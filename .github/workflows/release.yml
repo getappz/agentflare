@@ -223,3 +223,14 @@ jobs:
           git add bucket/leanstack.json
           git diff --cached --quiet || git commit -m "scoop manifest: leanstack ${VERSION}"
           git push origin HEAD:main
+
+  update-winget:
+    name: Update Winget
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: vedantmgoyal2009/winget-releaser@v2
+        with:
+          identifier: getappz.leanstack
+          installers-regex: 'x86_64-pc-windows-msvc\.zip$'
+          token: ${{ secrets.WINGET_GITHUB_TOKEN }}

@@ -97,6 +97,11 @@ scoop bucket add leanstack https://github.com/getappz/leanstack
 scoop install leanstack
 ```
 
+**Windows, Winget:**
+```powershell
+winget install getappz.leanstack
+```
+
 **Any platform with Rust, no clone needed:**
 ```bash
 cargo install --git https://github.com/getappz/leanstack
