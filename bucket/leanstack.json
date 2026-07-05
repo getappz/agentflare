@@ -1,0 +1,13 @@
+{
+  "version": "1.0.0",
+  "description": "lean-ctx + engram powered token-saving stack for AI coding agents",
+  "homepage": "https://github.com/getappz/leanstack",
+  "license": "MIT",
+  "url": "https://github.com/getappz/leanstack/releases/download/v1.0.0/leanstack-x86_64-pc-windows-msvc.zip",
+  "hash": "sha256:2260ac9582a3f2dc3b941b9ae0be3083f110a896106c2931198fbe579e192ef0",
+  "bin": "leanstack.exe",
+  "checkver": "github",
+  "autoupdate": {
+    "url": "https://github.com/getappz/leanstack/releases/download/v$version/leanstack-x86_64-pc-windows-msvc.zip"
+  }
+}
