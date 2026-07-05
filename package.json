@@ -1,0 +1,22 @@
+{
+  "name": "leanstack",
+  "version": "1.0.0",
+  "description": "lean-ctx powered token-saving stack. Zero fluff, max context per token.",
+  "author": "getappz",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/getappz/leanstack"
+  },
+  "keywords": [
+    "claude-code",
+    "claude-code-plugin",
+    "lean-ctx",
+    "token-optimization",
+    "productivity"
+  ],
+  "files": [
+    ".claude-plugin/",
+    "src/hooks/"
+  ]
+}

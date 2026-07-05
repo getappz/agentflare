@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "leanstack",
+  "description": "lean-ctx powered token-saving stack. Zero fluff, max context per token.",
+  "owner": {
+    "name": "getappz",
+    "url": "https://github.com/getappz"
+  },
+  "plugins": [
+    {
+      "name": "leanstack",
+      "description": "Auto-installs and wires lean-ctx (context compression), Caveman (conversation compression), Ponytail (code-writing discipline), and Exa/git rules. Detects what you have, adds only what's missing.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

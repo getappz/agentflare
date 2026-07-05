@@ -1,0 +1,32 @@
+{
+  "name": "leanstack",
+  "description": "lean-ctx powered token-saving stack. Zero fluff, max context per token.",
+  "author": {
+    "name": "getappz",
+    "url": "https://github.com/getappz"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/src/hooks/leanstack-activate.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/src/hooks/leanstack-remind.js\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
