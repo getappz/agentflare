@@ -82,12 +82,19 @@ brew tap getappz/leanstack
 brew install leanstack
 ```
 
-**Windows** (builds locally via cargo — no unsigned prebuilt binary to trip an
-AV heuristic):
+**Windows, build from source** (no unsigned prebuilt binary to trip an AV
+heuristic):
 ```powershell
 git clone https://github.com/getappz/leanstack
 cd leanstack
 .\install.ps1
+```
+
+**Windows, Scoop** (prebuilt binary — unsigned, like most small Rust CLIs;
+Defender/SmartScreen false-positives are possible, report an issue if hit):
+```powershell
+scoop bucket add leanstack https://github.com/getappz/scoop-leanstack
+scoop install leanstack
 ```
 
 **Any platform with Rust, no clone needed:**
