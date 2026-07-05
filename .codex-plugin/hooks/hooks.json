@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/src/hooks/session-start.js\" codex",
+            "command": "leanstack hook session-start --agent codex",
             "timeout": 10
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/src/hooks/prompt-submit.js\" codex",
+            "command": "leanstack hook prompt-submit --agent codex",
             "timeout": 5
           }
         ]

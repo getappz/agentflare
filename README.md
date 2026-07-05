@@ -2,7 +2,9 @@
 
 # leanstack
 
-**lean-ctx + engram powered token-saving stack across Claude Code, Codex, Cursor, Windsurf, VS Code, Cline, and Continue.**
+**A single Rust binary. No Node, no runtime dependencies. lean-ctx + engram
+powered token-saving stack across Claude Code, Codex, Cursor, Windsurf,
+VS Code, Cline, and Continue.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -12,8 +14,7 @@
 
 ## What this is
 
-A cross-tool setup for two non-overlapping layers, plus two companions where the host
-supports them:
+Two non-overlapping layers, plus two Claude-Code-only companions:
 
 | Layer | What it compresses | Tool |
 |---|---|---|
@@ -23,11 +24,19 @@ supports them:
 | **Ponytail** (Claude Code only) | code-writing over-engineering | companion plugin |
 
 lean-ctx and engram aren't substitutes for each other — one saves tokens inside a
-session, the other saves the re-explaining tax across sessions. Neither has a
-credible replacement for the other's job.
+session, the other saves the re-explaining tax across sessions.
 
-Every host gets one of three tiers, matched to what that host actually supports —
-no auto-install machinery built against an unverified surface.
+**Why Rust, not the original Node hooks:** Claude Code doesn't bundle or require
+Node.js — it's a standalone compiled binary. A plugin whose hooks shell out to
+`node` breaks on any machine that installed Claude Code without separately
+installing Node. leanstack is a single static binary; the only runtime
+dependency is leanstack itself.
+
+**Architecture, mirrored from [rtk-ai/rtk](https://github.com/rtk-ai/rtk)** (68k★,
+proven in production): no plugin marketplace for Claude Code or Cursor — `leanstack
+init --agent X` writes the hook config directly into the target's own settings file.
+Codex is the one exception: its hook system only activates through its plugin
+loader, so that wiring ships as a small `.codex-plugin/` manifest instead.
 
 ## Metrics
 
@@ -59,78 +68,64 @@ Check your own: `lean-ctx gain` · `/caveman-stats` (Claude Code) · `ponytail-d
 
 ---
 
-## Tier 1 — live plugin (marketplace-installable, real hooks)
+## Install the CLI
 
-**Claude Code** and **Codex** both have a real `SessionStart`/`UserPromptSubmit`-shaped
-hook system and a plugin marketplace. Same hook scripts run on both (Codex's loader
-honors `${CLAUDE_PLUGIN_ROOT}`, confirmed via `biefan/anchor`, a plugin that already
-does this in production).
-
-```
-/plugin marketplace add getappz/leanstack
-/plugin install leanstack@leanstack
-/reload-plugins
+**Linux/macOS:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/getappz/leanstack/main/install.sh | sh
 ```
 
-Detection-first: a component registry (`src/hooks/components.js`) checks what's already
-configured and skips it. **Consent-gated installs**: the first session only *lists* what's
-missing and the exact command each would run. Nothing that installs a package or plugin
-runs until you type `/leanstack confirm`. Rule files are the one exception — those are
-just usage guidance, not installs, so they write on first run.
+**Any platform with Rust:**
+```bash
+cargo install --git https://github.com/getappz/leanstack
+```
 
-**engram on Claude Code** installs via its own plugin marketplace (`Gentleman-Programming/engram`)
-— same pattern as the Ponytail companion, and engram's own documented recommended path.
+**Windows (no prebuilt-binary AV risk, compiles locally):**
+```powershell
+cargo install --git https://github.com/getappz/leanstack
+```
+Or download `leanstack-x86_64-pc-windows-msvc.zip` from
+[Releases](https://github.com/getappz/leanstack/releases), extract `leanstack.exe`
+onto your `PATH`.
 
-**lean-ctx** auto-installs via `npm install -g lean-ctx-bin && lean-ctx onboard`.
+**Homebrew tap:** planned as a fast-follow (not live yet — use one of the above).
 
-**engram elsewhere** (Codex/Cursor/Tier 2) auto-installs via `go install` (if Go is on
-`PATH`) or Homebrew (macOS/Linux, if present) — never the prebuilt Windows binary, which
-the project's own docs say gets flagged as a false positive by some antivirus engines. If
-neither path is available, the exact command is printed instead of silently downloading
-something that might trip your AV.
+## Set up an agent
 
-## Tier 1.5 — real hooks, no marketplace (Cursor)
-
-Cursor has the same kind of hook system (`.cursor/hooks.json`, events `sessionStart`/
-`beforeSubmitPrompt`) but no plugin marketplace to install from, so the hook scripts
-get copied into your project instead of loaded from an installed plugin:
+One command per tool, run once. Running it is the consent — installs happen
+immediately, no separate confirm step.
 
 ```bash
-npx github:getappz/leanstack cursor
+leanstack init --agent claude-code    # writes ~/.claude/settings.json hooks directly, no marketplace
+leanstack init --agent cursor         # writes .cursor/hooks.json directly, no marketplace
+leanstack init --agent windsurf
+leanstack init --agent vscode-copilot
+leanstack init --agent cline
+leanstack init --agent continue
 ```
 
-Writes `.cursor/leanstack/*.js` (the same hook scripts, host-tagged `cursor`),
-`.cursor/hooks.json`, `.cursor/rules/leanstack.mdc`, registers lean-ctx in
-`~/.cursor/mcp.json`, and runs `engram setup cursor` (engram's own native integration
-for Cursor) — both gated on the respective tool being installed already or auto-installed
-via the same safe paths as Tier 1.
-
-## Tier 2 — one-shot setup script (no hooks at all)
-
-**Windsurf**, **VS Code/Copilot**, **Cline**, and **Continue** have no programmable
-hook/lifecycle mechanism — but their MCP config and rules files are all scriptable.
-Running the script *is* the consent; there's no live confirm-gate because there's no
-live hook to gate.
-
-```bash
-npx github:getappz/leanstack            # auto-detects installed tools
-npx github:getappz/leanstack windsurf   # or force a specific one
+**Codex** is the one exception — its hook system only activates through its own
+plugin loader:
 ```
+codex plugin marketplace add getappz/leanstack
+codex plugin install leanstack
+```
+then `leanstack init --agent codex` for the rules/lean-ctx/engram setup (Codex's
+hook wiring itself comes from the plugin manifest, not `init`).
 
-| Tool | lean-ctx | engram | Rules file |
-|---|---|---|---|
-| Windsurf | `~/.codeium/windsurf/mcp_config.json` | `engram setup windsurf` (native) | `.windsurf/rules/leanstack.md` |
-| VS Code/Copilot | via `code --add-mcp` | `engram setup vscode-copilot` (native) | `.github/copilot-instructions.md` |
-| Cline | `~/.cline/mcp.json` | `~/.cline/mcp.json` (manual entry — no native `engram setup cline`) | `.clinerules/leanstack.md` |
-| Continue | `.continue/mcpServers/leanstack.json` | `.continue/mcpServers/engram.json` (manual — no native subcommand) | — (no dedicated rules convention found) |
+Each run: writes rule files (if absent), installs lean-ctx (`npm install -g
+lean-ctx-bin && lean-ctx onboard`) and engram (`go install`/`brew`, never the
+prebuilt Windows binary — see below) if missing, wires hooks/MCP where the host
+supports it. Detection-first — already-satisfied components are skipped, nothing
+gets clobbered.
 
-All writes are skip-if-exists — never clobbers something already there. If a tool
-itself isn't installed yet, MCP registration is skipped with a printed install command
-instead of registering a broken server entry.
+**engram's install safety**: the project's own docs say prebuilt Windows binaries
+get flagged as AV false positives, and explicitly recommend `go install` or
+Homebrew instead. `leanstack init` only auto-installs engram through one of those
+two paths; if neither is available, it prints the exact command instead of
+downloading something that might trip your AV.
 
-## Tier 3 — docs only (everyone else, e.g. Aider)
-
-No MCP support, no hooks: copy `AGENTS.md` into your project root.
+## Docs-only fallback (Aider, other AGENTS.md readers)
 
 ```bash
 curl -sL https://raw.githubusercontent.com/getappz/leanstack/main/AGENTS.md > AGENTS.md
@@ -142,32 +137,39 @@ curl -sL https://raw.githubusercontent.com/getappz/leanstack/main/AGENTS.md > AG
 
 ```
 src/
-├── rule-text.js         # shared rule copy (Exa, git, lean-ctx, engram usage)
-├── engram-install.js    # engram's safe-install logic (go install/brew, never
-│                         # the AV-flagged prebuilt Windows binary), shared by
-│                         # components.js and bin/setup.js
-└── hooks/
-    ├── state.js          # single JSON state blob (~/.leanstack/state.json), host-neutral
-    ├── components.js      # registry: each entry checks + fixes itself, host-aware
-    ├── session-start.js   # SessionStart hook — argv[2] = host ('claude-code'|'codex'|'cursor')
-    └── prompt-submit.js   # UserPromptSubmit hook — /leanstack confirm|on|off
-bin/
-└── setup.js              # one-shot script for Cursor/Windsurf/VS Code/Cline/Continue
+├── paths.rs             # home-dir resolution (LEANSTACK_HOME_OVERRIDE for tests —
+│                         # dirs::home_dir() ignores HOME/USERPROFILE overrides on
+│                         # Windows, learned the hard way)
+├── state.rs              # ~/.leanstack/state.json — on/off flag for the hooks
+├── rule_text.rs           # shared rule copy (Exa, git, lean-ctx, engram usage)
+├── engram_install.rs      # engram's safe-install logic (go install/brew only)
+├── components.rs          # registry: each entry checks + fixes itself, host-aware
+├── init.rs                # `leanstack init --agent X` — runs every component,
+│                           # wires hooks directly for claude-code/cursor
+├── hook.rs                # `leanstack hook session-start|prompt-submit --agent X`
+└── main.rs                 # clap CLI, dispatch
+
+.codex-plugin/              # Codex only — its hooks require the plugin loader
+install.sh                  # curl installer (Linux/macOS)
+.github/workflows/          # ci.yml (build+test), release.yml (cross-compile on tag)
 ```
 
-Adding a new managed component means adding one entry to `components.js` — neither
-hook hardcodes per-tool logic. Adding a new hook-less tool means adding one entry to
-`bin/setup.js`'s `TOOLS` map.
+Adding a new managed component means adding one entry to `components.rs` — neither
+`init` nor `hook` hardcodes per-tool logic.
 
 ---
 
 ## What Gets Created
 
-**Claude Code**: `~/.claude/rules/{exa,git,lean-ctx,engram}.md` (global), `~/.config/{caveman,ponytail}/config.json`, `~/.leanstack/state.json`.
+**Claude Code**: `~/.claude/rules/{exa,git,lean-ctx,engram}.md`, `~/.claude/settings.json` hooks section, `~/.config/{caveman,ponytail}/config.json`, `~/.leanstack/`.
 
-**Codex**: project-local `AGENTS.md` (only if absent), `~/.leanstack/state.json`.
+**Codex**: project-local `AGENTS.md` (only if absent), `~/.leanstack/`.
 
-**Cursor**: project-local `.cursor/rules/leanstack.mdc`, `.cursor/hooks.json`, `.cursor/leanstack/*.js`, `~/.cursor/mcp.json`, `~/.leanstack/state.json`.
+**Cursor**: project-local `.cursor/rules/leanstack.mdc`, `.cursor/hooks.json`, `~/.cursor/mcp.json`, `~/.leanstack/`.
+
+**Windsurf/VS Code/Cline**: project-local rules file (see table above), MCP config for lean-ctx/engram.
+
+**Continue**: `.continue/mcpServers/{leanstack,engram}.json`.
 
 Nothing is created if it already exists.
 
@@ -175,18 +177,13 @@ Nothing is created if it already exists.
 
 ## Uninstall
 
-**Claude Code / Codex**: `/uninstall-plugin leanstack`, then:
 ```bash
-rm ~/.claude/rules/exa.md ~/.claude/rules/git.md ~/.claude/rules/lean-ctx.md ~/.claude/rules/engram.md
-rm -rf ~/.leanstack
-rm ~/.config/ponytail/config.json  # ~/.config/caveman/config.json too if you want that reset
+cargo uninstall leanstack   # or remove the binary from wherever you installed it
 ```
 
-**Cursor**: `rm -rf .cursor/leanstack .cursor/hooks.json .cursor/rules/leanstack.mdc`
-
-**Tier 2 tools**: remove the specific files listed in the table above.
-
-Ponytail/Caveman/engram plugins themselves stay installed (uninstall separately if wanted).
+Then remove whatever `init` wrote for the hosts you set up — see "What Gets
+Created" above. Ponytail/Caveman/engram plugins themselves stay installed
+(uninstall separately if wanted).
 
 ---
 
