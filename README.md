@@ -93,7 +93,7 @@ cd leanstack
 **Windows, Scoop** (prebuilt binary — unsigned, like most small Rust CLIs;
 Defender/SmartScreen false-positives are possible, report an issue if hit):
 ```powershell
-scoop bucket add leanstack https://github.com/getappz/scoop-leanstack
+scoop bucket add leanstack https://github.com/getappz/leanstack
 scoop install leanstack
 ```
 

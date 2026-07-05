@@ -177,6 +177,10 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
       - name: Download checksums and extract windows hash
         id: checksums
         run: |
@@ -191,13 +195,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Clone and generate manifest
+      - name: Generate manifest and push to main
         run: |
           VERSION="${{ steps.checksums.outputs.version }}"
           WINDOWS_SHA="${{ steps.checksums.outputs.windows_sha }}"
 
-          git clone "https://x-access-token:${SCOOP_TOKEN}@github.com/getappz/scoop-leanstack.git"
-          cd scoop-leanstack
           mkdir -p bucket
 
           cat > bucket/leanstack.json <<EOF
@@ -219,7 +221,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add bucket/leanstack.json
-          git diff --cached --quiet || git commit -m "leanstack ${VERSION}"
-          git push
-        env:
-          SCOOP_TOKEN: ${{ secrets.SCOOP_GITHUB_TOKEN }}
+          git diff --cached --quiet || git commit -m "scoop manifest: leanstack ${VERSION}"
+          git push origin HEAD:main
