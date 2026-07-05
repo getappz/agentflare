@@ -66,7 +66,7 @@ jobs:
         run: |
           Compress-Archive -Path target/${{ matrix.target }}/release/leanstack.exe -DestinationPath leanstack-${{ matrix.target }}.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: leanstack-${{ matrix.target }}
           path: leanstack-${{ matrix.target }}.*
