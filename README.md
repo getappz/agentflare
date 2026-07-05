@@ -35,7 +35,27 @@ not installs, so they write on first run.
 
 ---
 
-## Install
+## Cross-agent support
+
+| Tool | Method | Auto-install |
+|---|---|---|
+| **Claude Code** | Plugin hooks (SessionStart + UserPromptSubmit) | Yes — detection, consent-gated install, per-turn reminders |
+| **Codex, Cursor, Windsurf, Copilot, Amp, Devin, others** | `AGENTS.md` at project root | No — these tools have no programmable hook mechanism, so it's rules-only |
+
+Claude Code gets the full stack because it's the only tool here with a verified hook
+API this project actually exercises. Everyone else gets the same rules as static
+context via `AGENTS.md`, with a manual `lean-ctx onboard` note — no auto-install
+machinery to build against an unverified hook surface.
+
+### Non-Claude-Code install
+
+```bash
+curl -sL https://raw.githubusercontent.com/getappz/leanstack/main/AGENTS.md > AGENTS.md
+```
+
+---
+
+## Claude Code Install
 
 ```
 /plugin marketplace add getappz/leanstack
