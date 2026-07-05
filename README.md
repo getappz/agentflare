@@ -26,17 +26,17 @@ Two non-overlapping layers, plus two Claude-Code-only companions:
 lean-ctx and engram aren't substitutes for each other — one saves tokens inside a
 session, the other saves the re-explaining tax across sessions.
 
-**Why Rust, not the original Node hooks:** Claude Code doesn't bundle or require
-Node.js — it's a standalone compiled binary. A plugin whose hooks shell out to
-`node` breaks on any machine that installed Claude Code without separately
-installing Node. leanstack is a single static binary; the only runtime
-dependency is leanstack itself.
+**Why Rust, not Node:** Claude Code doesn't bundle or require Node.js — it's a
+standalone compiled binary. A plugin whose hooks shell out to `node` breaks on
+any machine that installed Claude Code without separately installing Node.
+leanstack is a single static binary; the only runtime dependency is leanstack
+itself.
 
-**Architecture, mirrored from [rtk-ai/rtk](https://github.com/rtk-ai/rtk)** (68k★,
-proven in production): no plugin marketplace for Claude Code or Cursor — `leanstack
-init --agent X` writes the hook config directly into the target's own settings file.
-Codex is the one exception: its hook system only activates through its plugin
-loader, so that wiring ships as a small `.codex-plugin/` manifest instead.
+**No plugin marketplace for Claude Code or Cursor** — `leanstack init --agent X`
+writes the hook config directly into the target's own settings file (Claude
+Code's `~/.claude/settings.json`, Cursor's `.cursor/hooks.json`). Codex is the
+one exception: its hook system only activates through its plugin loader, so
+that wiring ships as a small `.codex-plugin/` manifest instead.
 
 ## Metrics
 
@@ -70,25 +70,35 @@ Check your own: `lean-ctx gain` · `/caveman-stats` (Claude Code) · `ponytail-d
 
 ## Install the CLI
 
-**Linux/macOS:**
+**Linux/macOS** (downloads a prebuilt binary, checksum-verified; builds from
+source instead if run from inside a clone):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/getappz/leanstack/main/install.sh | sh
 ```
 
-**Any platform with Rust:**
+**Homebrew:**
+```bash
+brew tap getappz/leanstack
+brew install leanstack
+```
+
+**Windows** (builds locally via cargo — no unsigned prebuilt binary to trip an
+AV heuristic):
+```powershell
+git clone https://github.com/getappz/leanstack
+cd leanstack
+.\install.ps1
+```
+
+**Any platform with Rust, no clone needed:**
 ```bash
 cargo install --git https://github.com/getappz/leanstack
 ```
 
-**Windows (no prebuilt-binary AV risk, compiles locally):**
-```powershell
-cargo install --git https://github.com/getappz/leanstack
+**Uninstall:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/getappz/leanstack/main/install.sh | sh -s -- --uninstall
 ```
-Or download `leanstack-x86_64-pc-windows-msvc.zip` from
-[Releases](https://github.com/getappz/leanstack/releases), extract `leanstack.exe`
-onto your `PATH`.
-
-**Homebrew tap:** planned as a fast-follow (not live yet — use one of the above).
 
 ## Set up an agent
 
@@ -150,7 +160,7 @@ src/
 └── main.rs                 # clap CLI, dispatch
 
 .codex-plugin/              # Codex only — its hooks require the plugin loader
-install.sh                  # curl installer (Linux/macOS)
+install.sh, install.ps1      # installers (checksum-verified download / local build)
 .github/workflows/          # ci.yml (build+test), release.yml (cross-compile on tag)
 ```
 
@@ -177,13 +187,10 @@ Nothing is created if it already exists.
 
 ## Uninstall
 
-```bash
-cargo uninstall leanstack   # or remove the binary from wherever you installed it
-```
-
-Then remove whatever `init` wrote for the hosts you set up — see "What Gets
-Created" above. Ponytail/Caveman/engram plugins themselves stay installed
-(uninstall separately if wanted).
+Remove the binary (see Install section above), then remove whatever `init`
+wrote for the hosts you set up — see "What Gets Created" above. Ponytail/
+Caveman/engram plugins themselves stay installed (uninstall separately if
+wanted).
 
 ---
 
