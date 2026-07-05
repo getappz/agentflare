@@ -1,0 +1,5 @@
+{
+  "name": "leanstack",
+  "description": "lean-ctx powered token-saving stack. Zero fluff, max context per token.",
+  "hooks": "./hooks/hooks.json"
+}

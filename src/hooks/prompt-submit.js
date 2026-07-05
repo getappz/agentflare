@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 const state = require('./state.js');
-const components = require('./components.js');
+const getComponents = require('./components.js');
+
+const host = process.argv[2] || 'claude-code';
+const components = getComponents(host);
 
 function emit(text) {
   process.stdout.write(JSON.stringify({
@@ -8,11 +11,19 @@ function emit(text) {
   }));
 }
 
+// Field name for the submitted prompt text is documented as "prompt" for
+// Claude Code; Codex/Cursor are confirmed to share the same stdin/stdout
+// hook contract, but exact key naming wasn't independently verified for
+// them, so fall back across the plausible alternatives rather than assume.
+function promptText(data) {
+  return (data.prompt || data.text || data.message || '').trim().toLowerCase();
+}
+
 let input = '';
 process.stdin.on('data', chunk => { input += chunk; });
 process.stdin.on('end', () => {
   let prompt = '';
-  try { prompt = ((JSON.parse(input).prompt) || '').trim().toLowerCase(); } catch (_) { return; }
+  try { prompt = promptText(JSON.parse(input)); } catch (_) { return; }
 
   const s = state.load();
 

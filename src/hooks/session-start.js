@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 const state = require('./state.js');
-const components = require('./components.js');
+const getComponents = require('./components.js');
+
+const host = process.argv[2] || 'claude-code';
+const components = getComponents(host);
 
 const s = state.load();
 s.active = true;
@@ -18,8 +21,6 @@ for (const c of components) {
     stillPending.push(c);
   }
 }
-
-if (!s.rulesInstalled) s.rulesInstalled = true;
 
 if (stillPending.length && !s.confirmed) {
   lines.push('');

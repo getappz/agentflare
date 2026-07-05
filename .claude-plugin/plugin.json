@@ -11,7 +11,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/src/hooks/session-start.js\"",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/src/hooks/session-start.js\" claude-code",
             "timeout": 10
           }
         ]
@@ -22,7 +22,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/src/hooks/prompt-submit.js\"",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/src/hooks/prompt-submit.js\" claude-code",
             "timeout": 5
           }
         ]

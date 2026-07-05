@@ -11,12 +11,19 @@
   "keywords": [
     "claude-code",
     "claude-code-plugin",
+    "codex",
+    "cursor",
     "lean-ctx",
     "token-optimization",
     "productivity"
   ],
+  "bin": {
+    "leanstack": "./bin/setup.js"
+  },
   "files": [
     ".claude-plugin/",
-    "src/hooks/"
+    ".codex-plugin/",
+    "bin/",
+    "src/"
   ]
 }
