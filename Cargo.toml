@@ -7,8 +7,24 @@ license = "MIT"
 repository = "https://github.com/getappz/agentflare"
 
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/agentflare-{ target }.{ archive-format }"
-bin-dir = "{ bin }{ binary-ext }"
+bin-dir = "agentflare{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/agentflare-x86_64-unknown-linux-gnu.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/agentflare-aarch64-unknown-linux-gnu.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/agentflare-x86_64-apple-darwin.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/agentflare-aarch64-apple-darwin.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/agentflare-x86_64-pc-windows-msvc.zip"
+pkg-fmt = "zip"
 
 [[bin]]
 name = "agentflare"

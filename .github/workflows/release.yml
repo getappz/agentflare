@@ -254,3 +254,14 @@ jobs:
           gh workflow run npm-publish.yml \
             --repo getappz/agentflare \
             -f version="${GITHUB_REF_NAME}"
+
+  publish-crates-io:
+    name: Publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
