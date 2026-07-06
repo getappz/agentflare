@@ -1,5 +1,6 @@
 mod agent_registry;
 mod agent_detect;
+mod agent_install;
 mod agents;
 mod components;
 mod coaching;
@@ -92,6 +93,25 @@ enum AgentsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Install an agent via its package manager (npm, pip, etc.).
+    Install {
+        agent: String,
+        /// Print the install command without executing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Update an agent to the latest version.
+    Update {
+        agent: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Uninstall an agent.
+    Uninstall {
+        agent: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -138,6 +158,9 @@ fn main() {
         Commands::Agents { action } => match action {
             AgentsAction::List { json } => agents::cli_list(json),
             AgentsAction::Doctor { json } => agents::cli_doctor(json),
+            AgentsAction::Install { agent, dry_run } => agents::cli_install(&agent, dry_run),
+            AgentsAction::Update { agent, dry_run } => agents::cli_update(&agent, dry_run),
+            AgentsAction::Uninstall { agent, dry_run } => agents::cli_uninstall(&agent, dry_run),
         },
     }
 }

@@ -475,6 +475,8 @@ mod detect_all_tests {
                     tier: Tier::Cli,
                     binary_names: &["found-agent"],
                     version_args: &["--version"],
+                    package_manager: None,
+                    package_name: None,
                 },
                 AgentSpec {
                     id: Agent::Codex,
@@ -482,6 +484,8 @@ mod detect_all_tests {
                     tier: Tier::Cli,
                     binary_names: &["not-on-path-xyz"],
                     version_args: &["--version"],
+                    package_manager: None,
+                    package_name: None,
                 },
                 AgentSpec {
                     id: Agent::Cline,
@@ -489,6 +493,8 @@ mod detect_all_tests {
                     tier: Tier::Extension,
                     binary_names: &[],
                     version_args: &[],
+                    package_manager: None,
+                    package_name: None,
                 },
             ];
             let mut cache = HashMap::new();
@@ -512,6 +518,8 @@ mod detect_all_tests {
                 tier: Tier::Cli,
                 binary_names: &["broken-agent"],
                 version_args: &["--version"],
+                package_manager: None,
+                package_name: None,
             }];
             let mut cache = HashMap::new();
 

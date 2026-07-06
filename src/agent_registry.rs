@@ -63,6 +63,11 @@ pub struct AgentSpec {
     pub binary_names: &'static [&'static str],
     /// Arguments passed to the binary to print its version, e.g. `--version`.
     pub version_args: &'static [&'static str],
+    /// Package manager for install/update/uninstall. `None` means no
+    /// automated install path (e.g. Cursor requires a manual download).
+    pub package_manager: Option<&'static str>,
+    /// Package name for the package manager (npm scope, pip package, etc.).
+    pub package_name: Option<&'static str>,
 }
 
 /// Not yet consumed outside tests — wired up by the upcoming agent detection
@@ -75,6 +80,8 @@ pub static REGISTRY: &[AgentSpec] = &[
         tier: Tier::Cli,
         binary_names: &["claude"],
         version_args: &["--version"],
+        package_manager: Some("npm"),
+        package_name: Some("@anthropic-ai/claude-code"),
     },
     AgentSpec {
         id: Agent::Codex,
@@ -82,6 +89,8 @@ pub static REGISTRY: &[AgentSpec] = &[
         tier: Tier::Cli,
         binary_names: &["codex"],
         version_args: &["--version"],
+        package_manager: Some("npm"),
+        package_name: Some("@openai/codex"),
     },
     AgentSpec {
         id: Agent::Cursor,
@@ -89,6 +98,8 @@ pub static REGISTRY: &[AgentSpec] = &[
         tier: Tier::Cli,
         binary_names: &["cursor-agent"],
         version_args: &["--version"],
+        package_manager: None,
+        package_name: None,
     },
     AgentSpec {
         id: Agent::Windsurf,
@@ -96,6 +107,8 @@ pub static REGISTRY: &[AgentSpec] = &[
         tier: Tier::Cli,
         binary_names: &["windsurf"],
         version_args: &["--version"],
+        package_manager: None,
+        package_name: None,
     },
     AgentSpec {
         id: Agent::Opencode,
@@ -103,6 +116,8 @@ pub static REGISTRY: &[AgentSpec] = &[
         tier: Tier::Cli,
         binary_names: &["opencode"],
         version_args: &["--version"],
+        package_manager: Some("npm"),
+        package_name: Some("@opencode-ai/opencode"),
     },
     AgentSpec {
         id: Agent::GeminiCli,
@@ -110,6 +125,8 @@ pub static REGISTRY: &[AgentSpec] = &[
         tier: Tier::Cli,
         binary_names: &["gemini"],
         version_args: &["--version"],
+        package_manager: Some("npm"),
+        package_name: Some("@google/gemini-cli"),
     },
     AgentSpec {
         id: Agent::GithubCopilotCli,
@@ -117,6 +134,8 @@ pub static REGISTRY: &[AgentSpec] = &[
         tier: Tier::Cli,
         binary_names: &["copilot"],
         version_args: &["--version"],
+        package_manager: Some("npm"),
+        package_name: Some("@github/copilot-cli"),
     },
     AgentSpec {
         id: Agent::Aider,
@@ -124,6 +143,8 @@ pub static REGISTRY: &[AgentSpec] = &[
         tier: Tier::Cli,
         binary_names: &["aider"],
         version_args: &["--version"],
+        package_manager: Some("pip"),
+        package_name: Some("aider-chat"),
     },
     AgentSpec {
         id: Agent::VscodeCopilot,
@@ -131,6 +152,8 @@ pub static REGISTRY: &[AgentSpec] = &[
         tier: Tier::Extension,
         binary_names: &[],
         version_args: &[],
+        package_manager: None,
+        package_name: None,
     },
     AgentSpec {
         id: Agent::Cline,
@@ -138,6 +161,8 @@ pub static REGISTRY: &[AgentSpec] = &[
         tier: Tier::Extension,
         binary_names: &[],
         version_args: &[],
+        package_manager: None,
+        package_name: None,
     },
     AgentSpec {
         id: Agent::Continue,
@@ -145,6 +170,8 @@ pub static REGISTRY: &[AgentSpec] = &[
         tier: Tier::Extension,
         binary_names: &[],
         version_args: &[],
+        package_manager: None,
+        package_name: None,
     },
 ];
 

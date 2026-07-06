@@ -2,6 +2,7 @@
 // Kept separate from agent_detect.rs so the detection engine stays free of
 // println!/format concerns and is fully unit-testable in isolation.
 use crate::agent_detect::{self, DetectedAgent, VersionRunner};
+use crate::agent_install::{self, Outcome};
 use crate::agent_registry::{self, AgentSpec};
 use crate::state;
 use serde::Serialize;
@@ -155,6 +156,30 @@ pub fn cli_doctor(json: bool) {
     state::save(&state);
 }
 
+pub fn cli_install(agent: &str, dry_run: bool) {
+    match agent_install::run_install(agent_registry::REGISTRY, agent, None, dry_run) {
+        Outcome::Ok(msg) => println!("{msg}"),
+        Outcome::Skipped(msg) => println!("skip: {msg}"),
+        Outcome::Err(msg) => eprintln!("error: {msg}"),
+    }
+}
+
+pub fn cli_update(agent: &str, dry_run: bool) {
+    match agent_install::run_update(agent_registry::REGISTRY, agent, dry_run) {
+        Outcome::Ok(msg) => println!("{msg}"),
+        Outcome::Skipped(msg) => println!("skip: {msg}"),
+        Outcome::Err(msg) => eprintln!("error: {msg}"),
+    }
+}
+
+pub fn cli_uninstall(agent: &str, dry_run: bool) {
+    match agent_install::run_uninstall(agent_registry::REGISTRY, agent, dry_run) {
+        Outcome::Ok(msg) => println!("{msg}"),
+        Outcome::Skipped(msg) => println!("skip: {msg}"),
+        Outcome::Err(msg) => eprintln!("error: {msg}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +219,8 @@ mod tests {
             tier: Tier::Cli,
             binary_names: &["testbin"],
             version_args: &["--version"],
+            package_manager: None,
+            package_name: None,
         }]
     }
 
@@ -236,6 +263,8 @@ mod tests {
                 tier: Tier::Cli,
                 binary_names: &["broken-bin"],
                 version_args: &["--version"],
+                package_manager: None,
+                package_name: None,
             }];
             let detected = agent_detect::detect_all_with(
                 &registry,
@@ -288,6 +317,8 @@ mod tests {
                 tier: Tier::Cli,
                 binary_names: &["docbin"],
                 version_args: &["--version"],
+                package_manager: None,
+                package_name: None,
             }];
             run_doctor(&registry, &mut cache, &runner, false);
         });
@@ -308,6 +339,8 @@ mod tests {
                 tier: Tier::Cli,
                 binary_names: &["drbin"],
                 version_args: &["--version"],
+                package_manager: None,
+                package_name: None,
             }];
             let detected = agent_detect::detect_all_with(
                 &registry,
