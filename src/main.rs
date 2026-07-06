@@ -1,9 +1,11 @@
 mod components;
+mod cost;
 mod engram_install;
 mod hook;
 mod init;
 mod optimize;
 mod paths;
+mod pricing;
 mod rule_text;
 mod state;
 
@@ -58,6 +60,8 @@ enum Commands {
         #[command(subcommand)]
         event: HookEvent,
     },
+    /// Print today's Claude Code token usage and estimated cost, by model.
+    Cost,
 }
 
 #[derive(Subcommand)]
@@ -85,5 +89,6 @@ fn main() {
             HookEvent::PromptSubmit { agent } => hook::prompt_submit(agent.as_str()),
             HookEvent::PreToolUse { agent } => hook::pre_tool_use(agent.as_str()),
         },
+        Commands::Cost => cost::run(),
     }
 }
