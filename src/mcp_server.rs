@@ -5,7 +5,7 @@
 use crate::optimize;
 use crate::optimize::Router;
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::wrapper::Parameters,
     model::{
         AnnotateAble, ErrorData, Implementation, ListResourcesResult, PaginatedRequestParams,
         RawResource, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
@@ -32,17 +32,7 @@ struct CheckSessionHealthRequest {
 }
 
 #[derive(Clone)]
-pub struct AgentflareMcp {
-    tool_router: ToolRouter<Self>,
-}
-
-impl AgentflareMcp {
-    fn new() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
-    }
-}
+pub struct AgentflareMcp;
 
 #[tool_router]
 impl AgentflareMcp {
@@ -215,7 +205,7 @@ impl ServerHandler for AgentflareMcp {
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let service = AgentflareMcp::new().serve(stdio()).await?;
+    let service = AgentflareMcp.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
@@ -226,7 +216,7 @@ mod tests {
 
     #[test]
     fn get_info_reports_agentflare_identity() {
-        let s = AgentflareMcp::new();
+        let s = AgentflareMcp;
         let info = s.get_info();
         assert_eq!(info.server_info.name, env!("CARGO_PKG_NAME"));
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
@@ -234,7 +224,7 @@ mod tests {
 
     #[test]
     fn routing_suggestion_returns_null_for_non_locate() {
-        let s = AgentflareMcp::new();
+        let s = AgentflareMcp;
         let result = s.get_routing_suggestion(Parameters(GetRoutingSuggestionRequest {
             prompt: "refactor the payment module".to_string(),
         }));
@@ -243,7 +233,7 @@ mod tests {
 
     #[test]
     fn routing_suggestion_returns_nudge_for_find() {
-        let s = AgentflareMcp::new();
+        let s = AgentflareMcp;
         let result = s.get_routing_suggestion(Parameters(GetRoutingSuggestionRequest {
             prompt: "find the auth handler".to_string(),
         }));
@@ -252,7 +242,7 @@ mod tests {
 
     #[test]
     fn check_session_health_unknown_returns_status() {
-        let s = AgentflareMcp::new();
+        let s = AgentflareMcp;
         let result = s
             .check_session_health(Parameters(CheckSessionHealthRequest {
                 session_id: "nonexistent-session-id".to_string(),
@@ -263,7 +253,7 @@ mod tests {
 
     #[test]
     fn check_session_health_rejects_empty_session_id() {
-        let s = AgentflareMcp::new();
+        let s = AgentflareMcp;
         let err = s
             .check_session_health(Parameters(CheckSessionHealthRequest {
                 session_id: String::new(),
@@ -290,7 +280,7 @@ mod tests {
 
     #[test]
     fn list_resources_returns_sessions_and_nudges() {
-        let s = AgentflareMcp::new();
+        let s = AgentflareMcp;
         let result = s.list_resources_sync();
         let uris: Vec<&str> = result.resources.iter().map(|r| r.uri.as_str()).collect();
         assert_eq!(uris, vec!["agentflare://sessions", "agentflare://nudges"]);
@@ -298,7 +288,7 @@ mod tests {
 
     #[test]
     fn read_resource_nudges_returns_nudges_json() {
-        let s = AgentflareMcp::new();
+        let s = AgentflareMcp;
         let result = s.read_resource_sync("agentflare://nudges").unwrap();
         assert_eq!(result.contents.len(), 1);
         let ResourceContents::TextResourceContents { text, uri, .. } = &result.contents[0] else {
@@ -310,7 +300,7 @@ mod tests {
 
     #[test]
     fn read_resource_unknown_uri_returns_resource_not_found() {
-        let s = AgentflareMcp::new();
+        let s = AgentflareMcp;
         let err = s.read_resource_sync("agentflare://bogus").unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
     }
