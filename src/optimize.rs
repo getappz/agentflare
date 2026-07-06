@@ -18,7 +18,7 @@ pub struct SessionRecord {
     pub recent_tool_calls: Vec<ToolCallRecord>,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct ToolCallRecord {
     pub name: String,
     pub ts: u64,
@@ -86,6 +86,71 @@ fn has_word_boundary_match(text: &str, keyword: &str) -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// Router trait — pluggable per-call model routing nudges
+// ---------------------------------------------------------------------------
+
+/// Context available to every routing decision.
+#[derive(Debug, Clone)]
+pub struct RouteContext {
+    pub prompt: String,
+    pub session_id: String,
+    pub turn_count: u32,
+    pub recent_tool_calls: Vec<ToolCallRecord>,
+    pub current_model: Option<String>,
+}
+
+/// A router decides whether to suggest a different model (or operational
+/// nudge) for a single LLM call. Return `None` to stay silent.
+pub trait Router: Send + Sync {
+    fn route(&self, ctx: &RouteContext) -> Option<String>;
+}
+
+// ---------------------------------------------------------------------------
+// KeywordRouter — the existing keyword heuristic as a Router
+// ---------------------------------------------------------------------------
+
+pub struct KeywordRouter;
+
+impl Router for KeywordRouter {
+    fn route(&self, ctx: &RouteContext) -> Option<String> {
+        model_routing_nudge(&ctx.prompt).map(|s| s.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LengthBasedRouter — short prompts → cheap model; long → keep current
+// ---------------------------------------------------------------------------
+
+const SHORT_PROMPT_LEN: usize = 100;
+const LONG_PROMPT_LEN: usize = 2000;
+
+pub struct LengthBasedRouter {
+    pub cheap_model: String,
+    pub big_model: String,
+}
+
+impl Router for LengthBasedRouter {
+    fn route(&self, ctx: &RouteContext) -> Option<String> {
+        let len = ctx.prompt.len();
+        if len < SHORT_PROMPT_LEN {
+            Some(format!(
+                "Short prompt ({len} chars) — consider routing to {}.",
+                self.cheap_model
+            ))
+        } else if len > LONG_PROMPT_LEN {
+            Some(format!(
+                "Long prompt ({len} chars) — stick with {} for quality.",
+                self.big_model
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// Legacy free-function — delegates to `KeywordRouter`. Kept for backward
+/// compatibility with existing test assertions.
 pub fn model_routing_nudge(prompt: &str) -> Option<&'static str> {
     let lower = prompt.to_lowercase();
     if LOCATE_KEYWORDS.iter().any(|kw| has_word_boundary_match(&lower, kw)) {
@@ -284,5 +349,72 @@ mod tests {
     #[test]
     fn schedule_wakeup_silent_over_dead_zone() {
         assert!(schedule_wakeup_nudge(1500).is_none());
+    }
+
+    // ---- Router trait tests ----
+
+    fn ctx(prompt: &str) -> RouteContext {
+        RouteContext {
+            prompt: prompt.to_string(),
+            session_id: "test-sess".to_string(),
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            current_model: None,
+        }
+    }
+
+    #[test]
+    fn keyword_router_flags_find_prompts() {
+        let r = KeywordRouter;
+        assert!(r.route(&ctx("find the auth handler")).is_some());
+    }
+
+    #[test]
+    fn keyword_router_ignores_unrelated_prompts() {
+        let r = KeywordRouter;
+        assert!(r.route(&ctx("refactor the payment module")).is_none());
+    }
+
+    #[test]
+    fn keyword_router_ignores_locate_substring() {
+        let r = KeywordRouter;
+        assert!(r.route(&ctx("let's reallocate the buffer")).is_none());
+    }
+
+    #[test]
+    fn length_router_short_prompt_routes_to_cheap() {
+        let r = LengthBasedRouter {
+            cheap_model: "haiku".into(),
+            big_model: "opus".into(),
+        };
+        let nudge = r.route(&ctx("hi")).unwrap();
+        assert!(nudge.contains("haiku"));
+    }
+
+    #[test]
+    fn length_router_long_prompt_sticks_to_big() {
+        let r = LengthBasedRouter {
+            cheap_model: "haiku".into(),
+            big_model: "opus".into(),
+        };
+        let long = "x".repeat(2500);
+        let nudge = r.route(&ctx(&long)).unwrap();
+        assert!(nudge.contains("opus"));
+    }
+
+    #[test]
+    fn length_router_medium_prompt_silent() {
+        let r = LengthBasedRouter {
+            cheap_model: "haiku".into(),
+            big_model: "opus".into(),
+        };
+        let medium = "x".repeat(500);
+        assert!(r.route(&ctx(&medium)).is_none());
+    }
+
+    #[test]
+    fn router_trait_is_object_safe() {
+        let r: &dyn Router = &KeywordRouter;
+        assert!(r.route(&ctx("find me")).is_some());
     }
 }
