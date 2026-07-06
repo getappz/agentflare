@@ -176,27 +176,25 @@ impl AgentflareMcp {
                 ));
             }
         };
-        Ok(ReadResourceResult {
-            contents: vec![ResourceContents::text(text, uri)],
-        })
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            text, uri,
+        )]))
     }
 }
 
 #[tool_handler]
 impl ServerHandler for AgentflareMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder()
+        ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
                 .build(),
-            server_info: Implementation {
-                name: env!("CARGO_PKG_NAME").into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                ..Implementation::from_build_env()
-            },
-            ..Default::default()
-        }
+        )
+        .with_server_info(Implementation::new(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
     }
 
     async fn list_resources(
