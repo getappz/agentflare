@@ -1,10 +1,14 @@
 [package]
 name = "agentflare"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 description = "Optimize AI CLI agents for cost and performance."
 license = "MIT"
 repository = "https://github.com/getappz/agentflare"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/agentflare-{ target }.{ archive-format }"
+bin-dir = "{ bin }{ binary-ext }"
 
 [[bin]]
 name = "agentflare"
