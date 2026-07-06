@@ -57,19 +57,19 @@ jobs:
         if: matrix.archive == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czf ../../../leanstack-${{ matrix.target }}.tar.gz leanstack
+          tar -czf ../../../agentflare-${{ matrix.target }}.tar.gz agentflare
           cd -
 
       - name: Package (windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/leanstack.exe -DestinationPath leanstack-${{ matrix.target }}.zip
+          Compress-Archive -Path target/${{ matrix.target }}/release/agentflare.exe -DestinationPath agentflare-${{ matrix.target }}.zip
 
       - uses: actions/upload-artifact@v7
         with:
-          name: leanstack-${{ matrix.target }}
-          path: leanstack-${{ matrix.target }}.*
+          name: agentflare-${{ matrix.target }}
+          path: agentflare-${{ matrix.target }}.*
 
   release:
     needs: build
@@ -104,7 +104,7 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
           gh release download "${GITHUB_REF_NAME}" \
-            --repo getappz/leanstack --pattern "SHA256SUMS" --dir .
+            --repo getappz/agentflare --pattern "SHA256SUMS" --dir .
 
           AARCH64_DARWIN=$(grep "aarch64-apple-darwin" SHA256SUMS | awk '{print $1}')
           X86_64_DARWIN=$(grep "x86_64-apple-darwin" SHA256SUMS | awk '{print $1}')
@@ -126,52 +126,52 @@ jobs:
           AARCH64_LINUX_SHA="${{ steps.checksums.outputs.aarch64_linux_sha }}"
           X86_64_LINUX_SHA="${{ steps.checksums.outputs.x86_64_linux_sha }}"
 
-          git clone "https://x-access-token:${HOMEBREW_TOKEN}@github.com/getappz/homebrew-leanstack.git"
-          cd homebrew-leanstack
+          git clone "https://x-access-token:${HOMEBREW_TOKEN}@github.com/getappz/homebrew-agentflare.git"
+          cd homebrew-agentflare
           mkdir -p Formula
 
-          cat > Formula/leanstack.rb <<EOF
-          class Leanstack < Formula
-            desc "lean-ctx + engram powered token-saving stack for AI coding agents"
-            homepage "https://github.com/getappz/leanstack"
+          cat > Formula/agentflare.rb <<EOF
+          class Agentflare < Formula
+            desc "Optimize AI CLI agents for cost and performance"
+            homepage "https://github.com/getappz/agentflare"
             version "${VERSION}"
             license "MIT"
 
             on_macos do
               if Hardware::CPU.arm?
-                url "https://github.com/getappz/leanstack/releases/download/v${VERSION}/leanstack-aarch64-apple-darwin.tar.gz"
+                url "https://github.com/getappz/agentflare/releases/download/v${VERSION}/agentflare-aarch64-apple-darwin.tar.gz"
                 sha256 "${AARCH64_DARWIN_SHA}"
               else
-                url "https://github.com/getappz/leanstack/releases/download/v${VERSION}/leanstack-x86_64-apple-darwin.tar.gz"
+                url "https://github.com/getappz/agentflare/releases/download/v${VERSION}/agentflare-x86_64-apple-darwin.tar.gz"
                 sha256 "${X86_64_DARWIN_SHA}"
               end
             end
 
             on_linux do
               if Hardware::CPU.arm?
-                url "https://github.com/getappz/leanstack/releases/download/v${VERSION}/leanstack-aarch64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/getappz/agentflare/releases/download/v${VERSION}/agentflare-aarch64-unknown-linux-gnu.tar.gz"
                 sha256 "${AARCH64_LINUX_SHA}"
               else
-                url "https://github.com/getappz/leanstack/releases/download/v${VERSION}/leanstack-x86_64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/getappz/agentflare/releases/download/v${VERSION}/agentflare-x86_64-unknown-linux-gnu.tar.gz"
                 sha256 "${X86_64_LINUX_SHA}"
               end
             end
 
             def install
-              bin.install "leanstack"
+              bin.install "agentflare"
             end
 
             test do
-              assert_match "leanstack ${VERSION}", shell_output("#{bin}/leanstack --version")
+              assert_match "agentflare ${VERSION}", shell_output("#{bin}/agentflare --version")
             end
           end
           EOF
-          sed -i 's/^          //' Formula/leanstack.rb
+          sed -i 's/^          //' Formula/agentflare.rb
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/leanstack.rb
-          git diff --cached --quiet || git commit -m "leanstack ${VERSION}"
+          git add Formula/agentflare.rb
+          git diff --cached --quiet || git commit -m "agentflare ${VERSION}"
           git push
         env:
           HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_GITHUB_TOKEN }}
@@ -192,7 +192,7 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
           gh release download "${GITHUB_REF_NAME}" \
-            --repo getappz/leanstack --pattern "SHA256SUMS" --dir .
+            --repo getappz/agentflare --pattern "SHA256SUMS" --dir .
 
           WINDOWS_SHA=$(grep "x86_64-pc-windows-msvc" SHA256SUMS | awk '{print $1}')
           echo "windows_sha=${WINDOWS_SHA}" >> "$GITHUB_OUTPUT"
@@ -206,24 +206,24 @@ jobs:
 
           mkdir -p bucket
 
-          cat > bucket/leanstack.json <<EOF
+          cat > bucket/agentflare.json <<EOF
           {
             "version": "${VERSION}",
-            "description": "lean-ctx + engram powered token-saving stack for AI coding agents",
-            "homepage": "https://github.com/getappz/leanstack",
+            "description": "Optimize AI CLI agents for cost and performance",
+            "homepage": "https://github.com/getappz/agentflare",
             "license": "MIT",
-            "url": "https://github.com/getappz/leanstack/releases/download/v${VERSION}/leanstack-x86_64-pc-windows-msvc.zip",
+            "url": "https://github.com/getappz/agentflare/releases/download/v${VERSION}/agentflare-x86_64-pc-windows-msvc.zip",
             "hash": "sha256:${WINDOWS_SHA}",
-            "bin": "leanstack.exe",
+            "bin": "agentflare.exe",
             "checkver": "github",
             "autoupdate": {
-              "url": "https://github.com/getappz/leanstack/releases/download/v\$version/leanstack-x86_64-pc-windows-msvc.zip"
+              "url": "https://github.com/getappz/agentflare/releases/download/v\$version/agentflare-x86_64-pc-windows-msvc.zip"
             }
           }
           EOF
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add bucket/leanstack.json
-          git diff --cached --quiet || git commit -m "scoop manifest: leanstack ${VERSION}"
+          git add bucket/agentflare.json
+          git diff --cached --quiet || git commit -m "scoop manifest: agentflare ${VERSION}"
           git push origin HEAD:master

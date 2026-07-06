@@ -1,11 +1,11 @@
 ---
 name: Bug Report
-about: Report a bug in leanstack
+about: Report a bug in agentflare
 title: 'bug: '
 labels: bug
 ---
 
-**leanstack version:** (run `leanstack --version`)
+**agentflare version:** (run `agentflare --version`)
 
 **OS:** (macOS / Linux / Windows)
 

@@ -1,6 +1,6 @@
 ---
 name: Feature Request
-about: Suggest an idea for leanstack
+about: Suggest an idea for agentflare
 title: 'feat: '
 labels: enhancement
 ---
