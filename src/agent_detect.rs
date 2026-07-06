@@ -232,7 +232,8 @@ pub fn resolve_version_with(
     }
 
     let raw = runner.run(binary_path, version_args)?;
-    let version = extract_version(&raw).unwrap_or_else(|| raw.trim().to_string());
+    let version = extract_version(&raw)
+        .ok_or_else(|| format!("could not parse a version from output: {raw:?}"))?;
 
     cache.insert(
         agent_key.to_string(),
@@ -343,6 +344,21 @@ mod resolve_version_tests {
 
         assert!(result.is_err());
         assert!(!cache.contains_key("agent-d"), "a failed resolution must not be cached");
+    }
+
+    #[test]
+    fn unparseable_success_output_is_not_persisted_to_cache() {
+        let binary = temp_binary_file("agent-e");
+        let runner = FakeRunner { response: Ok("no version information here".to_string()) };
+        let mut cache = HashMap::new();
+
+        let result = resolve_version_with(&runner, "agent-e", &binary, &["--version"], &mut cache);
+
+        assert!(result.is_err());
+        assert!(
+            !cache.contains_key("agent-e"),
+            "a successful-but-unparseable resolution must not be cached"
+        );
     }
 
     #[test]
