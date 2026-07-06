@@ -192,6 +192,55 @@ fn reindex_file(
     tx.commit().expect("failed to commit rollup transaction");
 }
 
+/// Reads pre-aggregated sums from `file_rollup` for the given date range,
+/// grouped by model or project. Every row's cost was already priced
+/// per-call at index time (see `reindex_file`), so this SUM never re-prices
+/// anything — it only adds already-correct per-call costs together.
+pub(crate) fn query(
+    conn: &Connection,
+    date_range: (NaiveDate, NaiveDate),
+    group_by: crate::cost::GroupBy,
+) -> HashMap<String, GroupTotals> {
+    let (start, end) = date_range;
+    let group_col = match group_by {
+        crate::cost::GroupBy::Model => "model",
+        crate::cost::GroupBy::Project => "project",
+    };
+
+    let sql = format!(
+        "SELECT {group_col},
+                SUM(input_tokens), SUM(output_tokens),
+                SUM(cache_read_tokens), SUM(cache_creation_tokens),
+                SUM(cache_creation_5m_tokens), SUM(cache_creation_1hr_tokens),
+                SUM(cost_usd), MAX(has_unpriced_usage)
+         FROM file_rollup
+         WHERE date >= ?1 AND date <= ?2
+         GROUP BY {group_col}"
+    );
+
+    let mut stmt = conn.prepare(&sql).expect("failed to prepare rollup query");
+    let rows = stmt
+        .query_map(params![start.to_string(), end.to_string()], |row| {
+            let key: String = row.get(0)?;
+            let totals = GroupTotals {
+                tokens: crate::pricing::TokenUsage {
+                    input_tokens: row.get::<_, i64>(1)? as u64,
+                    output_tokens: row.get::<_, i64>(2)? as u64,
+                    cache_read_tokens: row.get::<_, i64>(3)? as u64,
+                    cache_creation_tokens: row.get::<_, i64>(4)? as u64,
+                    cache_creation_5m_tokens: row.get::<_, i64>(5)? as u64,
+                    cache_creation_1hr_tokens: row.get::<_, i64>(6)? as u64,
+                },
+                cost_usd: row.get(7)?,
+                has_unpriced_usage: row.get::<_, i64>(8)? != 0,
+            };
+            Ok((key, totals))
+        })
+        .expect("failed to run rollup query");
+
+    rows.filter_map(Result::ok).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +429,114 @@ mod tests {
                 .query_row("SELECT input_tokens FROM file_rollup", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(input_tokens, 100, "duplicate content-block lines must be deduped");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn query_by_model_matches_aggregate_reference_implementation() {
+        with_temp_home(|| {
+            let dir = std::env::temp_dir().join("agentflare-test-rollup-query-model");
+            let _ = std::fs::remove_dir_all(&dir);
+            let opus = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":100}},"requestId":"r1"}"#;
+            let haiku = r#"{"type":"assistant","timestamp":"2026-07-06T11:00:00Z","message":{"id":"m2","model":"claude-haiku-4-5","usage":{"input_tokens":200,"output_tokens":20}},"requestId":"r2"}"#;
+            write_session_file(&dir, "proj-a", "session1.jsonl", &format!("{opus}\n"));
+            write_session_file(&dir, "proj-b", "session1.jsonl", &format!("{haiku}\n"));
+
+            let mut conn = open_or_rebuild();
+            sync(&mut conn, &dir);
+
+            let today = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+            let actual = query(&conn, (today, today), crate::cost::GroupBy::Model);
+
+            let files = find_session_files_under(&dir);
+            let pricing = crate::pricing::load_pricing();
+            let expected = crate::cost::aggregate(&files, (today, today), crate::cost::GroupBy::Model, &pricing);
+
+            assert_eq!(actual.len(), expected.len());
+            for (key, expected_totals) in &expected {
+                let actual_totals = actual.get(key).unwrap_or_else(|| panic!("missing key {key}"));
+                assert_eq!(actual_totals.tokens.input_tokens, expected_totals.tokens.input_tokens, "key {key}");
+                assert_eq!(actual_totals.tokens.output_tokens, expected_totals.tokens.output_tokens, "key {key}");
+                assert!((actual_totals.cost_usd - expected_totals.cost_usd).abs() < 0.000_001, "key {key}");
+                assert_eq!(actual_totals.has_unpriced_usage, expected_totals.has_unpriced_usage, "key {key}");
+            }
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn query_by_project_matches_aggregate_reference_implementation() {
+        with_temp_home(|| {
+            let dir = std::env::temp_dir().join("agentflare-test-rollup-query-project");
+            let _ = std::fs::remove_dir_all(&dir);
+            let line_a = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00Z","message":{"id":"ma","model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":50}},"requestId":"ra"}"#;
+            let line_b = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00Z","message":{"id":"mb","model":"claude-sonnet-5","usage":{"input_tokens":10,"output_tokens":5}},"requestId":"rb"}"#;
+            write_session_file(&dir, "proj-a", "session1.jsonl", &format!("{line_a}\n"));
+            write_session_file(&dir, "proj-b", "session1.jsonl", &format!("{line_b}\n"));
+
+            let mut conn = open_or_rebuild();
+            sync(&mut conn, &dir);
+
+            let today = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+            let actual = query(&conn, (today, today), crate::cost::GroupBy::Project);
+
+            let files = find_session_files_under(&dir);
+            let pricing = crate::pricing::load_pricing();
+            let expected = crate::cost::aggregate(&files, (today, today), crate::cost::GroupBy::Project, &pricing);
+
+            assert_eq!(actual.len(), expected.len());
+            for (key, expected_totals) in &expected {
+                let actual_totals = actual.get(key).unwrap_or_else(|| panic!("missing key {key}"));
+                assert_eq!(actual_totals.tokens.input_tokens, expected_totals.tokens.input_tokens, "key {key}");
+                assert!((actual_totals.cost_usd - expected_totals.cost_usd).abs() < 0.000_001, "key {key}");
+            }
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn query_respects_date_range_boundaries() {
+        with_temp_home(|| {
+            let dir = std::env::temp_dir().join("agentflare-test-rollup-query-range");
+            let _ = std::fs::remove_dir_all(&dir);
+            let in_range = r#"{"type":"assistant","timestamp":"2026-07-04T10:00:00Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":50}},"requestId":"r1"}"#;
+            let out_of_range = r#"{"type":"assistant","timestamp":"2026-07-03T10:00:00Z","message":{"id":"m2","model":"claude-opus-4-8","usage":{"input_tokens":999,"output_tokens":999}},"requestId":"r2"}"#;
+            write_session_file(&dir, "proj1", "session1.jsonl", &format!("{in_range}\n{out_of_range}\n"));
+
+            let mut conn = open_or_rebuild();
+            sync(&mut conn, &dir);
+
+            let today = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+            let range = (today - chrono::Duration::days(2), today);
+            let totals = query(&conn, range, crate::cost::GroupBy::Model);
+
+            let opus = totals.get("claude-opus-4-8").expect("expected opus entry");
+            assert_eq!(opus.tokens.input_tokens, 100, "2026-07-03 line is outside the 3-day window");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn query_flags_unpriced_usage_when_any_matching_row_has_it() {
+        with_temp_home(|| {
+            let dir = std::env::temp_dir().join("agentflare-test-rollup-query-unpriced");
+            let _ = std::fs::remove_dir_all(&dir);
+            let unpriced = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00Z","message":{"id":"m1","model":"some-unrecognized-model","usage":{"input_tokens":100,"output_tokens":50}},"requestId":"r1"}"#;
+            write_session_file(&dir, "proj1", "session1.jsonl", &format!("{unpriced}\n"));
+
+            let mut conn = open_or_rebuild();
+            sync(&mut conn, &dir);
+
+            let today = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+            let totals = query(&conn, (today, today), crate::cost::GroupBy::Model);
+
+            let entry = totals.get("some-unrecognized-model").expect("expected entry");
+            assert!(entry.has_unpriced_usage);
 
             let _ = std::fs::remove_dir_all(&dir);
         });
