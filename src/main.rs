@@ -128,6 +128,15 @@ fn main() {
             CoachingAction::Apply { id, title, body } => coaching::cli_apply(&id, &title, &body),
             CoachingAction::Remove { id } => coaching::cli_remove(&id),
         },
-        Commands::Mcp => mcp_server::run(),
+        Commands::Mcp => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime for mcp server");
+            if let Err(e) = runtime.block_on(mcp_server::run()) {
+                eprintln!("agentflare mcp: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 }

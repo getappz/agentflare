@@ -2,7 +2,7 @@
 name = "agentflare"
 version = "1.0.1"
 edition = "2021"
-description = "Optimize AI CLI agents for cost and performance. Zero fluff, zero runtime deps."
+description = "Optimize AI CLI agents for cost and performance."
 license = "MIT"
 repository = "https://github.com/getappz/agentflare"
 
@@ -16,6 +16,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 chrono = "0.4"
+rmcp = { version = "1.8.0", features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["rt", "macros", "io-util", "io-std"] }
 
 [profile.release]
 opt-level = 3
