@@ -1,4 +1,5 @@
 mod components;
+mod coaching;
 mod cost;
 mod engram_install;
 mod hook;
