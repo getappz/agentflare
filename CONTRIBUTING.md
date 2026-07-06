@@ -49,6 +49,10 @@ agentflare/
 └── .github/                 # CI, templates, workflows
 ```
 
+## Issues
+
+- If your issue was closed but the problem persists, comment `/reopen` on it — as the original author, this reopens the issue automatically (GitHub itself doesn't let authors reopen maintainer-closed issues). Issues closed as *not planned* are a maintainer call and aren't reopened this way, but a comment is still welcome.
+
 ## Pull requests
 
 - Keep PRs focused (one theme per PR)
