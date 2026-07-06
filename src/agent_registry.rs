@@ -18,6 +18,15 @@ pub enum Agent {
     GeminiCli,
     GithubCopilotCli,
     Aider,
+    Cody,
+    Goose,
+    Amp,
+    Kiro,
+    Antigravity,
+    Grok,
+    Kimi,
+    Openclaw,
+    Droid,
 }
 
 impl Agent {
@@ -34,6 +43,15 @@ impl Agent {
             Agent::GeminiCli => "gemini-cli",
             Agent::GithubCopilotCli => "github-copilot-cli",
             Agent::Aider => "aider",
+            Agent::Cody => "cody",
+            Agent::Goose => "goose",
+            Agent::Amp => "amp",
+            Agent::Kiro => "kiro",
+            Agent::Antigravity => "antigravity",
+            Agent::Grok => "grok",
+            Agent::Kimi => "kimi",
+            Agent::Openclaw => "openclaw",
+            Agent::Droid => "droid",
         }
     }
 }
@@ -147,6 +165,87 @@ pub static REGISTRY: &[AgentSpec] = &[
         package_name: Some("aider-chat"),
     },
     AgentSpec {
+        id: Agent::Cody,
+        display_name: "cody",
+        tier: Tier::Cli,
+        binary_names: &["cody"],
+        version_args: &["--version"],
+        package_manager: Some("npm"),
+        package_name: Some("@sourcegraph/cody"),
+    },
+    AgentSpec {
+        id: Agent::Goose,
+        display_name: "goose",
+        tier: Tier::Cli,
+        binary_names: &["goose"],
+        version_args: &["--version"],
+        package_manager: Some("npm"),
+        package_name: Some("goose"),
+    },
+    AgentSpec {
+        id: Agent::Amp,
+        display_name: "amp",
+        tier: Tier::Cli,
+        binary_names: &["amp"],
+        version_args: &["--version"],
+        package_manager: None,
+        package_name: None,
+    },
+    AgentSpec {
+        id: Agent::Kiro,
+        display_name: "kiro",
+        tier: Tier::Cli,
+        binary_names: &["kiro"],
+        version_args: &["--version"],
+        package_manager: None,
+        package_name: None,
+    },
+    AgentSpec {
+        id: Agent::Antigravity,
+        display_name: "antigravity",
+        tier: Tier::Cli,
+        binary_names: &["antigravity"],
+        version_args: &["--version"],
+        package_manager: None,
+        package_name: None,
+    },
+    AgentSpec {
+        id: Agent::Grok,
+        display_name: "grok",
+        tier: Tier::Cli,
+        binary_names: &["grok"],
+        version_args: &["--version"],
+        package_manager: None,
+        package_name: None,
+    },
+    AgentSpec {
+        id: Agent::Kimi,
+        display_name: "kimi",
+        tier: Tier::Cli,
+        binary_names: &["kimi"],
+        version_args: &["--version"],
+        package_manager: None,
+        package_name: None,
+    },
+    AgentSpec {
+        id: Agent::Openclaw,
+        display_name: "openclaw",
+        tier: Tier::Cli,
+        binary_names: &["openclaw"],
+        version_args: &["--version"],
+        package_manager: None,
+        package_name: None,
+    },
+    AgentSpec {
+        id: Agent::Droid,
+        display_name: "droid",
+        tier: Tier::Cli,
+        binary_names: &["droid"],
+        version_args: &["--version"],
+        package_manager: None,
+        package_name: None,
+    },
+    AgentSpec {
         id: Agent::VscodeCopilot,
         display_name: "vscode-copilot",
         tier: Tier::Extension,
@@ -190,15 +289,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_exactly_eleven_entries() {
-        assert_eq!(REGISTRY.len(), 11);
+    fn registry_has_exactly_twenty_entries() {
+        assert_eq!(REGISTRY.len(), 20);
     }
 
     #[test]
-    fn registry_has_eight_cli_tier_and_three_extension_tier() {
+    fn registry_has_seventeen_cli_tier_and_three_extension_tier() {
         let cli_count = REGISTRY.iter().filter(|s| s.tier == Tier::Cli).count();
         let ext_count = REGISTRY.iter().filter(|s| s.tier == Tier::Extension).count();
-        assert_eq!(cli_count, 8);
+        assert_eq!(cli_count, 17);
         assert_eq!(ext_count, 3);
     }
 
@@ -228,6 +327,7 @@ mod tests {
     fn spec_looks_up_the_matching_entry() {
         assert_eq!(spec(Agent::Aider).display_name, "aider");
         assert_eq!(spec(Agent::VscodeCopilot).tier, Tier::Extension);
+        assert_eq!(spec(Agent::Cody).display_name, "cody");
     }
 
     #[test]
