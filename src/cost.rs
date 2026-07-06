@@ -236,9 +236,9 @@ pub fn run(days: Option<u32>, by_project: bool) {
     let start = today - chrono::Duration::days(window as i64 - 1);
     let group_by = if by_project { GroupBy::Project } else { GroupBy::Model };
 
-    let files = find_session_files_under(&claude_projects_dir());
-    let pricing = load_pricing();
-    let totals = aggregate(&files, (start, today), group_by, &pricing);
+    let mut conn = crate::rollup::open_or_rebuild();
+    crate::rollup::sync(&mut conn, &claude_projects_dir());
+    let totals = crate::rollup::query(&conn, (start, today), group_by);
 
     let range_label = if window == 1 {
         format!("today ({today})")
