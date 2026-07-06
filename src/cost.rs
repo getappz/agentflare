@@ -226,18 +226,29 @@ fn aggregate(
     totals
 }
 
-pub fn run() {
+pub fn run(days: Option<u32>, by_project: bool) {
     let today = Local::now().date_naive();
+    let window = days.unwrap_or(1).max(1);
+    let start = today - chrono::Duration::days(window as i64 - 1);
+    let group_by = if by_project { GroupBy::Project } else { GroupBy::Model };
+
     let files = find_session_files_under(&claude_projects_dir());
     let pricing = load_pricing();
-    let totals = aggregate(&files, (today, today), GroupBy::Model, &pricing);
+    let totals = aggregate(&files, (start, today), group_by, &pricing);
+
+    let range_label = if window == 1 {
+        format!("today ({today})")
+    } else {
+        format!("the last {window} days ({start}..{today})")
+    };
+    let group_label = if by_project { "project" } else { "model" };
 
     if totals.is_empty() {
-        println!("No Claude Code sessions found for today ({today}).");
+        println!("No Claude Code sessions found for {range_label}.");
         return;
     }
 
-    println!("agentflare cost — {today}\n");
+    println!("agentflare cost — {range_label}, by {group_label}\n");
 
     let mut rows: Vec<_> = totals.iter().collect();
     rows.sort_by(|a, b| a.0.cmp(b.0));
