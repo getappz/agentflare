@@ -241,3 +241,16 @@ jobs:
           git add bucket/agentflare.json
           git diff --cached --quiet || git commit -m "scoop manifest: agentflare ${VERSION}"
           git push origin HEAD:master
+
+  trigger-npm-publish:
+    name: Trigger npm publish
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch npm-publish workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run npm-publish.yml \
+            --repo getappz/agentflare \
+            -f version="${GITHUB_REF_NAME}"

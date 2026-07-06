@@ -1,11 +1,6 @@
 name: npm-publish
 
 on:
-  workflow_run:
-    workflows:
-      - release
-    types:
-      - completed
   workflow_dispatch:
     inputs:
       version:
