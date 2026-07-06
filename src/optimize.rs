@@ -132,7 +132,7 @@ pub struct LengthBasedRouter {
 
 impl Router for LengthBasedRouter {
     fn route(&self, ctx: &RouteContext) -> Option<String> {
-        let len = ctx.prompt.len();
+        let len = ctx.prompt.chars().count();
         if len < SHORT_PROMPT_LEN {
             Some(format!(
                 "Short prompt ({len} chars) — consider routing to {}.",
@@ -147,6 +147,25 @@ impl Router for LengthBasedRouter {
             None
         }
     }
+}
+
+/// Select a router by name. Unknown/empty names fall back to `KeywordRouter`,
+/// preserving today's behavior when nothing is configured.
+pub fn router_by_name(name: &str) -> Box<dyn Router> {
+    match name {
+        "length" => Box::new(LengthBasedRouter {
+            cheap_model: "haiku".to_string(),
+            big_model: "opus".to_string(),
+        }),
+        _ => Box::new(KeywordRouter),
+    }
+}
+
+/// The router hook.rs actually uses, selected via `AGENTFLARE_ROUTER` (unset
+/// or unrecognized -> `KeywordRouter`, today's default behavior).
+pub fn active_router() -> Box<dyn Router> {
+    let name = std::env::var("AGENTFLARE_ROUTER").unwrap_or_default();
+    router_by_name(&name)
 }
 
 /// Legacy free-function — delegates to `KeywordRouter`. Kept for backward
@@ -416,5 +435,21 @@ mod tests {
     fn router_trait_is_object_safe() {
         let r: &dyn Router = &KeywordRouter;
         assert!(r.route(&ctx("find me")).is_some());
+    }
+
+    #[test]
+    fn router_by_name_defaults_to_keyword_router() {
+        let r = router_by_name("");
+        // KeywordRouter is silent on prompts with no locate-style keywords.
+        assert!(r.route(&ctx("refactor the payment module")).is_none());
+        // ...but flags them, same as KeywordRouter directly.
+        assert!(router_by_name("nonsense").route(&ctx("find the auth handler")).is_some());
+    }
+
+    #[test]
+    fn router_by_name_length_selects_length_based_router() {
+        let r = router_by_name("length");
+        let nudge = r.route(&ctx("hi")).unwrap();
+        assert!(nudge.contains("haiku"));
     }
 }

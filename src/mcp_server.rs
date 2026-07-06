@@ -250,12 +250,44 @@ impl McpServer {
     }
 }
 
+const MAX_LINE_BYTES: usize = 1_000_000; // generous for one JSON-RPC request; bounds unterminated-input memory growth
+
 pub fn run() {
     let server = McpServer;
     let stdin = std::io::stdin();
-    let reader = BufReader::new(stdin.lock());
+    let mut reader = BufReader::new(stdin.lock());
 
-    for line in reader.lines().map_while(Result::ok) {
+    loop {
+        let mut raw = Vec::new();
+        match reader.read_until(b'\n', &mut raw) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(_) => break, // unrecoverable stdin I/O error
+        }
+
+        if raw.len() > MAX_LINE_BYTES {
+            let err = json!({
+                "jsonrpc": "2.0",
+                "error": {"code": -32700, "message": "Parse error: request line too large"},
+                "id": Value::Null,
+            });
+            let _ = writeln!(std::io::stdout(), "{err}");
+            continue;
+        }
+
+        let line = match String::from_utf8(raw) {
+            Ok(s) => s,
+            Err(e) => {
+                let err = json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": format!("Parse error: invalid UTF-8: {e}")},
+                    "id": Value::Null,
+                });
+                let _ = writeln!(std::io::stdout(), "{err}");
+                continue;
+            }
+        };
+
         if line.trim().is_empty() {
             continue;
         }
