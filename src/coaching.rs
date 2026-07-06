@@ -64,6 +64,12 @@ fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
         }
     }
 
+    // Only return a rule if it has a valid # Applied: header (i.e., was
+    // written by write_rule_file). Malformed/empty files are skipped.
+    if applied_at.is_empty() {
+        return None;
+    }
+
     Some(CoachingRule {
         id,
         title,
@@ -243,7 +249,8 @@ mod tests {
             apply_rule("good", "T", "B").unwrap();
 
             let rules = list_rules();
-            assert_eq!(rules.len(), 2, "empty file still parses (empty body/title), just no crash");
+            assert_eq!(rules.len(), 1, "malformed file with no # Applied: header is skipped");
+            assert_eq!(rules[0].id, "good");
         });
     }
 
