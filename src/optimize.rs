@@ -96,6 +96,34 @@ pub fn model_routing_nudge(prompt: &str) -> Option<&'static str> {
     None
 }
 
+pub const BATCHABLE_TOOLS: &[&str] = &["Read", "Bash", "ctx_read", "ctx_shell"];
+const BATCH_WINDOW: usize = 3;
+
+/// Flags when the last BATCH_WINDOW calls (including the one about to run)
+/// are all solo calls to the same batch-eligible tool — a sign a batch form
+/// should have been used instead.
+pub fn batching_nudge(recent_calls: &[ToolCallRecord], next_tool: &str) -> Option<String> {
+    if !BATCHABLE_TOOLS.contains(&next_tool) {
+        return None;
+    }
+    let tail: Vec<&str> = recent_calls
+        .iter()
+        .rev()
+        .take(BATCH_WINDOW - 1)
+        .map(|c| c.name.as_str())
+        .collect();
+    if tail.len() < BATCH_WINDOW - 1 {
+        return None;
+    }
+    if tail.iter().all(|&name| name == next_tool) {
+        return Some(format!(
+            "That's {} consecutive solo calls to {next_tool} — check if it accepts a batch/list form instead.",
+            BATCH_WINDOW
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +227,38 @@ mod tests {
     fn model_routing_still_flags_real_locate_and_where_is_prompts() {
         assert!(model_routing_nudge("please locate the missing file").is_some());
         assert!(model_routing_nudge("where is the auth check?").is_some());
+    }
+
+    #[test]
+    fn batching_flags_three_consecutive_solo_calls() {
+        let recent = vec![
+            ToolCallRecord { name: "Read".to_string(), ts: 1 },
+            ToolCallRecord { name: "Read".to_string(), ts: 2 },
+        ];
+        assert!(batching_nudge(&recent, "Read").is_some());
+    }
+
+    #[test]
+    fn batching_ignores_non_batchable_tool() {
+        let recent = vec![
+            ToolCallRecord { name: "Write".to_string(), ts: 1 },
+            ToolCallRecord { name: "Write".to_string(), ts: 2 },
+        ];
+        assert!(batching_nudge(&recent, "Write").is_none());
+    }
+
+    #[test]
+    fn batching_ignores_mixed_recent_calls() {
+        let recent = vec![
+            ToolCallRecord { name: "Read".to_string(), ts: 1 },
+            ToolCallRecord { name: "Grep".to_string(), ts: 2 },
+        ];
+        assert!(batching_nudge(&recent, "Read").is_none());
+    }
+
+    #[test]
+    fn batching_ignores_short_history() {
+        let recent = vec![ToolCallRecord { name: "Read".to_string(), ts: 1 }];
+        assert!(batching_nudge(&recent, "Read").is_none());
     }
 }
