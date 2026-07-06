@@ -25,6 +25,11 @@ CREATE TABLE file_rollup (
     PRIMARY KEY (file_path, date, model)
 );
 CREATE INDEX file_rollup_date ON file_rollup(date);
+
+CREATE TABLE dedup_keys (
+    dedup_key TEXT PRIMARY KEY,
+    file_path TEXT NOT NULL
+);
 ";
 
 fn db_path() -> PathBuf {
@@ -122,6 +127,18 @@ fn reindex_file(
         return;
     };
     let project = project_name_for(path);
+
+    let tx = conn.transaction().expect("failed to open sqlite transaction");
+
+    // Release this file's prior contributions before recomputing them from
+    // a fresh parse — both its rollup rows and any dedup keys it previously
+    // claimed, so a changed file can re-establish (or lose) ownership
+    // correctly rather than compounding stale state.
+    tx.execute("DELETE FROM file_rollup WHERE file_path = ?1", params![path_str])
+        .expect("failed to clear stale file_rollup rows");
+    tx.execute("DELETE FROM dedup_keys WHERE file_path = ?1", params![path_str])
+        .expect("failed to release stale dedup_keys ownership");
+
     let mut seen: HashSet<String> = HashSet::new();
     let mut sums: HashMap<(NaiveDate, String), GroupTotals> = HashMap::new();
 
@@ -139,6 +156,34 @@ fn reindex_file(
             continue;
         }
 
+        // Cross-file dedup: Claude Code's resume/fork copies prior
+        // transcript lines (usage included) into a new session file, so the
+        // same (message_id, requestId) pair can legitimately appear in two
+        // different files. The first file to claim a given pair keeps it
+        // for the lifetime of the cache; a later file with the same pair is
+        // skipped here so the pair is never counted twice across files.
+        if let (Some(mid), Some(rid)) = (&parsed.message_id, &parsed.request_id) {
+            let key = format!("{mid}:{rid}");
+            let owner: Option<String> = tx
+                .query_row(
+                    "SELECT file_path FROM dedup_keys WHERE dedup_key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .ok();
+            match owner {
+                Some(owner_path) if owner_path != path_str => continue,
+                Some(_) => {}
+                None => {
+                    tx.execute(
+                        "INSERT INTO dedup_keys (dedup_key, file_path) VALUES (?1, ?2)",
+                        params![key, path_str],
+                    )
+                    .expect("failed to claim dedup key");
+                }
+            }
+        }
+
         let model = parsed.model.clone().unwrap_or_else(|| "unknown".to_string());
         let cost = crate::pricing::calculate_cost(&parsed.tokens, parsed.model.as_deref(), pricing);
 
@@ -147,10 +192,6 @@ fn reindex_file(
         entry.cost_usd += cost.total_usd;
         entry.has_unpriced_usage |= cost.has_unpriced_usage;
     }
-
-    let tx = conn.transaction().expect("failed to open sqlite transaction");
-    tx.execute("DELETE FROM file_rollup WHERE file_path = ?1", params![path_str])
-        .expect("failed to clear stale file_rollup rows");
 
     for ((date, model), totals) in &sums {
         tx.execute(
@@ -258,7 +299,7 @@ mod tests {
                 .unwrap()
                 .map(|r| r.unwrap())
                 .collect();
-            assert_eq!(names, vec!["file_rollup", "session_files"]);
+            assert_eq!(names, vec!["dedup_keys", "file_rollup", "session_files"]);
 
             let version: i32 = conn
                 .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -429,6 +470,33 @@ mod tests {
                 .query_row("SELECT input_tokens FROM file_rollup", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(input_tokens, 100, "duplicate content-block lines must be deduped");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn sync_dedups_shared_message_id_across_two_files_from_resume_or_fork() {
+        with_temp_home(|| {
+            let dir = std::env::temp_dir().join("agentflare-test-rollup-sync-crossfile-dedup");
+            let _ = std::fs::remove_dir_all(&dir);
+            // Simulates Claude Code's resume/fork behavior: the same
+            // message.id:requestId pair copied verbatim into a second
+            // session file.
+            let shared_line = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00Z","message":{"id":"m-shared","model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":50}},"requestId":"r-shared"}"#;
+            write_session_file(&dir, "proj1", "original.jsonl", &format!("{shared_line}\n"));
+            write_session_file(&dir, "proj1", "resumed.jsonl", &format!("{shared_line}\n"));
+
+            let mut conn = open_or_rebuild();
+            sync(&mut conn, &dir);
+
+            let total_input: i64 = conn
+                .query_row("SELECT SUM(input_tokens) FROM file_rollup", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                total_input, 100,
+                "the shared message.id:requestId pair must be counted once total, not once per file"
+            );
 
             let _ = std::fs::remove_dir_all(&dir);
         });
