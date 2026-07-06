@@ -23,4 +23,6 @@ agentflare includes code and data ported from claude-view
 
 Specifically: `data/anthropic-pricing.json` and the pricing lookup/cost
 calculation logic in `src/pricing.rs` (model pricing table, tiered-cost
-calculation, alias/family-fallback model resolution).
+calculation, alias/family-fallback model resolution); and the coaching-rule
+file format and storage logic in `src/coaching.rs` (rule id validation,
+markdown rule-file parse/write, directory listing).
