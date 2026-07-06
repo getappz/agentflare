@@ -30,6 +30,11 @@ CREATE TABLE dedup_keys (
     dedup_key TEXT PRIMARY KEY,
     file_path TEXT NOT NULL
 );
+
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ";
 
 fn db_path() -> PathBuf {
@@ -38,6 +43,12 @@ fn db_path() -> PathBuf {
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > 1 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_SCHEMA),
+            Some(format!("analytics.db schema version {version} is newer than this build supports")),
+        ));
+    }
     if version < 1 {
         conn.execute_batch(SCHEMA_V1)?;
         conn.pragma_update(None, "user_version", 1)?;
@@ -45,10 +56,55 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn pricing_fingerprint() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    crate::pricing::PRICING_JSON.hash(&mut hasher);
+    env!("CARGO_PKG_VERSION").hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
+/// Cached `cost_usd`/`has_unpriced_usage` values are frozen at index time
+/// from the pricing table and cost-calculation logic compiled into this
+/// binary. If either changed since the cache was built (a new `agentflare`
+/// version), inactive session files would otherwise keep stale prices
+/// forever, since they never get reindexed on their own. Detect that via a
+/// fingerprint and, on mismatch, wipe the cache tables so `sync()` rebuilds
+/// them from the JSONL source of truth with current pricing.
+fn invalidate_if_pricing_changed(conn: &Connection) {
+    let current = pricing_fingerprint();
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'pricing_fingerprint'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if stored.as_deref() == Some(current.as_str()) {
+        return;
+    }
+
+    let _ = conn.execute("DELETE FROM file_rollup", []);
+    let _ = conn.execute("DELETE FROM session_files", []);
+    let _ = conn.execute("DELETE FROM dedup_keys", []);
+    let _ = conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('pricing_fingerprint', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![current],
+    );
+}
+
+fn migrate_new_connection(conn: Connection) -> Option<Connection> {
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    migrate(&conn).ok()?;
+    invalidate_if_pricing_changed(&conn);
+    Some(conn)
+}
+
 fn try_open(path: &Path) -> Option<Connection> {
     let conn = Connection::open(path).ok()?;
-    migrate(&conn).ok()?;
-    Some(conn)
+    migrate_new_connection(conn)
 }
 
 /// Opens the analytics cache database, creating and migrating it if needed.
@@ -68,7 +124,10 @@ pub(crate) fn open_or_rebuild() -> Connection {
     if let Some(conn) = try_open(&path) {
         return conn;
     }
-    Connection::open_in_memory().expect("sqlite failed to open even an in-memory database")
+    Connection::open_in_memory()
+        .ok()
+        .and_then(migrate_new_connection)
+        .expect("sqlite failed to open even an in-memory database")
 }
 
 use crate::cost::{
@@ -128,16 +187,22 @@ fn reindex_file(
     };
     let project = project_name_for(path);
 
-    let tx = conn.transaction().expect("failed to open sqlite transaction");
+    let Ok(tx) = conn.transaction() else {
+        return;
+    };
 
-    // Release this file's prior contributions before recomputing them from
-    // a fresh parse — both its rollup rows and any dedup keys it previously
-    // claimed, so a changed file can re-establish (or lose) ownership
-    // correctly rather than compounding stale state.
-    tx.execute("DELETE FROM file_rollup WHERE file_path = ?1", params![path_str])
-        .expect("failed to clear stale file_rollup rows");
-    tx.execute("DELETE FROM dedup_keys WHERE file_path = ?1", params![path_str])
-        .expect("failed to release stale dedup_keys ownership");
+    if tx
+        .execute("DELETE FROM file_rollup WHERE file_path = ?1", params![path_str])
+        .is_err()
+    {
+        return;
+    }
+    if tx
+        .execute("DELETE FROM dedup_keys WHERE file_path = ?1", params![path_str])
+        .is_err()
+    {
+        return;
+    }
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut sums: HashMap<(NaiveDate, String), GroupTotals> = HashMap::new();
@@ -175,11 +240,15 @@ fn reindex_file(
                 Some(owner_path) if owner_path != path_str => continue,
                 Some(_) => {}
                 None => {
-                    tx.execute(
-                        "INSERT INTO dedup_keys (dedup_key, file_path) VALUES (?1, ?2)",
-                        params![key, path_str],
-                    )
-                    .expect("failed to claim dedup key");
+                    if tx
+                        .execute(
+                            "INSERT INTO dedup_keys (dedup_key, file_path) VALUES (?1, ?2)",
+                            params![key, path_str],
+                        )
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }
@@ -194,7 +263,7 @@ fn reindex_file(
     }
 
     for ((date, model), totals) in &sums {
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT INTO file_rollup (
                 file_path, date, project, model,
                 input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
@@ -215,11 +284,13 @@ fn reindex_file(
                 totals.cost_usd,
                 totals.has_unpriced_usage as i64,
             ],
-        )
-        .expect("failed to insert file_rollup row");
+        );
+        if inserted.is_err() {
+            return;
+        }
     }
 
-    tx.execute(
+    let upserted = tx.execute(
         "INSERT INTO session_files (file_path, mtime_secs, size_bytes, indexed_at)
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(file_path) DO UPDATE SET
@@ -227,10 +298,12 @@ fn reindex_file(
             size_bytes = excluded.size_bytes,
             indexed_at = excluded.indexed_at",
         params![path_str, mtime_secs, size_bytes, chrono::Local::now().to_rfc3339()],
-    )
-    .expect("failed to upsert session_files catalog row");
+    );
+    if upserted.is_err() {
+        return;
+    }
 
-    tx.commit().expect("failed to commit rollup transaction");
+    let _ = tx.commit();
 }
 
 /// Reads pre-aggregated sums from `file_rollup` for the given date range,
@@ -259,25 +332,27 @@ pub(crate) fn query(
          GROUP BY {group_col}"
     );
 
-    let mut stmt = conn.prepare(&sql).expect("failed to prepare rollup query");
-    let rows = stmt
-        .query_map(params![start.to_string(), end.to_string()], |row| {
-            let key: String = row.get(0)?;
-            let totals = GroupTotals {
-                tokens: crate::pricing::TokenUsage {
-                    input_tokens: row.get::<_, i64>(1)? as u64,
-                    output_tokens: row.get::<_, i64>(2)? as u64,
-                    cache_read_tokens: row.get::<_, i64>(3)? as u64,
-                    cache_creation_tokens: row.get::<_, i64>(4)? as u64,
-                    cache_creation_5m_tokens: row.get::<_, i64>(5)? as u64,
-                    cache_creation_1hr_tokens: row.get::<_, i64>(6)? as u64,
-                },
-                cost_usd: row.get(7)?,
-                has_unpriced_usage: row.get::<_, i64>(8)? != 0,
-            };
-            Ok((key, totals))
-        })
-        .expect("failed to run rollup query");
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return HashMap::new();
+    };
+    let Ok(rows) = stmt.query_map(params![start.to_string(), end.to_string()], |row| {
+        let key: String = row.get(0)?;
+        let totals = GroupTotals {
+            tokens: crate::pricing::TokenUsage {
+                input_tokens: row.get::<_, i64>(1)? as u64,
+                output_tokens: row.get::<_, i64>(2)? as u64,
+                cache_read_tokens: row.get::<_, i64>(3)? as u64,
+                cache_creation_tokens: row.get::<_, i64>(4)? as u64,
+                cache_creation_5m_tokens: row.get::<_, i64>(5)? as u64,
+                cache_creation_1hr_tokens: row.get::<_, i64>(6)? as u64,
+            },
+            cost_usd: row.get(7)?,
+            has_unpriced_usage: row.get::<_, i64>(8)? != 0,
+        };
+        Ok((key, totals))
+    }) else {
+        return HashMap::new();
+    };
 
     rows.filter_map(Result::ok).collect()
 }
@@ -299,7 +374,7 @@ mod tests {
                 .unwrap()
                 .map(|r| r.unwrap())
                 .collect();
-            assert_eq!(names, vec!["dedup_keys", "file_rollup", "session_files"]);
+            assert_eq!(names, vec!["dedup_keys", "file_rollup", "meta", "session_files"]);
 
             let version: i32 = conn
                 .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -608,5 +683,88 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    #[test]
+    fn migrate_rejects_and_rebuilds_a_newer_schema_version() {
+        with_temp_home(|| {
+            {
+                let conn = open_or_rebuild();
+                conn.pragma_update(None, "user_version", 2).unwrap();
+            }
+
+            let conn = open_or_rebuild();
+            let version: i32 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 1, "a newer-than-supported schema version must be rejected and rebuilt, not silently accepted");
+        });
+    }
+
+    #[test]
+    fn pricing_change_invalidates_cached_rollup_rows() {
+        with_temp_home(|| {
+            let dir = std::env::temp_dir().join("agentflare-test-rollup-pricing-invalidation");
+            let _ = std::fs::remove_dir_all(&dir);
+            let line = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":50}},"requestId":"r1"}"#;
+            write_session_file(&dir, "proj1", "session1.jsonl", &format!("{line}\n"));
+
+            let mut conn = open_or_rebuild();
+            sync(&mut conn, &dir);
+            assert_eq!(row_count(&conn, "file_rollup"), 1);
+
+            // Simulate an agentflare upgrade that changed pricing/cost logic:
+            // overwrite the stored fingerprint with something else.
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('pricing_fingerprint', 'stale')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+
+            // Reopening must detect the mismatch and wipe the stale rollup.
+            let conn = open_or_rebuild();
+            assert_eq!(row_count(&conn, "file_rollup"), 0, "stale rollup rows must be cleared when the pricing fingerprint no longer matches");
+            assert_eq!(row_count(&conn, "session_files"), 0);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn sync_does_not_panic_when_database_is_read_only() {
+        with_temp_home(|| {
+            let dir = std::env::temp_dir().join("agentflare-test-rollup-readonly");
+            let _ = std::fs::remove_dir_all(&dir);
+            let line = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":50}},"requestId":"r1"}"#;
+            write_session_file(&dir, "proj1", "session1.jsonl", &format!("{line}\n"));
+
+            let path = {
+                let _ = open_or_rebuild();
+                db_path()
+            };
+
+            let mut conn = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+
+            // Every write inside will fail (readonly database) — this must
+            // return cleanly, not panic.
+            sync(&mut conn, &dir);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn query_on_missing_tables_returns_empty_map_instead_of_panicking() {
+        let conn = Connection::open_in_memory().unwrap();
+        // No migrate() call — the file_rollup table does not exist.
+        let today = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let totals = query(&conn, (today, today), crate::cost::GroupBy::Model);
+        assert!(totals.is_empty());
     }
 }

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-const PRICING_JSON: &str = include_str!("../data/anthropic-pricing.json");
+pub(crate) const PRICING_JSON: &str = include_str!("../data/anthropic-pricing.json");
 const PER_MTOK: f64 = 1_000_000.0;
 const TIER_THRESHOLD: i64 = 200_000;
 
