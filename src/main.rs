@@ -35,7 +35,7 @@ impl Agent {
 }
 
 #[derive(Parser)]
-#[command(name = "leanstack", version, about = "lean-ctx + engram powered token-saving stack")]
+#[command(name = "agentflare", version, about = "Optimize AI CLI agents for cost and performance")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -43,7 +43,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Set up leanstack for one agent: writes rules, installs lean-ctx/engram
+    /// Set up agentflare for one agent: writes rules, installs lean-ctx/engram
     /// (and Ponytail/Caveman on Claude Code), wires the hook config directly
     /// where possible. Running this command is the consent.
     Init {

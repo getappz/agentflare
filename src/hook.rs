@@ -1,5 +1,5 @@
-// `leanstack hook session-start --agent X` / `leanstack hook prompt-submit --agent X`
-// The runtime handlers — invoked by whatever `leanstack init` (or, for
+// `agentflare hook session-start --agent X` / `agentflare hook prompt-submit --agent X`
+// The runtime handlers — invoked by whatever `agentflare init` (or, for
 // Codex, the plugin manifest) wired into the target agent's hook config.
 // No install/consent logic lives here: `init` is the explicit, one-shot
 // consent; these just reinforce rules and report drift each session/turn.
@@ -27,7 +27,7 @@ pub fn session_start(agent: &str) {
     if !pending.is_empty() {
         lines.push(String::new());
         lines.push(format!(
-            "leanstack: the following aren't set up yet — run `leanstack init --agent {agent}` to install them:"
+            "agentflare: the following aren't set up yet — run `agentflare init --agent {agent}` to install them:"
         ));
         for d in pending {
             lines.push(format!("  - {d}"));
@@ -36,7 +36,7 @@ pub fn session_start(agent: &str) {
 
     lines.push(String::new());
     lines.push(
-        "LEANSTACK ACTIVE — lean-ctx/engram tools, Exa search, clean git commits. Off: /leanstack off."
+        "AGENTFLARE ACTIVE — lean-ctx/engram tools, Exa search, clean git commits. Off: /agentflare off."
             .to_string(),
     );
 
@@ -66,12 +66,12 @@ pub fn prompt_submit(agent: &str) {
 
     let mut s = state::load();
 
-    if prompt == "/leanstack off" || prompt == "/leanstack stop" {
+    if prompt == "/agentflare off" || prompt == "/agentflare stop" {
         s.active = false;
         state::save(&s);
         return;
     }
-    if prompt == "/leanstack on" {
+    if prompt == "/agentflare on" {
         s.active = true;
         state::save(&s);
     }
@@ -81,7 +81,7 @@ pub fn prompt_submit(agent: &str) {
     }
 
     let mut bits = vec![
-        "LEANSTACK ACTIVE.".to_string(),
+        "AGENTFLARE ACTIVE.".to_string(),
         "Prefer lean-ctx ctx_* tools over native Read/Grep/Bash/Glob.".to_string(),
         "Exa is the only web search tool.".to_string(),
         "Clean git commits, no AI signature.".to_string(),
@@ -90,7 +90,7 @@ pub fn prompt_submit(agent: &str) {
         .iter()
         .any(|c| c.needs_consent && !(c.check)());
     if pending {
-        bits.push(format!("Reminder: `leanstack init --agent {agent}` to finish setup."));
+        bits.push(format!("Reminder: `agentflare init --agent {agent}` to finish setup."));
     }
 
     let out = json!({

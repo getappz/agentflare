@@ -1,4 +1,4 @@
-// `leanstack init --agent X` — the one explicit, consent-is-the-invocation
+// `agentflare init --agent X` — the one explicit, consent-is-the-invocation
 // setup command. Runs every component (installs included — no separate
 // confirm step, since running this command IS the consent), then wires the
 // host's hook config directly where a hook mechanism exists and can be
@@ -15,15 +15,15 @@ fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_default()
 }
 
-fn leanstack_binary() -> String {
+fn agentflare_binary() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_else(|| "leanstack".to_string())
+        .unwrap_or_else(|| "agentflare".to_string())
 }
 
 pub fn run(agent: &str) {
-    println!("leanstack init --agent {agent}\n");
+    println!("agentflare init --agent {agent}\n");
 
     for c in get_components(agent) {
         if (c.check)() {
@@ -51,12 +51,12 @@ fn wire_claude_code() {
     if !settings.is_object() {
         settings = json!({});
     }
-    let bin = leanstack_binary();
+    let bin = agentflare_binary();
 
     let already_wired = settings
         .get("hooks")
         .and_then(|h| h.get("SessionStart"))
-        .map(|v| v.to_string().contains("leanstack"))
+        .map(|v| v.to_string().contains("agentflare"))
         .unwrap_or(false);
     if already_wired {
         println!("  skip  ~/.claude/settings.json hooks (already wired)");
@@ -87,14 +87,14 @@ fn wire_cursor() {
     let path = cwd().join(".cursor").join("hooks.json");
     if path.exists() {
         let existing = fs::read_to_string(&path).unwrap_or_default();
-        if existing.contains("leanstack") {
+        if existing.contains("agentflare") {
             println!("  skip  .cursor/hooks.json (already wired)");
             return;
         }
-        println!("  skip  .cursor/hooks.json (exists, not leanstack's — not overwriting)");
+        println!("  skip  .cursor/hooks.json (exists, not agentflare's — not overwriting)");
         return;
     }
-    let bin = leanstack_binary();
+    let bin = agentflare_binary();
     let content = json!({
         "version": 1,
         "hooks": {
@@ -121,7 +121,7 @@ mod tests {
         with_temp_home(|| {
             wire_claude_code();
             let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
-            assert!(content.contains("leanstack"));
+            assert!(content.contains("agentflare"));
             assert!(content.contains("SessionStart"));
             assert!(content.contains("UserPromptSubmit"));
         });
@@ -148,7 +148,7 @@ mod tests {
             wire_claude_code();
             let content = fs::read_to_string(&path).unwrap();
             assert!(content.contains("dark"));
-            assert!(content.contains("leanstack"));
+            assert!(content.contains("agentflare"));
         });
     }
 
@@ -162,7 +162,7 @@ mod tests {
             let content = fs::read_to_string(&path).unwrap();
             let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
             assert!(parsed.is_object());
-            assert!(content.contains("leanstack"));
+            assert!(content.contains("agentflare"));
         });
     }
 
@@ -171,7 +171,7 @@ mod tests {
         with_temp_cwd(|| {
             wire_cursor();
             let content = fs::read_to_string(cwd().join(".cursor").join("hooks.json")).unwrap();
-            assert!(content.contains("leanstack"));
+            assert!(content.contains("agentflare"));
             assert!(content.contains("sessionStart"));
         });
     }
@@ -196,7 +196,7 @@ mod tests {
             fs::write(&path, r#"{"version": 1, "hooks": {}}"#).unwrap();
             wire_cursor();
             let content = fs::read_to_string(&path).unwrap();
-            assert!(!content.contains("leanstack"));
+            assert!(!content.contains("agentflare"));
         });
     }
 }

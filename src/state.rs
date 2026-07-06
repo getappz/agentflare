@@ -1,5 +1,5 @@
-// Single JSON state blob, host-neutral (~/.leanstack/), shared across
-// whichever agents this machine has run `leanstack init`/hooks for.
+// Single JSON state blob, host-neutral (~/.agentflare/), shared across
+// whichever agents this machine has run `agentflare init`/hooks for.
 use crate::paths::home;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -16,7 +16,7 @@ fn default_true() -> bool {
 }
 
 pub fn state_dir() -> PathBuf {
-    home().join(".leanstack")
+    home().join(".agentflare")
 }
 
 pub fn state_path() -> PathBuf {
