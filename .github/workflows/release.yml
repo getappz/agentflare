@@ -75,10 +75,19 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+
+      - name: Create source tarball
+        # Feeds the AUR PKGBUILD (aur/agentflare/PKGBUILD), which builds from
+        # source rather than a prebuilt binary.
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          git archive --format=tar.gz --prefix="agentflare-${VERSION}/" "${GITHUB_REF_NAME}" -o "dist/agentflare-${VERSION}-source.tar.gz"
 
       - name: Generate checksums
         run: |

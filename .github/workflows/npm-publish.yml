@@ -1,0 +1,77 @@
+name: npm-publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g., v1.0.1). Defaults to latest release."
+        required: false
+        type: string
+      dry_run:
+        description: "Run in dry-run mode (no actual publish)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: npm-publish-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+
+env:
+  DRY_RUN: ${{ github.event_name == 'release' && '0' || (inputs.dry_run && '1' || '0') }}
+
+jobs:
+  publish:
+    if: |
+      (github.event_name == 'release' &&
+       startsWith(github.event.release.tag_name, 'v') &&
+       !github.event.release.prerelease) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Determine version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ -n "$INPUT_VERSION" ]]; then
+            if ! [[ "$INPUT_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Invalid version: $INPUT_VERSION (expected vX.Y.Z)"
+              exit 1
+            fi
+            echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            VERSION="$(gh release view --json tagName --jq .tagName)"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22.x"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Publish npm packages
+        env:
+          AGENTFLARE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_DIR: ${{ runner.temp }}/release
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$RELEASE_DIR"
+          if [[ ${DRY_RUN:-0} == 1 ]]; then
+            echo "DRY RUN: would publish npm packages for $AGENTFLARE_VERSION"
+            exit 0
+          fi
+          bash scripts/release-npm.sh
