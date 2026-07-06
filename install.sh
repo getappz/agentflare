@@ -9,10 +9,10 @@
 #   ./install.sh --uninstall    # remove the installed binary
 #
 # One-liner (no Rust required):
-#   curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/master/install.sh | sh
 #
 # Uninstall one-liner:
-#   curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/main/install.sh | sh -s -- --uninstall
+#   curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/master/install.sh | sh -s -- --uninstall
 
 set -eu
 
