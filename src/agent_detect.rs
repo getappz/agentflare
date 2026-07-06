@@ -9,6 +9,14 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
+// PATH is process-global — every test in this file that mutates it (via
+// `with_temp_path_dir` in `find_binary_tests`/`detect_all_tests`) or relies
+// on the real one (`resolve_version_tests::run_version_command_captures_
+// real_process_output`) must serialize against this single shared lock.
+// Two separate `Mutex` instances would not actually serialize anything.
+#[cfg(test)]
+static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Search PATH for the first name in `names` that resolves to a file.
 /// Manual walk (not the `which` crate) to avoid a new dependency — mirrors
 /// the approach used by `agents-cli`'s `findInPath` and `caam`'s
@@ -37,14 +45,13 @@ pub fn find_binary(names: &[&str]) -> Option<PathBuf> {
 #[cfg(test)]
 mod find_binary_tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // PATH is process-global — serialize every test in this module against
-    // it, same pattern as paths::test_support::GLOBAL_STATE_LOCK.
-    static PATH_LOCK: Mutex<()> = Mutex::new(());
+    // PATH is process-global — serialize every test that mutates it against
+    // the single shared `super::PATH_LOCK`, same pattern as
+    // paths::test_support::GLOBAL_STATE_LOCK.
 
     fn with_temp_path_dir(f: impl FnOnce(&Path)) {
-        let _guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = super::PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("agentflare-test-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -340,6 +347,10 @@ mod resolve_version_tests {
 
     #[test]
     fn run_version_command_captures_real_process_output() {
+        // Take the shared PATH_LOCK so this can't run concurrently with a
+        // find_binary_tests/detect_all_tests test that has repointed PATH
+        // to a temp-only directory — this test needs the real PATH intact.
+        let _guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The one real-spawn test: `rustc` is guaranteed on PATH inside any
         // `cargo test` invocation, so this is portable without a stub binary.
         let output = run_version_command(Path::new("rustc"), &["--version"]).unwrap();
@@ -410,9 +421,6 @@ pub fn detect_all(
 mod detect_all_tests {
     use super::*;
     use crate::agent_registry::Agent;
-    use std::sync::Mutex;
-
-    static PATH_LOCK: Mutex<()> = Mutex::new(());
 
     struct StubRunner;
     impl VersionRunner for StubRunner {
@@ -426,7 +434,7 @@ mod detect_all_tests {
     }
 
     fn with_temp_path_dir(f: impl FnOnce(&Path)) {
-        let _guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = super::PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("agentflare-test-detect-all-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
