@@ -36,7 +36,7 @@ jobs:
           # Signatures are stored on a dedicated branch to keep master's history clean.
           branch: 'cla-signatures'
           # Maintainer + bots never need to sign.
-          allowlist: 'Shivakumar,dependabot[bot],*[bot]'
+          allowlist: 'getappz,dependabot[bot],*[bot]'
           custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
           # Friendlier, self-contained first message: explains the one-time nature,
           # the license guarantee, and the exact phrase — so contributors aren't
