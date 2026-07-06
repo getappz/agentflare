@@ -1,4 +1,5 @@
 mod agent_registry;
+mod agent_detect;
 mod components;
 mod coaching;
 mod cost;
