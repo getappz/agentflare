@@ -33,9 +33,10 @@ fn is_valid_rule_id(id: &str) -> bool {
 }
 
 /// Parse a single `coaching-<id>.md` file into a `CoachingRule`. Returns
-/// `None` if the filename doesn't match the expected pattern; a malformed
-/// body inside a matching file still parses (empty title/applied_at is not
-/// an error) so one bad file can never take down the whole listing.
+/// `None` if the filename doesn't match the expected pattern, or if a
+/// matching file has no valid `# Applied:` header — such files are skipped
+/// entirely (not included with blank fields) so one bad file can never take
+/// down the whole listing.
 fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
     let content = std::fs::read_to_string(path).ok()?;
     let filename = path.file_stem()?.to_str()?;
@@ -44,16 +45,20 @@ fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
     let mut title = String::new();
     let mut applied_at = String::new();
     let mut in_header = false;
+    let mut header_done = false;
     let mut body_lines = Vec::new();
 
     for line in content.lines() {
-        if line.starts_with("---") {
+        if line.starts_with("---") && !header_done {
             in_header = !in_header;
+            if !in_header {
+                header_done = true;
+            }
             continue;
         }
         if in_header {
             if let Some(rest) = line.strip_prefix("# Pattern:") {
-                if let Some(t) = rest.split('\u{2014}').nth(1) {
+                if let Some(t) = rest.splitn(2, '\u{2014}').nth(1) {
                     title = t.trim().to_string();
                 }
             } else if let Some(rest) = line.strip_prefix("# Applied:") {
@@ -295,6 +300,32 @@ mod tests {
             apply_rule("b-rule", "Title B", "Body B").unwrap();
             apply_rule("a-rule", "Title A", "Body A").unwrap();
             assert_eq!(active_rule_bodies(), vec!["Body A".to_string(), "Body B".to_string()]);
+        });
+    }
+
+    #[test]
+    fn apply_rule_body_with_dashes_line_is_not_truncated() {
+        with_temp_home(|| {
+            let applied = apply_rule("dashes", "Title", "before\n---\nafter").unwrap();
+            assert!(applied.body.contains("before"), "body should contain text before the --- line: {}", applied.body);
+            assert!(applied.body.contains("after"), "body should contain text after the --- line: {}", applied.body);
+
+            let rules = list_rules();
+            assert_eq!(rules.len(), 1);
+            assert!(rules[0].body.contains("before"));
+            assert!(rules[0].body.contains("after"));
+        });
+    }
+
+    #[test]
+    fn apply_rule_title_with_em_dash_is_not_truncated() {
+        with_temp_home(|| {
+            let applied = apply_rule("emdash", "Foo \u{2014} Bar", "Body").unwrap();
+            assert_eq!(applied.title, "Foo \u{2014} Bar");
+
+            let rules = list_rules();
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].title, "Foo \u{2014} Bar");
         });
     }
 }
