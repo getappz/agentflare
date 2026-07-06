@@ -3,6 +3,7 @@ mod cost;
 mod engram_install;
 mod hook;
 mod init;
+mod mcp_server;
 mod optimize;
 mod paths;
 mod pricing;
@@ -62,6 +63,9 @@ enum Commands {
     },
     /// Print today's Claude Code token usage and estimated cost, by model.
     Cost,
+    /// Start an MCP (Model Context Protocol) server on stdio,
+    /// exposing agentflare optimization state as resources and tools.
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -90,5 +94,6 @@ fn main() {
             HookEvent::PreToolUse { agent } => hook::pre_tool_use(agent.as_str()),
         },
         Commands::Cost => cost::run(),
+        Commands::Mcp => mcp_server::run(),
     }
 }
