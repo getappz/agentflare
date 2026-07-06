@@ -1,3 +1,4 @@
+mod agent_registry;
 mod components;
 mod coaching;
 mod cost;
@@ -11,33 +12,8 @@ mod pricing;
 mod rule_text;
 mod state;
 
-use clap::{Parser, Subcommand, ValueEnum};
-
-#[derive(Copy, Clone, ValueEnum, Debug)]
-#[value(rename_all = "kebab-case")]
-enum Agent {
-    ClaudeCode,
-    Codex,
-    Cursor,
-    Windsurf,
-    VscodeCopilot,
-    Cline,
-    Continue,
-}
-
-impl Agent {
-    fn as_str(self) -> &'static str {
-        match self {
-            Agent::ClaudeCode => "claude-code",
-            Agent::Codex => "codex",
-            Agent::Cursor => "cursor",
-            Agent::Windsurf => "windsurf",
-            Agent::VscodeCopilot => "vscode-copilot",
-            Agent::Cline => "cline",
-            Agent::Continue => "continue",
-        }
-    }
-}
+use agent_registry::Agent;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "agentflare", version, about = "Optimize AI CLI agents for cost and performance")]
