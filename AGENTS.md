@@ -1,9 +1,9 @@
-# leanstack rules
+# agentflare rules
 
 Static fallback for agents with no MCP support and no hook mechanism (e.g. Aider).
 Everything else (Claude Code, Codex, Cursor, Windsurf, VS Code/Copilot, Cline,
-Continue) gets a real integration via the `leanstack` CLI — see
-https://github.com/getappz/leanstack. Use this file only if your tool isn't
+Continue) gets a real integration via the `agentflare` CLI — see
+https://github.com/getappz/agentflare. Use this file only if your tool isn't
 one of those.
 
 ## Context compression — lean-ctx

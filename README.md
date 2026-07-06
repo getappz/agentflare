@@ -1,9 +1,9 @@
 <div align="center">
 
-# leanstack
+# agentflare
 
-**A single Rust binary. No Node, no runtime dependencies. lean-ctx + engram
-powered token-saving stack across Claude Code, Codex, Cursor, Windsurf,
+**Optimize AI CLI agents for cost and performance. A single Rust binary, no
+Node, no runtime dependencies — across Claude Code, Codex, Cursor, Windsurf,
 VS Code, Cline, and Continue.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -29,10 +29,10 @@ session, the other saves the re-explaining tax across sessions.
 **Why Rust, not Node:** Claude Code doesn't bundle or require Node.js — it's a
 standalone compiled binary. A plugin whose hooks shell out to `node` breaks on
 any machine that installed Claude Code without separately installing Node.
-leanstack is a single static binary; the only runtime dependency is leanstack
+agentflare is a single static binary; the only runtime dependency is agentflare
 itself.
 
-**No plugin marketplace for Claude Code or Cursor** — `leanstack init --agent X`
+**No plugin marketplace for Claude Code or Cursor** — `agentflare init --agent X`
 writes the hook config directly into the target's own settings file (Claude
 Code's `~/.claude/settings.json`, Cursor's `.cursor/hooks.json`). Codex is the
 one exception: its hook system only activates through its plugin loader, so
@@ -73,38 +73,38 @@ Check your own: `lean-ctx gain` · `/caveman-stats` (Claude Code) · `ponytail-d
 **Linux/macOS** (downloads a prebuilt binary, checksum-verified; builds from
 source instead if run from inside a clone):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/getappz/leanstack/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/main/install.sh | sh
 ```
 
 **Homebrew:**
 ```bash
-brew tap getappz/leanstack
-brew install leanstack
+brew tap getappz/agentflare
+brew install agentflare
 ```
 
 **Windows, build from source** (no unsigned prebuilt binary to trip an AV
 heuristic):
 ```powershell
-git clone https://github.com/getappz/leanstack
-cd leanstack
+git clone https://github.com/getappz/agentflare
+cd agentflare
 .\install.ps1
 ```
 
 **Windows, Scoop** (prebuilt binary — unsigned, like most small Rust CLIs;
 Defender/SmartScreen false-positives are possible, report an issue if hit):
 ```powershell
-scoop bucket add leanstack https://github.com/getappz/leanstack
-scoop install leanstack
+scoop bucket add agentflare https://github.com/getappz/agentflare
+scoop install agentflare
 ```
 
 **Any platform with Rust, no clone needed:**
 ```bash
-cargo install --git https://github.com/getappz/leanstack
+cargo install --git https://github.com/getappz/agentflare
 ```
 
 **Uninstall:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/getappz/leanstack/main/install.sh | sh -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/main/install.sh | sh -s -- --uninstall
 ```
 
 ## Set up an agent
@@ -113,21 +113,21 @@ One command per tool, run once. Running it is the consent — installs happen
 immediately, no separate confirm step.
 
 ```bash
-leanstack init --agent claude-code    # writes ~/.claude/settings.json hooks directly, no marketplace
-leanstack init --agent cursor         # writes .cursor/hooks.json directly, no marketplace
-leanstack init --agent windsurf
-leanstack init --agent vscode-copilot
-leanstack init --agent cline
-leanstack init --agent continue
+agentflare init --agent claude-code    # writes ~/.claude/settings.json hooks directly, no marketplace
+agentflare init --agent cursor         # writes .cursor/hooks.json directly, no marketplace
+agentflare init --agent windsurf
+agentflare init --agent vscode-copilot
+agentflare init --agent cline
+agentflare init --agent continue
 ```
 
 **Codex** is the one exception — its hook system only activates through its own
 plugin loader:
 ```
-codex plugin marketplace add getappz/leanstack
-codex plugin install leanstack
+codex plugin marketplace add getappz/agentflare
+codex plugin install agentflare
 ```
-then `leanstack init --agent codex` for the rules/lean-ctx/engram setup (Codex's
+then `agentflare init --agent codex` for the rules/lean-ctx/engram setup (Codex's
 hook wiring itself comes from the plugin manifest, not `init`).
 
 Each run: writes rule files (if absent), installs lean-ctx (`npm install -g
@@ -138,14 +138,14 @@ gets clobbered.
 
 **engram's install safety**: the project's own docs say prebuilt Windows binaries
 get flagged as AV false positives, and explicitly recommend `go install` or
-Homebrew instead. `leanstack init` only auto-installs engram through one of those
+Homebrew instead. `agentflare init` only auto-installs engram through one of those
 two paths; if neither is available, it prints the exact command instead of
 downloading something that might trip your AV.
 
 ## Docs-only fallback (Aider, other AGENTS.md readers)
 
 ```bash
-curl -sL https://raw.githubusercontent.com/getappz/leanstack/main/AGENTS.md > AGENTS.md
+curl -sL https://raw.githubusercontent.com/getappz/agentflare/main/AGENTS.md > AGENTS.md
 ```
 
 ---
@@ -154,16 +154,16 @@ curl -sL https://raw.githubusercontent.com/getappz/leanstack/main/AGENTS.md > AG
 
 ```
 src/
-├── paths.rs             # home-dir resolution (LEANSTACK_HOME_OVERRIDE for tests —
+├── paths.rs             # home-dir resolution (AGENTFLARE_HOME_OVERRIDE for tests —
 │                         # dirs::home_dir() ignores HOME/USERPROFILE overrides on
 │                         # Windows, learned the hard way)
-├── state.rs              # ~/.leanstack/state.json — on/off flag for the hooks
+├── state.rs              # ~/.agentflare/state.json — on/off flag for the hooks
 ├── rule_text.rs           # shared rule copy (Exa, git, lean-ctx, engram usage)
 ├── engram_install.rs      # engram's safe-install logic (go install/brew only)
 ├── components.rs          # registry: each entry checks + fixes itself, host-aware
-├── init.rs                # `leanstack init --agent X` — runs every component,
+├── init.rs                # `agentflare init --agent X` — runs every component,
 │                           # wires hooks directly for claude-code/cursor
-├── hook.rs                # `leanstack hook session-start|prompt-submit --agent X`
+├── hook.rs                # `agentflare hook session-start|prompt-submit --agent X`
 └── main.rs                 # clap CLI, dispatch
 
 .codex-plugin/              # Codex only — its hooks require the plugin loader
@@ -178,15 +178,15 @@ Adding a new managed component means adding one entry to `components.rs` — nei
 
 ## What Gets Created
 
-**Claude Code**: `~/.claude/rules/{exa,git,lean-ctx,engram}.md`, `~/.claude/settings.json` hooks section, `~/.config/{caveman,ponytail}/config.json`, `~/.leanstack/`.
+**Claude Code**: `~/.claude/rules/{exa,git,lean-ctx,engram}.md`, `~/.claude/settings.json` hooks section, `~/.config/{caveman,ponytail}/config.json`, `~/.agentflare/`.
 
-**Codex**: project-local `AGENTS.md` (only if absent), `~/.leanstack/`.
+**Codex**: project-local `AGENTS.md` (only if absent), `~/.agentflare/`.
 
-**Cursor**: project-local `.cursor/rules/leanstack.mdc`, `.cursor/hooks.json`, `~/.cursor/mcp.json`, `~/.leanstack/`.
+**Cursor**: project-local `.cursor/rules/agentflare.mdc`, `.cursor/hooks.json`, `~/.cursor/mcp.json`, `~/.agentflare/`.
 
 **Windsurf/VS Code/Cline**: project-local rules file (see table above), MCP config for lean-ctx/engram.
 
-**Continue**: `.continue/mcpServers/{leanstack,engram}.json`.
+**Continue**: `.continue/mcpServers/{agentflare,engram}.json`.
 
 Nothing is created if it already exists.
 
