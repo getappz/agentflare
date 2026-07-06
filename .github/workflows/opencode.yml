@@ -24,7 +24,5 @@ jobs:
           persist-credentials: false
 
       - uses: anomalyco/opencode/github@v1.17.13
-        env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         with:
-          model: opencode-go/deepseek-v4-pro
+          model: opencode/gpt-5-nano
