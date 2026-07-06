@@ -1,0 +1,15 @@
+pkgbase = agentflare
+	pkgdesc = Optimize AI CLI agents for cost and performance
+	pkgver = 1.0.1
+	pkgrel = 1
+	url = https://github.com/getappz/agentflare
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	makedepends = gcc
+	depends = gcc-libs
+	source = agentflare-1.0.1.tar.gz::https://github.com/getappz/agentflare/releases/download/v1.0.1/agentflare-1.0.1-source.tar.gz
+	sha256sums = f1b8b3a1c23d65c13b6de791b7a0488a559bc639991a277c2ff5bbd596326629
+
+pkgname = agentflare

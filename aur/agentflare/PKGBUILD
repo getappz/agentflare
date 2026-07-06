@@ -1,0 +1,38 @@
+# Maintainer: Shivakumar <kumar@appz.dev>
+pkgname=agentflare
+pkgver=1.0.1
+pkgrel=1
+pkgdesc="Optimize AI CLI agents for cost and performance"
+arch=('x86_64' 'aarch64')
+url="https://github.com/getappz/agentflare"
+license=('MIT')
+makedepends=('cargo' 'gcc')
+depends=('gcc-libs')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/getappz/agentflare/releases/download/v$pkgver/agentflare-$pkgver-source.tar.gz")
+sha256sums=('f1b8b3a1c23d65c13b6de791b7a0488a559bc639991a277c2ff5bbd596326629')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  ./target/release/agentflare --version
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 "target/release/agentflare" "$pkgdir/usr/bin/agentflare"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
