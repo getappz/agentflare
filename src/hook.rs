@@ -178,9 +178,7 @@ pub fn prompt_submit(agent: &str) {
         bits.push(format!("Reminder: `agentflare init --agent {agent}` to finish setup."));
     }
 
-    if let Some(nudge) = crate::optimize::model_routing_nudge(prompt) {
-        bits.push(nudge.to_string());
-    }
+    let router = crate::optimize::active_router();
 
     if let Some(sid) = session_id {
         let mut runtime = crate::optimize::load_runtime();
@@ -191,17 +189,40 @@ pub fn prompt_submit(agent: &str) {
         crate::optimize::prune_stale_sessions(&mut runtime, now);
         let record = runtime
             .sessions
-            .entry(sid)
+            .entry(sid.clone())
             .or_insert_with(|| crate::optimize::SessionRecord {
                 start_ts: now,
                 turn_count: 0,
                 recent_tool_calls: vec![],
             });
         record.turn_count += 1;
+
+        let ctx = crate::optimize::RouteContext {
+            prompt: prompt.to_string(),
+            session_id: sid,
+            turn_count: record.turn_count,
+            recent_tool_calls: record.recent_tool_calls.clone(),
+            current_model: None,
+        };
+        if let Some(nudge) = router.route(&ctx) {
+            bits.push(nudge);
+        }
+
         if let Some(nudge) = crate::optimize::session_hygiene_nudge(record, now) {
             bits.push(nudge);
         }
         crate::optimize::save_runtime(&runtime);
+    } else {
+        let ctx = crate::optimize::RouteContext {
+            prompt: prompt.to_string(),
+            session_id: String::new(),
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            current_model: None,
+        };
+        if let Some(nudge) = router.route(&ctx) {
+            bits.push(nudge);
+        }
     }
 
     let out = json!({

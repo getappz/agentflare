@@ -4,6 +4,7 @@ mod cost;
 mod engram_install;
 mod hook;
 mod init;
+mod mcp_server;
 mod optimize;
 mod paths;
 mod pricing;
@@ -75,6 +76,9 @@ enum Commands {
         #[command(subcommand)]
         action: CoachingAction,
     },
+    /// Start an MCP (Model Context Protocol) server on stdio,
+    /// exposing agentflare optimization state as resources and tools.
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -124,5 +128,6 @@ fn main() {
             CoachingAction::Apply { id, title, body } => coaching::cli_apply(&id, &title, &body),
             CoachingAction::Remove { id } => coaching::cli_remove(&id),
         },
+        Commands::Mcp => mcp_server::run(),
     }
 }
