@@ -73,7 +73,7 @@ Check your own: `lean-ctx gain` · `/caveman-stats` (Claude Code) · `ponytail-d
 **Linux/macOS** (downloads a prebuilt binary, checksum-verified; builds from
 source instead if run from inside a clone):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/master/install.sh | sh
 ```
 
 **Homebrew:**
@@ -104,7 +104,7 @@ cargo install --git https://github.com/getappz/agentflare
 
 **Uninstall:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/main/install.sh | sh -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/master/install.sh | sh -s -- --uninstall
 ```
 
 ## Set up an agent
@@ -145,7 +145,7 @@ downloading something that might trip your AV.
 ## Docs-only fallback (Aider, other AGENTS.md readers)
 
 ```bash
-curl -sL https://raw.githubusercontent.com/getappz/agentflare/main/AGENTS.md > AGENTS.md
+curl -sL https://raw.githubusercontent.com/getappz/agentflare/master/AGENTS.md > AGENTS.md
 ```
 
 ---
