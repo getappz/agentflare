@@ -13,7 +13,7 @@ pub fn detect(input: &str) -> Option<SwitchAction> {
         return Some(SwitchAction::Off);
     }
 
-    for skill in &["review", "audit", "debt", "gain", "help"] {
+    for skill in &["review", "audit", "debt", "gain", "help", "playbook"] {
         let prefixed = format!("/ponytail-{skill}");
         let alt = format!("/ponytail:{skill}");
         if prompt == prefixed || prompt.starts_with(&format!("{prefixed} ")) {
@@ -43,7 +43,7 @@ pub fn detect(input: &str) -> Option<SwitchAction> {
 
     match sub {
         "off" => Some(SwitchAction::Off),
-        "review" | "audit" | "debt" | "gain" | "help" => {
+        "review" | "audit" | "debt" | "gain" | "help" | "playbook" => {
             let normalized = config::normalize_config_mode(sub)?;
             Some(SwitchAction::SetMode(normalized.to_string()))
         }
@@ -103,5 +103,10 @@ mod tests {
     #[test]
     fn detects_sub_skill_inline() {
         assert!(matches!(detect("/ponytail review"), Some(SwitchAction::SetMode(m)) if m == "review"));
+    }
+
+    #[test]
+    fn detects_sub_skill_playbook() {
+        assert!(matches!(detect("/ponytail-playbook"), Some(SwitchAction::SetMode(m)) if m == "playbook"));
     }
 }

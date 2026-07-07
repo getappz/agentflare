@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 pub const DEFAULT_MODE: &str = "full";
 pub const VALID_MODES: &[&str] = &[
-    "off", "lite", "full", "ultra", "review", "audit", "debt", "gain", "help",
+    "off", "lite", "full", "ultra", "review", "audit", "debt", "gain", "help", "playbook",
 ];
 pub const RUNTIME_MODES: &[&str] = &["off", "lite", "full", "ultra"];
 

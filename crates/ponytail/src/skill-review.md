@@ -14,6 +14,13 @@ Review diffs for unnecessary complexity. Number each finding sequentially.
 One line per finding: location, what to cut, what replaces it. 
 The diff's best outcome is getting shorter.
 
+## Scope
+
+Default: tracked changes (`git diff HEAD`) plus untracked files (`git ls-files --cached --others --exclude-standard`). To review a different scope:
+- Branch: `git diff main...<branch>`
+- Range: `git diff <base>..<head>`
+- Entire repo: scan all source files (use `git ls-files`)
+
 ## Format
 
 `<N>. <file>:L<line>: <tag> <what>. <replacement>.`
