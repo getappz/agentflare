@@ -1,0 +1,23 @@
+name: vendored-file-warning
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "vendor/**"
+
+permissions: {}
+
+jobs:
+  warn:
+    if: github.event.pull_request.user.login != 'getappz'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Warn on vendored file changes
+        run: |
+          cat <<'EOF'
+          Changes to Cargo.lock or vendored dependencies should be made by
+          automated tooling (Renovate) or by maintainers only. If you need a
+          dependency update, file an issue or wait for Renovate to pick it up.
+          EOF
+          exit 1

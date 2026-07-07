@@ -180,11 +180,19 @@ pub fn activate(agent: &str, profile: &str, json: bool) {
                 fs::create_dir_all(parent).expect("create parent");
             }
             let data = fs::read(&src).expect("read");
-            if let Some(ref pw) = passphrase {
-                if let Some(decrypted) = auth_crypt::decrypt(&data, pw) {
-                    fs::write(&dest, decrypted).expect("write");
+            if auth_crypt::is_encrypted(&data) {
+                if let Some(ref pw) = passphrase {
+                    if let Some(decrypted) = auth_crypt::decrypt(&data, pw) {
+                        fs::write(&dest, decrypted).expect("write");
+                    } else {
+                        eprintln!("warning: cannot decrypt {} — wrong passphrase", src.display());
+                        continue;
+                    }
                 } else {
-                    eprintln!("warning: cannot decrypt {} — wrong passphrase or corrupted", src.display());
+                    eprintln!(
+                        "warning: {} is encrypted but no passphrase set — set AGENTFLARE_VAULT_PASSPHRASE",
+                        src.display()
+                    );
                     continue;
                 }
             } else {
@@ -819,9 +827,16 @@ pub fn auth_exec(agent: &str, profile: &str, args: &[String], json: bool) {
     let binary = &args[0];
     let rest = &args[1..];
 
-    let status = std::process::Command::new(binary)
-        .args(rest)
-        .env("HOME", &dir)
+    let mut cmd = std::process::Command::new(binary);
+    cmd.args(rest);
+    cmd.env("HOME", &dir);
+    #[cfg(windows)]
+    {
+        cmd.env("USERPROFILE", &dir);
+        cmd.env("HOMEDRIVE", "");
+        cmd.env("HOMEPATH", &dir);
+    }
+    let status = cmd
         .spawn()
         .and_then(|mut c| c.wait())
         .unwrap_or_else(|e| {
@@ -849,9 +864,16 @@ pub fn auth_login(agent: &str, profile: &str, args: &[String], json: bool) {
     let binary = &args[0];
     let rest = &args[1..];
 
-    let status = std::process::Command::new(binary)
-        .args(rest)
-        .env("HOME", &dir)
+    let mut cmd = std::process::Command::new(binary);
+    cmd.args(rest);
+    cmd.env("HOME", &dir);
+    #[cfg(windows)]
+    {
+        cmd.env("USERPROFILE", &dir);
+        cmd.env("HOMEDRIVE", "");
+        cmd.env("HOMEPATH", &dir);
+    }
+    let status = cmd
         .spawn()
         .and_then(|mut c| c.wait())
         .unwrap_or_else(|e| {
@@ -860,14 +882,20 @@ pub fn auth_login(agent: &str, profile: &str, args: &[String], json: bool) {
         });
 
     if status.success() {
-        // After login, backup the new auth state
+        let passphrase = auth_crypt::get_passphrase();
         let dir = isolates_dir().join(agent).join(profile);
         for &rel in CATALOG.iter().find(|c| c.agent_key == agent).map(|c| c.files).unwrap_or(&[]) {
             let dest = profile_dir(agent, profile).join(rel.rsplit('/').next().unwrap_or(rel));
             let src = dir.join(rel);
             if src.exists() {
+                let data = fs::read(&src).expect("read");
                 fs::create_dir_all(dest.parent().unwrap()).ok();
-                fs::copy(&src, &dest).ok();
+                if let Some(ref pw) = passphrase {
+                    let encrypted = auth_crypt::encrypt(&data, pw).expect("encrypt");
+                    fs::write(&dest, encrypted).expect("write");
+                } else {
+                    fs::write(&dest, data).expect("write");
+                }
             }
         }
         if !json {
@@ -878,9 +906,11 @@ pub fn auth_login(agent: &str, profile: &str, args: &[String], json: bool) {
     }
 }
 
+
 fn activate_into(agent: &str, profile: &str, target_dir: &std::path::Path) {
     let cat = match catalog_for(agent) { Some(c) => c, None => { return; } };
     let vault = profile_dir(agent, profile);
+    let passphrase = auth_crypt::get_passphrase();
     for &rel in cat.files {
         let src = vault.join(rel.rsplit('/').next().unwrap_or(rel));
         if src.exists() {
@@ -888,7 +918,22 @@ fn activate_into(agent: &str, profile: &str, target_dir: &std::path::Path) {
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent).ok();
             }
-            fs::copy(&src, &dest).ok();
+            let data = fs::read(&src).expect("read");
+            if auth_crypt::is_encrypted(&data) {
+                if let Some(ref pw) = passphrase {
+                    if let Some(decrypted) = auth_crypt::decrypt(&data, pw) {
+                        fs::write(&dest, decrypted).expect("write");
+                    } else {
+                        eprintln!("warning: cannot decrypt {} — wrong passphrase", src.display());
+                        continue;
+                    }
+                } else {
+                    eprintln!("warning: {} is encrypted but no passphrase set", src.display());
+                    continue;
+                }
+            } else {
+                fs::write(&dest, data).expect("write");
+            }
         }
     }
 }

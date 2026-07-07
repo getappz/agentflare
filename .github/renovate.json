@@ -1,0 +1,16 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "automerge": false,
+  "packageRules": [
+    {
+      "description": "Group tokio + hyper ecosystem bumps together",
+      "matchPackageNames": ["/^tokio/", "/^hyper/", "/^axum/", "/^tower/", "tonic"],
+      "matchManagers": ["cargo"],
+      "groupName": "tokio ecosystem"
+    }
+  ]
+}

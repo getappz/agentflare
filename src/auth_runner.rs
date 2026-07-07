@@ -27,15 +27,15 @@ pub fn run(agent: &str, args: &[String], json: bool) {
                     eprintln!("rate limited — rotating profile...");
                 }
                 let conn = auth_db::open_or_rebuild();
-                // Cooldown the current profile
                 if let Some((profile, _)) = auth_db::get_rotation_last(&conn, agent) {
                     auth_db::set_cooldown(&conn, agent, &profile, 30, "rate limit");
                 }
-                // Rotate to next profile
                 crate::auth::rotate(agent, "smart", json);
                 if !json {
                     eprintln!("retrying with new profile ({remaining} retries left)...");
                 }
+                // ponytail: short backoff, linear increase if rate limits persist
+                thread::sleep(Duration::from_secs(1 + (MAX_RETRIES - remaining) as u64));
             }
             ExitKind::Failure(code) => {
                 std::process::exit(code);
@@ -64,12 +64,18 @@ fn categorize_exit(status: (i32, String)) -> ExitKind {
 
 fn spawn_and_capture(agent: &str, args: &[String]) -> (i32, String) {
     let binary = find_binary(agent);
-    let mut child = Command::new(&binary)
+    let mut child = match Command::new(&binary)
         .args(args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn agent");
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("error: cannot run {binary}: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let stderr_handle = child.stderr.take().unwrap();
     let (tx, rx) = channel();
@@ -78,7 +84,7 @@ fn spawn_and_capture(agent: &str, args: &[String]) -> (i32, String) {
         let mut buf = String::new();
         for line in reader.lines() {
             if let Ok(l) = line {
-                eprintln!("{l}"); // passthrough to user
+                eprintln!("{l}");
                 buf.push_str(&l);
                 buf.push('\n');
             }
@@ -110,7 +116,6 @@ pub fn daemon_running(agent: &str) -> bool {
     {
         return !output.stdout.is_empty();
     }
-    // Windows fallback
     if let Ok(output) = std::process::Command::new("tasklist")
         .arg("/FI")
         .arg(format!("IMAGENAME eq {}.exe", names[0]))
@@ -128,9 +133,9 @@ pub fn reload_daemon(agent: &str) -> Result<(), String> {
     }
     let names = match agent {
         "codex" => &["codex"][..],
-        _ => &[],
+        "claude-code" => &["claude"][..],
+        _ => return Ok(()),
     };
-    // SIGTERM on Unix, taskkill on Windows
     #[cfg(windows)]
     {
         for name in names {
