@@ -123,6 +123,11 @@ enum Commands {
         #[arg(long)]
         keep_binary: bool,
     },
+    /// Auth profile vault — backup, switch, rotate, and manage agent OAuth tokens.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -183,11 +188,6 @@ enum AgentsAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Auth profile vault — backup, switch, and manage agent OAuth tokens.
-    Auth {
-        #[command(subcommand)]
-        action: AuthAction,
-    },
 }
 
 #[derive(Subcommand)]
@@ -245,6 +245,88 @@ enum AuthAction {
         #[arg(long)]
         json: bool,
     },
+    /// Smart profile rotation (skips cooldown'd profiles).
+    Rotate {
+        agent: String,
+        /// Rotation algorithm (smart, round-robin, random).
+        #[arg(long, default_value = "smart")]
+        algorithm: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview what rotation would pick.
+    Next {
+        agent: String,
+        #[arg(long, default_value = "smart")]
+        algorithm: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Interactive profile selector.
+    Pick {
+        agent: String,
+    },
+    /// Manage cooldowns.
+    Cooldown {
+        #[command(subcommand)]
+        action: CooldownAction,
+    },
+    /// Create short alias for a profile.
+    Alias {
+        agent: String,
+        profile: String,
+        alias: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage project-profile associations.
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CooldownAction {
+    /// Block a profile from rotation for N minutes.
+    Set {
+        /// <agent>/<profile>
+        target: String,
+        #[arg(long)]
+        minutes: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List active cooldowns.
+    List {
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clear a cooldown.
+    Clear {
+        /// <agent>/<profile>
+        target: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// Link current directory to a profile.
+    Set {
+        agent: String,
+        profile: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove project association for current directory.
+    Unset {
+        agent: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -297,15 +379,28 @@ fn main() {
             AgentsAction::Launch { agent, model, mode, args } => {
                 agents::cli_launch(&agent, model.as_deref(), mode.as_deref(), &args)
             }
-            AgentsAction::Auth { action } => match action {
-                AuthAction::Backup { agent, profile, json } => auth::backup(&agent, &profile, json),
-                AuthAction::Activate { agent, profile, json } => auth::activate(&agent, &profile, json),
-                AuthAction::Status { agent, json } => auth::status(agent.as_deref(), json),
-                AuthAction::Catalog { json } => auth::list_agents(json),
-                AuthAction::Ls { agent, json } => auth::ls(&agent, json),
-                AuthAction::Clear { agent, json } => auth::clear(&agent, json),
-                AuthAction::Delete { agent, profile, json } => auth::delete(&agent, &profile, json),
-                AuthAction::Rename { agent, old, new, json } => auth::rename(&agent, &old, &new, json),
+        },
+        Commands::Auth { action } => match action {
+            AuthAction::Backup { agent, profile, json } => auth::backup(&agent, &profile, json),
+            AuthAction::Activate { agent, profile, json } => auth::activate(&agent, &profile, json),
+            AuthAction::Status { agent, json } => auth::status(agent.as_deref(), json),
+            AuthAction::Catalog { json } => auth::list_agents(json),
+            AuthAction::Ls { agent, json } => auth::ls(&agent, json),
+            AuthAction::Clear { agent, json } => auth::clear(&agent, json),
+            AuthAction::Delete { agent, profile, json } => auth::delete(&agent, &profile, json),
+            AuthAction::Rename { agent, old, new, json } => auth::rename(&agent, &old, &new, json),
+            AuthAction::Rotate { agent, algorithm, json } => auth::rotate(&agent, &algorithm, json),
+            AuthAction::Next { agent, algorithm, json } => auth::next(&agent, &algorithm, json),
+            AuthAction::Pick { agent } => auth::pick(&agent),
+            AuthAction::Cooldown { action } => match action {
+                CooldownAction::Set { target, minutes, json } => auth::cooldown_set(&target, minutes, json),
+                CooldownAction::List { agent, json } => auth::cooldown_list(agent.as_deref(), json),
+                CooldownAction::Clear { target, json } => auth::cooldown_clear(&target, json),
+            },
+            AuthAction::Alias { agent, profile, alias, json } => auth::set_alias_cmd(&agent, &profile, &alias, json),
+            AuthAction::Project { action } => match action {
+                ProjectAction::Set { agent, profile, json } => auth::project_set(&agent, &profile, json),
+                ProjectAction::Unset { agent, json } => auth::project_unset(&agent, json),
             },
         },
         Commands::Alias { preferred, force, print, yes, shell, profile, json } => {

@@ -44,6 +44,7 @@ flate2 = "1"
 tar = "0.4"
 zip = "2"
 rusqlite = { version = "0.40", features = ["bundled"] }
+rand = "0.8"
 
 [profile.release]
 opt-level = 3
