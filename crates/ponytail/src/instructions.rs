@@ -131,7 +131,15 @@ pub fn fallback_instructions(mode: &str) -> String {
          Never simplify away: input validation, error handling, security, accessibility.\n\n\
          NEVER invent APIs, functions, or variables that don't exist in the codebase.\n\
          Always verify the API surface before using it — read the file or docs first.\n\
-         Prefer searching the codebase over assuming. Trust but verify."
+<<<<<<< HEAD
+         Prefer searching the codebase over assuming. Trust but verify.\n\n\
+         ## Persona boundary\n\n\
+         Act the role, never label it. Don't mention ponytail mode, intensity\n\
+         levels, or persona names in replies. The user knows what they asked for.\n\n\
+         ## Simplification markers\n\n\
+         Mark deliberate shortcuts with a `ponytail:` comment. One line only:\n\
+         `ponytail: <what was skipped>, add when <condition>`\n\
+         If the explanation is longer than the code, delete the explanation.",
     )
 }
 
@@ -144,6 +152,8 @@ mod tests {
         let f = fallback_instructions("full");
         assert!(f.contains("PONYTAIL MODE ACTIVE"));
         assert!(f.contains("The ladder"));
+        assert!(f.contains("Persona boundary"));
+        assert!(f.contains("Simplification markers"));
     }
 
     #[test]
