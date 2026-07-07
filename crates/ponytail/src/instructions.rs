@@ -131,7 +131,6 @@ pub fn fallback_instructions(mode: &str) -> String {
          Never simplify away: input validation, error handling, security, accessibility.\n\n\
          NEVER invent APIs, functions, or variables that don't exist in the codebase.\n\
          Always verify the API surface before using it — read the file or docs first.\n\
-<<<<<<< HEAD
          Prefer searching the codebase over assuming. Trust but verify.\n\n\
          ## Persona boundary\n\n\
          Act the role, never label it. Don't mention ponytail mode, intensity\n\
