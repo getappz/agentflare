@@ -253,7 +253,7 @@ fn resolve_name(
     }
 
     for name in candidates {
-        let on_path = crate::agent_detect::find_binary(&[name]).is_some();
+        let on_path = agent_registry::detect::find_binary(&[name]).is_some();
         let in_profile =
             profile_content.map_or(false, |c| shell.is_defined_in_profile(c, name));
         if !on_path && !in_profile {

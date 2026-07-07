@@ -1,7 +1,7 @@
 // Install/update/uninstall engine for `agentflare agents install|update|uninstall`.
 // Each agent's package manager and package name come from agent_registry.rs.
 // Dry-run mode prints commands instead of executing them.
-use crate::agent_registry::{self, AgentSpec};
+use agent_registry::{self, AgentSpec};
 use std::process::{Command, Stdio};
 
 pub enum Outcome {
@@ -142,7 +142,7 @@ pub fn run_uninstall(registry: &[AgentSpec], agent: &str, dry_run: bool) -> Outc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_registry::{Agent, Tier};
+    use agent_registry::{Agent, Tier};
 
     fn fake_registry() -> Vec<AgentSpec> {
         vec![

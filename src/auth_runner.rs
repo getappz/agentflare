@@ -100,7 +100,7 @@ fn spawn_and_capture(agent: &str, args: &[String]) -> (i32, String) {
 }
 
 fn find_binary(agent: &str) -> String {
-    crate::agent_detect::find_binary(&[agent])
+    agent_registry::detect::find_binary(&[agent])
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| agent.to_string())
 }

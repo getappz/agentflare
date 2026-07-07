@@ -1,10 +1,10 @@
 // CLI rendering for `agentflare agents list` / `agentflare agents doctor`.
 // Kept separate from agent_detect.rs so the detection engine stays free of
 // println!/format concerns and is fully unit-testable in isolation.
-use crate::agent_detect::{self, DetectedAgent, VersionRunner};
+use agent_registry::detect::{self, DetectedAgent, VersionRunner};
 use crate::agent_install::{self, Outcome};
 use crate::agent_launch::{self, LaunchOutcome};
-use crate::agent_registry::{self, AgentSpec};
+use agent_registry::{self, AgentSpec};
 use crate::state;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -91,7 +91,7 @@ pub fn run_list(
     runner: &dyn VersionRunner,
     json: bool,
 ) {
-    let agents = agent_detect::detect_all_with(registry, cache, runner);
+    let agents = detect::detect_all_with(registry, cache, runner);
     if json {
         println!(
             "{}",
@@ -111,7 +111,7 @@ pub fn run_doctor(
     runner: &dyn VersionRunner,
     json: bool,
 ) {
-    let agents = agent_detect::detect_all_with(registry, cache, runner);
+    let agents = detect::detect_all_with(registry, cache, runner);
     if json {
         println!(
             "{}",
@@ -140,7 +140,7 @@ pub fn cli_list(json: bool) {
     run_list(
         agent_registry::REGISTRY,
         &mut state.version_cache,
-        &agent_detect::RealVersionRunner,
+        &detect::RealVersionRunner,
         json,
     );
     state::save(&state);
@@ -151,7 +151,7 @@ pub fn cli_doctor(json: bool) {
     run_doctor(
         agent_registry::REGISTRY,
         &mut state.version_cache,
-        &agent_detect::RealVersionRunner,
+        &detect::RealVersionRunner,
         json,
     );
     state::save(&state);
@@ -193,7 +193,7 @@ pub fn cli_launch(agent: &str, model: Option<&str>, mode: Option<&str>, args: &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_registry::{Agent, Tier};
+    use agent_registry::{Agent, Tier};
     use std::path::Path;
 
     struct FakeRunner {
@@ -207,7 +207,7 @@ mod tests {
     }
 
     fn with_temp_path_dir(f: impl FnOnce(&Path)) {
-        let _guard = crate::agent_detect::PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = agent_registry::detect::PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir()
             .join(format!("agentflare-test-agents-cli-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -243,7 +243,7 @@ mod tests {
             };
             let mut cache = HashMap::new();
 
-            let detected = agent_detect::detect_all_with(
+            let detected = detect::detect_all_with(
                 &test_registry(),
                 &mut cache,
                 &runner,
@@ -276,7 +276,7 @@ mod tests {
                 package_manager: None,
                 package_name: None,
             }];
-            let detected = agent_detect::detect_all_with(
+            let detected = detect::detect_all_with(
                 &registry,
                 &mut cache,
                 &runner,
@@ -297,7 +297,7 @@ mod tests {
             response: Ok("1.0".to_string()),
         };
 
-        let detected = agent_detect::detect_all_with(&empty_registry, &mut cache, &runner);
+        let detected = detect::detect_all_with(&empty_registry, &mut cache, &runner);
         assert!(detected.is_empty());
     }
 
@@ -352,7 +352,7 @@ mod tests {
                 package_manager: None,
                 package_name: None,
             }];
-            let detected = agent_detect::detect_all_with(
+            let detected = detect::detect_all_with(
                 &registry,
                 &mut cache,
                 &runner,

@@ -1,0 +1,25 @@
+[package]
+name = "ponytail"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Ponytail — lazy senior dev mode for AI agents"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+ureq = { version = "2", features = ["json"] }
+sysinfo = { version = "0.34", optional = true, default-features = false, features = ["system"] }
+
+[features]
+default = []
+process-tree = ["sysinfo"]
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

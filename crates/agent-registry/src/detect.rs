@@ -1,21 +1,27 @@
 // Detection engine for `agentflare agents list`/`doctor`: PATH search,
 // version resolution, and mtime-keyed caching. Kept free of println!/CLI
 // concerns so it's fully unit-testable — src/agents.rs owns rendering.
-use crate::agent_registry::{AgentSpec, Tier};
-use crate::state::VersionCacheEntry;
+use crate::registry::{AgentSpec, Tier};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct VersionCacheEntry {
+    pub binary_path: String,
+    pub mtime: u64,
+    pub version: String,
+}
+
 // PATH is process-global — every test in this file that mutates it (via
 // `with_temp_path_dir` in `find_binary_tests`/`detect_all_tests`) or relies
 // on the real one (`resolve_version_tests::run_version_command_captures_
 // real_process_output`) must serialize against this single shared lock.
 // Two separate `Mutex` instances would not actually serialize anything.
-#[cfg(test)]
-pub(crate) static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[allow(dead_code)]
+pub static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Search PATH for the first name in `names` that resolves to a file.
 /// Manual walk (not the `which` crate) to avoid a new dependency — mirrors
@@ -436,7 +442,7 @@ pub fn detect_all(
 #[cfg(test)]
 mod detect_all_tests {
     use super::*;
-    use crate::agent_registry::Agent;
+    use crate::registry::Agent;
 
     struct StubRunner;
     impl VersionRunner for StubRunner {

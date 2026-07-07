@@ -1,6 +1,7 @@
 // Single JSON state blob, host-neutral (~/.agentflare/), shared across
 // whichever agents this machine has run `agentflare init`/hooks for.
 use crate::paths::home;
+pub use agent_registry::VersionCacheEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -13,17 +14,6 @@ pub struct State {
     /// `agentflare agents` version-resolution cache, keyed by `Agent::as_str()`.
     #[serde(default)]
     pub version_cache: HashMap<String, VersionCacheEntry>,
-}
-
-/// One cached `--version` resolution for an agent's binary. Keyed on both
-/// `binary_path` and `mtime` in `agent_detect.rs` — a reinstall to a
-/// different location invalidates the cache even if it happens to share an
-/// mtime, and a rebuilt binary at the same path invalidates via mtime.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct VersionCacheEntry {
-    pub binary_path: String,
-    pub mtime: u64,
-    pub version: String,
 }
 
 fn default_true() -> bool {
