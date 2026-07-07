@@ -213,11 +213,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let original = std::env::var_os("PATH");
-        unsafe { std::env::set_var("PATH", &dir) };
+        unsafe {
+            // SAFETY: PATH_LOCK mutex serializes all PATH mutations;
+            // no other thread can read or write PATH concurrently.
+            std::env::set_var("PATH", &dir)
+        };
         f(&dir);
         match original {
-            Some(p) => unsafe { std::env::set_var("PATH", p) },
-            None => unsafe { std::env::remove_var("PATH") },
+            Some(p) => unsafe {
+                // SAFETY: PATH_LOCK mutex serializes all PATH mutations.
+                std::env::set_var("PATH", p)
+            },
+            None => unsafe {
+                // SAFETY: PATH_LOCK mutex serializes all PATH mutations.
+                std::env::remove_var("PATH")
+            },
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

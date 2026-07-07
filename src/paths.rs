@@ -27,9 +27,16 @@ pub(crate) mod test_support {
         let dir = std::env::temp_dir().join("agentflare-test-home");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("AGENTFLARE_HOME_OVERRIDE", &dir) };
+        unsafe {
+            // SAFETY: GLOBAL_STATE_LOCK mutex serializes all env mutations;
+            // no other thread can read or write AGENTFLARE_HOME_OVERRIDE concurrently.
+            std::env::set_var("AGENTFLARE_HOME_OVERRIDE", &dir)
+        };
         let result = f();
-        unsafe { std::env::remove_var("AGENTFLARE_HOME_OVERRIDE") };
+        unsafe {
+            // SAFETY: GLOBAL_STATE_LOCK mutex serializes all env mutations.
+            std::env::remove_var("AGENTFLARE_HOME_OVERRIDE")
+        };
         result
     }
 
