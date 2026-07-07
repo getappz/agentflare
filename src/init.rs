@@ -34,9 +34,9 @@ pub fn run(agent: &str) {
     }
 
     match agent {
-        "claude-code" => wire_claude_code(),
-        "cursor" => wire_cursor(),
-        "opencode" => wire_opencode(),
+        "claude-code" => { wire_claude_code(); wire_ponytail_hooks(agent); }
+        "cursor" => { wire_cursor(); wire_ponytail_hooks(agent); }
+        "opencode" => { wire_opencode(); wire_ponytail_hooks(agent); }
         _ => {}
     }
 
@@ -169,6 +169,147 @@ fn wire_opencode() {
         println!("  info  opencode.jsonc — no rules to wire yet (run with rules present)");
     } else {
         println!("  skip  opencode.jsonc (already wired)");
+    }
+}
+
+pub fn wire_ponytail_hooks(agent: &str) {
+    match agent {
+        "claude-code" | "cowork" => wire_ponytail_claude_code(),
+        "cursor" | "cursor-cli" => wire_ponytail_cursor(),
+        "opencode" => wire_ponytail_opencode(),
+        _ => println!("  info  auto-wiring not supported for {agent}. Manual config required."),
+    }
+}
+
+fn wire_ponytail_claude_code() {
+    let path = home().join(".claude").join("settings.json");
+    let mut settings: Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !settings.is_object() {
+        settings = json!({});
+    }
+    let bin = agentflare_binary();
+
+    let already_wired = settings
+        .get("hooks")
+        .and_then(|h| h.get("SessionStart"))
+        .map(|v| v.to_string().contains("ponytail"))
+        .unwrap_or(false);
+    if already_wired {
+        println!("  skip  ponytail hooks already wired in ~/.claude/settings.json");
+        return;
+    }
+
+    let obj = settings.as_object_mut().unwrap();
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    let hooks_obj = hooks.as_object_mut().unwrap();
+
+    hooks_obj.entry("SessionStart").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
+        "hooks": [{ "type": "command", "command": format!("\"{bin}\" ponytail hook session-start"), "timeout": 10 }]
+    }));
+    hooks_obj.entry("SubagentStart").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
+        "hooks": [{ "type": "command", "command": format!("\"{bin}\" ponytail hook subagent-start"), "timeout": 5 }]
+    }));
+    hooks_obj.entry("UserPromptSubmit").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
+        "hooks": [{ "type": "command", "command": format!("\"{bin}\" ponytail hook prompt-submit"), "timeout": 5 }]
+    }));
+
+    obj.insert("statusLine".to_string(), json!({
+        "type": "command",
+        "command": format!("\"{bin}\" ponytail hook statusline")
+    }));
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::write(&path, serde_json::to_string_pretty(&settings).unwrap() + "\n") {
+        Ok(_) => println!("  ok    ponytail hooks wired in ~/.claude/settings.json"),
+        Err(e) => println!("  fail  writing ~/.claude/settings.json: {e}"),
+    }
+}
+
+fn wire_ponytail_cursor() {
+    let path = cwd().join(".cursor").join("hooks.json");
+    let bin = agentflare_binary();
+
+    let mut content: Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({ "version": 1, "hooks": {} }));
+    if !content.is_object() {
+        content = json!({ "version": 1, "hooks": {} });
+    }
+
+    let hooks = content.as_object_mut().unwrap()
+        .entry("hooks").or_insert_with(|| json!({}));
+    let hooks_obj = hooks.as_object_mut().unwrap();
+
+    hooks_obj.entry("sessionStart").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
+        "command": format!("\"{bin}\" ponytail hook session-start"),
+        "type": "command",
+        "timeout": 30
+    }));
+    hooks_obj.entry("beforeSubmitPrompt").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
+        "command": format!("\"{bin}\" ponytail hook prompt-submit"),
+        "type": "command",
+        "timeout": 10
+    }));
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::write(&path, serde_json::to_string_pretty(&content).unwrap() + "\n") {
+        Ok(_) => println!("  ok    ponytail hooks wired in .cursor/hooks.json"),
+        Err(e) => println!("  fail  writing .cursor/hooks.json: {e}"),
+    }
+}
+
+fn wire_ponytail_opencode() {
+    let path = home().join(".config").join("opencode").join("opencode.jsonc");
+    let bin = agentflare_binary();
+
+    let mut config: Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !config.is_object() {
+        config = json!({});
+    }
+
+    let already_wired = config
+        .get("hooks")
+        .and_then(|h| h.get("SessionStart"))
+        .map(|v| v.to_string().contains("ponytail"))
+        .unwrap_or(false);
+    if already_wired {
+        println!("  skip  ponytail hooks already wired in opencode.jsonc");
+        return;
+    }
+
+    let obj = config.as_object_mut().unwrap();
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    let hooks_obj = hooks.as_object_mut().unwrap();
+
+    hooks_obj.insert("SessionStart".to_string(), json!({
+        "command": format!("\"{bin}\" ponytail hook session-start")
+    }));
+    hooks_obj.insert("SubagentStart".to_string(), json!({
+        "command": format!("\"{bin}\" ponytail hook subagent-start")
+    }));
+
+    obj.insert("statusLine".to_string(), json!({
+        "type": "command",
+        "command": format!("\"{bin}\" ponytail hook statusline")
+    }));
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::write(&path, serde_json::to_string_pretty(&config).unwrap() + "\n") {
+        Ok(_) => println!("  ok    ponytail hooks wired in opencode.jsonc"),
+        Err(e) => println!("  fail  writing opencode.jsonc: {e}"),
     }
 }
 
