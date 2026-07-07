@@ -12,6 +12,7 @@ mod components;
 mod coaching;
 mod cost;
 mod engram_install;
+mod errors;
 mod hook;
 mod init;
 mod mcp_server;
