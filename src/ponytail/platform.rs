@@ -1,5 +1,7 @@
 use serde_json::json;
 
+use crate::ponytail::detect;
+
 pub enum AgentPlatform {
     Claude,
     Codex,
@@ -7,13 +9,14 @@ pub enum AgentPlatform {
     Fallback,
 }
 
-pub fn detect() -> AgentPlatform {
-    if std::env::var("CLAUDE_CONFIG_DIR").is_ok() {
-        AgentPlatform::Claude
-    } else if std::env::var("COPILOT_PLUGIN_DATA").is_ok() {
-        AgentPlatform::Copilot
-    } else if std::env::var("PLUGIN_DATA").is_ok() {
-        AgentPlatform::Codex
+pub fn detect_platform() -> AgentPlatform {
+    if let Some(result) = detect::detect() {
+        match result.name.as_str() {
+            "claude-code" | "cowork" => AgentPlatform::Claude,
+            "codex" => AgentPlatform::Codex,
+            "github-copilot" => AgentPlatform::Copilot,
+            _ => AgentPlatform::Fallback,
+        }
     } else {
         AgentPlatform::Fallback
     }
@@ -31,19 +34,14 @@ pub fn format_hook_output(event: &str, ctx: &str, platform: &AgentPlatform) -> S
             .to_string()
         }
         AgentPlatform::Codex => {
-            let sys_msg = if event == "SessionStart" {
-                "PONYTAIL:FULL"
-            } else {
-                ""
-            };
             let mut output = json!({
                 "hookSpecificOutput": {
                     "hookEventName": event,
                     "additionalContext": ctx,
                 }
             });
-            if !sys_msg.is_empty() {
-                output["systemMessage"] = json!(sys_msg);
+            if event == "SessionStart" {
+                output["systemMessage"] = json!("PONYTAIL:FULL");
             }
             output.to_string()
         }
