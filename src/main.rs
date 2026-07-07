@@ -219,6 +219,9 @@ enum AuthAction {
         profile: String,
         #[arg(long)]
         json: bool,
+        /// Restart agent daemon after auth restore (picks up new auth).
+        #[arg(long)]
+        reload_daemon: bool,
     },
     /// Show active profile via content-hash detection.
     Status {
@@ -339,6 +342,9 @@ enum IsolateAction {
         profile: String,
         #[arg(long)]
         json: bool,
+        /// Shallow mode: only auth files copied, everything else symlinked from host.
+        #[arg(long)]
+        shallow: bool,
     },
     /// List isolated profiles.
     Ls {
@@ -452,7 +458,7 @@ fn main() {
         },
         Commands::Auth { action } => match action {
             AuthAction::Backup { agent, profile, json } => auth::backup(&agent, &profile, json),
-            AuthAction::Activate { agent, profile, json } => auth::activate(&agent, &profile, json),
+            AuthAction::Activate { agent, profile, json, reload_daemon } => auth::activate_with(&agent, &profile, reload_daemon, json),
             AuthAction::Status { agent, json } => auth::status(agent.as_deref(), json),
             AuthAction::Catalog { json } => auth::list_agents(json),
             AuthAction::Ls { agent, json } => auth::ls(&agent, json),
@@ -474,7 +480,7 @@ fn main() {
             },
             AuthAction::Run { agent, json, args } => auth_runner::run(&agent, &args, json),
             AuthAction::Isolate { action } => match action {
-                IsolateAction::Add { agent, profile, json } => auth::isolate_add(&agent, &profile, json),
+                IsolateAction::Add { agent, profile, json, shallow } => auth::isolate_add_with(&agent, &profile, shallow, json),
                 IsolateAction::Ls { agent, json } => auth::isolate_ls(agent.as_deref(), json),
                 IsolateAction::Delete { agent, profile, json } => auth::isolate_delete(&agent, &profile, json),
             },
