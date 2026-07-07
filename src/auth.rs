@@ -146,6 +146,10 @@ pub fn resolve_name(agent: &str, name: &str) -> String {
 }
 
 pub fn activate(agent: &str, profile: &str, json: bool) {
+    activate_with(agent, profile, false, json)
+}
+
+pub fn activate_with(agent: &str, profile: &str, reload_daemon: bool, json: bool) {
     let profile = resolve_name(agent, profile);
     if let Err(e) = validate_name(agent, "agent").and_then(|_| validate_name(&profile, "profile")) {
         fail(&e, "", json);
@@ -210,6 +214,19 @@ pub fn activate(agent: &str, profile: &str, json: bool) {
         }));
     } else {
         println!("activated {agent}/{profile} — restored {restored} file(s)");
+    }
+
+    // Daemon check
+    if crate::auth_runner::daemon_running(agent) {
+        if reload_daemon {
+            if let Err(e) = crate::auth_runner::reload_daemon(agent) {
+                eprintln!("warning: failed to reload daemon: {e}");
+            } else if !json {
+                println!("daemon restarted — auth changes now active");
+            }
+        } else if !json {
+            eprintln!("warning: {agent} daemon is running — auth changes won't take effect until restart. Use --reload-daemon to auto-restart.");
+        }
     }
 }
 
@@ -722,6 +739,10 @@ fn isolates_dir() -> PathBuf {
 }
 
 pub fn isolate_add(agent: &str, profile: &str, json: bool) {
+    isolate_add_with(agent, profile, false, json)
+}
+
+pub fn isolate_add_with(agent: &str, profile: &str, shallow: bool, json: bool) {
     let dir = isolates_dir().join(agent).join(profile);
     if dir.exists() {
         if json {
@@ -733,16 +754,31 @@ pub fn isolate_add(agent: &str, profile: &str, json: bool) {
     }
     fs::create_dir_all(&dir).expect("create isolate dir");
 
-    // Symlink shared host files
-    for host_file in &[".ssh", ".gitconfig", ".git-credentials"] {
-        let src = home().join(host_file);
-        if src.exists() {
-            symlink_or_copy(&src, &dir.join(host_file));
+    if shallow {
+        // Symlink all host dirs, only auth files are real
+        let host_home = home();
+        for entry in &[".cache", ".config", ".local", "Documents", "Downloads"] {
+            let src = host_home.join(entry);
+            if src.exists() {
+                symlink_or_copy(&src, &dir.join(entry));
+            }
+        }
+    } else {
+        // Symlink shared host files only
+        for host_file in &[".ssh", ".gitconfig", ".git-credentials"] {
+            let src = home().join(host_file);
+            if src.exists() {
+                symlink_or_copy(&src, &dir.join(host_file));
+            }
         }
     }
 
     // Copy auth files from vault profile
     activate_into(agent, profile, &dir);
+
+    // Store metadata
+    let meta = serde_json::json!({"mode": if shallow { "shallow" } else { "deep" }, "agent": agent, "profile": profile});
+    fs::write(dir.join("isolate.json"), serde_json::to_string_pretty(&meta).unwrap() + "\n").ok();
 
     if json {
         println!("{}", serde_json::json!({"agent": agent, "profile": profile, "isolate_dir": dir.to_string_lossy()}));
@@ -776,10 +812,12 @@ pub fn isolate_ls(agent: Option<&str>, json: bool) {
             for entry in entries.flatten() {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     let p = entry.file_name().to_string_lossy().to_string();
+                    let mode = read_isolate_mode(&agent_dir.join(&p));
                     if json {
-                        results.push(serde_json::json!({"agent": a, "profile": p}));
+                        results.push(serde_json::json!({"agent": a, "profile": p, "mode": mode}));
                     } else {
-                        println!("{a}/{p}");
+                        let mode_str = mode.map_or(String::new(), |m| format!(" ({m})"));
+                        println!("{a}/{p}{mode_str}");
                     }
                 }
             }
@@ -906,6 +944,16 @@ pub fn auth_login(agent: &str, profile: &str, args: &[String], json: bool) {
     }
 }
 
+
+fn read_isolate_mode(dir: &std::path::Path) -> Option<String> {
+    let meta_path = dir.join("isolate.json");
+    if let Ok(data) = fs::read_to_string(&meta_path) {
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&data) {
+            return meta["mode"].as_str().map(|s| s.to_string());
+        }
+    }
+    None
+}
 
 fn activate_into(agent: &str, profile: &str, target_dir: &std::path::Path) {
     let cat = match catalog_for(agent) { Some(c) => c, None => { return; } };
