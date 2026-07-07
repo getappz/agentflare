@@ -539,7 +539,20 @@ fn main() {
         }
         Commands::Ponytail { action } => match action {
             PonytailAction::Setup => {
-                println!("download SKILL.md to cache, print per-platform hook configs");
+                match ponytail::download_skill() {
+                    Ok(path) => {
+                        println!("SKILL.md saved to {path}");
+                        println!("Hook config: add to agent hook settings:");
+                        println!("  Claude Code:  agentflare ponytail hook session-start");
+                        println!("  Codex:        agentflare ponytail hook session-start");
+                        println!("  Copilot:      agentflare ponytail hook session-start");
+                        println!("  Statusline:   agentflare ponytail hook statusline");
+                    }
+                    Err(e) => {
+                        eprintln!("download failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
             PonytailAction::Status => {
                 let mode = ponytail::active_mode().unwrap_or_else(ponytail::default_mode);
@@ -567,7 +580,13 @@ fn main() {
                 println!("off");
             }
             PonytailAction::Update => {
-                println!("re-download SKILL.md from ponytail repo");
+                match ponytail::download_skill() {
+                    Ok(path) => println!("SKILL.md updated at {path}"),
+                    Err(e) => {
+                        eprintln!("update failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
             PonytailAction::Hook { event } => match event {
                 PonytailHookEvent::SessionStart => {

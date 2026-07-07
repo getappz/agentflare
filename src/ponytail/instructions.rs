@@ -9,6 +9,33 @@ pub struct Instructions {
     pub body: String,
 }
 
+const SKILL_URL: &str =
+    "https://raw.githubusercontent.com/DietrichGebert/ponytail/main/skills/ponytail/SKILL.md";
+
+pub fn skill_cache_path() -> std::path::PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("agentflare")
+        .join("ponytail")
+        .join("SKILL.md")
+}
+
+pub fn download_skill() -> Result<String, String> {
+    let resp = ureq::get(SKILL_URL)
+        .call()
+        .map_err(|e| format!("fetch failed: {e}"))?;
+    if resp.status() != 200 {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let body = resp.into_string().map_err(|e| format!("read failed: {e}"))?;
+    let path = skill_cache_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    std::fs::write(&path, &body).map_err(|e| format!("write: {e}"))?;
+    Ok(path.display().to_string())
+}
+
 pub fn build(mode: &str, skill_path: Option<&Path>) -> Instructions {
     let effective = config::normalize_persisted_mode(mode)
         .unwrap_or(config::DEFAULT_MODE);
