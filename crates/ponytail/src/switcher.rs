@@ -1,4 +1,5 @@
 use crate::config;
+use crate::sub_skills;
 
 pub enum SwitchAction {
     SetMode(String),
@@ -8,6 +9,24 @@ pub enum SwitchAction {
     Report,
 }
 
+fn all_skill_names() -> Vec<String> {
+    let mut names: Vec<String> = ["review", "audit", "debt", "gain", "help", "playbook"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    names.extend(sub_skills::custom_skill_names());
+    names
+}
+
+fn all_mode_names() -> Vec<String> {
+    let mut names: Vec<String> = ["lite", "full", "ultra"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    names.extend(all_skill_names());
+    names
+}
+
 pub fn detect(input: &str) -> Option<SwitchAction> {
     let prompt = input.trim().to_lowercase();
 
@@ -15,15 +34,15 @@ pub fn detect(input: &str) -> Option<SwitchAction> {
         return Some(SwitchAction::Off);
     }
 
-    for skill in &["review", "audit", "debt", "gain", "help", "playbook"] {
-        let prefixed = format!("/ponytail-{skill}");
-        let alt = format!("/ponytail:{skill}");
+    for name in all_mode_names() {
+        let prefixed = format!("/ponytail-{name}");
+        let alt = format!("/ponytail:{name}");
         if prompt == prefixed || prompt.starts_with(&format!("{prefixed} ")) {
-            let normalized = config::normalize_config_mode(skill)?;
+            let normalized = config::normalize_config_mode(&name)?;
             return Some(SwitchAction::SetMode(normalized.to_string()));
         }
         if prompt == alt || prompt.starts_with(&format!("{alt} ")) {
-            let normalized = config::normalize_config_mode(skill)?;
+            let normalized = config::normalize_config_mode(&name)?;
             return Some(SwitchAction::SetMode(normalized.to_string()));
         }
     }
@@ -57,8 +76,8 @@ pub fn detect(input: &str) -> Option<SwitchAction> {
             let normalized = config::normalize_config_mode(smode)?;
             Some(SwitchAction::SetSession(normalized.to_string()))
         }
-        "review" | "audit" | "debt" | "gain" | "help" | "playbook" => {
-            let normalized = config::normalize_config_mode(sub)?;
+        s if all_skill_names().iter().any(|n| n == s) => {
+            let normalized = config::normalize_config_mode(s)?;
             Some(SwitchAction::SetMode(normalized.to_string()))
         }
         "default" => {
@@ -138,5 +157,11 @@ mod tests {
     #[test]
     fn detects_bare_as_report() {
         assert!(matches!(detect("/ponytail"), Some(SwitchAction::Report)));
+    }
+
+    #[test]
+    fn detects_mode_shortcut() {
+        assert!(matches!(detect("/ponytail-ultra"), Some(SwitchAction::SetMode(m)) if m == "ultra"));
+        assert!(matches!(detect("/ponytail-lite"), Some(SwitchAction::SetMode(m)) if m == "lite"));
     }
 }

@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
 pub const SKILL_REVIEW: &str = include_str!("skill-review.md");
 pub const SKILL_AUDIT: &str = include_str!("skill-audit.md");
 pub const SKILL_DEBT: &str = include_str!("skill-debt.md");
@@ -15,6 +18,44 @@ pub fn get(name: &str) -> Option<&'static str> {
         "playbook" => Some(SKILL_PLAYBOOK),
         _ => None,
     }
+}
+
+pub fn skills_dir() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("agentflare")
+        .join("ponytail")
+        .join("skills")
+}
+
+static CUSTOM_SKILLS: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
+    let dir = skills_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "md") {
+                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                    if let Ok(body) = std::fs::read_to_string(&path) {
+                        if !body.is_empty() {
+                            map.insert(name.to_string(), body);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    map
+});
+
+pub fn get_custom(name: &str) -> Option<String> {
+    CUSTOM_SKILLS.get(name).cloned()
+}
+
+pub fn custom_skill_names() -> Vec<String> {
+    let mut names: Vec<String> = CUSTOM_SKILLS.keys().cloned().collect();
+    names.sort();
+    names
 }
 
 pub struct Finding {

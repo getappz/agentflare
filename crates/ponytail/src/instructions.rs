@@ -56,7 +56,7 @@ pub fn build(mode: &str, skill_path: Option<&Path>) -> Instructions {
     let effective = config::normalize_persisted_mode(mode)
         .unwrap_or(config::DEFAULT_MODE);
 
-    if crate::sub_skills::get(effective).is_some() {
+    if crate::sub_skills::get(effective).is_some() || crate::sub_skills::get_custom(effective).is_some() {
         return Instructions {
             mode: effective.to_string(),
             body: format!(
@@ -68,11 +68,8 @@ pub fn build(mode: &str, skill_path: Option<&Path>) -> Instructions {
     let skill_body = if let Some(path) = skill_path {
         std::fs::read_to_string(path).unwrap_or_else(|_| EMBEDDED_SKILL.to_string())
     } else {
-        std::fs::read_to_string(skill_cache_path())
-            .or_else(|_| {
-                find_workspace_agents_md()
-                    .ok_or(std::io::Error::other("AGENTS.md not found in workspace"))
-            })
+        crate::sub_skills::get_custom(effective)
+            .or_else(|| std::fs::read_to_string(skill_cache_path()).ok())
             .unwrap_or_else(|_| EMBEDDED_SKILL.to_string())
     };
 
