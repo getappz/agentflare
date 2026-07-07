@@ -415,6 +415,7 @@ enum HookEvent {
 }
 
 fn main() {
+    color_eyre::install().expect("color_eyre::install failed");
     let cli = Cli::parse();
     match cli.command {
         Commands::Init { agent } => init::run(agent.as_str()),
