@@ -34,12 +34,7 @@ pub fn format_hook_output(event: &str, ctx: &str, platform: &AgentPlatform) -> S
             .to_string()
         }
         AgentPlatform::Codex => {
-            let mut output = json!({
-                "hookSpecificOutput": {
-                    "hookEventName": event,
-                    "additionalContext": ctx,
-                }
-            });
+            let mut output = json!({ "additionalContext": ctx });
             if event == "SessionStart" {
                 output["systemMessage"] = json!("PONYTAIL:FULL");
             }
