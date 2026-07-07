@@ -143,6 +143,11 @@ enum Commands {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Manage Ponytail — lazy senior dev mode for AI agents.
+    Ponytail {
+        #[command(subcommand)]
+        action: PonytailAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -336,6 +341,43 @@ enum AuthAction {
 }
 
 #[derive(Subcommand)]
+enum PonytailAction {
+    /// Download SKILL.md and print per-platform hook config snippets.
+    Setup,
+    /// Show active ponytail mode (reads flag file + config default).
+    Status,
+    /// Set session-scoped mode (off|lite|full|ultra). Writes flag file.
+    Set {
+        mode: String,
+    },
+    /// Persist default mode to config. Survives session restarts.
+    Default {
+        mode: String,
+    },
+    /// Turn ponytail off for this session.
+    Off,
+    /// Re-download SKILL.md from ponytail repo to cache.
+    Update,
+    /// Hook entry point — called by agent hook systems. Not for manual use.
+    Hook {
+        #[command(subcommand)]
+        event: PonytailHookEvent,
+    },
+}
+
+#[derive(Subcommand)]
+enum PonytailHookEvent {
+    /// Session start — emit rules as hook context, write flag file.
+    SessionStart,
+    /// Subagent start — emit rules for subagent context only.
+    SubagentStart,
+    /// Prompt submit — parse input for mode switch, update flag if found.
+    PromptSubmit,
+    /// Output ANSI mode badge for terminal statusline.
+    Statusline,
+}
+
+#[derive(Subcommand)]
 enum IsolateAction {
     /// Create isolated $HOME profile with symlinked host files.
     Add {
@@ -494,6 +536,107 @@ fn main() {
         Commands::Update { version, check, quiet } => update::run(version, check, quiet),
         Commands::Uninstall { dry_run, keep_config, keep_binary } => {
             uninstall::run(dry_run, keep_config, keep_binary)
+        }
+        Commands::Ponytail { action } => match action {
+            PonytailAction::Setup => {
+                println!("download SKILL.md to cache, print per-platform hook configs");
+            }
+            PonytailAction::Status => {
+                let mode = ponytail::active_mode().unwrap_or_else(ponytail::default_mode);
+                println!("{mode}");
+            }
+            PonytailAction::Set { mode } => {
+                let normalized = ponytail::normalize_config_mode(&mode)
+                    .unwrap_or("full");
+                ponytail::set_active(normalized).unwrap_or_else(|e| {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                });
+                println!("{normalized}");
+            }
+            PonytailAction::Default { mode } => {
+                ponytail::set_default_mode(&mode).unwrap_or_else(|e| {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                });
+                ponytail::set_active(&mode).ok();
+                println!("default: {mode}");
+            }
+            PonytailAction::Off => {
+                ponytail::clear_active();
+                println!("off");
+            }
+            PonytailAction::Update => {
+                println!("re-download SKILL.md from ponytail repo");
+            }
+            PonytailAction::Hook { event } => match event {
+                PonytailHookEvent::SessionStart => {
+                    let mode = ponytail::active_mode()
+                        .unwrap_or_else(ponytail::default_mode);
+                    if mode == "off" {
+                        ponytail::state::clear_active();
+                        println!("OK");
+                        return;
+                    }
+                    ponytail::set_active(&mode).ok();
+                    let instructions = ponytail::build_instructions(&mode, None);
+                    let platform = ponytail::detect_platform();
+                    let output = ponytail::format_hook_output(
+                        "SessionStart",
+                        &instructions.body,
+                        &platform,
+                    );
+                    println!("{output}");
+                }
+                PonytailHookEvent::SubagentStart => {
+                    let mode = ponytail::active_mode()
+                        .unwrap_or_else(ponytail::default_mode);
+                    if mode == "off" {
+                        println!("OK");
+                        return;
+                    }
+                    let instructions = ponytail::build_instructions(&mode, None);
+                    let platform = ponytail::detect_platform();
+                    let output = ponytail::format_hook_output(
+                        "SubagentStart",
+                        &instructions.body,
+                        &platform,
+                    );
+                    println!("{output}");
+                }
+                PonytailHookEvent::PromptSubmit => {
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).ok();
+                    if let Some(action) = ponytail::detect_switch(&input) {
+                        match action {
+                            ponytail::SwitchAction::SetMode(m) => {
+                                ponytail::set_active(&m).ok();
+                            }
+                            ponytail::SwitchAction::SetDefault(m) => {
+                                ponytail::set_default_mode(&m).ok();
+                                ponytail::set_active(&m).ok();
+                            }
+                            ponytail::SwitchAction::Off => {
+                                ponytail::clear_active();
+                            }
+                        }
+                    }
+                    println!("OK");
+                }
+                PonytailHookEvent::Statusline => {
+                    let mode = ponytail::active_mode()
+                        .unwrap_or_else(ponytail::default_mode);
+                    if mode == "off" || mode.is_empty() {
+                        return;
+                    }
+                    if mode == "full" {
+                        print!("\x1b[38;5;108m[PONYTAIL]\x1b[0m");
+                    } else {
+                        let upper = mode.to_uppercase();
+                        print!("\x1b[38;5;108m[PONYTAIL:{upper}]\x1b[0m");
+                    }
+                }
+            },
         }
     }
 }
