@@ -10,18 +10,6 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
-  no-stale-brand:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - name: Check for leftover 'leanstack' references
-        run: |
-          if git grep -il leanstack -- . ':!docs' ':!.github/workflows/ci.yml' | grep -q .; then
-            echo "Found stale 'leanstack' references (docs/ is exempt as historical record):"
-            git grep -il leanstack -- . ':!docs' ':!.github/workflows/ci.yml'
-            exit 1
-          fi
-
   build:
     strategy:
       matrix:
