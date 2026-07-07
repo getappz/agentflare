@@ -56,6 +56,9 @@ enum Commands {
     Init {
         #[arg(long, value_enum)]
         agent: Agent,
+        /// Skip all prompts — accept defaults.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Hook entry points, invoked by whatever `init` (or the Codex plugin
     /// manifest) wired into the target agent's hook config. Not meant to be
@@ -342,8 +345,6 @@ enum AuthAction {
 
 #[derive(Subcommand)]
 enum PonytailAction {
-    /// Download SKILL.md and print per-platform hook config snippets.
-    Setup,
     /// Show active ponytail mode (reads flag file + config default).
     Status,
     /// Set session-scoped mode (off|lite|full|ultra). Writes flag file.
@@ -477,7 +478,7 @@ fn main() {
     color_eyre::install().expect("color_eyre::install failed");
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init { agent } => init::run(agent.as_str()),
+        Commands::Init { agent, yes } => init::run(agent.as_str(), yes),
         Commands::Hook { event } => match event {
             HookEvent::SessionStart { agent } => hook::session_start(agent.as_str()),
             HookEvent::PromptSubmit { agent } => hook::prompt_submit(agent.as_str()),
@@ -548,22 +549,6 @@ fn main() {
             uninstall::run(dry_run, keep_config, keep_binary)
         }
         Commands::Ponytail { action } => match action {
-            PonytailAction::Setup => {
-                match ponytail::download_skill() {
-                    Ok(path) => {
-                        println!("SKILL.md saved to {path}");
-                        println!("Hook config: add to agent hook settings:");
-                        println!("  Claude Code:  agentflare ponytail hook session-start");
-                        println!("  Codex:        agentflare ponytail hook session-start");
-                        println!("  Copilot:      agentflare ponytail hook session-start");
-                        println!("  Statusline:   agentflare ponytail hook statusline");
-                    }
-                    Err(e) => {
-                        eprintln!("download failed: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
             PonytailAction::Status => {
                 let mode = ponytail::active_mode().unwrap_or_else(ponytail::default_mode);
                 println!("{mode}");
