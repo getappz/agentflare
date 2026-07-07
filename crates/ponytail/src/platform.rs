@@ -34,12 +34,7 @@ pub fn format_hook_output(event: &str, ctx: &str, platform: &AgentPlatform) -> S
             .to_string()
         }
         AgentPlatform::Codex => {
-            let mut output = json!({
-                "hookSpecificOutput": {
-                    "hookEventName": event,
-                    "additionalContext": ctx,
-                }
-            });
+            let mut output = json!({ "additionalContext": ctx });
             if event == "SessionStart" {
                 output["systemMessage"] = json!("PONYTAIL:FULL");
             }
@@ -53,5 +48,28 @@ pub fn format_hook_output(event: &str, ctx: &str, platform: &AgentPlatform) -> S
             }
         }
         AgentPlatform::Fallback => ctx.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_non_session_start_is_flat_json() {
+        let output = format_hook_output("SubagentStart", "test context", &AgentPlatform::Codex);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["additionalContext"], "test context");
+        assert!(parsed.get("hookSpecificOutput").is_none());
+        assert!(parsed.get("hookEventName").is_none());
+    }
+
+    #[test]
+    fn codex_session_start_includes_system_message() {
+        let output = format_hook_output("SessionStart", "test context", &AgentPlatform::Codex);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["systemMessage"], "PONYTAIL:FULL");
+        assert_eq!(parsed["additionalContext"], "test context");
+        assert!(parsed.get("hookSpecificOutput").is_none());
     }
 }
