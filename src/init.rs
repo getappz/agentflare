@@ -126,6 +126,8 @@ fn has_ponytail_ref(content: &str) -> bool {
 pub fn run(agent: &str, yes: bool) {
     println!("agentflare init --agent {agent}\n");
 
+    check_competing_plugins(agent);
+
     for c in get_components(agent) {
         if (c.check)() {
             println!("  skip  {} (already satisfied)", c.id);
@@ -399,6 +401,46 @@ fn wire_ponytail_opencode() {
     println!("  info  OpenCode uses plugin system for hooks, not config.");
     println!("        Keep @dietrichgebert/ponytail in plugin list.");
     println!("        The plugin's built-in hooks work alongside agentflare.");
+}
+
+fn check_competing_plugins(agent: &str) {
+    let competitors: &[(&str, &[&str])] = &[
+        ("lex-temple", &["lex-temple", "lex_temple"]),
+        ("cc-md", &["cc-md", "cc_md"]),
+    ];
+
+    for (name, markers) in competitors {
+        if let Some(where_found) = scan_agent_configs(agent, markers) {
+            eprintln!(
+                "[agentflare] warning: detected {name} in {where_found} — \
+                 may conflict with agentflare. Set AGENTFLARE_IGNORE_CONFLICTS=true to suppress."
+            );
+        }
+    }
+}
+
+fn scan_agent_configs(agent: &str, markers: &[&str]) -> Option<String> {
+    let configs: &[&str] = match agent {
+        "claude-code" | "cowork" => &[".claude/settings.json"],
+        "cursor" | "cursor-cli" => &[".cursor/hooks.json"],
+        "opencode" => &[".config/opencode/opencode.jsonc"],
+        _ => return None,
+    };
+
+    if std::env::var("AGENTFLARE_IGNORE_CONFLICTS").is_ok() {
+        return None;
+    }
+
+    for rel in configs {
+        let path = home().join(rel);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let lower = content.to_lowercase();
+            if markers.iter().any(|m| lower.contains(m)) {
+                return Some(rel.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
