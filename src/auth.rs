@@ -1,5 +1,6 @@
 use crate::auth_crypt;
 use crate::auth_db::{self, CooldownRow, ProfileHealth};
+use crate::errors::AuthError;
 use crate::paths::home;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -70,9 +71,9 @@ fn profile_dir(agent: &str, profile: &str) -> PathBuf {
     vault_dir().join(agent).join(profile)
 }
 
-fn validate_name(name: &str, kind: &str) -> Result<(), String> {
+fn validate_name(name: &str, kind: &'static str) -> Result<(), AuthError> {
     if name.is_empty() || name.contains('/') || name.contains('\\') {
-        Err(format!("invalid {kind}: '{name}' (must not contain path separators)"))
+        Err(AuthError::InvalidName { name: name.to_string(), kind: kind.to_string() })
     } else {
         Ok(())
     }
@@ -413,18 +414,18 @@ fn hash_vault_profile(cat: &AuthCatalog, profile: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn fail(msg: &str, detail: &str, json: bool) {
+fn fail(msg: &(impl std::fmt::Display + ?Sized), detail: &str, json: bool) {
     if json {
-        println!("{}", serde_json::json!({"error": msg, "detail": detail}));
+        println!("{}", serde_json::json!({"error": msg.to_string(), "detail": detail}));
     } else {
         eprintln!("error: {msg}: {detail}");
     }
 }
 
-fn validate_algorithm(name: &str) -> Result<&str, String> {
+fn validate_algorithm(name: &str) -> Result<&str, AuthError> {
     match name {
         "smart" | "round-robin" | "random" => Ok(name),
-        _ => Err(format!("unknown algorithm: '{name}' (valid: smart, round-robin, random)")),
+        _ => Err(AuthError::UnknownAlgorithm(name.to_string())),
     }
 }
 
