@@ -1,0 +1,20 @@
+[package]
+name = "agent-registry"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "AI agent definitions and detection for agentflare"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

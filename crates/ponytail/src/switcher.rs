@@ -1,4 +1,4 @@
-use crate::ponytail::config;
+use crate::config;
 
 pub enum SwitchAction {
     SetMode(String),

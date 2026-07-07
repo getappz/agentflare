@@ -3,7 +3,7 @@ use clap::Args;
 #[derive(Args)]
 pub struct InitArgs {
     #[arg(long, value_enum)]
-    pub agent: crate::agent_registry::Agent,
+    pub agent: agent_registry::Agent,
     #[arg(long, short = 'y')]
     pub yes: bool,
 }

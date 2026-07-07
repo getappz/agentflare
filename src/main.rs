@@ -1,5 +1,3 @@
-mod agent_registry;
-mod agent_detect;
 mod agent_install;
 mod agent_launch;
 mod agents;
@@ -20,7 +18,6 @@ mod init;
 mod mcp_server;
 mod optimize;
 mod paths;
-mod ponytail;
 mod pricing;
 mod rollup;
 mod rule_text;

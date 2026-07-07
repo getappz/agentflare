@@ -4,15 +4,15 @@ use clap::{Args, Subcommand};
 pub enum HookEvent {
     SessionStart {
         #[arg(long, value_enum)]
-        agent: crate::agent_registry::Agent,
+        agent: agent_registry::Agent,
     },
     PromptSubmit {
         #[arg(long, value_enum)]
-        agent: crate::agent_registry::Agent,
+        agent: agent_registry::Agent,
     },
     PreToolUse {
         #[arg(long, value_enum)]
-        agent: crate::agent_registry::Agent,
+        agent: agent_registry::Agent,
     },
 }
 

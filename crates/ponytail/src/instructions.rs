@@ -1,4 +1,4 @@
-use crate::ponytail::config;
+use crate::config;
 use std::path::Path;
 
 static EMBEDDED_SKILL: &str = include_str!("skill.md");
@@ -41,7 +41,7 @@ pub fn build(mode: &str, skill_path: Option<&Path>) -> Instructions {
     let effective = config::normalize_persisted_mode(mode)
         .unwrap_or(config::DEFAULT_MODE);
 
-    if crate::ponytail::sub_skills::get(effective).is_some() {
+    if crate::sub_skills::get(effective).is_some() {
         return Instructions {
             mode: effective.to_string(),
             body: format!(

@@ -1,8 +1,8 @@
 // Launch engine for `agentflare agents launch <agent> [args...]`.
 // Finds the agent binary on PATH, maps --model/--mode to agent-native
 // flags, and executes with pass-through args and inherited stdio.
-use crate::agent_detect::find_binary;
-use crate::agent_registry::{AgentSpec, Tier};
+use agent_registry::detect::find_binary;
+use agent_registry::{AgentSpec, Tier};
 use std::process::{Command, Stdio};
 
 pub enum LaunchOutcome {
@@ -71,7 +71,7 @@ pub fn run_launch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_registry::{Agent, Tier};
+    use agent_registry::{Agent, Tier};
 
     fn test_registry() -> Vec<AgentSpec> {
         vec![

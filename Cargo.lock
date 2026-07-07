@@ -53,10 +53,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-registry"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dirs",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "agentflare"
 version = "1.1.0"
 dependencies = [
  "aes-gcm",
+ "agent-registry",
  "built",
  "chrono",
  "clap",
@@ -66,6 +77,7 @@ dependencies = [
  "flate2",
  "insta",
  "pbkdf2",
+ "ponytail",
  "pretty_assertions",
  "rand",
  "rmcp",
@@ -1267,6 +1279,17 @@ dependencies = [
  "cpufeatures",
  "opaque-debug",
  "universal-hash",
+]
+
+[[package]]
+name = "ponytail"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "ureq",
 ]
 
 [[package]]

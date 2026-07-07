@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use crate::ponytail::detect;
+use crate::detect;
 
 pub enum AgentPlatform {
     Claude,
