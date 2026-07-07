@@ -1,4 +1,48 @@
 use clap::{Args, Subcommand};
+use std::io::Read;
+
+fn subagent_should_inject() -> bool {
+    let matcher = match std::env::var("PONYTAIL_SUBAGENT_MATCHER") {
+        Ok(m) => m,
+        Err(_) => return true,
+    };
+
+    let re = match regex::Regex::new(&format!("(?i){matcher}")) {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("[ponytail] invalid PONYTAIL_SUBAGENT_MATCHER regex — injecting everywhere");
+            return true;
+        }
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut input = String::new();
+        let _ = std::io::stdin().read_to_string(&mut input);
+        let _ = tx.send(input);
+    });
+    let input = match rx.recv_timeout(std::time::Duration::from_millis(1000)) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("[ponytail] SubagentStart stdin timeout — injecting");
+            return true;
+        }
+    };
+
+    let data: serde_json::Value = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    let agent_type = data
+        .get("agent_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if agent_type.is_empty() {
+        return true;
+    }
+
+    re.is_match(agent_type)
+}
 
 #[derive(Subcommand)]
 pub enum PonytailAction {
@@ -119,7 +163,9 @@ impl PonytailArgs {
                     emit_hook("SessionStart", true);
                 }
                 PonytailHookEvent::SubagentStart => {
-                    emit_hook("SubagentStart", true);
+                    if subagent_should_inject() {
+                        emit_hook("SubagentStart", true);
+                    }
                 }
                 PonytailHookEvent::PromptSubmit => {
                     let mut input = String::new();
