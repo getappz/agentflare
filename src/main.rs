@@ -56,6 +56,9 @@ enum Commands {
     Init {
         #[arg(long, value_enum)]
         agent: Agent,
+        /// Skip all prompts — accept defaults.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Hook entry points, invoked by whatever `init` (or the Codex plugin
     /// manifest) wired into the target agent's hook config. Not meant to be
@@ -475,7 +478,7 @@ fn main() {
     color_eyre::install().expect("color_eyre::install failed");
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init { agent } => init::run(agent.as_str()),
+        Commands::Init { agent, yes } => init::run(agent.as_str(), yes),
         Commands::Hook { event } => match event {
             HookEvent::SessionStart { agent } => hook::session_start(agent.as_str()),
             HookEvent::PromptSubmit { agent } => hook::prompt_submit(agent.as_str()),
