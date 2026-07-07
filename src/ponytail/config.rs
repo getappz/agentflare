@@ -72,3 +72,52 @@ pub fn set_default_mode(mode: &str) -> Result<(), String> {
     std::fs::write(config_path(), json).map_err(|e| e.to_string())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_valid_modes() {
+        assert_eq!(normalize_mode("full"), Some("full"));
+        assert_eq!(normalize_mode("off"), Some("off"));
+        assert_eq!(normalize_mode("ULTRA"), Some("ultra"));
+    }
+
+    #[test]
+    fn rejects_invalid_modes() {
+        assert_eq!(normalize_mode("extreme"), None);
+        assert_eq!(normalize_mode(""), None);
+        assert_eq!(normalize_config_mode("review"), Some("review"));
+        assert_eq!(normalize_mode("review"), None);
+    }
+
+    #[test]
+    fn detects_deactivation() {
+        assert!(is_deactivation("stop ponytail"));
+        assert!(is_deactivation("normal mode"));
+        assert!(is_deactivation("Normal Mode."));
+        assert!(!is_deactivation("add a normal mode toggle"));
+    }
+
+    #[test]
+    fn defaults_to_full() {
+        unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
+        assert_eq!(default_mode(), "full");
+    }
+
+    #[test]
+    fn reads_env_var() {
+        unsafe { std::env::set_var("PONYTAIL_DEFAULT_MODE", "lite") };
+        assert_eq!(default_mode(), "lite");
+        unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
+    }
+}
+
+#[test]
+fn roundtrip_default_mode() {
+    let prev = default_mode();
+    set_default_mode("ultra").unwrap();
+    assert_eq!(default_mode(), "ultra");
+    set_default_mode(&prev).unwrap();
+}

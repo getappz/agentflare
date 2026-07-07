@@ -41,3 +41,35 @@ pub fn detect(input: &str) -> Option<SwitchAction> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_mode_switch() {
+        assert!(matches!(detect("/ponytail lite"), Some(SwitchAction::SetMode(m)) if m == "lite"));
+        assert!(matches!(detect("/ponytail full"), Some(SwitchAction::SetMode(m)) if m == "full"));
+    }
+
+    #[test]
+    fn detects_off() {
+        assert!(matches!(detect("/ponytail off"), Some(SwitchAction::Off)));
+    }
+
+    #[test]
+    fn detects_deactivation_phrase() {
+        assert!(matches!(detect("stop ponytail"), Some(SwitchAction::Off)));
+    }
+
+    #[test]
+    fn detects_default() {
+        assert!(matches!(detect("/ponytail default ultra"), Some(SwitchAction::SetDefault(m)) if m == "ultra"));
+    }
+
+    #[test]
+    fn ignores_false_positives() {
+        assert!(detect("let's talk about ponytail").is_none());
+        assert!(detect("").is_none());
+    }
+}

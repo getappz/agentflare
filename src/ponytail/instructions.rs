@@ -76,3 +76,32 @@ pub fn fallback_instructions(mode: &str) -> String {
          Never simplify away: input validation, error handling, security, accessibility."
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_generates_for_mode() {
+        let f = fallback_instructions("full");
+        assert!(f.contains("PONYTAIL MODE ACTIVE"));
+        assert!(f.contains("The ladder"));
+    }
+
+    #[test]
+    fn build_uses_embedded_skill() {
+        let ins = build("full", None);
+        assert!(!ins.body.is_empty());
+        assert_eq!(ins.mode, "full");
+    }
+
+    #[test]
+    fn filter_keeps_non_mode_lines() {
+        let input = "some rule\n| **lite** | lite only |\n| **full** | full only |\nother rule";
+        let filtered = filter_skill_body(input, "full");
+        assert!(filtered.contains("some rule"));
+        assert!(filtered.contains("full only"));
+        assert!(!filtered.contains("lite only"));
+        assert!(filtered.contains("other rule"));
+    }
+}

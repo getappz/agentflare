@@ -27,3 +27,24 @@ pub fn set_active(mode: &str) -> io::Result<()> {
 pub fn clear_active() {
     let _ = std::fs::remove_file(flag_path());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_active_mode() {
+        clear_active();
+        assert_eq!(active_mode(), None);
+        set_active("full").unwrap();
+        assert_eq!(active_mode(), Some("full".to_string()));
+        clear_active();
+        assert_eq!(active_mode(), None);
+    }
+
+    #[test]
+    fn clear_nonexistent_is_noop() {
+        clear_active();
+        clear_active(); // should not panic
+    }
+}
