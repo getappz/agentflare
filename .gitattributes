@@ -1,0 +1,13 @@
+# Auto-detect text files and normalize line endings to LF in the repository.
+* text=auto
+
+# Shell scripts must be LF on all platforms.
+*.sh text eol=lf
+
+# Rust source is LF.
+*.rs text eol=lf
+Cargo.toml text eol=lf
+Cargo.lock text eol=lf
+
+# Generated files
+*.lock binary
