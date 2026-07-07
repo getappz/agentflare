@@ -22,7 +22,7 @@ fn agentflare_binary() -> String {
         .unwrap_or_else(|| "agentflare".to_string())
 }
 
-fn confirm_ponytail_migration(agent: &str) -> bool {
+fn confirm_ponytail_migration(agent: &str, yes: bool) -> bool {
     let detected = match agent {
         "claude-code" | "cowork" => has_existing_ponytail_claude(),
         "cursor" | "cursor-cli" => has_existing_ponytail_cursor(),
@@ -37,14 +37,45 @@ fn confirm_ponytail_migration(agent: &str) -> bool {
     println!();
     println!("⚠ Existing ponytail plugin detected for {agent}.");
     println!("  agentflare has ponytail built-in — the npm plugin would conflict.");
-    println!("  Disable it now?");
-    println!();
-    println!("  For OpenCode: run 'opencode plugin uninstall ponytail@ponytail'");
-    println!("  For Claude Code: run '/plugin uninstall ponytail@ponytail' in a session");
-    println!();
-    println!("  After disabling, re-run: agentflare init --agent {agent}");
 
-    false
+    if !yes {
+        print!("  Uninstall ponytail plugin? [Y/n] ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        match input.trim().to_lowercase().as_str() {
+            "y" | "yes" | "" => {}
+            _ => {
+                println!("  Skipped. Re-run: agentflare init --agent {agent}");
+                return false;
+            }
+        }
+    }
+
+    match agent {
+        "opencode" => {
+            println!("  Running: opencode plugin uninstall ponytail@ponytail");
+            match std::process::Command::new("opencode")
+                .args(["plugin", "uninstall", "ponytail@ponytail"])
+                .output()
+            {
+                Ok(out) => {
+                    if out.status.success() {
+                        println!("  ok    ponytail plugin uninstalled");
+                    } else {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        println!("  fail  {stderr}");
+                    }
+                }
+                Err(e) => println!("  fail  could not run opencode: {e}"),
+            }
+            true
+        }
+        "claude-code" | "cowork" => {
+            println!("  Run '/plugin uninstall ponytail@ponytail' in a Claude Code session");
+            true
+        }
+        _ => true,
+    }
 }
 
 fn has_existing_ponytail_claude() -> bool {
@@ -88,7 +119,7 @@ fn has_ponytail_ref(content: &str) -> bool {
     content.to_lowercase().contains("ponytail")
 }
 
-pub fn run(agent: &str) {
+pub fn run(agent: &str, yes: bool) {
     println!("agentflare init --agent {agent}\n");
 
     for c in get_components(agent) {
@@ -102,19 +133,19 @@ pub fn run(agent: &str) {
     match agent {
         "claude-code" => {
             wire_claude_code();
-            if confirm_ponytail_migration(agent) {
+            if confirm_ponytail_migration(agent, yes) {
                 wire_ponytail_hooks(agent);
             }
         }
         "cursor" => {
             wire_cursor();
-            if confirm_ponytail_migration(agent) {
+            if confirm_ponytail_migration(agent, yes) {
                 wire_ponytail_hooks(agent);
             }
         }
         "opencode" => {
             wire_opencode();
-            if confirm_ponytail_migration(agent) {
+            if confirm_ponytail_migration(agent, yes) {
                 wire_ponytail_hooks(agent);
             }
         }
