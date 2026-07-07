@@ -7,6 +7,17 @@ use crate::components::get_components;
 use crate::state;
 use serde_json::json;
 use std::io::Read;
+use std::time::Duration;
+
+fn read_stdin_timeout(ms: u64) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut input = String::new();
+        let _ = std::io::stdin().read_to_string(&mut input);
+        let _ = tx.send(input);
+    });
+    rx.recv_timeout(Duration::from_millis(ms)).ok()
+}
 
 pub fn session_start(agent: &str) {
     let components = get_components(agent);
@@ -83,10 +94,13 @@ fn parse_pre_tool_use(input: &str) -> Option<PreToolUseInput> {
 }
 
 pub fn pre_tool_use(_agent: &str) {
-    let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
-        return;
-    }
+    let input = match read_stdin_timeout(1000) {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            eprintln!("[agentflare] PreToolUse: stdin timeout or empty — skipping");
+            return;
+        }
+    };
     let Some(parsed) = parse_pre_tool_use(&input) else { return };
 
     let mut runtime = crate::optimize::load_runtime();
@@ -138,10 +152,13 @@ pub fn pre_tool_use(_agent: &str) {
 }
 
 pub fn prompt_submit(agent: &str) {
-    let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
-        return;
-    }
+    let input = match read_stdin_timeout(1000) {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            eprintln!("[agentflare] UserPromptSubmit: stdin timeout or empty — skipping");
+            return;
+        }
+    };
     let prompt = extract_prompt(&input);
     let prompt = prompt.trim();
 
@@ -151,6 +168,17 @@ pub fn prompt_submit(agent: &str) {
 
     let mut s = state::load();
 
+    if prompt == "/agentflare" || prompt == "/agentflare status" {
+        let state = if s.active { "ACTIVE" } else { "off" };
+        let out = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": format!("agentflare is {state}. Use /agentflare on | off | status."),
+            }
+        });
+        println!("{out}");
+        return;
+    }
     if prompt == "/agentflare off" || prompt == "/agentflare stop" {
         s.active = false;
         state::save(&s);
@@ -237,6 +265,11 @@ pub fn prompt_submit(agent: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_stdin_timeout_does_not_panic() {
+        let _ = read_stdin_timeout(100);
+    }
 
     #[test]
     fn extract_prompt_reads_prompt_key() {
