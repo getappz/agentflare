@@ -5,7 +5,9 @@ mod agent_launch;
 mod agents;
 mod alias;
 mod auth;
+mod auth_crypt;
 mod auth_db;
+mod auth_runner;
 mod components;
 mod coaching;
 mod cost;
@@ -284,6 +286,61 @@ enum AuthAction {
         #[command(subcommand)]
         action: ProjectAction,
     },
+    /// Wrap CLI with auto-failover on rate limit. Rotates profiles automatically.
+    Run {
+        agent: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Manage isolated $HOME profiles for parallel sessions.
+    Isolate {
+        #[command(subcommand)]
+        action: IsolateAction,
+    },
+    /// Run command with an isolated profile's $HOME.
+    Exec {
+        agent: String,
+        profile: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Login flow for an isolated profile.
+    Login {
+        agent: String,
+        profile: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum IsolateAction {
+    /// Create isolated $HOME profile with symlinked host files.
+    Add {
+        agent: String,
+        profile: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List isolated profiles.
+    Ls {
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete isolated profile.
+    Delete {
+        agent: String,
+        profile: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -402,6 +459,14 @@ fn main() {
                 ProjectAction::Set { agent, profile, json } => auth::project_set(&agent, &profile, json),
                 ProjectAction::Unset { agent, json } => auth::project_unset(&agent, json),
             },
+            AuthAction::Run { agent, json, args } => auth_runner::run(&agent, &args, json),
+            AuthAction::Isolate { action } => match action {
+                IsolateAction::Add { agent, profile, json } => auth::isolate_add(&agent, &profile, json),
+                IsolateAction::Ls { agent, json } => auth::isolate_ls(agent.as_deref(), json),
+                IsolateAction::Delete { agent, profile, json } => auth::isolate_delete(&agent, &profile, json),
+            },
+            AuthAction::Exec { agent, profile, json, args } => auth::auth_exec(&agent, &profile, &args, json),
+            AuthAction::Login { agent, profile, json, args } => auth::auth_login(&agent, &profile, &args, json),
         },
         Commands::Alias { preferred, force, print, yes, shell, profile, json } => {
             alias::run(preferred, force, print, yes, shell, profile, json)

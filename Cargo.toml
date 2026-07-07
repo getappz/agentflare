@@ -45,6 +45,8 @@ tar = "0.4"
 zip = "2"
 rusqlite = { version = "0.40", features = ["bundled"] }
 rand = "0.8"
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", features = ["simple"] }
 
 [profile.release]
 opt-level = 3

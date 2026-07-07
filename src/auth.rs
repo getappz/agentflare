@@ -1,3 +1,4 @@
+use crate::auth_crypt;
 use crate::auth_db::{self, CooldownRow, ProfileHealth};
 use crate::paths::home;
 use rusqlite::Connection;
@@ -49,6 +50,12 @@ static CATALOG: &[AuthCatalog] = &[
             ".opencode/auth.json",
         ],
     },
+    AuthCatalog {
+        agent_key: "copilot",
+        files: &[
+            ".copilot/auth.json",
+        ],
+    },
 ];
 
 fn catalog_for(agent: &str) -> Option<&'static AuthCatalog> {
@@ -84,11 +91,18 @@ pub fn backup(agent: &str, profile: &str, json: bool) {
 
     let mut backed = 0;
     let mut skipped = 0;
+    let passphrase = auth_crypt::get_passphrase();
     for &rel in cat.files {
         let src = home().join(rel);
         let dest = vault.join(rel.rsplit('/').next().unwrap_or(rel));
         if src.exists() {
-            fs::copy(&src, &dest).expect("copy");
+            let data = fs::read(&src).expect("read");
+            if let Some(ref pw) = passphrase {
+                let encrypted = auth_crypt::encrypt(&data, pw).expect("encrypt");
+                fs::write(&dest, encrypted).expect("write");
+            } else {
+                fs::write(&dest, data).expect("write");
+            }
             backed += 1;
         } else {
             skipped += 1;
@@ -155,6 +169,7 @@ pub fn activate(agent: &str, profile: &str, json: bool) {
     }
 
     let mut restored = 0;
+    let passphrase = auth_crypt::get_passphrase();
     for &rel in cat.files {
         let src = vault.join(
             rel.split('/').next_back().unwrap_or(rel)
@@ -164,7 +179,17 @@ pub fn activate(agent: &str, profile: &str, json: bool) {
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent).expect("create parent");
             }
-            fs::copy(&src, &dest).expect("copy");
+            let data = fs::read(&src).expect("read");
+            if let Some(ref pw) = passphrase {
+                if let Some(decrypted) = auth_crypt::decrypt(&data, pw) {
+                    fs::write(&dest, decrypted).expect("write");
+                } else {
+                    eprintln!("warning: cannot decrypt {} — wrong passphrase or corrupted", src.display());
+                    continue;
+                }
+            } else {
+                fs::write(&dest, data).expect("write");
+            }
             restored += 1;
         }
     }
@@ -680,6 +705,202 @@ pub fn project_unset(agent: &str, json: bool) {
     } else {
         println!("project unset: {path}/{agent}");
     }
+}
+
+const ISOLATE_DIR: &str = "isolate";
+
+fn isolates_dir() -> PathBuf {
+    home().join(".local").join("share").join("agentflare").join(ISOLATE_DIR)
+}
+
+pub fn isolate_add(agent: &str, profile: &str, json: bool) {
+    let dir = isolates_dir().join(agent).join(profile);
+    if dir.exists() {
+        if json {
+            println!("{}", serde_json::json!({"error": "isolated profile already exists"}));
+        } else {
+            eprintln!("isolated profile '{agent}/{profile}' already exists");
+        }
+        return;
+    }
+    fs::create_dir_all(&dir).expect("create isolate dir");
+
+    // Symlink shared host files
+    for host_file in &[".ssh", ".gitconfig", ".git-credentials"] {
+        let src = home().join(host_file);
+        if src.exists() {
+            symlink_or_copy(&src, &dir.join(host_file));
+        }
+    }
+
+    // Copy auth files from vault profile
+    activate_into(agent, profile, &dir);
+
+    if json {
+        println!("{}", serde_json::json!({"agent": agent, "profile": profile, "isolate_dir": dir.to_string_lossy()}));
+    } else {
+        println!("isolated profile created: {agent}/{profile} at {}", dir.display());
+    }
+}
+
+pub fn isolate_ls(agent: Option<&str>, json: bool) {
+    let dir = isolates_dir();
+    if !dir.exists() {
+        if json {
+            println!("[]");
+        } else {
+            println!("no isolated profiles");
+        }
+        return;
+    }
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let agents: Vec<String> = match agent {
+        Some(a) => vec![a.to_string()],
+        None => fs::read_dir(&dir).ok().map(|entries| {
+            entries.flatten().filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.file_name().to_string_lossy().to_string()).collect()
+        }).unwrap_or_default(),
+    };
+    for a in &agents {
+        let agent_dir = dir.join(a);
+        if !agent_dir.exists() { continue; }
+        if let Ok(entries) = fs::read_dir(&agent_dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    let p = entry.file_name().to_string_lossy().to_string();
+                    if json {
+                        results.push(serde_json::json!({"agent": a, "profile": p}));
+                    } else {
+                        println!("{a}/{p}");
+                    }
+                }
+            }
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string(&results).unwrap());
+    }
+}
+
+pub fn isolate_delete(agent: &str, profile: &str, json: bool) {
+    let dir = isolates_dir().join(agent).join(profile);
+    if !dir.exists() {
+        if json {
+            println!("{}", serde_json::json!({"error": "not found"}));
+        } else {
+            eprintln!("isolated profile '{agent}/{profile}' not found");
+        }
+        return;
+    }
+    fs::remove_dir_all(&dir).expect("remove isolate dir");
+    if json {
+        println!("{}", serde_json::json!({"deleted": true, "agent": agent, "profile": profile}));
+    } else {
+        println!("deleted isolated profile: {agent}/{profile}");
+    }
+}
+
+pub fn auth_exec(agent: &str, profile: &str, args: &[String], json: bool) {
+    let dir = isolates_dir().join(agent).join(profile);
+    if !dir.exists() {
+        if json {
+            println!("{}", serde_json::json!({"error": "isolated profile not found"}));
+        } else {
+            eprintln!("error: isolated profile '{agent}/{profile}' not found — run 'auth isolate add' first");
+        }
+        return;
+    }
+
+    if args.is_empty() {
+        eprintln!("error: no command specified after --");
+        return;
+    }
+
+    let binary = &args[0];
+    let rest = &args[1..];
+
+    let status = std::process::Command::new(binary)
+        .args(rest)
+        .env("HOME", &dir)
+        .spawn()
+        .and_then(|mut c| c.wait())
+        .unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        });
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+pub fn auth_login(agent: &str, profile: &str, args: &[String], json: bool) {
+    let dir = isolates_dir().join(agent).join(profile);
+    if !dir.exists() {
+        // Auto-create isolate if it doesn't exist
+        isolate_add(agent, profile, json);
+    }
+
+    if args.is_empty() {
+        eprintln!("error: no login command specified after --");
+        return;
+    }
+
+    let binary = &args[0];
+    let rest = &args[1..];
+
+    let status = std::process::Command::new(binary)
+        .args(rest)
+        .env("HOME", &dir)
+        .spawn()
+        .and_then(|mut c| c.wait())
+        .unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        });
+
+    if status.success() {
+        // After login, backup the new auth state
+        let dir = isolates_dir().join(agent).join(profile);
+        for &rel in CATALOG.iter().find(|c| c.agent_key == agent).map(|c| c.files).unwrap_or(&[]) {
+            let dest = profile_dir(agent, profile).join(rel.rsplit('/').next().unwrap_or(rel));
+            let src = dir.join(rel);
+            if src.exists() {
+                fs::create_dir_all(dest.parent().unwrap()).ok();
+                fs::copy(&src, &dest).ok();
+            }
+        }
+        if !json {
+            println!("login complete — auth backed up to vault profile '{agent}/{profile}'");
+        }
+    } else {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+fn activate_into(agent: &str, profile: &str, target_dir: &std::path::Path) {
+    let cat = match catalog_for(agent) { Some(c) => c, None => { return; } };
+    let vault = profile_dir(agent, profile);
+    for &rel in cat.files {
+        let src = vault.join(rel.rsplit('/').next().unwrap_or(rel));
+        if src.exists() {
+            let dest = target_dir.join(rel);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            fs::copy(&src, &dest).ok();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn symlink_or_copy(src: &std::path::Path, dest: &std::path::Path) {
+    std::os::unix::fs::symlink(src, dest).ok();
+}
+
+#[cfg(windows)]
+fn symlink_or_copy(src: &std::path::Path, dest: &std::path::Path) {
+    fs::copy(src, dest).ok();
 }
 
 #[cfg(test)]
