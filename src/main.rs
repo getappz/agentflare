@@ -4,6 +4,7 @@ mod agent_install;
 mod agent_launch;
 mod agents;
 mod alias;
+mod auth;
 mod components;
 mod coaching;
 mod cost;
@@ -181,6 +182,68 @@ enum AgentsAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Auth profile vault — backup, switch, and manage agent OAuth tokens.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Save current auth files to vault.
+    Backup {
+        agent: String,
+        profile: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore auth files from vault (<100ms switch).
+    Activate {
+        agent: String,
+        profile: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show active profile via content-hash detection.
+    Status {
+        /// Limit to one agent.
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List supported agents for auth vault.
+    Catalog {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List saved profiles for an agent.
+    Ls {
+        agent: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove live auth files (logout state).
+    Clear {
+        agent: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove profile from vault.
+    Delete {
+        agent: String,
+        profile: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename profile (non-destructive).
+    Rename {
+        agent: String,
+        old: String,
+        new: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -233,6 +296,16 @@ fn main() {
             AgentsAction::Launch { agent, model, mode, args } => {
                 agents::cli_launch(&agent, model.as_deref(), mode.as_deref(), &args)
             }
+            AgentsAction::Auth { action } => match action {
+                AuthAction::Backup { agent, profile, json } => auth::backup(&agent, &profile, json),
+                AuthAction::Activate { agent, profile, json } => auth::activate(&agent, &profile, json),
+                AuthAction::Status { agent, json } => auth::status(agent.as_deref(), json),
+                AuthAction::Catalog { json } => auth::list_agents(json),
+                AuthAction::Ls { agent, json } => auth::ls(&agent, json),
+                AuthAction::Clear { agent, json } => auth::clear(&agent, json),
+                AuthAction::Delete { agent, profile, json } => auth::delete(&agent, &profile, json),
+                AuthAction::Rename { agent, old, new, json } => auth::rename(&agent, &old, &new, json),
+            },
         },
         Commands::Alias { preferred, force, print, yes, shell, profile, json } => {
             alias::run(preferred, force, print, yes, shell, profile, json)
