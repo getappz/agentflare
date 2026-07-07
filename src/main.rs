@@ -19,6 +19,7 @@ mod init;
 mod mcp_server;
 mod optimize;
 mod paths;
+mod ponytail;
 mod pricing;
 mod rollup;
 mod rule_text;
