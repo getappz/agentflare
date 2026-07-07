@@ -552,11 +552,52 @@ fn main() {
                 match ponytail::download_skill() {
                     Ok(path) => {
                         println!("SKILL.md saved to {path}");
-                        println!("Hook config: add to agent hook settings:");
-                        println!("  Claude Code:  agentflare ponytail hook session-start");
-                        println!("  Codex:        agentflare ponytail hook session-start");
-                        println!("  Copilot:      agentflare ponytail hook session-start");
-                        println!("  Statusline:   agentflare ponytail hook statusline");
+                        println!();
+                        println!("Agent detection:");
+                        if let Some(result) = ponytail::detect::detect() {
+                            let source = match result.source {
+                                ponytail::detect::DetectionSource::ParentProcess => "process tree",
+                                ponytail::detect::DetectionSource::StandardEnvVar => "AI_AGENT/AGENT env",
+                                ponytail::detect::DetectionSource::ToolEnvVar => "tool env var",
+                                #[cfg(not(feature = "process-tree"))]
+                                _ => "env var",
+                            };
+                            println!("  detected: {} (via {source})", result.name);
+                            println!();
+                            println!("Hook config — add this to your agent settings:");
+                            match result.name.as_str() {
+                                "claude-code" | "cowork" => {
+                                    println!("  settings.json → hooks.SessionStart.command: agentflare ponytail hook session-start");
+                                    println!("  settings.json → hooks.SubagentStart.command: agentflare ponytail hook subagent-start");
+                                    println!("  settings.json → statusLine.command: agentflare ponytail hook statusline");
+                                }
+                                "codex" => {
+                                    println!("  plugin hooks config → SessionStart: agentflare ponytail hook session-start");
+                                    println!("  plugin hooks config → SubagentStart: agentflare ponytail hook subagent-start");
+                                }
+                                "opencode" => {
+                                    println!("  opencode.json hooks.SessionStart.command: agentflare ponytail hook session-start");
+                                    println!("  opencode.json hooks.SubagentStart.command: agentflare ponytail hook subagent-start");
+                                }
+                                "cursor" | "cursor-cli" => {
+                                    println!("  Cursor settings → hooks.SessionStart: agentflare ponytail hook session-start");
+                                }
+                                _ => {
+                                    println!("  SessionStart hook:  agentflare ponytail hook session-start");
+                                    println!("  SubagentStart hook: agentflare ponytail hook subagent-start");
+                                    println!("  Statusline:         agentflare ponytail hook statusline");
+                                }
+                            }
+                        } else {
+                            println!("  no AI agent detected. Run this inside an agent session.");
+                            println!();
+                            println!("Or configure manually:");
+                            println!("  SessionStart hook command: agentflare ponytail hook session-start");
+                            println!("  Statusline command:       agentflare ponytail hook statusline");
+                        }
+                        println!();
+                        println!("After configuring: restart your agent, then run:");
+                        println!("  agentflare ponytail status");
                     }
                     Err(e) => {
                         eprintln!("download failed: {e}");
