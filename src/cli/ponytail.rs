@@ -175,6 +175,9 @@ impl PonytailArgs {
                             ponytail::SwitchAction::SetMode(m) => {
                                 ponytail::set_active(&m).ok();
                             }
+                            ponytail::SwitchAction::SetSession(m) => {
+                                ponytail::set_session(&m).ok();
+                            }
                             ponytail::SwitchAction::SetDefault(m) => {
                                 ponytail::set_default_mode(&m).ok();
                                 ponytail::set_active(&m).ok();
@@ -182,6 +185,7 @@ impl PonytailArgs {
                             ponytail::SwitchAction::Off => {
                                 ponytail::clear_active();
                             }
+                            ponytail::SwitchAction::Report => {}
                         }
                     }
                     println!("OK");

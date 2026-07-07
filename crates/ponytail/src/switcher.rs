@@ -2,8 +2,10 @@ use crate::config;
 
 pub enum SwitchAction {
     SetMode(String),
+    SetSession(String),
     SetDefault(String),
     Off,
+    Report,
 }
 
 pub fn detect(input: &str) -> Option<SwitchAction> {
@@ -35,14 +37,26 @@ pub fn detect(input: &str) -> Option<SwitchAction> {
     let sub = parts.first().copied().unwrap_or("");
     let arg = parts.get(1).copied().unwrap_or("");
 
-    if sub.is_empty() || sub == "lite" || sub == "full" || sub == "ultra" {
-        let mode = if sub.is_empty() { "full" } else { sub };
-        let normalized = config::normalize_config_mode(mode)?;
+    if sub.is_empty() {
+        return Some(SwitchAction::Report);
+    }
+
+    if sub == "lite" || sub == "full" || sub == "ultra" {
+        let normalized = config::normalize_config_mode(sub)?;
         return Some(SwitchAction::SetMode(normalized.to_string()));
     }
 
     match sub {
         "off" => Some(SwitchAction::Off),
+        "status" => Some(SwitchAction::Report),
+        "session" => {
+            let smode = arg;
+            if smode.is_empty() {
+                return None;
+            }
+            let normalized = config::normalize_config_mode(smode)?;
+            Some(SwitchAction::SetSession(normalized.to_string()))
+        }
         "review" | "audit" | "debt" | "gain" | "help" | "playbook" => {
             let normalized = config::normalize_config_mode(sub)?;
             Some(SwitchAction::SetMode(normalized.to_string()))
@@ -108,5 +122,21 @@ mod tests {
     #[test]
     fn detects_sub_skill_playbook() {
         assert!(matches!(detect("/ponytail-playbook"), Some(SwitchAction::SetMode(m)) if m == "playbook"));
+    }
+
+    #[test]
+    fn detects_session_mode() {
+        assert!(matches!(detect("/ponytail session ultra"), Some(SwitchAction::SetSession(m)) if m == "ultra"));
+        assert!(detect("/ponytail session").is_none());
+    }
+
+    #[test]
+    fn detects_status() {
+        assert!(matches!(detect("/ponytail status"), Some(SwitchAction::Report)));
+    }
+
+    #[test]
+    fn detects_bare_as_report() {
+        assert!(matches!(detect("/ponytail"), Some(SwitchAction::Report)));
     }
 }
