@@ -70,9 +70,14 @@ struct GatewayExecuteRequest {
     server: String,
     #[schemars(description = "Tool name from gateway_search")]
     tool: String,
+    // A bare `serde_json::Value` here made schemars emit a typeless schema
+    // (Value can be anything), so callers had no signal to send a nested
+    // JSON object rather than a stringified one — gateway_execute couldn't
+    // actually be invoked with arguments. `Map` renders as `{"type":
+    // ["object", "null"]}`, a real hint.
     #[schemars(description = "Arguments object matching the tool's input_schema")]
     #[serde(default)]
-    args: serde_json::Value,
+    args: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Default)]
@@ -346,6 +351,7 @@ impl AgentflareMcp {
         if server.trim().is_empty() || tool.trim().is_empty() {
             return Err(ErrorData::invalid_params("server and tool are required", None));
         }
+        let args = args.map(serde_json::Value::Object).unwrap_or(serde_json::Value::Null);
         let guard = self.ensure_gateway_registry().await?;
         let reg = guard.as_ref().expect("ensured above");
         match reg.execute(&server, &tool, args).await {
@@ -696,7 +702,7 @@ mod tests {
             .gateway_execute(Parameters(GatewayExecuteRequest {
                 server: "".into(),
                 tool: "x".into(),
-                args: serde_json::json!({}),
+                args: Some(serde_json::Map::new()),
             }))
             .await
             .unwrap_err();
@@ -717,11 +723,21 @@ mod tests {
             .gateway_execute(Parameters(GatewayExecuteRequest {
                 server: "definitely-not-a-configured-server".into(),
                 tool: "x".into(),
-                args: serde_json::json!({}),
+                args: Some(serde_json::Map::new()),
             }))
             .await
             .unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn gateway_execute_args_schema_is_object_or_null() {
+        let schema = schemars::schema_for!(GatewayExecuteRequest);
+        let schema_json = serde_json::to_value(&schema).unwrap();
+        let args_schema = schema_json.get("properties").and_then(|p| p.get("args")).expect("args schema present");
+        let rendered = args_schema.to_string();
+        assert!(rendered.contains("\"object\""), "{rendered}");
+        assert!(rendered.contains("\"null\""), "{rendered}");
     }
 }

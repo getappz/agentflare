@@ -79,6 +79,10 @@ fn session_start_message(agent: &str) -> String {
         "Skills load on demand: before assuming a relevant skill doesn't exist, call skill_search(query) then skill_load(name) via the agentflare MCP tools."
             .to_string(),
     );
+    lines.push(
+        "Memory on-demand: gateway_search(query)->gateway_execute(server=\"engram\",tool,args). Not auto-loaded."
+            .to_string(),
+    );
 
     lines.join("\n")
 }
@@ -356,6 +360,16 @@ mod tests {
             let msg = session_start_message("claude-code");
             assert!(msg.contains("skill_search(query)"));
             assert!(msg.contains("skill_load(name)"));
+        });
+    }
+
+    #[test]
+    fn session_start_message_nudges_engram_via_gateway() {
+        use crate::paths::test_support::with_temp_home;
+        with_temp_home(|| {
+            let msg = session_start_message("claude-code");
+            assert!(msg.contains("gateway_search(query)"));
+            assert!(msg.contains("gateway_execute(server=\"engram\""));
         });
     }
 }
