@@ -16,7 +16,17 @@ use std::time::{Duration, Instant};
 const REFRESH_DEBOUNCE: Duration = Duration::from_secs(60);
 
 pub struct Registry {
-    conn: Connection,
+    /// `std::sync::Mutex`, not a bare `Connection` — `rusqlite::Connection`
+    /// holds `RefCell`s internally (its statement cache), so it's `Send` but
+    /// not `Sync`, which makes a bare `&Registry` non-`Send` and breaks the
+    /// `Send` bound `rmcp`'s tool router needs on the futures returned by
+    /// `search`/`execute` when called from `src/mcp_server.rs`. Wrapping in a
+    /// `Mutex` (never held across an `.await` point — every access here locks,
+    /// does its synchronous rusqlite work, and drops the guard before any
+    /// `await`) makes `Registry: Sync` at negligible cost, mirroring how
+    /// `mcp_stdio::McpStdioBackend` already wraps its non-`Sync` connection
+    /// state in a `Mutex` for the same reason.
+    conn: std::sync::Mutex<Connection>,
     backends: HashMap<String, Backend>,
     last_refresh: Option<Instant>,
 }
@@ -29,7 +39,7 @@ impl Registry {
     ) -> Result<Self, GatewayError> {
         let conn = db::open_db(db_path)?;
         let backends = build_backends(config, secrets);
-        let mut reg = Self { conn, backends, last_refresh: None };
+        let mut reg = Self { conn: std::sync::Mutex::new(conn), backends, last_refresh: None };
         reg.ensure_fresh().await?;
         Ok(reg)
     }
@@ -48,7 +58,7 @@ impl Registry {
     ) -> Result<Self, GatewayError> {
         let conn = db::open_in_memory()?;
         let backends = build_backends(config, secrets);
-        let mut reg = Self { conn, backends, last_refresh: None };
+        let mut reg = Self { conn: std::sync::Mutex::new(conn), backends, last_refresh: None };
         reg.ensure_fresh().await?;
         Ok(reg)
     }
@@ -73,13 +83,17 @@ impl Registry {
                 Err(e) => eprintln!("gateway-registry: discover failed for backend '{name}': {e}"),
             }
         }
-        db::rebuild(&mut self.conn, &entries)?;
+        {
+            let mut conn = self.conn.lock().expect("gateway registry db mutex poisoned");
+            db::rebuild(&mut conn, &entries)?;
+        }
         self.last_refresh = Some(Instant::now());
         Ok(())
     }
 
     pub fn search(&self, query: &str, limit: usize, mode: MatchMode) -> Result<Vec<ToolHit>, GatewayError> {
-        Ok(search(&self.conn, query, limit, mode)?)
+        let conn = self.conn.lock().expect("gateway registry db mutex poisoned");
+        Ok(search(&conn, query, limit, mode)?)
     }
 
     pub async fn execute(&self, server: &str, tool: &str, args: Value) -> Result<Value, GatewayError> {
@@ -94,7 +108,10 @@ impl Registry {
                 return Err(GatewayError::ServerNotFound(msg));
             }
         };
-        let known_tools = db::tool_names(&self.conn, server)?;
+        let known_tools = {
+            let conn = self.conn.lock().expect("gateway registry db mutex poisoned");
+            db::tool_names(&conn, server)?
+        };
         if !known_tools.is_empty() && !known_tools.contains(&tool.to_string()) {
             let msg = match suggest(tool, &known_tools) {
                 Some(s) => format!("tool '{tool}' not found on server '{server}' — did you mean '{s}'?"),

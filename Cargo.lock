@@ -75,6 +75,7 @@ dependencies = [
  "dirs",
  "eyre",
  "flate2",
+ "gateway-registry",
  "insta",
  "pbkdf2",
  "ponytail",
