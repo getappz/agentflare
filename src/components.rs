@@ -45,6 +45,22 @@ fn claude_settings() -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// User-scope `claude mcp add` registrations live in `~/.claude.json`, a
+/// separate file from `~/.claude/settings.json`.
+fn claude_json() -> Value {
+    fs::read_to_string(home().join(".claude.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn json_at(path: &PathBuf) -> Value {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(Value::Null)
+}
+
 fn plugin_enabled(settings: &Value, key: &str) -> bool {
     settings
         .get("enabledPlugins")
@@ -195,6 +211,55 @@ fn host_marker(component: &str, host: &str) -> PathBuf {
 fn mark_done(path: &PathBuf) {
     let _ = fs::create_dir_all(path.parent().unwrap());
     let _ = fs::write(path, format!("{:?}", std::time::SystemTime::now()));
+}
+
+/// Every skill name the shared skill_registry cache currently knows about —
+/// same source `skill_search`/`skill_load` (mcp_server.rs) already serve
+/// from, so "known skills" here always matches what those tools can find.
+fn discover_skill_names() -> Result<Vec<String>, String> {
+    let mut registry = skill_registry::Registry::open_default(&crate::paths::skills_db_path())
+        .map_err(|e| e.to_string())?;
+    registry.ensure_fresh().map_err(|e| e.to_string())?;
+    registry.list_all_names().map_err(|e| e.to_string())
+}
+
+/// Pure merge step: adds a `"name-only"` entry for every name that doesn't
+/// already have *some* skillOverrides entry — a skill the user (or another
+/// tool) already set to e.g. `"off"` is left untouched. Returns how many
+/// entries were newly added. Split out from `sync_skill_overrides` so this
+/// logic is unit-testable without touching the real settings.json/skills.db.
+fn apply_skill_overrides(names: &[String], settings: &mut Value) -> Result<usize, String> {
+    if !settings.is_object() {
+        *settings = serde_json::json!({});
+    }
+    let obj = settings.as_object_mut().expect("just ensured object above");
+    let overrides = obj
+        .entry("skillOverrides")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("skillOverrides is not an object")?;
+    let mut added = 0;
+    for name in names {
+        if !overrides.contains_key(name) {
+            overrides.insert(name.clone(), serde_json::json!("name-only"));
+            added += 1;
+        }
+    }
+    Ok(added)
+}
+
+/// Adds a `"name-only"` entry to `~/.claude/settings.json`'s `skillOverrides`
+/// for every discovered skill that doesn't already have one.
+fn sync_skill_overrides() -> Result<usize, String> {
+    let names = discover_skill_names()?;
+    let path = home().join(".claude").join("settings.json");
+    let mut settings = claude_settings();
+    let added = apply_skill_overrides(&names, &mut settings)?;
+    if added > 0 {
+        fs::write(&path, serde_json::to_string_pretty(&settings).unwrap_or_default() + "\n")
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(added)
 }
 
 pub fn get_components(host: &str) -> Vec<Component> {
@@ -354,6 +419,111 @@ pub fn get_components(host: &str) -> Vec<Component> {
                 })
             },
         },
+        // agentflare's own MCP server exposes skill_search/skill_load — the
+        // on-demand replacement for the always-listed skill descriptions
+        // this same init wires `skillOverrides` to suppress (below). Same 4
+        // hosts engram's manual-registration branch covers; other hosts
+        // report satisfied until their MCP config format is verified here.
+        Component {
+            id: "agentflare-mcp",
+            needs_consent: true,
+            describe: if host_owned == "claude-code" {
+                "agentflare MCP server (skill_search/skill_load) — claude mcp add agentflare -- agentflare mcp".to_string()
+            } else if matches!(host_owned.as_str(), "cline" | "continue" | "opencode") {
+                format!("agentflare MCP server (skill_search/skill_load) — manual MCP registration for {host_owned}")
+            } else {
+                "agentflare MCP server — not yet supported for this host".to_string()
+            },
+            check: {
+                let host = host_owned.clone();
+                Box::new(move || match host.as_str() {
+                    "claude-code" => claude_json()
+                        .get("mcpServers")
+                        .and_then(|m| m.get("agentflare"))
+                        .is_some(),
+                    "cline" => json_at(&home().join(".cline").join("mcp.json"))
+                        .get("mcpServers")
+                        .and_then(|m| m.get("agentflare"))
+                        .is_some(),
+                    "continue" => cwd().join(".continue").join("mcpServers").join("agentflare.json").exists(),
+                    "opencode" => json_at(&home().join(".config").join("opencode").join("opencode.jsonc"))
+                        .get("mcp")
+                        .and_then(|m| m.get("agentflare"))
+                        .is_some(),
+                    _ => true,
+                })
+            },
+            apply: {
+                let host = host_owned.clone();
+                Box::new(move || {
+                    let entry = serde_json::json!({ "command": "agentflare", "args": ["mcp"] });
+                    match host.as_str() {
+                        "claude-code" => {
+                            if run_ok("claude", &["mcp", "add", "agentflare", "-s", "user", "--", "agentflare", "mcp"]) {
+                                "agentflare MCP server registered with claude-code".to_string()
+                            } else {
+                                "agentflare MCP registration failed — run manually: claude mcp add agentflare -- agentflare mcp".to_string()
+                            }
+                        }
+                        "cline" => {
+                            let path = home().join(".cline").join("mcp.json");
+                            if merge_json(&path, "agentflare", entry) {
+                                format!("{} (agentflare registered)", path.display())
+                            } else {
+                                format!("failed to write {}", path.display())
+                            }
+                        }
+                        "continue" => {
+                            let path = cwd().join(".continue").join("mcpServers").join("agentflare.json");
+                            if write_if_absent(&path, &(serde_json::to_string_pretty(&entry).unwrap() + "\n")) {
+                                format!("{} written", path.display())
+                            } else {
+                                format!("{} exists, skipped", path.display())
+                            }
+                        }
+                        "opencode" => {
+                            let path = home().join(".config").join("opencode").join("opencode.jsonc");
+                            if merge_opencode_mcp(&path, "agentflare", entry) {
+                                format!("{} (agentflare registered)", path.display())
+                            } else {
+                                format!("failed to write {}", path.display())
+                            }
+                        }
+                        _ => format!("no agentflare MCP integration defined for host '{host}'"),
+                    }
+                })
+            },
+        },
+        // Suppresses every known skill's description from Claude Code's
+        // always-on listing (settings.json `skillOverrides: name-only`) —
+        // names stay typable, skill_search/skill_load (registered above)
+        // become the on-demand detail source. Claude-Code-only: other hosts
+        // have no equivalent per-skill override mechanism. Not
+        // consent-gated (a local config tweak, same trust level as
+        // ponytail-mode/caveman-mode below) so it also re-syncs on every
+        // session-start as new skills appear, not just during `init`.
+        Component {
+            id: "skill-overrides-sync",
+            needs_consent: false,
+            describe: "sync skillOverrides so newly-discovered skills defer their description to on-demand search".to_string(),
+            check: {
+                let host = host_owned.clone();
+                Box::new(move || {
+                    if host != "claude-code" {
+                        return true;
+                    }
+                    let Ok(names) = discover_skill_names() else { return true };
+                    let settings = claude_settings();
+                    let overrides = settings.get("skillOverrides").and_then(|v| v.as_object());
+                    names.iter().all(|n| overrides.is_some_and(|o| o.contains_key(n)))
+                })
+            },
+            apply: Box::new(|| match sync_skill_overrides() {
+                Ok(0) => "skillOverrides already up to date".to_string(),
+                Ok(n) => format!("skillOverrides: {n} skill(s) set to name-only"),
+                Err(e) => format!("skillOverrides sync failed: {e}"),
+            }),
+        },
         // Ponytail/Caveman are Claude Code plugins installed via the `claude
         // plugin` CLI — no equivalent exists on any other host, so these
         // report "satisfied" everywhere else rather than nagging about
@@ -456,14 +626,23 @@ mod tests {
             let components = get_components(host);
             assert_eq!(
                 components.len(),
-                6,
-                "expected 6 components for host '{host}', got {}",
+                8,
+                "expected 8 components for host '{host}', got {}",
                 components.len()
             );
             let ids: Vec<_> = components.iter().map(|c| c.id).collect();
             assert_eq!(
                 ids,
-                vec!["rules", "leanctx", "engram", "ponytail-plugin", "ponytail-mode", "caveman-mode"]
+                vec![
+                    "rules",
+                    "leanctx",
+                    "engram",
+                    "agentflare-mcp",
+                    "skill-overrides-sync",
+                    "ponytail-plugin",
+                    "ponytail-mode",
+                    "caveman-mode"
+                ]
             );
         }
     }
@@ -522,5 +701,53 @@ mod tests {
             assert!((ponytail_plugin.check)(), "ponytail-plugin should be satisfied on '{host}'");
             assert!((caveman_mode.check)(), "caveman-mode should be satisfied on '{host}'");
         }
+    }
+
+    #[test]
+    fn agentflare_mcp_reports_satisfied_on_hosts_without_a_wired_format() {
+        // codex/cursor/windsurf/vscode-copilot have no verified MCP config
+        // format wired here yet — must never nag or attempt registration.
+        for host in ["codex", "cursor", "windsurf", "vscode-copilot"] {
+            let components = get_components(host);
+            let agentflare_mcp = components.iter().find(|c| c.id == "agentflare-mcp").unwrap();
+            assert!((agentflare_mcp.check)(), "agentflare-mcp should be satisfied on '{host}'");
+        }
+    }
+
+    #[test]
+    fn skill_overrides_sync_reports_satisfied_on_non_claude_code_hosts() {
+        for host in ["codex", "cursor", "windsurf", "vscode-copilot", "cline", "continue", "opencode"] {
+            let components = get_components(host);
+            let sync = components.iter().find(|c| c.id == "skill-overrides-sync").unwrap();
+            assert!((sync.check)(), "skill-overrides-sync should be satisfied on '{host}'");
+        }
+    }
+
+    #[test]
+    fn apply_skill_overrides_adds_name_only_for_new_skills_only() {
+        let mut settings = serde_json::json!({
+            "skillOverrides": { "already-configured": "off" }
+        });
+        let names = vec!["already-configured".to_string(), "brand-new".to_string()];
+        let added = apply_skill_overrides(&names, &mut settings).unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(settings["skillOverrides"]["already-configured"], "off");
+        assert_eq!(settings["skillOverrides"]["brand-new"], "name-only");
+    }
+
+    #[test]
+    fn apply_skill_overrides_handles_missing_settings_object() {
+        let mut settings = Value::Null;
+        let added = apply_skill_overrides(&["some-skill".to_string()], &mut settings).unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(settings["skillOverrides"]["some-skill"], "name-only");
+    }
+
+    #[test]
+    fn apply_skill_overrides_is_idempotent() {
+        let mut settings = serde_json::json!({});
+        let names = vec!["skill-a".to_string()];
+        assert_eq!(apply_skill_overrides(&names, &mut settings).unwrap(), 1);
+        assert_eq!(apply_skill_overrides(&names, &mut settings).unwrap(), 0);
     }
 }

@@ -109,14 +109,6 @@ impl AgentflareMcp {
         serde_json::to_string_pretty(&result).unwrap_or_default()
     }
 
-    fn skills_db_path() -> std::path::PathBuf {
-        // Same base dir the rollup cache uses; keep skills in their own file.
-        dirs::data_local_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("agentflare")
-            .join("skills.db")
-    }
-
     /// Lock the persisted registry, lazily opening it on first use, refresh
     /// it (debounced inside `Registry::ensure_fresh`), then run `f` against
     /// it. A poisoned lock or an init/refresh failure both map to the same
@@ -133,7 +125,7 @@ impl AgentflareMcp {
             let db_path = self
                 .skills_db_override
                 .clone()
-                .unwrap_or_else(Self::skills_db_path);
+                .unwrap_or_else(crate::paths::skills_db_path);
             let reg = skill_registry::Registry::open_default(&db_path)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
             *guard = Some(reg);

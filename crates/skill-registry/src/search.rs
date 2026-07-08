@@ -70,6 +70,15 @@ pub fn search(
     rows.collect()
 }
 
+/// Every distinct skill name currently indexed, regardless of source. Used
+/// to generate `skillOverrides` entries — unlike `search`, no query/ranking
+/// is needed, just the full set of names the registry knows about.
+pub fn list_all_names(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT name FROM skills ORDER BY name")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    rows.collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +155,14 @@ mod tests {
     fn empty_query_returns_empty() {
         let conn = seed();
         assert!(search(&conn, "  ", 5, MatchMode::All).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_all_names_returns_every_skill_sorted() {
+        let conn = seed();
+        assert_eq!(
+            list_all_names(&conn).unwrap(),
+            vec!["cv-usage".to_string(), "live".to_string(), "win-cleanup".to_string()]
+        );
     }
 }
