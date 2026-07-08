@@ -9,6 +9,7 @@ license = "MIT"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "2"
 toml = "0.8"
 tokio = { version = "1", features = ["rt", "process", "sync", "macros", "io-util"] }
 rmcp = { version = "1.8.0", features = ["client", "transport-child-process"] }
