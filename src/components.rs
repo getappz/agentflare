@@ -216,6 +216,7 @@ fn mark_done(path: &PathBuf) {
 /// Every skill name the shared skill_registry cache currently knows about —
 /// same source `skill_search`/`skill_load` (mcp_server.rs) already serve
 /// from, so "known skills" here always matches what those tools can find.
+#[cfg(feature = "skill-overrides-sync")]
 fn discover_skill_names() -> Result<Vec<String>, String> {
     let mut registry = skill_registry::Registry::open_default(&crate::paths::skills_db_path())
         .map_err(|e| e.to_string())?;
@@ -228,6 +229,7 @@ fn discover_skill_names() -> Result<Vec<String>, String> {
 /// tool) already set to e.g. `"off"` is left untouched. Returns how many
 /// entries were newly added. Split out from `sync_skill_overrides` so this
 /// logic is unit-testable without touching the real settings.json/skills.db.
+#[cfg(feature = "skill-overrides-sync")]
 fn apply_skill_overrides(names: &[String], settings: &mut Value) -> Result<usize, String> {
     if !settings.is_object() {
         *settings = serde_json::json!({});
@@ -250,6 +252,7 @@ fn apply_skill_overrides(names: &[String], settings: &mut Value) -> Result<usize
 
 /// Adds a `"name-only"` entry to `~/.claude/settings.json`'s `skillOverrides`
 /// for every discovered skill that doesn't already have one.
+#[cfg(feature = "skill-overrides-sync")]
 fn sync_skill_overrides() -> Result<usize, String> {
     let names = discover_skill_names()?;
     let path = home().join(".claude").join("settings.json");
@@ -270,7 +273,8 @@ pub fn get_components(host: &str) -> Vec<Component> {
     let ponytail_config = home().join(".config").join("ponytail").join("config.json");
     let caveman_config = home().join(".config").join("caveman").join("config.json");
 
-    vec![
+    #[cfg_attr(not(feature = "skill-overrides-sync"), allow(unused_mut))]
+    let mut components = vec![
         Component {
             id: "rules",
             needs_consent: false,
@@ -494,36 +498,6 @@ pub fn get_components(host: &str) -> Vec<Component> {
                 })
             },
         },
-        // Suppresses every known skill's description from Claude Code's
-        // always-on listing (settings.json `skillOverrides: name-only`) —
-        // names stay typable, skill_search/skill_load (registered above)
-        // become the on-demand detail source. Claude-Code-only: other hosts
-        // have no equivalent per-skill override mechanism. Not
-        // consent-gated (a local config tweak, same trust level as
-        // ponytail-mode/caveman-mode below) so it also re-syncs on every
-        // session-start as new skills appear, not just during `init`.
-        Component {
-            id: "skill-overrides-sync",
-            needs_consent: false,
-            describe: "sync skillOverrides so newly-discovered skills defer their description to on-demand search".to_string(),
-            check: {
-                let host = host_owned.clone();
-                Box::new(move || {
-                    if host != "claude-code" {
-                        return true;
-                    }
-                    let Ok(names) = discover_skill_names() else { return true };
-                    let settings = claude_settings();
-                    let overrides = settings.get("skillOverrides").and_then(|v| v.as_object());
-                    names.iter().all(|n| overrides.is_some_and(|o| o.contains_key(n)))
-                })
-            },
-            apply: Box::new(|| match sync_skill_overrides() {
-                Ok(0) => "skillOverrides already up to date".to_string(),
-                Ok(n) => format!("skillOverrides: {n} skill(s) set to name-only"),
-                Err(e) => format!("skillOverrides sync failed: {e}"),
-            }),
-        },
         // Ponytail/Caveman are Claude Code plugins installed via the `claude
         // plugin` CLI — no equivalent exists on any other host, so these
         // report "satisfied" everywhere else rather than nagging about
@@ -602,7 +576,45 @@ pub fn get_components(host: &str) -> Vec<Component> {
                 })
             },
         },
-    ]
+    ];
+
+    // Gated behind the `skill-overrides-sync` cargo feature (off by
+    // default, not part of released builds) until we have real evidence
+    // this saves money rather than just cache-cheap context tokens (measured
+    // ~900 tokens/turn of context-window space, mostly cache reads).
+    // Suppresses every known skill's description from
+    // Claude Code's always-on listing (settings.json `skillOverrides:
+    // name-only`) — names stay typable, skill_search/skill_load
+    // (registered above) become the on-demand detail source.
+    // Claude-Code-only: other hosts have no equivalent per-skill override
+    // mechanism. Not consent-gated (a local config tweak, same trust
+    // level as ponytail-mode/caveman-mode above) so it also re-syncs on
+    // every session-start as new skills appear, not just during `init`.
+    #[cfg(feature = "skill-overrides-sync")]
+    {
+        let host = host_owned.clone();
+        components.push(Component {
+            id: "skill-overrides-sync",
+            needs_consent: false,
+            describe: "sync skillOverrides so newly-discovered skills defer their description to on-demand search".to_string(),
+            check: Box::new(move || {
+                if host != "claude-code" {
+                    return true;
+                }
+                let Ok(names) = discover_skill_names() else { return true };
+                let settings = claude_settings();
+                let overrides = settings.get("skillOverrides").and_then(|v| v.as_object());
+                names.iter().all(|n| overrides.is_some_and(|o| o.contains_key(n)))
+            }),
+            apply: Box::new(|| match sync_skill_overrides() {
+                Ok(0) => "skillOverrides already up to date".to_string(),
+                Ok(n) => format!("skillOverrides: {n} skill(s) set to name-only"),
+                Err(e) => format!("skillOverrides sync failed: {e}"),
+            }),
+        });
+    }
+
+    components
 }
 
 #[cfg(test)]
@@ -622,28 +634,42 @@ mod tests {
 
     #[test]
     fn every_host_gets_the_full_component_set() {
+        // "skill-overrides-sync" only exists behind the `skill-overrides-sync`
+        // cargo feature (opt-in, not part of released builds — unconfirmed
+        // $ savings, see Cargo.toml). Expected ids adjust accordingly.
+        #[cfg(not(feature = "skill-overrides-sync"))]
+        let expected: Vec<&str> = vec![
+            "rules",
+            "leanctx",
+            "engram",
+            "agentflare-mcp",
+            "ponytail-plugin",
+            "ponytail-mode",
+            "caveman-mode",
+        ];
+        #[cfg(feature = "skill-overrides-sync")]
+        let expected: Vec<&str> = vec![
+            "rules",
+            "leanctx",
+            "engram",
+            "agentflare-mcp",
+            "ponytail-plugin",
+            "ponytail-mode",
+            "caveman-mode",
+            "skill-overrides-sync",
+        ];
+
         for host in HOSTS {
             let components = get_components(host);
             assert_eq!(
                 components.len(),
-                8,
-                "expected 8 components for host '{host}', got {}",
+                expected.len(),
+                "expected {} components for host '{host}', got {}",
+                expected.len(),
                 components.len()
             );
             let ids: Vec<_> = components.iter().map(|c| c.id).collect();
-            assert_eq!(
-                ids,
-                vec![
-                    "rules",
-                    "leanctx",
-                    "engram",
-                    "agentflare-mcp",
-                    "skill-overrides-sync",
-                    "ponytail-plugin",
-                    "ponytail-mode",
-                    "caveman-mode"
-                ]
-            );
+            assert_eq!(ids, expected);
         }
     }
 
@@ -715,6 +741,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "skill-overrides-sync")]
     fn skill_overrides_sync_reports_satisfied_on_non_claude_code_hosts() {
         for host in ["codex", "cursor", "windsurf", "vscode-copilot", "cline", "continue", "opencode"] {
             let components = get_components(host);
@@ -724,6 +751,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "skill-overrides-sync")]
     fn apply_skill_overrides_adds_name_only_for_new_skills_only() {
         let mut settings = serde_json::json!({
             "skillOverrides": { "already-configured": "off" }
@@ -736,6 +764,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "skill-overrides-sync")]
     fn apply_skill_overrides_handles_missing_settings_object() {
         let mut settings = Value::Null;
         let added = apply_skill_overrides(&["some-skill".to_string()], &mut settings).unwrap();
@@ -744,6 +773,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "skill-overrides-sync")]
     fn apply_skill_overrides_is_idempotent() {
         let mut settings = serde_json::json!({});
         let names = vec!["skill-a".to_string()];
