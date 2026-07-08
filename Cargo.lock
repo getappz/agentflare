@@ -87,6 +87,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "skill-registry",
  "sysinfo",
  "tar",
  "thiserror",

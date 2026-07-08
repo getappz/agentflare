@@ -31,6 +31,27 @@ struct CheckSessionHealthRequest {
     session_id: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SkillSearchRequest {
+    #[schemars(description = "What you need to do; keyword-style works best")]
+    query: String,
+    #[schemars(description = "Max results (default 5)")]
+    #[serde(default)]
+    limit: Option<usize>,
+    #[schemars(description = "'all' = every word must match (default); 'any' = broader recall for retries")]
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SkillLoadRequest {
+    #[schemars(description = "Skill name from skill_search; qualify as 'source:name' if ambiguous")]
+    name: String,
+    #[schemars(description = "true = load the original even when a compressed copy exists")]
+    #[serde(default)]
+    original: bool,
+}
+
 #[derive(Clone)]
 pub struct AgentflareMcp;
 
@@ -77,6 +98,66 @@ impl AgentflareMcp {
             None => serde_json::json!({"suggestion": null}),
         };
         serde_json::to_string_pretty(&result).unwrap_or_default()
+    }
+
+    fn skills_db_path() -> std::path::PathBuf {
+        // Same base dir the rollup cache uses; keep skills in their own file.
+        dirs::data_local_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("agentflare")
+            .join("skills.db")
+    }
+
+    fn open_registry() -> Result<skill_registry::Registry, ErrorData> {
+        let mut reg = skill_registry::Registry::open_default(&Self::skills_db_path())
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        reg.ensure_fresh()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(reg)
+    }
+
+    #[tool(description = "Search installed skills (all agents' skill dirs) by task description. Returns name, source, description, and estimated token cost; call skill_load to fetch one.")]
+    fn skill_search(
+        &self,
+        Parameters(SkillSearchRequest { query, limit, mode }): Parameters<SkillSearchRequest>,
+    ) -> Result<String, ErrorData> {
+        if query.trim().is_empty() {
+            return Err(ErrorData::invalid_params("query is required", None));
+        }
+        let mode = match mode.as_deref() {
+            None | Some("all") => skill_registry::MatchMode::All,
+            Some("any") => skill_registry::MatchMode::Any,
+            Some(other) => {
+                return Err(ErrorData::invalid_params(
+                    format!("mode must be 'all' or 'any', got '{other}'"),
+                    None,
+                ))
+            }
+        };
+        let reg = Self::open_registry()?;
+        let hits = reg
+            .search(&query, limit.unwrap_or(5), mode)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
+    }
+
+    #[tool(description = "Load a skill's full instructions by name. Serves the compressed copy when one exists (original=true for the source). Sibling reference files are listed, not inlined.")]
+    fn skill_load(
+        &self,
+        Parameters(SkillLoadRequest { name, original }): Parameters<SkillLoadRequest>,
+    ) -> Result<String, ErrorData> {
+        if name.trim().is_empty() {
+            return Err(ErrorData::invalid_params("name is required", None));
+        }
+        let reg = Self::open_registry()?;
+        match reg.load(&name, original) {
+            Ok(s) => Ok(serde_json::to_string_pretty(&s).unwrap_or_default()),
+            Err(e @ skill_registry::LoadError::NotFound(_))
+            | Err(e @ skill_registry::LoadError::Ambiguous(_)) => {
+                Err(ErrorData::invalid_params(e.to_string(), None))
+            }
+            Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
+        }
     }
 }
 
@@ -303,5 +384,43 @@ mod tests {
         let s = AgentflareMcp;
         let err = s.read_resource_sync("agentflare://bogus").unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+    }
+
+    #[test]
+    fn skill_search_empty_query_is_invalid_params() {
+        let s = AgentflareMcp;
+        let err = s
+            .skill_search(Parameters(SkillSearchRequest {
+                query: "".into(),
+                limit: None,
+                mode: None,
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("query"));
+    }
+
+    #[test]
+    fn skill_load_unknown_name_reports_not_found_with_search_hint() {
+        let s = AgentflareMcp;
+        let out = s
+            .skill_load(Parameters(SkillLoadRequest {
+                name: "definitely-not-a-skill-xyz".into(),
+                original: false,
+            }))
+            .unwrap_err();
+        assert!(out.to_string().contains("skill_search"));
+    }
+
+    #[test]
+    fn skill_search_mode_rejects_unknown_value() {
+        let s = AgentflareMcp;
+        let err = s
+            .skill_search(Parameters(SkillSearchRequest {
+                query: "anything".into(),
+                limit: None,
+                mode: Some("fuzzy".into()),
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("mode"));
     }
 }

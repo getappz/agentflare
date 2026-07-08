@@ -58,6 +58,7 @@ eyre = "0.6"
 color-eyre = "0.6"
 ponytail = { path = "crates/ponytail" }
 agent-registry = { path = "crates/agent-registry" }
+skill-registry = { path = "crates/skill-registry" }
 regex = "1"
 sysinfo = { version = "0.34", optional = true, default-features = false, features = ["system"] }
 
