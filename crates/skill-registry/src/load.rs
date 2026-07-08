@@ -133,6 +133,11 @@ impl Registry {
         crate::search::search(&self.conn, query, limit, mode).map_err(|e| LoadError::Db(e.to_string()))
     }
 
+    /// Every distinct skill name currently indexed, regardless of source.
+    pub fn list_all_names(&self) -> Result<Vec<String>, LoadError> {
+        crate::search::list_all_names(&self.conn).map_err(|e| LoadError::Db(e.to_string()))
+    }
+
     pub fn load(&self, name: &str, original: bool) -> Result<LoadedSkill, LoadError> {
         load(&self.conn, name, original)
     }

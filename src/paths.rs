@@ -12,6 +12,16 @@ pub fn home() -> PathBuf {
     dirs::home_dir().expect("home directory not found")
 }
 
+/// Shared by mcp_server.rs (serving skill_search/skill_load) and
+/// components.rs (syncing skillOverrides) — same on-disk cache, single path
+/// definition so the two can never drift apart.
+pub fn skills_db_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("agentflare")
+        .join("skills.db")
+}
+
 // Shared by state.rs/init.rs tests: both AGENTFLARE_HOME_OVERRIDE and cwd are
 // process-global, so tests that touch either must run serialized against
 // each other or they'll stomp on one another under cargo's default
