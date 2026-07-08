@@ -52,8 +52,14 @@ struct SkillLoadRequest {
     original: bool,
 }
 
-#[derive(Clone)]
-pub struct AgentflareMcp;
+#[derive(Default)]
+pub struct AgentflareMcp {
+    /// Persisted across calls so `Registry::ensure_fresh`'s 60s debounce is
+    /// real: a fresh `Registry` per call would rescan + rebuild every time.
+    /// `Registry` owns a `rusqlite::Connection` (Send, not Sync); the mutex
+    /// makes the server type `Sync` without requiring `Registry` to be.
+    skills_registry: std::sync::Mutex<Option<skill_registry::Registry>>,
+}
 
 #[tool_router]
 impl AgentflareMcp {
@@ -108,12 +114,27 @@ impl AgentflareMcp {
             .join("skills.db")
     }
 
-    fn open_registry() -> Result<skill_registry::Registry, ErrorData> {
-        let mut reg = skill_registry::Registry::open_default(&Self::skills_db_path())
+    /// Lock the persisted registry, lazily opening it on first use, refresh
+    /// it (debounced inside `Registry::ensure_fresh`), then run `f` against
+    /// it. A poisoned lock or an init/refresh failure both map to the same
+    /// internal_error the old per-call `open_registry` used.
+    fn with_fresh_registry<T>(
+        &self,
+        f: impl FnOnce(&skill_registry::Registry) -> T,
+    ) -> Result<T, ErrorData> {
+        let mut guard = self
+            .skills_registry
+            .lock()
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if guard.is_none() {
+            let reg = skill_registry::Registry::open_default(&Self::skills_db_path())
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            *guard = Some(reg);
+        }
+        let reg = guard.as_mut().expect("just initialized above");
         reg.ensure_fresh()
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(reg)
+        Ok(f(reg))
     }
 
     #[tool(description = "Search installed skills (all agents' skill dirs) by task description. Returns name, source, description, and estimated token cost; call skill_load to fetch one.")]
@@ -134,9 +155,8 @@ impl AgentflareMcp {
                 ))
             }
         };
-        let reg = Self::open_registry()?;
-        let hits = reg
-            .search(&query, limit.unwrap_or(5), mode)
+        let hits = self
+            .with_fresh_registry(|reg| reg.search(&query, limit.unwrap_or(5), mode))?
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
     }
@@ -149,8 +169,8 @@ impl AgentflareMcp {
         if name.trim().is_empty() {
             return Err(ErrorData::invalid_params("name is required", None));
         }
-        let reg = Self::open_registry()?;
-        match reg.load(&name, original) {
+        let result = self.with_fresh_registry(|reg| reg.load(&name, original))?;
+        match result {
             Ok(s) => Ok(serde_json::to_string_pretty(&s).unwrap_or_default()),
             Err(e @ skill_registry::LoadError::NotFound(_))
             | Err(e @ skill_registry::LoadError::Ambiguous(_)) => {
@@ -286,7 +306,7 @@ impl ServerHandler for AgentflareMcp {
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let service = AgentflareMcp.serve(stdio()).await?;
+    let service = AgentflareMcp::default().serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
@@ -297,7 +317,7 @@ mod tests {
 
     #[test]
     fn get_info_reports_agentflare_identity() {
-        let s = AgentflareMcp;
+        let s = AgentflareMcp::default();
         let info = s.get_info();
         assert_eq!(info.server_info.name, env!("CARGO_PKG_NAME"));
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
@@ -305,7 +325,7 @@ mod tests {
 
     #[test]
     fn routing_suggestion_returns_null_for_non_locate() {
-        let s = AgentflareMcp;
+        let s = AgentflareMcp::default();
         let result = s.get_routing_suggestion(Parameters(GetRoutingSuggestionRequest {
             prompt: "refactor the payment module".to_string(),
         }));
@@ -314,7 +334,7 @@ mod tests {
 
     #[test]
     fn routing_suggestion_returns_nudge_for_find() {
-        let s = AgentflareMcp;
+        let s = AgentflareMcp::default();
         let result = s.get_routing_suggestion(Parameters(GetRoutingSuggestionRequest {
             prompt: "find the auth handler".to_string(),
         }));
@@ -323,7 +343,7 @@ mod tests {
 
     #[test]
     fn check_session_health_unknown_returns_status() {
-        let s = AgentflareMcp;
+        let s = AgentflareMcp::default();
         let result = s
             .check_session_health(Parameters(CheckSessionHealthRequest {
                 session_id: "nonexistent-session-id".to_string(),
@@ -334,7 +354,7 @@ mod tests {
 
     #[test]
     fn check_session_health_rejects_empty_session_id() {
-        let s = AgentflareMcp;
+        let s = AgentflareMcp::default();
         let err = s
             .check_session_health(Parameters(CheckSessionHealthRequest {
                 session_id: String::new(),
@@ -361,7 +381,7 @@ mod tests {
 
     #[test]
     fn list_resources_returns_sessions_and_nudges() {
-        let s = AgentflareMcp;
+        let s = AgentflareMcp::default();
         let result = s.list_resources_sync();
         let uris: Vec<&str> = result.resources.iter().map(|r| r.uri.as_str()).collect();
         assert_eq!(uris, vec!["agentflare://sessions", "agentflare://nudges"]);
@@ -369,7 +389,7 @@ mod tests {
 
     #[test]
     fn read_resource_nudges_returns_nudges_json() {
-        let s = AgentflareMcp;
+        let s = AgentflareMcp::default();
         let result = s.read_resource_sync("agentflare://nudges").unwrap();
         assert_eq!(result.contents.len(), 1);
         let ResourceContents::TextResourceContents { text, uri, .. } = &result.contents[0] else {
@@ -381,14 +401,14 @@ mod tests {
 
     #[test]
     fn read_resource_unknown_uri_returns_resource_not_found() {
-        let s = AgentflareMcp;
+        let s = AgentflareMcp::default();
         let err = s.read_resource_sync("agentflare://bogus").unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
     }
 
     #[test]
     fn skill_search_empty_query_is_invalid_params() {
-        let s = AgentflareMcp;
+        let s = AgentflareMcp::default();
         let err = s
             .skill_search(Parameters(SkillSearchRequest {
                 query: "".into(),
@@ -401,7 +421,7 @@ mod tests {
 
     #[test]
     fn skill_load_unknown_name_reports_not_found_with_search_hint() {
-        let s = AgentflareMcp;
+        let s = AgentflareMcp::default();
         let out = s
             .skill_load(Parameters(SkillLoadRequest {
                 name: "definitely-not-a-skill-xyz".into(),
@@ -413,7 +433,7 @@ mod tests {
 
     #[test]
     fn skill_search_mode_rejects_unknown_value() {
-        let s = AgentflareMcp;
+        let s = AgentflareMcp::default();
         let err = s
             .skill_search(Parameters(SkillSearchRequest {
                 query: "anything".into(),

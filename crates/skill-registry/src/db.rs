@@ -26,6 +26,11 @@ pub fn open_db(path: &Path) -> rusqlite::Result<Connection> {
         let _ = std::fs::create_dir_all(parent);
     }
     let conn = Connection::open(path)?;
+    // Shared across all agentflare MCP processes: without a busy timeout,
+    // concurrent writers hit SQLITE_BUSY immediately instead of waiting;
+    // WAL lets readers and a writer proceed concurrently.
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
 }
@@ -41,8 +46,10 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
     tx.execute("DELETE FROM skills", [])?;
     tx.execute("DELETE FROM skills_fts", [])?;
     {
+        // OR IGNORE: a single bad skill (duplicate (name, source)) must not
+        // roll back the whole rebuild and disable every skill_search/skill_load.
         let mut ins = tx.prepare(
-            "INSERT INTO skills (name, source, path, description, tags, est_tokens, mtime, shadow_path)
+            "INSERT OR IGNORE INTO skills (name, source, path, description, tags, est_tokens, mtime, shadow_path)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         let mut fts = tx.prepare(
@@ -59,6 +66,11 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
                 e.mtime,
                 e.shadow_path.as_ref().map(|p| p.to_string_lossy().to_string()),
             ])?;
+            if tx.changes() == 0 {
+                // Duplicate (name, source) was ignored: no new skills row,
+                // so skip the fts mirror (last_insert_rowid() would be stale).
+                continue;
+            }
             let rowid = tx.last_insert_rowid();
             fts.execute(params![rowid, e.name, e.description, e.tags])?;
         }
@@ -109,5 +121,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pair.0, pair.1);
+    }
+
+    #[test]
+    fn rebuild_tolerates_duplicate_name_source_without_failing_whole_batch() {
+        let mut conn = open_in_memory().unwrap();
+        rebuild(
+            &mut conn,
+            &[entry("dup", "s", "first desc"), entry("dup", "s", "second desc")],
+        )
+        .unwrap();
+        let n: i64 = conn.query_row("SELECT count(*) FROM skills", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        let f: i64 = conn.query_row("SELECT count(*) FROM skills_fts", [], |r| r.get(0)).unwrap();
+        assert_eq!(f, 1);
+        let hits = crate::search::search(&conn, "first", 5, crate::search::MatchMode::All).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "dup");
+    }
+
+    #[test]
+    fn open_db_sets_wal_journal_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = open_db(&tmp.path().join("skills.db")).unwrap();
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, "wal");
     }
 }

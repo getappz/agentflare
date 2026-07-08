@@ -163,9 +163,13 @@ pub fn scan_sources(sources: &[Source]) -> ScanOutput {
     let mut drop_idx: Vec<usize> = Vec::new();
     for (shadow_i, origin) in &shadows {
         let shadow_path = out.entries[*shadow_i].path.clone();
+        let shadow_est_tokens = out.entries[*shadow_i].est_tokens;
         match out.entries.iter().position(|e| &e.path == origin) {
             Some(orig_i) => {
                 out.entries[orig_i].shadow_path = Some(shadow_path);
+                // skill_load serves the shadow body by default, so the
+                // advertised cost must match what's actually served.
+                out.entries[orig_i].est_tokens = shadow_est_tokens;
                 drop_idx.push(*shadow_i);
             }
             None => {
@@ -300,7 +304,13 @@ mod tests {
         assert_eq!(out.entries.len(), 1);
         let e = &out.entries[0];
         assert_eq!(e.source, "claude-plugin:cv");
-        assert_eq!(e.shadow_path.as_deref(), Some(ud.join("SKILL.md").as_path()));
+        let shadow_md_path = ud.join("SKILL.md");
+        assert_eq!(e.shadow_path.as_deref(), Some(shadow_md_path.as_path()));
+        // skill_load serves the shadow body by default, so est_tokens must
+        // reflect the shadow file's size, not the (bigger) original's.
+        let shadow_bytes = fs::metadata(&shadow_md_path).unwrap().len();
+        assert_eq!(e.est_tokens, est_tokens(shadow_bytes));
+        assert_ne!(e.est_tokens, est_tokens(fs::metadata(&orig).unwrap().len()));
     }
 
     #[test]
