@@ -1,0 +1,173 @@
+//! Real MCP client over a spawned child process, using `rmcp`'s own client
+//! transport (`TokioChildProcess` + the `initialize` handshake via
+//! `ServiceExt::serve`) — not a bespoke REST bridge.
+
+use crate::error::GatewayError;
+use crate::types::ToolEntry;
+use rmcp::{
+    service::RunningService,
+    transport::{ConfigureCommandExt, TokioChildProcess},
+    RoleClient, ServiceExt,
+};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::time::Duration;
+
+/// Bound on every downstream MCP round-trip (connect handshake, `discover`,
+/// `call`) so one hung/slow backend can only ever fail after this long,
+/// rather than wedging the whole `Registry` (which holds a single lock
+/// guarding all backends — see `mcp_server.rs::ensure_gateway_registry`)
+/// indefinitely. Not user-configurable in v1; 30s is long enough for a
+/// legitimate slow tool call and short enough to bound the blast radius.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub struct McpStdioBackend {
+    running: tokio::sync::Mutex<Option<RunningService<RoleClient, ()>>>,
+    command: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    timeout: Duration,
+}
+
+impl McpStdioBackend {
+    pub fn new(command: String, args: Vec<String>, env: HashMap<String, String>) -> Self {
+        Self::with_timeout(command, args, env, DEFAULT_TIMEOUT)
+    }
+
+    /// Same as [`Self::new`] but with an explicit timeout for downstream I/O.
+    /// Exists mainly so tests can exercise the timeout path without waiting
+    /// out the real `DEFAULT_TIMEOUT`; production callers should use `new`.
+    pub fn with_timeout(
+        command: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        timeout: Duration,
+    ) -> Self {
+        Self { running: tokio::sync::Mutex::new(None), command, args, env, timeout }
+    }
+
+    async fn ensure_connected(&self) -> Result<(), GatewayError> {
+        let mut guard = self.running.lock().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+        let transport = TokioChildProcess::new(tokio::process::Command::new(&self.command).configure(
+            |cmd| {
+                cmd.args(&self.args);
+                for (k, v) in &self.env {
+                    cmd.env(k, v);
+                }
+                // Without this, tokio::process::Child does NOT kill the OS
+                // process when dropped (it just detaches). If a downstream
+                // server hangs before ever responding, our tokio::time::timeout
+                // cancels this future correctly, but the orphaned child process
+                // would otherwise run forever — kill_on_drop ensures the
+                // timeout actually terminates the hung child, not just our
+                // side of the connection.
+                cmd.kill_on_drop(true);
+            },
+        ))
+        .map_err(|e| GatewayError::Connection(format!("spawn '{}' failed: {e}", self.command)))?;
+        let running = tokio::time::timeout(self.timeout, ().serve(transport))
+            .await
+            .map_err(|_| {
+                GatewayError::Timeout(format!(
+                    "connect to '{}' timed out after {:?}",
+                    self.command, self.timeout
+                ))
+            })?
+            .map_err(|e| {
+                GatewayError::Connection(format!("connect to '{}' failed: {e}", self.command))
+            })?;
+        *guard = Some(running);
+        Ok(())
+    }
+
+    pub async fn discover(&self) -> Result<Vec<ToolEntry>, GatewayError> {
+        self.ensure_connected().await?;
+        let mut guard = self.running.lock().await;
+        let running = guard.as_ref().expect("connected above");
+        let tools = match tokio::time::timeout(self.timeout, running.list_all_tools()).await {
+            Ok(Ok(tools)) => tools,
+            Ok(Err(e)) => return Err(GatewayError::Upstream(e.to_string())),
+            Err(_) => {
+                // Timing out here means the cached connection produced no
+                // response in time — it may be permanently wedged (e.g. the
+                // child process hung mid-request). Drop it so the NEXT
+                // `discover()`/`call()` respawns a fresh connection instead
+                // of `ensure_connected` seeing `guard.is_some()` and quietly
+                // reusing the broken one.
+                *guard = None;
+                return Err(GatewayError::Timeout(format!(
+                    "discover on '{}' timed out after {:?}",
+                    self.command, self.timeout
+                )));
+            }
+        };
+        Ok(tools
+            .into_iter()
+            .map(|t| ToolEntry {
+                name: t.name.to_string(),
+                description: t.description.map(|d| d.to_string()).unwrap_or_default(),
+                input_schema: Value::Object((*t.input_schema).clone()),
+            })
+            .collect())
+    }
+
+    pub async fn call(&self, tool: &str, args: Value) -> Result<Value, GatewayError> {
+        self.ensure_connected().await?;
+        let mut guard = self.running.lock().await;
+        let running = guard.as_ref().expect("connected above");
+        let args_map = match args {
+            Value::Object(map) => Some(map),
+            Value::Null => None,
+            other => {
+                // Local, pre-flight validation — happens before any
+                // downstream I/O, so this is the caller's mistake, not the
+                // downstream server's. `InvalidArgument`, not `Upstream`,
+                // so `gateway_execute` maps it to `invalid_params`.
+                return Err(GatewayError::InvalidArgument(format!(
+                    "args must be a JSON object, got {other}"
+                )))
+            }
+        };
+        let mut params = rmcp::model::CallToolRequestParams::new(tool.to_string());
+        params.arguments = args_map;
+        let result = match tokio::time::timeout(self.timeout, running.call_tool(params)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => return Err(GatewayError::Upstream(e.to_string())),
+            Err(_) => {
+                // See the matching comment in `discover()`: a timed-out
+                // cached connection may be permanently wedged, so drop it
+                // rather than let the next call reuse it.
+                *guard = None;
+                return Err(GatewayError::Timeout(format!(
+                    "call '{tool}' on '{}' timed out after {:?}",
+                    self.command, self.timeout
+                )));
+            }
+        };
+        if result.is_error.unwrap_or(false) {
+            return Err(GatewayError::Upstream(
+                serde_json::to_string(&result.content).unwrap_or_default(),
+            ));
+        }
+        if let Some(structured) = result.structured_content {
+            return Ok(structured);
+        }
+        serde_json::to_value(&result.content)
+            .map_err(|e| GatewayError::Upstream(format!("result serialization failed: {e}")))
+    }
+}
+
+// NOTE: the discover()-against-the-real-fixture-binary tests originally
+// planned as a `#[cfg(test)] mod tests` here had to move to
+// `tests/mcp_stdio_discover.rs` instead. `env!("CARGO_BIN_EXE_<name>")` is
+// only populated by Cargo when compiling an *integration* test target (a
+// file under `tests/`) or a benchmark — it is not set when compiling the
+// lib's own unit-test binary (`cargo test --lib`), so `cargo build` failed
+// with "environment variable `CARGO_BIN_EXE_gateway-fixture-server` not
+// defined at compile time" when the tests lived here. Moving them to an
+// integration test (which only needs the public `McpStdioBackend`/`discover`
+// API this module already exports) fixes that with no change to the
+// non-test code above.

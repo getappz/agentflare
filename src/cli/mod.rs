@@ -3,6 +3,7 @@ mod alias;
 mod auth;
 mod coaching;
 mod cost;
+mod gateway;
 mod hook;
 mod init;
 mod mcp;
@@ -35,6 +36,7 @@ pub enum Commands {
     Hook(hook::HookArgs),
     Cost(cost::CostArgs),
     Coaching(coaching::CoachingArgs),
+    Gateway(gateway::GatewayArgs),
     Mcp(mcp::McpArgs),
     Agents(agents::AgentsArgs),
     Alias(alias::AliasArgs),
@@ -51,6 +53,7 @@ impl Commands {
             Self::Hook(cmd) => cmd.run(),
             Self::Cost(cmd) => cmd.run(),
             Self::Coaching(cmd) => cmd.run(),
+            Self::Gateway(cmd) => cmd.run(),
             Self::Mcp(cmd) => cmd.run(),
             Self::Agents(cmd) => cmd.run(),
             Self::Alias(cmd) => cmd.run(),

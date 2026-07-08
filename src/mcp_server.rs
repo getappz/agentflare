@@ -52,6 +52,29 @@ struct SkillLoadRequest {
     original: bool,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GatewaySearchRequest {
+    #[schemars(description = "What tool you need; keyword-style works best")]
+    query: String,
+    #[schemars(description = "Max results (default 5)")]
+    #[serde(default)]
+    limit: Option<usize>,
+    #[schemars(description = "'all' = every word must match (default); 'any' = broader recall for retries")]
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GatewayExecuteRequest {
+    #[schemars(description = "Server name from gateway_search")]
+    server: String,
+    #[schemars(description = "Tool name from gateway_search")]
+    tool: String,
+    #[schemars(description = "Arguments object matching the tool's input_schema")]
+    #[serde(default)]
+    args: serde_json::Value,
+}
+
 #[derive(Default)]
 pub struct AgentflareMcp {
     /// Persisted across calls so `Registry::ensure_fresh`'s 60s debounce is
@@ -61,6 +84,14 @@ pub struct AgentflareMcp {
     skills_registry: std::sync::Mutex<Option<skill_registry::Registry>>,
     /// Tests inject a temp path here so they never touch the shared skills.db.
     skills_db_override: Option<std::path::PathBuf>,
+    /// `tokio::sync::Mutex`, not `std::sync::Mutex` like `skills_registry` —
+    /// `gateway_registry::Registry`'s methods are `async` (they `.await`
+    /// downstream MCP calls), and holding a `std::sync::MutexGuard` across
+    /// an `.await` point is both a correctness footgun and breaks the
+    /// `Send` bound rmcp's tool router needs on the returned future.
+    gateway_registry: tokio::sync::Mutex<Option<gateway_registry::Registry>>,
+    /// Tests inject a temp path here so they never touch the shared gateway.db.
+    gateway_db_override: Option<std::path::PathBuf>,
 }
 
 #[tool_router]
@@ -173,6 +204,158 @@ impl AgentflareMcp {
             Ok(s) => Ok(serde_json::to_string_pretty(&s).unwrap_or_default()),
             Err(e @ skill_registry::LoadError::NotFound(_))
             | Err(e @ skill_registry::LoadError::Ambiguous(_)) => {
+                Err(ErrorData::invalid_params(e.to_string(), None))
+            }
+            Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
+        }
+    }
+
+    fn gateway_db_path() -> std::path::PathBuf {
+        dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("agentflare").join("gateway.db")
+    }
+
+    fn gateway_secrets_db_path() -> std::path::PathBuf {
+        crate::paths::home().join(".agentflare").join("gateway.db")
+    }
+
+    fn load_gateway_config() -> gateway_registry::GatewayConfig {
+        let path = crate::paths::home().join(".agentflare").join("gateway.toml");
+        match std::fs::read_to_string(&path) {
+            Ok(s) => match gateway_registry::parse_config(&s) {
+                Ok(config) => config,
+                Err(e) => {
+                    // Malformed TOML, or a config that fails the
+                    // auth_ref/auth_env pairing check, used to look
+                    // identical to "no gateway.toml yet" — both silently
+                    // produced an empty config with zero configured
+                    // servers. Surface the parse error so a user who
+                    // typo'd their gateway.toml gets visible signal instead
+                    // of a silent "no servers configured".
+                    eprintln!(
+                        "agentflare: failed to parse gateway config at {}: {e} — using no configured servers",
+                        path.display()
+                    );
+                    gateway_registry::GatewayConfig::default()
+                }
+            },
+            // The file genuinely doesn't exist yet (or isn't readable) —
+            // the normal, expected case for a user who hasn't set up
+            // gateway.toml. No log needed here.
+            Err(_) => gateway_registry::GatewayConfig::default(),
+        }
+    }
+
+    fn resolve_gateway_secrets() -> std::collections::HashMap<String, String> {
+        let db_path = Self::gateway_secrets_db_path();
+        let conn = match crate::gateway_secrets::open_db(&db_path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!(
+                    "agentflare: failed to open gateway secrets db at {}: {e}",
+                    db_path.display()
+                );
+                return std::collections::HashMap::new();
+            }
+        };
+        let names = match crate::gateway_secrets::list_secrets(&conn) {
+            Ok(names) => names,
+            Err(e) => {
+                eprintln!("agentflare: failed to list gateway secrets: {e}");
+                return std::collections::HashMap::new();
+            }
+        };
+        names
+            .into_iter()
+            .filter_map(|name| match crate::gateway_secrets::get_secret(&conn, &name) {
+                Ok(Some(v)) => Some((name, v)),
+                Ok(None) => None,
+                Err(e) => {
+                    // A wrong/missing vault passphrase used to look
+                    // identical to "no secret configured" — `.ok().flatten()`
+                    // discarded the `Err` entirely. Surface it so a wrong
+                    // passphrase is at least visible in stderr instead of
+                    // silently leaving downstream backends uncredentialed.
+                    eprintln!("agentflare: failed to resolve gateway secret '{name}': {e}");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Ensures `self.gateway_registry` holds an initialized, freshly-
+    /// refreshed `Registry`, then returns the still-locked guard so the
+    /// caller can use it directly. Safe to hold across further `.await`
+    /// points on the returned guard — `tokio::sync::MutexGuard` (unlike
+    /// `std::sync::MutexGuard`) is designed for exactly that, which is why
+    /// `gateway_registry` is a `tokio::sync::Mutex` and `skills_registry`
+    /// isn't. (An earlier draft tried to fold `Registry::execute` — an
+    /// async fn — into a plain `FnOnce(&Registry) -> T` callback shared
+    /// with `gateway_search`; that doesn't compile without unstable
+    /// async-closure/HRTB machinery, so each tool method just calls this
+    /// helper and then works with the guard itself.)
+    async fn ensure_gateway_registry(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<gateway_registry::Registry>>, ErrorData> {
+        let mut guard = self.gateway_registry.lock().await;
+        if guard.is_none() {
+            let db_path = self.gateway_db_override.clone().unwrap_or_else(Self::gateway_db_path);
+            let config = Self::load_gateway_config();
+            let secrets = Self::resolve_gateway_secrets();
+            let reg = gateway_registry::Registry::open_default(&db_path, &config, &secrets)
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            *guard = Some(reg);
+        }
+        guard
+            .as_mut()
+            .expect("just initialized above")
+            .ensure_fresh()
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(guard)
+    }
+
+    #[tool(description = "Search downstream MCP servers' tools by task description. Returns server, tool, description, and input_schema; call gateway_execute to run one.")]
+    async fn gateway_search(
+        &self,
+        Parameters(GatewaySearchRequest { query, limit, mode }): Parameters<GatewaySearchRequest>,
+    ) -> Result<String, ErrorData> {
+        if query.trim().is_empty() {
+            return Err(ErrorData::invalid_params("query is required", None));
+        }
+        let mode = match mode.as_deref() {
+            None | Some("all") => gateway_registry::MatchMode::All,
+            Some("any") => gateway_registry::MatchMode::Any,
+            Some(other) => {
+                return Err(ErrorData::invalid_params(format!("mode must be 'all' or 'any', got '{other}'"), None))
+            }
+        };
+        let guard = self.ensure_gateway_registry().await?;
+        let reg = guard.as_ref().expect("ensured above");
+        let hits = reg
+            .search(&query, limit.unwrap_or(5), mode)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
+    }
+
+    #[tool(description = "Execute a tool on a downstream MCP server found via gateway_search. args must match that tool's input_schema.")]
+    async fn gateway_execute(
+        &self,
+        Parameters(GatewayExecuteRequest { server, tool, args }): Parameters<GatewayExecuteRequest>,
+    ) -> Result<String, ErrorData> {
+        if server.trim().is_empty() || tool.trim().is_empty() {
+            return Err(ErrorData::invalid_params("server and tool are required", None));
+        }
+        let guard = self.ensure_gateway_registry().await?;
+        let reg = guard.as_ref().expect("ensured above");
+        match reg.execute(&server, &tool, args).await {
+            Ok(value) => {
+                let capped = gateway_registry::truncate_if_needed(&value, gateway_registry::DEFAULT_MAX_CHARS);
+                Ok(serde_json::to_string_pretty(&capped).unwrap_or_default())
+            }
+            Err(e @ gateway_registry::GatewayError::ServerNotFound(_))
+            | Err(e @ gateway_registry::GatewayError::ToolNotFound(_))
+            | Err(e @ gateway_registry::GatewayError::InvalidArgument(_)) => {
                 Err(ErrorData::invalid_params(e.to_string(), None))
             }
             Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
@@ -467,5 +650,78 @@ mod tests {
             }))
             .unwrap_err();
         assert!(err.to_string().contains("mode"));
+    }
+
+    #[tokio::test]
+    async fn gateway_search_empty_query_is_invalid_params() {
+        // Isolated DB path so the test never opens/refreshes the shared gateway.db.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            gateway_db_override: Some(tmp.path().join("gateway.db")),
+            ..Default::default()
+        };
+        let err = s
+            .gateway_search(Parameters(GatewaySearchRequest { query: "".into(), limit: None, mode: None }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("query is required"));
+    }
+
+    #[tokio::test]
+    async fn gateway_search_mode_rejects_unknown_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            gateway_db_override: Some(tmp.path().join("gateway.db")),
+            ..Default::default()
+        };
+        let err = s
+            .gateway_search(Parameters(GatewaySearchRequest {
+                query: "x".into(),
+                limit: None,
+                mode: Some("bogus".into()),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mode must be"));
+    }
+
+    #[tokio::test]
+    async fn gateway_execute_requires_server_and_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            gateway_db_override: Some(tmp.path().join("gateway.db")),
+            ..Default::default()
+        };
+        let err = s
+            .gateway_execute(Parameters(GatewayExecuteRequest {
+                server: "".into(),
+                tool: "x".into(),
+                args: serde_json::json!({}),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("required"));
+    }
+
+    #[tokio::test]
+    async fn gateway_execute_unknown_server_is_invalid_params() {
+        // Isolated DB path, no servers configured — `Registry::execute` is
+        // guaranteed to hit `GatewayError::ServerNotFound`, which must map to
+        // `invalid_params` (a caller-fixable mistake), not `internal_error`.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            gateway_db_override: Some(tmp.path().join("gateway.db")),
+            ..Default::default()
+        };
+        let err = s
+            .gateway_execute(Parameters(GatewayExecuteRequest {
+                server: "definitely-not-a-configured-server".into(),
+                tool: "x".into(),
+                args: serde_json::json!({}),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.to_string().contains("not found"));
     }
 }
