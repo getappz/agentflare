@@ -72,10 +72,10 @@ fn get_ponytail_mode(request: &GetPromptRequestParams) -> GetPromptResult {
         return assistant_text("ponytail is now off.");
     }
     match ponytail::normalize_config_mode(&mode_arg) {
-        Some(normalized) => {
-            ponytail::set_active(normalized).ok();
-            assistant_text(ponytail::build_instructions(normalized, None).body)
-        }
+        Some(normalized) => match ponytail::set_active(normalized) {
+            Ok(()) => assistant_text(ponytail::build_instructions(normalized, None).body),
+            Err(e) => assistant_text(format!("Failed to persist ponytail mode: {e}")),
+        },
         None => assistant_text(format!(
             "Unknown ponytail mode '{mode_arg}'. Use lite|full|ultra|off|status."
         )),
@@ -83,7 +83,9 @@ fn get_ponytail_mode(request: &GetPromptRequestParams) -> GetPromptResult {
 }
 
 fn get_ponytail_skill(skill: &str) -> GetPromptResult {
-    ponytail::set_active(skill).ok();
+    if let Err(e) = ponytail::set_active(skill) {
+        return assistant_text(format!("Failed to persist ponytail mode: {e}"));
+    }
     let body = ponytail::sub_skills::get(skill).unwrap_or_default();
     assistant_text(body)
 }
