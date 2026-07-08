@@ -66,6 +66,11 @@ sysinfo = { version = "0.34", optional = true, default-features = false, feature
 [features]
 default = []
 process-tree = ["sysinfo"]
+# Off by default, not part of released builds: syncs Claude Code's
+# skillOverrides to suppress skill descriptions from the always-on listing.
+# Measured to save ~900 tokens/turn of context-window space, but that's
+# mostly cache-read traffic (cheap) — no confirmed $ savings yet.
+skill-overrides-sync = []
 
 [build-dependencies]
 built = { version = "0.8", features = ["chrono"] }
