@@ -364,7 +364,13 @@ impl AgentflareMcp {
             | Err(e @ gateway_registry::GatewayError::InvalidArgument(_)) => {
                 Err(ErrorData::invalid_params(e.to_string(), None))
             }
-            Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
+            // Every other variant (Upstream, Connection, Timeout, ...)
+            // carries the downstream server's or OS's own error text
+            // verbatim — unlike the three above, which are our own
+            // controlled messages. Redact before it reaches the LLM: a
+            // downstream server's raw error could otherwise leak a file
+            // path, connection string, or an echoed credential.
+            Err(e) => Err(ErrorData::internal_error(gateway_registry::redact_error_for_llm(&e.to_string()), None)),
         }
     }
 }

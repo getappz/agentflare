@@ -6,11 +6,12 @@ use crate::config::{GatewayConfig, ServerConfig};
 use crate::db::{self, ServerTools};
 use crate::error::{suggest, GatewayError};
 use crate::mcp_stdio::McpStdioBackend;
+use crate::sanitize::sanitize_tool_entry;
 use crate::search::{search, MatchMode, ToolHit};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const REFRESH_DEBOUNCE: Duration = Duration::from_secs(60);
@@ -29,6 +30,10 @@ pub struct Registry {
     conn: std::sync::Mutex<Connection>,
     backends: HashMap<String, Backend>,
     last_refresh: Option<Instant>,
+    /// `None` for `open_in_memory` (ephemeral/test registries — nothing
+    /// durable to audit). Sibling of `db_path` on disk so no extra config
+    /// plumbing is needed to locate it.
+    audit_log_path: Option<PathBuf>,
 }
 
 impl Registry {
@@ -39,7 +44,8 @@ impl Registry {
     ) -> Result<Self, GatewayError> {
         let conn = db::open_db(db_path)?;
         let backends = build_backends(config, secrets);
-        let mut reg = Self { conn: std::sync::Mutex::new(conn), backends, last_refresh: None };
+        let audit_log_path = Some(db_path.with_file_name("gateway-audit.log"));
+        let mut reg = Self { conn: std::sync::Mutex::new(conn), backends, last_refresh: None, audit_log_path };
         reg.ensure_fresh().await?;
         Ok(reg)
     }
@@ -58,7 +64,8 @@ impl Registry {
     ) -> Result<Self, GatewayError> {
         let conn = db::open_in_memory()?;
         let backends = build_backends(config, secrets);
-        let mut reg = Self { conn: std::sync::Mutex::new(conn), backends, last_refresh: None };
+        let mut reg =
+            Self { conn: std::sync::Mutex::new(conn), backends, last_refresh: None, audit_log_path: None };
         reg.ensure_fresh().await?;
         Ok(reg)
     }
@@ -90,7 +97,14 @@ impl Registry {
             // `skill-registry`'s `scan_sources`, which counts and skips
             // per-entry failures rather than aborting the whole scan).
             match result {
-                Ok(tools) => entries.push(ServerTools { server: name, tools }),
+                // Sanitize here, at the one point genuinely untrusted
+                // downstream data enters our storage — a fallback-path
+                // `previous` entry below was already sanitized when it was
+                // first discovered, so it doesn't need this again.
+                Ok(tools) => {
+                    let tools = tools.into_iter().map(sanitize_tool_entry).collect();
+                    entries.push(ServerTools { server: name, tools });
+                }
                 Err(e) => {
                     eprintln!("gateway-registry: discover failed for backend '{name}': {e}");
                     // A transient failure (e.g. a one-off RPC timeout) must
@@ -146,7 +160,31 @@ impl Registry {
             };
             return Err(GatewayError::ToolNotFound(msg));
         }
-        backend.call(tool, args).await
+        let result = backend.call(tool, args.clone()).await;
+        if let Some(path) = &self.audit_log_path {
+            match &result {
+                Ok(_) => crate::audit::record(path, server, tool, &args, Ok(())),
+                Err(e) => crate::audit::record(path, server, tool, &args, Err(error_kind(e))),
+            }
+        }
+        result
+    }
+}
+
+/// A short, stable tag for `GatewayError`'s variant — used only in the
+/// audit log's `error_kind` field, not shown to the LLM (that's
+/// `redact_error_for_llm`'s job on the full message elsewhere).
+fn error_kind(e: &GatewayError) -> &'static str {
+    match e {
+        GatewayError::ServerNotFound(_) => "ServerNotFound",
+        GatewayError::ToolNotFound(_) => "ToolNotFound",
+        GatewayError::NotImplemented(_) => "NotImplemented",
+        GatewayError::Connection(_) => "Connection",
+        GatewayError::Upstream(_) => "Upstream",
+        GatewayError::Timeout(_) => "Timeout",
+        GatewayError::InvalidArgument(_) => "InvalidArgument",
+        GatewayError::CircuitOpen(_) => "CircuitOpen",
+        GatewayError::Sqlite(_) => "Sqlite",
     }
 }
 
@@ -231,7 +269,8 @@ mod tests {
         );
         // `last_refresh: None` so `ensure_fresh` doesn't skip via the
         // debounce and actually runs the discover-fails-then-fallback path.
-        let mut reg = Registry { conn: std::sync::Mutex::new(conn), backends, last_refresh: None };
+        let mut reg =
+            Registry { conn: std::sync::Mutex::new(conn), backends, last_refresh: None, audit_log_path: None };
 
         reg.ensure_fresh().await.unwrap();
 

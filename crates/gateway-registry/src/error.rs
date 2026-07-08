@@ -24,6 +24,11 @@ pub enum GatewayError {
     /// a caller-fixable mistake, not an infrastructure failure.
     #[error("{0}")]
     InvalidArgument(String),
+    /// The backend's circuit breaker is open after repeated consecutive
+    /// failures — short-circuited without attempting a spawn. See
+    /// `mcp_stdio.rs`'s `CIRCUIT_FAILURE_THRESHOLD`/`CIRCUIT_RECOVERY_TIMEOUT`.
+    #[error("{0}")]
+    CircuitOpen(String),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
 }
