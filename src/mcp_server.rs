@@ -320,7 +320,11 @@ impl AgentflareMcp {
                 let capped = gateway_registry::truncate_if_needed(&value, gateway_registry::DEFAULT_MAX_CHARS);
                 Ok(serde_json::to_string_pretty(&capped).unwrap_or_default())
             }
-            Err(e) => Err(ErrorData::invalid_params(e.to_string(), None)),
+            Err(e @ gateway_registry::GatewayError::ServerNotFound(_))
+            | Err(e @ gateway_registry::GatewayError::ToolNotFound(_)) => {
+                Err(ErrorData::invalid_params(e.to_string(), None))
+            }
+            Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
         }
     }
 }
@@ -642,5 +646,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("required"));
+    }
+
+    #[tokio::test]
+    async fn gateway_execute_unknown_server_is_invalid_params() {
+        // Isolated DB path, no servers configured — `Registry::execute` is
+        // guaranteed to hit `GatewayError::ServerNotFound`, which must map to
+        // `invalid_params` (a caller-fixable mistake), not `internal_error`.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            gateway_db_override: Some(tmp.path().join("gateway.db")),
+            ..Default::default()
+        };
+        let err = s
+            .gateway_execute(Parameters(GatewayExecuteRequest {
+                server: "definitely-not-a-configured-server".into(),
+                tool: "x".into(),
+                args: serde_json::json!({}),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.to_string().contains("not found"));
     }
 }
