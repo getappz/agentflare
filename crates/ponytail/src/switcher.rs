@@ -38,12 +38,12 @@ pub fn detect(input: &str) -> Option<SwitchAction> {
         let prefixed = format!("/ponytail-{name}");
         let alt = format!("/ponytail:{name}");
         if prompt == prefixed || prompt.starts_with(&format!("{prefixed} ")) {
-            let normalized = config::normalize_config_mode(&name)?;
-            return Some(SwitchAction::SetMode(normalized.to_string()));
+            let normalized = config::normalize_extended_mode(&name)?;
+            return Some(SwitchAction::SetMode(normalized));
         }
         if prompt == alt || prompt.starts_with(&format!("{alt} ")) {
-            let normalized = config::normalize_config_mode(&name)?;
-            return Some(SwitchAction::SetMode(normalized.to_string()));
+            let normalized = config::normalize_extended_mode(&name)?;
+            return Some(SwitchAction::SetMode(normalized));
         }
     }
 
@@ -73,20 +73,20 @@ pub fn detect(input: &str) -> Option<SwitchAction> {
             if smode.is_empty() {
                 return None;
             }
-            let normalized = config::normalize_config_mode(smode)?;
-            Some(SwitchAction::SetSession(normalized.to_string()))
+            let normalized = config::normalize_extended_mode(smode)?;
+            Some(SwitchAction::SetSession(normalized))
         }
         s if all_skill_names().iter().any(|n| n == s) => {
-            let normalized = config::normalize_config_mode(s)?;
-            Some(SwitchAction::SetMode(normalized.to_string()))
+            let normalized = config::normalize_extended_mode(s)?;
+            Some(SwitchAction::SetMode(normalized))
         }
         "default" => {
             let dmode = arg;
             if dmode.is_empty() {
                 return None;
             }
-            let normalized = config::normalize_config_mode(dmode)?;
-            Some(SwitchAction::SetDefault(normalized.to_string()))
+            let normalized = config::normalize_extended_mode(dmode)?;
+            Some(SwitchAction::SetDefault(normalized))
         }
         _ => None,
     }

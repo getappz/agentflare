@@ -50,9 +50,9 @@ Default mode = `full`, auto-active every session. Change it:
 export PONYTAIL_DEFAULT_MODE=ultra
 ```
 
-**Config file** (`~/.config/ponytail/config.json`, Windows: `%APPDATA%\ponytail\config.json`):
+**Config file** (`~/.config/agentflare/ponytail/config.json`, Windows: `%APPDATA%\agentflare\ponytail\config.json`):
 ```json
-{ "defaultMode": "lite" }
+{ "default_mode": "lite" }
 ```
 
 Set `"off"` to disable auto-activation on session start, activate manually

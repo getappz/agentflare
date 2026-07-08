@@ -53,31 +53,41 @@ pub fn download_skill() -> Result<String, String> {
 }
 
 pub fn build(mode: &str, skill_path: Option<&Path>) -> Instructions {
-    let effective = config::normalize_persisted_mode(mode)
-        .unwrap_or(config::DEFAULT_MODE);
+    // Custom skill names aren't in the static mode lists, so keep them as-is
+    // instead of collapsing them to the default mode.
+    let effective: String = config::normalize_persisted_mode(mode)
+        .map(str::to_string)
+        .or_else(|| crate::sub_skills::get_custom(mode).map(|_| mode.to_string()))
+        .unwrap_or_else(|| config::DEFAULT_MODE.to_string());
 
-    if crate::sub_skills::get(effective).is_some() || crate::sub_skills::get_custom(effective).is_some() {
+    if crate::sub_skills::get(&effective).is_some() {
         return Instructions {
-            mode: effective.to_string(),
+            mode: effective.clone(),
             body: format!(
                 "PONYTAIL MODE ACTIVE — level: {effective}. Behavior defined by /ponytail-{effective} skill."
             ),
         };
     }
 
+    // Custom skills have no harness-installed /ponytail-<name> skill to point
+    // at, so their authored body is delivered inline.
+    if let Some(body) = crate::sub_skills::get_custom(&effective) {
+        return Instructions { mode: effective, body };
+    }
+
     let skill_body = if let Some(path) = skill_path {
         std::fs::read_to_string(path).unwrap_or_else(|_| EMBEDDED_SKILL.to_string())
     } else {
-        crate::sub_skills::get_custom(effective)
-            .or_else(|| std::fs::read_to_string(skill_cache_path()).ok())
+        std::fs::read_to_string(skill_cache_path())
+            .ok()
             .or_else(find_workspace_agents_md)
             .unwrap_or_else(|| EMBEDDED_SKILL.to_string())
     };
 
-    let filtered = filter_skill_body(&skill_body, effective);
+    let filtered = filter_skill_body(&skill_body, &effective);
 
     Instructions {
-        mode: effective.to_string(),
+        mode: effective,
         body: filtered,
     }
 }

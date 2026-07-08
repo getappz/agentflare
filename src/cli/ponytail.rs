@@ -155,6 +155,11 @@ impl PonytailArgs {
             }
             PonytailAction::Hook { event } => match event {
                 PonytailHookEvent::SessionStart => {
+                    // A session-scoped override must not outlive its session:
+                    // there is no SessionEnd hook, so clear it when the next
+                    // session starts — otherwise active_mode() reads the stale
+                    // override and set_active() below promotes it to global.
+                    ponytail::clear_session();
                     let mode = ponytail::active_mode()
                         .unwrap_or_else(ponytail::default_mode);
                     if mode != "off" {

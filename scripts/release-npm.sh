@@ -37,15 +37,17 @@ platforms=(
 download_asset() {
 	local asset="$1"
 	local dest="$2"
-	if [ ! -f "$dest" ]; then
-		gh release download "$AGENTFLARE_VERSION" \
-			--repo getappz/agentflare \
-			--pattern "$asset" \
-			--dir "$RELEASE_DIR" || {
-			echo "Warning: $asset not found, skipping"
-			return 1
-		}
-	fi
+	# Always fetch fresh: asset names carry no version, so a leftover file in
+	# a reused RELEASE_DIR would silently republish the previous release's
+	# binary under the new version tag.
+	rm -f "$dest"
+	gh release download "$AGENTFLARE_VERSION" \
+		--repo getappz/agentflare \
+		--pattern "$asset" \
+		--dir "$RELEASE_DIR" || {
+		echo "Warning: $asset not found, skipping"
+		return 1
+	}
 }
 
 extract_asset() {
@@ -69,6 +71,8 @@ extract_asset() {
 	fi
 }
 
+skipped_platforms=()
+
 for entry in "${platforms[@]}"; do
 	IFS=":" read -r npm_plat rust_target ext <<<"$entry"
 	IFS="-" read -r os arch <<<"$npm_plat"
@@ -76,7 +80,10 @@ for entry in "${platforms[@]}"; do
 	asset="agentflare-${rust_target}.${ext}"
 	archive_path="$RELEASE_DIR/$asset"
 
-	download_asset "$asset" "$archive_path" || continue
+	download_asset "$asset" "$archive_path" || {
+		skipped_platforms+=("$npm_plat")
+		continue
+	}
 
 	rm -rf "$RELEASE_DIR/npm"
 	mkdir -p "$RELEASE_DIR/npm"
@@ -251,5 +258,11 @@ else
 	}
 fi
 popd
+
+# A release that quietly ships fewer platform packages than declared leaves
+# those users with broken npm installs and no CI signal — fail loudly.
+if [ "${#skipped_platforms[@]}" -gt 0 ]; then
+	error "npm publish incomplete for v$AGENTFLARE_NPM_VERSION — missing platform assets: ${skipped_platforms[*]}"
+fi
 
 echo "npm publish complete for v$AGENTFLARE_NPM_VERSION"

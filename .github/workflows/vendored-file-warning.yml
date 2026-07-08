@@ -10,7 +10,7 @@ permissions: {}
 
 jobs:
   warn:
-    if: github.event.pull_request.user.login != 'getappz'
+    if: github.event.pull_request.user.login != 'getappz' && github.event.pull_request.user.type != 'Bot'
     runs-on: ubuntu-latest
     steps:
       - name: Warn on vendored file changes

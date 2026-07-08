@@ -1,3 +1,10 @@
 /target
 /docs/superpowers/
 /.worktrees/
+
+# Local onpush doc-generation tooling (machine-specific, not part of the project)
+/.onpush/
+/onpush_run.log
+/install_onpush.ps1
+/run_onpush.bat
+/serve_docs.py

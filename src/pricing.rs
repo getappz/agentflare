@@ -213,10 +213,15 @@ pub fn lookup_pricing<'a>(
             return Some(p);
         }
     }
-    for (key, p) in pricing {
-        if model_id.starts_with(key.as_str()) {
-            return Some(p);
-        }
+    // Longest matching prefix wins — HashMap iteration order is random, so
+    // taking the first match would resolve ambiguous ids nondeterministically.
+    if let Some(p) = pricing
+        .iter()
+        .filter(|(key, _)| model_id.starts_with(key.as_str()))
+        .max_by_key(|(key, _)| key.len())
+        .map(|(_, p)| p)
+    {
+        return Some(p);
     }
     {
         let matches: Vec<&ModelPricing> = pricing

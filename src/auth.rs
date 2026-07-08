@@ -207,6 +207,9 @@ pub fn activate_with(agent: &str, profile: &str, reload_daemon: bool, json: bool
         }
     }
 
+    let conn = crate::auth_db::open_or_rebuild();
+    crate::auth_db::touch_last_used(&conn, agent, &profile);
+
     if json {
         println!("{}", serde_json::json!({
             "agent": agent,

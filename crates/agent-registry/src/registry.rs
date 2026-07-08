@@ -30,6 +30,7 @@ pub enum Agent {
 }
 
 impl Agent {
+    #[must_use] 
     pub fn as_str(self) -> &'static str {
         match self {
             Agent::ClaudeCode => "claude-code",
@@ -277,6 +278,7 @@ pub static REGISTRY: &[AgentSpec] = &[
 /// Not yet consumed outside tests — wired up by the upcoming agent detection
 /// engine and CLI commands.
 #[allow(dead_code)]
+#[must_use] 
 pub fn spec(agent: Agent) -> &'static AgentSpec {
     REGISTRY
         .iter()

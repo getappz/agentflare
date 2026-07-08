@@ -5,6 +5,9 @@ on:
     types: [published]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   publish:
     runs-on: windows-latest
@@ -19,7 +22,7 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           $id = "getappz.agentflare"
-          $urls = gh release view --json assets --jq '.assets[] | select(.name | test("\\.(exe|msi)$")) | .url'
+          $urls = gh release view --json assets --jq '.assets[] | select(.name | test("windows.*\\.(zip|exe|msi)$")) | .url'
           if (-not $urls) { throw "No winget installer assets found" }
           komac update $id --version "$env:RELEASE_TAG" --urls $urls
           komac cleanup --only-merged

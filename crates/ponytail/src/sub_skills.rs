@@ -36,6 +36,11 @@ static CUSTOM_SKILLS: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
             let path = entry.path();
             if path.extension().map_or(false, |e| e == "md") {
                 if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                    // Reserved built-in mode/skill names can't be shadowed by
+                    // custom files — a user's full.md must not hijack full mode.
+                    if crate::config::VALID_MODES.contains(&name) {
+                        continue;
+                    }
                     if let Ok(body) = std::fs::read_to_string(&path) {
                         if !body.is_empty() {
                             map.insert(name.to_string(), body);

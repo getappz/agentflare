@@ -1,15 +1,12 @@
 name: security-check
 
+# No paths filter: "cargo audit" is a required branch-protection check, and a
+# path-filtered required check never reports on PRs that skip it — blocking
+# the merge forever. Audit is cheap with a warm cache; run it everywhere.
 on:
   push:
     branches: [master]
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
   pull_request:
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
 
 permissions:
   contents: read

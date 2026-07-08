@@ -163,7 +163,9 @@ use std::collections::{HashMap, HashSet};
 /// message.id:requestId dedup guarantee exact.
 pub(crate) fn sync(conn: &mut Connection, projects_dir: &Path) {
     let pricing = crate::pricing::load_pricing();
-    for path in find_session_files_under(projects_dir) {
+    let files = find_session_files_under(projects_dir);
+    prune_deleted_files(conn, &files);
+    for path in files {
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
@@ -191,6 +193,38 @@ pub(crate) fn sync(conn: &mut Connection, projects_dir: &Path) {
 
         reindex_file(conn, &path, &path_str, mtime_secs, size_bytes, &pricing);
     }
+}
+
+/// Files deleted or moved since the last sync must drop out of the catalog:
+/// stale `file_rollup` rows overstate cost forever, and stale `dedup_keys`
+/// ownership can wrongly mark a new file's lines as duplicates.
+fn prune_deleted_files(conn: &mut Connection, on_disk: &[std::path::PathBuf]) {
+    let disk: HashSet<String> = on_disk
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    let known: Vec<String> = {
+        let Ok(mut stmt) = conn.prepare("SELECT file_path FROM session_files") else {
+            return;
+        };
+        match stmt.query_map([], |row| row.get(0)) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => return,
+        }
+    };
+    let stale: Vec<&String> = known.iter().filter(|k| !disk.contains(*k)).collect();
+    if stale.is_empty() {
+        return;
+    }
+    let Ok(tx) = conn.transaction() else {
+        return;
+    };
+    for path in stale {
+        tx.execute("DELETE FROM session_files WHERE file_path = ?1", params![path]).ok();
+        tx.execute("DELETE FROM file_rollup WHERE file_path = ?1", params![path]).ok();
+        tx.execute("DELETE FROM dedup_keys WHERE file_path = ?1", params![path]).ok();
+    }
+    tx.commit().ok();
 }
 
 fn reindex_file(

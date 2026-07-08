@@ -21,6 +21,15 @@ pub fn normalize_persisted_mode(mode: &str) -> Option<&'static str> {
     normalize_mode(mode).or_else(|| normalize_config_mode(mode))
 }
 
+/// Like `normalize_config_mode`, but also accepts user-defined custom skill
+/// names (which are discovered at runtime, so they can't be `&'static str`).
+pub fn normalize_extended_mode(mode: &str) -> Option<String> {
+    let m = mode.trim().to_lowercase();
+    normalize_config_mode(&m)
+        .map(str::to_string)
+        .or_else(|| crate::sub_skills::get_custom(&m).map(|_| m))
+}
+
 pub fn is_deactivation(text: &str) -> bool {
     let t = text.trim().to_lowercase();
     let t = t.trim_end_matches(|c: char| c == '.' || c == '!' || c == '?' || c.is_whitespace());
@@ -45,29 +54,29 @@ struct ConfigFile {
 
 pub fn default_mode() -> String {
     if let Ok(val) = std::env::var("PONYTAIL_DEFAULT_MODE")
-        && let Some(m) = normalize_config_mode(&val)
+        && let Some(m) = normalize_extended_mode(&val)
     {
-        return m.to_string();
+        return m;
     }
     if let Ok(data) = std::fs::read_to_string(config_path())
         && let Ok(cfg) = serde_json::from_str::<ConfigFile>(&data)
         && let Some(mode) = cfg.default_mode
-        && let Some(m) = normalize_config_mode(&mode)
+        && let Some(m) = normalize_extended_mode(&mode)
     {
-        return m.to_string();
+        return m;
     }
     DEFAULT_MODE.to_string()
 }
 
 pub fn set_default_mode(mode: &str) -> Result<(), String> {
-    let normalized = normalize_config_mode(mode).ok_or_else(|| format!("invalid mode: {mode}"))?;
+    let normalized = normalize_extended_mode(mode).ok_or_else(|| format!("invalid mode: {mode}"))?;
     let dir = config_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut cfg: ConfigFile = std::fs::read_to_string(config_path())
         .ok()
         .and_then(|d| serde_json::from_str(&d).ok())
         .unwrap_or_default();
-    cfg.default_mode = Some(normalized.to_string());
+    cfg.default_mode = Some(normalized);
     let json = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
     std::fs::write(config_path(), json).map_err(|e| e.to_string())?;
     Ok(())

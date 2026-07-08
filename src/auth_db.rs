@@ -183,6 +183,19 @@ pub fn record_error(conn: &Connection, agent: &str, profile: &str, error_msg: &s
     .ok();
 }
 
+/// Stamp a profile as just-activated so `smart_pick`'s recency term is real.
+pub fn touch_last_used(conn: &Connection, agent: &str, profile: &str) {
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO profile_health (agent, profile, status, error_count_1h, penalty, last_used_at, updated_at)
+         VALUES (?1, ?2, 'healthy', 0, 0.0, ?3, ?4)
+         ON CONFLICT(agent, profile) DO UPDATE SET
+         last_used_at = excluded.last_used_at, updated_at = excluded.updated_at",
+        params![agent, profile, now, now],
+    )
+    .ok();
+}
+
 pub fn set_cooldown(conn: &Connection, agent: &str, profile: &str, minutes: u32, reason: &str) {
     let until = chrono::Utc::now() + chrono::Duration::minutes(minutes as i64);
     conn.execute(

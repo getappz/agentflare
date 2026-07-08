@@ -19,13 +19,16 @@ set -eu
 REPO="getappz/agentflare"
 INSTALL_DIR="${AGENTFLARE_INSTALL_DIR:-$HOME/.local/bin}"
 # Resolve the script's directory when invoked as a file. When piped via
-# `curl ... | sh`, $0 is "sh" (or similar) — the [ -f "$0" ] guard then
-# falls back to pwd, which routes to install_download since Cargo.toml
-# won't be found there.
+# `curl ... | sh`, $0 is "sh" (or similar) — SCRIPT_IS_FILE stays 0 and the
+# dispatch below always downloads: trusting pwd would build whatever
+# unrelated Cargo.toml the user happens to be sitting in.
+SCRIPT_IS_FILE=0
+if [ -n "${0:-}" ] && [ -f "$0" ]; then
+  SCRIPT_IS_FILE=1
+fi
 SCRIPT_DIR="$(
-  src="$0"
-  if [ -n "$src" ] && [ -f "$src" ]; then
-    cd "$(dirname "$src")" 2>/dev/null && pwd
+  if [ "$SCRIPT_IS_FILE" = "1" ]; then
+    cd "$(dirname "$0")" 2>/dev/null && pwd
   else
     pwd
   fi
@@ -132,13 +135,26 @@ install_download() {
   fi
 
   echo "Downloading checksums..."
+  # Fail closed: an installer that silently skips verification when the
+  # (much smaller) SHA256SUMS request is blocked or incomplete is exactly
+  # what a selective MITM wants. AGENTFLARE_SKIP_VERIFY=1 is the escape hatch.
   if curl -fsSL "$sums_url" -o "$tmpdir/SHA256SUMS" 2>/dev/null; then
     expected="$(grep "agentflare-${target}.tar.gz" "$tmpdir/SHA256SUMS" | cut -d' ' -f1)"
     if [ -n "$expected" ]; then
       verify_checksum "$tmpdir/agentflare.tar.gz" "$expected"
+    elif [ "${AGENTFLARE_SKIP_VERIFY:-0}" = "1" ]; then
+      echo "  Warning: agentflare-${target}.tar.gz not listed in SHA256SUMS — proceeding unverified (AGENTFLARE_SKIP_VERIFY=1)"
+    else
+      echo "Error: agentflare-${target}.tar.gz is not listed in SHA256SUMS — refusing to install unverified."
+      echo "Set AGENTFLARE_SKIP_VERIFY=1 to bypass (not recommended)."
+      exit 1
     fi
+  elif [ "${AGENTFLARE_SKIP_VERIFY:-0}" = "1" ]; then
+    echo "  Warning: checksums not available — proceeding unverified (AGENTFLARE_SKIP_VERIFY=1)"
   else
-    echo "  Warning: checksums not available, skipping verification"
+    echo "Error: could not download SHA256SUMS — refusing to install unverified."
+    echo "Set AGENTFLARE_SKIP_VERIFY=1 to bypass (not recommended)."
+    exit 1
   fi
 
   tar -xzf "$tmpdir/agentflare.tar.gz" -C "$tmpdir"
@@ -230,7 +246,7 @@ case "${1:-}" in
     echo "  AGENTFLARE_INSTALL_DIR  Custom install directory (default: ~/.local/bin)"
     ;;
   *)
-    if [ -f "$SCRIPT_DIR/Cargo.toml" ]; then
+    if [ "$SCRIPT_IS_FILE" = "1" ] && [ -f "$SCRIPT_DIR/Cargo.toml" ]; then
       install_from_source
     else
       install_download

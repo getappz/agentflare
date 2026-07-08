@@ -15,8 +15,8 @@ const MAX_RETRIES: usize = 5;
 pub fn run(agent: &str, args: &[String], json: bool) {
     let mut remaining = MAX_RETRIES;
     loop {
-        let status = spawn_and_capture(agent, args);
-        match categorize_exit(status) {
+        let (code, stderr) = spawn_and_capture(agent, args);
+        match categorize_exit(code, &stderr) {
             ExitKind::Success => return,
             ExitKind::RateLimited => {
                 if remaining == 0 {
@@ -29,6 +29,7 @@ pub fn run(agent: &str, args: &[String], json: bool) {
                 }
                 let conn = auth_db::open_or_rebuild();
                 if let Some((profile, _)) = auth_db::get_rotation_last(&conn, agent) {
+                    auth_db::record_error(&conn, agent, &profile, &stderr);
                     auth_db::set_cooldown(&conn, agent, &profile, 30, "rate limit");
                 }
                 crate::auth::rotate(agent, "smart", json);
@@ -39,6 +40,12 @@ pub fn run(agent: &str, args: &[String], json: bool) {
                 thread::sleep(Duration::from_secs(1 + (MAX_RETRIES - remaining) as u64));
             }
             ExitKind::Failure(code) => {
+                // Feed health scoring even for non-retryable failures so
+                // smart_pick can demote profiles that keep erroring.
+                let conn = auth_db::open_or_rebuild();
+                if let Some((profile, _)) = auth_db::get_rotation_last(&conn, agent) {
+                    auth_db::record_error(&conn, agent, &profile, &stderr);
+                }
                 std::process::exit(code);
             }
         }
@@ -51,8 +58,7 @@ enum ExitKind {
     Failure(i32),
 }
 
-fn categorize_exit(status: (i32, String)) -> ExitKind {
-    let (code, stderr) = status;
+fn categorize_exit(code: i32, stderr: &str) -> ExitKind {
     if code == 0 {
         return ExitKind::Success;
     }
@@ -160,25 +166,25 @@ mod tests {
 
     #[test]
     fn categorize_rate_limit_detects_429() {
-        let result = categorize_exit((1, "HTTP 429 Too Many Requests".to_string()));
+        let result = categorize_exit(1, "HTTP 429 Too Many Requests");
         assert!(matches!(result, ExitKind::RateLimited));
     }
 
     #[test]
     fn categorize_rate_limit_detects_quota() {
-        let result = categorize_exit((1, "quota exceeded for today".to_string()));
+        let result = categorize_exit(1, "quota exceeded for today");
         assert!(matches!(result, ExitKind::RateLimited));
     }
 
     #[test]
     fn categorize_success_on_zero() {
-        let result = categorize_exit((0, String::new()));
+        let result = categorize_exit(0, "");
         assert!(matches!(result, ExitKind::Success));
     }
 
     #[test]
     fn categorize_failure_on_unknown_error() {
-        let result = categorize_exit((1, "something went wrong".to_string()));
+        let result = categorize_exit(1, "something went wrong");
         assert!(matches!(result, ExitKind::Failure(1)));
     }
 }

@@ -3,7 +3,6 @@
 //! dependency, not ported code; no /NOTICE entry needed).
 
 use crate::optimize;
-use crate::optimize::Router;
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{
@@ -100,7 +99,8 @@ impl AgentflareMcp {
             recent_tool_calls: vec![],
             current_model: None,
         };
-        let router = optimize::KeywordRouter;
+        // Same router the CLI hook uses — honors AGENTFLARE_ROUTER.
+        let router = optimize::active_router();
         let result = match router.route(&ctx) {
             Some(nudge) => serde_json::json!({"suggestion": nudge}),
             None => serde_json::json!({"suggestion": null}),

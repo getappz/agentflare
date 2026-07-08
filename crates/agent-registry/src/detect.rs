@@ -28,6 +28,7 @@ pub static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// the approach used by `agents-cli`'s `findInPath` and `caam`'s
 /// `findBinary`, minus their shims-dir exclusion (agentflare has no shims
 /// directory yet).
+#[must_use] 
 pub fn find_binary(names: &[&str]) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -110,6 +111,7 @@ mod find_binary_tests {
 /// Find the first `\d+\.\d+\.\d+`-shaped substring in `text` (a `--version`
 /// command's combined stdout+stderr). Hand-rolled instead of pulling in the
 /// `regex` crate for one pattern.
+#[must_use] 
 pub fn extract_version(text: &str) -> Option<String> {
     let chars: Vec<char> = text.chars().collect();
     for start in 0..chars.len() {
@@ -196,7 +198,7 @@ impl VersionRunner for RealVersionRunner {
 fn run_version_command(binary: &Path, args: &[&str]) -> Result<String, String> {
     let binary = binary.to_path_buf();
     let binary_for_thread = binary.clone();
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let args: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
     let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
@@ -237,15 +239,13 @@ pub fn resolve_version_with(
         .and_then(|m| m.modified())
         .map_err(|e| format!("could not stat {}: {e}", binary_path.display()))?
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let binary_path_str = binary_path.to_string_lossy().into_owned();
 
-    if let Some(entry) = cache.get(agent_key) {
-        if entry.binary_path == binary_path_str && entry.mtime == mtime {
+    if let Some(entry) = cache.get(agent_key)
+        && entry.binary_path == binary_path_str && entry.mtime == mtime {
             return Ok(entry.version.clone());
         }
-    }
 
     let raw = runner.run(binary_path, version_args)?;
     let version = extract_version(&raw)
