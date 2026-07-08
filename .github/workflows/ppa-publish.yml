@@ -22,6 +22,9 @@ on:
 env:
   DEBIAN_FRONTEND: noninteractive
 
+permissions:
+  contents: read
+
 jobs:
   publish-ppa:
     runs-on: ubuntu-latest

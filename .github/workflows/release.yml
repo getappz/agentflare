@@ -5,6 +5,10 @@ on:
     tags:
       - "v*"
 
+# Least privilege: read-only token by default, elevated per job below.
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
@@ -71,6 +75,8 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # creates the GitHub release and uploads assets
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -243,6 +249,8 @@ jobs:
     name: Trigger npm publish
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      actions: write # gh workflow run
     steps:
       - name: Dispatch npm-publish workflow
         env:
@@ -256,6 +264,8 @@ jobs:
     name: Trigger PPA publish
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      actions: write # gh workflow run
     steps:
       - name: Dispatch ppa-publish workflow
         env:
@@ -269,6 +279,8 @@ jobs:
     name: Trigger Docker publish
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      actions: write # gh workflow run
     steps:
       - name: Dispatch docker workflow
         env:
