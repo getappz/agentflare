@@ -70,7 +70,8 @@ pub fn build(mode: &str, skill_path: Option<&Path>) -> Instructions {
     } else {
         crate::sub_skills::get_custom(effective)
             .or_else(|| std::fs::read_to_string(skill_cache_path()).ok())
-            .unwrap_or_else(|_| EMBEDDED_SKILL.to_string())
+            .or_else(find_workspace_agents_md)
+            .unwrap_or_else(|| EMBEDDED_SKILL.to_string())
     };
 
     let filtered = filter_skill_body(&skill_body, effective);
