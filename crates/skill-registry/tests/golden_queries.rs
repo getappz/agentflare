@@ -2,9 +2,9 @@
 //! This is the BM25-sufficiency gate from the design spec: if hit@3 drops
 //! below 85%, the v2 embeddings feature is justified.
 
-use skill_registry::db::{open_in_memory, rebuild};
-use skill_registry::search::{search, MatchMode};
-use skill_registry::sources::{scan_sources, Source, SourceKind};
+use agentflare_skill_registry::db::{open_in_memory, rebuild};
+use agentflare_skill_registry::search::{search, MatchMode};
+use agentflare_skill_registry::sources::{scan_sources, Source, SourceKind};
 use std::fs;
 use std::path::Path;
 
