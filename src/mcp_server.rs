@@ -6,9 +6,10 @@ use crate::optimize;
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{
-        AnnotateAble, ErrorData, Implementation, ListResourcesResult, PaginatedRequestParams,
-        RawResource, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
-        ServerCapabilities, ServerInfo,
+        AnnotateAble, ErrorData, GetPromptRequestParams, GetPromptResult, Implementation,
+        ListPromptsResult, ListResourcesResult, PaginatedRequestParams, RawResource,
+        ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
+        ServerInfo,
     },
     schemars,
     service::{RequestContext, RoleServer},
@@ -286,6 +287,7 @@ impl ServerHandler for AgentflareMcp {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
+                .enable_prompts()
                 .build(),
         )
         .with_server_info(Implementation::new(
@@ -308,6 +310,26 @@ impl ServerHandler for AgentflareMcp {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
         self.read_resource_sync(request.uri.as_str())
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        Ok(ListPromptsResult::with_all_items(
+            crate::mcp_prompts::list_prompts(),
+        ))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, ErrorData> {
+        crate::mcp_prompts::get_prompt(&request).ok_or_else(|| {
+            ErrorData::invalid_params(format!("Unknown prompt: {}", request.name), None)
+        })
     }
 }
 

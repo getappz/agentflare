@@ -60,6 +60,8 @@ pub enum PonytailAction {
     Debt,
     Gain,
     Info,
+    Playbook,
+    NoHallucination,
     Hook {
         #[command(subcommand)]
         event: PonytailHookEvent,
@@ -160,6 +162,12 @@ impl PonytailArgs {
             }
             PonytailAction::Info => {
                 println!("{}", ponytail::sub_skills::SKILL_HELP);
+            }
+            PonytailAction::Playbook => {
+                println!("{}", ponytail::sub_skills::SKILL_PLAYBOOK);
+            }
+            PonytailAction::NoHallucination => {
+                println!("{}", ponytail::sub_skills::SKILL_NO_HALLUCINATION);
             }
             PonytailAction::Hook { event } => match event {
                 PonytailHookEvent::SessionStart => {
