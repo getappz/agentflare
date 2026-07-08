@@ -53,21 +53,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-registry"
-version = "0.1.0"
-dependencies = [
- "clap",
- "dirs",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "agentflare"
 version = "1.2.0"
 dependencies = [
  "aes-gcm",
- "agent-registry",
+ "agentflare-agent-registry",
+ "agentflare-skill-registry",
  "built",
  "chrono",
  "clap",
@@ -87,7 +78,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "skill-registry",
  "sysinfo",
  "tar",
  "tempfile",
@@ -95,6 +85,30 @@ dependencies = [
  "tokio",
  "ureq",
  "zip",
+]
+
+[[package]]
+name = "agentflare-agent-registry"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dirs",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "agentflare-skill-registry"
+version = "0.1.1"
+dependencies = [
+ "agentflare-agent-registry",
+ "dirs",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -1760,20 +1774,6 @@ name = "similar"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
-
-[[package]]
-name = "skill-registry"
-version = "0.1.1"
-dependencies = [
- "agent-registry",
- "dirs",
- "regex",
- "rusqlite",
- "serde",
- "serde_yaml",
- "tempfile",
- "thiserror",
-]
 
 [[package]]
 name = "slab"
