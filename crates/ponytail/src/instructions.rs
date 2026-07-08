@@ -84,12 +84,33 @@ pub fn build(mode: &str, skill_path: Option<&Path>) -> Instructions {
             .unwrap_or_else(|| EMBEDDED_SKILL.to_string())
     };
 
-    let filtered = filter_skill_body(&skill_body, &effective);
+    let mut filtered = filter_skill_body(&skill_body, &effective);
+    filtered.push_str(&compression_deconfliction());
 
     Instructions {
         mode: effective,
         body: filtered,
     }
+}
+
+/// If a known compression/persona plugin (e.g. caveman) is also wired into
+/// the agent's settings, add a short note so the two don't read as
+/// contradictory: ponytail governs code structure, the peer plugin governs
+/// output style.
+fn compression_deconfliction() -> String {
+    let peers = config::detect_compression_plugins();
+    if peers.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n## Compression plugin coexistence\n\n\
+         Detected: {}. Ponytail governs WHAT to build (the ladder, YAGNI, \
+         stdlib-first, minimal diffs). Defer to the other plugin for output \
+         STYLE (brevity, tone, formatting). If rules conflict, the \
+         structural rule (ponytail) wins for code decisions; the style rule \
+         (peer plugin) wins for prose and formatting.",
+        peers.join(", ")
+    )
 }
 
 pub fn filter_skill_body(body: &str, mode: &str) -> String {
@@ -118,56 +139,32 @@ pub fn filter_skill_body(body: &str, mode: &str) -> String {
         .join("\n")
 }
 
-#[allow(dead_code)]
-pub fn fallback_instructions(mode: &str) -> String {
-    let m = config::normalize_mode(mode).unwrap_or(config::DEFAULT_MODE);
-    format!(
-        "PONYTAIL MODE ACTIVE — level: {m}\n\n\
-         You are a lazy senior developer. Lazy means efficient, not careless — \
-         less work for the same result. The best code is the code never written.\n\n\
-         ## The ladder\n\n\
-         1. Does this need to exist at all? (YAGNI)\n\
-         2. Already in this codebase? Reuse it.\n\
-         3. Stdlib does it? Use it.\n\
-         4. Native platform feature covers it? Use it.\n\
-         5. Already-installed dependency solves it? Use it.\n\
-         6. Can it be one line? One line.\n\
-         7. Only then: the minimum code that works.\n\n\
-         ## Rules\n\n\
-         No unrequested abstractions. No boilerplate. Deletion over addition.\n\
-         Code first, then at most three lines: what was skipped, when to add it.\n\
-         Never simplify away: input validation, error handling, security, accessibility.\n\n\
-         NEVER invent APIs, functions, or variables that don't exist in the codebase.\n\
-         Always verify the API surface before using it — read the file or docs first.\n\
-         Prefer searching the codebase over assuming. Trust but verify.\n\n\
-         ## Persona boundary\n\n\
-         Act the role, never label it. Don't mention ponytail mode, intensity\n\
-         levels, or persona names in replies. The user knows what they asked for.\n\n\
-         ## Simplification markers\n\n\
-         Mark deliberate shortcuts with a `ponytail:` comment. One line only:\n\
-         `ponytail: <what was skipped>, add when <condition>`\n\
-         If the explanation is longer than the code, delete the explanation.",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fallback_generates_for_mode() {
-        let f = fallback_instructions("full");
-        assert!(f.contains("PONYTAIL MODE ACTIVE"));
-        assert!(f.contains("The ladder"));
-        assert!(f.contains("Persona boundary"));
-        assert!(f.contains("Simplification markers"));
-    }
 
     #[test]
     fn build_uses_embedded_skill() {
         let ins = build("full", None);
         assert!(!ins.body.is_empty());
         assert_eq!(ins.mode, "full");
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn build_appends_deconfliction_when_compression_plugin_present() {
+        let _guard = config::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("ponytail_test_instructions_compression");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"plugins": ["caveman"]}"#).unwrap();
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &dir) };
+
+        let ins = build("full", None);
+        assert!(ins.body.contains("Compression plugin coexistence"));
+        assert!(ins.body.contains("caveman"));
+
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

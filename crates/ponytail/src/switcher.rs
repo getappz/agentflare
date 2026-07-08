@@ -10,7 +10,15 @@ pub enum SwitchAction {
 }
 
 fn all_skill_names() -> Vec<String> {
-    let mut names: Vec<String> = ["review", "audit", "debt", "gain", "help", "playbook"]
+    let mut names: Vec<String> = [
+        "review",
+        "audit",
+        "debt",
+        "gain",
+        "help",
+        "playbook",
+        "no-hallucination",
+    ]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -141,6 +149,11 @@ mod tests {
     #[test]
     fn detects_sub_skill_playbook() {
         assert!(matches!(detect("/ponytail-playbook"), Some(SwitchAction::SetMode(m)) if m == "playbook"));
+    }
+
+    #[test]
+    fn detects_sub_skill_no_hallucination() {
+        assert!(matches!(detect("/ponytail-no-hallucination"), Some(SwitchAction::SetMode(m)) if m == "no-hallucination"));
     }
 
     #[test]

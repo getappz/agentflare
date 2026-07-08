@@ -7,6 +7,7 @@ pub const SKILL_DEBT: &str = include_str!("skill-debt.md");
 pub const SKILL_GAIN: &str = include_str!("skill-gain.md");
 pub const SKILL_HELP: &str = include_str!("skill-help.md");
 pub const SKILL_PLAYBOOK: &str = include_str!("skill-playbook.md");
+pub const SKILL_NO_HALLUCINATION: &str = include_str!("skill-no-hallucination.md");
 
 pub fn get(name: &str) -> Option<&'static str> {
     match name {
@@ -16,6 +17,7 @@ pub fn get(name: &str) -> Option<&'static str> {
         "gain" => Some(SKILL_GAIN),
         "help" => Some(SKILL_HELP),
         "playbook" => Some(SKILL_PLAYBOOK),
+        "no-hallucination" => Some(SKILL_NO_HALLUCINATION),
         _ => None,
     }
 }

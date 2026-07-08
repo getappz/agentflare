@@ -36,9 +36,17 @@ pub fn load() -> State {
 }
 
 pub fn save(state: &State) {
-    let _ = fs::create_dir_all(state_dir());
-    if let Ok(json) = serde_json::to_string_pretty(state) {
-        let _ = fs::write(state_path(), json + "\n");
+    if let Err(e) = fs::create_dir_all(state_dir()) {
+        eprintln!("[agentflare] warning: failed to create state dir: {e}");
+        return;
+    }
+    match serde_json::to_string_pretty(state) {
+        Ok(json) => {
+            if let Err(e) = fs::write(state_path(), json + "\n") {
+                eprintln!("[agentflare] warning: failed to persist state: {e}");
+            }
+        }
+        Err(e) => eprintln!("[agentflare] warning: failed to serialize state: {e}"),
     }
 }
 

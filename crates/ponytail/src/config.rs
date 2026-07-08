@@ -4,6 +4,7 @@ use std::path::PathBuf;
 pub const DEFAULT_MODE: &str = "full";
 pub const VALID_MODES: &[&str] = &[
     "off", "lite", "full", "ultra", "review", "audit", "debt", "gain", "help", "playbook",
+    "no-hallucination",
 ];
 pub const RUNTIME_MODES: &[&str] = &["off", "lite", "full", "ultra"];
 
@@ -28,6 +29,43 @@ pub fn normalize_extended_mode(mode: &str) -> Option<String> {
     normalize_config_mode(&m)
         .map(str::to_string)
         .or_else(|| crate::sub_skills::get_custom(&m).map(|_| m))
+}
+
+/// Serializes tests (in this module and `instructions.rs`) that mutate
+/// process-global env vars (`CLAUDE_CONFIG_DIR`, `PONYTAIL_DEFAULT_MODE`) —
+/// `cargo test` runs unit tests in parallel by default, so unguarded
+/// `set_var`/`remove_var` calls can leak across assertions.
+pub static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Compression/persona plugins known to conflict with ponytail's own style
+/// guidance if both are active — e.g. caveman's terse-prose rules vs
+/// ponytail's own output-shape rules.
+const KNOWN_COMPRESSION_PLUGINS: &[&str] = &["caveman"];
+
+fn claude_dir() -> PathBuf {
+    std::env::var("CLAUDE_CONFIG_DIR").map_or_else(
+        |_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".claude")
+        },
+        PathBuf::from,
+    )
+}
+
+/// Scans `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`)
+/// for known compression/persona plugins so ponytail can add a
+/// deconfliction note instead of silently contradicting them.
+pub fn detect_compression_plugins() -> Vec<&'static str> {
+    let Ok(raw) = std::fs::read_to_string(claude_dir().join("settings.json")) else {
+        return Vec::new();
+    };
+    let blob = raw.to_lowercase();
+    KNOWN_COMPRESSION_PLUGINS
+        .iter()
+        .filter(|name| blob.contains(*name))
+        .copied()
+        .collect()
 }
 
 pub fn is_deactivation(text: &str) -> bool {
@@ -103,6 +141,26 @@ mod tests {
     }
 
     #[test]
+    fn no_compression_plugins_when_settings_missing() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", "/nonexistent/ponytail-test-dir") };
+        assert!(detect_compression_plugins().is_empty());
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+    }
+
+    #[test]
+    fn detects_caveman_in_settings_json() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("ponytail_test_compression_conflict");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"plugins": ["caveman"]}"#).unwrap();
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &dir) };
+        assert_eq!(detect_compression_plugins(), vec!["caveman"]);
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn detects_deactivation() {
         assert!(is_deactivation("stop ponytail"));
         assert!(is_deactivation("normal mode"));
@@ -112,12 +170,14 @@ mod tests {
 
     #[test]
     fn defaults_to_full() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
         assert_eq!(default_mode(), "full");
     }
 
     #[test]
     fn reads_env_var() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("PONYTAIL_DEFAULT_MODE", "lite") };
         assert_eq!(default_mode(), "lite");
         unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
