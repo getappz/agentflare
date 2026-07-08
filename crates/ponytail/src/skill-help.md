@@ -34,7 +34,7 @@ Level sticks until changed or session end.
 | **ponytail-no-hallucination** | `/ponytail-no-hallucination` | Reality-check layer: blocks invented APIs, deprecated methods, undeclared variables. |
 
 Codex uses `@ponytail`, `@ponytail-review`, and `@ponytail-help`; Claude Code
-and OpenCode use the slash-command forms above (OpenCode ships all six as
+and OpenCode use the slash-command forms above (OpenCode ships all seven as
 slash commands).
 
 ## Deactivate

@@ -80,6 +80,14 @@ pub struct PonytailArgs {
     pub action: PonytailAction,
 }
 
+fn report_message(mode: &str) -> String {
+    if mode == "off" {
+        "ponytail is off. Use /ponytail lite|full|ultra to activate.".to_string()
+    } else {
+        format!("PONYTAIL MODE ACTIVE — level: {mode}")
+    }
+}
+
 fn emit_hook(event: &str, off_guard: bool) {
     let mode = ponytail::active_mode().unwrap_or_else(ponytail::default_mode);
     if off_guard && mode == "off" {
@@ -194,7 +202,7 @@ impl PonytailArgs {
                                 let mode = ponytail::active_mode()
                                     .unwrap_or_else(ponytail::default_mode);
                                 let platform = ponytail::detect_platform();
-                                let ctx = format!("PONYTAIL MODE ACTIVE — level: {mode}");
+                                let ctx = report_message(&mode);
                                 let output = ponytail::format_hook_output(
                                     "UserPromptSubmit",
                                     &ctx,
@@ -222,5 +230,23 @@ impl PonytailArgs {
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_message_says_active_for_runtime_mode() {
+        assert_eq!(report_message("full"), "PONYTAIL MODE ACTIVE — level: full");
+    }
+
+    #[test]
+    fn report_message_says_off_for_off_mode() {
+        assert_eq!(
+            report_message("off"),
+            "ponytail is off. Use /ponytail lite|full|ultra to activate."
+        );
     }
 }

@@ -153,6 +153,7 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn build_appends_deconfliction_when_compression_plugin_present() {
+        let _guard = config::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("ponytail_test_instructions_compression");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("settings.json"), r#"{"plugins": ["caveman"]}"#).unwrap();

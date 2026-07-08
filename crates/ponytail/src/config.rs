@@ -31,6 +31,12 @@ pub fn normalize_extended_mode(mode: &str) -> Option<String> {
         .or_else(|| crate::sub_skills::get_custom(&m).map(|_| m))
 }
 
+/// Serializes tests (in this module and `instructions.rs`) that mutate
+/// process-global env vars (`CLAUDE_CONFIG_DIR`, `PONYTAIL_DEFAULT_MODE`) —
+/// `cargo test` runs unit tests in parallel by default, so unguarded
+/// `set_var`/`remove_var` calls can leak across assertions.
+pub static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Compression/persona plugins known to conflict with ponytail's own style
 /// guidance if both are active — e.g. caveman's terse-prose rules vs
 /// ponytail's own output-shape rules.
@@ -136,6 +142,7 @@ mod tests {
 
     #[test]
     fn no_compression_plugins_when_settings_missing() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", "/nonexistent/ponytail-test-dir") };
         assert!(detect_compression_plugins().is_empty());
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
@@ -143,6 +150,7 @@ mod tests {
 
     #[test]
     fn detects_caveman_in_settings_json() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("ponytail_test_compression_conflict");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("settings.json"), r#"{"plugins": ["caveman"]}"#).unwrap();
@@ -162,12 +170,14 @@ mod tests {
 
     #[test]
     fn defaults_to_full() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
         assert_eq!(default_mode(), "full");
     }
 
     #[test]
     fn reads_env_var() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("PONYTAIL_DEFAULT_MODE", "lite") };
         assert_eq!(default_mode(), "lite");
         unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
