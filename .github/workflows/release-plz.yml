@@ -5,12 +5,13 @@ on:
     branches: [master]
   schedule:
     - cron: "0 0 * * *"
+  workflow_dispatch:
 
 permissions: {}
 
 jobs:
   release-pr:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
