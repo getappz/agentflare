@@ -18,9 +18,12 @@ pub fn home() -> PathBuf {
 // parallel test runner.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::sync::Mutex;
-
-    static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
+    // One process-wide lock for ALL env mutation in this test binary.
+    // src/agents.rs already serializes PATH edits on agent_registry's
+    // PATH_LOCK; using a second, independent lock here would let a
+    // set_var("AGENTFLARE_HOME_OVERRIDE") race a set_var("PATH") on another
+    // thread — exactly the UB set_var is unsafe for.
+    use agent_registry::detect::PATH_LOCK as GLOBAL_STATE_LOCK;
 
     pub(crate) fn with_temp_home<T>(f: impl FnOnce() -> T) -> T {
         let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
