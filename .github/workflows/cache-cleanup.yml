@@ -1,9 +1,9 @@
 name: cache-cleanup
 
-# zizmor: ignore[dangerous-triggers] — pull_request_target is required so forked
-# PRs get a write-scoped token to delete their own caches; no PR code is
-# checked out or executed, only the trusted workflow from the base branch runs.
 on:
+  # zizmor: ignore[dangerous-triggers] — pull_request_target is required so forked
+  # PRs get a write-scoped token to delete their own caches; no PR code is
+  # checked out or executed, only the trusted workflow from the base branch runs.
   pull_request_target:
     types: [closed]
 
