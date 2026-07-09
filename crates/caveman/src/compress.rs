@@ -8,6 +8,7 @@ use crate::llm::Llm;
 use crate::prompt::Prompt;
 use crate::sensitive::is_sensitive_path;
 use crate::validate::validate;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 const MAX_FILE_SIZE: u64 = 500_000; // 500KB
@@ -131,13 +132,18 @@ fn backup_path_for(target: &Path, mode: BackupMode) -> PathBuf {
                 .join("agentflare")
                 .join("caveman")
                 .join("backups");
-            let parent_name = target
-                .parent()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
+            // Hash the full parent path, not just its last component — two
+            // files with the same name under differently-located but
+            // identically-named parent dirs (e.g. "project-a/docs/README.md"
+            // and "project-b/docs/README.md") would otherwise collide on
+            // the same backup path.
+            let parent = target.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            let canonical_parent = std::fs::canonicalize(&parent).unwrap_or(parent);
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            canonical_parent.hash(&mut hasher);
+            let dir_hash = hasher.finish();
             let stem = target.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-            base.join(parent_name).join(format!("{stem}.original.md"))
+            base.join(format!("{dir_hash:016x}")).join(format!("{stem}.original.md"))
         }
     }
 }
@@ -247,6 +253,21 @@ mod tests {
         assert!(matches!(err, CavemanError::ValidationFailed(2, _)), "{err:?}");
         assert_eq!(std::fs::read_to_string(&source).unwrap(), original, "source must be restored");
         assert!(!dir.path().join("doc.md.orig").exists(), "backup must be cleaned up");
+    }
+
+    #[test]
+    fn out_of_tree_backup_paths_dont_collide_for_same_named_parents() {
+        let root = tempdir().unwrap();
+        let a_dir = root.path().join("project-a").join("docs");
+        let b_dir = root.path().join("project-b").join("docs");
+        std::fs::create_dir_all(&a_dir).unwrap();
+        std::fs::create_dir_all(&b_dir).unwrap();
+        let a = write(&a_dir, "README.md", "a content");
+        let b = write(&b_dir, "README.md", "b content");
+
+        let backup_a = backup_path_for(&a, BackupMode::OutOfTree);
+        let backup_b = backup_path_for(&b, BackupMode::OutOfTree);
+        assert_ne!(backup_a, backup_b, "same-named parent dirs must not collide");
     }
 
     #[test]

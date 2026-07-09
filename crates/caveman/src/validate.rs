@@ -94,6 +94,12 @@ pub fn validate(orig: &str, comp: &str) -> Vec<String> {
     let h2 = extract_headings(comp);
     if h1.len() != h2.len() {
         errors.push(format!("Heading count mismatch: {} vs {}", h1.len(), h2.len()));
+    } else if h1 != h2 {
+        // Same count but different level/text — the compressor rewrote a
+        // heading instead of preserving it, which the prompt promises not
+        // to do (and the fix-prompt's "Heading mismatch" guidance assumes
+        // this case is actually detected).
+        errors.push(format!("Headings not preserved exactly: {h1:?} vs {h2:?}"));
     }
 
     if extract_code_blocks(orig) != extract_code_blocks(comp) {
@@ -143,6 +149,14 @@ mod tests {
         let comp = "# One\n\nbody";
         let errors = validate(orig, comp);
         assert!(errors.iter().any(|e| e.contains("Heading count mismatch")), "{errors:?}");
+    }
+
+    #[test]
+    fn heading_text_changed_with_same_count_is_an_error() {
+        let orig = "# One\n\n## Getting Started\n\nbody";
+        let comp = "# One\n\n## Start\n\nbody";
+        let errors = validate(orig, comp);
+        assert!(errors.iter().any(|e| e.contains("Headings not preserved exactly")), "{errors:?}");
     }
 
     #[test]
