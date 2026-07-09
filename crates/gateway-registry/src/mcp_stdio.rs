@@ -2,6 +2,7 @@
 //! transport (`TokioChildProcess` + the `initialize` handshake via
 //! `ServiceExt::serve`) — not a bespoke REST bridge.
 
+use crate::circuit::{CircuitBreaker, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_RECOVERY_TIMEOUT};
 use crate::error::GatewayError;
 use crate::types::ToolEntry;
 use rmcp::{
@@ -11,7 +12,7 @@ use rmcp::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Bound on every downstream MCP round-trip (connect handshake, `discover`,
 /// `call`) so one hung/slow backend can only ever fail after this long,
@@ -21,32 +22,18 @@ use std::time::{Duration, Instant};
 /// legitimate slow tool call and short enough to bound the blast radius.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Consecutive discover()/call() failures (spawn failure, connect timeout,
-/// or a service-level error) before the circuit opens.
-const CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
-/// How long the circuit stays open before allowing one probe attempt
-/// through. Not user-configurable in v1, same rationale as `DEFAULT_TIMEOUT`.
-const CIRCUIT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
-
-#[derive(Default)]
-struct CircuitState {
-    consecutive_failures: u32,
-    opened_until: Option<Instant>,
-}
-
 pub struct McpStdioBackend {
     running: tokio::sync::Mutex<Option<RunningService<RoleClient, ()>>>,
     /// A persistently broken backend (missing binary, crashing on every
     /// spawn) would otherwise pay a full spawn + handshake + timeout cycle
     /// on every single call. After `CIRCUIT_FAILURE_THRESHOLD` consecutive
-    /// failures, short-circuit for `CIRCUIT_RECOVERY_TIMEOUT` instead of
+    /// failures, short-circuit for the recovery timeout instead of
     /// retrying — then allow exactly one probe attempt through.
-    circuit: tokio::sync::Mutex<CircuitState>,
+    circuit: CircuitBreaker,
     command: String,
     args: Vec<String>,
     env: HashMap<String, String>,
     timeout: Duration,
-    circuit_recovery: Duration,
 }
 
 impl McpStdioBackend {
@@ -79,43 +66,11 @@ impl McpStdioBackend {
     ) -> Self {
         Self {
             running: tokio::sync::Mutex::new(None),
-            circuit: tokio::sync::Mutex::new(CircuitState::default()),
+            circuit: CircuitBreaker::new(CIRCUIT_FAILURE_THRESHOLD, circuit_recovery),
             command,
             args,
             env,
             timeout,
-            circuit_recovery,
-        }
-    }
-
-    /// Fast-fails without attempting a spawn if the circuit is open.
-    async fn check_circuit(&self) -> Result<(), GatewayError> {
-        let state = self.circuit.lock().await;
-        if let Some(until) = state.opened_until {
-            let now = Instant::now();
-            if now < until {
-                return Err(GatewayError::CircuitOpen(format!(
-                    "backend '{}' circuit open after {} consecutive failures — retry in {:?}",
-                    self.command,
-                    state.consecutive_failures,
-                    until.saturating_duration_since(now)
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    async fn record_success(&self) {
-        let mut state = self.circuit.lock().await;
-        state.consecutive_failures = 0;
-        state.opened_until = None;
-    }
-
-    async fn record_failure(&self) {
-        let mut state = self.circuit.lock().await;
-        state.consecutive_failures += 1;
-        if state.consecutive_failures >= CIRCUIT_FAILURE_THRESHOLD {
-            state.opened_until = Some(Instant::now() + self.circuit_recovery);
         }
     }
 
@@ -157,11 +112,11 @@ impl McpStdioBackend {
     }
 
     pub async fn discover(&self) -> Result<Vec<ToolEntry>, GatewayError> {
-        self.check_circuit().await?;
+        self.circuit.check(&self.command).await?;
         let result = self.discover_inner().await;
         match &result {
-            Ok(_) => self.record_success().await,
-            Err(_) => self.record_failure().await,
+            Ok(_) => self.circuit.record_success().await,
+            Err(_) => self.circuit.record_failure().await,
         }
         result
     }
@@ -210,11 +165,11 @@ impl McpStdioBackend {
     }
 
     pub async fn call(&self, tool: &str, args: Value) -> Result<Value, GatewayError> {
-        self.check_circuit().await?;
+        self.circuit.check(&self.command).await?;
         let result = self.call_inner(tool, args).await;
         match &result {
-            Ok(_) => self.record_success().await,
-            Err(_) => self.record_failure().await,
+            Ok(_) => self.circuit.record_success().await,
+            Err(_) => self.circuit.record_failure().await,
         }
         result
     }

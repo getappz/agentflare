@@ -1,5 +1,6 @@
 mod audit;
 mod backend;
+mod circuit;
 mod config;
 mod db;
 mod error;
