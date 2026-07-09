@@ -74,11 +74,36 @@ pub fn is_deactivation(text: &str) -> bool {
     t == "stop ponytail" || t == "normal mode"
 }
 
+/// `dirs::config_dir()` resolves via the OS directly and ignores env-var
+/// overrides — same footgun `paths::home()` documents in the root crate
+/// (a "sandboxed" test run silently writing to the real ~/.config).
+/// PONYTAIL_CONFIG_DIR_OVERRIDE is this crate's own escape hatch for tests.
 pub fn config_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("PONYTAIL_CONFIG_DIR_OVERRIDE") {
+        return PathBuf::from(p);
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("agentflare")
         .join("ponytail")
+}
+
+/// Test-only isolation for `config_dir()` — without this, tests that read
+/// or write the persisted default mode (`default_mode`/`set_default_mode`)
+/// hit the real on-disk config file and can race each other under cargo's
+/// parallel test runner (see the `defaults_to_full` vs `roundtrip_default_mode`
+/// flake this was added to fix).
+#[cfg(test)]
+#[allow(unsafe_code)]
+fn with_temp_config_dir<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join("ponytail-test-config-dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    unsafe { std::env::set_var("PONYTAIL_CONFIG_DIR_OVERRIDE", &dir) };
+    let result = f();
+    unsafe { std::env::remove_var("PONYTAIL_CONFIG_DIR_OVERRIDE") };
+    result
 }
 
 pub fn config_path() -> PathBuf {
@@ -170,24 +195,30 @@ mod tests {
 
     #[test]
     fn defaults_to_full() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
-        assert_eq!(default_mode(), "full");
+        with_temp_config_dir(|| {
+            unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
+            assert_eq!(default_mode(), "full");
+        });
     }
 
     #[test]
     fn reads_env_var() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("PONYTAIL_DEFAULT_MODE", "lite") };
-        assert_eq!(default_mode(), "lite");
-        unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
+        with_temp_config_dir(|| {
+            unsafe { std::env::set_var("PONYTAIL_DEFAULT_MODE", "lite") };
+            assert_eq!(default_mode(), "lite");
+            unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
+        });
     }
 }
 
 #[test]
+#[allow(unsafe_code)]
 fn roundtrip_default_mode() {
-    let prev = default_mode();
-    set_default_mode("ultra").unwrap();
-    assert_eq!(default_mode(), "ultra");
-    set_default_mode(&prev).unwrap();
+    with_temp_config_dir(|| {
+        unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
+        let prev = default_mode();
+        set_default_mode("ultra").unwrap();
+        assert_eq!(default_mode(), "ultra");
+        set_default_mode(&prev).unwrap();
+    });
 }
