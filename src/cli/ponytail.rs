@@ -1,19 +1,37 @@
 use clap::{Args, Subcommand};
 use std::io::Read;
 
-fn subagent_should_inject() -> bool {
-    let matcher = match std::env::var("PONYTAIL_SUBAGENT_MATCHER") {
-        Ok(m) => m,
-        Err(_) => return true,
-    };
+/// Read-only/investigative subagent types get no ponytail persona by
+/// default — the persona's lazy-code/commit-style/etc. guidance is dead
+/// weight (~1300 tokens) for an agent that never writes code.
+const DEFAULT_EXCLUDE_AGENT_TYPES: &str = "explore|investigat|search|review|readonly|read-only|verify";
 
-    let re = match regex::Regex::new(&format!("(?i){matcher}")) {
+/// Decides whether to inject for a given `agent_type`. With no override,
+/// `DEFAULT_EXCLUDE_AGENT_TYPES` is a DENY-list (matches → skip injection).
+/// `PONYTAIL_SUBAGENT_MATCHER`, when set, fully replaces that default with a
+/// caller-supplied ALLOW-list regex instead (matches → inject) — same
+/// semantics as before this default existed.
+fn should_inject_for(agent_type: &str, override_matcher: Option<&str>) -> bool {
+    if agent_type.is_empty() {
+        return true;
+    }
+    let (pattern, is_allowlist) = match override_matcher {
+        Some(m) => (m, true),
+        None => (DEFAULT_EXCLUDE_AGENT_TYPES, false),
+    };
+    let re = match regex::Regex::new(&format!("(?i){pattern}")) {
         Ok(r) => r,
         Err(_) => {
             eprintln!("[ponytail] invalid PONYTAIL_SUBAGENT_MATCHER regex — injecting everywhere");
             return true;
         }
     };
+    let matched = re.is_match(agent_type);
+    if is_allowlist { matched } else { !matched }
+}
+
+fn subagent_should_inject() -> bool {
+    let override_matcher = std::env::var("PONYTAIL_SUBAGENT_MATCHER").ok();
 
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -37,11 +55,8 @@ fn subagent_should_inject() -> bool {
         .get("agent_type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if agent_type.is_empty() {
-        return true;
-    }
 
-    re.is_match(agent_type)
+    should_inject_for(agent_type, override_matcher.as_deref())
 }
 
 #[derive(Subcommand)]
@@ -248,6 +263,40 @@ mod tests {
     #[test]
     fn report_message_says_active_for_runtime_mode() {
         assert_eq!(report_message("full"), "PONYTAIL MODE ACTIVE — level: full");
+    }
+
+    #[test]
+    fn should_inject_for_excludes_read_only_agent_types_by_default() {
+        assert!(!should_inject_for("cavecrew-investigator", None));
+        assert!(!should_inject_for("Explore", None), "case-insensitive");
+        assert!(!should_inject_for("cavecrew-reviewer", None));
+        assert!(!should_inject_for("some-search-agent", None));
+    }
+
+    #[test]
+    fn should_inject_for_includes_code_writing_agent_types_by_default() {
+        assert!(should_inject_for("general-purpose", None));
+        assert!(should_inject_for("cavecrew-builder", None));
+    }
+
+    #[test]
+    fn should_inject_for_treats_empty_agent_type_as_inject() {
+        assert!(should_inject_for("", None));
+        assert!(should_inject_for("", Some("builder")));
+    }
+
+    #[test]
+    fn should_inject_for_override_matcher_is_an_allowlist_not_a_denylist() {
+        // PONYTAIL_SUBAGENT_MATCHER fully replaces the default deny-list —
+        // an explore-type agent normally excluded by default is injected
+        // when it matches the caller's allow-list.
+        assert!(should_inject_for("explore", Some("explore|builder")));
+        assert!(!should_inject_for("other", Some("explore|builder")));
+    }
+
+    #[test]
+    fn should_inject_for_falls_back_to_inject_on_invalid_override_regex() {
+        assert!(should_inject_for("anything", Some("[invalid(")));
     }
 
     #[test]
