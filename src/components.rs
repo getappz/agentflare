@@ -157,7 +157,7 @@ fn write_if_absent(path: &PathBuf, content: &str) -> bool {
 /// get project-local files instead, and only when absent, since a project
 /// file is more sensitive to clobber than a per-user dotfile. Continue has
 /// no dedicated rules convention (per research), so it gets none.
-fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
+pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
     let joined = || rule_text::all().join("\n\n");
     match host {
         "claude-code" => {
