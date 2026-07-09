@@ -50,7 +50,8 @@ impl CavemanArgs {
                 let result = caveman::compress(&caveman::RealLlm, &source, &target, prompt, backup_mode);
                 match result {
                     Ok(report) => {
-                        let pct = 100 - (100 * report.compressed_bytes / report.original_bytes.max(1));
+                        let ratio = 100 * report.compressed_bytes / report.original_bytes.max(1);
+                        let pct = 100usize.saturating_sub(ratio);
                         println!("{}→{}B ▼{pct}%", report.original_bytes, report.compressed_bytes);
                     }
                     Err(e) => {
