@@ -213,8 +213,17 @@ fn build_backends(config: &GatewayConfig, secrets: &HashMap<String, String>) -> 
                 }
                 Backend::McpStdio(McpStdioBackend::new(command.clone(), args.clone(), env))
             }
-            ServerConfig::McpHttp { .. } => {
-                unimplemented!("McpHttp backend will be implemented in Tasks 6/7")
+            ServerConfig::McpHttp { url, .. } => {
+                // McpHttpBackend doesn't exist yet (lands in a later task in
+                // this same plan) — skip rather than panic, so one
+                // not-yet-supported server config doesn't crash every other
+                // server's backend construction. Mirrors this function's
+                // own missing-secret-credential handling above (log + keep
+                // going), rather than aborting.
+                eprintln!(
+                    "gateway-registry: server '{name}' uses kind = \"mcp_http\" ({url}), which is not implemented yet — skipping"
+                );
+                continue;
             }
         };
         out.insert(name.clone(), backend);
