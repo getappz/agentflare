@@ -43,3 +43,19 @@ async fn service_error_on_a_cached_connection_clears_it_so_the_next_call_reconne
          reconnect), got {spawn_count}: {marker_contents:?}"
     );
 }
+
+#[tokio::test]
+async fn concurrent_calls_to_the_same_backend_never_panic() {
+    let fixture = env!("CARGO_BIN_EXE_gateway-fixture-server").to_string();
+    let backend = std::sync::Arc::new(agentflare_gateway_registry::McpStdioBackend::new(
+        fixture,
+        vec![],
+        HashMap::new(),
+    ));
+    let calls = (0..20).map(|i| {
+        let backend = backend.clone();
+        async move { backend.call("echo", serde_json::json!({"text": i.to_string()})).await }
+    });
+    let results = futures_util::future::join_all(calls).await;
+    assert!(results.iter().all(|r| r.is_ok()), "expected all concurrent calls to succeed: {results:?}");
+}

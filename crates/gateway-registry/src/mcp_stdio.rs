@@ -74,41 +74,42 @@ impl McpStdioBackend {
         }
     }
 
-    async fn ensure_connected(&self) -> Result<(), GatewayError> {
+    async fn ensure_connected(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<RunningService<RoleClient, ()>>>, GatewayError> {
         let mut guard = self.running.lock().await;
-        if guard.is_some() {
-            return Ok(());
+        if guard.is_none() {
+            let transport = TokioChildProcess::new(tokio::process::Command::new(&self.command).configure(
+                |cmd| {
+                    cmd.args(&self.args);
+                    for (k, v) in &self.env {
+                        cmd.env(k, v);
+                    }
+                    // Without this, tokio::process::Child does NOT kill the OS
+                    // process when dropped (it just detaches). If a downstream
+                    // server hangs before ever responding, our tokio::time::timeout
+                    // cancels this future correctly, but the orphaned child process
+                    // would otherwise run forever — kill_on_drop ensures the
+                    // timeout actually terminates the hung child, not just our
+                    // side of the connection.
+                    cmd.kill_on_drop(true);
+                },
+            ))
+            .map_err(|e| GatewayError::Connection(format!("spawn '{}' failed: {e}", self.command)))?;
+            let running = tokio::time::timeout(self.timeout, ().serve(transport))
+                .await
+                .map_err(|_| {
+                    GatewayError::Timeout(format!(
+                        "connect to '{}' timed out after {:?}",
+                        self.command, self.timeout
+                    ))
+                })?
+                .map_err(|e| {
+                    GatewayError::Connection(format!("connect to '{}' failed: {e}", self.command))
+                })?;
+            *guard = Some(running);
         }
-        let transport = TokioChildProcess::new(tokio::process::Command::new(&self.command).configure(
-            |cmd| {
-                cmd.args(&self.args);
-                for (k, v) in &self.env {
-                    cmd.env(k, v);
-                }
-                // Without this, tokio::process::Child does NOT kill the OS
-                // process when dropped (it just detaches). If a downstream
-                // server hangs before ever responding, our tokio::time::timeout
-                // cancels this future correctly, but the orphaned child process
-                // would otherwise run forever — kill_on_drop ensures the
-                // timeout actually terminates the hung child, not just our
-                // side of the connection.
-                cmd.kill_on_drop(true);
-            },
-        ))
-        .map_err(|e| GatewayError::Connection(format!("spawn '{}' failed: {e}", self.command)))?;
-        let running = tokio::time::timeout(self.timeout, ().serve(transport))
-            .await
-            .map_err(|_| {
-                GatewayError::Timeout(format!(
-                    "connect to '{}' timed out after {:?}",
-                    self.command, self.timeout
-                ))
-            })?
-            .map_err(|e| {
-                GatewayError::Connection(format!("connect to '{}' failed: {e}", self.command))
-            })?;
-        *guard = Some(running);
-        Ok(())
+        Ok(guard)
     }
 
     pub async fn discover(&self) -> Result<Vec<ToolEntry>, GatewayError> {
@@ -122,8 +123,7 @@ impl McpStdioBackend {
     }
 
     async fn discover_inner(&self) -> Result<Vec<ToolEntry>, GatewayError> {
-        self.ensure_connected().await?;
-        let mut guard = self.running.lock().await;
+        let mut guard = self.ensure_connected().await?;
         let running = guard.as_ref().expect("connected above");
         let tools = match tokio::time::timeout(self.timeout, running.list_all_tools()).await {
             Ok(Ok(tools)) => tools,
@@ -175,8 +175,7 @@ impl McpStdioBackend {
     }
 
     async fn call_inner(&self, tool: &str, args: Value) -> Result<Value, GatewayError> {
-        self.ensure_connected().await?;
-        let mut guard = self.running.lock().await;
+        let mut guard = self.ensure_connected().await?;
         let running = guard.as_ref().expect("connected above");
         let args_map = match args {
             Value::Object(map) => Some(map),
