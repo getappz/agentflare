@@ -9,8 +9,31 @@ pub const LEANCTX: &str = "Prefer lean-ctx over native tools: ctx_read > Read/ca
 
 // Workflow-level, not tool-name-level: engram's exposed MCP tool names have
 // shifted across versions, so pin the behavior, not the exact call names.
-pub const ENGRAM: &str = "Use engram MCP tools for persistent cross-session memory: recall relevant prior context at the start of a session, store durable decisions/facts/preferences as you learn them (not every detail — the load-bearing ones), and create a session handoff before a long session ends or context gets tight. This is the single source of truth for cross-session memory — do not duplicate it into lean-ctx's own session/knowledge tools.";
+// Also don't assume a fixed access path: engram may be a native plugin
+// (mcp__engram__*) or, when that's disabled to avoid duplicating agentflare's
+// own gateway-registry, only reachable via gateway_search/gateway_execute.
+// Absence of mcp__engram__* in ToolSearch does NOT mean engram is unavailable.
+pub const ENGRAM: &str = "Use engram for persistent cross-session memory: recall relevant prior context at the start of a session, store durable decisions/facts/preferences as you learn them (not every detail — the load-bearing ones), and create a session handoff before a long session ends or context gets tight. This is the single source of truth for cross-session memory — do not duplicate it into lean-ctx's own session/knowledge tools. Its tools may be exposed directly as mcp__engram__* or only via the agentflare gateway (gateway_search(query) -> gateway_execute(server=\"engram\", tool, args)) if the native plugin is disabled — try gateway_search before concluding engram isn't available. This intent-first discovery applies to any gateway-fronted tool, not just engram.";
+
+// Prior wording of ENGRAM, kept so `init` can detect an on-disk rule file
+// that still has the old text (vs. one a user hand-edited) and offer to
+// refresh it with consent, the same way `confirm_ponytail_migration` asks
+// before touching an existing install.
+pub const ENGRAM_SUPERSEDED: &[&str] = &[
+    "Use engram MCP tools for persistent cross-session memory: recall relevant prior context at the start of a session, store durable decisions/facts/preferences as you learn them (not every detail — the load-bearing ones), and create a session handoff before a long session ends or context gets tight. This is the single source of truth for cross-session memory — do not duplicate it into lean-ctx's own session/knowledge tools.",
+];
 
 pub fn all() -> Vec<&'static str> {
     vec![EXA, GIT, LEANCTX, ENGRAM]
+}
+
+/// Known-old wording for a rule file, keyed by its filename — empty for rules
+/// that have never changed. Used to tell "this file still has text we shipped
+/// before" (safe to offer a refresh) apart from "the user edited this" (leave
+/// it alone).
+pub fn superseded(filename: &str) -> &'static [&'static str] {
+    match filename {
+        "engram.md" => ENGRAM_SUPERSEDED,
+        _ => &[],
+    }
 }

@@ -5,8 +5,9 @@
 // written without going through a plugin marketplace (Claude Code, Cursor).
 // Codex's hook only activates through its plugin system, so that wiring
 // lives in .codex-plugin/ instead, not here.
-use crate::components::get_components;
+use crate::components::{get_components, rule_targets};
 use crate::paths::home;
+use crate::rule_text;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
@@ -123,10 +124,70 @@ fn has_ponytail_ref(content: &str) -> bool {
     content.to_lowercase().contains("ponytail")
 }
 
+/// A rule file is stale (safe to offer a refresh) only if its on-disk
+/// content matches a KNOWN old version verbatim — anything else (already
+/// current, or diverging for some other reason) is left untouched, since
+/// that "some other reason" is most likely a user edit.
+fn is_stale_rule(path: &PathBuf, current: &str) -> bool {
+    let Some(filename) = path.file_name().and_then(|f| f.to_str()) else { return false };
+    let superseded = rule_text::superseded(filename);
+    if superseded.is_empty() {
+        return false;
+    }
+    let Ok(existing) = fs::read_to_string(path) else { return false };
+    existing.trim_end() != current.trim_end()
+        && superseded.iter().any(|old| existing.trim_end() == old.trim_end())
+}
+
+fn prompt_yes(message: &str, agent: &str, yes: bool) -> bool {
+    if yes {
+        return true;
+    }
+    print!("{message}");
+    let mut input = String::new();
+    let bytes_read = std::io::stdin().read_line(&mut input).ok();
+    if bytes_read == Some(0) {
+        println!("  Skipped. Re-run: agentflare init --agent {agent}");
+        return false;
+    }
+    match input.trim().to_lowercase().as_str() {
+        "y" | "yes" | "" => true,
+        _ => {
+            println!("  Skipped. Re-run: agentflare init --agent {agent}");
+            false
+        }
+    }
+}
+
+/// Rule files under `rule_targets` are only ever written when absent (see
+/// components.rs's "rules" component) — safe by default, but it means a rule
+/// whose wording we later fix (e.g. the engram gateway-discovery bug fixed
+/// 2026-07-09) stays stale forever on machines that already have the old
+/// file. Offer to refresh it, same consent pattern as ponytail migration.
+fn confirm_rule_refresh(agent: &str, yes: bool) {
+    for (path, current) in rule_targets(agent) {
+        if !is_stale_rule(&path, &current) {
+            continue;
+        }
+
+        println!();
+        println!("⚠ {} has outdated guidance (from an earlier agentflare version).", path.display());
+        if !prompt_yes("  Refresh to the current version? [Y/n] ", agent, yes) {
+            continue;
+        }
+
+        match fs::write(&path, format!("{current}\n")) {
+            Ok(_) => println!("  ok    {} refreshed", path.display()),
+            Err(e) => println!("  fail  writing {}: {e}", path.display()),
+        }
+    }
+}
+
 pub fn run(agent: &str, yes: bool) {
     println!("agentflare init --agent {agent}\n");
 
     check_competing_plugins(agent);
+    confirm_rule_refresh(agent, yes);
 
     for c in get_components(agent) {
         if (c.check)() {
@@ -447,6 +508,74 @@ fn scan_agent_configs(agent: &str, markers: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::paths::test_support::{with_temp_cwd, with_temp_home};
+
+    #[test]
+    fn is_stale_rule_true_for_known_superseded_content() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("rules").join("engram.md");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("{}\n", rule_text::ENGRAM_SUPERSEDED[0])).unwrap();
+            assert!(is_stale_rule(&path, rule_text::ENGRAM));
+        });
+    }
+
+    #[test]
+    fn is_stale_rule_false_when_already_current() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("rules").join("engram.md");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("{}\n", rule_text::ENGRAM)).unwrap();
+            assert!(!is_stale_rule(&path, rule_text::ENGRAM));
+        });
+    }
+
+    #[test]
+    fn is_stale_rule_false_for_user_edited_content() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("rules").join("engram.md");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "my own custom engram notes\n").unwrap();
+            assert!(!is_stale_rule(&path, rule_text::ENGRAM));
+        });
+    }
+
+    #[test]
+    fn is_stale_rule_false_for_rule_with_no_superseded_versions() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("rules").join("git.md");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "some old git rule text\n").unwrap();
+            assert!(!is_stale_rule(&path, rule_text::GIT));
+        });
+    }
+
+    #[test]
+    fn confirm_rule_refresh_updates_stale_file_when_yes() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("rules").join("engram.md");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("{}\n", rule_text::ENGRAM_SUPERSEDED[0])).unwrap();
+
+            confirm_rule_refresh("claude-code", true);
+
+            let content = fs::read_to_string(&path).unwrap();
+            assert_eq!(content.trim_end(), rule_text::ENGRAM);
+        });
+    }
+
+    #[test]
+    fn confirm_rule_refresh_leaves_user_edited_file_alone() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("rules").join("engram.md");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "my own custom engram notes\n").unwrap();
+
+            confirm_rule_refresh("claude-code", true);
+
+            let content = fs::read_to_string(&path).unwrap();
+            assert_eq!(content.trim_end(), "my own custom engram notes");
+        });
+    }
 
     #[test]
     fn wire_claude_code_writes_hooks_to_fresh_settings() {
