@@ -1,17 +1,24 @@
+mod audit;
 mod backend;
+mod circuit;
 mod config;
 mod db;
 mod error;
 mod mcp_stdio;
+mod mcp_http;
+mod redact;
 mod registry;
+mod sanitize;
 mod search;
 mod truncate;
 mod types;
 
-pub use backend::{Backend, HttpApiBackend};
-pub use config::{parse as parse_config, ConfigError, GatewayConfig, HttpToolConfig, ServerConfig};
+pub use backend::Backend;
+pub use config::{parse as parse_config, ConfigError, GatewayConfig, ServerConfig};
 pub use error::{suggest, GatewayError};
+pub use mcp_http::McpHttpBackend;
 pub use mcp_stdio::{McpStdioBackend, DEFAULT_TIMEOUT};
+pub use redact::redact_error_for_llm;
 pub use registry::Registry;
 pub use search::{search as search_tools, MatchMode, ToolHit};
 pub use truncate::{truncate_if_needed, DEFAULT_MAX_CHARS};

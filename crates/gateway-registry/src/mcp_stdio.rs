@@ -2,6 +2,7 @@
 //! transport (`TokioChildProcess` + the `initialize` handshake via
 //! `ServiceExt::serve`) — not a bespoke REST bridge.
 
+use crate::circuit::{CircuitBreaker, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_RECOVERY_TIMEOUT};
 use crate::error::GatewayError;
 use crate::types::ToolEntry;
 use rmcp::{
@@ -23,6 +24,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct McpStdioBackend {
     running: tokio::sync::Mutex<Option<RunningService<RoleClient, ()>>>,
+    /// A persistently broken backend (missing binary, crashing on every
+    /// spawn) would otherwise pay a full spawn + handshake + timeout cycle
+    /// on every single call. After `CIRCUIT_FAILURE_THRESHOLD` consecutive
+    /// failures, short-circuit for the recovery timeout instead of
+    /// retrying — then allow exactly one probe attempt through.
+    circuit: CircuitBreaker,
     command: String,
     args: Vec<String>,
     env: HashMap<String, String>,
@@ -43,53 +50,96 @@ impl McpStdioBackend {
         env: HashMap<String, String>,
         timeout: Duration,
     ) -> Self {
-        Self { running: tokio::sync::Mutex::new(None), command, args, env, timeout }
+        Self::with_timeout_and_circuit_recovery(command, args, env, timeout, CIRCUIT_RECOVERY_TIMEOUT)
     }
 
-    async fn ensure_connected(&self) -> Result<(), GatewayError> {
-        let mut guard = self.running.lock().await;
-        if guard.is_some() {
-            return Ok(());
+    /// Same as [`Self::with_timeout`] but with an explicit circuit-breaker
+    /// recovery window too. Exists mainly so tests can exercise the
+    /// half-open recovery path without waiting out the real
+    /// `CIRCUIT_RECOVERY_TIMEOUT`; production callers should use `new`.
+    pub fn with_timeout_and_circuit_recovery(
+        command: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        timeout: Duration,
+        circuit_recovery: Duration,
+    ) -> Self {
+        Self {
+            running: tokio::sync::Mutex::new(None),
+            circuit: CircuitBreaker::new(CIRCUIT_FAILURE_THRESHOLD, circuit_recovery),
+            command,
+            args,
+            env,
+            timeout,
         }
-        let transport = TokioChildProcess::new(tokio::process::Command::new(&self.command).configure(
-            |cmd| {
-                cmd.args(&self.args);
-                for (k, v) in &self.env {
-                    cmd.env(k, v);
-                }
-                // Without this, tokio::process::Child does NOT kill the OS
-                // process when dropped (it just detaches). If a downstream
-                // server hangs before ever responding, our tokio::time::timeout
-                // cancels this future correctly, but the orphaned child process
-                // would otherwise run forever — kill_on_drop ensures the
-                // timeout actually terminates the hung child, not just our
-                // side of the connection.
-                cmd.kill_on_drop(true);
-            },
-        ))
-        .map_err(|e| GatewayError::Connection(format!("spawn '{}' failed: {e}", self.command)))?;
-        let running = tokio::time::timeout(self.timeout, ().serve(transport))
-            .await
-            .map_err(|_| {
-                GatewayError::Timeout(format!(
-                    "connect to '{}' timed out after {:?}",
-                    self.command, self.timeout
-                ))
-            })?
-            .map_err(|e| {
-                GatewayError::Connection(format!("connect to '{}' failed: {e}", self.command))
-            })?;
-        *guard = Some(running);
-        Ok(())
+    }
+
+    async fn ensure_connected(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<RunningService<RoleClient, ()>>>, GatewayError> {
+        let mut guard = self.running.lock().await;
+        if guard.is_none() {
+            let transport = TokioChildProcess::new(tokio::process::Command::new(&self.command).configure(
+                |cmd| {
+                    cmd.args(&self.args);
+                    for (k, v) in &self.env {
+                        cmd.env(k, v);
+                    }
+                    // Without this, tokio::process::Child does NOT kill the OS
+                    // process when dropped (it just detaches). If a downstream
+                    // server hangs before ever responding, our tokio::time::timeout
+                    // cancels this future correctly, but the orphaned child process
+                    // would otherwise run forever — kill_on_drop ensures the
+                    // timeout actually terminates the hung child, not just our
+                    // side of the connection.
+                    cmd.kill_on_drop(true);
+                },
+            ))
+            .map_err(|e| GatewayError::Connection(format!("spawn '{}' failed: {e}", self.command)))?;
+            let running = tokio::time::timeout(self.timeout, ().serve(transport))
+                .await
+                .map_err(|_| {
+                    GatewayError::Timeout(format!(
+                        "connect to '{}' timed out after {:?}",
+                        self.command, self.timeout
+                    ))
+                })?
+                .map_err(|e| {
+                    GatewayError::Connection(format!("connect to '{}' failed: {e}", self.command))
+                })?;
+            *guard = Some(running);
+        }
+        Ok(guard)
     }
 
     pub async fn discover(&self) -> Result<Vec<ToolEntry>, GatewayError> {
-        self.ensure_connected().await?;
-        let mut guard = self.running.lock().await;
+        self.circuit.check(&self.command).await?;
+        let result = self.discover_inner().await;
+        match &result {
+            Ok(_) => self.circuit.record_success().await,
+            Err(_) => self.circuit.record_failure().await,
+        }
+        result
+    }
+
+    async fn discover_inner(&self) -> Result<Vec<ToolEntry>, GatewayError> {
+        let mut guard = self.ensure_connected().await?;
         let running = guard.as_ref().expect("connected above");
         let tools = match tokio::time::timeout(self.timeout, running.list_all_tools()).await {
             Ok(Ok(tools)) => tools,
-            Ok(Err(e)) => return Err(GatewayError::Upstream(e.to_string())),
+            Ok(Err(e)) => {
+                // A service-level error here (as opposed to a timeout) can
+                // still mean the transport itself died underneath us (broken
+                // pipe, child process crashed) rather than the downstream
+                // server returning a clean protocol error — rmcp doesn't
+                // distinguish the two at this call site. Drop the cached
+                // connection so the next discover()/call() respawns rather
+                // than repeatedly hitting a dead pipe until something else
+                // notices; a healthy connection just pays one extra
+                // handshake next time, which is cheap.
+                *guard = None;
+                return Err(GatewayError::Upstream(e.to_string()));
+            }
             Err(_) => {
                 // Timing out here means the cached connection produced no
                 // response in time — it may be permanently wedged (e.g. the
@@ -115,9 +165,21 @@ impl McpStdioBackend {
     }
 
     pub async fn call(&self, tool: &str, args: Value) -> Result<Value, GatewayError> {
-        self.ensure_connected().await?;
-        let mut guard = self.running.lock().await;
-        let running = guard.as_ref().expect("connected above");
+        self.circuit.check(&self.command).await?;
+        let result = self.call_inner(tool, args).await;
+        match &result {
+            Ok(_) => self.circuit.record_success().await,
+            Err(_) => self.circuit.record_failure().await,
+        }
+        result
+    }
+
+    async fn call_inner(&self, tool: &str, args: Value) -> Result<Value, GatewayError> {
+        // Validated before `ensure_connected()`, not after: this is a local,
+        // pre-flight check with no downstream I/O involved, so a malformed
+        // call fails instantly instead of first paying for (and holding the
+        // process-wide gateway lock across) a connect attempt that was
+        // never going to succeed regardless of the args.
         let args_map = match args {
             Value::Object(map) => Some(map),
             Value::Null => None,
@@ -131,11 +193,21 @@ impl McpStdioBackend {
                 )))
             }
         };
+        let mut guard = self.ensure_connected().await?;
+        let running = guard.as_ref().expect("connected above");
         let mut params = rmcp::model::CallToolRequestParams::new(tool.to_string());
         params.arguments = args_map;
         let result = match tokio::time::timeout(self.timeout, running.call_tool(params)).await {
             Ok(Ok(result)) => result,
-            Ok(Err(e)) => return Err(GatewayError::Upstream(e.to_string())),
+            Ok(Err(e)) => {
+                // See the matching comment in `discover()`: a service-level
+                // error here may mean the transport itself died rather than
+                // a clean protocol-level failure — drop the cached
+                // connection so the next call respawns instead of reusing a
+                // possibly-dead pipe.
+                *guard = None;
+                return Err(GatewayError::Upstream(e.to_string()));
+            }
             Err(_) => {
                 // See the matching comment in `discover()`: a timed-out
                 // cached connection may be permanently wedged, so drop it

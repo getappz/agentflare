@@ -38,6 +38,17 @@ impl FixtureServer {
         std::future::pending::<()>().await;
         unreachable!("pending future never resolves")
     }
+
+    /// Returns immediately with a service-level error (not a timeout) —
+    /// simulates a downstream tool call that fails cleanly rather than the
+    /// connection wedging. Used by `tests/mcp_stdio_reconnect.rs` to prove a
+    /// `Ok(Err(_))` from `call_tool` also clears the cached connection,
+    /// since rmcp doesn't distinguish "server said no" from "pipe died" at
+    /// that call site.
+    #[tool(description = "Always errors; simulates a downstream tool-level failure.")]
+    fn fail(&self) -> Result<String, rmcp::ErrorData> {
+        Err(rmcp::ErrorData::invalid_params("simulated failure", None))
+    }
 }
 
 #[tool_handler]
