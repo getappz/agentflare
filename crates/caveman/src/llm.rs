@@ -58,15 +58,20 @@ fn call_via_cli(prompt: &str) -> Result<String, CavemanError> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| CavemanError::Llm(format!("spawn '{claude_bin}' failed: {e}")))?;
-    child
-        .stdin
-        .take()
-        .expect("stdin was piped")
-        .write_all(prompt.as_bytes())
-        .map_err(|e| CavemanError::Llm(format!("write to '{claude_bin}' stdin failed: {e}")))?;
+    // Write stdin on a separate thread, concurrently with wait_with_output()
+    // draining stdout/stderr below — writing the whole prompt first and only
+    // then waiting would deadlock if the child fills its stdout/stderr pipe
+    // buffer before finishing reading stdin (both sides then block forever).
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    let prompt_owned = prompt.to_string();
+    let writer = std::thread::spawn(move || stdin.write_all(prompt_owned.as_bytes()));
     let output = child
         .wait_with_output()
         .map_err(|e| CavemanError::Llm(format!("'{claude_bin}' failed: {e}")))?;
+    let write_result = writer
+        .join()
+        .map_err(|_| CavemanError::Llm(format!("stdin writer thread for '{claude_bin}' panicked")))?;
+    write_result.map_err(|e| CavemanError::Llm(format!("write to '{claude_bin}' stdin failed: {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(CavemanError::Llm(format!("Claude call failed:\n{stderr}")));
