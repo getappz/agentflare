@@ -12,11 +12,12 @@ serde_json = "1"
 thiserror = "2"
 toml = "0.8"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "process", "sync", "macros", "io-util", "time", "net"] }
-rmcp = { version = "1.8.0", features = ["client", "transport-child-process", "server", "transport-io", "macros"] }
+rmcp = { version = "1.8.0", features = ["client", "transport-child-process", "server", "transport-io", "macros", "transport-streamable-http-client-reqwest"] }
 schemars = "1.0"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 regex = "1"
 sha2 = "0.10"
+http = "1.4"
 
 [dev-dependencies]
 tempfile = "3"
