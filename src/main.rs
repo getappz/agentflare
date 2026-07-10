@@ -2,6 +2,7 @@ mod agent_install;
 mod agent_launch;
 mod agents;
 mod alias;
+mod artifacts;
 mod auth;
 mod auth_crypt;
 mod auth_db;

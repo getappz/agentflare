@@ -1,5 +1,6 @@
 mod agents;
 mod alias;
+mod artifacts;
 mod auth;
 mod caveman;
 mod coaching;
@@ -46,6 +47,7 @@ pub enum Commands {
     Update(update::UpdateArgs),
     Uninstall(uninstall::UninstallArgs),
     Auth(auth::AuthArgs),
+    Artifacts(artifacts::ArtifactsArgs),
     Ponytail(ponytail::PonytailArgs),
     Caveman(caveman::CavemanArgs),
 }
@@ -65,6 +67,7 @@ impl Commands {
             Self::Update(cmd) => cmd.run(),
             Self::Uninstall(cmd) => cmd.run(),
             Self::Auth(cmd) => cmd.run(),
+            Self::Artifacts(cmd) => cmd.run(),
             Self::Ponytail(cmd) => cmd.run(),
             Self::Caveman(cmd) => cmd.run(),
         }
