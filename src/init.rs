@@ -8,7 +8,7 @@
 use crate::components::{get_components, rule_targets};
 use crate::paths::{agentflare_binary, home};
 use crate::rule_text;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::PathBuf;
 
@@ -220,6 +220,22 @@ pub fn run(agent: &str, yes: bool) {
     println!("\nDone. Restart {agent} if it was already running.");
 }
 
+/// Adds one hook entry for `event` unless an agentflare-owned entry for it
+/// (matched by `marker`, e.g. `"hook session-end --agent"`) is already
+/// present — lets re-running `agentflare init` backfill newly-added hook
+/// types (like SessionEnd) into installs wired by an older agentflare
+/// version, instead of the old all-or-nothing "SessionStart present? skip
+/// everything" gate. `marker` must not match ponytail's own hook commands
+/// (`"<bin>" ponytail hook X"`, no `--agent`), so both can coexist per event.
+fn add_hook_entry(hooks_obj: &mut Map<String, Value>, event: &str, marker: &str, command: String, timeout: u64) -> bool {
+    let arr = hooks_obj.entry(event).or_insert_with(|| json!([])).as_array_mut().unwrap();
+    if arr.iter().any(|v| v.to_string().contains(marker)) {
+        return false;
+    }
+    arr.push(json!({ "hooks": [{ "type": "command", "command": command, "timeout": timeout }] }));
+    true
+}
+
 fn wire_claude_code() {
     let path = home().join(".claude").join("settings.json");
     let mut settings: Value = fs::read_to_string(&path)
@@ -231,29 +247,32 @@ fn wire_claude_code() {
     }
     let bin = agentflare_binary();
 
-    let already_wired = settings
-        .get("hooks")
-        .and_then(|h| h.get("SessionStart"))
-        .map(|v| v.to_string().contains("agentflare"))
-        .unwrap_or(false);
-    if already_wired {
-        println!("  skip  ~/.claude/settings.json hooks (already wired)");
-        return;
-    }
-
     let obj = settings.as_object_mut().unwrap();
     let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
     let hooks_obj = hooks.as_object_mut().unwrap();
 
-    hooks_obj.entry("SessionStart").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
-        "hooks": [{ "type": "command", "command": format!("\"{bin}\" hook session-start --agent claude-code"), "timeout": 10 }]
-    }));
-    hooks_obj.entry("UserPromptSubmit").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
-        "hooks": [{ "type": "command", "command": format!("\"{bin}\" hook prompt-submit --agent claude-code"), "timeout": 5 }]
-    }));
-    hooks_obj.entry("PreToolUse").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
-        "hooks": [{ "type": "command", "command": format!("\"{bin}\" hook pre-tool-use --agent claude-code"), "timeout": 5 }]
-    }));
+    let mut added = false;
+    added |= add_hook_entry(
+        hooks_obj, "SessionStart", "hook session-start --agent",
+        format!("\"{bin}\" hook session-start --agent claude-code"), 10,
+    );
+    added |= add_hook_entry(
+        hooks_obj, "UserPromptSubmit", "hook prompt-submit --agent",
+        format!("\"{bin}\" hook prompt-submit --agent claude-code"), 5,
+    );
+    added |= add_hook_entry(
+        hooks_obj, "PreToolUse", "hook pre-tool-use --agent",
+        format!("\"{bin}\" hook pre-tool-use --agent claude-code"), 5,
+    );
+    added |= add_hook_entry(
+        hooks_obj, "SessionEnd", "hook session-end --agent",
+        format!("\"{bin}\" hook session-end --agent claude-code"), 10,
+    );
+
+    if !added {
+        println!("  skip  ~/.claude/settings.json hooks (already wired)");
+        return;
+    }
 
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -618,6 +637,53 @@ mod tests {
             let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
             assert!(parsed.is_object());
             assert!(content.contains("agentflare"));
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_writes_session_end_hook() {
+        with_temp_home(|| {
+            wire_claude_code();
+            let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+            assert!(content.contains("SessionEnd"));
+            assert!(content.contains("hook session-end --agent claude-code"));
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_backfills_session_end_into_already_wired_install() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("settings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Simulates an install wired by an older agentflare version,
+            // before the SessionEnd hook existed.
+            fs::write(&path, serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "SessionStart": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook session-start --agent claude-code", "timeout": 10 }] }],
+                    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook prompt-submit --agent claude-code", "timeout": 5 }] }],
+                    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook pre-tool-use --agent claude-code", "timeout": 5 }] }]
+                }
+            })).unwrap()).unwrap();
+
+            wire_claude_code();
+
+            let content = fs::read_to_string(&path).unwrap();
+            let parsed: Value = serde_json::from_str(&content).unwrap();
+            assert!(content.contains("hook session-end --agent claude-code"));
+            // Pre-existing hooks weren't duplicated.
+            assert_eq!(parsed["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_does_not_duplicate_session_end_on_rerun() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("settings.json");
+            wire_claude_code();
+            wire_claude_code();
+            let content = fs::read_to_string(&path).unwrap();
+            let parsed: Value = serde_json::from_str(&content).unwrap();
+            assert_eq!(parsed["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
         });
     }
 

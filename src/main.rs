@@ -11,6 +11,7 @@ mod gateway_secrets;
 mod cli;
 mod coaching;
 mod components;
+mod config;
 mod dev_vars;
 mod cost;
 mod engram_install;

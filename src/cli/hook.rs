@@ -14,6 +14,10 @@ pub enum HookEvent {
         #[arg(long, value_enum)]
         agent: agent_registry::Agent,
     },
+    SessionEnd {
+        #[arg(long, value_enum)]
+        agent: agent_registry::Agent,
+    },
 }
 
 #[derive(Args)]
@@ -28,6 +32,7 @@ impl HookArgs {
             HookEvent::SessionStart { agent } => crate::hook::session_start(agent.as_str()),
             HookEvent::PromptSubmit { agent } => crate::hook::prompt_submit(agent.as_str()),
             HookEvent::PreToolUse { agent } => crate::hook::pre_tool_use(agent.as_str()),
+            HookEvent::SessionEnd { agent } => crate::hook::session_end(agent.as_str()),
         }
     }
 }

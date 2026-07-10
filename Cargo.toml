@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ponytail", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/caveman"]
+members = ["crates/ponytail", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/caveman", "crates/agentflare-artifacts"]
 resolver = "2"
 
 [package]
@@ -63,6 +63,7 @@ gateway-registry = { package = "agentflare-gateway-registry", path = "crates/gat
 caveman = { package = "agentflare-caveman", path = "crates/caveman", version = "0.1.0" }
 regex = "1"
 sysinfo = { version = "0.34", optional = true, default-features = false, features = ["system"] }
+agentflare-artifacts = { version = "0.1.0", path = "crates/agentflare-artifacts" }
 
 [features]
 default = []
@@ -91,3 +92,4 @@ strip = true
 
 [profile.dev]
 debug = 1
+

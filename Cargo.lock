@@ -58,6 +58,7 @@ version = "1.2.0"
 dependencies = [
  "aes-gcm",
  "agentflare-agent-registry",
+ "agentflare-artifacts",
  "agentflare-caveman",
  "agentflare-gateway-registry",
  "agentflare-skill-registry",
@@ -97,6 +98,15 @@ dependencies = [
  "dirs",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "agentflare-artifacts"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
