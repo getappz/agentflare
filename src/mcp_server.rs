@@ -80,6 +80,23 @@ struct GatewayExecuteRequest {
     args: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ArtifactPublishRequest {
+    #[schemars(description = "Display name of the artifact")]
+    name: String,
+    #[schemars(description = "html | markdown | mermaid | diagram | text (default: text)")]
+    #[serde(default)]
+    r#type: Option<String>,
+    #[schemars(description = "Full artifact content (HTML document, markdown source, plain text, ...)")]
+    content: String,
+    #[schemars(description = "Session ID for grouping artifacts (optional)")]
+    #[serde(default)]
+    session_id: Option<String>,
+    #[schemars(description = "Existing artifact id to update in place — keeps the same URL and live-reloads open viewers")]
+    #[serde(default)]
+    update_id: Option<String>,
+}
+
 #[derive(Default)]
 pub struct AgentflareMcp {
     /// Persisted across calls so `Registry::ensure_fresh`'s 60s debounce is
@@ -97,6 +114,17 @@ pub struct AgentflareMcp {
     gateway_registry: tokio::sync::Mutex<Option<gateway_registry::Registry>>,
     /// Tests inject a temp path here so they never touch the shared gateway.db.
     gateway_db_override: Option<std::path::PathBuf>,
+    /// Store + HTTP server for `artifact_publish`, started lazily on first
+    /// use. Living in the same process as the publisher is what makes the
+    /// store's in-memory SSE broadcast (live page reload) actually fire.
+    artifacts: std::sync::Mutex<
+        Option<(
+            std::sync::Arc<agentflare_artifacts::ArtifactStore>,
+            agentflare_artifacts::ArtifactServer,
+        )>,
+    >,
+    /// Tests inject a temp dir here so they never touch ~/.agentflare/artifacts.
+    artifacts_dir_override: Option<std::path::PathBuf>,
 }
 
 #[tool_router]
@@ -213,6 +241,63 @@ impl AgentflareMcp {
             }
             Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
         }
+    }
+
+    /// Lock the artifact store + server pair, lazily starting the HTTP
+    /// server (auto-assigned port) on first use. Returns a cloned store
+    /// handle and the bound port so callers don't hold the lock while
+    /// doing I/O.
+    fn ensure_artifact_server(
+        &self,
+    ) -> Result<(std::sync::Arc<agentflare_artifacts::ArtifactStore>, u16), ErrorData> {
+        let mut guard = self
+            .artifacts
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if guard.is_none() {
+            let dir = self
+                .artifacts_dir_override
+                .clone()
+                .unwrap_or_else(|| crate::paths::home().join(".agentflare").join("artifacts"));
+            let store = std::sync::Arc::new(agentflare_artifacts::ArtifactStore::new(dir));
+            let server = agentflare_artifacts::ArtifactServer::start(store.clone(), 0)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            *guard = Some((store, server));
+        }
+        let (store, server) = guard.as_ref().expect("just initialized above");
+        Ok((store.clone(), server.port()))
+    }
+
+    #[tool(description = "Publish a live-shareable artifact page (HTML, markdown, text, ...) and return its local URL. Pass update_id to update an existing artifact in place — same URL, open viewers live-reload.")]
+    fn artifact_publish(
+        &self,
+        Parameters(ArtifactPublishRequest { name, r#type, content, session_id, update_id }): Parameters<ArtifactPublishRequest>,
+    ) -> Result<String, ErrorData> {
+        if name.trim().is_empty() {
+            return Err(ErrorData::invalid_params("name is required", None));
+        }
+        if content.is_empty() {
+            return Err(ErrorData::invalid_params("content is required", None));
+        }
+        let (store, port) = self.ensure_artifact_server()?;
+        let req = agentflare_artifacts::PublishRequest {
+            name,
+            artifact_type: agentflare_artifacts::ArtifactType::from(
+                r#type.as_deref().unwrap_or("text"),
+            ),
+            content,
+            session_id: session_id.unwrap_or_default(),
+            update_id,
+        };
+        let resp = store
+            .publish(&req)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let result = serde_json::json!({
+            "id": resp.id,
+            "url": format!("http://127.0.0.1:{port}/{}", resp.id),
+            "index": format!("http://127.0.0.1:{port}/"),
+        });
+        Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
     }
 
     fn gateway_db_path() -> std::path::PathBuf {
@@ -745,5 +830,105 @@ mod tests {
         let rendered = args_schema.to_string();
         assert!(rendered.contains("\"object\""), "{rendered}");
         assert!(rendered.contains("\"null\""), "{rendered}");
+    }
+
+    /// Minimal HTTP GET against a `http://127.0.0.1:<port>/<id>` URL,
+    /// returning the full response (status line + headers + body).
+    fn http_get(url: &str) -> String {
+        use std::io::{Read, Write};
+        let rest = url.strip_prefix("http://").expect("http url");
+        let (host_port, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let mut stream = std::net::TcpStream::connect(host_port)
+            .unwrap_or_else(|_| panic!("connect to {host_port}"));
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        write!(stream, "GET /{path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+        let mut full = String::new();
+        let _ = stream.read_to_string(&mut full);
+        full
+    }
+
+    #[test]
+    fn artifact_publish_serves_content_at_returned_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            artifacts_dir_override: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = s
+            .artifact_publish(Parameters(ArtifactPublishRequest {
+                name: "hello".into(),
+                r#type: None,
+                content: "artifact-body-marker".into(),
+                session_id: None,
+                update_id: None,
+            }))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let url = v["url"].as_str().expect("url in response");
+        assert!(url.starts_with("http://127.0.0.1:"), "local url: {url}");
+        assert!(!v["id"].as_str().unwrap_or_default().is_empty());
+
+        let resp = http_get(url);
+        assert!(resp.contains("200"), "serves published artifact: {resp}");
+        assert!(resp.contains("artifact-body-marker"), "body present: {resp}");
+    }
+
+    #[test]
+    fn artifact_publish_update_id_keeps_same_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            artifacts_dir_override: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+        let first: serde_json::Value = serde_json::from_str(
+            &s.artifact_publish(Parameters(ArtifactPublishRequest {
+                name: "doc".into(),
+                r#type: Some("markdown".into()),
+                content: "v1".into(),
+                session_id: Some("ses-1".into()),
+                update_id: None,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let id = first["id"].as_str().unwrap().to_string();
+
+        let second: serde_json::Value = serde_json::from_str(
+            &s.artifact_publish(Parameters(ArtifactPublishRequest {
+                name: "doc".into(),
+                r#type: Some("markdown".into()),
+                content: "v2".into(),
+                session_id: Some("ses-1".into()),
+                update_id: Some(id.clone()),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second["id"].as_str().unwrap(), id);
+        assert_eq!(second["url"], first["url"]);
+    }
+
+    #[test]
+    fn artifact_publish_rejects_empty_name_and_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            artifacts_dir_override: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+        for (name, content) in [("", "x"), ("x", "")] {
+            let err = s
+                .artifact_publish(Parameters(ArtifactPublishRequest {
+                    name: name.into(),
+                    r#type: None,
+                    content: content.into(),
+                    session_id: None,
+                    update_id: None,
+                }))
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        }
     }
 }
