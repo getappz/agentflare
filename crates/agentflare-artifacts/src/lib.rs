@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn server_serves_artifact_via_http() {
         let store = Arc::new(test_store("server_serves_artifact_via_http"));
-        let server = ArtifactServer::start(store.clone()).unwrap();
+        let server = ArtifactServer::start(store.clone(), 0).unwrap();
         let port = server.port();
 
         store
@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn server_404_on_missing() {
         let store = Arc::new(test_store("server_404_on_missing"));
-        let server = ArtifactServer::start(store.clone()).unwrap();
+        let server = ArtifactServer::start(store.clone(), 0).unwrap();
         let resp = read_http("/nonexistent", server.port());
         assert!(
             resp.contains("404") || resp.contains("Not Found"),
@@ -184,5 +184,24 @@ mod tests {
 
         let summary = ArtifactSummary::from(&a);
         assert_eq!(summary.name, "test");
+    }
+
+    #[test]
+    fn server_binds_preferred_port() {
+        let store = Arc::new(test_store("server_binds_preferred_port"));
+        // grab a free port from the OS, release it, then ask the server for it
+        let free = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let server = ArtifactServer::start(store, free).unwrap();
+        assert_eq!(server.port(), free);
+
+        let resp = read_http("/", free);
+        assert!(
+            resp.contains("HTTP/1.0 200") || resp.contains("HTTP/1.1 200"),
+            "server responds on preferred port: {resp}"
+        );
     }
 }

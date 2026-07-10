@@ -10,8 +10,9 @@ pub struct ArtifactServer {
 }
 
 impl ArtifactServer {
-    pub fn start(store: Arc<ArtifactStore>) -> std::io::Result<Self> {
-        let port = find_available_port(0);
+    /// Start the server. `port` 0 binds an OS-assigned free port;
+    /// a nonzero port is bound exactly, erroring if unavailable.
+    pub fn start(store: Arc<ArtifactStore>, port: u16) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         let actual_port = listener.local_addr()?.port();
         let server = ArtifactServer {
@@ -44,22 +45,6 @@ impl ArtifactServer {
 
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
-    }
-}
-
-fn find_available_port(preferred: u16) -> u16 {
-    if preferred == 0 {
-        TcpListener::bind("127.0.0.1:0")
-            .ok()
-            .and_then(|l| l.local_addr().ok())
-            .map(|a| a.port())
-            .unwrap_or(18789)
-    } else {
-        TcpListener::bind(("127.0.0.1", preferred))
-            .ok()
-            .and_then(|l| l.local_addr().ok())
-            .map(|a| a.port())
-            .unwrap_or_else(|| find_available_port(0))
     }
 }
 
