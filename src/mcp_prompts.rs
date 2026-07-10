@@ -105,13 +105,16 @@ fn get_artifact_command(request: &GetPromptRequestParams) -> GetPromptResult {
         .to_string();
 
     if command.is_empty() {
+        // Client-agnostic: Claude Code renders this prompt's name differently
+        // across versions (/agentflare:artifact vs /mcp__agentflare__artifact),
+        // so the usage card only shows the argument part.
         return assistant_text(
-            "Artifact commands (live-shareable local pages):\n\
-             /agentflare:artifact publish [--name N] [--type html|markdown|mermaid|diagram|text] [--session S] [--label L] [--description D] [--favicon 🚀] — publish preceding/attached content\n\
-             /agentflare:artifact update <id> [--base-version N] [options] — update in place (open tabs live-reload)\n\
-             /agentflare:artifact list [--session S]\n\
-             /agentflare:artifact get <id> [--version N]\n\
-             /agentflare:artifact delete <id>",
+            "Artifact commands (live-shareable local pages) — pass as this command's argument:\n\
+             publish [--name N] [--type html|markdown|mermaid|diagram|text] [--session S] [--label L] [--description D] [--favicon 🚀] — publish preceding/attached content\n\
+             update <id> [--base-version N] [options] — update in place (open tabs live-reload)\n\
+             list [--session S]\n\
+             get <id> [--version N]\n\
+             delete <id>",
         );
     }
 
