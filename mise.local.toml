@@ -1,4 +1,3 @@
 [tasks.refresh-devel]
-description = "Build the local devel branch (master + all open PRs) and reinstall it as the system agentflare binary"
-dir = "{{config_root}}/.worktrees/devel"
+description = "Build the current worktree and reinstall it as the system agentflare binary"
 run = "cargo install --path . --force"
