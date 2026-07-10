@@ -9,6 +9,7 @@ mod hook;
 mod init;
 mod mcp;
 mod ponytail;
+mod run;
 mod uninstall;
 mod update;
 
@@ -40,6 +41,7 @@ pub enum Commands {
     Gateway(gateway::GatewayArgs),
     Mcp(mcp::McpArgs),
     Agents(agents::AgentsArgs),
+    Run(run::RunArgs),
     Alias(alias::AliasArgs),
     Update(update::UpdateArgs),
     Uninstall(uninstall::UninstallArgs),
@@ -58,6 +60,7 @@ impl Commands {
             Self::Gateway(cmd) => cmd.run(),
             Self::Mcp(cmd) => cmd.run(),
             Self::Agents(cmd) => cmd.run(),
+            Self::Run(cmd) => cmd.run(),
             Self::Alias(cmd) => cmd.run(),
             Self::Update(cmd) => cmd.run(),
             Self::Uninstall(cmd) => cmd.run(),

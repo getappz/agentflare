@@ -190,6 +190,31 @@ pub fn cli_launch(agent: &str, model: Option<&str>, mode: Option<&str>, args: &[
     }
 }
 
+/// `agentflare run <agent>` — launch through mise (so its tools are on PATH) with
+/// wrangler-style `.dev.vars`[.<stage>] env vars injected. Reports what it
+/// injects on stderr so it doesn't pollute the agent's stdout.
+pub fn cli_run(agent: &str, stage: Option<&str>, model: Option<&str>, mode: Option<&str>, args: &[String]) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let env = match crate::dev_vars::load(&cwd, stage) {
+        Some((path, vars)) => {
+            eprintln!("agentflare run: injecting {} var(s) from {}", vars.len(), path.display());
+            vars
+        }
+        None => {
+            if let Some(s) = stage {
+                eprintln!("agentflare run: no .dev.vars.{s} or .dev.vars found");
+            }
+            Vec::new()
+        }
+    };
+    match agent_launch::run_launch_env(agent_registry::REGISTRY, agent, model, mode, args, &env, true) {
+        LaunchOutcome::Launched => {}
+        LaunchOutcome::NotFound(msg) => eprintln!("error: {msg}"),
+        LaunchOutcome::UnknownAgent(msg) => eprintln!("error: unknown agent: {msg}"),
+        LaunchOutcome::Extension(msg) => eprintln!("error: {msg}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

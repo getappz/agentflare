@@ -6,7 +6,7 @@
 // Codex's hook only activates through its plugin system, so that wiring
 // lives in .codex-plugin/ instead, not here.
 use crate::components::{get_components, rule_targets};
-use crate::paths::home;
+use crate::paths::{agentflare_binary, home};
 use crate::rule_text;
 use serde_json::{json, Value};
 use std::fs;
@@ -14,13 +14,6 @@ use std::path::PathBuf;
 
 fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_default()
-}
-
-fn agentflare_binary() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_else(|| "agentflare".to_string())
 }
 
 fn confirm_ponytail_migration(agent: &str, yes: bool) -> bool {

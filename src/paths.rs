@@ -12,6 +12,19 @@ pub fn home() -> PathBuf {
     dirs::home_dir().expect("home directory not found")
 }
 
+/// Absolute path to the currently-running agentflare binary, falling back to
+/// the bare name if it can't be resolved. Used wherever agentflare registers
+/// itself as a command in another tool's config (Claude Code hooks, MCP
+/// servers) so the integration keeps working even when the launching process
+/// doesn't inherit agentflare's install dir on PATH — e.g. a GUI-launched
+/// Claude Code that never sourced the shell profile that adds ~/.local/bin.
+pub fn agentflare_binary() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "agentflare".to_string())
+}
+
 /// Shared by mcp_server.rs (serving skill_search/skill_load) and
 /// components.rs (syncing skillOverrides) — same on-disk cache, single path
 /// definition so the two can never drift apart.

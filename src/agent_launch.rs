@@ -19,6 +19,22 @@ pub fn run_launch(
     mode: Option<&str>,
     args: &[String],
 ) -> LaunchOutcome {
+    run_launch_env(registry, agent, model, mode, args, &[], false)
+}
+
+/// Like `run_launch`, but injects `env` overrides into the child and — when
+/// `via_mise` is set and mise is available — launches through `mise exec` so the
+/// agent (and everything it spawns) inherits mise's tool paths. Powers
+/// `agentflare run`. Falls back to a plain launch if mise isn't installed.
+pub fn run_launch_env(
+    registry: &[AgentSpec],
+    agent: &str,
+    model: Option<&str>,
+    mode: Option<&str>,
+    args: &[String],
+    env: &[(String, String)],
+    via_mise: bool,
+) -> LaunchOutcome {
     let spec = match registry.iter().find(|s| s.id.as_str() == agent) {
         Some(s) => s,
         None => return LaunchOutcome::UnknownAgent(agent.to_string()),
@@ -40,10 +56,23 @@ pub fn run_launch(
         }
     };
 
-    let mut cmd = Command::new(&binary);
+    // `mise exec -- <binary> …` runs the agent inside mise's environment, so its
+    // tool paths are on PATH for the agent and its child shells.
+    let mise = if via_mise { crate::mise_install::mise_bin() } else { None };
+    let mut cmd = match &mise {
+        Some(m) => {
+            let mut c = Command::new(m);
+            c.arg("exec").arg("--").arg(&binary);
+            c
+        }
+        None => Command::new(&binary),
+    };
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
     cmd.stdin(Stdio::inherit());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
 
     if let Some(m) = model {
         cmd.arg("--model").arg(m);
