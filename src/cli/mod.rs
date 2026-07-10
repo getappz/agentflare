@@ -6,6 +6,7 @@ mod caveman;
 mod coaching;
 mod cost;
 mod gateway;
+mod handoff;
 mod hook;
 mod init;
 mod mcp;
@@ -48,6 +49,7 @@ pub enum Commands {
     Uninstall(uninstall::UninstallArgs),
     Auth(auth::AuthArgs),
     Artifacts(artifacts::ArtifactsArgs),
+    Handoff(handoff::HandoffArgs),
     Ponytail(ponytail::PonytailArgs),
     Caveman(caveman::CavemanArgs),
 }
@@ -68,6 +70,7 @@ impl Commands {
             Self::Uninstall(cmd) => cmd.run(),
             Self::Auth(cmd) => cmd.run(),
             Self::Artifacts(cmd) => cmd.run(),
+            Self::Handoff(cmd) => cmd.run(),
             Self::Ponytail(cmd) => cmd.run(),
             Self::Caveman(cmd) => cmd.run(),
         }

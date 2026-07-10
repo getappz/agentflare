@@ -64,6 +64,7 @@ caveman = { package = "agentflare-caveman", path = "crates/caveman", version = "
 regex = "1"
 sysinfo = { version = "0.34", optional = true, default-features = false, features = ["system"] }
 agentflare-artifacts = { version = "0.1.0", path = "crates/agentflare-artifacts" }
+agent-detector = "0.2.1"
 
 [features]
 default = []

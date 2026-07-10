@@ -186,6 +186,10 @@ pub struct AgentflareMcp {
     gateway_registry: tokio::sync::Mutex<Option<gateway_registry::Registry>>,
     /// Tests inject a temp path here so they never touch the shared gateway.db.
     gateway_db_override: Option<std::path::PathBuf>,
+    /// Handoff identity of the runtime this server instance serves — from
+    /// AGENTFLARE_AGENT, baked into the MCP entry by `init --agent <name>`.
+    /// Defaults artifact_publish's sender and the handoff prompt's "me".
+    agent: Option<String>,
     /// Store + HTTP server for `artifact_publish`, started lazily on first
     /// use. Living in the same process as the publisher is what makes the
     /// store's in-memory SSE broadcast (live page reload) actually fire.
@@ -378,7 +382,7 @@ impl AgentflareMcp {
             description,
             favicon,
             base_version,
-            sender,
+            sender: sender.or_else(|| self.agent.clone()),
             recipient,
             thread_id,
             reply_to,
@@ -396,7 +400,7 @@ impl AgentflareMcp {
 
     /// Best-effort git context of this process's cwd (the project the MCP
     /// server was launched in). None outside a repo; never fails a publish.
-    fn git_provenance() -> Option<agentflare_artifacts::GitProvenance> {
+    pub(crate) fn git_provenance() -> Option<agentflare_artifacts::GitProvenance> {
         fn git(args: &[&str]) -> Option<String> {
             let out = std::process::Command::new("git").args(args).output().ok()?;
             if !out.status.success() {
@@ -846,14 +850,30 @@ impl ServerHandler for AgentflareMcp {
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResult, ErrorData> {
-        crate::mcp_prompts::get_prompt(&request).ok_or_else(|| {
+        crate::mcp_prompts::get_prompt(&request, self.agent.as_deref()).ok_or_else(|| {
             ErrorData::invalid_params(format!("Unknown prompt: {}", request.name), None)
         })
     }
 }
 
+impl AgentflareMcp {
+    /// Runtime identity: explicit override wins, else auto-detect the host
+    /// that launched us (parent process walk + agent env fingerprints).
+    fn identity(explicit: Option<String>) -> Option<String> {
+        explicit.filter(|s| !s.is_empty()).or_else(agent_detector::agent_name)
+    }
+
+    /// Production constructor: identity from AGENTFLARE_AGENT or detection.
+    fn from_env() -> Self {
+        AgentflareMcp {
+            agent: Self::identity(std::env::var("AGENTFLARE_AGENT").ok()),
+            ..Default::default()
+        }
+    }
+}
+
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let service = AgentflareMcp::default().serve(stdio()).await?;
+    let service = AgentflareMcp::from_env().serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
@@ -1422,6 +1442,58 @@ mod tests {
         .unwrap();
         let commit = got["git"]["commit"].as_str().expect("git commit captured");
         assert!(commit.len() >= 7, "{got}");
+    }
+
+    #[test]
+    fn artifact_publish_defaults_sender_to_agent_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            artifacts_dir_override: Some(tmp.path().to_path_buf()),
+            agent: Some("opencode".into()),
+            ..Default::default()
+        };
+        let sender_of = |req: ArtifactPublishRequest| -> serde_json::Value {
+            let out: serde_json::Value =
+                serde_json::from_str(&s.artifact_publish(Parameters(req)).unwrap()).unwrap();
+            let got: serde_json::Value = serde_json::from_str(
+                &s.artifact_get(Parameters(ArtifactGetRequest {
+                    id: out["id"].as_str().unwrap().into(),
+                    version: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            got["sender"].clone()
+        };
+
+        let defaulted = sender_of(ArtifactPublishRequest {
+            name: "defaulted".into(),
+            content: "x".into(),
+            ..Default::default()
+        });
+        assert_eq!(defaulted, "opencode");
+
+        // An explicit sender always wins over the identity default.
+        let explicit = sender_of(ArtifactPublishRequest {
+            name: "explicit".into(),
+            content: "x".into(),
+            sender: Some("codex".into()),
+            ..Default::default()
+        });
+        assert_eq!(explicit, "codex");
+    }
+
+    #[test]
+    fn identity_prefers_explicit_override_then_detection() {
+        // Explicit override beats detection…
+        assert_eq!(
+            AgentflareMcp::identity(Some("opencode".into())).as_deref(),
+            Some("opencode")
+        );
+        // …empty counts as unset, and without an override identity falls
+        // back to detecting the host that launched us (None outside agents).
+        assert_eq!(AgentflareMcp::identity(Some(String::new())), agent_detector::agent_name());
+        assert_eq!(AgentflareMcp::identity(None), agent_detector::agent_name());
     }
 
     #[test]

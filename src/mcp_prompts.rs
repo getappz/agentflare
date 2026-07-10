@@ -50,12 +50,15 @@ pub fn list_prompts() -> Vec<Prompt> {
     prompts
 }
 
-pub fn get_prompt(request: &GetPromptRequestParams) -> Option<GetPromptResult> {
+pub fn get_prompt(
+    request: &GetPromptRequestParams,
+    agent: Option<&str>,
+) -> Option<GetPromptResult> {
     if request.name == "artifact" {
         return Some(get_artifact_command(request));
     }
     if request.name == "handoff" {
-        return Some(get_handoff_command(request));
+        return Some(get_handoff_command(request, agent));
     }
     if request.name == "ponytail" {
         return Some(get_ponytail_mode(request));
@@ -143,7 +146,13 @@ fn get_artifact_command(request: &GetPromptRequestParams) -> GetPromptResult {
     ))
 }
 
-fn get_handoff_command(request: &GetPromptRequestParams) -> GetPromptResult {
+fn get_handoff_command(
+    request: &GetPromptRequestParams,
+    agent: Option<&str>,
+) -> GetPromptResult {
+    // Identity comes from AGENTFLARE_AGENT baked into the MCP entry by
+    // `agentflare init --agent <name>`; claude-code is the legacy default.
+    let me = agent.unwrap_or("claude-code");
     let command = request
         .arguments
         .as_ref()
@@ -154,25 +163,25 @@ fn get_handoff_command(request: &GetPromptRequestParams) -> GetPromptResult {
         .to_string();
 
     if command.is_empty() {
-        return assistant_text(
+        return assistant_text(format!(
             "Handoff — agent-to-agent work exchange via artifacts. Pass as this command's argument:\n\
              <recipient> <brief> — hand the relevant work product to that agent (e.g. `codex review the API design above`)\n\
-             inbox [me] — list artifacts addressed to an agent (default: claude-code)\n\
+             inbox [me] — list artifacts addressed to an agent (default: {me})\n\
              thread <id> — show a handoff thread's artifacts in order\n\
              Work products only — facts and decisions belong in engram memory.",
-        );
+        ));
     }
 
     assistant_text(format!(
         "Handoff command: `{command}`\n\n\
          Grammar: first word is a subcommand (`inbox`, `thread`) or a recipient; the rest is the brief.\n\
-         - `<recipient> <brief>` → artifact_publish with recipient=<recipient>, sender=claude-code, \
+         - `<recipient> <brief>` → artifact_publish with recipient=<recipient>, sender={me}, \
          a fresh thread_id (or the current one when continuing an exchange), name from the brief, \
          and content = the work product the brief points at (the preceding conversation content, \
          diff, review, or document — ask only if genuinely ambiguous). Prepend the brief to the \
          content so the recipient knows what is being asked. When answering an item from your \
          inbox, set reply_to=<that artifact id> and reuse its thread_id.\n\
-         - `inbox [me]` → artifact_list with recipient=<me or claude-code>; summarize sender, \
+         - `inbox [me]` → artifact_list with recipient=<me or {me}>; summarize sender, \
          name, and brief for each.\n\
          - `thread <id>` → artifact_list with thread_id=<id>; present in chronological order with \
          reply lineage.\n\
@@ -206,7 +215,7 @@ mod tests {
 
     #[test]
     fn unknown_prompt_name_returns_none() {
-        assert!(get_prompt(&GetPromptRequestParams::new("not-a-real-prompt")).is_none());
+        assert!(get_prompt(&GetPromptRequestParams::new("not-a-real-prompt"), None).is_none());
     }
 
     #[test]
@@ -217,7 +226,7 @@ mod tests {
 
     #[test]
     fn bare_artifact_prompt_returns_usage() {
-        let result = get_prompt(&GetPromptRequestParams::new("artifact")).unwrap();
+        let result = get_prompt(&GetPromptRequestParams::new("artifact"), None).unwrap();
         let text = format!("{:?}", result.messages[0].content);
         assert!(text.contains("publish"), "{text}");
         assert!(text.contains("list"), "{text}");
@@ -231,7 +240,7 @@ mod tests {
 
     #[test]
     fn bare_handoff_prompt_returns_usage() {
-        let result = get_prompt(&GetPromptRequestParams::new("handoff")).unwrap();
+        let result = get_prompt(&GetPromptRequestParams::new("handoff"), None).unwrap();
         let text = format!("{:?}", result.messages[0].content);
         assert!(text.contains("<recipient>"), "{text}");
         assert!(text.contains("inbox"), "{text}");
@@ -247,7 +256,7 @@ mod tests {
             serde_json::json!("codex review the API design above"),
         );
         let params = GetPromptRequestParams::new("handoff").with_arguments(args);
-        let result = get_prompt(&params).unwrap();
+        let result = get_prompt(&params, None).unwrap();
         let text = format!("{:?}", result.messages[0].content);
         assert!(text.contains("codex review the API design above"), "{text}");
         assert!(text.contains("artifact_publish"), "{text}");
@@ -264,7 +273,7 @@ mod tests {
             serde_json::json!("publish --type markdown --favicon 🚀"),
         );
         let params = GetPromptRequestParams::new("artifact").with_arguments(args);
-        let result = get_prompt(&params).unwrap();
+        let result = get_prompt(&params, None).unwrap();
         let text = format!("{:?}", result.messages[0].content);
         assert!(text.contains("publish --type markdown --favicon 🚀"), "{text}");
         assert!(text.contains("artifact_publish"), "{text}");
@@ -272,8 +281,39 @@ mod tests {
     }
 
     #[test]
+    fn handoff_grammar_uses_agent_identity_for_sender_and_inbox() {
+        use rmcp::model::JsonObject;
+        let mut args = JsonObject::new();
+        args.insert("command".to_string(), serde_json::json!("inbox"));
+        let params = GetPromptRequestParams::new("handoff").with_arguments(args);
+        let result = get_prompt(&params, Some("opencode")).unwrap();
+        let text = format!("{:?}", result.messages[0].content);
+        assert!(text.contains("sender=opencode"), "{text}");
+        assert!(text.contains("recipient=<me or opencode>"), "{text}");
+        assert!(!text.contains("claude-code"), "{text}");
+    }
+
+    #[test]
+    fn handoff_identity_falls_back_to_claude_code() {
+        use rmcp::model::JsonObject;
+        let mut args = JsonObject::new();
+        args.insert("command".to_string(), serde_json::json!("inbox"));
+        let params = GetPromptRequestParams::new("handoff").with_arguments(args);
+        let result = get_prompt(&params, None).unwrap();
+        let text = format!("{:?}", result.messages[0].content);
+        assert!(text.contains("sender=claude-code"), "{text}");
+    }
+
+    #[test]
+    fn bare_handoff_usage_names_agent_identity() {
+        let result = get_prompt(&GetPromptRequestParams::new("handoff"), Some("opencode")).unwrap();
+        let text = format!("{:?}", result.messages[0].content);
+        assert!(text.contains("default: opencode"), "{text}");
+    }
+
+    #[test]
     fn ponytail_review_returns_full_skill_body() {
-        let result = get_prompt(&GetPromptRequestParams::new("ponytail-review")).unwrap();
+        let result = get_prompt(&GetPromptRequestParams::new("ponytail-review"), None).unwrap();
         let PromptMessage { content, .. } = &result.messages[0];
         let text = format!("{content:?}");
         assert!(text.contains("ponytail-review"));
@@ -281,7 +321,7 @@ mod tests {
 
     #[test]
     fn bare_ponytail_without_mode_reports_without_crashing() {
-        let result = get_prompt(&GetPromptRequestParams::new("ponytail")).unwrap();
+        let result = get_prompt(&GetPromptRequestParams::new("ponytail"), None).unwrap();
         assert_eq!(result.messages.len(), 1);
     }
 
@@ -291,7 +331,7 @@ mod tests {
         let mut args = JsonObject::new();
         args.insert("mode".to_string(), serde_json::json!("bogus-mode"));
         let params = GetPromptRequestParams::new("ponytail").with_arguments(args);
-        let result = get_prompt(&params).unwrap();
+        let result = get_prompt(&params, None).unwrap();
         let PromptMessage { content, .. } = &result.messages[0];
         let text = format!("{content:?}");
         assert!(text.contains("Unknown ponytail mode"));
