@@ -26,6 +26,7 @@ pub fn open() -> rusqlite::Result<Connection> {
     restrict(&path, 0o600);
     tune(&conn)?;
     crate::claims::migrate(&conn)?;
+    crate::review::migrate(&conn)?;
     Ok(conn)
 }
 
