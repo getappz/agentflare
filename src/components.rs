@@ -38,7 +38,7 @@ fn run_ok(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-fn claude_settings() -> Value {
+pub(crate) fn claude_settings() -> Value {
     fs::read_to_string(home().join(".claude").join("settings.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -61,7 +61,7 @@ fn json_at(path: &PathBuf) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn plugin_enabled(settings: &Value, key: &str) -> bool {
+pub(crate) fn plugin_enabled(settings: &Value, key: &str) -> bool {
     settings
         .get("enabledPlugins")
         .and_then(|p| p.get(key))

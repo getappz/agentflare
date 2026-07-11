@@ -71,20 +71,38 @@ fn session_start_message(agent: &str) -> String {
     }
 
     lines.push(String::new());
-    lines.push(
-        "AGENTFLARE ACTIVE — lean-ctx/engram tools, Exa search, clean git commits. Off: /agentflare off."
-            .to_string(),
-    );
+    let memory_label = if engram_active() { "lean-ctx/engram tools" } else { "lean-ctx tools" };
+    lines.push(format!(
+        "AGENTFLARE ACTIVE — {memory_label}, Exa search, clean git commits. Off: /agentflare off."
+    ));
     lines.push(
         "Skills load on demand: before assuming a relevant skill doesn't exist, call skill_search(query) then skill_load(name) via the agentflare MCP tools."
             .to_string(),
     );
-    lines.push(
-        "Memory on-demand: gateway_search(query)->gateway_execute(server=\"engram\",tool,args). Not auto-loaded."
-            .to_string(),
-    );
+    lines.push(memory_nudge_line());
 
     lines.join("\n")
+}
+
+/// True iff the engram plugin is enabled (Claude Code only — other hosts
+/// don't have a plugin-enable concept, so engram is never "active" there in
+/// this sense and `memory_nudge_line` falls back to agentflare's own tools).
+fn engram_active() -> bool {
+    crate::components::plugin_enabled(&crate::components::claude_settings(), "engram@engram")
+}
+
+/// Points the agent at whichever cross-session memory system is actually
+/// live: engram if its plugin is enabled, otherwise agentflare's own
+/// in-binary `memory_*` MCP tools (`memory_remember`/`memory_recall`/
+/// `memory_context`/`memory_handoff`/`memory_relate`/`memory_curate`, plus
+/// `agentflare memory <context|search|sessions|observations>` from the CLI)
+/// — no separate install/consent needed, they ship in the binary.
+fn memory_nudge_line() -> String {
+    if engram_active() {
+        "Memory on-demand: gateway_search(query)->gateway_execute(server=\"engram\",tool,args). Not auto-loaded.".to_string()
+    } else {
+        "Memory: agentflare's built-in memory_remember/memory_recall/memory_context/memory_handoff/memory_relate/memory_curate MCP tools (or `agentflare memory ...` CLI) — no install needed, call directly.".to_string()
+    }
 }
 
 fn extract_prompt(input: &str) -> String {
@@ -163,7 +181,7 @@ pub fn pre_tool_use(_agent: &str) {
 
     if !nudges.is_empty() {
         let out = json!({
-            "systemMessage": nudges.join(" ")
+            "systemMessage": format!("agentflare: {}", nudges.join(" "))
         });
         println!("{out}");
     }
@@ -445,12 +463,34 @@ mod tests {
     }
 
     #[test]
-    fn session_start_message_nudges_engram_via_gateway() {
+    fn session_start_message_points_to_builtin_memory_when_engram_inactive() {
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
+            // No ~/.claude/settings.json at all (fresh temp home) — engram
+            // reads as disabled, same as an explicit enabledPlugins:false.
+            let msg = session_start_message("claude-code");
+            assert!(msg.contains("memory_remember"));
+            assert!(msg.contains("memory_recall"));
+            assert!(!msg.contains("gateway_execute(server=\"engram\""));
+        });
+    }
+
+    #[test]
+    fn session_start_message_nudges_engram_via_gateway_when_plugin_enabled() {
+        use crate::paths::test_support::with_temp_home;
+        with_temp_home(|| {
+            let settings_dir = crate::paths::home().join(".claude");
+            std::fs::create_dir_all(&settings_dir).unwrap();
+            std::fs::write(
+                settings_dir.join("settings.json"),
+                r#"{"enabledPlugins": {"engram@engram": true}}"#,
+            )
+            .unwrap();
+
             let msg = session_start_message("claude-code");
             assert!(msg.contains("gateway_search(query)"));
             assert!(msg.contains("gateway_execute(server=\"engram\""));
+            assert!(!msg.contains("memory_remember"));
         });
     }
 }

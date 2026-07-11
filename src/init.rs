@@ -258,12 +258,14 @@ fn confirm_gateway_integrations(agent: &str, yes: bool) {
 }
 
 /// Adds one hook entry for `event` unless an agentflare-owned entry for it
-/// (matched by `marker`, e.g. `"hook session-end --agent"`) is already
-/// present — lets re-running `agentflare init` backfill newly-added hook
-/// types (like SessionEnd) into installs wired by an older agentflare
-/// version, instead of the old all-or-nothing "SessionStart present? skip
-/// everything" gate. `marker` must not match ponytail's own hook commands
-/// (`"<bin>" ponytail hook X"`, no `--agent`), so both can coexist per event.
+/// (matched by `marker`, e.g. `"hook session-end"`) is already present — lets
+/// re-running `agentflare init` backfill newly-added hook types (like
+/// SessionEnd) into installs wired by an older agentflare version, instead
+/// of the old all-or-nothing "SessionStart present? skip everything" gate.
+/// `marker` is a plain substring of `"hook <event>"`, matching both current
+/// flagless commands and older installs that still carry `--agent <host>`
+/// (upgrades stay idempotent either way). It must not match ponytail's own
+/// hook commands (`"<bin>" ponytail hook X"`), so both can coexist per event.
 fn add_hook_entry(hooks_obj: &mut Map<String, Value>, event: &str, marker: &str, command: String, timeout: u64) -> bool {
     let arr = hooks_obj.entry(event).or_insert_with(|| json!([])).as_array_mut().unwrap();
     if arr.iter().any(|v| v.to_string().contains(marker)) {
@@ -290,20 +292,20 @@ fn wire_claude_code() {
 
     let mut added = false;
     added |= add_hook_entry(
-        hooks_obj, "SessionStart", "hook session-start --agent",
-        format!("\"{bin}\" hook session-start --agent claude-code"), 10,
+        hooks_obj, "SessionStart", "hook session-start",
+        format!("\"{bin}\" hook session-start"), 10,
     );
     added |= add_hook_entry(
-        hooks_obj, "UserPromptSubmit", "hook prompt-submit --agent",
-        format!("\"{bin}\" hook prompt-submit --agent claude-code"), 5,
+        hooks_obj, "UserPromptSubmit", "hook prompt-submit",
+        format!("\"{bin}\" hook prompt-submit"), 5,
     );
     added |= add_hook_entry(
-        hooks_obj, "PreToolUse", "hook pre-tool-use --agent",
-        format!("\"{bin}\" hook pre-tool-use --agent claude-code"), 5,
+        hooks_obj, "PreToolUse", "hook pre-tool-use",
+        format!("\"{bin}\" hook pre-tool-use"), 5,
     );
     added |= add_hook_entry(
-        hooks_obj, "SessionEnd", "hook session-end --agent",
-        format!("\"{bin}\" hook session-end --agent claude-code"), 10,
+        hooks_obj, "SessionEnd", "hook session-end",
+        format!("\"{bin}\" hook session-end"), 10,
     );
 
     if !added {
@@ -335,8 +337,8 @@ fn wire_cursor() {
     let content = json!({
         "version": 1,
         "hooks": {
-            "sessionStart": [{ "command": format!("\"{bin}\" hook session-start --agent cursor"), "type": "command", "timeout": 30 }],
-            "beforeSubmitPrompt": [{ "command": format!("\"{bin}\" hook prompt-submit --agent cursor"), "type": "command", "timeout": 10 }]
+            "sessionStart": [{ "command": format!("\"{bin}\" hook session-start"), "type": "command", "timeout": 30 }],
+            "beforeSubmitPrompt": [{ "command": format!("\"{bin}\" hook prompt-submit"), "type": "command", "timeout": 10 }]
         }
     });
     if let Some(parent) = path.parent() {
@@ -683,7 +685,8 @@ mod tests {
             wire_claude_code();
             let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
             assert!(content.contains("SessionEnd"));
-            assert!(content.contains("hook session-end --agent claude-code"));
+            assert!(content.contains("hook session-end"));
+            assert!(!content.contains("hook session-end --agent"));
         });
     }
 
@@ -706,8 +709,12 @@ mod tests {
 
             let content = fs::read_to_string(&path).unwrap();
             let parsed: Value = serde_json::from_str(&content).unwrap();
-            assert!(content.contains("hook session-end --agent claude-code"));
-            // Pre-existing hooks weren't duplicated.
+            // Backfilled fresh, so it's the new flagless form...
+            assert!(content.contains("hook session-end"));
+            assert!(!content.contains("hook session-end --agent"));
+            // ...while the pre-existing old-format entries are left as-is,
+            // not duplicated or rewritten.
+            assert!(content.contains("hook session-start --agent claude-code"));
             assert_eq!(parsed["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         });
     }
