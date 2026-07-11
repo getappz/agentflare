@@ -194,6 +194,35 @@ struct ArtifactPublishRequest {
     reply_to: Option<String>,
 }
 
+/// A handoff is an artifact routed to another agent's inbox. Unlike
+/// `ArtifactPublishRequest`, `recipient` is a required field, not `Option` —
+/// the schema itself makes an unaddressed handoff unrepresentable, so an
+/// intended handoff can't silently land in no inbox.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct HandoffRequest {
+    #[schemars(description = "Agent/runtime this handoff is addressed to — its inbox (artifact_list recipient=...). Required.")]
+    recipient: String,
+    #[schemars(description = "Short name/brief for the handoff, shown in the recipient's inbox")]
+    name: String,
+    #[schemars(description = "The work product being handed off (diff, review, document, ...). Prepend the brief so the recipient knows the ask.")]
+    content: String,
+    #[schemars(description = "html | markdown | mermaid | diagram | text (default: markdown)")]
+    #[serde(default)]
+    r#type: Option<String>,
+    #[schemars(description = "Handoff thread to continue; omit to start a new one")]
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[schemars(description = "Artifact id this replies to (when answering an inbox item)")]
+    #[serde(default)]
+    reply_to: Option<String>,
+    #[schemars(description = "Session ID for grouping (optional)")]
+    #[serde(default)]
+    session_id: Option<String>,
+    #[schemars(description = "One-line description shown in the gallery")]
+    #[serde(default)]
+    description: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct ArtifactListRequest {
     #[schemars(description = "Only artifacts from this session (omit for all)")]
@@ -581,6 +610,64 @@ impl AgentflareMcp {
             "version": resp.version,
             "url": format!("{base}/{}", resp.id),
             "index": format!("{base}/"),
+        });
+        Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+    }
+
+    #[tool(description = "Hand a work product to another agent's inbox. Like artifact_publish, but recipient is REQUIRED, so the artifact is routed and shows up in that agent's artifact_list(recipient=...) inbox — it can't silently land nowhere. Use for agent-to-agent handoffs (reviews, diffs, docs); use artifact_publish for plain shareable pages. Sender is this runtime's own identity.")]
+    fn handoff(
+        &self,
+        Parameters(HandoffRequest {
+            recipient,
+            name,
+            content,
+            r#type,
+            thread_id,
+            reply_to,
+            session_id,
+            description,
+        }): Parameters<HandoffRequest>,
+    ) -> Result<String, ErrorData> {
+        if recipient.trim().is_empty() {
+            return Err(ErrorData::invalid_params(
+                "recipient is required for a handoff — without it the artifact lands in no inbox",
+                None,
+            ));
+        }
+        if name.trim().is_empty() {
+            return Err(ErrorData::invalid_params("name is required", None));
+        }
+        if content.is_empty() {
+            return Err(ErrorData::invalid_params("content is required", None));
+        }
+        let recipient = recipient.trim().to_string();
+        let name = name.trim().to_string();
+        let (store, base) = self.ensure_artifact_server()?;
+        let req = agentflare_artifacts::PublishRequest {
+            name,
+            artifact_type: agentflare_artifacts::ArtifactType::from(
+                r#type.as_deref().unwrap_or("markdown"),
+            ),
+            content,
+            session_id: session_id.unwrap_or_default(),
+            update_id: None,
+            label: None,
+            description,
+            favicon: None,
+            base_version: None,
+            sender: self.agent.clone(),
+            recipient: Some(recipient),
+            thread_id,
+            reply_to,
+            git: Self::git_provenance(),
+        };
+        let resp = store.publish(&req).map_err(Self::artifact_error)?;
+        let result = serde_json::json!({
+            "id": resp.id,
+            "version": resp.version,
+            "url": format!("{base}/{}", resp.id),
+            "index": format!("{base}/"),
+            "recipient": req.recipient,
         });
         Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
     }
@@ -1749,6 +1836,81 @@ mod tests {
         )
         .unwrap();
         assert_eq!(thread.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn handoff_tool_requires_recipient_and_routes_to_inbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            artifacts_dir_override: Some(tmp.path().to_path_buf()),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+
+        // A blank recipient is rejected — the whole reason this tool exists.
+        let err = s
+            .handoff(Parameters(HandoffRequest {
+                recipient: "  ".into(),
+                name: "orphan".into(),
+                content: "for someone".into(),
+                ..Default::default()
+            }))
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        // A real handoff lands in the recipient's inbox; sender is our identity.
+        s.handoff(Parameters(HandoffRequest {
+            recipient: "opencode".into(),
+            name: "review-packet".into(),
+            content: "please review".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        let inbox: serde_json::Value = serde_json::from_str(
+            &s.artifact_list(Parameters(ArtifactListRequest {
+                recipient: Some("opencode".into()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inbox.as_array().unwrap().len(), 1);
+        assert_eq!(inbox[0]["name"], "review-packet");
+        assert_eq!(inbox[0]["sender"], "claude-code");
+        assert_eq!(inbox[0]["recipient"], "opencode");
+    }
+
+    #[test]
+    fn handoff_trims_whitespace_padded_recipient() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            artifacts_dir_override: Some(tmp.path().to_path_buf()),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+
+        // A whitespace-padded recipient passes the emptiness check but must
+        // still be stored trimmed, or exact-match inbox lookups miss it.
+        s.handoff(Parameters(HandoffRequest {
+            recipient: "  opencode  ".into(),
+            name: "review-packet".into(),
+            content: "please review".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        let inbox: serde_json::Value = serde_json::from_str(
+            &s.artifact_list(Parameters(ArtifactListRequest {
+                recipient: Some("opencode".into()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inbox.as_array().unwrap().len(), 1);
+        assert_eq!(inbox[0]["name"], "review-packet");
+        assert_eq!(inbox[0]["recipient"], "opencode");
     }
 
     #[test]

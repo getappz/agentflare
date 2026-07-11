@@ -175,12 +175,14 @@ fn get_handoff_command(
     assistant_text(format!(
         "Handoff command: `{command}`\n\n\
          Grammar: first word is a subcommand (`inbox`, `thread`) or a recipient; the rest is the brief.\n\
-         - `<recipient> <brief>` → artifact_publish with recipient=<recipient>, sender={me}, \
-         a fresh thread_id (or the current one when continuing an exchange), name from the brief, \
-         and content = the work product the brief points at (the preceding conversation content, \
-         diff, review, or document — ask only if genuinely ambiguous). Prepend the brief to the \
-         content so the recipient knows what is being asked. When answering an item from your \
-         inbox, set reply_to=<that artifact id> and reuse its thread_id.\n\
+         - `<recipient> <brief>` → call the `handoff` tool with recipient=<recipient>, \
+         name from the brief, content = the work product the brief points at (the preceding \
+         conversation content, diff, review, or document — ask only if genuinely ambiguous), \
+         and a thread_id when continuing an exchange. Prepend the brief to the content so the \
+         recipient knows what is being asked (sender is set to your identity, {me}, \
+         automatically). Use the `handoff` tool, not artifact_publish, so recipient can't be \
+         omitted. When answering an item from your inbox, set reply_to=<that artifact id> and \
+         reuse its thread_id.\n\
          - `inbox [me]` → artifact_list with recipient=<me or {me}>; summarize sender, \
          name, and brief for each.\n\
          - `thread <id>` → artifact_list with thread_id=<id>; present in chronological order with \
@@ -259,7 +261,7 @@ mod tests {
         let result = get_prompt(&params, None).unwrap();
         let text = format!("{:?}", result.messages[0].content);
         assert!(text.contains("codex review the API design above"), "{text}");
-        assert!(text.contains("artifact_publish"), "{text}");
+        assert!(text.contains("`handoff` tool"), "{text}");
         assert!(text.contains("recipient"), "{text}");
         assert!(text.contains("reply_to"), "{text}");
     }
@@ -288,7 +290,7 @@ mod tests {
         let params = GetPromptRequestParams::new("handoff").with_arguments(args);
         let result = get_prompt(&params, Some("opencode")).unwrap();
         let text = format!("{:?}", result.messages[0].content);
-        assert!(text.contains("sender=opencode"), "{text}");
+        assert!(text.contains("identity, opencode"), "{text}");
         assert!(text.contains("recipient=<me or opencode>"), "{text}");
         assert!(!text.contains("claude-code"), "{text}");
     }
@@ -301,7 +303,7 @@ mod tests {
         let params = GetPromptRequestParams::new("handoff").with_arguments(args);
         let result = get_prompt(&params, None).unwrap();
         let text = format!("{:?}", result.messages[0].content);
-        assert!(text.contains("sender=claude-code"), "{text}");
+        assert!(text.contains("identity, claude-code"), "{text}");
     }
 
     #[test]
