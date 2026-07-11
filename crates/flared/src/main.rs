@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use flared::config::Config;
-use flared::daemon::{kill_process_tree, sweep_once, unix_now};
+use flared::daemon::{make_verified_killer, sweep_once, unix_now};
 use flared::events::EventLog;
 use flared::http::AppState;
 use flared::janitor::lean_ctx::{check_registry, prune_registry};
@@ -106,7 +106,7 @@ fn main() -> eyre::Result<()> {
 
     match cli.command {
         Command::Status => {
-            let outcome = sweep_once(&cfg, &store, &log, false, true, &mut kill_process_tree)?;
+            let outcome = sweep_once(&cfg, &store, &log, false, true, &mut make_verified_killer(&store))?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
@@ -152,7 +152,7 @@ fn main() -> eyre::Result<()> {
             }
         }
         Command::Clean { execute } => {
-            let outcome = sweep_once(&cfg, &store, &log, execute, true, &mut kill_process_tree)?;
+            let outcome = sweep_once(&cfg, &store, &log, execute, true, &mut make_verified_killer(&store))?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&outcome.outcomes)?);
             } else if outcome.actions.is_empty() {
@@ -173,7 +173,7 @@ fn main() -> eyre::Result<()> {
             }
         }
         Command::Orphans => {
-            let outcome = sweep_once(&cfg, &store, &log, false, true, &mut kill_process_tree)?;
+            let outcome = sweep_once(&cfg, &store, &log, false, true, &mut make_verified_killer(&store))?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&outcome.orphans)?);
             } else if outcome.orphans.is_empty() {
@@ -187,16 +187,33 @@ fn main() -> eyre::Result<()> {
         }
         Command::RegistryCheck { execute } => {
             let (procs, _) = scan(&cfg);
+            let mut results = Vec::new();
             for reg in &cfg.registries {
+                // Same filter as the daemon: only formats we understand may
+                // ever be parsed, let alone pruned.
+                if reg.kind != "lean-ctx" {
+                    if !cli.json {
+                        println!("skip {} (unsupported kind '{}')", reg.path.display(), reg.kind);
+                    }
+                    results.push(serde_json::json!({
+                        "path": reg.path.display().to_string(),
+                        "skipped": format!("unsupported kind '{}'", reg.kind),
+                    }));
+                    continue;
+                }
                 if !reg.path.exists() {
-                    println!("skip {} (missing)", reg.path.display());
+                    if !cli.json {
+                        println!("skip {} (missing)", reg.path.display());
+                    }
+                    results.push(serde_json::json!({
+                        "path": reg.path.display().to_string(),
+                        "skipped": "missing",
+                    }));
                     continue;
                 }
                 let report =
                     check_registry(&reg.path, &procs, &reg.expected_exe, cfg.identity_tolerance_secs)?;
-                if cli.json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                } else {
+                if !cli.json {
                     println!(
                         "{}: {} entries, {} live, {} stale",
                         reg.path.display(),
@@ -211,6 +228,7 @@ fn main() -> eyre::Result<()> {
                         println!("  … and {} more", report.stale.len() - 10);
                     }
                 }
+                let mut backup_path = None;
                 if execute && !report.stale.is_empty() {
                     let backup = prune_registry(&reg.path, &report)?;
                     log.append(
@@ -221,8 +239,25 @@ fn main() -> eyre::Result<()> {
                             "backup": backup.display().to_string(),
                         }),
                     )?;
-                    println!("pruned {} stale entries (backup: {})", report.stale.len(), backup.display());
+                    if !cli.json {
+                        println!(
+                            "pruned {} stale entries (backup: {})",
+                            report.stale.len(),
+                            backup.display()
+                        );
+                    }
+                    backup_path = Some(backup.display().to_string());
                 }
+                results.push(serde_json::json!({
+                    "path": reg.path.display().to_string(),
+                    "report": report,
+                    "pruned": execute && backup_path.is_some(),
+                    "backup": backup_path,
+                }));
+            }
+            if cli.json {
+                // One valid JSON document, whatever the number of registries.
+                println!("{}", serde_json::to_string_pretty(&results)?);
             }
         }
         Command::Lease { command } => match command {
@@ -277,8 +312,11 @@ fn main() -> eyre::Result<()> {
                 "windows"
             } else if cfg!(target_os = "macos") {
                 "macos"
-            } else {
+            } else if cfg!(target_os = "linux") {
                 "linux"
+            } else {
+                // Preserve the manual-run fallback on other unixes.
+                std::env::consts::OS
             };
             println!("{}", flared::service::autostart_recipe(platform, &exe));
         }

@@ -4,12 +4,17 @@
 use std::path::Path;
 
 /// Recipe text for the given platform ("windows" | "linux" | "macos").
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 pub fn autostart_recipe(platform: &str, exe: &Path) -> String {
-    let exe = exe.display();
+    let exe = exe.display().to_string();
+    let exe_xml = xml_escape(&exe);
     match platform {
         "windows" => format!(
             r#"# Register flared as a logon task (run in an elevated or user shell):
-schtasks /Create /TN "flared" /TR "{exe} serve" /SC ONLOGON /RL LIMITED /F
+schtasks /Create /TN "flared" /TR "\"{exe}\" serve" /SC ONLOGON /RL LIMITED /F
 
 # Start it now without waiting for the next logon:
 schtasks /Run /TN "flared"
@@ -24,7 +29,7 @@ schtasks /Delete /TN "flared" /F
 Description=flared - AI-agent workload hygiene supervisor
 
 [Service]
-ExecStart={exe} serve
+ExecStart="{exe}" serve
 Restart=on-failure
 
 [Install]
@@ -42,7 +47,7 @@ systemctl --user enable --now flared
 <dict>
   <key>Label</key><string>com.getappz.flared</string>
   <key>ProgramArguments</key><array>
-    <string>{exe}</string><string>serve</string>
+    <string>{exe_xml}</string><string>serve</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -80,5 +85,26 @@ mod tests {
         let text = autostart_recipe("macos", Path::new("/usr/local/bin/flared"));
         assert!(text.contains("launchctl"));
         assert!(text.contains("plist"));
+    }
+
+    #[test]
+    fn paths_with_spaces_are_quoted() {
+        let text = autostart_recipe("linux", Path::new("/opt/my tools/flared"));
+        assert!(text.contains("ExecStart=\"/opt/my tools/flared\" serve"));
+        let text = autostart_recipe("windows", Path::new("C:/My Tools/flared.exe"));
+        assert!(text.contains(r#"\"C:/My Tools/flared.exe\" serve"#));
+    }
+
+    #[test]
+    fn plist_xml_escapes_special_characters() {
+        let text = autostart_recipe("macos", Path::new("/opt/a&b/flared"));
+        assert!(text.contains("/opt/a&amp;b/flared"));
+        assert!(!text.contains("<string>/opt/a&b/flared</string>"));
+    }
+
+    #[test]
+    fn unknown_platform_gets_manual_fallback() {
+        let text = autostart_recipe("freebsd", Path::new("/bin/flared"));
+        assert!(text.contains("no autostart recipe"));
     }
 }

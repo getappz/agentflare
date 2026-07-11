@@ -47,6 +47,29 @@ pub fn kill_process_tree(pid: u32) -> eyre::Result<()> {
         .map_err(|err| eyre::eyre!("kill_tree({pid}): {err}"))
 }
 
+/// The production killer: reloads the lease store and re-queries the OS at
+/// the moment of execution, so a lease heartbeated/removed after planning, or
+/// a pid recycled after the scan, is never killed. Lease-backed kills require
+/// an EXACT start-time match — fuzzy tolerance is for report-only heuristics.
+pub fn make_verified_killer(store: &LeaseStore) -> impl FnMut(u32) -> eyre::Result<()> + '_ {
+    move |pid| {
+        let now = unix_now();
+        let leases = store.load()?;
+        let lease = leases
+            .iter()
+            .find(|l| l.pid == pid && l.allow_kill && l.expires_at() <= now)
+            .ok_or_else(|| {
+                eyre::eyre!("no expired kill-authorized lease for pid {pid} at execution time")
+            })?;
+        let (name, start) = crate::scanner::identity_of(pid)
+            .ok_or_else(|| eyre::eyre!("pid {pid} exited before execution"))?;
+        if !crate::model::identity_matches(&lease.identity, &name, start, 0) {
+            eyre::bail!("identity changed for pid {pid} at execution time (now '{name}')");
+        }
+        kill_process_tree(pid)
+    }
+}
+
 /// One full sweep:
 ///
 /// 1. audit + classify processes
@@ -76,9 +99,10 @@ pub fn sweep_once(
     }
 
     let expired: Vec<_> = leases.iter().filter(|l| l.expires_at() <= now).cloned().collect();
-    let actions = plan_lease_actions(&expired, &procs, cfg.identity_tolerance_secs);
-    let outcomes =
-        execute_actions(&actions, &leases, &procs, cfg.identity_tolerance_secs, execute, kill);
+    // Lease-backed kills demand an exact start-time match; the configured
+    // tolerance applies only to report-only registry heuristics.
+    let actions = plan_lease_actions(&expired, &procs, 0);
+    let outcomes = execute_actions(&actions, &leases, &procs, 0, execute, kill);
     for outcome in outcomes.iter().filter(|o| o.executed) {
         if let Some(id) = outcome.action.target.strip_prefix("lease:") {
             let _ = store.remove(id);
@@ -158,17 +182,29 @@ pub async fn run_loop(
     snapshot: SharedSnapshot,
 ) {
     let light = std::time::Duration::from_secs(cfg.light_interval_secs.max(5));
-    let mut ticks_per_deep = (cfg.deep_interval_secs / cfg.light_interval_secs.max(1)).max(1);
-    let mut tick = 0u64;
+    let deep_every =
+        std::time::Duration::from_secs(cfg.deep_interval_secs.max(cfg.light_interval_secs.max(5)));
+    // Deep sweeps are scheduled on elapsed time, not tick counts, so backoff
+    // stretching the light cadence cannot stretch the deep cadence with it.
+    let mut next_deep = tokio::time::Instant::now();
     loop {
-        let deep = tick.is_multiple_of(ticks_per_deep);
+        let deep = tokio::time::Instant::now() >= next_deep;
+        if deep {
+            next_deep = tokio::time::Instant::now() + deep_every;
+        }
         let cfg2 = Arc::clone(&cfg);
         let store2 = Arc::clone(&store);
         let log2 = Arc::clone(&log);
         let result = tokio::task::spawn_blocking(move || {
             let (procs, _) = scan(&cfg2);
-            let outcome =
-                sweep_once(&cfg2, &store2, &log2, true, deep, &mut kill_process_tree);
+            let outcome = sweep_once(
+                &cfg2,
+                &store2,
+                &log2,
+                true,
+                deep,
+                &mut make_verified_killer(&store2),
+            );
             (procs, outcome)
         })
         .await;
@@ -185,14 +221,17 @@ pub async fn run_loop(
             Ok((_, Err(err))) => tracing::warn!(%err, "sweep failed"),
             Err(err) => tracing::warn!(%err, "sweep task panicked"),
         }
-        tick += 1;
-        // Back off when everything is calm: green pressure doubles the nap.
+        // Back off when everything is calm: green pressure doubles the nap,
+        // but never sleep past the next deep-sweep deadline.
         let calm = {
             let snap = snapshot.lock().expect("snapshot lock");
             snap.last.as_ref().is_some_and(|o| o.pressure.level == "green")
         };
-        ticks_per_deep = ticks_per_deep.max(1);
-        tokio::time::sleep(if calm { light * 2 } else { light }).await;
+        let nap = if calm { light * 2 } else { light };
+        let until_deep = next_deep
+            .saturating_duration_since(tokio::time::Instant::now())
+            .max(std::time::Duration::from_secs(1));
+        tokio::time::sleep(nap.min(until_deep)).await;
     }
 }
 

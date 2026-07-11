@@ -3,15 +3,16 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::StatusCode;
-use axum::response::Html;
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
 use crate::config::Config;
-use crate::daemon::{kill_process_tree, sweep_once, unix_now, SharedSnapshot, SweepOutcome};
+use crate::daemon::{make_verified_killer, sweep_once, unix_now, SharedSnapshot, SweepOutcome};
 use crate::events::EventLog;
 use crate::leases::LeaseStore;
 use crate::model::{Finding, Identity, Lease, ProcInfo};
@@ -29,6 +30,11 @@ pub struct AppState {
     pub snapshot: SharedSnapshot,
     pub store: Arc<LeaseStore>,
     pub log: Arc<EventLog>,
+    /// Per-install secret required on every mutating request. Guards the
+    /// kill-enabled endpoints against localhost CSRF: a web page can fire a
+    /// cross-origin POST at 127.0.0.1, but it cannot read this token, and the
+    /// custom header forces a CORS preflight that never passes.
+    pub token: Arc<String>,
 }
 
 impl AppState {
@@ -38,8 +44,56 @@ impl AppState {
             snapshot: SharedSnapshot::default(),
             store: Arc::new(LeaseStore::new(&state_dir)),
             log: Arc::new(EventLog::new(&state_dir)),
+            token: Arc::new(load_or_create_token(&state_dir)),
         }
     }
+}
+
+fn load_or_create_token(dir: &std::path::Path) -> String {
+    use std::hash::BuildHasher;
+    let path = dir.join("token");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return existing;
+        }
+    }
+    // 128 bits from std's randomly-keyed SipHash (RandomState seeds from OS
+    // entropy) mixed with time and pid.
+    let mut token = String::with_capacity(32);
+    for round in 0u8..2 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let word = std::collections::hash_map::RandomState::new()
+            .hash_one((nanos, std::process::id(), round));
+        token.push_str(&format!("{word:016x}"));
+    }
+    let _ = std::fs::create_dir_all(dir);
+    if let Err(err) = std::fs::write(&path, &token) {
+        tracing::warn!(%err, "could not persist API token; using session-only token");
+    }
+    token
+}
+
+async fn require_token(State(s): State<AppState>, req: Request, next: Next) -> Response {
+    let mutating = matches!(req.method().as_str(), "POST" | "DELETE" | "PUT" | "PATCH");
+    if mutating {
+        let ok = req
+            .headers()
+            .get("x-flared-token")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == s.token.as_str());
+        if !ok {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid x-flared-token (value lives in flared's state dir)",
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 #[derive(Deserialize)]
@@ -80,6 +134,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sweep", post(sweep_now))
         .route("/clean", post(clean_dry_run))
         .route("/clean/execute", post(clean_execute))
+        .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
 
@@ -164,13 +219,23 @@ async fn lease_delete(
 }
 
 async fn run_sweep(s: AppState, execute: bool) -> Result<Json<SweepOutcome>, HttpError> {
-    tokio::task::spawn_blocking(move || {
-        sweep_once(&s.cfg, &s.store, &s.log, execute, true, &mut kill_process_tree)
+    let worker = s.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        sweep_once(
+            &worker.cfg,
+            &worker.store,
+            &worker.log,
+            execute,
+            true,
+            &mut make_verified_killer(&worker.store),
+        )
     })
     .await
     .map_err(internal)?
-    .map(Json)
-    .map_err(internal)
+    .map_err(internal)?;
+    // Publish so /status, /orphans, and the dashboard see manual sweeps too.
+    s.snapshot.lock().expect("snapshot lock").last = Some(outcome.clone());
+    Ok(Json(outcome))
 }
 
 async fn sweep_now(State(s): State<AppState>) -> Result<Json<SweepOutcome>, HttpError> {
@@ -198,23 +263,30 @@ td,th{padding:.25rem .75rem;border-bottom:1px solid #333;text-align:left}
 <h2>workloads</h2><table id="buckets"></table>
 <h2>orphan findings</h2><table id="orphans"></table>
 <script>
+// All dynamic values go through textContent — process names and finding
+// reasons are attacker-influenced strings and must never reach innerHTML.
+function row(cells){
+  const tr=document.createElement('tr');
+  for(const c of cells){const td=document.createElement('td');td.textContent=String(c);tr.appendChild(td);}
+  return tr;
+}
 async function tick(){
   const s = await (await fetch('/status')).json();
   const last = s.last;
-  if(!last){document.getElementById('pressure').textContent='no sweep yet';return}
+  const pressure = document.getElementById('pressure');
+  if(!last){pressure.textContent='no sweep yet';return}
   const p = last.pressure;
-  document.getElementById('pressure').innerHTML =
-    `pressure: <span class="${p.level}">${p.level}</span>` +
+  const level=document.createElement('span');
+  level.className=p.level; level.textContent=p.level;
+  pressure.replaceChildren('pressure: ', level,
     ` · cpu ${p.cpu_pct.toFixed(0)}%` +
     ` · mem free ${(p.avail_mem_bytes/2**30).toFixed(1)} GiB` +
-    ` · leases ${s.lease_count}`;
-  document.getElementById('buckets').innerHTML =
-    Object.entries(last.bucket_counts).sort((a,b)=>b[1]-a[1])
-      .map(([k,v])=>`<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+    ` · leases ${s.lease_count}`);
+  document.getElementById('buckets').replaceChildren(
+    ...Object.entries(last.bucket_counts).sort((a,b)=>b[1]-a[1]).map(([k,v])=>row([k,v])));
   const orphans = await (await fetch('/orphans')).json();
-  document.getElementById('orphans').innerHTML =
-    orphans.length ? orphans.map(o=>`<tr><td>${o.pid}</td><td>${o.name}</td><td>${o.reason}</td></tr>`).join('')
-                   : '<tr><td>none</td></tr>';
+  document.getElementById('orphans').replaceChildren(
+    ...(orphans.length ? orphans.map(o=>row([o.pid,o.name,o.reason])) : [row(['none'])]));
 }
 tick(); setInterval(tick, 15000);
 </script></body></html>"#;
@@ -287,6 +359,7 @@ mod tests {
 
         // Register a lease for OUR OWN live process — identity is resolvable.
         let me = std::process::id();
+        let token = state.token.as_str().to_string();
         let response = app
             .clone()
             .oneshot(
@@ -294,6 +367,7 @@ mod tests {
                     .method("POST")
                     .uri("/lease")
                     .header("content-type", "application/json")
+                    .header("x-flared-token", &token)
                     .body(axum::body::Body::from(
                         serde_json::json!({ "pid": me, "ttl_seconds": 300 }).to_string(),
                     ))
@@ -314,6 +388,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method("POST")
                     .uri(format!("/lease/{id}/heartbeat"))
+                    .header("x-flared-token", &token)
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -328,6 +403,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method("DELETE")
                     .uri(format!("/lease/{id}"))
+                    .header("x-flared-token", &token)
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -340,6 +416,7 @@ mod tests {
     #[tokio::test]
     async fn lease_for_dead_pid_is_rejected() {
         let (_dir, state) = state();
+        let token = state.token.as_str().to_string();
         let app = router(state);
         let response = app
             .oneshot(
@@ -347,6 +424,7 @@ mod tests {
                     .method("POST")
                     .uri("/lease")
                     .header("content-type", "application/json")
+                    .header("x-flared-token", &token)
                     .body(axum::body::Body::from(
                         serde_json::json!({ "pid": u32::MAX - 7, "ttl_seconds": 300 })
                             .to_string(),
@@ -356,5 +434,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mutating_request_without_token_is_unauthorized() {
+        let (_dir, state) = state();
+        let app = router(state.clone());
+        for (method, uri) in
+            [("POST", "/sweep"), ("POST", "/clean/execute"), ("DELETE", "/lease/x")]
+        {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must require the token"
+            );
+        }
+        // Reads stay open.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

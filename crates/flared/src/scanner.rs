@@ -45,7 +45,12 @@ pub fn classify(name: &str, cmd: &str, cfg: &Config) -> (Bucket, bool) {
         Bucket::Other
     };
 
-    let protected = matches!(bucket, Bucket::Browsers | Bucket::Terminals | Bucket::Desktop)
+    // Protection is decided by the executable NAME alone, independent of the
+    // bucket: a browser whose cmdline mentions an agent pattern still lands in
+    // the Agents bucket, but must never lose its protected status.
+    let protected = matches(&cfg.browser_patterns, &name_lc)
+        || matches(&cfg.terminal_patterns, &name_lc)
+        || matches(&cfg.desktop_patterns, &name_lc)
         || matches(&cfg.protect_patterns, &name_lc)
         || matches(&cfg.protect_patterns, &cmd_lc);
     (bucket, protected)
@@ -175,6 +180,16 @@ mod tests {
         let (bucket, protected) = classify("randomthing.exe", "randomthing", &cfg());
         assert_eq!(bucket, Bucket::Other);
         assert!(!protected);
+    }
+
+    #[test]
+    fn browser_with_agent_cmdline_stays_protected() {
+        // Regression: agent pattern in the cmdline reclassifies the bucket,
+        // but a browser executable must remain protected regardless.
+        let (bucket, protected) =
+            classify("chrome.exe", "chrome --load-extension mcp-helper", &cfg());
+        assert_eq!(bucket, Bucket::Agents);
+        assert!(protected);
     }
 
     #[test]

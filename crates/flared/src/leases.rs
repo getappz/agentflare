@@ -5,13 +5,19 @@ use crate::model::{Identity, Lease};
 /// JSON-file-backed lease store with atomic writes and corrupt-file
 /// quarantine. All timestamps are seconds since the unix epoch and are passed
 /// in by callers so the logic stays deterministic under test.
+///
+/// Every operation holds an internal mutex, so concurrent HTTP handlers and
+/// the sweep loop within one process cannot interleave load-modify-save and
+/// lose a heartbeat. Cross-process writers still race (last writer wins) but
+/// cannot corrupt the file: writes go to a per-process temp file + rename.
 pub struct LeaseStore {
     dir: PathBuf,
+    guard: std::sync::Mutex<()>,
 }
 
 impl LeaseStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self { dir: dir.into(), guard: std::sync::Mutex::new(()) }
     }
 
     pub fn path(&self) -> PathBuf {
@@ -22,6 +28,11 @@ impl LeaseStore {
     /// moved aside to `leases.json.quarantine` and treated as empty — the
     /// supervisor must never crash-loop on bad state.
     pub fn load(&self) -> eyre::Result<Vec<Lease>> {
+        let _guard = self.guard.lock().expect("lease store lock");
+        self.load_unlocked()
+    }
+
+    fn load_unlocked(&self) -> eyre::Result<Vec<Lease>> {
         let path = self.path();
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
@@ -40,10 +51,16 @@ impl LeaseStore {
         }
     }
 
-    /// Atomic save: write to a temp file in the same directory, then rename.
+    /// Atomic save: write to a per-process temp file in the same directory,
+    /// then rename over the target.
     pub fn save(&self, leases: &[Lease]) -> eyre::Result<()> {
+        let _guard = self.guard.lock().expect("lease store lock");
+        self.save_unlocked(leases)
+    }
+
+    fn save_unlocked(&self, leases: &[Lease]) -> eyre::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
-        let tmp = self.dir.join("leases.json.tmp");
+        let tmp = self.dir.join(format!("leases.json.tmp-{}", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec_pretty(leases)?)?;
         std::fs::rename(&tmp, self.path())?;
         Ok(())
@@ -58,7 +75,8 @@ impl LeaseStore {
         allow_kill: bool,
         now: u64,
     ) -> eyre::Result<Lease> {
-        let mut leases = self.load()?;
+        let _guard = self.guard.lock().expect("lease store lock");
+        let mut leases = self.load_unlocked()?;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
@@ -73,30 +91,32 @@ impl LeaseStore {
             allow_kill,
         };
         leases.push(lease.clone());
-        self.save(&leases)?;
+        self.save_unlocked(&leases)?;
         Ok(lease)
     }
 
     /// Reset the lease clock. Returns the refreshed lease, or None when the
     /// id is unknown.
     pub fn heartbeat(&self, id: &str, now: u64) -> eyre::Result<Option<Lease>> {
-        let mut leases = self.load()?;
+        let _guard = self.guard.lock().expect("lease store lock");
+        let mut leases = self.load_unlocked()?;
         let Some(lease) = leases.iter_mut().find(|l| l.id == id) else {
             return Ok(None);
         };
         lease.created_at = now;
         let refreshed = lease.clone();
-        self.save(&leases)?;
+        self.save_unlocked(&leases)?;
         Ok(Some(refreshed))
     }
 
     pub fn remove(&self, id: &str) -> eyre::Result<bool> {
-        let mut leases = self.load()?;
+        let _guard = self.guard.lock().expect("lease store lock");
+        let mut leases = self.load_unlocked()?;
         let before = leases.len();
         leases.retain(|l| l.id != id);
         let removed = leases.len() < before;
         if removed {
-            self.save(&leases)?;
+            self.save_unlocked(&leases)?;
         }
         Ok(removed)
     }

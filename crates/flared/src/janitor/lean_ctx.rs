@@ -51,24 +51,36 @@ pub fn check_registry(
             .and_then(|v| v.as_str())
             .unwrap_or("<unknown>")
             .to_string();
-        let pid = entry.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let raw_pid = entry.get("pid").and_then(|v| v.as_u64());
+        let Some(pid) = raw_pid.and_then(|v| u32::try_from(v).ok()) else {
+            stale.push(StaleEntry {
+                agent_id,
+                pid: 0,
+                reason: format!("missing or out-of-range pid ({raw_pid:?})"),
+            });
+            continue;
+        };
         let recorded_start = entry
             .get("started_at")
             .and_then(|v| v.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.timestamp().max(0) as u64);
 
+        // Identity requires ALL of: pid alive, expected exe name, and a
+        // recorded start time that agrees. Missing/unparseable started_at is
+        // stale — falling through as "live" would bypass the PID-reuse guard.
         let stale_reason = match procs.get(&pid) {
             None => Some(format!("pid {pid} is not running")),
             Some(p) if !p.name.to_ascii_lowercase().contains(&expected) => {
                 Some(format!("pid {pid} was reused by '{}'", p.name))
             }
             Some(p) => match recorded_start {
+                None => Some("missing or unparseable started_at".to_string()),
                 Some(t) if p.start_time.abs_diff(t) > tolerance_secs => Some(format!(
                     "pid {pid} start time {} does not match recorded started_at {t}",
                     p.start_time
                 )),
-                _ => None,
+                Some(_) => None,
             },
         };
         match stale_reason {
@@ -93,14 +105,21 @@ pub fn prune_registry(path: &Path, report: &RegistryReport) -> eyre::Result<Path
     let backup = PathBuf::from(format!("{}.bak-{ts}", path.display()));
     std::fs::write(&backup, &text)?;
 
-    let stale_ids: std::collections::HashSet<&str> =
-        report.stale.iter().map(|s| s.agent_id.as_str()).collect();
+    // Remove by (agent_id, pid) pair, not id alone: a fresh registration that
+    // happened to reuse an id between check and prune keeps its entry unless
+    // the pid also matches the stale record.
+    let stale_keys: std::collections::HashSet<(&str, u64)> =
+        report.stale.iter().map(|s| (s.agent_id.as_str(), s.pid as u64)).collect();
     if let Some(agents) = value.get_mut("agents").and_then(|a| a.as_array_mut()) {
         agents.retain(|entry| {
-            entry
-                .get("agent_id")
-                .and_then(|v| v.as_str())
-                .is_none_or(|id| !stale_ids.contains(id))
+            let id = entry.get("agent_id").and_then(|v| v.as_str());
+            let pid = entry.get("pid").and_then(|v| v.as_u64());
+            match (id, pid) {
+                (Some(id), Some(pid)) => !stale_keys.contains(&(id, pid)),
+                // Entries with a broken pid were reported with pid 0.
+                (Some(id), None) => !stale_keys.contains(&(id, 0)),
+                _ => true,
+            }
         });
     }
 
@@ -196,6 +215,27 @@ mod tests {
         let report = check_registry(&path, &procs, "lean-ctx", 5).unwrap();
         assert_eq!(report.live, 0);
         assert_eq!(report.stale.len(), 3);
+    }
+
+    #[test]
+    fn out_of_range_pid_and_missing_started_at_are_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        // Entry 1: pid exceeds u32 (would previously wrap). Entry 2: live pid
+        // + right name, but no started_at (would previously pass as live).
+        std::fs::write(
+            &path,
+            r#"{"agents": [
+                {"agent_id": "a-big", "pid": 4294967297, "started_at": "2000-01-01T00:00:00Z", "status": "Active"},
+                {"agent_id": "a-nostart", "pid": 100, "status": "Active"}
+            ]}"#,
+        )
+        .unwrap();
+        let procs: HashMap<u32, ProcInfo> =
+            [(100, proc(100, "lean-ctx.exe", T0))].into_iter().collect();
+        let report = check_registry(&path, &procs, "lean-ctx", 5).unwrap();
+        assert_eq!(report.live, 0);
+        assert_eq!(report.stale.len(), 2);
     }
 
     #[test]

@@ -49,7 +49,9 @@ pub struct Lease {
 
 impl Lease {
     pub fn expires_at(&self) -> u64 {
-        self.created_at + self.ttl_seconds
+        // Saturate: a huge client-supplied TTL must mean "never expires",
+        // not wrap into an immediately-expired (killable) lease.
+        self.created_at.saturating_add(self.ttl_seconds)
     }
 }
 
@@ -130,6 +132,26 @@ mod tests {
     #[test]
     fn rejects_start_time_beyond_tolerance() {
         assert!(!identity_matches(&identity("a.exe", 1000), "a.exe", 1003, 2));
+    }
+
+    #[test]
+    fn huge_ttl_saturates_instead_of_wrapping() {
+        let lease = Lease {
+            id: "l".into(),
+            pid: 1,
+            class: "a".into(),
+            created_at: 100,
+            ttl_seconds: u64::MAX,
+            identity: identity("a.exe", 1),
+            allow_kill: true,
+        };
+        assert_eq!(lease.expires_at(), u64::MAX);
+    }
+
+    #[test]
+    fn zero_tolerance_requires_exact_start_time() {
+        assert!(identity_matches(&identity("a.exe", 1000), "a.exe", 1000, 0));
+        assert!(!identity_matches(&identity("a.exe", 1000), "a.exe", 1001, 0));
     }
 
     #[test]
