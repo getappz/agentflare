@@ -1340,100 +1340,17 @@ impl AgentflareMcp {
             Err(e) => Err(ErrorData::internal_error(gateway_registry::redact_error_for_llm(&e.to_string()), None)),
         }
     }
-}
-
-impl AgentflareMcp {
-    /// Pure logic backing [`ServerHandler::list_resources`]; kept as a plain
-    /// sync method so it can be unit-tested without constructing a
-    /// `RequestContext<RoleServer>`.
-    fn list_resources_sync(&self) -> ListResourcesResult {
-        let runtime = optimize::load_runtime();
-        let sessions_resource = RawResource {
-            description: Some(format!("{} tracked sessions", runtime.sessions.len())),
-            mime_type: Some("application/json".to_string()),
-            ..RawResource::new("agentflare://sessions", "Active sessions")
-        };
-        let nudges_resource = RawResource {
-            description: Some("All nudge types agentflare can emit".to_string()),
-            mime_type: Some("application/json".to_string()),
-            ..RawResource::new("agentflare://nudges", "Optimization nudges")
-        };
-        ListResourcesResult::with_all_items(vec![
-            sessions_resource.no_annotation(),
-            nudges_resource.no_annotation(),
-        ])
-    }
-
-    /// Pure logic backing [`ServerHandler::read_resource`]; kept as a plain
-    /// sync method so it can be unit-tested without constructing a
-    /// `RequestContext<RoleServer>`.
-    fn read_resource_sync(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
-        let text = match uri {
-            "agentflare://sessions" => {
-                let runtime = optimize::load_runtime();
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let sessions: Vec<serde_json::Value> = runtime
-                    .sessions
-                    .iter()
-                    .map(|(id, record)| {
-                        let elapsed_secs = now.saturating_sub(record.start_ts);
-                        let hygiene = optimize::session_hygiene_nudge(record, now);
-                        serde_json::json!({
-                            "session_id": id,
-                            "turn_count": record.turn_count,
-                            "age_seconds": elapsed_secs,
-                            "age_hours": elapsed_secs / 3600,
-                            "recent_tool_calls": record.recent_tool_calls.iter().map(|c| serde_json::json!({
-                                "name": c.name,
-                                "ts": c.ts,
-                            })).collect::<Vec<_>>(),
-                            "hygiene_status": if hygiene.is_some() { "stale" } else { "healthy" },
-                            "hygiene_nudge": hygiene,
-                        })
-                    })
-                    .collect();
-                serde_json::to_string_pretty(&sessions).unwrap_or_default()
-            }
-            "agentflare://nudges" => serde_json::to_string_pretty(&serde_json::json!({
-                "nudges": [
-                    {
-                        "id": "session_hygiene",
-                        "description": "Warns when a session exceeds turn/time thresholds",
-                        "thresholds": {
-                            "turns": optimize::SESSION_HYGIENE_TURN_THRESHOLD,
-                            "time_seconds": optimize::SESSION_HYGIENE_TIME_THRESHOLD_SECS
-                        }
-                    },
-                    {
-                        "id": "model_routing",
-                        "description": "Suggests cheap models for locate/investigate tasks"
-                    },
-                    {
-                        "id": "batching",
-                        "description": "Flags repeated solo tool calls that should be batched"
-                    },
-                    {
-                        "id": "schedule_wakeup",
-                        "description": "Warns about cache-miss dead zone in scheduling delays"
-                    }
-                ]
-            })).unwrap_or_default(),
-            _ => {
-                return Err(ErrorData::resource_not_found(
-                    format!("Unknown resource: {uri}"),
-                    None,
-                ));
-            }
-        };
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(
-            text, uri,
-        )]))
-    }
 
     // --- Memory tools ---
+    //
+    // Must live in this impl block, not a separate one — #[tool_router]
+    // (on this block's `impl` line) is what rmcp's macro uses to collect
+    // #[tool]-annotated methods into the router that get_tools/call_tool
+    // actually dispatch through. A #[tool] method in an untagged impl
+    // block compiles fine and is directly callable as a plain Rust
+    // method (which is why unit tests calling e.g. `s.memory_remember(...)`
+    // passed), but is never registered as an MCP tool and is invisible to
+    // every real MCP client — silently dead on arrival.
 
     #[tool(description = "Save an observation to persistent memory. Creates, updates (by topic_key), or deduplicates. Returns status: created|updated|duplicate.")]
     fn memory_remember(
@@ -1530,6 +1447,98 @@ impl AgentflareMcp {
         };
         crate::memory::mcp::handle_curate(input)
             .map_err(|e| ErrorData::internal_error(e, None))
+    }
+}
+
+impl AgentflareMcp {
+    /// Pure logic backing [`ServerHandler::list_resources`]; kept as a plain
+    /// sync method so it can be unit-tested without constructing a
+    /// `RequestContext<RoleServer>`.
+    fn list_resources_sync(&self) -> ListResourcesResult {
+        let runtime = optimize::load_runtime();
+        let sessions_resource = RawResource {
+            description: Some(format!("{} tracked sessions", runtime.sessions.len())),
+            mime_type: Some("application/json".to_string()),
+            ..RawResource::new("agentflare://sessions", "Active sessions")
+        };
+        let nudges_resource = RawResource {
+            description: Some("All nudge types agentflare can emit".to_string()),
+            mime_type: Some("application/json".to_string()),
+            ..RawResource::new("agentflare://nudges", "Optimization nudges")
+        };
+        ListResourcesResult::with_all_items(vec![
+            sessions_resource.no_annotation(),
+            nudges_resource.no_annotation(),
+        ])
+    }
+
+    /// Pure logic backing [`ServerHandler::read_resource`]; kept as a plain
+    /// sync method so it can be unit-tested without constructing a
+    /// `RequestContext<RoleServer>`.
+    fn read_resource_sync(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
+        let text = match uri {
+            "agentflare://sessions" => {
+                let runtime = optimize::load_runtime();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let sessions: Vec<serde_json::Value> = runtime
+                    .sessions
+                    .iter()
+                    .map(|(id, record)| {
+                        let elapsed_secs = now.saturating_sub(record.start_ts);
+                        let hygiene = optimize::session_hygiene_nudge(record, now);
+                        serde_json::json!({
+                            "session_id": id,
+                            "turn_count": record.turn_count,
+                            "age_seconds": elapsed_secs,
+                            "age_hours": elapsed_secs / 3600,
+                            "recent_tool_calls": record.recent_tool_calls.iter().map(|c| serde_json::json!({
+                                "name": c.name,
+                                "ts": c.ts,
+                            })).collect::<Vec<_>>(),
+                            "hygiene_status": if hygiene.is_some() { "stale" } else { "healthy" },
+                            "hygiene_nudge": hygiene,
+                        })
+                    })
+                    .collect();
+                serde_json::to_string_pretty(&sessions).unwrap_or_default()
+            }
+            "agentflare://nudges" => serde_json::to_string_pretty(&serde_json::json!({
+                "nudges": [
+                    {
+                        "id": "session_hygiene",
+                        "description": "Warns when a session exceeds turn/time thresholds",
+                        "thresholds": {
+                            "turns": optimize::SESSION_HYGIENE_TURN_THRESHOLD,
+                            "time_seconds": optimize::SESSION_HYGIENE_TIME_THRESHOLD_SECS
+                        }
+                    },
+                    {
+                        "id": "model_routing",
+                        "description": "Suggests cheap models for locate/investigate tasks"
+                    },
+                    {
+                        "id": "batching",
+                        "description": "Flags repeated solo tool calls that should be batched"
+                    },
+                    {
+                        "id": "schedule_wakeup",
+                        "description": "Warns about cache-miss dead zone in scheduling delays"
+                    }
+                ]
+            })).unwrap_or_default(),
+            _ => {
+                return Err(ErrorData::resource_not_found(
+                    format!("Unknown resource: {uri}"),
+                    None,
+                ));
+            }
+        };
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            text, uri,
+        )]))
     }
 }
 
