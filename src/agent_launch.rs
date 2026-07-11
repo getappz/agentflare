@@ -122,8 +122,16 @@ pub struct Captured {
 fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
+        // `kill -KILL -<pid>` packs the signal and the (negative, i.e.
+        // process-group-targeting) pid into two separate `-`-prefixed argv
+        // entries. Some `kill` implementations misparse the second as
+        // another option rather than as the target once a signal option has
+        // already been consumed. `-s SIGNAME` plus a `--` end-of-options
+        // marker before the pid is the portable, unambiguous idiom.
         let _ = Command::new("kill")
-            .arg("-KILL")
+            .arg("-s")
+            .arg("KILL")
+            .arg("--")
             .arg(format!("-{}", child.id()))
             .status();
     }
