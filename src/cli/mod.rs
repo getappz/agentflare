@@ -12,6 +12,7 @@ mod hook;
 mod init;
 mod mcp;
 mod ponytail;
+mod review;
 mod run;
 mod uninstall;
 mod update;
@@ -54,6 +55,7 @@ pub enum Commands {
     Ponytail(ponytail::PonytailArgs),
     Caveman(caveman::CavemanArgs),
     Claim(claim::ClaimArgs),
+    Review(review::ReviewArgs),
 }
 
 impl Commands {
@@ -76,6 +78,7 @@ impl Commands {
             Self::Ponytail(cmd) => cmd.run(),
             Self::Caveman(cmd) => cmd.run(),
             Self::Claim(cmd) => cmd.run(),
+            Self::Review(cmd) => cmd.run(),
         }
     }
 }

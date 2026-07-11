@@ -102,6 +102,47 @@ struct ClaimListRequest {
     all_repos: bool,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ReviewSubmitRequest {
+    #[schemars(description = "Findings, each {file, line, message, severity?, category?}")]
+    findings: Vec<serde_json::Value>,
+    #[schemars(description = "Review round id (default: current branch)")]
+    #[serde(default)]
+    pr: Option<String>,
+    #[schemars(description = "Finder name (default: detected agent)")]
+    #[serde(default)]
+    agent: Option<String>,
+    #[schemars(description = "Repo key owner/name (default: origin remote)")]
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ReviewConsensusRequest {
+    #[schemars(description = "Review round id (default: current branch)")]
+    #[serde(default)]
+    pr: Option<String>,
+    #[schemars(description = "Diff base ref (default: master)")]
+    #[serde(default)]
+    base: Option<String>,
+    #[schemars(description = "Diff head ref (default: HEAD)")]
+    #[serde(default)]
+    head: Option<String>,
+    #[schemars(description = "Repo key owner/name (default: origin remote)")]
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ReviewRoundRequest {
+    #[schemars(description = "Review round id (default: current branch)")]
+    #[serde(default)]
+    pr: Option<String>,
+    #[schemars(description = "Repo key owner/name (default: origin remote)")]
+    #[serde(default)]
+    repo: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct ArtifactPublishRequest {
     #[schemars(description = "Display name of the artifact")]
@@ -790,6 +831,99 @@ impl AgentflareMcp {
             )
         })?;
         Ok((conn, repo))
+    }
+
+    #[tool(description = "Submit a finder's review findings for a round (each finding is {file, line, message, severity?, category?}). Replaces this finder's prior findings for the round. Call from each reviewing agent, then call review_consensus to verify + dedup + tag.")]
+    fn review_submit(
+        &self,
+        Parameters(ReviewSubmitRequest { findings, pr, agent, repo }): Parameters<ReviewSubmitRequest>,
+    ) -> Result<String, ErrorData> {
+        let conn = Self::claim_db()?;
+        let repo = Self::resolve_repo_or_err(repo)?;
+        let pr = Self::resolve_round(pr)?;
+        let agent = agent.filter(|s| !s.is_empty()).unwrap_or_else(crate::review::submitter_name);
+        let parsed: Vec<crate::review::Finding> = findings
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<Result<_, _>>()
+            .map_err(|e| ErrorData::invalid_params(format!("invalid finding: {e}"), None))?;
+        let n = crate::review::submit(&conn, &repo, &pr, &agent, &parsed, crate::claims::now())
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(serde_json::json!({ "submitted": n, "repo": repo, "pr": pr, "agent": agent }).to_string())
+    }
+
+    #[tool(description = "Verify all submitted findings for a round against the git diff (base...head), dedup overlapping ones, and tag each CONFIRMED/UNIQUE/DISPUTED/UNVERIFIED. Returns the ranked consensus items.")]
+    fn review_consensus(
+        &self,
+        Parameters(ReviewConsensusRequest { pr, base, head, repo }): Parameters<ReviewConsensusRequest>,
+    ) -> Result<String, ErrorData> {
+        let conn = Self::claim_db()?;
+        let repo = Self::resolve_repo_or_err(repo)?;
+        let pr = Self::resolve_round(pr)?;
+        let findings = crate::review::load(&conn, &repo, &pr)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let diff = crate::review::compute_diff(base.as_deref(), head.as_deref())
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let changed = crate::review::changed_lines(&diff);
+        let items = crate::review::consensus(&findings, &changed);
+        Ok(serde_json::json!({
+            "repo": repo,
+            "pr": pr,
+            "items": items,
+            "markdown": crate::review::render_markdown(&items),
+        })
+        .to_string())
+    }
+
+    #[tool(description = "List the raw submitted findings for a review round (before consensus).")]
+    fn review_list(
+        &self,
+        Parameters(ReviewRoundRequest { pr, repo }): Parameters<ReviewRoundRequest>,
+    ) -> Result<String, ErrorData> {
+        let conn = Self::claim_db()?;
+        let repo = Self::resolve_repo_or_err(repo)?;
+        let pr = Self::resolve_round(pr)?;
+        let findings = crate::review::load(&conn, &repo, &pr)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let rows: Vec<serde_json::Value> = findings
+            .iter()
+            .map(|sf| serde_json::json!({ "agent": sf.agent, "file": sf.finding.file, "line": sf.finding.line, "message": sf.finding.message, "severity": sf.finding.severity }))
+            .collect();
+        Ok(serde_json::to_string_pretty(&rows).unwrap_or_default())
+    }
+
+    #[tool(description = "Drop all submitted findings for a review round.")]
+    fn review_clear(
+        &self,
+        Parameters(ReviewRoundRequest { pr, repo }): Parameters<ReviewRoundRequest>,
+    ) -> Result<String, ErrorData> {
+        let conn = Self::claim_db()?;
+        let repo = Self::resolve_repo_or_err(repo)?;
+        let pr = Self::resolve_round(pr)?;
+        let n = crate::review::clear(&conn, &repo, &pr)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(serde_json::json!({ "cleared": n, "repo": repo, "pr": pr }).to_string())
+    }
+
+    fn resolve_repo_or_err(repo: Option<String>) -> Result<String, ErrorData> {
+        crate::claims::resolve_repo(repo).ok_or_else(|| {
+            ErrorData::invalid_params("could not determine repo — run in a git repo or pass repo=owner/name", None)
+        })
+    }
+
+    /// Review round id: explicit `pr`, else the current branch name.
+    fn resolve_round(pr: Option<String>) -> Result<String, ErrorData> {
+        if let Some(pr) = pr.filter(|s| !s.is_empty()) {
+            return Ok(pr);
+        }
+        std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ErrorData::invalid_params("could not determine round — pass pr", None))
     }
 
     fn gateway_db_path() -> std::path::PathBuf {

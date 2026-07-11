@@ -28,6 +28,7 @@ mod mise_install;
 mod optimize;
 mod paths;
 mod pricing;
+mod review;
 mod rollup;
 mod rule_text;
 mod shell;
