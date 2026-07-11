@@ -9,7 +9,7 @@ pub struct SkillEntry {
     pub source: String,
     pub path: PathBuf,
     pub description: String,
-    pub tags: String,      // space-joined, FTS column
+    pub tags: String, // space-joined, FTS column
     pub est_tokens: i64,
     pub mtime: i64,
     /// Compressed shadow copy of this skill, when one exists.
@@ -82,15 +82,16 @@ fn read_entry(id: &str, path: &Path) -> Option<SkillEntry> {
     })
 }
 
-static SHADOW_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"compressed-from:\s+(.+?)\s+\d+B").unwrap()
-});
+static SHADOW_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"compressed-from:\s+(.+?)\s+\d+B").unwrap());
 
 /// `<!-- compressed-from: <path> <N>B → <M>B, <date> -->` in the first 2000 chars.
 fn shadow_origin(path: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(path).ok()?;
     let head: String = text.chars().take(2000).collect();
-    SHADOW_RE.captures(&head).map(|c| PathBuf::from(c[1].to_string()))
+    SHADOW_RE
+        .captures(&head)
+        .map(|c| PathBuf::from(c[1].to_string()))
 }
 
 pub fn scan_sources(sources: &[Source]) -> ScanOutput {
@@ -98,7 +99,9 @@ pub fn scan_sources(sources: &[Source]) -> ScanOutput {
     for src in sources {
         match &src.kind {
             SourceKind::FlatDir(root) => {
-                let Ok(read) = std::fs::read_dir(root) else { continue };
+                let Ok(read) = std::fs::read_dir(root) else {
+                    continue;
+                };
                 for dir in read.flatten() {
                     let skill_md = dir.path().join("SKILL.md");
                     if !skill_md.is_file() {
@@ -115,8 +118,16 @@ pub fn scan_sources(sources: &[Source]) -> ScanOutput {
                 let mut best: std::collections::HashMap<(String, String), PathBuf> =
                     std::collections::HashMap::new();
                 for mkt in std::fs::read_dir(root).into_iter().flatten().flatten() {
-                    for plugin in std::fs::read_dir(mkt.path()).into_iter().flatten().flatten() {
-                        for ver in std::fs::read_dir(plugin.path()).into_iter().flatten().flatten() {
+                    for plugin in std::fs::read_dir(mkt.path())
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                    {
+                        for ver in std::fs::read_dir(plugin.path())
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                        {
                             let skills = ver.path().join("skills");
                             for sk in std::fs::read_dir(&skills).into_iter().flatten().flatten() {
                                 let f = sk.path().join("SKILL.md");
@@ -130,7 +141,9 @@ pub fn scan_sources(sources: &[Source]) -> ScanOutput {
                                 let replace = match best.get(&key) {
                                     // parents: SKILL.md -> <skill> -> skills -> <version>
                                     Some(cur) => {
-                                        let cur_ver = cur.ancestors().nth(3)
+                                        let cur_ver = cur
+                                            .ancestors()
+                                            .nth(3)
                                             .and_then(|p| p.file_name())
                                             .map(|n| version_key(&n.to_string_lossy()))
                                             .unwrap_or_default();
@@ -159,9 +172,10 @@ pub fn scan_sources(sources: &[Source]) -> ScanOutput {
     let mut shadows: Vec<(usize, PathBuf)> = Vec::new(); // (entry idx of shadow, origin path)
     for (i, e) in out.entries.iter().enumerate() {
         if e.source.starts_with("claude-user")
-            && let Some(origin) = shadow_origin(&e.path) {
-                shadows.push((i, origin));
-            }
+            && let Some(origin) = shadow_origin(&e.path)
+        {
+            shadows.push((i, origin));
+        }
     }
     let mut drop_idx: Vec<usize> = Vec::new();
     for (shadow_i, origin) in &shadows {
@@ -193,20 +207,35 @@ pub fn scan_sources(sources: &[Source]) -> ScanOutput {
 /// directory exists.
 pub fn default_sources(home: &Path, cwd: &Path, detected_agents: &[String]) -> Vec<Source> {
     let mut v = vec![
-        Source { id: "claude-user".into(), kind: SourceKind::FlatDir(home.join(".claude").join("skills")) },
-        Source { id: "claude-project".into(), kind: SourceKind::FlatDir(cwd.join(".claude").join("skills")) },
-        Source { id: "claude-plugin".into(), kind: SourceKind::PluginCache(home.join(".claude").join("plugins").join("cache")) },
+        Source {
+            id: "claude-user".into(),
+            kind: SourceKind::FlatDir(home.join(".claude").join("skills")),
+        },
+        Source {
+            id: "claude-project".into(),
+            kind: SourceKind::FlatDir(cwd.join(".claude").join("skills")),
+        },
+        Source {
+            id: "claude-plugin".into(),
+            kind: SourceKind::PluginCache(home.join(".claude").join("plugins").join("cache")),
+        },
     ];
     // Conventional flat skill dirs for other agents; contributed only when the
     // agent is detected AND the dir exists (harmless no-op otherwise).
     let conventions: &[(&str, PathBuf)] = &[
         ("codex", home.join(".codex").join("skills")),
         ("cursor", home.join(".cursor").join("skills")),
-        ("opencode", home.join(".config").join("opencode").join("skills")),
+        (
+            "opencode",
+            home.join(".config").join("opencode").join("skills"),
+        ),
     ];
     for (agent, dir) in conventions {
         if detected_agents.iter().any(|a| a == agent) && dir.is_dir() {
-            v.push(Source { id: (*agent).to_string(), kind: SourceKind::FlatDir(dir.clone()) });
+            v.push(Source {
+                id: (*agent).to_string(),
+                kind: SourceKind::FlatDir(dir.clone()),
+            });
         }
     }
     v.retain(|s| match &s.kind {
@@ -265,8 +294,18 @@ mod tests {
     fn plugin_cache_picks_newest_version() {
         let tmp = tempfile::tempdir().unwrap();
         for v in ["6.0.3", "6.1.1", "6.1.0"] {
-            let d = tmp.path().join("mkt").join("superpowers").join(v).join("skills");
-            write_skill(&d, "writing-skills", "Use when creating skills", &format!("v{v}"));
+            let d = tmp
+                .path()
+                .join("mkt")
+                .join("superpowers")
+                .join(v)
+                .join("skills");
+            write_skill(
+                &d,
+                "writing-skills",
+                "Use when creating skills",
+                &format!("v{v}"),
+            );
         }
         let out = scan_sources(&[Source {
             id: "claude-plugin".into(),
@@ -284,7 +323,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("cache");
         let d = cache.join("mkt").join("cv").join("1.0.0").join("skills");
-        write_skill(&d, "live", "Use when checking live sessions", "ORIGINAL BODY");
+        write_skill(
+            &d,
+            "live",
+            "Use when checking live sessions",
+            "ORIGINAL BODY",
+        );
         let orig = d.join("live").join("SKILL.md");
 
         let user = tmp.path().join("user-skills");
@@ -300,8 +344,14 @@ mod tests {
         .unwrap();
 
         let out = scan_sources(&[
-            Source { id: "claude-user".into(), kind: SourceKind::FlatDir(user) },
-            Source { id: "claude-plugin".into(), kind: SourceKind::PluginCache(cache) },
+            Source {
+                id: "claude-user".into(),
+                kind: SourceKind::FlatDir(user),
+            },
+            Source {
+                id: "claude-plugin".into(),
+                kind: SourceKind::PluginCache(cache),
+            },
         ]);
         // one logical skill: the plugin original carrying its shadow
         assert_eq!(out.entries.len(), 1);
@@ -331,7 +381,10 @@ mod tests {
             kind: SourceKind::FlatDir(tmp.path().to_path_buf()),
         }]);
         assert_eq!(out.entries.len(), 1);
-        assert_eq!(out.entries[0].shadow_path.as_deref(), Some(ud.join("SKILL.md").as_path()));
+        assert_eq!(
+            out.entries[0].shadow_path.as_deref(),
+            Some(ud.join("SKILL.md").as_path())
+        );
     }
 
     #[test]

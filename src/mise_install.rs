@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 
 pub enum MiseOutcome {
     /// Already on the system (path to the binary).
+    #[allow(dead_code)]
     Present(String),
     /// We just installed it (path to the binary).
     Installed(String),

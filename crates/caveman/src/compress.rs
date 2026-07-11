@@ -60,7 +60,9 @@ pub fn compress(
     let in_place = source == target;
     let backup_path = backup_path_for(target, backup);
     if in_place && backup_path.exists() {
-        return Err(CavemanError::BackupExists(backup_path.display().to_string()));
+        return Err(CavemanError::BackupExists(
+            backup_path.display().to_string(),
+        ));
     }
 
     let compressed_body = llm.call(&prompt.build_compress_prompt(&body))?;
@@ -81,7 +83,9 @@ pub fn compress(
         let readback = std::fs::read_to_string(&backup_path)?;
         if readback != original_text {
             let _ = std::fs::remove_file(&backup_path);
-            return Err(CavemanError::BackupVerifyFailed(backup_path.display().to_string()));
+            return Err(CavemanError::BackupVerifyFailed(
+                backup_path.display().to_string(),
+            ));
         }
     }
 
@@ -90,7 +94,7 @@ pub fn compress(
     }
     std::fs::write(target, &compressed)?;
 
-    let mut errors = Vec::new();
+    let mut errors;
     for attempt in 0..MAX_RETRIES {
         let current = std::fs::read_to_string(target)?;
         errors = validate(&original_text, &current);
@@ -123,7 +127,10 @@ pub fn compress(
 fn backup_path_for(target: &Path, mode: BackupMode) -> PathBuf {
     match mode {
         BackupMode::Sibling => {
-            let file_name = target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let file_name = target
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
             target.with_file_name(format!("{file_name}.orig"))
         }
         BackupMode::OutOfTree => {
@@ -137,13 +144,20 @@ fn backup_path_for(target: &Path, mode: BackupMode) -> PathBuf {
             // identically-named parent dirs (e.g. "project-a/docs/README.md"
             // and "project-b/docs/README.md") would otherwise collide on
             // the same backup path.
-            let parent = target.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            let parent = target
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_default();
             let canonical_parent = std::fs::canonicalize(&parent).unwrap_or(parent);
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             canonical_parent.hash(&mut hasher);
             let dir_hash = hasher.finish();
-            let stem = target.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-            base.join(format!("{dir_hash:016x}")).join(format!("{stem}.original.md"))
+            let stem = target
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            base.join(format!("{dir_hash:016x}"))
+                .join(format!("{stem}.original.md"))
         }
     }
 }
@@ -165,12 +179,19 @@ mod tests {
         let dir = tempdir().unwrap();
         let source = write(dir.path(), "doc.md", "# Title\n\nverbose text here");
         let llm = FakeLlm::queue(&["# Title\n\nterse"]);
-        let report = compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap();
+        let report =
+            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap();
         assert_eq!(report.original_bytes, "# Title\n\nverbose text here".len());
-        assert_eq!(std::fs::read_to_string(&source).unwrap(), "# Title\n\nterse");
+        assert_eq!(
+            std::fs::read_to_string(&source).unwrap(),
+            "# Title\n\nterse"
+        );
         let backup = dir.path().join("doc.md.orig");
         assert!(backup.exists());
-        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "# Title\n\nverbose text here");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "# Title\n\nverbose text here"
+        );
     }
 
     #[test]
@@ -178,7 +199,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let source = write(dir.path(), "credentials.md", "some content");
         let llm = FakeLlm::queue(&["irrelevant"]);
-        let err = compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        let err =
+            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
         assert!(matches!(err, CavemanError::Sensitive(_)), "{err:?}");
     }
 
@@ -187,7 +209,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let source = write(dir.path(), "doc.md", "   \n  ");
         let llm = FakeLlm::queue(&["irrelevant"]);
-        let err = compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        let err =
+            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
         assert!(matches!(err, CavemanError::Empty(_)), "{err:?}");
     }
 
@@ -197,7 +220,8 @@ mod tests {
         let big = "x".repeat(600_000);
         let source = write(dir.path(), "doc.md", &big);
         let llm = FakeLlm::queue(&["irrelevant"]);
-        let err = compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        let err =
+            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
         assert!(matches!(err, CavemanError::TooLarge(_)), "{err:?}");
     }
 
@@ -207,7 +231,8 @@ mod tests {
         let source = write(dir.path(), "doc.md", "some real content");
         write(dir.path(), "doc.md.orig", "pre-existing backup");
         let llm = FakeLlm::queue(&["irrelevant"]);
-        let err = compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        let err =
+            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
         assert!(matches!(err, CavemanError::BackupExists(_)), "{err:?}");
     }
 
@@ -216,7 +241,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let source = write(dir.path(), "doc.md", "real content here");
         let llm = FakeLlm::queue(&[""]);
-        let err = compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        let err =
+            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
         assert!(matches!(err, CavemanError::EmptyResponse), "{err:?}");
     }
 
@@ -225,7 +251,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let source = write(dir.path(), "doc.md", "unchanged text");
         let llm = FakeLlm::queue(&["unchanged text"]);
-        let err = compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        let err =
+            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
         assert!(matches!(err, CavemanError::IdenticalOutput), "{err:?}");
     }
 
@@ -236,9 +263,17 @@ mod tests {
         let source = write(dir.path(), "doc.md", original);
         // First compress response drops the code block (fails validation),
         // second (fix) response restores it (passes).
-        let llm = FakeLlm::queue(&["# T\n\nterse, no code block", "# T\n\n```py\nprint(1)\n```\nterse"]);
-        let report = compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap();
-        assert!(std::fs::read_to_string(&source).unwrap().contains("print(1)"));
+        let llm = FakeLlm::queue(&[
+            "# T\n\nterse, no code block",
+            "# T\n\n```py\nprint(1)\n```\nterse",
+        ]);
+        let report =
+            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap();
+        assert!(
+            std::fs::read_to_string(&source)
+                .unwrap()
+                .contains("print(1)")
+        );
         assert!(report.compressed_bytes > 0);
     }
 
@@ -249,10 +284,21 @@ mod tests {
         let source = write(dir.path(), "doc.md", original);
         // Every response drops the code block — validation never passes.
         let llm = FakeLlm::queue(&["missing code", "still missing code"]);
-        let err = compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
-        assert!(matches!(err, CavemanError::ValidationFailed(2, _)), "{err:?}");
-        assert_eq!(std::fs::read_to_string(&source).unwrap(), original, "source must be restored");
-        assert!(!dir.path().join("doc.md.orig").exists(), "backup must be cleaned up");
+        let err =
+            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        assert!(
+            matches!(err, CavemanError::ValidationFailed(2, _)),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&source).unwrap(),
+            original,
+            "source must be restored"
+        );
+        assert!(
+            !dir.path().join("doc.md.orig").exists(),
+            "backup must be cleaned up"
+        );
     }
 
     #[test]
@@ -267,7 +313,10 @@ mod tests {
 
         let backup_a = backup_path_for(&a, BackupMode::OutOfTree);
         let backup_b = backup_path_for(&b, BackupMode::OutOfTree);
-        assert_ne!(backup_a, backup_b, "same-named parent dirs must not collide");
+        assert_ne!(
+            backup_a, backup_b,
+            "same-named parent dirs must not collide"
+        );
     }
 
     #[test]
@@ -278,6 +327,10 @@ mod tests {
         let llm = FakeLlm::queue(&["compressed content"]);
         compress(&llm, &source, &target, Prompt::Generic, BackupMode::Sibling).unwrap();
         assert!(!dir.path().join("shadow.md.orig").exists());
-        assert_eq!(std::fs::read_to_string(&source).unwrap(), "plugin content here", "source untouched");
+        assert_eq!(
+            std::fs::read_to_string(&source).unwrap(),
+            "plugin content here",
+            "source untouched"
+        );
     }
 }

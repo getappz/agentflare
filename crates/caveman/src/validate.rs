@@ -10,7 +10,8 @@ use std::sync::LazyLock;
 static URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://[^\s)]+").unwrap());
 static FENCE_OPEN_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\s{0,3})(`{3,}|~{3,})(.*)$").unwrap());
-static HEADING_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^(#{1,6})\s+(.*)").unwrap());
+static HEADING_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^(#{1,6})\s+(.*)").unwrap());
 static INLINE_CODE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`]+)`").unwrap());
 
 fn extract_headings(text: &str) -> Vec<(String, String)> {
@@ -39,16 +40,15 @@ fn extract_code_blocks(text: &str) -> Vec<String> {
         i += 1;
         let mut closed = false;
         while i < lines.len() {
-            if let Some(close_caps) = FENCE_OPEN_REGEX.captures(lines[i]) {
-                if close_caps[2].chars().next() == Some(fence_char)
-                    && close_caps[2].len() >= fence_len
-                    && close_caps[3].trim().is_empty()
-                {
-                    block_lines.push(lines[i]);
-                    closed = true;
-                    i += 1;
-                    break;
-                }
+            if let Some(close_caps) = FENCE_OPEN_REGEX.captures(lines[i])
+                && close_caps[2].starts_with(fence_char)
+                && close_caps[2].len() >= fence_len
+                && close_caps[3].trim().is_empty()
+            {
+                block_lines.push(lines[i]);
+                closed = true;
+                i += 1;
+                break;
             }
             block_lines.push(lines[i]);
             i += 1;
@@ -63,7 +63,10 @@ fn extract_code_blocks(text: &str) -> Vec<String> {
 }
 
 fn extract_urls(text: &str) -> HashSet<String> {
-    URL_REGEX.find_iter(text).map(|m| m.as_str().to_string()).collect()
+    URL_REGEX
+        .find_iter(text)
+        .map(|m| m.as_str().to_string())
+        .collect()
 }
 
 fn extract_inline_codes(text: &str) -> Vec<String> {
@@ -93,7 +96,11 @@ pub fn validate(orig: &str, comp: &str) -> Vec<String> {
     let h1 = extract_headings(orig);
     let h2 = extract_headings(comp);
     if h1.len() != h2.len() {
-        errors.push(format!("Heading count mismatch: {} vs {}", h1.len(), h2.len()));
+        errors.push(format!(
+            "Heading count mismatch: {} vs {}",
+            h1.len(),
+            h2.len()
+        ));
     } else if h1 != h2 {
         // Same count but different level/text — the compressor rewrote a
         // heading instead of preserving it, which the prompt promises not
@@ -148,7 +155,10 @@ mod tests {
         let orig = "# One\n\n## Two\n\nbody";
         let comp = "# One\n\nbody";
         let errors = validate(orig, comp);
-        assert!(errors.iter().any(|e| e.contains("Heading count mismatch")), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("Heading count mismatch")),
+            "{errors:?}"
+        );
     }
 
     #[test]
@@ -156,7 +166,12 @@ mod tests {
         let orig = "# One\n\n## Getting Started\n\nbody";
         let comp = "# One\n\n## Start\n\nbody";
         let errors = validate(orig, comp);
-        assert!(errors.iter().any(|e| e.contains("Headings not preserved exactly")), "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("Headings not preserved exactly")),
+            "{errors:?}"
+        );
     }
 
     #[test]
@@ -164,7 +179,12 @@ mod tests {
         let orig = "```py\nprint(1)\n```\n";
         let comp = "```py\nprint(2)\n```\n";
         let errors = validate(orig, comp);
-        assert!(errors.iter().any(|e| e.contains("Code blocks not preserved")), "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("Code blocks not preserved")),
+            "{errors:?}"
+        );
     }
 
     #[test]
@@ -172,7 +192,10 @@ mod tests {
         let orig = "see https://x.com for details";
         let comp = "see the docs for details";
         let errors = validate(orig, comp);
-        assert!(errors.iter().any(|e| e.contains("URL mismatch")), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("URL mismatch")),
+            "{errors:?}"
+        );
     }
 
     #[test]
@@ -180,7 +203,10 @@ mod tests {
         let orig = "run `cargo test` to check";
         let comp = "run the tests to check";
         let errors = validate(orig, comp);
-        assert!(errors.iter().any(|e| e.contains("Inline code lost")), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("Inline code lost")),
+            "{errors:?}"
+        );
     }
 
     #[test]

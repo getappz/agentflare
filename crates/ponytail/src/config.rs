@@ -3,21 +3,33 @@ use std::path::PathBuf;
 
 pub const DEFAULT_MODE: &str = "full";
 pub const VALID_MODES: &[&str] = &[
-    "off", "lite", "full", "ultra", "review", "audit", "debt", "gain", "help", "playbook",
+    "off",
+    "lite",
+    "full",
+    "ultra",
+    "review",
+    "audit",
+    "debt",
+    "gain",
+    "help",
+    "playbook",
     "no-hallucination",
 ];
 pub const RUNTIME_MODES: &[&str] = &["off", "lite", "full", "ultra"];
 
+#[must_use]
 pub fn normalize_mode(mode: &str) -> Option<&'static str> {
     let m = mode.trim().to_lowercase();
     RUNTIME_MODES.iter().find(|&&v| v == m).copied()
 }
 
+#[must_use]
 pub fn normalize_config_mode(mode: &str) -> Option<&'static str> {
     let m = mode.trim().to_lowercase();
     VALID_MODES.iter().find(|&&v| v == m).copied()
 }
 
+#[must_use]
 pub fn normalize_persisted_mode(mode: &str) -> Option<&'static str> {
     normalize_mode(mode).or_else(|| normalize_config_mode(mode))
 }
@@ -56,6 +68,7 @@ fn claude_dir() -> PathBuf {
 /// Scans `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`)
 /// for known compression/persona plugins so ponytail can add a
 /// deconfliction note instead of silently contradicting them.
+#[must_use]
 pub fn detect_compression_plugins() -> Vec<&'static str> {
     let Ok(raw) = std::fs::read_to_string(claude_dir().join("settings.json")) else {
         return Vec::new();
@@ -68,6 +81,7 @@ pub fn detect_compression_plugins() -> Vec<&'static str> {
         .collect()
 }
 
+#[must_use]
 pub fn is_deactivation(text: &str) -> bool {
     let t = text.trim().to_lowercase();
     let t = t.trim_end_matches(|c: char| c == '.' || c == '!' || c == '?' || c.is_whitespace());
@@ -77,7 +91,8 @@ pub fn is_deactivation(text: &str) -> bool {
 /// `dirs::config_dir()` resolves via the OS directly and ignores env-var
 /// overrides — same footgun `paths::home()` documents in the root crate
 /// (a "sandboxed" test run silently writing to the real ~/.config).
-/// PONYTAIL_CONFIG_DIR_OVERRIDE is this crate's own escape hatch for tests.
+/// `PONYTAIL_CONFIG_DIR_OVERRIDE` is this crate's own escape hatch for tests.
+#[must_use]
 pub fn config_dir() -> PathBuf {
     if let Ok(p) = std::env::var("PONYTAIL_CONFIG_DIR_OVERRIDE") {
         return PathBuf::from(p);
@@ -107,7 +122,9 @@ impl Drop for ConfigDirOverrideGuard {
 #[cfg(test)]
 #[allow(unsafe_code)]
 fn with_temp_config_dir<T>(f: impl FnOnce() -> T) -> T {
-    let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = std::env::temp_dir().join("ponytail-test-config-dir");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -119,6 +136,7 @@ fn with_temp_config_dir<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+#[must_use]
 pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
@@ -128,6 +146,7 @@ struct ConfigFile {
     default_mode: Option<String>,
 }
 
+#[must_use]
 pub fn default_mode() -> String {
     if let Ok(val) = std::env::var("PONYTAIL_DEFAULT_MODE")
         && let Some(m) = normalize_extended_mode(&val)
@@ -145,7 +164,8 @@ pub fn default_mode() -> String {
 }
 
 pub fn set_default_mode(mode: &str) -> Result<(), String> {
-    let normalized = normalize_extended_mode(mode).ok_or_else(|| format!("invalid mode: {mode}"))?;
+    let normalized =
+        normalize_extended_mode(mode).ok_or_else(|| format!("invalid mode: {mode}"))?;
     let dir = config_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut cfg: ConfigFile = std::fs::read_to_string(config_path())
@@ -180,7 +200,9 @@ mod tests {
 
     #[test]
     fn no_compression_plugins_when_settings_missing() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", "/nonexistent/ponytail-test-dir") };
         assert!(detect_compression_plugins().is_empty());
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
@@ -188,7 +210,9 @@ mod tests {
 
     #[test]
     fn detects_caveman_in_settings_json() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join("ponytail_test_compression_conflict");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("settings.json"), r#"{"plugins": ["caveman"]}"#).unwrap();

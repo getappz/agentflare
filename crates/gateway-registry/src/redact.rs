@@ -18,8 +18,9 @@ use std::sync::LazyLock;
 static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s'")]+"#).unwrap());
 static IPV4_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?\b").unwrap());
-static UNIX_PATH_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"/(?:home|Users|etc|var|tmp|opt|usr|root)(?:/[\w.\-]+)+").unwrap());
+static UNIX_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"/(?:home|Users|etc|var|tmp|opt|usr|root)(?:/[\w.\-]+)+").unwrap()
+});
 static WINDOWS_PATH_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z]:\\[\w.\\ \-]+").unwrap());
 static CREDENTIAL_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -40,7 +41,10 @@ pub fn redact_error_for_llm(error: &str) -> String {
     msg = UNIX_PATH_RE.replace_all(&msg, "[path]").to_string();
     msg = IPV4_RE.replace_all(&msg, "[addr]").to_string();
     msg = STACK_FRAME_RE.replace_all(&msg, "").to_string();
-    msg.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("\n")
+    msg.lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -70,7 +74,9 @@ mod tests {
 
     #[test]
     fn redacts_windows_paths() {
-        let result = redact_error_for_llm(r"spawn failed: C:\Users\shiva\.agentflare\gateway.toml not found");
+        let result = redact_error_for_llm(
+            r"spawn failed: C:\Users\shiva\.agentflare\gateway.toml not found",
+        );
         assert!(result.contains("[path]"), "{result}");
         assert!(!result.contains("shiva"), "{result}");
     }
@@ -95,7 +101,10 @@ mod tests {
     #[test]
     fn preserves_tool_names_and_validation_errors() {
         let result = redact_error_for_llm("field 'pattern' is required for tool 'find_symbols'");
-        assert_eq!(result, "field 'pattern' is required for tool 'find_symbols'");
+        assert_eq!(
+            result,
+            "field 'pattern' is required for tool 'find_symbols'"
+        );
     }
 
     #[test]

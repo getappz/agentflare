@@ -70,12 +70,25 @@ impl ClaimArgs {
                 // repository, so HEAD here would be misleading provenance.
                 let commit = if repo.is_none() { git_commit() } else { None };
                 let repo = require_repo(repo);
-                match crate::claims::acquire(&conn, &repo, &target, &owner, commit.as_deref(), now, ttl) {
+                match crate::claims::acquire(
+                    &conn,
+                    &repo,
+                    &target,
+                    &owner,
+                    commit.as_deref(),
+                    now,
+                    ttl,
+                ) {
                     Ok(crate::claims::Acquire::Acquired) => {
                         println!("claimed {repo} {target}  (owner {owner})");
                     }
-                    Ok(crate::claims::Acquire::Held { owner: holder, age_secs }) => {
-                        eprintln!("{repo} {target} already held by {holder} ({age_secs}s since heartbeat)");
+                    Ok(crate::claims::Acquire::Held {
+                        owner: holder,
+                        age_secs,
+                    }) => {
+                        eprintln!(
+                            "{repo} {target} already held by {holder} ({age_secs}s since heartbeat)"
+                        );
                         std::process::exit(1);
                     }
                     Err(e) => fail(e),
@@ -83,18 +96,44 @@ impl ClaimArgs {
             }
             ClaimAction::Heartbeat { target, repo } => {
                 let repo = require_repo(repo);
-                report(crate::claims::heartbeat(&conn, &repo, &target, &owner, now), "heartbeat", &repo, &target, &owner);
+                report(
+                    crate::claims::heartbeat(&conn, &repo, &target, &owner, now),
+                    "heartbeat",
+                    &repo,
+                    &target,
+                    &owner,
+                );
             }
             ClaimAction::Release { target, repo } => {
                 let repo = require_repo(repo);
-                report(crate::claims::release(&conn, &repo, &target, &owner), "released", &repo, &target, &owner);
+                report(
+                    crate::claims::release(&conn, &repo, &target, &owner),
+                    "released",
+                    &repo,
+                    &target,
+                    &owner,
+                );
             }
             ClaimAction::Done { target, repo } => {
                 let repo = require_repo(repo);
-                report(crate::claims::done(&conn, &repo, &target, &owner, now), "done", &repo, &target, &owner);
+                report(
+                    crate::claims::done(&conn, &repo, &target, &owner, now),
+                    "done",
+                    &repo,
+                    &target,
+                    &owner,
+                );
             }
-            ClaimAction::List { repo, all, all_repos } => {
-                let scope = if all_repos { None } else { Some(require_repo(repo)) };
+            ClaimAction::List {
+                repo,
+                all,
+                all_repos,
+            } => {
+                let scope = if all_repos {
+                    None
+                } else {
+                    Some(require_repo(repo))
+                };
                 match crate::claims::list(&conn, scope.as_deref(), all, now, ttl) {
                     Ok(claims) if claims.is_empty() => println!("no claims"),
                     Ok(claims) => {
@@ -130,7 +169,9 @@ fn report(res: rusqlite::Result<bool>, verb: &str, repo: &str, target: &str, own
 
 fn require_repo(explicit: Option<String>) -> String {
     crate::claims::resolve_repo(explicit).unwrap_or_else(|| {
-        eprintln!("claim: could not determine repo — run inside a git repo or pass --repo owner/name");
+        eprintln!(
+            "claim: could not determine repo — run inside a git repo or pass --repo owner/name"
+        );
         std::process::exit(1);
     })
 }

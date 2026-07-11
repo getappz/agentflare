@@ -11,7 +11,10 @@ async fn discover_lists_the_fixture_servers_echo_tool() {
     let fixture = support::start().await;
     let backend = McpHttpBackend::new(fixture.url.clone(), None);
     let tools = backend.discover().await.unwrap();
-    let echo = tools.iter().find(|t| t.name == "echo").expect("echo tool present");
+    let echo = tools
+        .iter()
+        .find(|t| t.name == "echo")
+        .expect("echo tool present");
     assert!(echo.description.contains("Echoes"));
 }
 

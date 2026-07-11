@@ -49,10 +49,15 @@ impl AgentsArgs {
             AgentsAction::Doctor { json } => crate::agents::cli_doctor(json),
             AgentsAction::Install { agent, dry_run } => crate::agents::cli_install(&agent, dry_run),
             AgentsAction::Update { agent, dry_run } => crate::agents::cli_update(&agent, dry_run),
-            AgentsAction::Uninstall { agent, dry_run } => crate::agents::cli_uninstall(&agent, dry_run),
-            AgentsAction::Launch { agent, model, mode, args } => {
-                crate::agents::cli_launch(&agent, model.as_deref(), mode.as_deref(), &args)
+            AgentsAction::Uninstall { agent, dry_run } => {
+                crate::agents::cli_uninstall(&agent, dry_run)
             }
+            AgentsAction::Launch {
+                agent,
+                model,
+                mode,
+                args,
+            } => crate::agents::cli_launch(&agent, model.as_deref(), mode.as_deref(), &args),
         }
     }
 }

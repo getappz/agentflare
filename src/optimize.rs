@@ -92,6 +92,7 @@ fn has_word_boundary_match(text: &str, keyword: &str) -> bool {
 
 /// Context available to every routing decision.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RouteContext {
     pub prompt: String,
     pub session_id: String,
@@ -172,7 +173,10 @@ pub fn active_router() -> Box<dyn Router> {
 /// compatibility with existing test assertions.
 pub fn model_routing_nudge(prompt: &str) -> Option<&'static str> {
     let lower = prompt.to_lowercase();
-    if LOCATE_KEYWORDS.iter().any(|kw| has_word_boundary_match(&lower, kw)) {
+    if LOCATE_KEYWORDS
+        .iter()
+        .any(|kw| has_word_boundary_match(&lower, kw))
+    {
         return Some(
             "This looks like a locate/investigate task — consider a cheap-model subagent (e.g. haiku) instead of running it inline.",
         );
@@ -235,7 +239,11 @@ mod tests {
             let mut state = RuntimeState::default();
             state.sessions.insert(
                 "sess-1".to_string(),
-                SessionRecord { start_ts: 1000, turn_count: 3, recent_tool_calls: vec![] },
+                SessionRecord {
+                    start_ts: 1000,
+                    turn_count: 3,
+                    recent_tool_calls: vec![],
+                },
             );
             save_runtime(&state);
             let loaded = load_runtime();
@@ -258,11 +266,19 @@ mod tests {
         let mut state = RuntimeState::default();
         state.sessions.insert(
             "old".to_string(),
-            SessionRecord { start_ts: 0, turn_count: 1, recent_tool_calls: vec![] },
+            SessionRecord {
+                start_ts: 0,
+                turn_count: 1,
+                recent_tool_calls: vec![],
+            },
         );
         state.sessions.insert(
             "recent".to_string(),
-            SessionRecord { start_ts: 100_000, turn_count: 1, recent_tool_calls: vec![] },
+            SessionRecord {
+                start_ts: 100_000,
+                turn_count: 1,
+                recent_tool_calls: vec![],
+            },
         );
         let now = 100_100; // 100s after "recent", ~27.7h after "old"
         prune_stale_sessions(&mut state, now);
@@ -272,19 +288,31 @@ mod tests {
 
     #[test]
     fn session_hygiene_no_nudge_below_thresholds() {
-        let record = SessionRecord { start_ts: 0, turn_count: 5, recent_tool_calls: vec![] };
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 5,
+            recent_tool_calls: vec![],
+        };
         assert!(session_hygiene_nudge(&record, 100).is_none());
     }
 
     #[test]
     fn session_hygiene_nudges_past_turn_threshold() {
-        let record = SessionRecord { start_ts: 0, turn_count: 81, recent_tool_calls: vec![] };
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 81,
+            recent_tool_calls: vec![],
+        };
         assert!(session_hygiene_nudge(&record, 100).is_some());
     }
 
     #[test]
     fn session_hygiene_nudges_past_time_threshold() {
-        let record = SessionRecord { start_ts: 0, turn_count: 1, recent_tool_calls: vec![] };
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 1,
+            recent_tool_calls: vec![],
+        };
         assert!(session_hygiene_nudge(&record, 2 * 60 * 60 + 1).is_some());
     }
 
@@ -325,8 +353,14 @@ mod tests {
     #[test]
     fn batching_flags_three_consecutive_solo_calls() {
         let recent = vec![
-            ToolCallRecord { name: "Read".to_string(), ts: 1 },
-            ToolCallRecord { name: "Read".to_string(), ts: 2 },
+            ToolCallRecord {
+                name: "Read".to_string(),
+                ts: 1,
+            },
+            ToolCallRecord {
+                name: "Read".to_string(),
+                ts: 2,
+            },
         ];
         assert!(batching_nudge(&recent, "Read").is_some());
     }
@@ -334,8 +368,14 @@ mod tests {
     #[test]
     fn batching_ignores_non_batchable_tool() {
         let recent = vec![
-            ToolCallRecord { name: "Write".to_string(), ts: 1 },
-            ToolCallRecord { name: "Write".to_string(), ts: 2 },
+            ToolCallRecord {
+                name: "Write".to_string(),
+                ts: 1,
+            },
+            ToolCallRecord {
+                name: "Write".to_string(),
+                ts: 2,
+            },
         ];
         assert!(batching_nudge(&recent, "Write").is_none());
     }
@@ -343,15 +383,24 @@ mod tests {
     #[test]
     fn batching_ignores_mixed_recent_calls() {
         let recent = vec![
-            ToolCallRecord { name: "Read".to_string(), ts: 1 },
-            ToolCallRecord { name: "Grep".to_string(), ts: 2 },
+            ToolCallRecord {
+                name: "Read".to_string(),
+                ts: 1,
+            },
+            ToolCallRecord {
+                name: "Grep".to_string(),
+                ts: 2,
+            },
         ];
         assert!(batching_nudge(&recent, "Read").is_none());
     }
 
     #[test]
     fn batching_ignores_short_history() {
-        let recent = vec![ToolCallRecord { name: "Read".to_string(), ts: 1 }];
+        let recent = vec![ToolCallRecord {
+            name: "Read".to_string(),
+            ts: 1,
+        }];
         assert!(batching_nudge(&recent, "Read").is_none());
     }
 
@@ -443,7 +492,11 @@ mod tests {
         // KeywordRouter is silent on prompts with no locate-style keywords.
         assert!(r.route(&ctx("refactor the payment module")).is_none());
         // ...but flags them, same as KeywordRouter directly.
-        assert!(router_by_name("nonsense").route(&ctx("find the auth handler")).is_some());
+        assert!(
+            router_by_name("nonsense")
+                .route(&ctx("find the auth handler"))
+                .is_some()
+        );
     }
 
     #[test]

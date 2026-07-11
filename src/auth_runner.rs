@@ -7,8 +7,13 @@ use std::thread;
 use std::time::Duration;
 
 const RATE_LIMIT_PATTERNS: &[&str] = &[
-    "429", "rate limit", "too many requests", "quota exceeded",
-    "usage limit", "billing limit", "try again",
+    "429",
+    "rate limit",
+    "too many requests",
+    "quota exceeded",
+    "usage limit",
+    "billing limit",
+    "try again",
 ];
 const MAX_RETRIES: usize = 5;
 
@@ -89,12 +94,10 @@ fn spawn_and_capture(agent: &str, args: &[String]) -> (i32, String) {
     thread::spawn(move || {
         let reader = BufReader::new(stderr_handle);
         let mut buf = String::new();
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                eprintln!("{l}");
-                buf.push_str(&l);
-                buf.push('\n');
-            }
+        for l in reader.lines().map_while(Result::ok) {
+            eprintln!("{l}");
+            buf.push_str(&l);
+            buf.push('\n');
         }
         tx.send(buf).ok();
     });
@@ -117,10 +120,7 @@ pub fn daemon_running(agent: &str) -> bool {
         "claude-code" => &["claude"][..],
         _ => return false,
     };
-    if let Ok(output) = std::process::Command::new("pgrep")
-        .args(names)
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("pgrep").args(names).output() {
         return !output.stdout.is_empty();
     }
     if let Ok(output) = std::process::Command::new("tasklist")
@@ -153,9 +153,7 @@ pub fn reload_daemon(agent: &str) -> Result<(), DaemonError> {
     }
     #[cfg(not(windows))]
     {
-        std::process::Command::new("pkill")
-            .args(names)
-            .output()?;
+        std::process::Command::new("pkill").args(names).output()?;
     }
     Ok(())
 }

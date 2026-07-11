@@ -82,10 +82,20 @@ pub fn load(conn: &Connection, name: &str, original: bool) -> Result<LoadedSkill
                     }
                 }
             }
-            Ok(LoadedSkill { name, source, path: body_path, compressed: use_shadow, body, siblings })
+            Ok(LoadedSkill {
+                name,
+                source,
+                path: body_path,
+                compressed: use_shadow,
+                body,
+                siblings,
+            })
         }
         _ => Err(LoadError::Ambiguous(
-            candidates.into_iter().map(|(n, s, ..)| format!("{s}:{n}")).collect(),
+            candidates
+                .into_iter()
+                .map(|(n, s, ..)| format!("{s}:{n}"))
+                .collect(),
         )),
     }
 }
@@ -102,14 +112,16 @@ pub const REFRESH_DEBOUNCE_SECS: u64 = 60;
 impl Registry {
     pub fn open_default(db_path: &Path) -> Result<Self, LoadError> {
         let conn = crate::db::open_db(db_path).map_err(|e| LoadError::Db(e.to_string()))?;
-        Ok(Registry { conn, last_refresh: std::time::Instant::now(), refreshed_once: false })
+        Ok(Registry {
+            conn,
+            last_refresh: std::time::Instant::now(),
+            refreshed_once: false,
+        })
     }
 
     /// Rescan sources when never scanned or debounce elapsed.
     pub fn ensure_fresh(&mut self) -> Result<(), LoadError> {
-        if self.refreshed_once
-            && self.last_refresh.elapsed().as_secs() < REFRESH_DEBOUNCE_SECS
-        {
+        if self.refreshed_once && self.last_refresh.elapsed().as_secs() < REFRESH_DEBOUNCE_SECS {
             return Ok(());
         }
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -117,20 +129,28 @@ impl Registry {
         // Detected agents: agent-registry's detect_all needs a version cache;
         // skill discovery only needs agent IDs, so pass an empty cache.
         let mut cache = std::collections::HashMap::new();
-        let detected: Vec<String> = agent_registry::detect_all(agent_registry::REGISTRY, &mut cache)
-            .into_iter()
-            .map(|d| d.id.to_lowercase())
-            .collect();
+        let detected: Vec<String> =
+            agent_registry::detect_all(agent_registry::REGISTRY, &mut cache)
+                .into_iter()
+                .map(|d| d.id.to_lowercase())
+                .collect();
         let sources = crate::sources::default_sources(&home, &cwd, &detected);
         let out = crate::sources::scan_sources(&sources);
-        crate::db::rebuild(&mut self.conn, &out.entries).map_err(|e| LoadError::Db(e.to_string()))?;
+        crate::db::rebuild(&mut self.conn, &out.entries)
+            .map_err(|e| LoadError::Db(e.to_string()))?;
         self.last_refresh = std::time::Instant::now();
         self.refreshed_once = true;
         Ok(())
     }
 
-    pub fn search(&self, query: &str, limit: usize, mode: MatchMode) -> Result<Vec<SkillHit>, LoadError> {
-        crate::search::search(&self.conn, query, limit, mode).map_err(|e| LoadError::Db(e.to_string()))
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        mode: MatchMode,
+    ) -> Result<Vec<SkillHit>, LoadError> {
+        crate::search::search(&self.conn, query, limit, mode)
+            .map_err(|e| LoadError::Db(e.to_string()))
     }
 
     /// Every distinct skill name currently indexed, regardless of source.
@@ -221,6 +241,9 @@ mod tests {
     #[test]
     fn unknown_name_is_not_found() {
         let (_tmp, conn) = seed_with_files();
-        assert!(matches!(load(&conn, "nope", false), Err(LoadError::NotFound(_))));
+        assert!(matches!(
+            load(&conn, "nope", false),
+            Err(LoadError::NotFound(_))
+        ));
     }
 }

@@ -10,10 +10,10 @@ const NONCE_SIZE: usize = 12;
 const ITERATIONS: u32 = 600_000;
 
 pub fn get_passphrase() -> Option<String> {
-    if let Ok(pw) = std::env::var("AGENTFLARE_VAULT_PASSPHRASE") {
-        if !pw.is_empty() {
-            return Some(pw);
-        }
+    if let Ok(pw) = std::env::var("AGENTFLARE_VAULT_PASSPHRASE")
+        && !pw.is_empty()
+    {
+        return Some(pw);
     }
     prompt_passphrase()
 }
@@ -25,7 +25,11 @@ fn prompt_passphrase() -> Option<String> {
     }
     let pw = rpassword::prompt_password("vault passphrase: ").unwrap_or_default();
     let trimmed = pw.trim().to_string();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn derive_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {

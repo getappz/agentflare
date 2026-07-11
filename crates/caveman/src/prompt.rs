@@ -23,10 +23,13 @@ const GENERIC_RULES: &str = "STRICT RULES:
 Only compress natural language.";
 
 impl Prompt {
+    #[must_use]
     pub fn build_compress_prompt(&self, body: &str) -> String {
         match self {
             Prompt::Generic => {
-                format!("Compress this markdown into caveman format.\n\n{GENERIC_RULES}\n\nTEXT:\n{body}")
+                format!(
+                    "Compress this markdown into caveman format.\n\n{GENERIC_RULES}\n\nTEXT:\n{body}"
+                )
             }
             Prompt::Custom(spec) => format!(
                 "Compress this markdown body per the spec below.\n\n{spec}\n\nReturn ONLY the compressed markdown body — no outer fence, no explanation.\n\nBODY:\n{body}"
@@ -34,8 +37,13 @@ impl Prompt {
         }
     }
 
+    #[must_use]
     pub fn build_fix_prompt(&self, original: &str, compressed: &str, errors: &[String]) -> String {
-        let errors_str = errors.iter().map(|e| format!("- {e}")).collect::<Vec<_>>().join("\n");
+        let errors_str = errors
+            .iter()
+            .map(|e| format!("- {e}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         format!(
             "You are fixing a compressed markdown file. Specific validation errors were found.\n\n\
 CRITICAL RULES:\n\

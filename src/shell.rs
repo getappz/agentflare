@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Shell {
     Bash,
     Zsh,
@@ -61,7 +62,7 @@ impl Shell {
                     .join("Documents")
                     .join("PowerShell")
                     .join("Microsoft.PowerShell_profile.ps1");
-                if ps7.parent().map_or(false, |p| p.exists()) {
+                if ps7.parent().is_some_and(|p| p.exists()) {
                     ps7
                 } else {
                     home.join("Documents")
@@ -157,7 +158,8 @@ mod tests {
 
     #[test]
     fn is_defined_in_profile_ignores_own_managed_block() {
-        let content = "# >>> agentflare alias >>>\nalias af='agentflare'\n# <<< agentflare alias <<<\n";
+        let content =
+            "# >>> agentflare alias >>>\nalias af='agentflare'\n# <<< agentflare alias <<<\n";
         assert!(!Shell::Bash.is_defined_in_profile(content, "af"));
     }
 
@@ -189,7 +191,8 @@ mod tests {
 
     #[test]
     fn strip_managed_blocks_preserves_content_outside() {
-        let content = "line1\n# >>> agentflare alias >>>\ninside\n# <<< agentflare alias <<<\nline2\n";
+        let content =
+            "line1\n# >>> agentflare alias >>>\ninside\n# <<< agentflare alias <<<\nline2\n";
         let stripped = strip_managed_blocks(content);
         assert!(stripped.contains("line1"));
         assert!(stripped.contains("line2"));

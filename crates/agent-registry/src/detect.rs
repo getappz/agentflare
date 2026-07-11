@@ -28,7 +28,7 @@ pub static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// the approach used by `agents-cli`'s `findInPath` and `caam`'s
 /// `findBinary`, minus their shims-dir exclusion (agentflare has no shims
 /// directory yet).
-#[must_use] 
+#[must_use]
 pub fn find_binary(names: &[&str]) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -58,7 +58,9 @@ mod find_binary_tests {
     // paths::test_support::GLOBAL_STATE_LOCK.
 
     fn with_temp_path_dir(f: impl FnOnce(&Path)) {
-        let _guard = super::PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = super::PATH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!("agentflare-test-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -66,17 +68,17 @@ mod find_binary_tests {
         unsafe {
             // SAFETY: PATH_LOCK mutex serializes all PATH mutations;
             // no other thread can read or write PATH concurrently.
-            std::env::set_var("PATH", &dir)
+            std::env::set_var("PATH", &dir);
         };
         f(&dir);
         match original {
             Some(p) => unsafe {
                 // SAFETY: PATH_LOCK mutex serializes all PATH mutations.
-                std::env::set_var("PATH", p)
+                std::env::set_var("PATH", p);
             },
             None => unsafe {
                 // SAFETY: PATH_LOCK mutex serializes all PATH mutations.
-                std::env::remove_var("PATH")
+                std::env::remove_var("PATH");
             },
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -111,7 +113,7 @@ mod find_binary_tests {
 /// Find the first `\d+\.\d+\.\d+`-shaped substring in `text` (a `--version`
 /// command's combined stdout+stderr). Hand-rolled instead of pulling in the
 /// `regex` crate for one pattern.
-#[must_use] 
+#[must_use]
 pub fn extract_version(text: &str) -> Option<String> {
     let chars: Vec<char> = text.chars().collect();
     for start in 0..chars.len() {
@@ -145,12 +147,18 @@ mod extract_version_tests {
 
     #[test]
     fn extracts_version_from_prefixed_output() {
-        assert_eq!(extract_version("claude-code/1.2.3"), Some("1.2.3".to_string()));
+        assert_eq!(
+            extract_version("claude-code/1.2.3"),
+            Some("1.2.3".to_string())
+        );
     }
 
     #[test]
     fn extracts_version_embedded_in_a_sentence() {
-        assert_eq!(extract_version("codex cli version 0.128.0 (build abc)"), Some("0.128.0".to_string()));
+        assert_eq!(
+            extract_version("codex cli version 0.128.0 (build abc)"),
+            Some("0.128.0".to_string())
+        );
     }
 
     #[test]
@@ -165,7 +173,10 @@ mod extract_version_tests {
 
     #[test]
     fn returns_first_match_when_multiple_numbers_present() {
-        assert_eq!(extract_version("built with node 20.11.0 for app 1.2.3"), Some("20.11.0".to_string()));
+        assert_eq!(
+            extract_version("built with node 20.11.0 for app 1.2.3"),
+            Some("20.11.0".to_string())
+        );
     }
 }
 
@@ -220,7 +231,10 @@ fn run_version_command(binary: &Path, args: &[&str]) -> Result<String, String> {
         Ok(Ok(text)) if !text.trim().is_empty() => Ok(text),
         Ok(Ok(_)) => Err(format!("{} produced no output", binary.display())),
         Ok(Err(e)) => Err(e),
-        Err(_) => Err(format!("{} timed out after {VERSION_TIMEOUT:?}", binary.display())),
+        Err(_) => Err(format!(
+            "{} timed out after {VERSION_TIMEOUT:?}",
+            binary.display()
+        )),
     }
 }
 
@@ -243,9 +257,11 @@ pub fn resolve_version_with(
     let binary_path_str = binary_path.to_string_lossy().into_owned();
 
     if let Some(entry) = cache.get(agent_key)
-        && entry.binary_path == binary_path_str && entry.mtime == mtime {
-            return Ok(entry.version.clone());
-        }
+        && entry.binary_path == binary_path_str
+        && entry.mtime == mtime
+    {
+        return Ok(entry.version.clone());
+    }
 
     let raw = runner.run(binary_path, version_args)?;
     let version = extract_version(&raw)
@@ -253,7 +269,11 @@ pub fn resolve_version_with(
 
     cache.insert(
         agent_key.to_string(),
-        VersionCacheEntry { binary_path: binary_path_str, mtime, version: version.clone() },
+        VersionCacheEntry {
+            binary_path: binary_path_str,
+            mtime,
+            version: version.clone(),
+        },
     );
     Ok(version)
 }
@@ -265,7 +285,13 @@ pub fn resolve_version(
     version_args: &[&str],
     cache: &mut HashMap<String, VersionCacheEntry>,
 ) -> Result<String, String> {
-    resolve_version_with(&RealVersionRunner, agent_key, binary_path, version_args, cache)
+    resolve_version_with(
+        &RealVersionRunner,
+        agent_key,
+        binary_path,
+        version_args,
+        cache,
+    )
 }
 
 #[cfg(test)]
@@ -286,7 +312,8 @@ mod resolve_version_tests {
     /// A real file on disk so `fs::metadata` succeeds — its content is
     /// irrelevant since `FakeRunner` never actually executes it.
     fn temp_binary_file(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("agentflare-test-resolve-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agentflare-test-resolve-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         let mut f = std::fs::File::create(&path).unwrap();
@@ -297,10 +324,13 @@ mod resolve_version_tests {
     #[test]
     fn cache_miss_spawns_and_caches_result() {
         let binary = temp_binary_file("agent-a");
-        let runner = FakeRunner { response: Ok("agent-a version 1.2.3".to_string()) };
+        let runner = FakeRunner {
+            response: Ok("agent-a version 1.2.3".to_string()),
+        };
         let mut cache = HashMap::new();
 
-        let version = resolve_version_with(&runner, "agent-a", &binary, &["--version"], &mut cache).unwrap();
+        let version =
+            resolve_version_with(&runner, "agent-a", &binary, &["--version"], &mut cache).unwrap();
 
         assert_eq!(version, "1.2.3");
         assert_eq!(cache.get("agent-a").unwrap().version, "1.2.3");
@@ -309,8 +339,13 @@ mod resolve_version_tests {
     #[test]
     fn cache_hit_does_not_call_runner_again() {
         let binary = temp_binary_file("agent-b");
-        let mtime = std::fs::metadata(&binary).unwrap().modified().unwrap()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mtime = std::fs::metadata(&binary)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let mut cache = HashMap::new();
         cache.insert(
             "agent-b".to_string(),
@@ -328,7 +363,9 @@ mod resolve_version_tests {
             }
         }
 
-        let version = resolve_version_with(&PanicRunner, "agent-b", &binary, &["--version"], &mut cache).unwrap();
+        let version =
+            resolve_version_with(&PanicRunner, "agent-b", &binary, &["--version"], &mut cache)
+                .unwrap();
         assert_eq!(version, "9.9.9");
     }
 
@@ -344,28 +381,38 @@ mod resolve_version_tests {
                 version: "0.0.0".to_string(),
             },
         );
-        let runner = FakeRunner { response: Ok("2.0.0".to_string()) };
+        let runner = FakeRunner {
+            response: Ok("2.0.0".to_string()),
+        };
 
-        let version = resolve_version_with(&runner, "agent-c", &binary, &["--version"], &mut cache).unwrap();
+        let version =
+            resolve_version_with(&runner, "agent-c", &binary, &["--version"], &mut cache).unwrap();
         assert_eq!(version, "2.0.0");
     }
 
     #[test]
     fn failed_resolution_is_not_persisted_to_cache() {
         let binary = temp_binary_file("agent-d");
-        let runner = FakeRunner { response: Err("boom".to_string()) };
+        let runner = FakeRunner {
+            response: Err("boom".to_string()),
+        };
         let mut cache = HashMap::new();
 
         let result = resolve_version_with(&runner, "agent-d", &binary, &["--version"], &mut cache);
 
         assert!(result.is_err());
-        assert!(!cache.contains_key("agent-d"), "a failed resolution must not be cached");
+        assert!(
+            !cache.contains_key("agent-d"),
+            "a failed resolution must not be cached"
+        );
     }
 
     #[test]
     fn unparseable_success_output_is_not_persisted_to_cache() {
         let binary = temp_binary_file("agent-e");
-        let runner = FakeRunner { response: Ok("no version information here".to_string()) };
+        let runner = FakeRunner {
+            response: Ok("no version information here".to_string()),
+        };
         let mut cache = HashMap::new();
 
         let result = resolve_version_with(&runner, "agent-e", &binary, &["--version"], &mut cache);
@@ -382,7 +429,9 @@ mod resolve_version_tests {
         // Take the shared PATH_LOCK so this can't run concurrently with a
         // find_binary_tests/detect_all_tests test that has repointed PATH
         // to a temp-only directory — this test needs the real PATH intact.
-        let _guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PATH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The one real-spawn test: `rustc` is guaranteed on PATH inside any
         // `cargo test` invocation, so this is portable without a stub binary.
         let output = run_version_command(Path::new("rustc"), &["--version"]).unwrap();
@@ -466,25 +515,28 @@ mod detect_all_tests {
     }
 
     fn with_temp_path_dir(f: impl FnOnce(&Path)) {
-        let _guard = super::PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("agentflare-test-detect-all-{}", std::process::id()));
+        let _guard = super::PATH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir =
+            std::env::temp_dir().join(format!("agentflare-test-detect-all-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let original = std::env::var_os("PATH");
         unsafe {
             // SAFETY: PATH_LOCK mutex serializes all PATH mutations;
             // no other thread can read or write PATH concurrently.
-            std::env::set_var("PATH", &dir)
+            std::env::set_var("PATH", &dir);
         };
         f(&dir);
         match original {
             Some(p) => unsafe {
                 // SAFETY: PATH_LOCK mutex serializes all PATH mutations.
-                std::env::set_var("PATH", p)
+                std::env::set_var("PATH", p);
             },
             None => unsafe {
                 // SAFETY: PATH_LOCK mutex serializes all PATH mutations.
-                std::env::remove_var("PATH")
+                std::env::remove_var("PATH");
             },
         }
         let _ = std::fs::remove_dir_all(&dir);

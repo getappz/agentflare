@@ -18,15 +18,24 @@ fn fixture_path() -> String {
 #[tokio::test]
 async fn call_echo_returns_the_downstream_result() {
     let backend = McpStdioBackend::new(fixture_path(), vec![], HashMap::new());
-    let result = backend.call("echo", serde_json::json!({"text": "hi"})).await.unwrap();
-    let text = result.get(0).and_then(|c| c.get("text")).and_then(|t| t.as_str());
+    let result = backend
+        .call("echo", serde_json::json!({"text": "hi"}))
+        .await
+        .unwrap();
+    let text = result
+        .get(0)
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str());
     assert_eq!(text, Some("echo: hi"));
 }
 
 #[tokio::test]
 async fn call_unknown_tool_surfaces_as_upstream_error() {
     let backend = McpStdioBackend::new(fixture_path(), vec![], HashMap::new());
-    let err = backend.call("does_not_exist", serde_json::json!({})).await.unwrap_err();
+    let err = backend
+        .call("does_not_exist", serde_json::json!({}))
+        .await
+        .unwrap_err();
     assert!(matches!(err, GatewayError::Upstream(_)));
 }
 
@@ -38,6 +47,12 @@ async fn call_with_non_object_args_is_invalid_argument_not_upstream() {
     // (which `gateway_execute` maps to `invalid_params`), not `Upstream`
     // (which maps to `internal_error`).
     let backend = McpStdioBackend::new(fixture_path(), vec![], HashMap::new());
-    let err = backend.call("echo", serde_json::json!("not an object")).await.unwrap_err();
-    assert!(matches!(err, GatewayError::InvalidArgument(_)), "expected InvalidArgument, got {err:?}");
+    let err = backend
+        .call("echo", serde_json::json!("not an object"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, GatewayError::InvalidArgument(_)),
+        "expected InvalidArgument, got {err:?}"
+    );
 }

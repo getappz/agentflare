@@ -19,9 +19,9 @@ fn all_skill_names() -> Vec<String> {
         "playbook",
         "no-hallucination",
     ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    .iter()
+    .map(std::string::ToString::to_string)
+    .collect();
     names.extend(sub_skills::custom_skill_names());
     names
 }
@@ -29,12 +29,13 @@ fn all_skill_names() -> Vec<String> {
 fn all_mode_names() -> Vec<String> {
     let mut names: Vec<String> = ["lite", "full", "ultra"]
         .iter()
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
     names.extend(all_skill_names());
     names
 }
 
+#[must_use]
 pub fn detect(input: &str) -> Option<SwitchAction> {
     let prompt = input.trim().to_lowercase();
 
@@ -122,7 +123,9 @@ mod tests {
 
     #[test]
     fn detects_default() {
-        assert!(matches!(detect("/ponytail default ultra"), Some(SwitchAction::SetDefault(m)) if m == "ultra"));
+        assert!(
+            matches!(detect("/ponytail default ultra"), Some(SwitchAction::SetDefault(m)) if m == "ultra")
+        );
     }
 
     #[test]
@@ -133,38 +136,53 @@ mod tests {
 
     #[test]
     fn detects_sub_skill_review() {
-        assert!(matches!(detect("/ponytail-review"), Some(SwitchAction::SetMode(m)) if m == "review"));
+        assert!(
+            matches!(detect("/ponytail-review"), Some(SwitchAction::SetMode(m)) if m == "review")
+        );
     }
 
     #[test]
     fn detects_sub_skill_audit() {
-        assert!(matches!(detect("/ponytail-audit"), Some(SwitchAction::SetMode(m)) if m == "audit"));
+        assert!(
+            matches!(detect("/ponytail-audit"), Some(SwitchAction::SetMode(m)) if m == "audit")
+        );
     }
 
     #[test]
     fn detects_sub_skill_inline() {
-        assert!(matches!(detect("/ponytail review"), Some(SwitchAction::SetMode(m)) if m == "review"));
+        assert!(
+            matches!(detect("/ponytail review"), Some(SwitchAction::SetMode(m)) if m == "review")
+        );
     }
 
     #[test]
     fn detects_sub_skill_playbook() {
-        assert!(matches!(detect("/ponytail-playbook"), Some(SwitchAction::SetMode(m)) if m == "playbook"));
+        assert!(
+            matches!(detect("/ponytail-playbook"), Some(SwitchAction::SetMode(m)) if m == "playbook")
+        );
     }
 
     #[test]
     fn detects_sub_skill_no_hallucination() {
-        assert!(matches!(detect("/ponytail-no-hallucination"), Some(SwitchAction::SetMode(m)) if m == "no-hallucination"));
+        assert!(
+            matches!(detect("/ponytail-no-hallucination"), Some(SwitchAction::SetMode(m)) if m == "no-hallucination")
+        );
     }
 
     #[test]
     fn detects_session_mode() {
-        assert!(matches!(detect("/ponytail session ultra"), Some(SwitchAction::SetSession(m)) if m == "ultra"));
+        assert!(
+            matches!(detect("/ponytail session ultra"), Some(SwitchAction::SetSession(m)) if m == "ultra")
+        );
         assert!(detect("/ponytail session").is_none());
     }
 
     #[test]
     fn detects_status() {
-        assert!(matches!(detect("/ponytail status"), Some(SwitchAction::Report)));
+        assert!(matches!(
+            detect("/ponytail status"),
+            Some(SwitchAction::Report)
+        ));
     }
 
     #[test]
@@ -174,7 +192,9 @@ mod tests {
 
     #[test]
     fn detects_mode_shortcut() {
-        assert!(matches!(detect("/ponytail-ultra"), Some(SwitchAction::SetMode(m)) if m == "ultra"));
+        assert!(
+            matches!(detect("/ponytail-ultra"), Some(SwitchAction::SetMode(m)) if m == "ultra")
+        );
         assert!(matches!(detect("/ponytail-lite"), Some(SwitchAction::SetMode(m)) if m == "lite"));
     }
 }

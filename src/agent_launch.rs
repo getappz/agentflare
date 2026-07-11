@@ -2,7 +2,7 @@
 // Finds the agent binary on PATH, maps --model/--mode to agent-native
 // flags, and executes with pass-through args and inherited stdio.
 use agent_registry::detect::find_binary;
-use agent_registry::{headless_args, Agent, AgentSpec, Tier};
+use agent_registry::{Agent, AgentSpec, Tier, headless_args};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -61,7 +61,11 @@ pub fn run_launch_env(
 
     // `mise exec -- <binary> …` runs the agent inside mise's environment, so its
     // tool paths are on PATH for the agent and its child shells.
-    let mise = if via_mise { crate::mise_install::mise_bin() } else { None };
+    let mise = if via_mise {
+        crate::mise_install::mise_bin()
+    } else {
+        None
+    };
     let mut cmd = match &mise {
         Some(m) => {
             let mut c = Command::new(m);
@@ -93,10 +97,7 @@ pub fn run_launch_env(
             let code = s.code().unwrap_or(-1);
             std::process::exit(code);
         }
-        Err(e) => LaunchOutcome::NotFound(format!(
-            "failed to launch {}: {e}",
-            binary.display()
-        )),
+        Err(e) => LaunchOutcome::NotFound(format!("failed to launch {}: {e}", binary.display())),
     }
 }
 
@@ -318,9 +319,8 @@ mod tests {
     fn launch_not_on_path_errors() {
         let reg = test_registry();
         // "aider" unlikely to be on a test PATH
-        match run_launch(&reg, "aider", None, None, &[]) {
-            LaunchOutcome::NotFound(msg) => assert!(msg.contains("not found on PATH")),
-            _ => {}
+        if let LaunchOutcome::NotFound(msg) = run_launch(&reg, "aider", None, None, &[]) {
+            assert!(msg.contains("not found on PATH"))
         }
     }
 
@@ -347,7 +347,10 @@ mod tests {
         assert!(out.timed_out, "should report timeout");
         assert!(!out.success, "a killed child is not a success");
         // Must return promptly, not wait out the full 5s sleep.
-        assert!(start.elapsed() < std::time::Duration::from_secs(2), "did not kill promptly");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "did not kill promptly"
+        );
     }
 
     // Proves the fix for the "descendant outlives the direct child" hang: the
@@ -400,17 +403,28 @@ mod tests {
         let binary = std::path::Path::new("/usr/bin/claude");
         assert_eq!(
             headless_argv(Agent::ClaudeCode, binary, "hi there"),
-            Some(vec!["/usr/bin/claude".to_string(), "-p".to_string(), "hi there".to_string()])
+            Some(vec![
+                "/usr/bin/claude".to_string(),
+                "-p".to_string(),
+                "hi there".to_string()
+            ])
         );
         assert_eq!(
             headless_argv(Agent::Codex, std::path::Path::new("/x/codex"), "do it"),
-            Some(vec!["/x/codex".to_string(), "exec".to_string(), "do it".to_string()])
+            Some(vec![
+                "/x/codex".to_string(),
+                "exec".to_string(),
+                "do it".to_string()
+            ])
         );
     }
 
     #[test]
     fn headless_argv_none_without_print_mode() {
-        assert_eq!(headless_argv(Agent::Aider, std::path::Path::new("/x/aider"), "p"), None);
+        assert_eq!(
+            headless_argv(Agent::Aider, std::path::Path::new("/x/aider"), "p"),
+            None
+        );
     }
 
     #[test]

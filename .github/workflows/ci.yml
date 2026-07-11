@@ -68,3 +68,87 @@ jobs:
         run: cargo build --workspace --verbose
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
         run: cargo test --workspace --verbose
+
+  clippy:
+    needs: changes
+    if: always()
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+      - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+      - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 # zizmor: ignore[cache-poisoning] save-if already gates writes to master
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      # The root [lints.rust] unsafe_code and sub-crate [lints.clippy]
+      # pedantic overrides are deliberately warn-only, not deny — exempt both
+      # groups here so this gate doesn't silently escalate that policy.
+      - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings -A unsafe_code -A clippy::pedantic
+
+  fmt:
+    needs: changes
+    if: always()
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+      - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt
+      - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
+        run: cargo fmt --check
+
+  deny:
+    # No paths filter, same rationale as security-check.yml's audit job: a
+    # path-filtered required check never reports on PRs that skip it,
+    # blocking the merge forever. cargo-deny is cheap enough to run always.
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: EmbarkStudios/cargo-deny-action@5bb39ff5d5a0e94dc9e2dc94eced0c6129743a57 # v2
+        with:
+          manifest-path: Cargo.toml
+
+  # Single aggregating gate. Point branch protection at THIS job instead of
+  # every leg above — stays correct when jobs are added/removed and can't be
+  # bypassed by a silently-missing required check.
+  ci-green:
+    name: CI Green
+    if: always()
+    needs:
+      - build
+      - clippy
+      - fmt
+      - deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify no required job failed
+        shell: bash
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS_JSON"
+          python3 - <<'PY'
+          import json, os, sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          blocked = {k: v["result"] for k, v in needs.items()
+                     if v["result"] in ("failure", "cancelled")}
+          if blocked:
+              print("Required CI jobs did not pass:", blocked)
+              sys.exit(1)
+          print("All required CI jobs passed (success or skipped).")
+          PY

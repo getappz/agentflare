@@ -52,15 +52,23 @@ pub enum ConfigError {
          (got auth_ref={auth_ref:?}, auth_env={auth_env:?}) — a lone auth_ref silently \
          injects no credentials at runtime, so this is rejected at parse time instead"
     )]
-    IncompleteAuthConfig { server: String, auth_ref: Option<String>, auth_env: Option<String> },
+    IncompleteAuthConfig {
+        server: String,
+        auth_ref: Option<String>,
+        auth_env: Option<String>,
+    },
 }
 
 pub fn parse(toml_str: &str) -> Result<GatewayConfig, ConfigError> {
     let cfg: GatewayConfig = toml::from_str(toml_str)?;
     for (name, server) in &cfg.servers {
         let (auth_ref, auth_env) = match server {
-            ServerConfig::McpStdio { auth_ref, auth_env, .. } => (auth_ref, auth_env),
-            ServerConfig::McpHttp { auth_ref, auth_env, .. } => (auth_ref, auth_env),
+            ServerConfig::McpStdio {
+                auth_ref, auth_env, ..
+            } => (auth_ref, auth_env),
+            ServerConfig::McpHttp {
+                auth_ref, auth_env, ..
+            } => (auth_ref, auth_env),
         };
         if auth_ref.is_some() != auth_env.is_some() {
             return Err(ConfigError::IncompleteAuthConfig {
@@ -90,8 +98,12 @@ mod tests {
             "#,
         )
         .unwrap();
-        let ServerConfig::McpStdio { command, args, auth_ref, auth_env } =
-            cfg.servers.get("narsil").unwrap()
+        let ServerConfig::McpStdio {
+            command,
+            args,
+            auth_ref,
+            auth_env,
+        } = cfg.servers.get("narsil").unwrap()
         else {
             panic!("expected McpStdio");
         };
@@ -118,7 +130,9 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(matches!(err, ConfigError::IncompleteAuthConfig { server, .. } if server == "narsil"));
+        assert!(
+            matches!(err, ConfigError::IncompleteAuthConfig { server, .. } if server == "narsil")
+        );
     }
 
     #[test]
@@ -132,7 +146,9 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(matches!(err, ConfigError::IncompleteAuthConfig { server, .. } if server == "narsil"));
+        assert!(
+            matches!(err, ConfigError::IncompleteAuthConfig { server, .. } if server == "narsil")
+        );
     }
 
     #[test]
@@ -145,8 +161,12 @@ mod tests {
             "#,
         )
         .unwrap();
-        let ServerConfig::McpStdio { args, auth_ref, auth_env, .. } =
-            cfg.servers.get("bare").unwrap()
+        let ServerConfig::McpStdio {
+            args,
+            auth_ref,
+            auth_env,
+            ..
+        } = cfg.servers.get("bare").unwrap()
         else {
             panic!("expected McpStdio");
         };
@@ -168,8 +188,12 @@ mod tests {
             "#,
         )
         .unwrap();
-        let ServerConfig::McpHttp { url, auth_ref, auth_env, auth_header } =
-            cfg.servers.get("narsil").unwrap()
+        let ServerConfig::McpHttp {
+            url,
+            auth_ref,
+            auth_env,
+            auth_header,
+        } = cfg.servers.get("narsil").unwrap()
         else {
             panic!("expected McpHttp");
         };
@@ -189,8 +213,12 @@ mod tests {
             "#,
         )
         .unwrap();
-        let ServerConfig::McpHttp { auth_ref, auth_env, auth_header, .. } =
-            cfg.servers.get("bare").unwrap()
+        let ServerConfig::McpHttp {
+            auth_ref,
+            auth_env,
+            auth_header,
+            ..
+        } = cfg.servers.get("bare").unwrap()
         else {
             panic!("expected McpHttp");
         };
@@ -210,6 +238,8 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(matches!(err, ConfigError::IncompleteAuthConfig { server, .. } if server == "narsil"));
+        assert!(
+            matches!(err, ConfigError::IncompleteAuthConfig { server, .. } if server == "narsil")
+        );
     }
 }

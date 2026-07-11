@@ -10,13 +10,34 @@ use rmcp::model::{
 };
 
 const SUB_SKILLS: &[(&str, &str)] = &[
-    ("review", "Over-engineering review of the current diff/branch/repo"),
-    ("audit", "Whole-repo over-engineering audit: ranked list of what to delete"),
-    ("debt", "Harvest `ponytail:` shortcut comments into a tracked ledger"),
-    ("gain", "Measured-impact scoreboard: less code, less cost, more speed"),
-    ("help", "Quick-reference card for all ponytail modes, skills, and commands"),
-    ("playbook", "TDD-aware project companion — red-green-refactor enforced"),
-    ("no-hallucination", "Reality-check layer: blocks invented APIs, deprecated methods, undeclared variables"),
+    (
+        "review",
+        "Over-engineering review of the current diff/branch/repo",
+    ),
+    (
+        "audit",
+        "Whole-repo over-engineering audit: ranked list of what to delete",
+    ),
+    (
+        "debt",
+        "Harvest `ponytail:` shortcut comments into a tracked ledger",
+    ),
+    (
+        "gain",
+        "Measured-impact scoreboard: less code, less cost, more speed",
+    ),
+    (
+        "help",
+        "Quick-reference card for all ponytail modes, skills, and commands",
+    ),
+    (
+        "playbook",
+        "TDD-aware project companion — red-green-refactor enforced",
+    ),
+    (
+        "no-hallucination",
+        "Reality-check layer: blocks invented APIs, deprecated methods, undeclared variables",
+    ),
 ];
 
 pub fn list_prompts() -> Vec<Prompt> {
@@ -71,7 +92,10 @@ pub fn get_prompt(
 }
 
 fn assistant_text(msg: impl Into<String>) -> GetPromptResult {
-    GetPromptResult::new(vec![PromptMessage::new_text(PromptMessageRole::Assistant, msg)])
+    GetPromptResult::new(vec![PromptMessage::new_text(
+        PromptMessageRole::Assistant,
+        msg,
+    )])
 }
 
 fn get_ponytail_mode(request: &GetPromptRequestParams) -> GetPromptResult {
@@ -146,10 +170,7 @@ fn get_artifact_command(request: &GetPromptRequestParams) -> GetPromptResult {
     ))
 }
 
-fn get_handoff_command(
-    request: &GetPromptRequestParams,
-    agent: Option<&str>,
-) -> GetPromptResult {
+fn get_handoff_command(request: &GetPromptRequestParams, agent: Option<&str>) -> GetPromptResult {
     // Identity comes from AGENTFLARE_AGENT baked into the MCP entry by
     // `agentflare init --agent <name>`; claude-code is the legacy default.
     let me = agent.unwrap_or("claude-code");
@@ -277,7 +298,10 @@ mod tests {
         let params = GetPromptRequestParams::new("artifact").with_arguments(args);
         let result = get_prompt(&params, None).unwrap();
         let text = format!("{:?}", result.messages[0].content);
-        assert!(text.contains("publish --type markdown --favicon 🚀"), "{text}");
+        assert!(
+            text.contains("publish --type markdown --favicon 🚀"),
+            "{text}"
+        );
         assert!(text.contains("artifact_publish"), "{text}");
         assert!(text.contains("artifact_delete"), "{text}");
     }

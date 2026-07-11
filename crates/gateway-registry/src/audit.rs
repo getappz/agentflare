@@ -32,13 +32,23 @@ pub fn record(path: &Path, server: &str, tool: &str, args: &Value, outcome: Resu
             "outcome": "err", "error_kind": error_kind,
         }),
     };
-    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         Ok(mut f) => {
             if let Err(e) = writeln!(f, "{line}") {
-                eprintln!("gateway-registry: failed to write audit log entry to {}: {e}", path.display());
+                eprintln!(
+                    "gateway-registry: failed to write audit log entry to {}: {e}",
+                    path.display()
+                );
             }
         }
-        Err(e) => eprintln!("gateway-registry: failed to open audit log {}: {e}", path.display()),
+        Err(e) => eprintln!(
+            "gateway-registry: failed to open audit log {}: {e}",
+            path.display()
+        ),
     }
 }
 

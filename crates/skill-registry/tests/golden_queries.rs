@@ -3,18 +3,36 @@
 //! below 85%, the v2 embeddings feature is justified.
 
 use agentflare_skill_registry::db::{open_in_memory, rebuild};
-use agentflare_skill_registry::search::{search, MatchMode};
-use agentflare_skill_registry::sources::{scan_sources, Source, SourceKind};
+use agentflare_skill_registry::search::{MatchMode, search};
+use agentflare_skill_registry::sources::{Source, SourceKind, scan_sources};
 use std::fs;
 use std::path::Path;
 
 const FIXTURES: &[(&str, &str)] = &[
-    ("live", "Use when the user asks about running sessions, agent status, what needs attention — e.g. 'what's running', 'live status', 'anything stuck'"),
-    ("cv-usage", "Use when the user asks about usage analytics, statistics, token usage, or cost summary — e.g. 'usage stats', 'how many sessions this week', 'cost report'"),
-    ("win-cleanup", "Use when the user asks to free disk space, clean up the Windows system, says disk is full, or wants a disk usage report"),
-    ("code-review", "Review the current diff for correctness bugs and reuse, simplification, efficiency cleanups"),
-    ("deep-research", "Deep research harness — fan-out web searches, fetch sources, verify claims, synthesize a cited report"),
-    ("short-skill", "Use when the user wants a compressed shorthand version of an installed skill, complains a skill is bloated, verbose, or token-heavy"),
+    (
+        "live",
+        "Use when the user asks about running sessions, agent status, what needs attention — e.g. 'what's running', 'live status', 'anything stuck'",
+    ),
+    (
+        "cv-usage",
+        "Use when the user asks about usage analytics, statistics, token usage, or cost summary — e.g. 'usage stats', 'how many sessions this week', 'cost report'",
+    ),
+    (
+        "win-cleanup",
+        "Use when the user asks to free disk space, clean up the Windows system, says disk is full, or wants a disk usage report",
+    ),
+    (
+        "code-review",
+        "Review the current diff for correctness bugs and reuse, simplification, efficiency cleanups",
+    ),
+    (
+        "deep-research",
+        "Deep research harness — fan-out web searches, fetch sources, verify claims, synthesize a cited report",
+    ),
+    (
+        "short-skill",
+        "Use when the user wants a compressed shorthand version of an installed skill, complains a skill is bloated, verbose, or token-heavy",
+    ),
 ];
 
 const GOLDEN: &[(&str, &str)] = &[
@@ -75,11 +93,21 @@ fn golden_queries_hit_at_3_is_at_least_85_percent() {
         if r.iter().any(|h| h.name == *expected) {
             hits += 1;
         } else {
-            misses.push(format!("{query:?} -> wanted {expected}, got {:?}",
-                r.iter().map(|h| h.name.clone()).collect::<Vec<_>>()));
+            misses.push(format!(
+                "{query:?} -> wanted {expected}, got {:?}",
+                r.iter().map(|h| h.name.clone()).collect::<Vec<_>>()
+            ));
         }
     }
     let rate = hits as f64 / GOLDEN.len() as f64;
-    println!("hit@3 = {rate:.2} ({} / {} queries matched)", hits, GOLDEN.len());
-    assert!(rate >= 0.85, "hit@3 {rate:.2} below gate; misses:\n{}", misses.join("\n"));
+    println!(
+        "hit@3 = {rate:.2} ({} / {} queries matched)",
+        hits,
+        GOLDEN.len()
+    );
+    assert!(
+        rate >= 0.85,
+        "hit@3 {rate:.2} below gate; misses:\n{}",
+        misses.join("\n")
+    );
 }

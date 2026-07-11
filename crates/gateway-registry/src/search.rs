@@ -91,7 +91,7 @@ pub fn search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{open_in_memory, rebuild, ServerTools};
+    use crate::db::{ServerTools, open_in_memory, rebuild};
     use crate::types::ToolEntry;
 
     fn seed() -> Connection {
@@ -149,7 +149,13 @@ mod tests {
     #[test]
     fn fts_operators_in_query_are_neutralized() {
         let conn = seed();
-        for q in ["symbol\" OR \"x", "NEAR(a b)", "issues*", "(references)", "col:val"] {
+        for q in [
+            "symbol\" OR \"x",
+            "NEAR(a b)",
+            "issues*",
+            "(references)",
+            "col:val",
+        ] {
             search(&conn, q, 5, MatchMode::Any).unwrap();
         }
     }

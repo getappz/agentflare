@@ -74,16 +74,18 @@ fn run_secret(action: GatewaySecretAction) {
                 std::process::exit(1);
             }
         },
-        GatewaySecretAction::Remove { name } => match crate::gateway_secrets::remove_secret(&conn, &name) {
-            Ok(true) => println!("removed secret '{name}'"),
-            Ok(false) => {
-                eprintln!("no secret named '{name}'");
-                std::process::exit(1);
+        GatewaySecretAction::Remove { name } => {
+            match crate::gateway_secrets::remove_secret(&conn, &name) {
+                Ok(true) => println!("removed secret '{name}'"),
+                Ok(false) => {
+                    eprintln!("no secret named '{name}'");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("failed to remove secret: {e}");
+                    std::process::exit(1);
+                }
             }
-            Err(e) => {
-                eprintln!("failed to remove secret: {e}");
-                std::process::exit(1);
-            }
-        },
+        }
     }
 }

@@ -4,7 +4,7 @@
 //! transaction (same pattern as `crates/skill-registry/src/db.rs`).
 
 use crate::types::ToolEntry;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 
 const SCHEMA: &str = "
@@ -94,7 +94,11 @@ pub fn server_tools(conn: &Connection, server: &str) -> rusqlite::Result<Vec<Too
         let schema_json: String = r.get(2)?;
         let input_schema: serde_json::Value =
             serde_json::from_str(&schema_json).unwrap_or(serde_json::Value::Null);
-        Ok(ToolEntry { name: r.get(0)?, description: r.get(1)?, input_schema })
+        Ok(ToolEntry {
+            name: r.get(0)?,
+            description: r.get(1)?,
+            input_schema,
+        })
     })?;
     rows.collect()
 }
@@ -118,28 +122,46 @@ mod tests {
             &mut conn,
             &[ServerTools {
                 server: "narsil".into(),
-                tools: vec![entry("find_symbols", "alpha desc"), entry("references", "beta desc")],
+                tools: vec![
+                    entry("find_symbols", "alpha desc"),
+                    entry("references", "beta desc"),
+                ],
             }],
         )
         .unwrap();
-        let n: i64 = conn.query_row("SELECT count(*) FROM tools", [], |r| r.get(0)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM tools", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 2);
         rebuild(
             &mut conn,
-            &[ServerTools { server: "narsil".into(), tools: vec![entry("gamma", "gamma desc")] }],
+            &[ServerTools {
+                server: "narsil".into(),
+                tools: vec![entry("gamma", "gamma desc")],
+            }],
         )
         .unwrap();
-        let n: i64 = conn.query_row("SELECT count(*) FROM tools", [], |r| r.get(0)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM tools", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1);
-        let f: i64 = conn.query_row("SELECT count(*) FROM tools_fts", [], |r| r.get(0)).unwrap();
+        let f: i64 = conn
+            .query_row("SELECT count(*) FROM tools_fts", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(f, 1);
     }
 
     #[test]
     fn fts_rowids_match_tools_rowids() {
         let mut conn = open_in_memory().unwrap();
-        rebuild(&mut conn, &[ServerTools { server: "s".into(), tools: vec![entry("a", "alpha")] }])
-            .unwrap();
+        rebuild(
+            &mut conn,
+            &[ServerTools {
+                server: "s".into(),
+                tools: vec![entry("a", "alpha")],
+            }],
+        )
+        .unwrap();
         let pair: (i64, i64) = conn
             .query_row(
                 "SELECT t.rowid, f.rowid FROM tools t, tools_fts f WHERE f.name = t.name",
@@ -156,8 +178,14 @@ mod tests {
         rebuild(
             &mut conn,
             &[
-                ServerTools { server: "a".into(), tools: vec![entry("x", "")] },
-                ServerTools { server: "b".into(), tools: vec![entry("y", "")] },
+                ServerTools {
+                    server: "a".into(),
+                    tools: vec![entry("x", "")],
+                },
+                ServerTools {
+                    server: "b".into(),
+                    tools: vec![entry("y", "")],
+                },
             ],
         )
         .unwrap();
@@ -176,7 +204,10 @@ mod tests {
                     server: "a".into(),
                     tools: vec![entry("x", "desc-x")],
                 },
-                ServerTools { server: "b".into(), tools: vec![entry("y", "desc-y")] },
+                ServerTools {
+                    server: "b".into(),
+                    tools: vec![entry("y", "desc-y")],
+                },
             ],
         )
         .unwrap();
@@ -184,7 +215,10 @@ mod tests {
         assert_eq!(a_tools.len(), 1);
         assert_eq!(a_tools[0].name, "x");
         assert_eq!(a_tools[0].description, "desc-x");
-        assert_eq!(a_tools[0].input_schema, serde_json::json!({"type": "object"}));
+        assert_eq!(
+            a_tools[0].input_schema,
+            serde_json::json!({"type": "object"})
+        );
         assert!(server_tools(&conn, "missing").unwrap().is_empty());
     }
 
@@ -192,7 +226,9 @@ mod tests {
     fn open_db_sets_wal_journal_mode() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = open_db(&tmp.path().join("gateway.db")).unwrap();
-        let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(mode, "wal");
     }
 }

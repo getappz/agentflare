@@ -222,7 +222,10 @@ pub(crate) fn aggregate(
             }
 
             let key = match group_by {
-                GroupBy::Model => parsed.model.clone().unwrap_or_else(|| "unknown".to_string()),
+                GroupBy::Model => parsed
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
                 GroupBy::Project => project.clone(),
             };
             let cost = calculate_cost(&parsed.tokens, parsed.model.as_deref(), pricing);
@@ -241,7 +244,11 @@ pub fn run(days: Option<u32>, by_project: bool) {
     let today = Local::now().date_naive();
     let window = days.unwrap_or(1).max(1);
     let start = today - chrono::Duration::days(window as i64 - 1);
-    let group_by = if by_project { GroupBy::Project } else { GroupBy::Model };
+    let group_by = if by_project {
+        GroupBy::Project
+    } else {
+        GroupBy::Model
+    };
 
     let mut conn = crate::rollup::open_or_rebuild();
     crate::rollup::sync(&mut conn, &claude_projects_dir());
@@ -271,7 +278,12 @@ pub fn run(days: Option<u32>, by_project: bool) {
     // Model names always fit in 32 chars, so this floor keeps the no-flags/
     // by-model output byte-identical; project directory names can be much
     // longer, so the column widens to fit them instead of going ragged.
-    let key_width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(32).max(32);
+    let key_width = rows
+        .iter()
+        .map(|(k, _)| k.len())
+        .max()
+        .unwrap_or(32)
+        .max(32);
 
     let mut total_cost = 0.0;
     let mut total_tokens = TokenUsage::default();
@@ -342,7 +354,10 @@ mod tests {
         let mut seen = HashSet::new();
         let make = |input: u64| LineUsage {
             model: None,
-            tokens: TokenUsage { input_tokens: input, ..Default::default() },
+            tokens: TokenUsage {
+                input_tokens: input,
+                ..Default::default()
+            },
             message_id: Some("msg_1".to_string()),
             request_id: Some("req_1".to_string()),
             date: None,
@@ -357,7 +372,10 @@ mod tests {
         let mut seen = HashSet::new();
         let line = LineUsage {
             model: None,
-            tokens: TokenUsage { input_tokens: 5, ..Default::default() },
+            tokens: TokenUsage {
+                input_tokens: 5,
+                ..Default::default()
+            },
             message_id: None,
             request_id: None,
             date: None,
@@ -390,16 +408,10 @@ mod tests {
         let yesterday_ts = "2026-07-05T10:00:00Z";
 
         let content = format!(
-            "{}\n{}\n{}\n",
-            format!(
-                r#"{{"type":"assistant","timestamp":"{today_ts}","message":{{"id":"m1","model":"claude-opus-4-8","usage":{{"input_tokens":100,"output_tokens":50}}}},"requestId":"r1"}}"#
-            ),
-            format!(
-                r#"{{"type":"assistant","timestamp":"{today_ts}","message":{{"id":"m2","model":"claude-opus-4-8","usage":{{"input_tokens":20,"output_tokens":10}}}},"requestId":"r2"}}"#
-            ),
-            format!(
-                r#"{{"type":"assistant","timestamp":"{yesterday_ts}","message":{{"id":"m3","model":"claude-opus-4-8","usage":{{"input_tokens":999,"output_tokens":999}}}},"requestId":"r3"}}"#
-            ),
+            r#"{{"type":"assistant","timestamp":"{today_ts}","message":{{"id":"m1","model":"claude-opus-4-8","usage":{{"input_tokens":100,"output_tokens":50}}}},"requestId":"r1"}}
+{{"type":"assistant","timestamp":"{today_ts}","message":{{"id":"m2","model":"claude-opus-4-8","usage":{{"input_tokens":20,"output_tokens":10}}}},"requestId":"r2"}}
+{{"type":"assistant","timestamp":"{yesterday_ts}","message":{{"id":"m3","model":"claude-opus-4-8","usage":{{"input_tokens":999,"output_tokens":999}}}},"requestId":"r3"}}
+"#
         );
         std::fs::write(project_dir.join("session1.jsonl"), content).unwrap();
 
@@ -409,7 +421,10 @@ mod tests {
         let pricing = load_pricing();
         let totals = aggregate(&files, (today, today), GroupBy::Model, &pricing);
         let opus = totals.get("claude-opus-4-8").expect("expected opus entry");
-        assert_eq!(opus.tokens.input_tokens, 120, "yesterday's tokens must be excluded when range is today-only");
+        assert_eq!(
+            opus.tokens.input_tokens, 120,
+            "yesterday's tokens must be excluded when range is today-only"
+        );
         assert_eq!(opus.tokens.output_tokens, 60);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -439,8 +454,13 @@ mod tests {
 
         let pricing = load_pricing();
         let totals = aggregate(&files, range, GroupBy::Model, &pricing);
-        let opus = totals.get("claude-opus-4-8").expect("expected opus entry from within range");
-        assert_eq!(opus.tokens.input_tokens, 100, "the 2026-07-03 line is outside the 3-day window and must be excluded");
+        let opus = totals
+            .get("claude-opus-4-8")
+            .expect("expected opus entry from within range");
+        assert_eq!(
+            opus.tokens.input_tokens, 100,
+            "the 2026-07-03 line is outside the 3-day window and must be excluded"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -465,9 +485,26 @@ mod tests {
 
         let pricing = load_pricing();
         let totals = aggregate(&files, (today, today), GroupBy::Project, &pricing);
-        assert_eq!(totals.get("proj-a").expect("expected proj-a entry").tokens.input_tokens, 100);
-        assert_eq!(totals.get("proj-b").expect("expected proj-b entry").tokens.input_tokens, 10);
-        assert!(totals.get("claude-opus-4-8").is_none(), "grouping by project must not key by model name");
+        assert_eq!(
+            totals
+                .get("proj-a")
+                .expect("expected proj-a entry")
+                .tokens
+                .input_tokens,
+            100
+        );
+        assert_eq!(
+            totals
+                .get("proj-b")
+                .expect("expected proj-b entry")
+                .tokens
+                .input_tokens,
+            10
+        );
+        assert!(
+            !totals.contains_key("claude-opus-4-8"),
+            "grouping by project must not key by model name"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -483,14 +520,21 @@ mod tests {
 
         let opus_line = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":0}},"requestId":"r1"}"#;
         let haiku_line = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00Z","message":{"id":"m2","model":"claude-haiku-4-5","usage":{"input_tokens":1000,"output_tokens":0}},"requestId":"r2"}"#;
-        std::fs::write(project_dir.join("session1.jsonl"), format!("{opus_line}\n{haiku_line}\n")).unwrap();
+        std::fs::write(
+            project_dir.join("session1.jsonl"),
+            format!("{opus_line}\n{haiku_line}\n"),
+        )
+        .unwrap();
 
         let files = find_session_files_under(&dir);
         let today = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
         let pricing = load_pricing();
 
         let by_project = aggregate(&files, (today, today), GroupBy::Project, &pricing);
-        let project_cost = by_project.get("proj-mixed").expect("expected proj-mixed entry").cost_usd;
+        let project_cost = by_project
+            .get("proj-mixed")
+            .expect("expected proj-mixed entry")
+            .cost_usd;
 
         let by_model = aggregate(&files, (today, today), GroupBy::Model, &pricing);
         let expected_total: f64 = by_model.values().map(|g| g.cost_usd).sum();
@@ -499,7 +543,10 @@ mod tests {
             (project_cost - expected_total).abs() < 0.000_001,
             "project-grouped cost ({project_cost}) must equal the sum of correctly-priced per-model costs ({expected_total}), not a single blended/unpriced rate"
         );
-        assert!(project_cost > 0.0, "opus and haiku are both known, priced models — cost must be nonzero");
+        assert!(
+            project_cost > 0.0,
+            "opus and haiku are both known, priced models — cost must be nonzero"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -525,7 +572,11 @@ mod tests {
         let line_2 = format!(
             r#"{{"type":"assistant","timestamp":"2026-07-06T10:00:00Z","message":{{"id":"m2","model":"{MODEL}","usage":{{"input_tokens":150000,"output_tokens":0}}}},"requestId":"r2"}}"#
         );
-        std::fs::write(project_dir.join("session1.jsonl"), format!("{line_1}\n{line_2}\n")).unwrap();
+        std::fs::write(
+            project_dir.join("session1.jsonl"),
+            format!("{line_1}\n{line_2}\n"),
+        )
+        .unwrap();
 
         let files = find_session_files_under(&dir);
         let today = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
@@ -536,7 +587,10 @@ mod tests {
 
         // Hypothetical: what the cost WOULD be if both lines' tokens were
         // summed first and priced once as a single 300,000-token call.
-        let combined_tokens = crate::pricing::TokenUsage { input_tokens: 300_000, ..Default::default() };
+        let combined_tokens = crate::pricing::TokenUsage {
+            input_tokens: 300_000,
+            ..Default::default()
+        };
         let combined_cost =
             crate::pricing::calculate_cost(&combined_tokens, Some(MODEL), &pricing).total_usd;
 

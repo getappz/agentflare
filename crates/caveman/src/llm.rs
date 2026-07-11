@@ -1,4 +1,4 @@
-//! LLM invocation: raw HTTP to the Anthropic API when ANTHROPIC_API_KEY is
+//! LLM invocation: raw HTTP to the Anthropic API when `ANTHROPIC_API_KEY` is
 //! set, else shell out to `claude --print` (handles desktop/OAuth auth).
 //! Every I/O boundary here is explicit UTF-8 — unlike the ported Python
 //! version, which only pinned UTF-8 on this subprocess path and left plain
@@ -36,11 +36,12 @@ fn call_via_api(api_key: &str, prompt: &str) -> Result<String, CavemanError> {
         .set("x-api-key", api_key)
         .set("anthropic-version", "2023-06-01")
         .set("content-type", "application/json")
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .send_json(body)
         .map_err(|e| CavemanError::Llm(format!("API call failed: {e}")))?;
-    let json: serde_json::Value =
-        resp.into_json().map_err(|e| CavemanError::Llm(format!("bad API response: {e}")))?;
+    let json: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| CavemanError::Llm(format!("bad API response: {e}")))?;
     json["content"][0]["text"]
         .as_str()
         .map(|s| s.trim().to_string())
@@ -48,9 +49,8 @@ fn call_via_api(api_key: &str, prompt: &str) -> Result<String, CavemanError> {
 }
 
 fn call_via_cli(prompt: &str) -> Result<String, CavemanError> {
-    let claude_bin = which::which("claude")
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "claude".to_string());
+    let claude_bin =
+        which::which("claude").map_or_else(|_| "claude".to_string(), |p| p.display().to_string());
     let mut child = Command::new(&claude_bin)
         .arg("--print")
         .stdin(Stdio::piped())
@@ -68,10 +68,11 @@ fn call_via_cli(prompt: &str) -> Result<String, CavemanError> {
     let output = child
         .wait_with_output()
         .map_err(|e| CavemanError::Llm(format!("'{claude_bin}' failed: {e}")))?;
-    let write_result = writer
-        .join()
-        .map_err(|_| CavemanError::Llm(format!("stdin writer thread for '{claude_bin}' panicked")))?;
-    write_result.map_err(|e| CavemanError::Llm(format!("write to '{claude_bin}' stdin failed: {e}")))?;
+    let write_result = writer.join().map_err(|_| {
+        CavemanError::Llm(format!("stdin writer thread for '{claude_bin}' panicked"))
+    })?;
+    write_result
+        .map_err(|e| CavemanError::Llm(format!("write to '{claude_bin}' stdin failed: {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(CavemanError::Llm(format!("Claude call failed:\n{stderr}")));
@@ -88,7 +89,12 @@ pub struct FakeLlm {
 impl FakeLlm {
     pub fn queue(responses: &[&str]) -> Self {
         Self {
-            responses: std::cell::RefCell::new(responses.iter().map(|s| s.to_string()).collect()),
+            responses: std::cell::RefCell::new(
+                responses
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect(),
+            ),
         }
     }
 }

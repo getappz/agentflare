@@ -42,13 +42,15 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     for (i, row) in dp.iter_mut().enumerate().take(la + 1) {
         row[0] = i;
     }
-    for j in 0..=lb {
-        dp[0][j] = j;
+    for (j, cell) in dp[0].iter_mut().enumerate() {
+        *cell = j;
     }
     for i in 1..=la {
         for j in 1..=lb {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            dp[i][j] = (dp[i - 1][j] + 1).min(dp[i][j - 1] + 1).min(dp[i - 1][j - 1] + cost);
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
         }
     }
     dp[la][lb]
@@ -82,7 +84,10 @@ mod tests {
     #[test]
     fn suggest_picks_closest_within_threshold() {
         let candidates = vec!["find_symbols".to_string(), "list_issues".to_string()];
-        assert_eq!(suggest("find_symbls", &candidates), Some("find_symbols".to_string()));
+        assert_eq!(
+            suggest("find_symbls", &candidates),
+            Some("find_symbols".to_string())
+        );
     }
 
     #[test]

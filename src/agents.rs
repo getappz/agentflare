@@ -1,11 +1,11 @@
 // CLI rendering for `agentflare agents list` / `agentflare agents doctor`.
 // Kept separate from agent_detect.rs so the detection engine stays free of
 // println!/format concerns and is fully unit-testable in isolation.
-use agent_registry::detect::{self, DetectedAgent, VersionRunner};
 use crate::agent_install::{self, Outcome};
 use crate::agent_launch::{self, LaunchOutcome};
-use agent_registry::{self, AgentSpec};
 use crate::state;
+use agent_registry::detect::{self, DetectedAgent, VersionRunner};
+use agent_registry::{self, AgentSpec};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -56,12 +56,7 @@ fn render_table(agents: &[DetectedAgent]) {
         .unwrap_or(0)
         .max(c1.len());
 
-    println!(
-        "  {}  {}  {}",
-        pad(c0, max_agent),
-        pad(c1, max_version),
-        c2
-    );
+    println!("  {}  {}  {}", pad(c0, max_agent), pad(c1, max_version), c2);
     for a in agents {
         println!(
             "  {}  {}  {}",
@@ -123,13 +118,10 @@ pub fn run_doctor(
     } else {
         render_table(&agents);
         for a in &agents {
-            if a.status == "unknown" {
-                if let Some(ref err) = a.error {
-                    println!(
-                        "  {}: {} — {}",
-                        a.display_name, a.binary_path, err
-                    );
-                }
+            if a.status == "unknown"
+                && let Some(ref err) = a.error
+            {
+                println!("  {}: {} — {}", a.display_name, a.binary_path, err);
             }
         }
     }
@@ -193,11 +185,21 @@ pub fn cli_launch(agent: &str, model: Option<&str>, mode: Option<&str>, args: &[
 /// `agentflare run <agent>` — launch through mise (so its tools are on PATH) with
 /// wrangler-style `.dev.vars`[.<stage>] env vars injected. Reports what it
 /// injects on stderr so it doesn't pollute the agent's stdout.
-pub fn cli_run(agent: &str, stage: Option<&str>, model: Option<&str>, mode: Option<&str>, args: &[String]) {
+pub fn cli_run(
+    agent: &str,
+    stage: Option<&str>,
+    model: Option<&str>,
+    mode: Option<&str>,
+    args: &[String],
+) {
     let cwd = std::env::current_dir().unwrap_or_default();
     let env = match crate::dev_vars::load(&cwd, stage) {
         Some((path, vars)) => {
-            eprintln!("agentflare run: injecting {} var(s) from {}", vars.len(), path.display());
+            eprintln!(
+                "agentflare run: injecting {} var(s) from {}",
+                vars.len(),
+                path.display()
+            );
             vars
         }
         None => {
@@ -207,7 +209,15 @@ pub fn cli_run(agent: &str, stage: Option<&str>, model: Option<&str>, mode: Opti
             Vec::new()
         }
     };
-    match agent_launch::run_launch_env(agent_registry::REGISTRY, agent, model, mode, args, &env, true) {
+    match agent_launch::run_launch_env(
+        agent_registry::REGISTRY,
+        agent,
+        model,
+        mode,
+        args,
+        &env,
+        true,
+    ) {
         LaunchOutcome::Launched => {}
         LaunchOutcome::NotFound(msg) => eprintln!("error: {msg}"),
         LaunchOutcome::UnknownAgent(msg) => eprintln!("error: unknown agent: {msg}"),
@@ -251,9 +261,11 @@ mod tests {
     }
 
     fn with_temp_path_dir(f: impl FnOnce(&Path)) {
-        let _guard = agent_registry::detect::PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir()
-            .join(format!("agentflare-test-agents-cli-{}", std::process::id()));
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("agentflare-test-agents-cli-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let original = std::env::var_os("PATH");
@@ -297,12 +309,10 @@ mod tests {
             };
             let mut cache = HashMap::new();
 
-            let detected = detect::detect_all_with(
-                &test_registry(),
-                &mut cache,
-                &runner,
-            );
-            let output = ListOutput { agents: to_rows(&detected) };
+            let detected = detect::detect_all_with(&test_registry(), &mut cache, &runner);
+            let output = ListOutput {
+                agents: to_rows(&detected),
+            };
             let json = serde_json::to_string_pretty(&output).unwrap();
             assert!(json.contains("\"agent\": \"test-agent\""));
             assert!(json.contains("\"version\": \"1.2.3\""));
@@ -330,12 +340,10 @@ mod tests {
                 package_manager: None,
                 package_name: None,
             }];
-            let detected = detect::detect_all_with(
-                &registry,
-                &mut cache,
-                &runner,
-            );
-            let output = ListOutput { agents: to_rows(&detected) };
+            let detected = detect::detect_all_with(&registry, &mut cache, &runner);
+            let output = ListOutput {
+                agents: to_rows(&detected),
+            };
             let json = serde_json::to_string_pretty(&output).unwrap();
             assert!(json.contains("\"status\": \"unknown\""));
             assert!(json.contains("\"error\""));
@@ -406,12 +414,10 @@ mod tests {
                 package_manager: None,
                 package_name: None,
             }];
-            let detected = detect::detect_all_with(
-                &registry,
-                &mut cache,
-                &runner,
-            );
-            let output = ListOutput { agents: to_rows(&detected) };
+            let detected = detect::detect_all_with(&registry, &mut cache, &runner);
+            let output = ListOutput {
+                agents: to_rows(&detected),
+            };
             let json = serde_json::to_string_pretty(&output).unwrap();
             assert!(json.contains("\"agent\": \"dr-agent\""));
             assert!(json.contains("\"version\": \"7.8.9\""));

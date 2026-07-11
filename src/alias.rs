@@ -94,30 +94,28 @@ pub fn run(
 
     let existing_content = std::fs::read_to_string(&profile).ok();
 
-    if !force {
-        if let Some(ref content) = existing_content {
-            if let Some(existing_alias) = read_managed_block_alias(content) {
-                if existing_alias == shell.alias_line(preferred, "agentflare") {
-                    if !json && !print_only {
-                        println!(
-                            "alias '{preferred}' already installed in {}",
-                            profile.display()
-                        );
-                    }
-                    if json {
-                        emit_json(JsonOutput {
-                            requested: preferred.to_string(),
-                            installed: preferred.to_string(),
-                            status: Status::AlreadyInstalled.as_str(),
-                            profile: profile.to_string_lossy().into_owned(),
-                            snippet: None,
-                            error: None,
-                        });
-                    }
-                    return;
-                }
-            }
+    if !force
+        && let Some(ref content) = existing_content
+        && let Some(existing_alias) = read_managed_block_alias(content)
+        && existing_alias == shell.alias_line(preferred, "agentflare")
+    {
+        if !json && !print_only {
+            println!(
+                "alias '{preferred}' already installed in {}",
+                profile.display()
+            );
         }
+        if json {
+            emit_json(JsonOutput {
+                requested: preferred.to_string(),
+                installed: preferred.to_string(),
+                status: Status::AlreadyInstalled.as_str(),
+                profile: profile.to_string_lossy().into_owned(),
+                snippet: None,
+                error: None,
+            });
+        }
+        return;
     }
 
     let name = resolve_name(preferred, force, shell, existing_content.as_deref());
@@ -254,8 +252,7 @@ fn resolve_name(
 
     for name in candidates {
         let on_path = agent_registry::detect::find_binary(&[name]).is_some();
-        let in_profile =
-            profile_content.map_or(false, |c| shell.is_defined_in_profile(c, name));
+        let in_profile = profile_content.is_some_and(|c| shell.is_defined_in_profile(c, name));
         if !on_path && !in_profile {
             return name.to_string();
         }
@@ -287,17 +284,16 @@ fn write_managed_block(
     let content = existing.unwrap_or("");
     let new_block = format!("{BLOCK_START}\n{alias_line}\n{BLOCK_END}\n");
 
-    if let Some(start) = content.find(BLOCK_START) {
-        if let Some(end_rel) = content[start..].find(BLOCK_END) {
-            let mut end = start + end_rel + BLOCK_END.len();
-            if content[end..].starts_with('\n') {
-                end += 1;
-            }
-            let new_content =
-                content[..start].to_string() + &new_block + &content[end..];
-            std::fs::write(profile, new_content)?;
-            return Ok(());
+    if let Some(start) = content.find(BLOCK_START)
+        && let Some(end_rel) = content[start..].find(BLOCK_END)
+    {
+        let mut end = start + end_rel + BLOCK_END.len();
+        if content[end..].starts_with('\n') {
+            end += 1;
         }
+        let new_content = content[..start].to_string() + &new_block + &content[end..];
+        std::fs::write(profile, new_content)?;
+        return Ok(());
     }
 
     let mut new_content = content.to_string();
@@ -316,7 +312,8 @@ mod tests {
     static ALIAS_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn temp_profile(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("agentflare-test-alias-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agentflare-test-alias-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
@@ -346,7 +343,8 @@ mod tests {
 
     #[test]
     fn read_managed_block_alias_finds_content() {
-        let content = "# >>> agentflare alias >>>\nalias af='agentflare'\n# <<< agentflare alias <<<\n";
+        let content =
+            "# >>> agentflare alias >>>\nalias af='agentflare'\n# <<< agentflare alias <<<\n";
         assert_eq!(
             read_managed_block_alias(content),
             Some("alias af='agentflare'".to_string())
@@ -397,7 +395,8 @@ mod tests {
     fn write_managed_block_idempotent() {
         let _guard = ALIAS_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let profile = temp_profile("test_idempotent.sh");
-        let original = "# >>> agentflare alias >>>\nalias af='agentflare'\n# <<< agentflare alias <<<\n";
+        let original =
+            "# >>> agentflare alias >>>\nalias af='agentflare'\n# <<< agentflare alias <<<\n";
         std::fs::write(&profile, original).unwrap();
 
         write_managed_block(

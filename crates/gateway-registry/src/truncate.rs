@@ -54,23 +54,29 @@ fn build_envelope(json: &str, cut: usize) -> Value {
 /// `gateway_execute` (`src/mcp_server.rs`), which serializes the capped
 /// value with `serde_json::to_string_pretty` before returning it.
 fn envelope_len(envelope: &Value) -> usize {
-    serde_json::to_string_pretty(envelope).map(|s| s.len()).unwrap_or(usize::MAX)
+    serde_json::to_string_pretty(envelope)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
 }
 
 fn find_safe_cut_point(json: &str, max_pos: usize) -> usize {
     let limit = floor_char_boundary(json, max_pos);
     let region = &json[..limit];
-    if let Some(pos) = region.rfind('\n') {
-        if pos > limit / 2 {
-            return pos;
-        }
+    if let Some(pos) = region.rfind('\n')
+        && pos > limit / 2
+    {
+        return pos;
     }
-    if let Some(pos) = region.rfind(',') {
-        if pos > limit / 2 {
-            return pos + 1;
-        }
+    if let Some(pos) = region.rfind(',')
+        && pos > limit / 2
+    {
+        return pos + 1;
     }
-    region.char_indices().last().map(|(i, c)| i + c.len_utf8()).unwrap_or(0)
+    region
+        .char_indices()
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0)
 }
 
 fn floor_char_boundary(s: &str, max: usize) -> usize {

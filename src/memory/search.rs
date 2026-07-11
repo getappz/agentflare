@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use super::observations::Observation;
 
@@ -52,7 +52,8 @@ pub fn search(
          ORDER BY o.created_at DESC
          LIMIT ?2";
     let mut like_stmt = conn.prepare(like_sql)?;
-    let like_rows = like_stmt.query_map(params![like_pat, limit, project, r#type], map_search_row)?;
+    let like_rows =
+        like_stmt.query_map(params![like_pat, limit, project, r#type], map_search_row)?;
     like_rows.collect()
 }
 
@@ -122,8 +123,30 @@ mod tests {
     #[test]
     fn project_scoped_search_returns_only_matching_project() {
         let conn = new_db();
-        observations::save(&conn, None, "note", "widget rollout", "shipping the widget rollout", None, Some("proj-a"), None, None).unwrap();
-        observations::save(&conn, None, "note", "widget outage", "widget rollout caused an outage", None, Some("proj-b"), None, None).unwrap();
+        observations::save(
+            &conn,
+            None,
+            "note",
+            "widget rollout",
+            "shipping the widget rollout",
+            None,
+            Some("proj-a"),
+            None,
+            None,
+        )
+        .unwrap();
+        observations::save(
+            &conn,
+            None,
+            "note",
+            "widget outage",
+            "widget rollout caused an outage",
+            None,
+            Some("proj-b"),
+            None,
+            None,
+        )
+        .unwrap();
 
         let results = search(&conn, "widget", Some("proj-a"), None, 10).unwrap();
         assert_eq!(results.len(), 1);
@@ -153,9 +176,31 @@ mod tests {
         // matching row entirely depending on rank order — the filter must
         // be applied in SQL before LIMIT to reliably surface it.
         for i in 0..5 {
-            observations::save(&conn, None, "bugfix", &format!("bug {i}"), "marker filler content", None, Some("proj-a"), None, None).unwrap();
+            observations::save(
+                &conn,
+                None,
+                "bugfix",
+                &format!("bug {i}"),
+                "marker filler content",
+                None,
+                Some("proj-a"),
+                None,
+                None,
+            )
+            .unwrap();
         }
-        observations::save(&conn, None, "decision", "the decision", "marker decided content", None, Some("proj-a"), None, None).unwrap();
+        observations::save(
+            &conn,
+            None,
+            "decision",
+            "the decision",
+            "marker decided content",
+            None,
+            Some("proj-a"),
+            None,
+            None,
+        )
+        .unwrap();
 
         let results = search(&conn, "marker", Some("proj-a"), Some("decision"), 3).unwrap();
         assert_eq!(results.len(), 1);

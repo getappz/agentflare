@@ -114,12 +114,20 @@ fn parse_pre_tool_use(input: &str) -> Option<PreToolUseInput> {
         .get("tool_input")
         .and_then(|ti| ti.get("delaySeconds"))
         .and_then(|d| d.as_u64());
-    Some(PreToolUseInput { session_id, tool_name, delay_seconds })
+    Some(PreToolUseInput {
+        session_id,
+        tool_name,
+        delay_seconds,
+    })
 }
 
 pub fn pre_tool_use(_agent: &str) {
-    let Some(input) = read_stdin_or_skip("PreToolUse") else { return };
-    let Some(parsed) = parse_pre_tool_use(&input) else { return };
+    let Some(input) = read_stdin_or_skip("PreToolUse") else {
+        return;
+    };
+    let Some(parsed) = parse_pre_tool_use(&input) else {
+        return;
+    };
 
     let mut runtime = crate::optimize::load_runtime();
     let now = std::time::SystemTime::now()
@@ -139,22 +147,25 @@ pub fn pre_tool_use(_agent: &str) {
 
     let mut nudges: Vec<String> = vec![];
 
-    if let Some(nudge) = crate::optimize::batching_nudge(&record.recent_tool_calls, &parsed.tool_name) {
+    if let Some(nudge) =
+        crate::optimize::batching_nudge(&record.recent_tool_calls, &parsed.tool_name)
+    {
         nudges.push(nudge);
     }
 
-    if parsed.tool_name == "ScheduleWakeup" {
-        if let Some(delay) = parsed.delay_seconds {
-            if let Some(nudge) = crate::optimize::schedule_wakeup_nudge(delay) {
-                nudges.push(nudge.to_string());
-            }
-        }
+    if parsed.tool_name == "ScheduleWakeup"
+        && let Some(delay) = parsed.delay_seconds
+        && let Some(nudge) = crate::optimize::schedule_wakeup_nudge(delay)
+    {
+        nudges.push(nudge.to_string());
     }
 
-    record.recent_tool_calls.push(crate::optimize::ToolCallRecord {
-        name: parsed.tool_name.clone(),
-        ts: now,
-    });
+    record
+        .recent_tool_calls
+        .push(crate::optimize::ToolCallRecord {
+            name: parsed.tool_name.clone(),
+            ts: now,
+        });
     if record.recent_tool_calls.len() > 10 {
         record.recent_tool_calls.remove(0);
     }
@@ -176,13 +187,19 @@ pub fn pre_tool_use(_agent: &str) {
 pub fn session_end(_agent: &str) {}
 
 pub fn prompt_submit(agent: &str) {
-    let Some(input) = read_stdin_or_skip("UserPromptSubmit") else { return };
+    let Some(input) = read_stdin_or_skip("UserPromptSubmit") else {
+        return;
+    };
     let prompt = extract_prompt(&input);
     let prompt = prompt.trim();
 
     let session_id: Option<String> = serde_json::from_str::<serde_json::Value>(&input)
         .ok()
-        .and_then(|v| v.get("session_id").and_then(|s| s.as_str()).map(String::from));
+        .and_then(|v| {
+            v.get("session_id")
+                .and_then(|s| s.as_str())
+                .map(String::from)
+        });
 
     let mut s = state::load();
 
@@ -221,7 +238,9 @@ pub fn prompt_submit(agent: &str) {
         .iter()
         .any(|c| c.needs_consent && !(c.check)());
     if pending {
-        bits.push(format!("Reminder: `agentflare init --agent {agent}` to finish setup."));
+        bits.push(format!(
+            "Reminder: `agentflare init --agent {agent}` to finish setup."
+        ));
     }
 
     let router = crate::optimize::active_router();
@@ -233,14 +252,15 @@ pub fn prompt_submit(agent: &str) {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         crate::optimize::prune_stale_sessions(&mut runtime, now);
-        let record = runtime
-            .sessions
-            .entry(sid.clone())
-            .or_insert_with(|| crate::optimize::SessionRecord {
-                start_ts: now,
-                turn_count: 0,
-                recent_tool_calls: vec![],
-            });
+        let record =
+            runtime
+                .sessions
+                .entry(sid.clone())
+                .or_insert_with(|| crate::optimize::SessionRecord {
+                    start_ts: now,
+                    turn_count: 0,
+                    recent_tool_calls: vec![],
+                });
         record.turn_count += 1;
 
         let ctx = crate::optimize::RouteContext {
@@ -292,7 +312,10 @@ mod tests {
 
     #[test]
     fn extract_prompt_reads_prompt_key() {
-        assert_eq!(extract_prompt(r#"{"prompt": "Hello World"}"#), "hello world");
+        assert_eq!(
+            extract_prompt(r#"{"prompt": "Hello World"}"#),
+            "hello world"
+        );
     }
 
     #[test]
@@ -307,7 +330,10 @@ mod tests {
 
     #[test]
     fn extract_prompt_prefers_prompt_over_text_and_message() {
-        assert_eq!(extract_prompt(r#"{"prompt": "A", "text": "B", "message": "C"}"#), "a");
+        assert_eq!(
+            extract_prompt(r#"{"prompt": "A", "text": "B", "message": "C"}"#),
+            "a"
+        );
     }
 
     #[test]
@@ -345,7 +371,12 @@ mod tests {
     fn session_start_includes_active_coaching_rule_bodies() {
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
-            crate::coaching::apply_rule("hygiene", "Close sessions promptly", "Wrap up each phase before starting the next.").unwrap();
+            crate::coaching::apply_rule(
+                "hygiene",
+                "Close sessions promptly",
+                "Wrap up each phase before starting the next.",
+            )
+            .unwrap();
 
             // session_start prints via println!; session_start_message
             // (below) covers the actual message content, this just confirms
@@ -356,7 +387,10 @@ mod tests {
             session_start("claude-code");
 
             let bodies = crate::coaching::active_rule_bodies();
-            assert_eq!(bodies, vec!["Wrap up each phase before starting the next.".to_string()]);
+            assert_eq!(
+                bodies,
+                vec!["Wrap up each phase before starting the next.".to_string()]
+            );
         });
     }
 

@@ -26,7 +26,11 @@ pub struct CircuitBreaker {
 
 impl CircuitBreaker {
     pub fn new(failure_threshold: u32, recovery_timeout: Duration) -> Self {
-        Self { state: tokio::sync::Mutex::new(CircuitState::default()), failure_threshold, recovery_timeout }
+        Self {
+            state: tokio::sync::Mutex::new(CircuitState::default()),
+            failure_threshold,
+            recovery_timeout,
+        }
     }
 
     /// Fast-fails without attempting a connection if the circuit is open.

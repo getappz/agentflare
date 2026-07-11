@@ -54,7 +54,11 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, description: &str) -> ToolEntry {
-        ToolEntry { name: name.to_string(), description: description.to_string(), input_schema: serde_json::json!({}) }
+        ToolEntry {
+            name: name.to_string(),
+            description: description.to_string(),
+            input_schema: serde_json::json!({}),
+        }
     }
 
     #[test]

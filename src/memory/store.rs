@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub fn brain_db_path() -> PathBuf {
-    crate::paths::home().join(".agentflare").join("memory").join("brain.db")
+    crate::paths::home()
+        .join(".agentflare")
+        .join("memory")
+        .join("brain.db")
 }
 
 /// Wraps a non-rusqlite error (e.g. a filesystem error) so it can propagate
@@ -19,7 +22,8 @@ pub fn open() -> rusqlite::Result<Connection> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(io_err)?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .map_err(io_err)?;
         }
     }
     let conn = Connection::open(&path)?;

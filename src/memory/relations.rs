@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Relation {
@@ -18,6 +18,7 @@ pub struct Relation {
     pub updated_at: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create(
     conn: &Connection,
     source_id: i64,
@@ -49,6 +50,7 @@ pub fn create(
     )
 }
 
+#[allow(dead_code)]
 pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Relation>> {
     conn.query_row(
         "SELECT id, source_id, target_id, relation, judgment_status, reason, evidence,
@@ -57,9 +59,11 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Relation>> {
          FROM memory_relations WHERE id = ?1",
         params![id],
         map_relation,
-    ).optional()
+    )
+    .optional()
 }
 
+#[allow(dead_code)]
 pub fn list_for_observation(conn: &Connection, obs_id: i64) -> rusqlite::Result<Vec<Relation>> {
     let mut stmt = conn.prepare(
         "SELECT id, source_id, target_id, relation, judgment_status, reason, evidence,
@@ -73,6 +77,7 @@ pub fn list_for_observation(conn: &Connection, obs_id: i64) -> rusqlite::Result<
     rows.collect()
 }
 
+#[allow(dead_code)]
 fn map_relation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Relation> {
     Ok(Relation {
         id: r.get(0)?,
@@ -93,7 +98,9 @@ fn map_relation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Relation> {
 }
 
 fn now_iso() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -108,7 +115,9 @@ mod tests {
     }
 
     fn make_obs(conn: &Connection, title: &str) -> i64 {
-        match observations::save(conn, None, "note", title, "content", None, None, None, None).unwrap() {
+        match observations::save(conn, None, "note", title, "content", None, None, None, None)
+            .unwrap()
+        {
             observations::SaveOutcome::Created(id) => id,
             other => panic!("expected Created, got {other:?}"),
         }
@@ -123,8 +132,28 @@ mod tests {
         let source = make_obs(&conn, "source obs");
         let target = make_obs(&conn, "target obs");
 
-        let id1 = create(&conn, source, target, "related", None, Some("first reason"), None, None).unwrap();
-        let id2 = create(&conn, source, target, "related", None, Some("second reason"), None, None).unwrap();
+        let id1 = create(
+            &conn,
+            source,
+            target,
+            "related",
+            None,
+            Some("first reason"),
+            None,
+            None,
+        )
+        .unwrap();
+        let id2 = create(
+            &conn,
+            source,
+            target,
+            "related",
+            None,
+            Some("second reason"),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(id1, id2);
         let rel = get(&conn, id1).unwrap().unwrap();

@@ -4,7 +4,7 @@
 //! changed line, cluster overlapping findings, and tag each cluster by
 //! agreement + verification. No agent launching, no posting — just the
 //! verifiable consensus core (see issue #142).
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
 
 /// Lines within this many rows of each other (same file) are treated as the
@@ -142,10 +142,10 @@ pub fn load(conn: &Connection, repo: &str, pr: &str) -> rusqlite::Result<Vec<Sto
 }
 
 pub fn clear(conn: &Connection, repo: &str, pr: &str) -> rusqlite::Result<usize> {
-    Ok(conn.execute(
+    conn.execute(
         "DELETE FROM review_findings WHERE repo = ?1 AND pr = ?2",
         params![repo, pr],
-    )?)
+    )
 }
 
 // --- accuracy scoring --------------------------------------------------------
@@ -177,7 +177,10 @@ pub fn record_round(
     for sf in findings {
         let entry = per_agent.entry(sf.agent.as_str()).or_default();
         entry.0 += 1;
-        if changed.get(&sf.finding.file).is_some_and(|s| s.contains(&sf.finding.line)) {
+        if changed
+            .get(&sf.finding.file)
+            .is_some_and(|s| s.contains(&sf.finding.line))
+        {
             entry.1 += 1;
         }
     }
@@ -213,7 +216,11 @@ pub fn scores(conn: &Connection, repo: Option<&str>) -> rusqlite::Result<Vec<Age
                 agent: r.get(0)?,
                 findings: findings as u32,
                 verified: verified as u32,
-                accuracy: if findings > 0 { verified as f64 / findings as f64 } else { 0.0 },
+                accuracy: if findings > 0 {
+                    verified as f64 / findings as f64
+                } else {
+                    0.0
+                },
                 rounds: rounds as u32,
             })
         })?
@@ -250,7 +257,12 @@ pub fn changed_lines(diff: &str) -> HashMap<String, HashSet<u32>> {
             file = (p != "/dev/null").then(|| p.to_string());
         } else if let Some(hunk) = raw.strip_prefix("@@") {
             // "@@ -a,b +c,d @@ ..." — grab the new-side start `c`.
-            if let Some(start) = hunk.split('+').nth(1).and_then(|s| s.split([',', ' ']).next()).and_then(|s| s.parse::<u32>().ok()) {
+            if let Some(start) = hunk
+                .split('+')
+                .nth(1)
+                .and_then(|s| s.split([',', ' ']).next())
+                .and_then(|s| s.parse::<u32>().ok())
+            {
                 new_line = start;
             }
         } else if let Some(f) = &file {
@@ -277,13 +289,19 @@ pub fn changed_lines(diff: &str) -> HashMap<String, HashSet<u32>> {
 
 /// Verifies, clusters, and tags submitted findings against the diff's changed
 /// lines. Returns items ranked most-confident first.
-pub fn consensus(findings: &[StoredFinding], changed: &HashMap<String, HashSet<u32>>) -> Vec<ConsensusItem> {
+pub fn consensus(
+    findings: &[StoredFinding],
+    changed: &HashMap<String, HashSet<u32>>,
+) -> Vec<ConsensusItem> {
     let mut items: Vec<ConsensusItem> = Vec::new();
 
     // Unverified: cited line isn't a changed line. Each stands alone.
-    let (verified, unverified): (Vec<&StoredFinding>, Vec<&StoredFinding>) = findings
-        .iter()
-        .partition(|sf| changed.get(&sf.finding.file).is_some_and(|s| s.contains(&sf.finding.line)));
+    let (verified, unverified): (Vec<&StoredFinding>, Vec<&StoredFinding>) =
+        findings.iter().partition(|sf| {
+            changed
+                .get(&sf.finding.file)
+                .is_some_and(|s| s.contains(&sf.finding.line))
+        });
 
     for sf in unverified {
         items.push(single_item(Verdict::Unverified, sf));
@@ -292,7 +310,10 @@ pub fn consensus(findings: &[StoredFinding], changed: &HashMap<String, HashSet<u
     // Cluster verified findings per file by line proximity.
     let mut by_file: HashMap<&str, Vec<&StoredFinding>> = HashMap::new();
     for sf in verified {
-        by_file.entry(sf.finding.file.as_str()).or_default().push(sf);
+        by_file
+            .entry(sf.finding.file.as_str())
+            .or_default()
+            .push(sf);
     }
     for (_file, mut group) in by_file {
         group.sort_by_key(|sf| sf.finding.line);
@@ -356,7 +377,10 @@ fn tag_cluster(cluster: &[&StoredFinding]) -> ConsensusItem {
         line_start: cluster.iter().map(|sf| sf.finding.line).min().unwrap_or(0),
         line_end: cluster.iter().map(|sf| sf.finding.line).max().unwrap_or(0),
         agents,
-        messages: cluster.iter().map(|sf| sf.finding.message.clone()).collect(),
+        messages: cluster
+            .iter()
+            .map(|sf| sf.finding.message.clone())
+            .collect(),
         severities,
     }
 }
@@ -507,7 +531,11 @@ diff --git a/f2 b/f2
 +new
 ";
         let c = changed_lines(diff);
-        assert_eq!(c["f1"], [1u32, 2].into_iter().collect::<HashSet<_>>(), "f1 should be exactly {{1,2}}, no phantom line 3");
+        assert_eq!(
+            c["f1"],
+            [1u32, 2].into_iter().collect::<HashSet<_>>(),
+            "f1 should be exactly {{1,2}}, no phantom line 3"
+        );
         assert_eq!(c["f2"], [1u32].into_iter().collect::<HashSet<_>>());
     }
 
@@ -528,7 +556,10 @@ diff --git a/f b/f
 
     #[test]
     fn finding_off_the_diff_is_unverified() {
-        let items = consensus(&[sf("a", "src/foo.rs", 99, None)], &changed(&[("src/foo.rs", &[10, 11])]));
+        let items = consensus(
+            &[sf("a", "src/foo.rs", 99, None)],
+            &changed(&[("src/foo.rs", &[10, 11])]),
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].verdict, Verdict::Unverified);
     }
@@ -536,7 +567,13 @@ diff --git a/f b/f
     #[test]
     fn two_agents_same_area_is_confirmed() {
         let ch = changed(&[("src/foo.rs", &[10, 11, 12])]);
-        let items = consensus(&[sf("a", "src/foo.rs", 10, None), sf("b", "src/foo.rs", 12, None)], &ch);
+        let items = consensus(
+            &[
+                sf("a", "src/foo.rs", 10, None),
+                sf("b", "src/foo.rs", 12, None),
+            ],
+            &ch,
+        );
         assert_eq!(items.len(), 1, "should cluster into one");
         assert_eq!(items[0].verdict, Verdict::Confirmed);
         assert_eq!(items[0].agents.len(), 2);
@@ -544,14 +581,23 @@ diff --git a/f b/f
 
     #[test]
     fn single_agent_is_unique() {
-        let items = consensus(&[sf("a", "src/foo.rs", 10, None)], &changed(&[("src/foo.rs", &[10])]));
+        let items = consensus(
+            &[sf("a", "src/foo.rs", 10, None)],
+            &changed(&[("src/foo.rs", &[10])]),
+        );
         assert_eq!(items[0].verdict, Verdict::Unique);
     }
 
     #[test]
     fn same_agent_twice_is_not_confirmed() {
         let ch = changed(&[("src/foo.rs", &[10, 11])]);
-        let items = consensus(&[sf("a", "src/foo.rs", 10, None), sf("a", "src/foo.rs", 11, None)], &ch);
+        let items = consensus(
+            &[
+                sf("a", "src/foo.rs", 10, None),
+                sf("a", "src/foo.rs", 11, None),
+            ],
+            &ch,
+        );
         assert_eq!(items[0].agents.len(), 1);
         assert_eq!(items[0].verdict, Verdict::Unique);
     }
@@ -560,7 +606,10 @@ diff --git a/f b/f
     fn conflicting_severity_across_agents_is_disputed() {
         let ch = changed(&[("src/foo.rs", &[10, 11])]);
         let items = consensus(
-            &[sf("a", "src/foo.rs", 10, Some("bug")), sf("b", "src/foo.rs", 11, Some("nit"))],
+            &[
+                sf("a", "src/foo.rs", 10, Some("bug")),
+                sf("b", "src/foo.rs", 11, Some("nit")),
+            ],
             &ch,
         );
         assert_eq!(items[0].verdict, Verdict::Disputed);
@@ -569,7 +618,13 @@ diff --git a/f b/f
     #[test]
     fn distant_lines_do_not_cluster() {
         let ch = changed(&[("src/foo.rs", &[10, 50])]);
-        let items = consensus(&[sf("a", "src/foo.rs", 10, None), sf("b", "src/foo.rs", 50, None)], &ch);
+        let items = consensus(
+            &[
+                sf("a", "src/foo.rs", 10, None),
+                sf("b", "src/foo.rs", 50, None),
+            ],
+            &ch,
+        );
         assert_eq!(items.len(), 2, "10 and 50 are far apart → separate");
         assert!(items.iter().all(|i| i.verdict == Verdict::Unique));
     }
@@ -580,8 +635,8 @@ diff --git a/f b/f
         let items = consensus(
             &[
                 sf("a", "f", 1, None),
-                sf("b", "f", 2, None), // f:1-2 confirmed
-                sf("a", "g", 1, None), // g:1 unique
+                sf("b", "f", 2, None),   // f:1-2 confirmed
+                sf("a", "g", 1, None),   // g:1 unique
                 sf("a", "f", 999, None), // unverified
             ],
             &ch,
@@ -594,8 +649,20 @@ diff --git a/f b/f
     fn submit_replaces_prior_findings_from_same_agent() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        let f1 = Finding { file: "a".into(), line: 1, message: "one".into(), severity: None, category: None };
-        let f2 = Finding { file: "a".into(), line: 2, message: "two".into(), severity: None, category: None };
+        let f1 = Finding {
+            file: "a".into(),
+            line: 1,
+            message: "one".into(),
+            severity: None,
+            category: None,
+        };
+        let f2 = Finding {
+            file: "a".into(),
+            line: 2,
+            message: "two".into(),
+            severity: None,
+            category: None,
+        };
         submit(&conn, "o/r", "7", "agentA", std::slice::from_ref(&f1), 100).unwrap();
         submit(&conn, "o/r", "7", "agentA", std::slice::from_ref(&f2), 200).unwrap();
         let loaded = load(&conn, "o/r", "7").unwrap();
@@ -636,7 +703,11 @@ diff --git a/f b/f
         record_round(&conn, "o/r", "7", &findings, &ch, 200).unwrap();
         let s = scores(&conn, Some("o/r")).unwrap();
         assert_eq!(s.len(), 1);
-        assert_eq!((s[0].findings, s[0].rounds), (1, 1), "same round must not double-count");
+        assert_eq!(
+            (s[0].findings, s[0].rounds),
+            (1, 1),
+            "same round must not double-count"
+        );
     }
 
     #[test]
@@ -654,7 +725,13 @@ diff --git a/f b/f
     fn load_and_clear_are_round_scoped() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        let f = Finding { file: "a".into(), line: 1, message: "m".into(), severity: None, category: None };
+        let f = Finding {
+            file: "a".into(),
+            line: 1,
+            message: "m".into(),
+            severity: None,
+            category: None,
+        };
         submit(&conn, "o/r", "7", "a", std::slice::from_ref(&f), 100).unwrap();
         submit(&conn, "o/r", "8", "a", std::slice::from_ref(&f), 100).unwrap();
         assert_eq!(clear(&conn, "o/r", "7").unwrap(), 1);

@@ -22,15 +22,16 @@ fn target_triple() -> &'static str {
 }
 
 fn asset_ext() -> &'static str {
-    if cfg!(windows) {
-        "zip"
-    } else {
-        "tar.gz"
-    }
+    if cfg!(windows) { "zip" } else { "tar.gz" }
 }
 
 fn asset_name(version: &str) -> String {
-    format!("agentflare-{}-{}.{}", target_triple(), clear_v(version), asset_ext())
+    format!(
+        "agentflare-{}-{}.{}",
+        target_triple(),
+        clear_v(version),
+        asset_ext()
+    )
 }
 
 fn checksums_name() -> String {
@@ -38,9 +39,7 @@ fn checksums_name() -> String {
 }
 
 fn release_url(version: &str, asset: &str) -> String {
-    format!(
-        "https://github.com/{REPO}/releases/download/{version}/{asset}"
-    )
+    format!("https://github.com/{REPO}/releases/download/{version}/{asset}")
 }
 
 fn clear_v(version: &str) -> &str {
@@ -101,7 +100,10 @@ pub fn run(version: Option<String>, check_only: bool, quiet: bool) {
             };
             if check_only {
                 if !quiet {
-                    println!("new version available: {latest} (current: v{})", env!("CARGO_PKG_VERSION"));
+                    println!(
+                        "new version available: {latest} (current: v{})",
+                        env!("CARGO_PKG_VERSION")
+                    );
                 }
                 return;
             }
@@ -157,7 +159,11 @@ pub fn run(version: Option<String>, check_only: bool, quiet: bool) {
     let _ = std::fs::remove_dir_all(&tmpdir);
     std::fs::create_dir_all(&tmpdir).unwrap();
 
-    let binary_name = if cfg!(windows) { "agentflare.exe" } else { "agentflare" };
+    let binary_name = if cfg!(windows) {
+        "agentflare.exe"
+    } else {
+        "agentflare"
+    };
 
     match asset_ext() {
         "tar.gz" => {
@@ -170,7 +176,9 @@ pub fn run(version: Option<String>, check_only: bool, quiet: bool) {
         }
         "zip" => {
             let cursor = std::io::Cursor::new(&data);
-            let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("zip error: {e}")).unwrap();
+            let mut archive = zip::ZipArchive::new(cursor)
+                .map_err(|e| format!("zip error: {e}"))
+                .unwrap();
             archive
                 .extract(&tmpdir)
                 .map_err(|e| format!("extract error: {e}"))

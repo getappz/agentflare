@@ -87,7 +87,11 @@ pub fn already_registered(name: &str) -> bool {
 pub fn register(intg: &GatewayIntegration) -> String {
     let path = gateway_toml_path();
     if already_registered(intg.name) {
-        return format!("skip  {} already registered ({})", intg.name, path.display());
+        return format!(
+            "skip  {} already registered ({})",
+            intg.name,
+            path.display()
+        );
     }
     let existing = fs::read_to_string(&path).unwrap_or_default();
 
@@ -102,7 +106,11 @@ pub fn register(intg: &GatewayIntegration) -> String {
         let _ = fs::create_dir_all(parent);
     }
     match fs::write(&path, out) {
-        Ok(_) => format!("ok    {} MCP registered behind the gateway ({})", intg.name, path.display()),
+        Ok(_) => format!(
+            "ok    {} MCP registered behind the gateway ({})",
+            intg.name,
+            path.display()
+        ),
         Err(e) => format!("fail  writing {}: {e}", path.display()),
     }
 }
@@ -114,15 +122,23 @@ mod tests {
 
     #[test]
     fn remotes_mention_github_matches_https_ssh_and_aliases() {
-        assert!(remotes_mention_github("origin\thttps://github.com/org/repo.git (fetch)"));
-        assert!(remotes_mention_github("origin\tgit@github.com:org/repo.git (push)"));
+        assert!(remotes_mention_github(
+            "origin\thttps://github.com/org/repo.git (fetch)"
+        ));
+        assert!(remotes_mention_github(
+            "origin\tgit@github.com:org/repo.git (push)"
+        ));
         // SSH host alias (this very repo's shape).
-        assert!(remotes_mention_github("origin\tgit@github-work:org/repo.git (fetch)"));
+        assert!(remotes_mention_github(
+            "origin\tgit@github-work:org/repo.git (fetch)"
+        ));
     }
 
     #[test]
     fn remotes_mention_github_ignores_other_forges() {
-        assert!(!remotes_mention_github("origin\tgit@gitlab.com:org/repo.git (fetch)"));
+        assert!(!remotes_mention_github(
+            "origin\tgit@gitlab.com:org/repo.git (fetch)"
+        ));
         assert!(!remotes_mention_github(""));
     }
 

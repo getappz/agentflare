@@ -3,16 +3,16 @@
 //! handshake via `ServiceExt::serve`) — same shape as `mcp_stdio.rs`'s
 //! stdio backend, just a different transport underneath.
 
-use crate::circuit::{CircuitBreaker, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_RECOVERY_TIMEOUT};
+use crate::circuit::{CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_RECOVERY_TIMEOUT, CircuitBreaker};
 use crate::error::GatewayError;
 use crate::types::ToolEntry;
 use http::{HeaderName, HeaderValue};
 use rmcp::{
+    RoleClient, ServiceExt,
     service::RunningService,
     transport::{
-        streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
-    RoleClient, ServiceExt,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -34,7 +34,12 @@ pub struct McpHttpBackend {
 
 impl McpHttpBackend {
     pub fn new(url: String, auth_header: Option<(String, String)>) -> Self {
-        Self::with_timeout_and_circuit_recovery(url, auth_header, DEFAULT_TIMEOUT, CIRCUIT_RECOVERY_TIMEOUT)
+        Self::with_timeout_and_circuit_recovery(
+            url,
+            auth_header,
+            DEFAULT_TIMEOUT,
+            CIRCUIT_RECOVERY_TIMEOUT,
+        )
     }
 
     /// Same as [`Self::new`] but with an explicit timeout and circuit
@@ -58,16 +63,19 @@ impl McpHttpBackend {
 
     async fn ensure_connected(
         &self,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<RunningService<RoleClient, ()>>>, GatewayError> {
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<RunningService<RoleClient, ()>>>, GatewayError>
+    {
         let mut guard = self.running.lock().await;
         if guard.is_none() {
             let mut cfg = StreamableHttpClientTransportConfig::with_uri(self.url.clone());
             if let Some((name, value)) = &self.auth_header {
                 let mut headers = HashMap::new();
-                let header_name = HeaderName::from_bytes(name.as_bytes())
-                    .map_err(|e| GatewayError::Connection(format!("invalid header name '{name}': {e}")))?;
-                let header_value = HeaderValue::from_str(value)
-                    .map_err(|e| GatewayError::Connection(format!("invalid header value for '{name}': {e}")))?;
+                let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                    GatewayError::Connection(format!("invalid header name '{name}': {e}"))
+                })?;
+                let header_value = HeaderValue::from_str(value).map_err(|e| {
+                    GatewayError::Connection(format!("invalid header value for '{name}': {e}"))
+                })?;
                 headers.insert(header_name, header_value);
                 cfg = cfg.custom_headers(headers);
             }
@@ -148,7 +156,7 @@ impl McpHttpBackend {
             other => {
                 return Err(GatewayError::InvalidArgument(format!(
                     "args must be a JSON object, got {other}"
-                )))
+                )));
             }
         };
         let mut guard = self.ensure_connected().await?;

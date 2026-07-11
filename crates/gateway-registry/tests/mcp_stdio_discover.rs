@@ -22,7 +22,10 @@ async fn discover_lists_the_fixture_servers_echo_tool() {
     // `tests/mcp_stdio_timeout.rs` to test Fix 1's reconnect-after-timeout
     // behavior), so assert the `echo` tool specifically rather than the
     // exact total count.
-    let echo = tools.iter().find(|t| t.name == "echo").expect("echo tool present");
+    let echo = tools
+        .iter()
+        .find(|t| t.name == "echo")
+        .expect("echo tool present");
     assert!(echo.description.contains("Echoes"));
 }
 

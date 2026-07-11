@@ -8,7 +8,7 @@
 use crate::components::{get_components, rule_targets};
 use crate::paths::{agentflare_binary, home};
 use crate::rule_text;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::PathBuf;
 
@@ -78,19 +78,19 @@ fn confirm_ponytail_migration(agent: &str, yes: bool) -> bool {
 
 fn has_existing_ponytail_claude() -> bool {
     let path = home().join(".claude").join("settings.json");
-    if let Ok(content) = fs::read_to_string(&path) {
-        if let Ok(settings) = serde_json::from_str::<Value>(&content) {
-            let hooks = settings.get("hooks");
-            let has_ponytail = hooks
-                .and_then(|h| h.get("SessionStart"))
-                .map(|v| v.to_string().contains("ponytail"))
-                .unwrap_or(false);
-            let not_agentflare = hooks
-                .and_then(|h| h.get("SessionStart"))
-                .map(|v| !v.to_string().contains("agentflare"))
-                .unwrap_or(true);
-            return has_ponytail && not_agentflare;
-        }
+    if let Ok(content) = fs::read_to_string(&path)
+        && let Ok(settings) = serde_json::from_str::<Value>(&content)
+    {
+        let hooks = settings.get("hooks");
+        let has_ponytail = hooks
+            .and_then(|h| h.get("SessionStart"))
+            .map(|v| v.to_string().contains("ponytail"))
+            .unwrap_or(false);
+        let not_agentflare = hooks
+            .and_then(|h| h.get("SessionStart"))
+            .map(|v| !v.to_string().contains("agentflare"))
+            .unwrap_or(true);
+        return has_ponytail && not_agentflare;
     }
     false
 }
@@ -105,7 +105,10 @@ fn has_existing_ponytail_cursor() -> bool {
 }
 
 fn has_existing_ponytail_opencode() -> bool {
-    let path = home().join(".config").join("opencode").join("opencode.jsonc");
+    let path = home()
+        .join(".config")
+        .join("opencode")
+        .join("opencode.jsonc");
     if let Ok(content) = fs::read_to_string(&path) {
         has_ponytail_ref(&content) && !content.contains("agentflare")
     } else {
@@ -122,14 +125,20 @@ fn has_ponytail_ref(content: &str) -> bool {
 /// current, or diverging for some other reason) is left untouched, since
 /// that "some other reason" is most likely a user edit.
 fn is_stale_rule(path: &PathBuf, current: &str) -> bool {
-    let Some(filename) = path.file_name().and_then(|f| f.to_str()) else { return false };
+    let Some(filename) = path.file_name().and_then(|f| f.to_str()) else {
+        return false;
+    };
     let superseded = rule_text::superseded(filename);
     if superseded.is_empty() {
         return false;
     }
-    let Ok(existing) = fs::read_to_string(path) else { return false };
+    let Ok(existing) = fs::read_to_string(path) else {
+        return false;
+    };
     existing.trim_end() != current.trim_end()
-        && superseded.iter().any(|old| existing.trim_end() == old.trim_end())
+        && superseded
+            .iter()
+            .any(|old| existing.trim_end() == old.trim_end())
 }
 
 fn prompt_yes(message: &str, agent: &str, yes: bool) -> bool {
@@ -164,7 +173,10 @@ fn confirm_rule_refresh(agent: &str, yes: bool) {
         }
 
         println!();
-        println!("⚠ {} has outdated guidance (from an earlier agentflare version).", path.display());
+        println!(
+            "⚠ {} has outdated guidance (from an earlier agentflare version).",
+            path.display()
+        );
         if !prompt_yes("  Refresh to the current version? [Y/n] ", agent, yes) {
             continue;
         }
@@ -227,20 +239,27 @@ pub fn run(agent: &str, yes: bool) {
 /// rest of `init` since it wires an outside service; idempotent via
 /// `already_registered`, so re-running never re-prompts once wired.
 fn confirm_gateway_integrations(agent: &str, yes: bool) {
-    use crate::gateway_integrations::{already_registered, register, INTEGRATIONS};
+    use crate::gateway_integrations::{INTEGRATIONS, already_registered, register};
 
     for intg in INTEGRATIONS {
         if !(intg.detect)() {
             continue;
         }
         if already_registered(intg.name) {
-            println!("  skip  {} MCP already registered behind the gateway", intg.name);
+            println!(
+                "  skip  {} MCP already registered behind the gateway",
+                intg.name
+            );
             continue;
         }
 
         println!();
         println!("{}", intg.prompt);
-        if !prompt_yes("  Register it behind the agentflare gateway? [Y/n] ", agent, yes) {
+        if !prompt_yes(
+            "  Register it behind the agentflare gateway? [Y/n] ",
+            agent,
+            yes,
+        ) {
             continue;
         }
 
@@ -266,8 +285,18 @@ fn confirm_gateway_integrations(agent: &str, yes: bool) {
 /// flagless commands and older installs that still carry `--agent <host>`
 /// (upgrades stay idempotent either way). It must not match ponytail's own
 /// hook commands (`"<bin>" ponytail hook X"`), so both can coexist per event.
-fn add_hook_entry(hooks_obj: &mut Map<String, Value>, event: &str, marker: &str, command: String, timeout: u64) -> bool {
-    let arr = hooks_obj.entry(event).or_insert_with(|| json!([])).as_array_mut().unwrap();
+fn add_hook_entry(
+    hooks_obj: &mut Map<String, Value>,
+    event: &str,
+    marker: &str,
+    command: String,
+    timeout: u64,
+) -> bool {
+    let arr = hooks_obj
+        .entry(event)
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .unwrap();
     if arr.iter().any(|v| v.to_string().contains(marker)) {
         return false;
     }
@@ -292,16 +321,25 @@ fn wire_claude_code() {
 
     let mut added = false;
     added |= add_hook_entry(
-        hooks_obj, "SessionStart", "hook session-start",
-        format!("\"{bin}\" hook session-start"), 10,
+        hooks_obj,
+        "SessionStart",
+        "hook session-start",
+        format!("\"{bin}\" hook session-start"),
+        10,
     );
     added |= add_hook_entry(
-        hooks_obj, "UserPromptSubmit", "hook prompt-submit",
-        format!("\"{bin}\" hook prompt-submit"), 5,
+        hooks_obj,
+        "UserPromptSubmit",
+        "hook prompt-submit",
+        format!("\"{bin}\" hook prompt-submit"),
+        5,
     );
     added |= add_hook_entry(
-        hooks_obj, "PreToolUse", "hook pre-tool-use",
-        format!("\"{bin}\" hook pre-tool-use"), 5,
+        hooks_obj,
+        "PreToolUse",
+        "hook pre-tool-use",
+        format!("\"{bin}\" hook pre-tool-use"),
+        5,
     );
 
     if !added {
@@ -312,7 +350,10 @@ fn wire_claude_code() {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match fs::write(&path, serde_json::to_string_pretty(&settings).unwrap() + "\n") {
+    match fs::write(
+        &path,
+        serde_json::to_string_pretty(&settings).unwrap() + "\n",
+    ) {
         Ok(_) => println!("  ok    ~/.claude/settings.json hooks wired"),
         Err(e) => println!("  fail  writing ~/.claude/settings.json: {e}"),
     }
@@ -340,14 +381,20 @@ fn wire_cursor() {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match fs::write(&path, serde_json::to_string_pretty(&content).unwrap() + "\n") {
+    match fs::write(
+        &path,
+        serde_json::to_string_pretty(&content).unwrap() + "\n",
+    ) {
         Ok(_) => println!("  ok    .cursor/hooks.json written"),
         Err(e) => println!("  fail  writing .cursor/hooks.json: {e}"),
     }
 }
 
 fn wire_opencode() {
-    let path = home().join(".config").join("opencode").join("opencode.jsonc");
+    let path = home()
+        .join(".config")
+        .join("opencode")
+        .join("opencode.jsonc");
     let rules_dir = home().join(".config").join("opencode").join("rules");
     let rule_files: &[&str] = &["exa.md", "git.md", "lean-ctx.md"];
 
@@ -376,7 +423,10 @@ fn wire_opencode() {
     // Drop a legacy engram.md entry from an install wired before engram was
     // removed — `rule_files` no longer lists it, so it would otherwise sit
     // there forever, unrewritten, since nothing below ever adds it back.
-    let legacy_engram_path = rules_dir.join("engram.md").to_string_lossy().replace('\\', "/");
+    let legacy_engram_path = rules_dir
+        .join("engram.md")
+        .to_string_lossy()
+        .replace('\\', "/");
     let before_cleanup = arr.len();
     arr.retain(|v| v.as_str() != Some(legacy_engram_path.as_str()));
     let removed_legacy = arr.len() != before_cleanup;
@@ -385,11 +435,9 @@ fn wire_opencode() {
     for &file in rule_files {
         let rule_path = rules_dir.join(file);
         let path_str = rule_path.to_string_lossy().replace('\\', "/");
-        let has_it = arr.iter().any(|v| {
-            v.as_str()
-                .map(|s| s.contains(file))
-                .unwrap_or(false)
-        });
+        let has_it = arr
+            .iter()
+            .any(|v| v.as_str().map(|s| s.contains(file)).unwrap_or(false));
         if !has_it && rule_path.exists() {
             arr.push(json!(path_str));
             added += 1;
@@ -402,7 +450,9 @@ fn wire_opencode() {
         }
         match fs::write(&path, serde_json::to_string_pretty(&config).unwrap() + "\n") {
             Ok(_) if removed_legacy => {
-                println!("  ok    opencode.jsonc instructions wired ({added} rule(s), removed stale engram.md)")
+                println!(
+                    "  ok    opencode.jsonc instructions wired ({added} rule(s), removed stale engram.md)"
+                )
             }
             Ok(_) => println!("  ok    opencode.jsonc instructions wired ({added} rule(s))"),
             Err(e) => println!("  fail  writing opencode.jsonc: {e}"),
@@ -458,15 +508,21 @@ fn wire_ponytail_claude_code() {
         "hooks": [{ "type": "command", "command": format!("\"{bin}\" ponytail hook prompt-submit"), "timeout": 5 }]
     }));
 
-    obj.insert("statusLine".to_string(), json!({
-        "type": "command",
-        "command": format!("\"{bin}\" ponytail hook statusline")
-    }));
+    obj.insert(
+        "statusLine".to_string(),
+        json!({
+            "type": "command",
+            "command": format!("\"{bin}\" ponytail hook statusline")
+        }),
+    );
 
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match fs::write(&path, serde_json::to_string_pretty(&settings).unwrap() + "\n") {
+    match fs::write(
+        &path,
+        serde_json::to_string_pretty(&settings).unwrap() + "\n",
+    ) {
         Ok(_) => println!("  ok    ponytail hooks wired in ~/.claude/settings.json"),
         Err(e) => println!("  fail  writing ~/.claude/settings.json: {e}"),
     }
@@ -492,25 +548,41 @@ fn wire_ponytail_cursor() {
         content = json!({ "version": 1, "hooks": {} });
     }
 
-    let hooks = content.as_object_mut().unwrap()
-        .entry("hooks").or_insert_with(|| json!({}));
+    let hooks = content
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| json!({}));
     let hooks_obj = hooks.as_object_mut().unwrap();
 
-    hooks_obj.entry("sessionStart").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
-        "command": format!("\"{bin}\" ponytail hook session-start"),
-        "type": "command",
-        "timeout": 30
-    }));
-    hooks_obj.entry("beforeSubmitPrompt").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
-        "command": format!("\"{bin}\" ponytail hook prompt-submit"),
-        "type": "command",
-        "timeout": 10
-    }));
+    hooks_obj
+        .entry("sessionStart")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "command": format!("\"{bin}\" ponytail hook session-start"),
+            "type": "command",
+            "timeout": 30
+        }));
+    hooks_obj
+        .entry("beforeSubmitPrompt")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "command": format!("\"{bin}\" ponytail hook prompt-submit"),
+            "type": "command",
+            "timeout": 10
+        }));
 
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match fs::write(&path, serde_json::to_string_pretty(&content).unwrap() + "\n") {
+    match fs::write(
+        &path,
+        serde_json::to_string_pretty(&content).unwrap() + "\n",
+    ) {
         Ok(_) => println!("  ok    ponytail hooks wired in .cursor/hooks.json"),
         Err(e) => println!("  fail  writing .cursor/hooks.json: {e}"),
     }
@@ -763,7 +835,10 @@ mod tests {
     #[test]
     fn wire_opencode_adds_instructions_to_fresh_config() {
         with_temp_home(|| {
-            let config_path = home().join(".config").join("opencode").join("opencode.jsonc");
+            let config_path = home()
+                .join(".config")
+                .join("opencode")
+                .join("opencode.jsonc");
             let rules_dir = home().join(".config").join("opencode").join("rules");
             fs::create_dir_all(&rules_dir).unwrap();
             for &f in &["exa.md", "git.md", "lean-ctx.md"] {
@@ -774,15 +849,22 @@ mod tests {
             let content = fs::read_to_string(&config_path).unwrap();
             let parsed: Value = serde_json::from_str(&content).unwrap();
             let instructions = parsed["instructions"].as_array().unwrap();
-            assert!(instructions.len() >= 1);
-            assert!(instructions.iter().any(|v| v.as_str().unwrap().contains("exa.md")));
+            assert!(!instructions.is_empty());
+            assert!(
+                instructions
+                    .iter()
+                    .any(|v| v.as_str().unwrap().contains("exa.md"))
+            );
         });
     }
 
     #[test]
     fn wire_opencode_is_idempotent() {
         with_temp_home(|| {
-            let config_path = home().join(".config").join("opencode").join("opencode.jsonc");
+            let config_path = home()
+                .join(".config")
+                .join("opencode")
+                .join("opencode.jsonc");
             let rules_dir = home().join(".config").join("opencode").join("rules");
             fs::create_dir_all(&rules_dir).unwrap();
             fs::write(rules_dir.join("exa.md"), "# exa\n").unwrap();
@@ -791,17 +873,27 @@ mod tests {
             let first = fs::read_to_string(&config_path).unwrap();
             wire_opencode();
             let second = fs::read_to_string(&config_path).unwrap();
-            assert_eq!(first, second, "second run should not duplicate instructions");
+            assert_eq!(
+                first, second,
+                "second run should not duplicate instructions"
+            );
         });
     }
 
     #[test]
     fn wire_opencode_preserves_existing_instructions() {
         with_temp_home(|| {
-            let config_path = home().join(".config").join("opencode").join("opencode.jsonc");
+            let config_path = home()
+                .join(".config")
+                .join("opencode")
+                .join("opencode.jsonc");
             let rules_dir = home().join(".config").join("opencode").join("rules");
             fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-            fs::write(&config_path, r#"{"instructions": ["/some/existing/rule.md"], "mcp": {}}"#).unwrap();
+            fs::write(
+                &config_path,
+                r#"{"instructions": ["/some/existing/rule.md"], "mcp": {}}"#,
+            )
+            .unwrap();
             fs::create_dir_all(&rules_dir).unwrap();
             fs::write(rules_dir.join("exa.md"), "# exa\n").unwrap();
 
@@ -816,7 +908,10 @@ mod tests {
     #[test]
     fn wire_opencode_removes_legacy_engram_instruction_on_upgrade() {
         with_temp_home(|| {
-            let config_path = home().join(".config").join("opencode").join("opencode.jsonc");
+            let config_path = home()
+                .join(".config")
+                .join("opencode")
+                .join("opencode.jsonc");
             let rules_dir = home().join(".config").join("opencode").join("rules");
             fs::create_dir_all(&rules_dir).unwrap();
             // Simulates an install wired before engram was removed: all three
@@ -824,7 +919,10 @@ mod tests {
             for f in ["exa.md", "git.md", "lean-ctx.md"] {
                 fs::write(rules_dir.join(f), format!("# {f}\n")).unwrap();
             }
-            let legacy_engram_path = rules_dir.join("engram.md").to_string_lossy().replace('\\', "/");
+            let legacy_engram_path = rules_dir
+                .join("engram.md")
+                .to_string_lossy()
+                .replace('\\', "/");
             fs::create_dir_all(config_path.parent().unwrap()).unwrap();
             fs::write(
                 &config_path,
@@ -835,18 +933,22 @@ mod tests {
                         format!("{}/lean-ctx.md", rules_dir.to_string_lossy().replace('\\', "/")),
                         legacy_engram_path.clone(),
                     ]
-                })).unwrap(),
-            ).unwrap();
+                }))
+                .unwrap(),
+            )
+            .unwrap();
 
             // Nothing new to add (all 3 current rules already wired), so this
             // exercises the "rewrite triggered by removal alone" path.
             wire_opencode();
 
             let content = fs::read_to_string(&config_path).unwrap();
-            assert!(!content.contains(&legacy_engram_path), "stale engram.md entry should be removed: {content}");
+            assert!(
+                !content.contains(&legacy_engram_path),
+                "stale engram.md entry should be removed: {content}"
+            );
             assert!(content.contains("exa.md"));
             assert!(content.contains("lean-ctx.md"));
         });
     }
-
 }

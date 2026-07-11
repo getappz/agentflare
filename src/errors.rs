@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum AgentDetectError {
     #[error("{0} produced no output")]
     NoOutput(String),
@@ -13,6 +14,7 @@ pub enum AgentDetectError {
 }
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum AuthError {
     #[error("invalid {kind}: '{name}' (must not contain path separators)")]
     InvalidName { name: String, kind: String },
@@ -41,6 +43,7 @@ pub enum DaemonError {
 }
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum UpdateError {
     #[error("HTTP request failed: {0}")]
     Http(String),
@@ -49,12 +52,14 @@ pub enum UpdateError {
 }
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum AliasError {
     #[error("unsupported shell: {0}")]
     UnsupportedShell(String),
 }
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum AgentInstallError {
     #[error("unknown agent: {0}")]
     UnknownAgent(String),
@@ -69,6 +74,7 @@ pub enum AgentInstallError {
 }
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum CoachingError {
     #[error("invalid coaching rule: {0}")]
     InvalidRule(String),

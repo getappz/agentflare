@@ -46,7 +46,9 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if version > 1 {
         return Err(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_SCHEMA),
-            Some(format!("analytics.db schema version {version} is newer than this build supports")),
+            Some(format!(
+                "analytics.db schema version {version} is newer than this build supports"
+            )),
         ));
     }
     if version < 1 {
@@ -150,7 +152,7 @@ pub(crate) fn open_or_rebuild() -> Connection {
 }
 
 use crate::cost::{
-    add_tokens, find_session_files_under, project_name_for, should_count_line, GroupTotals,
+    GroupTotals, add_tokens, find_session_files_under, project_name_for, should_count_line,
 };
 use chrono::NaiveDate;
 use rusqlite::params;
@@ -220,9 +222,18 @@ fn prune_deleted_files(conn: &mut Connection, on_disk: &[std::path::PathBuf]) {
         return;
     };
     for path in stale {
-        tx.execute("DELETE FROM session_files WHERE file_path = ?1", params![path]).ok();
-        tx.execute("DELETE FROM file_rollup WHERE file_path = ?1", params![path]).ok();
-        tx.execute("DELETE FROM dedup_keys WHERE file_path = ?1", params![path]).ok();
+        tx.execute(
+            "DELETE FROM session_files WHERE file_path = ?1",
+            params![path],
+        )
+        .ok();
+        tx.execute(
+            "DELETE FROM file_rollup WHERE file_path = ?1",
+            params![path],
+        )
+        .ok();
+        tx.execute("DELETE FROM dedup_keys WHERE file_path = ?1", params![path])
+            .ok();
     }
     tx.commit().ok();
 }
@@ -245,13 +256,19 @@ fn reindex_file(
     };
 
     if tx
-        .execute("DELETE FROM file_rollup WHERE file_path = ?1", params![path_str])
+        .execute(
+            "DELETE FROM file_rollup WHERE file_path = ?1",
+            params![path_str],
+        )
         .is_err()
     {
         return;
     }
     if tx
-        .execute("DELETE FROM dedup_keys WHERE file_path = ?1", params![path_str])
+        .execute(
+            "DELETE FROM dedup_keys WHERE file_path = ?1",
+            params![path_str],
+        )
         .is_err()
     {
         return;
@@ -306,7 +323,10 @@ fn reindex_file(
             }
         }
 
-        let model = parsed.model.clone().unwrap_or_else(|| "unknown".to_string());
+        let model = parsed
+            .model
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         let cost = crate::pricing::calculate_cost(&parsed.tokens, parsed.model.as_deref(), pricing);
 
         let entry = sums.entry((date, model)).or_default();
@@ -350,7 +370,12 @@ fn reindex_file(
             mtime_secs = excluded.mtime_secs,
             size_bytes = excluded.size_bytes,
             indexed_at = excluded.indexed_at",
-        params![path_str, mtime_secs, size_bytes, chrono::Local::now().to_rfc3339()],
+        params![
+            path_str,
+            mtime_secs,
+            size_bytes,
+            chrono::Local::now().to_rfc3339()
+        ],
     );
     if upserted.is_err() {
         return;
@@ -427,7 +452,10 @@ mod tests {
                 .unwrap()
                 .map(|r| r.unwrap())
                 .collect();
-            assert_eq!(names, vec!["dedup_keys", "file_rollup", "meta", "session_files"]);
+            assert_eq!(
+                names,
+                vec!["dedup_keys", "file_rollup", "meta", "session_files"]
+            );
 
             let version: i32 = conn
                 .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -463,7 +491,12 @@ mod tests {
         });
     }
 
-    fn write_session_file(dir: &std::path::Path, project: &str, file: &str, content: &str) -> PathBuf {
+    fn write_session_file(
+        dir: &std::path::Path,
+        project: &str,
+        file: &str,
+        content: &str,
+    ) -> PathBuf {
         let project_dir = dir.join(project);
         std::fs::create_dir_all(&project_dir).unwrap();
         let path = project_dir.join(file);
@@ -472,8 +505,10 @@ mod tests {
     }
 
     fn row_count(conn: &Connection, table: &str) -> i64 {
-        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
-            .unwrap()
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
     }
 
     #[test]
@@ -490,11 +525,9 @@ mod tests {
             assert_eq!(row_count(&conn, "session_files"), 1);
             assert_eq!(row_count(&conn, "file_rollup"), 1);
             let (model, input_tokens): (String, i64) = conn
-                .query_row(
-                    "SELECT model, input_tokens FROM file_rollup",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
+                .query_row("SELECT model, input_tokens FROM file_rollup", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
                 .unwrap();
             assert_eq!(model, "claude-opus-4-8");
             assert_eq!(input_tokens, 100);
@@ -547,11 +580,18 @@ mod tests {
 
             sync(&mut conn, &dir);
 
-            assert_eq!(row_count(&conn, "file_rollup"), 1, "same date+model still one row");
+            assert_eq!(
+                row_count(&conn, "file_rollup"),
+                1,
+                "same date+model still one row"
+            );
             let input_tokens: i64 = conn
                 .query_row("SELECT input_tokens FROM file_rollup", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(input_tokens, 120, "reindex must reflect the appended line, not double-count the original");
+            assert_eq!(
+                input_tokens, 120,
+                "reindex must reflect the appended line, not double-count the original"
+            );
 
             let _ = std::fs::remove_dir_all(&dir);
         });
@@ -569,7 +609,12 @@ mod tests {
             // is applied to both instants alike.
             let day1 = r#"{"type":"assistant","timestamp":"2026-07-05T12:00:00Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":0}},"requestId":"r1"}"#;
             let day2 = r#"{"type":"assistant","timestamp":"2026-07-06T13:00:00Z","message":{"id":"m2","model":"claude-opus-4-8","usage":{"input_tokens":30,"output_tokens":0}},"requestId":"r2"}"#;
-            write_session_file(&dir, "proj1", "session1.jsonl", &format!("{day1}\n{day2}\n"));
+            write_session_file(
+                &dir,
+                "proj1",
+                "session1.jsonl",
+                &format!("{day1}\n{day2}\n"),
+            );
 
             let mut conn = open_or_rebuild();
             sync(&mut conn, &dir);
@@ -589,7 +634,12 @@ mod tests {
             // message.id:requestId) must be counted once, not twice.
             let block1 = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":50}},"requestId":"r1"}"#;
             let block2 = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":50}},"requestId":"r1"}"#;
-            write_session_file(&dir, "proj1", "session1.jsonl", &format!("{block1}\n{block2}\n"));
+            write_session_file(
+                &dir,
+                "proj1",
+                "session1.jsonl",
+                &format!("{block1}\n{block2}\n"),
+            );
 
             let mut conn = open_or_rebuild();
             sync(&mut conn, &dir);
@@ -597,7 +647,10 @@ mod tests {
             let input_tokens: i64 = conn
                 .query_row("SELECT input_tokens FROM file_rollup", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(input_tokens, 100, "duplicate content-block lines must be deduped");
+            assert_eq!(
+                input_tokens, 100,
+                "duplicate content-block lines must be deduped"
+            );
 
             let _ = std::fs::remove_dir_all(&dir);
         });
@@ -619,7 +672,9 @@ mod tests {
             sync(&mut conn, &dir);
 
             let total_input: i64 = conn
-                .query_row("SELECT SUM(input_tokens) FROM file_rollup", [], |row| row.get(0))
+                .query_row("SELECT SUM(input_tokens) FROM file_rollup", [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             assert_eq!(
                 total_input, 100,
@@ -648,15 +703,34 @@ mod tests {
 
             let files = find_session_files_under(&dir);
             let pricing = crate::pricing::load_pricing();
-            let expected = crate::cost::aggregate(&files, (today, today), crate::cost::GroupBy::Model, &pricing);
+            let expected = crate::cost::aggregate(
+                &files,
+                (today, today),
+                crate::cost::GroupBy::Model,
+                &pricing,
+            );
 
             assert_eq!(actual.len(), expected.len());
             for (key, expected_totals) in &expected {
-                let actual_totals = actual.get(key).unwrap_or_else(|| panic!("missing key {key}"));
-                assert_eq!(actual_totals.tokens.input_tokens, expected_totals.tokens.input_tokens, "key {key}");
-                assert_eq!(actual_totals.tokens.output_tokens, expected_totals.tokens.output_tokens, "key {key}");
-                assert!((actual_totals.cost_usd - expected_totals.cost_usd).abs() < 0.000_001, "key {key}");
-                assert_eq!(actual_totals.has_unpriced_usage, expected_totals.has_unpriced_usage, "key {key}");
+                let actual_totals = actual
+                    .get(key)
+                    .unwrap_or_else(|| panic!("missing key {key}"));
+                assert_eq!(
+                    actual_totals.tokens.input_tokens, expected_totals.tokens.input_tokens,
+                    "key {key}"
+                );
+                assert_eq!(
+                    actual_totals.tokens.output_tokens, expected_totals.tokens.output_tokens,
+                    "key {key}"
+                );
+                assert!(
+                    (actual_totals.cost_usd - expected_totals.cost_usd).abs() < 0.000_001,
+                    "key {key}"
+                );
+                assert_eq!(
+                    actual_totals.has_unpriced_usage, expected_totals.has_unpriced_usage,
+                    "key {key}"
+                );
             }
 
             let _ = std::fs::remove_dir_all(&dir);
@@ -681,13 +755,26 @@ mod tests {
 
             let files = find_session_files_under(&dir);
             let pricing = crate::pricing::load_pricing();
-            let expected = crate::cost::aggregate(&files, (today, today), crate::cost::GroupBy::Project, &pricing);
+            let expected = crate::cost::aggregate(
+                &files,
+                (today, today),
+                crate::cost::GroupBy::Project,
+                &pricing,
+            );
 
             assert_eq!(actual.len(), expected.len());
             for (key, expected_totals) in &expected {
-                let actual_totals = actual.get(key).unwrap_or_else(|| panic!("missing key {key}"));
-                assert_eq!(actual_totals.tokens.input_tokens, expected_totals.tokens.input_tokens, "key {key}");
-                assert!((actual_totals.cost_usd - expected_totals.cost_usd).abs() < 0.000_001, "key {key}");
+                let actual_totals = actual
+                    .get(key)
+                    .unwrap_or_else(|| panic!("missing key {key}"));
+                assert_eq!(
+                    actual_totals.tokens.input_tokens, expected_totals.tokens.input_tokens,
+                    "key {key}"
+                );
+                assert!(
+                    (actual_totals.cost_usd - expected_totals.cost_usd).abs() < 0.000_001,
+                    "key {key}"
+                );
             }
 
             let _ = std::fs::remove_dir_all(&dir);
@@ -701,7 +788,12 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             let in_range = r#"{"type":"assistant","timestamp":"2026-07-04T10:00:00Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":50}},"requestId":"r1"}"#;
             let out_of_range = r#"{"type":"assistant","timestamp":"2026-07-03T10:00:00Z","message":{"id":"m2","model":"claude-opus-4-8","usage":{"input_tokens":999,"output_tokens":999}},"requestId":"r2"}"#;
-            write_session_file(&dir, "proj1", "session1.jsonl", &format!("{in_range}\n{out_of_range}\n"));
+            write_session_file(
+                &dir,
+                "proj1",
+                "session1.jsonl",
+                &format!("{in_range}\n{out_of_range}\n"),
+            );
 
             let mut conn = open_or_rebuild();
             sync(&mut conn, &dir);
@@ -711,7 +803,10 @@ mod tests {
             let totals = query(&conn, range, crate::cost::GroupBy::Model);
 
             let opus = totals.get("claude-opus-4-8").expect("expected opus entry");
-            assert_eq!(opus.tokens.input_tokens, 100, "2026-07-03 line is outside the 3-day window");
+            assert_eq!(
+                opus.tokens.input_tokens, 100,
+                "2026-07-03 line is outside the 3-day window"
+            );
 
             let _ = std::fs::remove_dir_all(&dir);
         });
@@ -731,7 +826,9 @@ mod tests {
             let today = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
             let totals = query(&conn, (today, today), crate::cost::GroupBy::Model);
 
-            let entry = totals.get("some-unrecognized-model").expect("expected entry");
+            let entry = totals
+                .get("some-unrecognized-model")
+                .expect("expected entry");
             assert!(entry.has_unpriced_usage);
 
             let _ = std::fs::remove_dir_all(&dir);
@@ -750,7 +847,10 @@ mod tests {
             let version: i32 = conn
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 1, "a newer-than-supported schema version must be rejected and rebuilt, not silently accepted");
+            assert_eq!(
+                version, 1,
+                "a newer-than-supported schema version must be rejected and rebuilt, not silently accepted"
+            );
         });
     }
 
@@ -778,7 +878,11 @@ mod tests {
 
             // Reopening must detect the mismatch and wipe the stale rollup.
             let conn = open_or_rebuild();
-            assert_eq!(row_count(&conn, "file_rollup"), 0, "stale rollup rows must be cleared when the pricing fingerprint no longer matches");
+            assert_eq!(
+                row_count(&conn, "file_rollup"),
+                0,
+                "stale rollup rows must be cleared when the pricing fingerprint no longer matches"
+            );
             assert_eq!(row_count(&conn, "session_files"), 0);
 
             let _ = std::fs::remove_dir_all(&dir);

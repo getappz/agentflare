@@ -13,6 +13,8 @@ pub const DEFAULT_PORT: u16 = 64009;
 pub struct ArtifactServer {
     host: String,
     port: u16,
+    #[allow(dead_code)]
+    // kept alive for the server's lifetime; the listener thread holds its own clone
     store: Arc<ArtifactStore>,
 }
 
@@ -119,15 +121,23 @@ fn handle_connection(mut stream: TcpStream, store: &ArtifactStore) {
             headers.push(line.trim().to_string());
         }
 
-        (method.to_string(), path.to_string(), content_length, reader.into_inner())
+        (
+            method.to_string(),
+            path.to_string(),
+            content_length,
+            reader.into_inner(),
+        )
     };
 
     let (method, path, _content_length, _remaining) = buf;
 
     let response = match (method.as_str(), path.as_str()) {
-        ("GET", path) if path == "/" => index_page(store),
+        ("GET", "/") => index_page(store),
         ("GET", path) if path.ends_with("/live") => {
-            let id = path.strip_suffix("/live").unwrap_or("").trim_start_matches('/');
+            let id = path
+                .strip_suffix("/live")
+                .unwrap_or("")
+                .trim_start_matches('/');
             if !valid_id(id) {
                 let _ = stream.write_all(not_found().0.as_bytes());
                 let _ = stream.flush();
@@ -136,7 +146,10 @@ fn handle_connection(mut stream: TcpStream, store: &ArtifactStore) {
             return serve_sse(&mut stream, store, id);
         }
         ("GET", path) if path.ends_with("/versions") => {
-            let id = path.strip_suffix("/versions").unwrap_or("").trim_start_matches('/');
+            let id = path
+                .strip_suffix("/versions")
+                .unwrap_or("")
+                .trim_start_matches('/');
             versions_json(store, id)
         }
         ("GET", path) => {
@@ -149,9 +162,7 @@ fn handle_connection(mut stream: TcpStream, store: &ArtifactStore) {
                 None => serve_artifact(store, rest, None),
             }
         }
-        _ => (
-            "HTTP/1.0 405 Method Not Allowed\r\n\r\nMethod Not Allowed".to_string(),
-        ),
+        _ => ("HTTP/1.0 405 Method Not Allowed\r\n\r\nMethod Not Allowed".to_string(),),
     };
 
     let _ = stream.write_all(response.0.as_bytes());
@@ -167,10 +178,7 @@ pub fn valid_id(id: &str) -> bool {
 }
 
 fn not_found() -> (String,) {
-    (
-        "HTTP/1.0 404 Not Found\r\nContent-Type: text/plain\r\n\r\nArtifact not found"
-            .to_string(),
-    )
+    ("HTTP/1.0 404 Not Found\r\nContent-Type: text/plain\r\n\r\nArtifact not found".to_string(),)
 }
 
 fn http_200(content_type: &str, body: &str) -> (String,) {
@@ -244,7 +252,11 @@ pub fn render_index(store: &ArtifactStore, prefix: &str) -> String {
     }
     let mut groups = String::new();
     for (session, items) in &sessions {
-        let session_label = if session.is_empty() { "(no session)" } else { session };
+        let session_label = if session.is_empty() {
+            "(no session)"
+        } else {
+            session
+        };
         groups.push_str(&format!("<h2>{}</h2>\n<ul>\n", html_escape(session_label)));
         for a in items {
             let icon = a.favicon.as_deref().unwrap_or("📄");

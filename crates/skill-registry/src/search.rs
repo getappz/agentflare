@@ -101,9 +101,21 @@ mod tests {
         rebuild(
             &mut conn,
             &[
-                mk("live", "Use when the user asks about running sessions, agent status", true),
-                mk("cv-usage", "Use when the user asks about usage analytics, token usage, cost summary", false),
-                mk("win-cleanup", "Use when the user asks to free disk space on Windows", false),
+                mk(
+                    "live",
+                    "Use when the user asks about running sessions, agent status",
+                    true,
+                ),
+                mk(
+                    "cv-usage",
+                    "Use when the user asks about usage analytics, token usage, cost summary",
+                    false,
+                ),
+                mk(
+                    "win-cleanup",
+                    "Use when the user asks to free disk space on Windows",
+                    false,
+                ),
             ],
         )
         .unwrap();
@@ -145,7 +157,13 @@ mod tests {
     #[test]
     fn fts_operators_in_query_are_neutralized() {
         let conn = seed();
-        for q in ["cost\" OR \"x", "NEAR(a b)", "usage*", "(sessions)", "col:val"] {
+        for q in [
+            "cost\" OR \"x",
+            "NEAR(a b)",
+            "usage*",
+            "(sessions)",
+            "col:val",
+        ] {
             // must not error; may or may not match
             search(&conn, q, 5, MatchMode::Any).unwrap();
         }
@@ -162,7 +180,11 @@ mod tests {
         let conn = seed();
         assert_eq!(
             list_all_names(&conn).unwrap(),
-            vec!["cv-usage".to_string(), "live".to_string(), "win-cleanup".to_string()]
+            vec![
+                "cv-usage".to_string(),
+                "live".to_string(),
+                "win-cleanup".to_string()
+            ]
         );
     }
 }

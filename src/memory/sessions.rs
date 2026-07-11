@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Session {
@@ -32,7 +32,9 @@ pub fn create(
          VALUES (?1, ?2, ?3, ?4, 'active', ?4, ?4)",
         params![id, project, directory, now],
     )?;
-    get(conn, id)?.ok_or_else(|| rusqlite::Error::InvalidParameterName("insert succeeded but readback failed".into()))
+    get(conn, id)?.ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName("insert succeeded but readback failed".into())
+    })
 }
 
 pub fn get(conn: &Connection, id: &str) -> rusqlite::Result<Option<Session>> {
@@ -62,9 +64,11 @@ pub fn get(conn: &Connection, id: &str) -> rusqlite::Result<Option<Session>> {
                 updated_at: r.get(15)?,
             })
         },
-    ).optional()
+    )
+    .optional()
 }
 
+#[allow(dead_code)]
 pub fn update_status(conn: &Connection, id: &str, status: &str) -> rusqlite::Result<()> {
     let now = now_iso();
     conn.execute(
@@ -83,6 +87,7 @@ pub fn close(conn: &Connection, id: &str, summary: &str) -> rusqlite::Result<()>
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn update_enriched(
     conn: &Connection,
     id: &str,
@@ -106,12 +111,26 @@ pub fn update_enriched(
             compaction_snapshot = COALESCE(?8, compaction_snapshot),
             updated_at = ?9
          WHERE id = ?1",
-        params![id, task, findings, decisions, files_touched, evidence, stats, compaction_snapshot, now],
+        params![
+            id,
+            task,
+            findings,
+            decisions,
+            files_touched,
+            evidence,
+            stats,
+            compaction_snapshot,
+            now
+        ],
     )?;
     Ok(())
 }
 
-pub fn list_recent(conn: &Connection, project: Option<&str>, limit: usize) -> rusqlite::Result<Vec<Session>> {
+pub fn list_recent(
+    conn: &Connection,
+    project: Option<&str>,
+    limit: usize,
+) -> rusqlite::Result<Vec<Session>> {
     let mut stmt = conn.prepare(
         "SELECT id, project, directory, started_at, ended_at, summary, status,
                 task, findings, decisions, files_touched, evidence, stats,
@@ -144,13 +163,16 @@ pub fn list_recent(conn: &Connection, project: Option<&str>, limit: usize) -> ru
     rows.collect()
 }
 
+#[allow(dead_code)]
 pub fn delete(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     let n = conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
     Ok(n > 0)
 }
 
 fn now_iso() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 #[cfg(test)]

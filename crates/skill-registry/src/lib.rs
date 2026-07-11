@@ -4,5 +4,5 @@ pub mod load;
 pub mod search;
 pub mod sources;
 
-pub use load::{load, LoadError, LoadedSkill, Registry};
-pub use search::{search, MatchMode, SkillHit};
+pub use load::{LoadError, LoadedSkill, Registry, load};
+pub use search::{MatchMode, SkillHit, search};

@@ -134,7 +134,10 @@ impl ArtifactStore {
 
         fs::create_dir_all(dir.join(VERSIONS_DIR))?;
         if !unchanged {
-            fs::write(dir.join(VERSIONS_DIR).join(version.to_string()), &req.content)?;
+            fs::write(
+                dir.join(VERSIONS_DIR).join(version.to_string()),
+                &req.content,
+            )?;
         }
         fs::write(dir.join(META_FILE), serde_json::to_string_pretty(&meta)?)?;
         fs::write(dir.join(CONTENT_FILE), &req.content)?;
@@ -168,20 +171,21 @@ impl ArtifactStore {
 
     /// Version history, oldest first.
     pub fn versions(&self, id: &str) -> std::io::Result<Vec<VersionInfo>> {
-        self.read_meta(id)
-            .map(|m| m.history)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("artifact {id} not found"),
-                )
-            })
+        self.read_meta(id).map(|m| m.history).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("artifact {id} not found"),
+            )
+        })
     }
 
     /// A specific version's snapshot; `get()` always serves the latest.
     pub fn get_version(&self, id: &str, version: u32) -> std::io::Result<Artifact> {
         let mut artifact = self.get(id)?;
-        let content_path = self.artifact_dir(id).join(VERSIONS_DIR).join(version.to_string());
+        let content_path = self
+            .artifact_dir(id)
+            .join(VERSIONS_DIR)
+            .join(version.to_string());
         artifact.content = fs::read_to_string(content_path)?;
         artifact.version = version;
         Ok(artifact)
@@ -195,8 +199,7 @@ impl ArtifactStore {
                 format!("artifact {id} not found"),
             ));
         }
-        let meta: ArtifactMeta =
-            serde_json::from_str(&fs::read_to_string(dir.join(META_FILE))?)?;
+        let meta: ArtifactMeta = serde_json::from_str(&fs::read_to_string(dir.join(META_FILE))?)?;
         let content = fs::read_to_string(dir.join(CONTENT_FILE))?;
         Ok(Artifact {
             id: meta.id,
@@ -251,7 +254,7 @@ impl ArtifactStore {
                 }
             }
         }
-        artifacts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        artifacts.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         Ok(artifacts)
     }
 

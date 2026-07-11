@@ -30,7 +30,9 @@ mod tests {
         use std::io::Write;
         stream.write_all(req.as_bytes()).unwrap();
         stream.flush().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut reader = BufReader::new(&stream);
         let mut full = String::new();
         let _ = reader.read_to_string(&mut full);
@@ -158,10 +160,16 @@ mod tests {
             .unwrap();
 
         let listing = read_http("/", port);
-        assert!(listing.contains("http-test"), "index page shows artifact: {listing}");
+        assert!(
+            listing.contains("http-test"),
+            "index page shows artifact: {listing}"
+        );
 
         let resp = read_http("/", port);
-        assert!(resp.contains("HTTP/1.0 200") || resp.contains("HTTP/1.1 200"), "bad status: {resp}");
+        assert!(
+            resp.contains("HTTP/1.0 200") || resp.contains("HTTP/1.1 200"),
+            "bad status: {resp}"
+        );
     }
 
     #[test]
@@ -360,11 +368,20 @@ mod tests {
             .unwrap();
 
         let page = read_http(&format!("/{}", resp.id), port);
-        assert!(!page.contains("<script>alert"), "raw script must not survive: {page}");
-        assert!(page.contains("&lt;script&gt;"), "escaped form present: {page}");
+        assert!(
+            !page.contains("<script>alert"),
+            "raw script must not survive: {page}"
+        );
+        assert!(
+            page.contains("&lt;script&gt;"),
+            "escaped form present: {page}"
+        );
 
         let index = read_http("/", port);
-        assert!(!index.contains("<script>alert"), "index escapes names: {index}");
+        assert!(
+            !index.contains("<script>alert"),
+            "index escapes names: {index}"
+        );
     }
 
     #[test]
@@ -397,7 +414,10 @@ mod tests {
         assert!(old.contains("OLD-CONTENT"), "{old}");
 
         let history = read_http(&format!("/{id}/versions"), port);
-        assert!(history.contains("\"version\": 1") || history.contains("\"version\":1"), "{history}");
+        assert!(
+            history.contains("\"version\": 1") || history.contains("\"version\":1"),
+            "{history}"
+        );
         assert!(history.contains("draft"), "label in history: {history}");
     }
 
@@ -414,7 +434,10 @@ mod tests {
             })
             .unwrap();
         let page = read_http(&format!("/{}", md.id), port);
-        assert!(page.contains("marked"), "markdown page loads renderer: {page}");
+        assert!(
+            page.contains("marked"),
+            "markdown page loads renderer: {page}"
+        );
 
         let mm = store
             .publish(&PublishRequest {
@@ -426,7 +449,10 @@ mod tests {
             })
             .unwrap();
         let page = read_http(&format!("/{}", mm.id), port);
-        assert!(page.contains("mermaid"), "mermaid page loads renderer: {page}");
+        assert!(
+            page.contains("mermaid"),
+            "mermaid page loads renderer: {page}"
+        );
     }
 
     #[test]
@@ -503,9 +529,15 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(resp.version, 1, "identical content must not bump the version");
+        assert_eq!(
+            resp.version, 1,
+            "identical content must not bump the version"
+        );
         assert_eq!(store.versions(&id).unwrap().len(), 1);
-        assert_eq!(store.get(&id).unwrap().description.as_deref(), Some("added later"));
+        assert_eq!(
+            store.get(&id).unwrap().description.as_deref(),
+            Some("added later")
+        );
 
         // different content still bumps
         let resp = store
@@ -610,7 +642,9 @@ mod tests {
         use std::io::{Read, Write};
         write!(stream, "GET /{id}/live HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
         stream.flush().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
 
         // Wait for the SSE headers (and a beat for the handler to snapshot
         // its baseline version) before publishing, else the handler's first
@@ -645,6 +679,9 @@ mod tests {
                 Err(_) => break,
             }
         }
-        assert!(buf.contains("event:"), "poll fallback must emit an update event: {buf}");
+        assert!(
+            buf.contains("event:"),
+            "poll fallback must emit an update event: {buf}"
+        );
     }
 }

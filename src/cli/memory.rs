@@ -42,7 +42,10 @@ pub enum MemoryCommands {
 impl MemoryArgs {
     pub fn run(self) {
         match self.command {
-            MemoryCommands::Context { project, session_id } => {
+            MemoryCommands::Context {
+                project,
+                session_id,
+            } => {
                 let input = crate::memory::mcp::ContextInput {
                     session_id,
                     project,
@@ -52,7 +55,11 @@ impl MemoryArgs {
                     Err(e) => eprintln!("error: {e}"),
                 }
             }
-            MemoryCommands::Search { query, project, limit } => {
+            MemoryCommands::Search {
+                query,
+                project,
+                limit,
+            } => {
                 let input = crate::memory::mcp::RecallInput {
                     query,
                     id: None,
@@ -65,24 +72,32 @@ impl MemoryArgs {
                     Err(e) => eprintln!("error: {e}"),
                 }
             }
-            MemoryCommands::Sessions { project, limit } => {
-                match crate::memory::store::open() {
-                    Err(e) => eprintln!("error: {e}"),
-                    Ok(conn) => match crate::memory::sessions::list_recent(&conn, project.as_deref(), limit) {
-                        Ok(sessions) => println!("{}", serde_json::to_string_pretty(&sessions).unwrap_or_default()),
+            MemoryCommands::Sessions { project, limit } => match crate::memory::store::open() {
+                Err(e) => eprintln!("error: {e}"),
+                Ok(conn) => {
+                    match crate::memory::sessions::list_recent(&conn, project.as_deref(), limit) {
+                        Ok(sessions) => println!(
+                            "{}",
+                            serde_json::to_string_pretty(&sessions).unwrap_or_default()
+                        ),
                         Err(e) => eprintln!("error: {e}"),
-                    },
+                    }
                 }
-            }
-            MemoryCommands::Observations { project, limit } => {
-                match crate::memory::store::open() {
+            },
+            MemoryCommands::Observations { project, limit } => match crate::memory::store::open() {
+                Err(e) => eprintln!("error: {e}"),
+                Ok(conn) => match crate::memory::observations::list_recent(
+                    &conn,
+                    project.as_deref(),
+                    None,
+                    limit,
+                ) {
+                    Ok(obs) => {
+                        println!("{}", serde_json::to_string_pretty(&obs).unwrap_or_default())
+                    }
                     Err(e) => eprintln!("error: {e}"),
-                    Ok(conn) => match crate::memory::observations::list_recent(&conn, project.as_deref(), None, limit) {
-                        Ok(obs) => println!("{}", serde_json::to_string_pretty(&obs).unwrap_or_default()),
-                        Err(e) => eprintln!("error: {e}"),
-                    },
-                }
-            }
+                },
+            },
         }
     }
 }

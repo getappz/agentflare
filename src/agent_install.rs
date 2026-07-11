@@ -53,8 +53,16 @@ fn uninstall_args(spec: &AgentSpec) -> Option<Vec<String>> {
     let pm = spec.package_manager?;
     let pkg = spec.package_name?;
     match pm {
-        "npm" => Some(vec!["uninstall".to_string(), "-g".to_string(), pkg.to_string()]),
-        "pip" => Some(vec!["uninstall".to_string(), "-y".to_string(), pkg.to_string()]),
+        "npm" => Some(vec![
+            "uninstall".to_string(),
+            "-g".to_string(),
+            pkg.to_string(),
+        ]),
+        "pip" => Some(vec![
+            "uninstall".to_string(),
+            "-y".to_string(),
+            pkg.to_string(),
+        ]),
         _ => None,
     }
 }
@@ -70,14 +78,16 @@ pub fn run_install(
         None => return Outcome::Err(format!("unknown agent: {agent}")),
     };
     if spec.tier != agent_registry::Tier::Cli {
-        return Outcome::Skipped(format!("{agent} is an editor extension, no binary to install"));
+        return Outcome::Skipped(format!(
+            "{agent} is an editor extension, no binary to install"
+        ));
     }
     let pm = match spec.package_manager {
         Some(p) => p,
         None => {
             return Outcome::Skipped(format!(
                 "{agent} has no automated install — download from the official site"
-            ))
+            ));
         }
     };
     let args = match install_args(spec, version) {
@@ -101,7 +111,7 @@ pub fn run_update(registry: &[AgentSpec], agent: &str, dry_run: bool) -> Outcome
         None => {
             return Outcome::Skipped(format!(
                 "{agent} is manually installed — re-download from the official site"
-            ))
+            ));
         }
     };
     let pkg = match spec.package_name {
@@ -121,14 +131,16 @@ pub fn run_uninstall(registry: &[AgentSpec], agent: &str, dry_run: bool) -> Outc
         None => return Outcome::Err(format!("unknown agent: {agent}")),
     };
     if spec.tier != agent_registry::Tier::Cli {
-        return Outcome::Skipped(format!("{agent} is an editor extension, nothing to uninstall"));
+        return Outcome::Skipped(format!(
+            "{agent} is an editor extension, nothing to uninstall"
+        ));
     }
     let pm = match spec.package_manager {
         Some(p) => p,
         None => {
             return Outcome::Skipped(format!(
                 "{agent} is manually installed — remove from your system manually"
-            ))
+            ));
         }
     };
     let args = match uninstall_args(spec) {

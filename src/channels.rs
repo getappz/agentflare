@@ -10,7 +10,7 @@
 //! - Slack:    `POST slack.com/api/chat.postMessage`  body `{channel, text}`    (Authorization: Bearer)
 //! - Discord:  `POST discord.com/api/v10/channels/{id}/messages`  body `{content}` (Authorization: Bot)
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A supported outbound chat platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,7 +177,9 @@ pub fn send_message(
     let token = crate::gateway_secrets::get_secret(conn, name)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| {
-            format!("no {name} configured — store the bot token as the gateway secret '{name}' first")
+            format!(
+                "no {name} configured — store the bot token as the gateway secret '{name}' first"
+            )
         })?;
     let req = build_request(platform, target, text, &token);
     send(platform, &req)
@@ -239,9 +241,16 @@ mod tests {
     #[test]
     fn interpret_slack_checks_the_ok_field_even_on_http_200() {
         assert!(interpret_response(Platform::Slack, 200, r#"{"ok":true,"ts":"1"}"#).is_ok());
-        let err = interpret_response(Platform::Slack, 200, r#"{"ok":false,"error":"channel_not_found"}"#)
-            .unwrap_err();
-        assert!(err.contains("channel_not_found"), "error should surface Slack's reason: {err}");
+        let err = interpret_response(
+            Platform::Slack,
+            200,
+            r#"{"ok":false,"error":"channel_not_found"}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("channel_not_found"),
+            "error should surface Slack's reason: {err}"
+        );
     }
 
     #[test]
@@ -268,9 +277,18 @@ mod tests {
         );
 
         let msg = describe_send_error(Platform::Telegram, &err);
-        assert!(!msg.contains(token), "error message must not leak the bot token: {msg}");
-        assert!(!msg.contains(&url), "error message must not leak the request URL: {msg}");
-        assert!(msg.contains("Telegram"), "error message should name the platform: {msg}");
+        assert!(
+            !msg.contains(token),
+            "error message must not leak the bot token: {msg}"
+        );
+        assert!(
+            !msg.contains(&url),
+            "error message must not leak the request URL: {msg}"
+        );
+        assert!(
+            msg.contains("Telegram"),
+            "error message should name the platform: {msg}"
+        );
     }
 
     #[test]

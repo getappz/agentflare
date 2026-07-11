@@ -24,7 +24,14 @@ static SENSITIVE_BASENAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 const SENSITIVE_PATH_COMPONENTS: &[&str] = &[".ssh", ".aws", ".gnupg", ".kube", ".docker"];
 const SENSITIVE_NAME_TOKENS: &[&str] = &[
-    "secret", "credential", "password", "passwd", "apikey", "accesskey", "token", "privatekey",
+    "secret",
+    "credential",
+    "password",
+    "passwd",
+    "apikey",
+    "accesskey",
+    "token",
+    "privatekey",
 ];
 
 pub fn is_sensitive_path(path: &Path) -> bool {
@@ -37,14 +44,19 @@ pub fn is_sensitive_path(path: &Path) -> bool {
     let has_sensitive_component = path.components().any(|c| {
         c.as_os_str()
             .to_str()
-            .map(|s| SENSITIVE_PATH_COMPONENTS.contains(&s.to_lowercase().as_str()))
-            .unwrap_or(false)
+            .is_some_and(|s| SENSITIVE_PATH_COMPONENTS.contains(&s.to_lowercase().as_str()))
     });
     if has_sensitive_component {
         return true;
     }
-    let normalized: String = name.to_lowercase().chars().filter(|c| !"_- .".contains(*c)).collect();
-    SENSITIVE_NAME_TOKENS.iter().any(|tok| normalized.contains(tok))
+    let normalized: String = name
+        .to_lowercase()
+        .chars()
+        .filter(|c| !"_- .".contains(*c))
+        .collect();
+    SENSITIVE_NAME_TOKENS
+        .iter()
+        .any(|tok| normalized.contains(tok))
 }
 
 #[cfg(test)]
@@ -70,7 +82,9 @@ mod tests {
 
     #[test]
     fn matches_ssh_path_component() {
-        assert!(is_sensitive_path(&PathBuf::from("/home/user/.ssh/id_ed25519")));
+        assert!(is_sensitive_path(&PathBuf::from(
+            "/home/user/.ssh/id_ed25519"
+        )));
     }
 
     #[test]

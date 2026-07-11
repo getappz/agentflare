@@ -2,13 +2,13 @@
 //! transport (`TokioChildProcess` + the `initialize` handshake via
 //! `ServiceExt::serve`) — not a bespoke REST bridge.
 
-use crate::circuit::{CircuitBreaker, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_RECOVERY_TIMEOUT};
+use crate::circuit::{CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_RECOVERY_TIMEOUT, CircuitBreaker};
 use crate::error::GatewayError;
 use crate::types::ToolEntry;
 use rmcp::{
+    RoleClient, ServiceExt,
     service::RunningService,
     transport::{ConfigureCommandExt, TokioChildProcess},
-    RoleClient, ServiceExt,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -50,7 +50,13 @@ impl McpStdioBackend {
         env: HashMap<String, String>,
         timeout: Duration,
     ) -> Self {
-        Self::with_timeout_and_circuit_recovery(command, args, env, timeout, CIRCUIT_RECOVERY_TIMEOUT)
+        Self::with_timeout_and_circuit_recovery(
+            command,
+            args,
+            env,
+            timeout,
+            CIRCUIT_RECOVERY_TIMEOUT,
+        )
     }
 
     /// Same as [`Self::with_timeout`] but with an explicit circuit-breaker
@@ -76,11 +82,12 @@ impl McpStdioBackend {
 
     async fn ensure_connected(
         &self,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<RunningService<RoleClient, ()>>>, GatewayError> {
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<RunningService<RoleClient, ()>>>, GatewayError>
+    {
         let mut guard = self.running.lock().await;
         if guard.is_none() {
-            let transport = TokioChildProcess::new(tokio::process::Command::new(&self.command).configure(
-                |cmd| {
+            let transport = TokioChildProcess::new(
+                tokio::process::Command::new(&self.command).configure(|cmd| {
                     cmd.args(&self.args);
                     for (k, v) in &self.env {
                         cmd.env(k, v);
@@ -93,9 +100,11 @@ impl McpStdioBackend {
                     // timeout actually terminates the hung child, not just our
                     // side of the connection.
                     cmd.kill_on_drop(true);
-                },
-            ))
-            .map_err(|e| GatewayError::Connection(format!("spawn '{}' failed: {e}", self.command)))?;
+                }),
+            )
+            .map_err(|e| {
+                GatewayError::Connection(format!("spawn '{}' failed: {e}", self.command))
+            })?;
             let running = tokio::time::timeout(self.timeout, ().serve(transport))
                 .await
                 .map_err(|_| {
@@ -190,7 +199,7 @@ impl McpStdioBackend {
                 // so `gateway_execute` maps it to `invalid_params`.
                 return Err(GatewayError::InvalidArgument(format!(
                     "args must be a JSON object, got {other}"
-                )))
+                )));
             }
         };
         let mut guard = self.ensure_connected().await?;

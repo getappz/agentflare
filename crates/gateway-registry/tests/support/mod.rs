@@ -12,13 +12,13 @@
 //! pulled in via `mod support;` from each real test file instead.
 
 use rmcp::{
+    ServerHandler,
     handler::server::wrapper::Parameters,
     model::{Implementation, ServerCapabilities, ServerInfo},
-    schemars,
+    schemars, tool, tool_handler, tool_router,
     transport::streamable_http_server::{
-        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
-    tool, tool_handler, tool_router, ServerHandler,
 };
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -77,15 +77,18 @@ impl Drop for HttpFixture {
 /// its full MCP endpoint URL (e.g. `http://127.0.0.1:54321/mcp`).
 pub async fn start() -> HttpFixture {
     let ct = CancellationToken::new();
-    let service: StreamableHttpService<HttpFixtureServer, LocalSessionManager> = StreamableHttpService::new(
-        || Ok(HttpFixtureServer),
-        Default::default(),
-        StreamableHttpServerConfig::default()
-            .with_sse_keep_alive(None)
-            .with_cancellation_token(ct.child_token()),
-    );
+    let service: StreamableHttpService<HttpFixtureServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            || Ok(HttpFixtureServer),
+            Default::default(),
+            StreamableHttpServerConfig::default()
+                .with_sse_keep_alive(None)
+                .with_cancellation_token(ct.child_token()),
+        );
     let router = axum::Router::new().nest_service("/mcp", service);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind fixture http listener");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture http listener");
     let addr = listener.local_addr().expect("fixture listener local_addr");
 
     let server_ct = ct.clone();
@@ -95,5 +98,8 @@ pub async fn start() -> HttpFixture {
             .await;
     });
 
-    HttpFixture { url: format!("http://{addr}/mcp"), cancel: ct }
+    HttpFixture {
+        url: format!("http://{addr}/mcp"),
+        cancel: ct,
+    }
 }

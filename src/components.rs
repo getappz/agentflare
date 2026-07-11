@@ -66,7 +66,11 @@ fn write_pinned_mode(path: &PathBuf) -> bool {
     let current: Option<String> = fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.get("defaultMode").and_then(|m| m.as_str()).map(String::from));
+        .and_then(|v| {
+            v.get("defaultMode")
+                .and_then(|m| m.as_str())
+                .map(String::from)
+        });
     if current.is_some() {
         return false;
     }
@@ -94,7 +98,11 @@ fn merge_json(path: &PathBuf, key: &str, value: Value) -> bool {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    fs::write(path, serde_json::to_string_pretty(&existing).unwrap_or_default() + "\n").is_ok()
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&existing).unwrap_or_default() + "\n",
+    )
+    .is_ok()
 }
 
 fn merge_opencode_mcp(path: &PathBuf, key: &str, entry: Value) -> bool {
@@ -106,33 +114,42 @@ fn merge_opencode_mcp(path: &PathBuf, key: &str, entry: Value) -> bool {
         existing = serde_json::json!({});
     }
     let obj = existing.as_object_mut().unwrap();
-    let mcp = obj
-        .entry("mcp")
-        .or_insert_with(|| serde_json::json!({}));
-    if let Some(m) = mcp.as_object_mut() {
-        if !m.contains_key(key) {
-            let command = entry.get("command").and_then(|c| c.as_str()).map(|s| s.to_string());
-            let args: Vec<String> = entry
-                .get("args")
-                .and_then(|a| a.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            let mut cmd = vec![command.unwrap_or_else(|| key.to_string())];
-            cmd.extend(args);
-            m.insert(
-                key.to_string(),
-                serde_json::json!({
-                    "command": cmd,
-                    "enabled": true,
-                    "type": "local",
-                }),
-            );
-        }
+    let mcp = obj.entry("mcp").or_insert_with(|| serde_json::json!({}));
+    if let Some(m) = mcp.as_object_mut()
+        && !m.contains_key(key)
+    {
+        let command = entry
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string());
+        let args: Vec<String> = entry
+            .get("args")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut cmd = vec![command.unwrap_or_else(|| key.to_string())];
+        cmd.extend(args);
+        m.insert(
+            key.to_string(),
+            serde_json::json!({
+                "command": cmd,
+                "enabled": true,
+                "type": "local",
+            }),
+        );
     }
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    fs::write(path, serde_json::to_string_pretty(&existing).unwrap_or_default() + "\n").is_ok()
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&existing).unwrap_or_default() + "\n",
+    )
+    .is_ok()
 }
 
 fn write_if_absent(path: &PathBuf, content: &str) -> bool {
@@ -163,20 +180,32 @@ pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
         }
         "cursor" => {
             let content = format!("---\nalwaysApply: true\n---\n\n{}", joined());
-            vec![(cwd().join(".cursor").join("rules").join("agentflare.mdc"), content)]
+            vec![(
+                cwd().join(".cursor").join("rules").join("agentflare.mdc"),
+                content,
+            )]
         }
         "codex" => {
             let content = format!("# Rules (agentflare)\n\n{}\n", joined());
             vec![(cwd().join("AGENTS.md"), content)]
         }
         "windsurf" => {
-            vec![(cwd().join(".windsurf").join("rules").join("agentflare.md"), joined() + "\n")]
+            vec![(
+                cwd().join(".windsurf").join("rules").join("agentflare.md"),
+                joined() + "\n",
+            )]
         }
         "vscode-copilot" => {
-            vec![(cwd().join(".github").join("copilot-instructions.md"), joined() + "\n")]
+            vec![(
+                cwd().join(".github").join("copilot-instructions.md"),
+                joined() + "\n",
+            )]
         }
         "cline" => {
-            vec![(cwd().join(".clinerules").join("agentflare.md"), joined() + "\n")]
+            vec![(
+                cwd().join(".clinerules").join("agentflare.md"),
+                joined() + "\n",
+            )]
         }
         "opencode" => {
             let dir = home().join(".config").join("opencode").join("rules");
@@ -236,8 +265,11 @@ fn sync_skill_overrides() -> Result<usize, String> {
     let mut settings = claude_settings();
     let added = apply_skill_overrides(&names, &mut settings)?;
     if added > 0 {
-        fs::write(&path, serde_json::to_string_pretty(&settings).unwrap_or_default() + "\n")
-            .map_err(|e| e.to_string())?;
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&settings).unwrap_or_default() + "\n",
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(added)
 }
@@ -633,12 +665,29 @@ mod tests {
         // testing: these two components must report "satisfied" (no
         // pending nag, no attempted install) on every host except
         // claude-code, since Ponytail/Caveman have no equivalent elsewhere.
-        for host in ["codex", "cursor", "windsurf", "vscode-copilot", "cline", "continue", "opencode"] {
+        for host in [
+            "codex",
+            "cursor",
+            "windsurf",
+            "vscode-copilot",
+            "cline",
+            "continue",
+            "opencode",
+        ] {
             let components = get_components(host);
-            let ponytail_plugin = components.iter().find(|c| c.id == "ponytail-plugin").unwrap();
+            let ponytail_plugin = components
+                .iter()
+                .find(|c| c.id == "ponytail-plugin")
+                .unwrap();
             let caveman_mode = components.iter().find(|c| c.id == "caveman-mode").unwrap();
-            assert!((ponytail_plugin.check)(), "ponytail-plugin should be satisfied on '{host}'");
-            assert!((caveman_mode.check)(), "caveman-mode should be satisfied on '{host}'");
+            assert!(
+                (ponytail_plugin.check)(),
+                "ponytail-plugin should be satisfied on '{host}'"
+            );
+            assert!(
+                (caveman_mode.check)(),
+                "caveman-mode should be satisfied on '{host}'"
+            );
         }
     }
 
@@ -648,18 +697,38 @@ mod tests {
         // format wired here yet — must never nag or attempt registration.
         for host in ["codex", "cursor", "windsurf", "vscode-copilot"] {
             let components = get_components(host);
-            let agentflare_mcp = components.iter().find(|c| c.id == "agentflare-mcp").unwrap();
-            assert!((agentflare_mcp.check)(), "agentflare-mcp should be satisfied on '{host}'");
+            let agentflare_mcp = components
+                .iter()
+                .find(|c| c.id == "agentflare-mcp")
+                .unwrap();
+            assert!(
+                (agentflare_mcp.check)(),
+                "agentflare-mcp should be satisfied on '{host}'"
+            );
         }
     }
 
     #[test]
     #[cfg(feature = "skill-overrides-sync")]
     fn skill_overrides_sync_reports_satisfied_on_non_claude_code_hosts() {
-        for host in ["codex", "cursor", "windsurf", "vscode-copilot", "cline", "continue", "opencode"] {
+        for host in [
+            "codex",
+            "cursor",
+            "windsurf",
+            "vscode-copilot",
+            "cline",
+            "continue",
+            "opencode",
+        ] {
             let components = get_components(host);
-            let sync = components.iter().find(|c| c.id == "skill-overrides-sync").unwrap();
-            assert!((sync.check)(), "skill-overrides-sync should be satisfied on '{host}'");
+            let sync = components
+                .iter()
+                .find(|c| c.id == "skill-overrides-sync")
+                .unwrap();
+            assert!(
+                (sync.check)(),
+                "skill-overrides-sync should be satisfied on '{host}'"
+            );
         }
     }
 

@@ -25,7 +25,9 @@ impl CoachingArgs {
     pub fn run(self) {
         match self.action {
             CoachingAction::List => crate::coaching::print_list(),
-            CoachingAction::Apply { id, title, body } => crate::coaching::cli_apply(&id, &title, &body),
+            CoachingAction::Apply { id, title, body } => {
+                crate::coaching::cli_apply(&id, &title, &body)
+            }
             CoachingAction::Remove { id } => crate::coaching::cli_remove(&id),
         }
     }

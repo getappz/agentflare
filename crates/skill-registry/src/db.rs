@@ -3,7 +3,7 @@
 //! inside one transaction.
 
 use crate::sources::SkillEntry;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 
 const SCHEMA: &str = "
@@ -64,7 +64,9 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
                 e.tags,
                 e.est_tokens,
                 e.mtime,
-                e.shadow_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                e.shadow_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
             ])?;
             if tx.changes() == 0 {
                 // Duplicate (name, source) was ignored: no new skills row,
@@ -99,13 +101,23 @@ mod tests {
     #[test]
     fn rebuild_replaces_rows_and_fts_stays_in_sync() {
         let mut conn = open_in_memory().unwrap();
-        rebuild(&mut conn, &[entry("a", "s", "alpha desc"), entry("b", "s", "beta desc")]).unwrap();
-        let n: i64 = conn.query_row("SELECT count(*) FROM skills", [], |r| r.get(0)).unwrap();
+        rebuild(
+            &mut conn,
+            &[entry("a", "s", "alpha desc"), entry("b", "s", "beta desc")],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM skills", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 2);
         rebuild(&mut conn, &[entry("c", "s", "gamma desc")]).unwrap();
-        let n: i64 = conn.query_row("SELECT count(*) FROM skills", [], |r| r.get(0)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM skills", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1);
-        let f: i64 = conn.query_row("SELECT count(*) FROM skills_fts", [], |r| r.get(0)).unwrap();
+        let f: i64 = conn
+            .query_row("SELECT count(*) FROM skills_fts", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(f, 1);
     }
 
@@ -128,12 +140,19 @@ mod tests {
         let mut conn = open_in_memory().unwrap();
         rebuild(
             &mut conn,
-            &[entry("dup", "s", "first desc"), entry("dup", "s", "second desc")],
+            &[
+                entry("dup", "s", "first desc"),
+                entry("dup", "s", "second desc"),
+            ],
         )
         .unwrap();
-        let n: i64 = conn.query_row("SELECT count(*) FROM skills", [], |r| r.get(0)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM skills", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1);
-        let f: i64 = conn.query_row("SELECT count(*) FROM skills_fts", [], |r| r.get(0)).unwrap();
+        let f: i64 = conn
+            .query_row("SELECT count(*) FROM skills_fts", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(f, 1);
         let hits = crate::search::search(&conn, "first", 5, crate::search::MatchMode::All).unwrap();
         assert_eq!(hits.len(), 1);
@@ -144,7 +163,9 @@ mod tests {
     fn open_db_sets_wal_journal_mode() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = open_db(&tmp.path().join("skills.db")).unwrap();
-        let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(mode, "wal");
     }
 }

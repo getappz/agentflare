@@ -9,6 +9,7 @@ pub const SKILL_HELP: &str = include_str!("skill-help.md");
 pub const SKILL_PLAYBOOK: &str = include_str!("skill-playbook.md");
 pub const SKILL_NO_HALLUCINATION: &str = include_str!("skill-no-hallucination.md");
 
+#[must_use]
 pub fn get(name: &str) -> Option<&'static str> {
     match name {
         "review" => Some(SKILL_REVIEW),
@@ -22,6 +23,7 @@ pub fn get(name: &str) -> Option<&'static str> {
     }
 }
 
+#[must_use]
 pub fn skills_dir() -> std::path::PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -36,18 +38,18 @@ static CUSTOM_SKILLS: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "md") {
-                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                    // Reserved built-in mode/skill names can't be shadowed by
-                    // custom files — a user's full.md must not hijack full mode.
-                    if crate::config::VALID_MODES.contains(&name) {
-                        continue;
-                    }
-                    if let Ok(body) = std::fs::read_to_string(&path) {
-                        if !body.is_empty() {
-                            map.insert(name.to_string(), body);
-                        }
-                    }
+            if path.extension().is_some_and(|e| e == "md")
+                && let Some(name) = path.file_stem().and_then(|s| s.to_str())
+            {
+                // Reserved built-in mode/skill names can't be shadowed by
+                // custom files — a user's full.md must not hijack full mode.
+                if crate::config::VALID_MODES.contains(&name) {
+                    continue;
+                }
+                if let Ok(body) = std::fs::read_to_string(&path)
+                    && !body.is_empty()
+                {
+                    map.insert(name.to_string(), body);
                 }
             }
         }
@@ -73,6 +75,7 @@ pub struct Finding {
     pub snippet: String,
 }
 
+#[must_use]
 pub fn detect_over_engineering(text: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
     ponytail_engineering_check_internal(text, &mut findings, 0);
@@ -82,10 +85,45 @@ pub fn detect_over_engineering(text: &str) -> Vec<Finding> {
 
 fn ponytail_engineering_check_internal(text: &str, findings: &mut Vec<Finding>, base_line: usize) {
     let patterns: &[(&str, &str, &str, &[&str])] = &[
-        ("lodash", "stdlib", "Use native JS methods: Array.map, Array.filter, Object.keys.", &["from \"lodash\"", "from 'lodash'", "require(\"lodash\")", "require('lodash')"]),
-        ("moment", "native", "Use Intl.DateTimeFormat, Date.toLocaleDateString, or Temporal.", &["from \"moment\"", "from 'moment'", "require(\"moment\")", "require('moment')"]),
-        ("axios", "native", "Use native fetch() instead of axios.", &["from \"axios\"", "from 'axios'", "require(\"axios\")", "require('axios')"]),
-        ("JSON.parse(JSON.stringify(", "stdlib", "Use structuredClone() for deep copy.", &["JSON.parse(JSON.stringify("]),
+        (
+            "lodash",
+            "stdlib",
+            "Use native JS methods: Array.map, Array.filter, Object.keys.",
+            &[
+                "from \"lodash\"",
+                "from 'lodash'",
+                "require(\"lodash\")",
+                "require('lodash')",
+            ],
+        ),
+        (
+            "moment",
+            "native",
+            "Use Intl.DateTimeFormat, Date.toLocaleDateString, or Temporal.",
+            &[
+                "from \"moment\"",
+                "from 'moment'",
+                "require(\"moment\")",
+                "require('moment')",
+            ],
+        ),
+        (
+            "axios",
+            "native",
+            "Use native fetch() instead of axios.",
+            &[
+                "from \"axios\"",
+                "from 'axios'",
+                "require(\"axios\")",
+                "require('axios')",
+            ],
+        ),
+        (
+            "JSON.parse(JSON.stringify(",
+            "stdlib",
+            "Use structuredClone() for deep copy.",
+            &["JSON.parse(JSON.stringify("],
+        ),
     ];
 
     for (line_num, line) in text.lines().enumerate() {
@@ -93,7 +131,10 @@ fn ponytail_engineering_check_internal(text: &str, findings: &mut Vec<Finding>, 
         for (_name, tag, replacement, needles) in patterns {
             if needles.iter().any(|n| lower.contains(&n.to_lowercase())) {
                 let trimmed = line.trim().to_string();
-                if !findings.iter().any(|f| f.line == base_line + line_num + 1 && f.problem == trimmed) {
+                if !findings
+                    .iter()
+                    .any(|f| f.line == base_line + line_num + 1 && f.problem == trimmed)
+                {
                     findings.push(Finding {
                         line: base_line + line_num + 1,
                         tag: (*tag).to_string(),

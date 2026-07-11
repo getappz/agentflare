@@ -4,7 +4,8 @@ use std::io::Read;
 /// Read-only/investigative subagent types get no ponytail persona by
 /// default — the persona's lazy-code/commit-style/etc. guidance is dead
 /// weight (~1300 tokens) for an agent that never writes code.
-const DEFAULT_EXCLUDE_AGENT_TYPES: &str = "explore|investigat|search|review|readonly|read-only|verify";
+const DEFAULT_EXCLUDE_AGENT_TYPES: &str =
+    "explore|investigat|search|review|readonly|read-only|verify";
 
 /// Decides whether to inject for a given `agent_type`. With no override,
 /// `DEFAULT_EXCLUDE_AGENT_TYPES` is a DENY-list (matches → skip injection).
@@ -125,11 +126,10 @@ impl PonytailArgs {
                 println!("{mode}");
             }
             PonytailAction::Set { mode } => {
-                let normalized = ponytail::normalize_config_mode(&mode)
-                    .unwrap_or_else(|| {
-                        eprintln!("error: invalid mode: {mode}");
-                        std::process::exit(1);
-                    });
+                let normalized = ponytail::normalize_config_mode(&mode).unwrap_or_else(|| {
+                    eprintln!("error: invalid mode: {mode}");
+                    std::process::exit(1);
+                });
                 ponytail::set_active(normalized).unwrap_or_else(|e| {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -137,11 +137,10 @@ impl PonytailArgs {
                 println!("{normalized}");
             }
             PonytailAction::Default { mode } => {
-                let normalized = ponytail::normalize_config_mode(&mode)
-                    .unwrap_or_else(|| {
-                        eprintln!("error: invalid mode: {mode}");
-                        std::process::exit(1);
-                    });
+                let normalized = ponytail::normalize_config_mode(&mode).unwrap_or_else(|| {
+                    eprintln!("error: invalid mode: {mode}");
+                    std::process::exit(1);
+                });
                 ponytail::set_default_mode(normalized).unwrap_or_else(|e| {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -181,8 +180,7 @@ impl PonytailArgs {
                     // session starts — otherwise active_mode() reads the stale
                     // override and set_active() below promotes it to global.
                     ponytail::clear_session();
-                    let mode = ponytail::active_mode()
-                        .unwrap_or_else(ponytail::default_mode);
+                    let mode = ponytail::active_mode().unwrap_or_else(ponytail::default_mode);
                     if mode != "off" {
                         ponytail::set_active(&mode).ok();
                     }
@@ -212,8 +210,8 @@ impl PonytailArgs {
                                 ponytail::clear_active();
                             }
                             ponytail::SwitchAction::Report => {
-                                let mode = ponytail::active_mode()
-                                    .unwrap_or_else(ponytail::default_mode);
+                                let mode =
+                                    ponytail::active_mode().unwrap_or_else(ponytail::default_mode);
                                 let platform = ponytail::detect_platform();
                                 let ctx = report_message(&mode);
                                 let output = ponytail::format_hook_output(
@@ -229,8 +227,7 @@ impl PonytailArgs {
                     println!("OK");
                 }
                 PonytailHookEvent::Statusline => {
-                    let mode = ponytail::active_mode()
-                        .unwrap_or_else(ponytail::default_mode);
+                    let mode = ponytail::active_mode().unwrap_or_else(ponytail::default_mode);
                     if mode == "off" || mode.is_empty() {
                         return;
                     }

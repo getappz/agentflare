@@ -71,8 +71,7 @@ static PRICING_CACHE: OnceLock<HashMap<String, ModelPricing>> = OnceLock::new();
 pub fn load_pricing() -> HashMap<String, ModelPricing> {
     PRICING_CACHE
         .get_or_init(|| {
-            parse_pricing_file(PRICING_JSON)
-                .expect("embedded anthropic-pricing.json is invalid")
+            parse_pricing_file(PRICING_JSON).expect("embedded anthropic-pricing.json is invalid")
         })
         .clone()
 }
@@ -159,10 +158,10 @@ fn parse_claude_model(model_id: &str) -> Option<(Family, (u32, u32))> {
     for token in lower.split('-') {
         if let Some(f) = Family::from_token(token) {
             family = Some(f);
-        } else if let Ok(n) = token.parse::<u32>() {
-            if n < 1000 {
-                versions.push(n);
-            }
+        } else if let Ok(n) = token.parse::<u32>()
+            && n < 1000
+        {
+            versions.push(n);
         }
     }
     let family = family?;
@@ -187,7 +186,7 @@ fn family_nearest_pricing<'a>(
     if candidates.is_empty() {
         return None;
     }
-    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates.sort_by_key(|a| a.0);
 
     candidates
         .iter()
@@ -208,10 +207,10 @@ pub fn lookup_pricing<'a>(
     if let Some(p) = pricing.get(model_id) {
         return Some(p);
     }
-    if let Some(resolved) = resolve_model_alias(model_id) {
-        if let Some(p) = pricing.get(resolved) {
-            return Some(p);
-        }
+    if let Some(resolved) = resolve_model_alias(model_id)
+        && let Some(p) = pricing.get(resolved)
+    {
+        return Some(p);
     }
     // Longest matching prefix wins — HashMap iteration order is random, so
     // taking the first match would resolve ambiguous ids nondeterministically.
@@ -350,7 +349,10 @@ mod tests {
     #[test]
     fn test_opus_46_flat_pricing() {
         let pricing = pricing();
-        let tokens = TokenUsage { input_tokens: 500_000, ..Default::default() };
+        let tokens = TokenUsage {
+            input_tokens: 500_000,
+            ..Default::default()
+        };
         let cost = calculate_cost(&tokens, Some("claude-opus-4-6"), &pricing);
         assert!((cost.total_usd - 2.50).abs() < 0.001);
         assert!(!cost.has_unpriced_usage);
@@ -359,7 +361,10 @@ mod tests {
     #[test]
     fn test_sonnet_45_tiered_pricing() {
         let pricing = pricing();
-        let tokens = TokenUsage { input_tokens: 500_000, ..Default::default() };
+        let tokens = TokenUsage {
+            input_tokens: 500_000,
+            ..Default::default()
+        };
         let cost = calculate_cost(&tokens, Some("claude-sonnet-4-5-20250929"), &pricing);
         assert!((cost.total_usd - 2.40).abs() < 0.001);
     }
@@ -367,7 +372,10 @@ mod tests {
     #[test]
     fn test_unknown_model_has_no_fake_usd() {
         let pricing = pricing();
-        let tokens = TokenUsage { input_tokens: 1_000_000, ..Default::default() };
+        let tokens = TokenUsage {
+            input_tokens: 1_000_000,
+            ..Default::default()
+        };
         let cost = calculate_cost(&tokens, Some("gpt-4o"), &pricing);
         assert_eq!(cost.total_usd, 0.0);
         assert!(cost.has_unpriced_usage);

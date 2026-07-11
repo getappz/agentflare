@@ -4,6 +4,7 @@
 
 use crate::optimize;
 use rmcp::{
+    ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
     model::{
         AnnotateAble, ErrorData, GetPromptRequestParams, GetPromptResult, Implementation,
@@ -15,7 +16,6 @@ use rmcp::{
     service::{RequestContext, RoleServer},
     tool, tool_handler, tool_router,
     transport::stdio,
-    ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
 
@@ -38,14 +38,18 @@ struct SkillSearchRequest {
     #[schemars(description = "Max results (default 5)")]
     #[serde(default)]
     limit: Option<usize>,
-    #[schemars(description = "'all' = every word must match (default); 'any' = broader recall for retries")]
+    #[schemars(
+        description = "'all' = every word must match (default); 'any' = broader recall for retries"
+    )]
     #[serde(default)]
     mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SkillLoadRequest {
-    #[schemars(description = "Skill name from skill_search; qualify as 'source:name' if ambiguous")]
+    #[schemars(
+        description = "Skill name from skill_search; qualify as 'source:name' if ambiguous"
+    )]
     name: String,
     #[schemars(description = "true = load the original even when a compressed copy exists")]
     #[serde(default)]
@@ -59,7 +63,9 @@ struct GatewaySearchRequest {
     #[schemars(description = "Max results (default 5)")]
     #[serde(default)]
     limit: Option<usize>,
-    #[schemars(description = "'all' = every word must match (default); 'any' = broader recall for retries")]
+    #[schemars(
+        description = "'all' = every word must match (default); 'any' = broader recall for retries"
+    )]
     #[serde(default)]
     mode: Option<String>,
 }
@@ -170,15 +176,21 @@ struct ArtifactPublishRequest {
     #[schemars(description = "html | markdown | mermaid | diagram | text (default: text)")]
     #[serde(default)]
     r#type: Option<String>,
-    #[schemars(description = "Full artifact content (HTML document, markdown source, plain text, ...)")]
+    #[schemars(
+        description = "Full artifact content (HTML document, markdown source, plain text, ...)"
+    )]
     content: String,
     #[schemars(description = "Session ID for grouping artifacts (optional)")]
     #[serde(default)]
     session_id: Option<String>,
-    #[schemars(description = "Existing artifact id to update in place — keeps the same URL and live-reloads open viewers")]
+    #[schemars(
+        description = "Existing artifact id to update in place — keeps the same URL and live-reloads open viewers"
+    )]
     #[serde(default)]
     update_id: Option<String>,
-    #[schemars(description = "Short label for this version, shown in history (e.g. \"draft\", \"final\")")]
+    #[schemars(
+        description = "Short label for this version, shown in history (e.g. \"draft\", \"final\")"
+    )]
     #[serde(default)]
     label: Option<String>,
     #[schemars(description = "One-line description shown in the gallery")]
@@ -187,16 +199,24 @@ struct ArtifactPublishRequest {
     #[schemars(description = "One or two emoji used as the page icon")]
     #[serde(default)]
     favicon: Option<String>,
-    #[schemars(description = "Optimistic-concurrency guard: update only applies if the artifact's current version equals this; otherwise a version-conflict error is returned")]
+    #[schemars(
+        description = "Optimistic-concurrency guard: update only applies if the artifact's current version equals this; otherwise a version-conflict error is returned"
+    )]
     #[serde(default)]
     base_version: Option<u32>,
-    #[schemars(description = "Handoff envelope: which agent/runtime is publishing (e.g. claude-code, codex)")]
+    #[schemars(
+        description = "Handoff envelope: which agent/runtime is publishing (e.g. claude-code, codex)"
+    )]
     #[serde(default)]
     sender: Option<String>,
-    #[schemars(description = "Handoff envelope: agent/runtime this artifact is addressed to — for WORK PRODUCTS only; facts and decisions belong in memory (memory_remember), not artifacts")]
+    #[schemars(
+        description = "Handoff envelope: agent/runtime this artifact is addressed to — for WORK PRODUCTS only; facts and decisions belong in memory (memory_remember), not artifacts"
+    )]
     #[serde(default)]
     recipient: Option<String>,
-    #[schemars(description = "Handoff envelope: thread this belongs to; replies reuse the sender's thread_id")]
+    #[schemars(
+        description = "Handoff envelope: thread this belongs to; replies reuse the sender's thread_id"
+    )]
     #[serde(default)]
     thread_id: Option<String>,
     #[schemars(description = "Handoff envelope: artifact id this replies to")]
@@ -210,11 +230,15 @@ struct ArtifactPublishRequest {
 /// intended handoff can't silently land in no inbox.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct HandoffRequest {
-    #[schemars(description = "Agent/runtime this handoff is addressed to — its inbox (artifact_list recipient=...). Required.")]
+    #[schemars(
+        description = "Agent/runtime this handoff is addressed to — its inbox (artifact_list recipient=...). Required."
+    )]
     recipient: String,
     #[schemars(description = "Short name/brief for the handoff, shown in the recipient's inbox")]
     name: String,
-    #[schemars(description = "The work product being handed off (diff, review, document, ...). Prepend the brief so the recipient knows the ask.")]
+    #[schemars(
+        description = "The work product being handed off (diff, review, document, ...). Prepend the brief so the recipient knows the ask."
+    )]
     content: String,
     #[schemars(description = "html | markdown | mermaid | diagram | text (default: markdown)")]
     #[serde(default)]
@@ -360,7 +384,9 @@ struct MemoryRelateRequest {
     source_id: i64,
     #[schemars(description = "Target observation ID")]
     target_id: i64,
-    #[schemars(description = "Relation: related|compatible|scoped|conflicts_with|supersedes|not_conflict")]
+    #[schemars(
+        description = "Relation: related|compatible|scoped|conflicts_with|supersedes|not_conflict"
+    )]
     relation: String,
     #[schemars(description = "Reason for the relation")]
     #[serde(default)]
@@ -489,7 +515,9 @@ impl ArtifactBackend {
 
 #[tool_router]
 impl AgentflareMcp {
-    #[tool(description = "Check if a session should be refreshed based on turn count and elapsed time.")]
+    #[tool(
+        description = "Check if a session should be refreshed based on turn count and elapsed time."
+    )]
     fn check_session_health(
         &self,
         Parameters(CheckSessionHealthRequest { session_id }): Parameters<CheckSessionHealthRequest>,
@@ -504,10 +532,14 @@ impl AgentflareMcp {
             .unwrap_or(0);
         let result = match runtime.sessions.get(&session_id) {
             Some(record) => match optimize::session_hygiene_nudge(record, now) {
-                Some(nudge) => serde_json::json!({"session_id": session_id, "status": "stale", "nudge": nudge}),
+                Some(nudge) => {
+                    serde_json::json!({"session_id": session_id, "status": "stale", "nudge": nudge})
+                }
                 None => serde_json::json!({"session_id": session_id, "status": "healthy"}),
             },
-            None => serde_json::json!({"session_id": session_id, "status": "unknown", "message": "Session not tracked"}),
+            None => {
+                serde_json::json!({"session_id": session_id, "status": "unknown", "message": "Session not tracked"})
+            }
         };
         Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
     }
@@ -560,7 +592,9 @@ impl AgentflareMcp {
         Ok(f(reg))
     }
 
-    #[tool(description = "Search installed skills (all agents' skill dirs) by task description. Returns name, source, description, and estimated token cost; call skill_load to fetch one.")]
+    #[tool(
+        description = "Search installed skills (all agents' skill dirs) by task description. Returns name, source, description, and estimated token cost; call skill_load to fetch one."
+    )]
     fn skill_search(
         &self,
         Parameters(SkillSearchRequest { query, limit, mode }): Parameters<SkillSearchRequest>,
@@ -575,7 +609,7 @@ impl AgentflareMcp {
                 return Err(ErrorData::invalid_params(
                     format!("mode must be 'all' or 'any', got '{other}'"),
                     None,
-                ))
+                ));
             }
         };
         let hits = self
@@ -584,7 +618,9 @@ impl AgentflareMcp {
         Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
     }
 
-    #[tool(description = "Load a skill's full instructions by name. Serves the compressed copy when one exists (original=true for the source). Sibling reference files are listed, not inlined.")]
+    #[tool(
+        description = "Load a skill's full instructions by name. Serves the compressed copy when one exists (original=true for the source). Sibling reference files are listed, not inlined."
+    )]
     fn skill_load(
         &self,
         Parameters(SkillLoadRequest { name, original }): Parameters<SkillLoadRequest>,
@@ -629,16 +665,14 @@ impl AgentflareMcp {
                 // Overridden stores (tests) stay private: the shared fixed
                 // port serves the default store, not this one.
                 Some(dir) => {
-                    let store =
-                        std::sync::Arc::new(agentflare_artifacts::ArtifactStore::new(dir));
+                    let store = std::sync::Arc::new(agentflare_artifacts::ArtifactStore::new(dir));
                     let server = agentflare_artifacts::ArtifactServer::start(store.clone(), 0)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                     (store, ArtifactBackend::Owned(server))
                 }
                 None => {
                     let dir = crate::paths::home().join(".agentflare").join("artifacts");
-                    let store =
-                        std::sync::Arc::new(agentflare_artifacts::ArtifactStore::new(dir));
+                    let store = std::sync::Arc::new(agentflare_artifacts::ArtifactStore::new(dir));
                     let backend = Self::shared_backend(&store)?;
                     (store, backend)
                 }
@@ -679,7 +713,9 @@ impl AgentflareMcp {
         }
     }
 
-    #[tool(description = "Publish a live-shareable artifact page (HTML, markdown, mermaid, text, ...) and return its local URL. Pass update_id to update in place — same URL, open viewers live-reload; every publish snapshots a version. Pass base_version to fail on concurrent edits instead of clobbering.")]
+    #[tool(
+        description = "Publish a live-shareable artifact page (HTML, markdown, mermaid, text, ...) and return its local URL. Pass update_id to update in place — same URL, open viewers live-reload; every publish snapshots a version. Pass base_version to fail on concurrent edits instead of clobbering."
+    )]
     fn artifact_publish(
         &self,
         Parameters(ArtifactPublishRequest {
@@ -733,7 +769,9 @@ impl AgentflareMcp {
         Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
     }
 
-    #[tool(description = "Hand a work product to another agent's inbox. Like artifact_publish, but recipient is REQUIRED, so the artifact is routed and shows up in that agent's artifact_list(recipient=...) inbox — it can't silently land nowhere. Use for agent-to-agent handoffs (reviews, diffs, docs); use artifact_publish for plain shareable pages. Sender is this runtime's own identity.")]
+    #[tool(
+        description = "Hand a work product to another agent's inbox. Like artifact_publish, but recipient is REQUIRED, so the artifact is routed and shows up in that agent's artifact_list(recipient=...) inbox — it can't silently land nowhere. Use for agent-to-agent handoffs (reviews, diffs, docs); use artifact_publish for plain shareable pages. Sender is this runtime's own identity."
+    )]
     fn handoff(
         &self,
         Parameters(HandoffRequest {
@@ -821,10 +859,16 @@ impl AgentflareMcp {
         }
     }
 
-    #[tool(description = "List published artifacts (id, name, type, version, description, session, handoff envelope) with their local URLs. Filter by session_id, recipient (inbox), or thread_id.")]
+    #[tool(
+        description = "List published artifacts (id, name, type, version, description, session, handoff envelope) with their local URLs. Filter by session_id, recipient (inbox), or thread_id."
+    )]
     fn artifact_list(
         &self,
-        Parameters(ArtifactListRequest { session_id, recipient, thread_id }): Parameters<ArtifactListRequest>,
+        Parameters(ArtifactListRequest {
+            session_id,
+            recipient,
+            thread_id,
+        }): Parameters<ArtifactListRequest>,
     ) -> Result<String, ErrorData> {
         let (store, base) = self.ensure_artifact_server()?;
         let summaries = store
@@ -833,16 +877,17 @@ impl AgentflareMcp {
         let items: Vec<serde_json::Value> = summaries
             .iter()
             .filter(|s| {
-                recipient.as_deref().is_none_or(|r| s.recipient.as_deref() == Some(r))
-                    && thread_id.as_deref().is_none_or(|t| s.thread_id.as_deref() == Some(t))
+                recipient
+                    .as_deref()
+                    .is_none_or(|r| s.recipient.as_deref() == Some(r))
+                    && thread_id
+                        .as_deref()
+                        .is_none_or(|t| s.thread_id.as_deref() == Some(t))
             })
             .map(|s| {
                 let mut v = serde_json::to_value(s).unwrap_or_default();
                 if let Some(obj) = v.as_object_mut() {
-                    obj.insert(
-                        "url".into(),
-                        serde_json::json!(format!("{base}/{}", s.id)),
-                    );
+                    obj.insert("url".into(), serde_json::json!(format!("{base}/{}", s.id)));
                 }
                 v
             })
@@ -850,7 +895,9 @@ impl AgentflareMcp {
         Ok(serde_json::to_string_pretty(&items).unwrap_or_default())
     }
 
-    #[tool(description = "Fetch an artifact's full content and metadata by id; pass version to read an older snapshot. Version history itself is at GET /{id}/versions.")]
+    #[tool(
+        description = "Fetch an artifact's full content and metadata by id; pass version to read an older snapshot. Version history itself is at GET /{id}/versions."
+    )]
     fn artifact_get(
         &self,
         Parameters(ArtifactGetRequest { id, version }): Parameters<ArtifactGetRequest>,
@@ -867,10 +914,16 @@ impl AgentflareMcp {
         Ok(serde_json::to_string_pretty(&artifact).unwrap_or_default())
     }
 
-    #[tool(description = "Unified diff between two versions of an artifact; to_version defaults to the latest. Use after an update to see what changed.")]
+    #[tool(
+        description = "Unified diff between two versions of an artifact; to_version defaults to the latest. Use after an update to see what changed."
+    )]
     fn artifact_diff(
         &self,
-        Parameters(ArtifactDiffRequest { id, from_version, to_version }): Parameters<ArtifactDiffRequest>,
+        Parameters(ArtifactDiffRequest {
+            id,
+            from_version,
+            to_version,
+        }): Parameters<ArtifactDiffRequest>,
     ) -> Result<String, ErrorData> {
         if id.trim().is_empty() {
             return Err(ErrorData::invalid_params("id is required", None));
@@ -880,10 +933,14 @@ impl AgentflareMcp {
             Some(v) => v,
             None => store.get(&id).map_err(Self::artifact_error)?.version,
         };
-        store.diff(&id, from_version, to).map_err(Self::artifact_error)
+        store
+            .diff(&id, from_version, to)
+            .map_err(Self::artifact_error)
     }
 
-    #[tool(description = "Case-insensitive search across artifact names, descriptions, and content; returns matching summaries with a snippet around the first content match.")]
+    #[tool(
+        description = "Case-insensitive search across artifact names, descriptions, and content; returns matching summaries with a snippet around the first content match."
+    )]
     fn artifact_search(
         &self,
         Parameters(ArtifactSearchRequest { query, session_id }): Parameters<ArtifactSearchRequest>,
@@ -894,13 +951,19 @@ impl AgentflareMcp {
         let (store, base) = self.ensure_artifact_server()?;
         let needle = query.to_lowercase();
         let mut hits = Vec::new();
-        for summary in store.list(session_id.as_deref()).map_err(Self::artifact_error)? {
+        for summary in store
+            .list(session_id.as_deref())
+            .map_err(Self::artifact_error)?
+        {
             let name_hit = summary.name.to_lowercase().contains(&needle);
             let desc_hit = summary
                 .description
                 .as_deref()
                 .is_some_and(|d| d.to_lowercase().contains(&needle));
-            let content = store.get(&summary.id).map(|a| a.content).unwrap_or_default();
+            let content = store
+                .get(&summary.id)
+                .map(|a| a.content)
+                .unwrap_or_default();
             let content_pos = content.to_lowercase().find(&needle);
             if !(name_hit || desc_hit || content_pos.is_some()) {
                 continue;
@@ -944,10 +1007,16 @@ impl AgentflareMcp {
         Ok(serde_json::json!({ "deleted": deleted }).to_string())
     }
 
-    #[tool(description = "Send a text message out to a chat platform (telegram, slack, or discord). The bot token must already be stored as the gateway secret '<platform>_bot_token'. target is the Telegram chat_id or Slack/Discord channel id.")]
+    #[tool(
+        description = "Send a text message out to a chat platform (telegram, slack, or discord). The bot token must already be stored as the gateway secret '<platform>_bot_token'. target is the Telegram chat_id or Slack/Discord channel id."
+    )]
     fn channel_send(
         &self,
-        Parameters(ChannelSendRequest { platform, target, message }): Parameters<ChannelSendRequest>,
+        Parameters(ChannelSendRequest {
+            platform,
+            target,
+            message,
+        }): Parameters<ChannelSendRequest>,
     ) -> Result<String, ErrorData> {
         let plat = crate::channels::Platform::parse(&platform).ok_or_else(|| {
             ErrorData::invalid_params(
@@ -962,7 +1031,9 @@ impl AgentflareMcp {
         Ok(serde_json::json!({ "sent": true, "platform": platform, "target": target }).to_string())
     }
 
-    #[tool(description = "Claim a GitHub issue/PR so other agents don't duplicate the work. Returns 'acquired' if you now own it, or 'held' with the current owner if a live claim exists. Only stale (past-TTL) or done claims are stolen. Re-heartbeat periodically to keep it.")]
+    #[tool(
+        description = "Claim a GitHub issue/PR so other agents don't duplicate the work. Returns 'acquired' if you now own it, or 'held' with the current owner if a live claim exists. Only stale (past-TTL) or done claims are stolen. Re-heartbeat periodically to keep it."
+    )]
     fn claim_acquire(
         &self,
         Parameters(ClaimTargetRequest { target, repo }): Parameters<ClaimTargetRequest>,
@@ -972,10 +1043,19 @@ impl AgentflareMcp {
         let repo_overridden = repo.as_ref().is_some_and(|r| !r.is_empty());
         let (conn, repo) = Self::claim_ctx(&target, repo)?;
         let owner = crate::claims::owner_id();
-        let commit = if repo_overridden { None } else { Self::git_provenance().and_then(|g| g.commit) };
+        let commit = if repo_overridden {
+            None
+        } else {
+            Self::git_provenance().and_then(|g| g.commit)
+        };
         let outcome = crate::claims::acquire(
-            &conn, &repo, &target, &owner, commit.as_deref(),
-            crate::claims::now(), crate::claims::ttl_secs(),
+            &conn,
+            &repo,
+            &target,
+            &owner,
+            commit.as_deref(),
+            crate::claims::now(),
+            crate::claims::ttl_secs(),
         )
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(match outcome {
@@ -989,7 +1069,9 @@ impl AgentflareMcp {
         .to_string())
     }
 
-    #[tool(description = "Refresh the lease on a claim you own, so it isn't reclaimed as stale. Returns refreshed=false if the claim is gone or owned by someone else.")]
+    #[tool(
+        description = "Refresh the lease on a claim you own, so it isn't reclaimed as stale. Returns refreshed=false if the claim is gone or owned by someone else."
+    )]
     fn claim_heartbeat(
         &self,
         Parameters(ClaimTargetRequest { target, repo }): Parameters<ClaimTargetRequest>,
@@ -1001,7 +1083,9 @@ impl AgentflareMcp {
         Ok(serde_json::json!({ "refreshed": ok, "repo": repo, "target": target }).to_string())
     }
 
-    #[tool(description = "Release a claim you own, freeing the target for other agents. Returns released=false if it wasn't yours.")]
+    #[tool(
+        description = "Release a claim you own, freeing the target for other agents. Returns released=false if it wasn't yours."
+    )]
     fn claim_release(
         &self,
         Parameters(ClaimTargetRequest { target, repo }): Parameters<ClaimTargetRequest>,
@@ -1013,7 +1097,9 @@ impl AgentflareMcp {
         Ok(serde_json::json!({ "released": ok, "repo": repo, "target": target }).to_string())
     }
 
-    #[tool(description = "Mark a claim you own as done — keeps the audit row (unlike release, which deletes it) while freeing the target for re-acquisition. Returns done=false if it wasn't yours.")]
+    #[tool(
+        description = "Mark a claim you own as done — keeps the audit row (unlike release, which deletes it) while freeing the target for re-acquisition. Returns done=false if it wasn't yours."
+    )]
     fn claim_done(
         &self,
         Parameters(ClaimTargetRequest { target, repo }): Parameters<ClaimTargetRequest>,
@@ -1025,10 +1111,16 @@ impl AgentflareMcp {
         Ok(serde_json::json!({ "done": ok, "repo": repo, "target": target }).to_string())
     }
 
-    #[tool(description = "List work claims. Defaults to live claims for the current repo; set all=true to include stale/done, all_repos=true to span every repo.")]
+    #[tool(
+        description = "List work claims. Defaults to live claims for the current repo; set all=true to include stale/done, all_repos=true to span every repo."
+    )]
     fn claim_list(
         &self,
-        Parameters(ClaimListRequest { repo, all, all_repos }): Parameters<ClaimListRequest>,
+        Parameters(ClaimListRequest {
+            repo,
+            all,
+            all_repos,
+        }): Parameters<ClaimListRequest>,
     ) -> Result<String, ErrorData> {
         let conn = Self::claim_db()?;
         let scope = if all_repos {
@@ -1041,19 +1133,29 @@ impl AgentflareMcp {
                 )
             })?)
         };
-        let claims = crate::claims::list(&conn, scope.as_deref(), all, crate::claims::now(), crate::claims::ttl_secs())
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let claims = crate::claims::list(
+            &conn,
+            scope.as_deref(),
+            all,
+            crate::claims::now(),
+            crate::claims::ttl_secs(),
+        )
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(serde_json::to_string_pretty(&claims).unwrap_or_default())
     }
 
     /// Opens the ledger db, mapping errors to MCP internal_error.
     fn claim_db() -> Result<rusqlite::Connection, ErrorData> {
-        crate::db::open().map_err(|e| ErrorData::internal_error(format!("cannot open ledger: {e}"), None))
+        crate::db::open()
+            .map_err(|e| ErrorData::internal_error(format!("cannot open ledger: {e}"), None))
     }
 
     /// Shared prelude for the per-target claim tools: validate target, open the
     /// ledger, resolve the repo key.
-    fn claim_ctx(target: &str, repo: Option<String>) -> Result<(rusqlite::Connection, String), ErrorData> {
+    fn claim_ctx(
+        target: &str,
+        repo: Option<String>,
+    ) -> Result<(rusqlite::Connection, String), ErrorData> {
         if target.trim().is_empty() {
             return Err(ErrorData::invalid_params("target is required", None));
         }
@@ -1067,15 +1169,24 @@ impl AgentflareMcp {
         Ok((conn, repo))
     }
 
-    #[tool(description = "Submit a finder's review findings for a round (each finding is {file, line, message, severity?, category?}). Replaces this finder's prior findings for the round. Call from each reviewing agent, then call review_consensus to verify + dedup + tag.")]
+    #[tool(
+        description = "Submit a finder's review findings for a round (each finding is {file, line, message, severity?, category?}). Replaces this finder's prior findings for the round. Call from each reviewing agent, then call review_consensus to verify + dedup + tag."
+    )]
     fn review_submit(
         &self,
-        Parameters(ReviewSubmitRequest { findings, pr, agent, repo }): Parameters<ReviewSubmitRequest>,
+        Parameters(ReviewSubmitRequest {
+            findings,
+            pr,
+            agent,
+            repo,
+        }): Parameters<ReviewSubmitRequest>,
     ) -> Result<String, ErrorData> {
         let conn = Self::claim_db()?;
         let repo = Self::resolve_repo_or_err(repo)?;
         let pr = Self::resolve_round(pr)?;
-        let agent = agent.filter(|s| !s.is_empty()).unwrap_or_else(crate::review::submitter_name);
+        let agent = agent
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(crate::review::submitter_name);
         let parsed: Vec<crate::review::Finding> = findings
             .into_iter()
             .map(serde_json::from_value)
@@ -1083,13 +1194,23 @@ impl AgentflareMcp {
             .map_err(|e| ErrorData::invalid_params(format!("invalid finding: {e}"), None))?;
         let n = crate::review::submit(&conn, &repo, &pr, &agent, &parsed, crate::claims::now())
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(serde_json::json!({ "submitted": n, "repo": repo, "pr": pr, "agent": agent }).to_string())
+        Ok(
+            serde_json::json!({ "submitted": n, "repo": repo, "pr": pr, "agent": agent })
+                .to_string(),
+        )
     }
 
-    #[tool(description = "Verify all submitted findings for a round against the git diff (base...head), dedup overlapping ones, and tag each CONFIRMED/UNIQUE/DISPUTED/UNVERIFIED. Returns the ranked consensus items.")]
+    #[tool(
+        description = "Verify all submitted findings for a round against the git diff (base...head), dedup overlapping ones, and tag each CONFIRMED/UNIQUE/DISPUTED/UNVERIFIED. Returns the ranked consensus items."
+    )]
     fn review_consensus(
         &self,
-        Parameters(ReviewConsensusRequest { pr, base, head, repo }): Parameters<ReviewConsensusRequest>,
+        Parameters(ReviewConsensusRequest {
+            pr,
+            base,
+            head,
+            repo,
+        }): Parameters<ReviewConsensusRequest>,
     ) -> Result<String, ErrorData> {
         let conn = Self::claim_db()?;
         let repo = Self::resolve_repo_or_err(repo)?;
@@ -1139,10 +1260,17 @@ impl AgentflareMcp {
         Ok(serde_json::json!({ "cleared": n, "repo": repo, "pr": pr }).to_string())
     }
 
-    #[tool(description = "Record this round's per-agent accuracy: how many of each finder's findings cited a real changed line (verified) vs total. Idempotent per round. Feeds review_scores.")]
+    #[tool(
+        description = "Record this round's per-agent accuracy: how many of each finder's findings cited a real changed line (verified) vs total. Idempotent per round. Feeds review_scores."
+    )]
     fn review_record(
         &self,
-        Parameters(ReviewConsensusRequest { pr, base, head, repo }): Parameters<ReviewConsensusRequest>,
+        Parameters(ReviewConsensusRequest {
+            pr,
+            base,
+            head,
+            repo,
+        }): Parameters<ReviewConsensusRequest>,
     ) -> Result<String, ErrorData> {
         let conn = Self::claim_db()?;
         let repo = Self::resolve_repo_or_err(repo)?;
@@ -1152,18 +1280,31 @@ impl AgentflareMcp {
         let diff = crate::review::compute_diff(base.as_deref(), head.as_deref())
             .map_err(|e| ErrorData::invalid_params(e, None))?;
         let changed = crate::review::changed_lines(&diff);
-        let n = crate::review::record_round(&conn, &repo, &pr, &findings, &changed, crate::claims::now())
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let n = crate::review::record_round(
+            &conn,
+            &repo,
+            &pr,
+            &findings,
+            &changed,
+            crate::claims::now(),
+        )
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(serde_json::json!({ "recorded_agents": n, "repo": repo, "pr": pr }).to_string())
     }
 
-    #[tool(description = "Per-agent accuracy across recorded rounds: verified/total citation rate, ranked. Use to weight which finders to trust or dispatch.")]
+    #[tool(
+        description = "Per-agent accuracy across recorded rounds: verified/total citation rate, ranked. Use to weight which finders to trust or dispatch."
+    )]
     fn review_scores(
         &self,
         Parameters(ReviewScoresRequest { repo, all_repos }): Parameters<ReviewScoresRequest>,
     ) -> Result<String, ErrorData> {
         let conn = Self::claim_db()?;
-        let scope = if all_repos { None } else { Some(Self::resolve_repo_or_err(repo)?) };
+        let scope = if all_repos {
+            None
+        } else {
+            Some(Self::resolve_repo_or_err(repo)?)
+        };
         let scores = crate::review::scores(&conn, scope.as_deref())
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(serde_json::to_string_pretty(&scores).unwrap_or_default())
@@ -1171,7 +1312,10 @@ impl AgentflareMcp {
 
     fn resolve_repo_or_err(repo: Option<String>) -> Result<String, ErrorData> {
         crate::claims::resolve_repo(repo).ok_or_else(|| {
-            ErrorData::invalid_params("could not determine repo — run in a git repo or pass repo=owner/name", None)
+            ErrorData::invalid_params(
+                "could not determine repo — run in a git repo or pass repo=owner/name",
+                None,
+            )
         })
     }
 
@@ -1191,11 +1335,16 @@ impl AgentflareMcp {
     }
 
     fn gateway_db_path() -> std::path::PathBuf {
-        dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("agentflare").join("gateway.db")
+        dirs::data_local_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("agentflare")
+            .join("gateway.db")
     }
 
     fn load_gateway_config() -> gateway_registry::GatewayConfig {
-        let path = crate::paths::home().join(".agentflare").join("gateway.toml");
+        let path = crate::paths::home()
+            .join(".agentflare")
+            .join("gateway.toml");
         match std::fs::read_to_string(&path) {
             Ok(s) => match gateway_registry::parse_config(&s) {
                 Ok(config) => config,
@@ -1238,19 +1387,21 @@ impl AgentflareMcp {
         };
         names
             .into_iter()
-            .filter_map(|name| match crate::gateway_secrets::get_secret(&conn, &name) {
-                Ok(Some(v)) => Some((name, v)),
-                Ok(None) => None,
-                Err(e) => {
-                    // A wrong/missing vault passphrase used to look
-                    // identical to "no secret configured" — `.ok().flatten()`
-                    // discarded the `Err` entirely. Surface it so a wrong
-                    // passphrase is at least visible in stderr instead of
-                    // silently leaving downstream backends uncredentialed.
-                    eprintln!("agentflare: failed to resolve gateway secret '{name}': {e}");
-                    None
-                }
-            })
+            .filter_map(
+                |name| match crate::gateway_secrets::get_secret(&conn, &name) {
+                    Ok(Some(v)) => Some((name, v)),
+                    Ok(None) => None,
+                    Err(e) => {
+                        // A wrong/missing vault passphrase used to look
+                        // identical to "no secret configured" — `.ok().flatten()`
+                        // discarded the `Err` entirely. Surface it so a wrong
+                        // passphrase is at least visible in stderr instead of
+                        // silently leaving downstream backends uncredentialed.
+                        eprintln!("agentflare: failed to resolve gateway secret '{name}': {e}");
+                        None
+                    }
+                },
+            )
             .collect()
     }
 
@@ -1270,7 +1421,10 @@ impl AgentflareMcp {
     ) -> Result<tokio::sync::MutexGuard<'_, Option<gateway_registry::Registry>>, ErrorData> {
         let mut guard = self.gateway_registry.lock().await;
         if guard.is_none() {
-            let db_path = self.gateway_db_override.clone().unwrap_or_else(Self::gateway_db_path);
+            let db_path = self
+                .gateway_db_override
+                .clone()
+                .unwrap_or_else(Self::gateway_db_path);
             let config = Self::load_gateway_config();
             let secrets = Self::resolve_gateway_secrets();
             let reg = gateway_registry::Registry::open_default(&db_path, &config, &secrets)
@@ -1287,7 +1441,9 @@ impl AgentflareMcp {
         Ok(guard)
     }
 
-    #[tool(description = "Search downstream MCP servers' tools by task description. Returns server, tool, description, and input_schema; call gateway_execute to run one.")]
+    #[tool(
+        description = "Search downstream MCP servers' tools by task description. Returns server, tool, description, and input_schema; call gateway_execute to run one."
+    )]
     async fn gateway_search(
         &self,
         Parameters(GatewaySearchRequest { query, limit, mode }): Parameters<GatewaySearchRequest>,
@@ -1299,7 +1455,10 @@ impl AgentflareMcp {
             None | Some("all") => gateway_registry::MatchMode::All,
             Some("any") => gateway_registry::MatchMode::Any,
             Some(other) => {
-                return Err(ErrorData::invalid_params(format!("mode must be 'all' or 'any', got '{other}'"), None))
+                return Err(ErrorData::invalid_params(
+                    format!("mode must be 'all' or 'any', got '{other}'"),
+                    None,
+                ));
             }
         };
         let guard = self.ensure_gateway_registry().await?;
@@ -1310,20 +1469,30 @@ impl AgentflareMcp {
         Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
     }
 
-    #[tool(description = "Execute a tool on a downstream MCP server found via gateway_search. args must match that tool's input_schema.")]
+    #[tool(
+        description = "Execute a tool on a downstream MCP server found via gateway_search. args must match that tool's input_schema."
+    )]
     async fn gateway_execute(
         &self,
         Parameters(GatewayExecuteRequest { server, tool, args }): Parameters<GatewayExecuteRequest>,
     ) -> Result<String, ErrorData> {
         if server.trim().is_empty() || tool.trim().is_empty() {
-            return Err(ErrorData::invalid_params("server and tool are required", None));
+            return Err(ErrorData::invalid_params(
+                "server and tool are required",
+                None,
+            ));
         }
-        let args = args.map(serde_json::Value::Object).unwrap_or(serde_json::Value::Null);
+        let args = args
+            .map(serde_json::Value::Object)
+            .unwrap_or(serde_json::Value::Null);
         let guard = self.ensure_gateway_registry().await?;
         let reg = guard.as_ref().expect("ensured above");
         match reg.execute(&server, &tool, args).await {
             Ok(value) => {
-                let capped = gateway_registry::truncate_if_needed(&value, gateway_registry::DEFAULT_MAX_CHARS);
+                let capped = gateway_registry::truncate_if_needed(
+                    &value,
+                    gateway_registry::DEFAULT_MAX_CHARS,
+                );
                 Ok(serde_json::to_string_pretty(&capped).unwrap_or_default())
             }
             Err(e @ gateway_registry::GatewayError::ServerNotFound(_))
@@ -1337,7 +1506,10 @@ impl AgentflareMcp {
             // controlled messages. Redact before it reaches the LLM: a
             // downstream server's raw error could otherwise leak a file
             // path, connection string, or an echoed credential.
-            Err(e) => Err(ErrorData::internal_error(gateway_registry::redact_error_for_llm(&e.to_string()), None)),
+            Err(e) => Err(ErrorData::internal_error(
+                gateway_registry::redact_error_for_llm(&e.to_string()),
+                None,
+            )),
         }
     }
 
@@ -1352,10 +1524,20 @@ impl AgentflareMcp {
     // passed), but is never registered as an MCP tool and is invisible to
     // every real MCP client — silently dead on arrival.
 
-    #[tool(description = "Save an observation to persistent memory. Creates, updates (by topic_key), or deduplicates. Returns status: created|updated|duplicate.")]
+    #[tool(
+        description = "Save an observation to persistent memory. Creates, updates (by topic_key), or deduplicates. Returns status: created|updated|duplicate."
+    )]
     fn memory_remember(
         &self,
-        Parameters(MemoryRememberRequest { title, content, r#type, session_id, project, topic_key, scope }): Parameters<MemoryRememberRequest>,
+        Parameters(MemoryRememberRequest {
+            title,
+            content,
+            r#type,
+            session_id,
+            project,
+            topic_key,
+            scope,
+        }): Parameters<MemoryRememberRequest>,
     ) -> Result<String, ErrorData> {
         let input = crate::memory::mcp::RememberInput {
             title,
@@ -1366,14 +1548,21 @@ impl AgentflareMcp {
             topic_key,
             scope,
         };
-        crate::memory::mcp::handle_remember(input)
-            .map_err(|e| ErrorData::internal_error(e, None))
+        crate::memory::mcp::handle_remember(input).map_err(|e| ErrorData::internal_error(e, None))
     }
 
-    #[tool(description = "Search or retrieve observations. Pass id for direct lookup, query for FTS5 BM25 search, omit query for recent listing. Filters by type/project.")]
+    #[tool(
+        description = "Search or retrieve observations. Pass id for direct lookup, query for FTS5 BM25 search, omit query for recent listing. Filters by type/project."
+    )]
     fn memory_recall(
         &self,
-        Parameters(MemoryRecallRequest { query, id, r#type, project, limit }): Parameters<MemoryRecallRequest>,
+        Parameters(MemoryRecallRequest {
+            query,
+            id,
+            r#type,
+            project,
+            limit,
+        }): Parameters<MemoryRecallRequest>,
     ) -> Result<String, ErrorData> {
         let input = crate::memory::mcp::RecallInput {
             query,
@@ -1382,27 +1571,39 @@ impl AgentflareMcp {
             project,
             limit,
         };
-        crate::memory::mcp::handle_recall(input)
-            .map_err(|e| ErrorData::internal_error(e, None))
+        crate::memory::mcp::handle_recall(input).map_err(|e| ErrorData::internal_error(e, None))
     }
 
-    #[tool(description = "Return session context: active session (findings/decisions/files_touched), recent sessions, recent observations, and recent session summaries.")]
+    #[tool(
+        description = "Return session context: active session (findings/decisions/files_touched), recent sessions, recent observations, and recent session summaries."
+    )]
     fn memory_context(
         &self,
-        Parameters(MemoryContextRequest { session_id, project }): Parameters<MemoryContextRequest>,
+        Parameters(MemoryContextRequest {
+            session_id,
+            project,
+        }): Parameters<MemoryContextRequest>,
     ) -> Result<String, ErrorData> {
         let input = crate::memory::mcp::ContextInput {
             session_id,
             project,
         };
-        crate::memory::mcp::handle_context(input)
-            .map_err(|e| ErrorData::internal_error(e, None))
+        crate::memory::mcp::handle_context(input).map_err(|e| ErrorData::internal_error(e, None))
     }
 
-    #[tool(description = "Close a session with a handoff summary. Enriches the session with findings/decisions/files_touched/evidence, builds a compaction snapshot, appends to session_summaries, and marks the session closed.")]
+    #[tool(
+        description = "Close a session with a handoff summary. Enriches the session with findings/decisions/files_touched/evidence, builds a compaction snapshot, appends to session_summaries, and marks the session closed."
+    )]
     fn memory_handoff(
         &self,
-        Parameters(MemoryHandoffRequest { session_id, summary, findings, decisions, files_touched, evidence }): Parameters<MemoryHandoffRequest>,
+        Parameters(MemoryHandoffRequest {
+            session_id,
+            summary,
+            findings,
+            decisions,
+            files_touched,
+            evidence,
+        }): Parameters<MemoryHandoffRequest>,
     ) -> Result<String, ErrorData> {
         let input = crate::memory::mcp::HandoffInput {
             session_id,
@@ -1412,14 +1613,21 @@ impl AgentflareMcp {
             files_touched,
             evidence,
         };
-        crate::memory::mcp::handle_handoff(input)
-            .map_err(|e| ErrorData::internal_error(e, None))
+        crate::memory::mcp::handle_handoff(input).map_err(|e| ErrorData::internal_error(e, None))
     }
 
-    #[tool(description = "Record a semantic relation verdict between two observations. Relation: related|compatible|scoped|conflicts_with|supersedes|not_conflict.")]
+    #[tool(
+        description = "Record a semantic relation verdict between two observations. Relation: related|compatible|scoped|conflicts_with|supersedes|not_conflict."
+    )]
     fn memory_relate(
         &self,
-        Parameters(MemoryRelateRequest { source_id, target_id, relation, reason, confidence }): Parameters<MemoryRelateRequest>,
+        Parameters(MemoryRelateRequest {
+            source_id,
+            target_id,
+            relation,
+            reason,
+            confidence,
+        }): Parameters<MemoryRelateRequest>,
     ) -> Result<String, ErrorData> {
         let input = crate::memory::mcp::RelateInput {
             source_id,
@@ -1428,14 +1636,22 @@ impl AgentflareMcp {
             reason,
             confidence,
         };
-        crate::memory::mcp::handle_relate(input)
-            .map_err(|e| ErrorData::internal_error(e, None))
+        crate::memory::mcp::handle_relate(input).map_err(|e| ErrorData::internal_error(e, None))
     }
 
-    #[tool(description = "Update, soft-delete, pin, or unpin an observation by ID. Actions: update (title/content/type/pinned), delete, pin, unpin.")]
+    #[tool(
+        description = "Update, soft-delete, pin, or unpin an observation by ID. Actions: update (title/content/type/pinned), delete, pin, unpin."
+    )]
     fn memory_curate(
         &self,
-        Parameters(MemoryCurateRequest { action, id, title, content, r#type, pinned }): Parameters<MemoryCurateRequest>,
+        Parameters(MemoryCurateRequest {
+            action,
+            id,
+            title,
+            content,
+            r#type,
+            pinned,
+        }): Parameters<MemoryCurateRequest>,
     ) -> Result<String, ErrorData> {
         let input = crate::memory::mcp::CurateInput {
             action,
@@ -1445,8 +1661,7 @@ impl AgentflareMcp {
             r#type,
             pinned,
         };
-        crate::memory::mcp::handle_curate(input)
-            .map_err(|e| ErrorData::internal_error(e, None))
+        crate::memory::mcp::handle_curate(input).map_err(|e| ErrorData::internal_error(e, None))
     }
 }
 
@@ -1528,7 +1743,8 @@ impl AgentflareMcp {
                         "description": "Warns about cache-miss dead zone in scheduling delays"
                     }
                 ]
-            })).unwrap_or_default(),
+            }))
+            .unwrap_or_default(),
             _ => {
                 return Err(ErrorData::resource_not_found(
                     format!("Unknown resource: {uri}"),
@@ -1599,7 +1815,9 @@ impl AgentflareMcp {
     /// Runtime identity: explicit override wins, else auto-detect the host
     /// that launched us (parent process walk + agent env fingerprints).
     fn identity(explicit: Option<String>) -> Option<String> {
-        explicit.filter(|s| !s.is_empty()).or_else(agent_detector::agent_name)
+        explicit
+            .filter(|s| !s.is_empty())
+            .or_else(agent_detector::agent_name)
     }
 
     /// Production constructor: identity from AGENTFLARE_AGENT or detection.
@@ -1624,11 +1842,17 @@ mod tests {
     #[test]
     fn parse_flared_port_reads_top_level_key_only() {
         assert_eq!(parse_flared_port("port = 4444\n"), Some(4444));
-        assert_eq!(parse_flared_port("# comment\nport=9999 # inline\n"), Some(9999));
+        assert_eq!(
+            parse_flared_port("# comment\nport=9999 # inline\n"),
+            Some(9999)
+        );
         // tables end the top-level scan; a port inside one is not flared's
         assert_eq!(parse_flared_port("[[registries]]\nport = 1\n"), None);
         // prefix collisions and malformed values are not overrides
-        assert_eq!(parse_flared_port("portable = 1\nlight_interval_secs = 60\n"), None);
+        assert_eq!(
+            parse_flared_port("portable = 1\nlight_interval_secs = 60\n"),
+            None
+        );
         assert_eq!(parse_flared_port("port = not-a-number\n"), None);
         assert_eq!(parse_flared_port(""), None);
     }
@@ -1776,7 +2000,11 @@ mod tests {
             ..Default::default()
         };
         let err = s
-            .gateway_search(Parameters(GatewaySearchRequest { query: "".into(), limit: None, mode: None }))
+            .gateway_search(Parameters(GatewaySearchRequest {
+                query: "".into(),
+                limit: None,
+                mode: None,
+            }))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("query is required"));
@@ -1844,7 +2072,10 @@ mod tests {
     fn gateway_execute_args_schema_is_object_or_null() {
         let schema = schemars::schema_for!(GatewayExecuteRequest);
         let schema_json = serde_json::to_value(&schema).unwrap();
-        let args_schema = schema_json.get("properties").and_then(|p| p.get("args")).expect("args schema present");
+        let args_schema = schema_json
+            .get("properties")
+            .and_then(|p| p.get("args"))
+            .expect("args schema present");
         let rendered = args_schema.to_string();
         assert!(rendered.contains("\"object\""), "{rendered}");
         assert!(rendered.contains("\"null\""), "{rendered}");
@@ -1892,7 +2123,10 @@ mod tests {
 
         let resp = http_get(url);
         assert!(resp.contains("200"), "serves published artifact: {resp}");
-        assert!(resp.contains("artifact-body-marker"), "body present: {resp}");
+        assert!(
+            resp.contains("artifact-body-marker"),
+            "body present: {resp}"
+        );
     }
 
     #[test]
@@ -1957,9 +2191,11 @@ mod tests {
         let a = publish("alpha", "ses-1");
         let _b = publish("beta", "ses-2");
 
-        let all: serde_json::Value =
-            serde_json::from_str(&s.artifact_list(Parameters(ArtifactListRequest::default())).unwrap())
-                .unwrap();
+        let all: serde_json::Value = serde_json::from_str(
+            &s.artifact_list(Parameters(ArtifactListRequest::default()))
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(all.as_array().unwrap().len(), 2);
 
         let one: serde_json::Value = serde_json::from_str(
@@ -1976,13 +2212,18 @@ mod tests {
 
         let id = a["id"].as_str().unwrap().to_string();
         let got: serde_json::Value = serde_json::from_str(
-            &s.artifact_get(Parameters(ArtifactGetRequest { id: id.clone(), version: None })).unwrap(),
+            &s.artifact_get(Parameters(ArtifactGetRequest {
+                id: id.clone(),
+                version: None,
+            }))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(got["content"], "content-of-alpha");
 
         let del: serde_json::Value = serde_json::from_str(
-            &s.artifact_delete(Parameters(ArtifactDeleteRequest { id: id.clone() })).unwrap(),
+            &s.artifact_delete(Parameters(ArtifactDeleteRequest { id: id.clone() }))
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(del["deleted"], true);
@@ -2028,7 +2269,8 @@ mod tests {
                 ..Default::default()
             }))
         };
-        let second: serde_json::Value = serde_json::from_str(&update(Some(1), "v2").unwrap()).unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(&update(Some(1), "v2").unwrap()).unwrap();
         assert_eq!(second["version"], 2);
 
         let err = update(Some(1), "v3-stale").unwrap_err();
@@ -2043,20 +2285,21 @@ mod tests {
             artifacts_dir_override: Some(tmp.path().to_path_buf()),
             ..Default::default()
         };
-        let publish = |name: &str, recipient: Option<&str>, thread: Option<&str>| -> serde_json::Value {
-            serde_json::from_str(
-                &s.artifact_publish(Parameters(ArtifactPublishRequest {
-                    name: name.into(),
-                    content: format!("content {name}"),
-                    sender: Some("claude-code".into()),
-                    recipient: recipient.map(Into::into),
-                    thread_id: thread.map(Into::into),
-                    ..Default::default()
-                }))
-                .unwrap(),
-            )
-            .unwrap()
-        };
+        let publish =
+            |name: &str, recipient: Option<&str>, thread: Option<&str>| -> serde_json::Value {
+                serde_json::from_str(
+                    &s.artifact_publish(Parameters(ArtifactPublishRequest {
+                        name: name.into(),
+                        content: format!("content {name}"),
+                        sender: Some("claude-code".into()),
+                        recipient: recipient.map(Into::into),
+                        thread_id: thread.map(Into::into),
+                        ..Default::default()
+                    }))
+                    .unwrap(),
+                )
+                .unwrap()
+            };
         publish("packet", Some("codex"), Some("t1"));
         publish("reply", Some("claude-code"), Some("t1"));
         publish("other", None, None);
@@ -2226,7 +2469,11 @@ mod tests {
         assert_eq!(hits.as_array().unwrap().len(), 1);
         assert_eq!(hits[0]["name"], "alpha");
         assert!(
-            hits[0]["snippet"].as_str().unwrap().to_lowercase().contains("needle"),
+            hits[0]["snippet"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("needle"),
             "{hits}"
         );
 
@@ -2318,7 +2565,10 @@ mod tests {
         );
         // …empty counts as unset, and without an override identity falls
         // back to detecting the host that launched us (None outside agents).
-        assert_eq!(AgentflareMcp::identity(Some(String::new())), agent_detector::agent_name());
+        assert_eq!(
+            AgentflareMcp::identity(Some(String::new())),
+            agent_detector::agent_name()
+        );
         assert_eq!(AgentflareMcp::identity(None), agent_detector::agent_name());
     }
 

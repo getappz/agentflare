@@ -87,22 +87,41 @@ impl ReviewArgs {
             Err(e) => fail(format!("cannot open ledger: {e}")),
         };
         match self.action {
-            ReviewAction::Submit { pr, agent, file, repo } => {
+            ReviewAction::Submit {
+                pr,
+                agent,
+                file,
+                repo,
+            } => {
                 let repo = require_repo(repo);
                 let pr = resolve_pr(pr);
                 let agent = agent.unwrap_or_else(crate::review::submitter_name);
                 let raw = match &file {
-                    Some(p) => std::fs::read_to_string(p).unwrap_or_else(|e| fail(format!("cannot read {}: {e}", p.display()))),
+                    Some(p) => std::fs::read_to_string(p)
+                        .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", p.display()))),
                     None => read_stdin(),
                 };
                 let findings: Vec<crate::review::Finding> = serde_json::from_str(&raw)
                     .unwrap_or_else(|e| fail(format!("invalid findings JSON: {e}")));
-                match crate::review::submit(&conn, &repo, &pr, &agent, &findings, crate::claims::now()) {
+                match crate::review::submit(
+                    &conn,
+                    &repo,
+                    &pr,
+                    &agent,
+                    &findings,
+                    crate::claims::now(),
+                ) {
                     Ok(n) => println!("submitted {n} finding(s) as {agent} for {repo}#{pr}"),
                     Err(e) => fail(format!("submit failed: {e}")),
                 }
             }
-            ReviewAction::Consensus { pr, base, head, repo, json } => {
+            ReviewAction::Consensus {
+                pr,
+                base,
+                head,
+                repo,
+                json,
+            } => {
                 let repo = require_repo(repo);
                 let pr = resolve_pr(pr);
                 let findings = crate::review::load(&conn, &repo, &pr)
@@ -112,7 +131,10 @@ impl ReviewArgs {
                 let changed = crate::review::changed_lines(&diff);
                 let items = crate::review::consensus(&findings, &changed);
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&items).unwrap_or_default());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&items).unwrap_or_default()
+                    );
                 } else {
                     println!("{}", crate::review::render_markdown(&items));
                 }
@@ -124,7 +146,10 @@ impl ReviewArgs {
                     Ok(fs) if fs.is_empty() => println!("no findings for {repo}#{pr}"),
                     Ok(fs) => {
                         for sf in fs {
-                            println!("{}  {}:{}  {}", sf.agent, sf.finding.file, sf.finding.line, sf.finding.message);
+                            println!(
+                                "{}  {}:{}  {}",
+                                sf.agent, sf.finding.file, sf.finding.line, sf.finding.message
+                            );
                         }
                     }
                     Err(e) => fail(format!("list failed: {e}")),
@@ -138,7 +163,12 @@ impl ReviewArgs {
                     Err(e) => fail(format!("clear failed: {e}")),
                 }
             }
-            ReviewAction::Record { pr, base, head, repo } => {
+            ReviewAction::Record {
+                pr,
+                base,
+                head,
+                repo,
+            } => {
                 let repo = require_repo(repo);
                 let pr = resolve_pr(pr);
                 let findings = crate::review::load(&conn, &repo, &pr)
@@ -146,23 +176,47 @@ impl ReviewArgs {
                 let diff = crate::review::compute_diff(base.as_deref(), head.as_deref())
                     .unwrap_or_else(|e| fail(e));
                 let changed = crate::review::changed_lines(&diff);
-                match crate::review::record_round(&conn, &repo, &pr, &findings, &changed, crate::claims::now()) {
+                match crate::review::record_round(
+                    &conn,
+                    &repo,
+                    &pr,
+                    &findings,
+                    &changed,
+                    crate::claims::now(),
+                ) {
                     Ok(n) => println!("recorded accuracy for {n} agent(s) on {repo}#{pr}"),
                     Err(e) => fail(format!("record failed: {e}")),
                 }
             }
-            ReviewAction::Scores { repo, all_repos, json } => {
-                let scope = if all_repos { None } else { Some(require_repo(repo)) };
+            ReviewAction::Scores {
+                repo,
+                all_repos,
+                json,
+            } => {
+                let scope = if all_repos {
+                    None
+                } else {
+                    Some(require_repo(repo))
+                };
                 let scores = crate::review::scores(&conn, scope.as_deref())
                     .unwrap_or_else(|e| fail(format!("scores failed: {e}")));
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&scores).unwrap_or_default());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&scores).unwrap_or_default()
+                    );
                 } else if scores.is_empty() {
                     println!("no recorded scores");
                 } else {
                     for s in scores {
-                        println!("{:<20} {:.0}%  ({}/{} verified, {} round(s))",
-                            s.agent, s.accuracy * 100.0, s.verified, s.findings, s.rounds);
+                        println!(
+                            "{:<20} {:.0}%  ({}/{} verified, {} round(s))",
+                            s.agent,
+                            s.accuracy * 100.0,
+                            s.verified,
+                            s.findings,
+                            s.rounds
+                        );
                     }
                 }
             }
@@ -185,8 +239,9 @@ fn resolve_pr(explicit: Option<String>) -> String {
 }
 
 fn require_repo(explicit: Option<String>) -> String {
-    crate::claims::resolve_repo(explicit)
-        .unwrap_or_else(|| fail("could not determine repo — run in a git repo or pass --repo owner/name".to_string()))
+    crate::claims::resolve_repo(explicit).unwrap_or_else(|| {
+        fail("could not determine repo — run in a git repo or pass --repo owner/name".to_string())
+    })
 }
 
 fn read_stdin() -> String {

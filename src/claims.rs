@@ -4,7 +4,7 @@
 //! stale-steal are ONE atomic statement, which a filesystem lock can't give
 //! for the steal case. Models [Beads](https://github.com/gastownhall/beads)'s
 //! claim/close model, minus the full issue-tracker surface.
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, params};
 
 /// Default lease: a claim whose owner hasn't heartbeat within this window is
 /// stealable, so a crashed/hung agent can't wedge a target forever.
@@ -86,13 +86,22 @@ pub fn acquire(
     Ok(if row_owner == owner {
         Acquire::Acquired
     } else {
-        Acquire::Held { owner: row_owner, age_secs: now - heartbeat_at }
+        Acquire::Held {
+            owner: row_owner,
+            age_secs: now - heartbeat_at,
+        }
     })
 }
 
 /// Refreshes the lease on a claim we own. Returns false if the claim is gone
 /// or owned by someone else (don't heartbeat what isn't yours).
-pub fn heartbeat(conn: &Connection, repo: &str, target: &str, owner: &str, now: i64) -> rusqlite::Result<bool> {
+pub fn heartbeat(
+    conn: &Connection,
+    repo: &str,
+    target: &str,
+    owner: &str,
+    now: i64,
+) -> rusqlite::Result<bool> {
     let changed = conn.execute(
         "UPDATE claims SET heartbeat_at = ?4 WHERE repo = ?1 AND target = ?2 AND owner = ?3",
         params![repo, target, owner, now],
@@ -110,7 +119,13 @@ pub fn release(conn: &Connection, repo: &str, target: &str, owner: &str) -> rusq
 }
 
 /// Marks our claim done (kept for audit; a done target is re-acquirable).
-pub fn done(conn: &Connection, repo: &str, target: &str, owner: &str, now: i64) -> rusqlite::Result<bool> {
+pub fn done(
+    conn: &Connection,
+    repo: &str,
+    target: &str,
+    owner: &str,
+    now: i64,
+) -> rusqlite::Result<bool> {
     let changed = conn.execute(
         "UPDATE claims SET status = 'done', heartbeat_at = ?4 WHERE repo = ?1 AND target = ?2 AND owner = ?3",
         params![repo, target, owner, now],
@@ -153,7 +168,9 @@ pub fn list(
     Ok(if include_stale {
         all
     } else {
-        all.into_iter().filter(|c| c.status == "claimed" && !c.stale).collect()
+        all.into_iter()
+            .filter(|c| c.status == "claimed" && !c.stale)
+            .collect()
     })
 }
 
@@ -209,7 +226,10 @@ pub fn normalize_repo(remote_url: &str) -> String {
         // scp-like: host:owner/name
         Some((_host, path)) if !path.starts_with('/') => path,
         // https-like: host/owner/name  (or host:port/owner/name)
-        _ => after_scheme.splitn(2, '/').nth(1).unwrap_or(after_scheme),
+        _ => after_scheme
+            .split_once('/')
+            .map(|x| x.1)
+            .unwrap_or(after_scheme),
     };
     let path = path.trim_start_matches('/').trim_end_matches(".git");
     // Keep the last two segments (owner/name); fall back to whatever's there.
@@ -283,7 +303,9 @@ mod tests {
             acquire(&c, "o/r", "issue#1", "b:2", None, 1000 + TTL + 1, TTL).unwrap(),
             Acquire::Acquired
         );
-        let owner: String = c.query_row("SELECT owner FROM claims", [], |r| r.get(0)).unwrap();
+        let owner: String = c
+            .query_row("SELECT owner FROM claims", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(owner, "b:2");
     }
 
@@ -337,11 +359,26 @@ mod tests {
 
     #[test]
     fn normalize_repo_handles_https_ssh_alias_and_dotgit() {
-        assert_eq!(normalize_repo("https://github.com/getappz/agentflare.git"), "getappz/agentflare");
-        assert_eq!(normalize_repo("https://github.com/getappz/agentflare"), "getappz/agentflare");
-        assert_eq!(normalize_repo("git@github.com:getappz/agentflare.git"), "getappz/agentflare");
+        assert_eq!(
+            normalize_repo("https://github.com/getappz/agentflare.git"),
+            "getappz/agentflare"
+        );
+        assert_eq!(
+            normalize_repo("https://github.com/getappz/agentflare"),
+            "getappz/agentflare"
+        );
+        assert_eq!(
+            normalize_repo("git@github.com:getappz/agentflare.git"),
+            "getappz/agentflare"
+        );
         // SSH host alias (this repo's real remote shape).
-        assert_eq!(normalize_repo("git@github-appzdev:getappz/agentflare.git"), "getappz/agentflare");
-        assert_eq!(normalize_repo("ssh://git@github.com/getappz/agentflare.git"), "getappz/agentflare");
+        assert_eq!(
+            normalize_repo("git@github-appzdev:getappz/agentflare.git"),
+            "getappz/agentflare"
+        );
+        assert_eq!(
+            normalize_repo("ssh://git@github.com/getappz/agentflare.git"),
+            "getappz/agentflare"
+        );
     }
 }

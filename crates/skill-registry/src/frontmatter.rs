@@ -16,7 +16,9 @@ pub struct Frontmatter {
 /// well-formed frontmatter block or the YAML does not parse.
 pub fn parse_frontmatter(text: &str) -> Option<(Frontmatter, &str)> {
     let rest = text.strip_prefix("---")?;
-    let rest = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix('\n'))?;
+    let rest = rest
+        .strip_prefix("\r\n")
+        .or_else(|| rest.strip_prefix('\n'))?;
     // Closing fence: a line that is exactly `---` (allow trailing \r).
     let mut offset = 0usize;
     for line in rest.split_inclusive('\n') {
@@ -38,7 +40,8 @@ mod tests {
     #[test]
     fn parses_simple_frontmatter_and_body() {
         let (fm, body) =
-            parse_frontmatter("---\nname: live\ndescription: Use when X\n---\nBody here\n").unwrap();
+            parse_frontmatter("---\nname: live\ndescription: Use when X\n---\nBody here\n")
+                .unwrap();
         assert_eq!(fm.name.as_deref(), Some("live"));
         assert_eq!(fm.description.as_deref(), Some("Use when X"));
         assert_eq!(body.trim(), "Body here");

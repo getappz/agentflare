@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -30,6 +30,7 @@ pub enum SaveOutcome {
     Duplicate(i64),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn save(
     conn: &Connection,
     session_id: Option<&str>,
@@ -53,8 +54,8 @@ pub fn save(
         return Ok(SaveOutcome::Duplicate(id));
     }
 
-    if let Some(tk) = topic_key.filter(|t| !t.is_empty()) {
-        if let Some(existing) = conn
+    if let Some(tk) = topic_key.filter(|t| !t.is_empty())
+        && let Some(existing) = conn
             .query_row(
                 "SELECT id, revision_count FROM observations
                  WHERE topic_key = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR project = ?2) LIMIT 1",
@@ -70,14 +71,15 @@ pub fn save(
             )?;
             return Ok(SaveOutcome::Updated(id));
         }
-    }
 
     conn.execute(
         "INSERT INTO observations
             (session_id, type, title, content, tool_name, project, scope,
              topic_key, normalized_hash, created_at, updated_at, last_seen_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10)",
-        params![session_id, r#type, title, content, tool_name, project, scope, topic_key, &hash, now],
+        params![
+            session_id, r#type, title, content, tool_name, project, scope, topic_key, &hash, now
+        ],
     )?;
     let id = conn.last_insert_rowid();
     Ok(SaveOutcome::Created(id))
@@ -91,7 +93,8 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Observation>> 
          FROM observations WHERE id = ?1",
         params![id],
         map_observation,
-    ).optional()
+    )
+    .optional()
 }
 
 pub fn update(
@@ -177,14 +180,19 @@ pub fn list_recent(
     rows.collect()
 }
 
-fn find_duplicate(conn: &Connection, hash: &str, project: Option<&str>) -> rusqlite::Result<Option<(i64, String)>> {
+fn find_duplicate(
+    conn: &Connection,
+    hash: &str,
+    project: Option<&str>,
+) -> rusqlite::Result<Option<(i64, String)>> {
     conn.query_row(
         "SELECT id, created_at FROM observations
          WHERE normalized_hash = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR project = ?2)
          ORDER BY created_at DESC LIMIT 1",
         params![hash, project],
         |r| Ok((r.get(0)?, r.get(1)?)),
-    ).optional()
+    )
+    .optional()
 }
 
 pub fn hash_normalized(title: &str, content: &str) -> String {
@@ -199,7 +207,9 @@ pub fn hash_normalized(title: &str, content: &str) -> String {
 }
 
 fn now_iso() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 fn map_observation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Observation> {
@@ -242,15 +252,48 @@ mod tests {
     #[test]
     fn cross_project_observations_with_identical_content_do_not_collide() {
         let conn = new_db();
-        let outcome_a = save(&conn, None, "note", "same title", "same content", None, Some("proj-a"), None, None).unwrap();
-        let outcome_b = save(&conn, None, "note", "same title", "same content", None, Some("proj-b"), None, None).unwrap();
+        let outcome_a = save(
+            &conn,
+            None,
+            "note",
+            "same title",
+            "same content",
+            None,
+            Some("proj-a"),
+            None,
+            None,
+        )
+        .unwrap();
+        let outcome_b = save(
+            &conn,
+            None,
+            "note",
+            "same title",
+            "same content",
+            None,
+            Some("proj-b"),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert!(matches!(outcome_a, SaveOutcome::Created(_)));
         assert!(matches!(outcome_b, SaveOutcome::Created(_)));
 
         // Saving the same content again *within* proj-a should still be
         // detected as a duplicate (scoping must not break same-project dedup).
-        let outcome_a2 = save(&conn, None, "note", "same title", "same content", None, Some("proj-a"), None, None).unwrap();
+        let outcome_a2 = save(
+            &conn,
+            None,
+            "note",
+            "same title",
+            "same content",
+            None,
+            Some("proj-a"),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(matches!(outcome_a2, SaveOutcome::Duplicate(_)));
     }
 
@@ -260,22 +303,58 @@ mod tests {
     #[test]
     fn topic_key_revision_refreshes_normalized_hash() {
         let conn = new_db();
-        let outcome1 = save(&conn, None, "decision", "v1 title", "v1 content", None, Some("proj-a"), None, Some("topic-x")).unwrap();
+        let outcome1 = save(
+            &conn,
+            None,
+            "decision",
+            "v1 title",
+            "v1 content",
+            None,
+            Some("proj-a"),
+            None,
+            Some("topic-x"),
+        )
+        .unwrap();
         let id = match outcome1 {
             SaveOutcome::Created(id) => id,
             other => panic!("expected Created, got {other:?}"),
         };
 
-        let outcome2 = save(&conn, None, "decision", "v2 title", "v2 content", None, Some("proj-a"), None, Some("topic-x")).unwrap();
+        let outcome2 = save(
+            &conn,
+            None,
+            "decision",
+            "v2 title",
+            "v2 content",
+            None,
+            Some("proj-a"),
+            None,
+            Some("topic-x"),
+        )
+        .unwrap();
         assert_eq!(outcome2, SaveOutcome::Updated(id));
 
         let obs = get(&conn, id).unwrap().unwrap();
-        assert_eq!(obs.normalized_hash.as_deref(), Some(hash_normalized("v2 title", "v2 content").as_str()));
+        assert_eq!(
+            obs.normalized_hash.as_deref(),
+            Some(hash_normalized("v2 title", "v2 content").as_str())
+        );
 
         // Now a fresh save with content matching the *revised* version
         // (different topic_key so it goes through the dedup path, not the
         // topic_key path) should be recognized as a duplicate of `id`.
-        let outcome3 = save(&conn, None, "decision", "v2 title", "v2 content", None, Some("proj-a"), None, None).unwrap();
+        let outcome3 = save(
+            &conn,
+            None,
+            "decision",
+            "v2 title",
+            "v2 content",
+            None,
+            Some("proj-a"),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(outcome3, SaveOutcome::Duplicate(id));
     }
 
@@ -286,7 +365,18 @@ mod tests {
         // this build's bundled SQLite enforces foreign keys by default, so
         // create the referenced session first.
         crate::memory::sessions::create(&conn, "sess-1", Some("proj-a"), None).unwrap();
-        let outcome = save(&conn, Some("sess-1"), "learning", "title", "content", None, Some("proj-a"), None, None).unwrap();
+        let outcome = save(
+            &conn,
+            Some("sess-1"),
+            "learning",
+            "title",
+            "content",
+            None,
+            Some("proj-a"),
+            None,
+            None,
+        )
+        .unwrap();
         let id = match outcome {
             SaveOutcome::Created(id) => id,
             other => panic!("expected Created, got {other:?}"),

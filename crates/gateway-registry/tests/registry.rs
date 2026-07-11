@@ -22,14 +22,21 @@ fn config_with_fixture() -> GatewayConfig {
     let mut servers = HashMap::new();
     servers.insert(
         "fixture".to_string(),
-        ServerConfig::McpStdio { command: fixture_path(), args: vec![], auth_ref: None, auth_env: None },
+        ServerConfig::McpStdio {
+            command: fixture_path(),
+            args: vec![],
+            auth_ref: None,
+            auth_env: None,
+        },
     );
     GatewayConfig { servers }
 }
 
 #[tokio::test]
 async fn search_finds_the_fixture_tool_after_open() {
-    let reg = Registry::open_in_memory(&config_with_fixture(), &HashMap::new()).await.unwrap();
+    let reg = Registry::open_in_memory(&config_with_fixture(), &HashMap::new())
+        .await
+        .unwrap();
     let hits = reg.search("echo", 5, MatchMode::All).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].tool, "echo");
@@ -38,9 +45,17 @@ async fn search_finds_the_fixture_tool_after_open() {
 
 #[tokio::test]
 async fn execute_dispatches_to_the_right_backend() {
-    let reg = Registry::open_in_memory(&config_with_fixture(), &HashMap::new()).await.unwrap();
-    let result = reg.execute("fixture", "echo", serde_json::json!({"text": "hi"})).await.unwrap();
-    let text = result.get(0).and_then(|c| c.get("text")).and_then(|t| t.as_str());
+    let reg = Registry::open_in_memory(&config_with_fixture(), &HashMap::new())
+        .await
+        .unwrap();
+    let result = reg
+        .execute("fixture", "echo", serde_json::json!({"text": "hi"}))
+        .await
+        .unwrap();
+    let text = result
+        .get(0)
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str());
     assert_eq!(text, Some("echo: hi"));
 }
 
@@ -62,21 +77,34 @@ async fn execute_dispatches_to_an_mcp_http_backend() {
     );
     let config = GatewayConfig { servers };
 
-    let reg = Registry::open_in_memory(&config, &HashMap::new()).await.unwrap();
+    let reg = Registry::open_in_memory(&config, &HashMap::new())
+        .await
+        .unwrap();
 
     let hits = reg.search("echo", 5, MatchMode::All).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].server, "http_fixture");
 
-    let result = reg.execute("http_fixture", "echo", serde_json::json!({"text": "hi"})).await.unwrap();
-    let text = result.get(0).and_then(|c| c.get("text")).and_then(|t| t.as_str());
+    let result = reg
+        .execute("http_fixture", "echo", serde_json::json!({"text": "hi"}))
+        .await
+        .unwrap();
+    let text = result
+        .get(0)
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str());
     assert_eq!(text, Some("echo: hi"));
 }
 
 #[tokio::test]
 async fn execute_unknown_server_suggests_the_closest_name() {
-    let reg = Registry::open_in_memory(&config_with_fixture(), &HashMap::new()).await.unwrap();
-    let err = reg.execute("fixtur", "echo", serde_json::json!({})).await.unwrap_err();
+    let reg = Registry::open_in_memory(&config_with_fixture(), &HashMap::new())
+        .await
+        .unwrap();
+    let err = reg
+        .execute("fixtur", "echo", serde_json::json!({}))
+        .await
+        .unwrap_err();
     match err {
         GatewayError::ServerNotFound(msg) => assert!(msg.contains("fixture")),
         other => panic!("expected ServerNotFound, got {other:?}"),
@@ -85,8 +113,13 @@ async fn execute_unknown_server_suggests_the_closest_name() {
 
 #[tokio::test]
 async fn execute_unknown_tool_suggests_the_closest_name() {
-    let reg = Registry::open_in_memory(&config_with_fixture(), &HashMap::new()).await.unwrap();
-    let err = reg.execute("fixture", "ech", serde_json::json!({})).await.unwrap_err();
+    let reg = Registry::open_in_memory(&config_with_fixture(), &HashMap::new())
+        .await
+        .unwrap();
+    let err = reg
+        .execute("fixture", "ech", serde_json::json!({}))
+        .await
+        .unwrap_err();
     match err {
         GatewayError::ToolNotFound(msg) => assert!(msg.contains("echo")),
         other => panic!("expected ToolNotFound, got {other:?}"),
@@ -103,7 +136,12 @@ async fn one_failing_backend_does_not_block_the_others() {
     let mut servers = HashMap::new();
     servers.insert(
         "fixture".to_string(),
-        ServerConfig::McpStdio { command: fixture_path(), args: vec![], auth_ref: None, auth_env: None },
+        ServerConfig::McpStdio {
+            command: fixture_path(),
+            args: vec![],
+            auth_ref: None,
+            auth_env: None,
+        },
     );
     servers.insert(
         "broken".to_string(),
@@ -116,14 +154,22 @@ async fn one_failing_backend_does_not_block_the_others() {
     );
     let config = GatewayConfig { servers };
 
-    let reg = Registry::open_in_memory(&config, &HashMap::new()).await.unwrap();
+    let reg = Registry::open_in_memory(&config, &HashMap::new())
+        .await
+        .unwrap();
 
     let hits = reg.search("echo", 5, MatchMode::All).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].tool, "echo");
     assert_eq!(hits[0].server, "fixture");
 
-    let result = reg.execute("fixture", "echo", serde_json::json!({"text": "hi"})).await.unwrap();
-    let text = result.get(0).and_then(|c| c.get("text")).and_then(|t| t.as_str());
+    let result = reg
+        .execute("fixture", "echo", serde_json::json!({"text": "hi"}))
+        .await
+        .unwrap();
+    let text = result
+        .get(0)
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str());
     assert_eq!(text, Some("echo: hi"));
 }

@@ -1,6 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
+#[must_use]
 pub fn flag_path() -> PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")))
@@ -9,6 +10,7 @@ pub fn flag_path() -> PathBuf {
         .join("active")
 }
 
+#[must_use]
 pub fn session_path() -> PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")))
@@ -24,6 +26,7 @@ fn read_session() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+#[must_use]
 pub fn active_mode() -> Option<String> {
     read_session().or_else(|| {
         std::fs::read_to_string(flag_path())
@@ -58,6 +61,7 @@ pub fn clear_active() {
     clear_session();
 }
 
+#[must_use]
 pub fn active_scope() -> &'static str {
     if read_session().is_some() {
         "session"
@@ -81,7 +85,9 @@ mod tests {
 
     #[test]
     fn roundtrip_active_mode() {
-        let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_active();
         assert_eq!(active_mode(), None);
 
@@ -103,7 +109,9 @@ mod tests {
 
     #[test]
     fn clear_nonexistent_is_noop() {
-        let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_active();
         clear_active();
         clear_session();

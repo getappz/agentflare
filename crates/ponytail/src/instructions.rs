@@ -13,10 +13,10 @@ fn find_workspace_agents_md() -> Option<String> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
         let path = dir.join("AGENTS.md");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if content.contains("PONYTAIL") {
-                return Some(content);
-            }
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && content.contains("PONYTAIL")
+        {
+            return Some(content);
         }
         if !dir.pop() {
             return None;
@@ -44,7 +44,10 @@ pub fn build(mode: &str, skill_path: Option<&Path>) -> Instructions {
     // Custom skills have no harness-installed /ponytail-<name> skill to point
     // at, so their authored body is delivered inline.
     if let Some(body) = crate::sub_skills::get_custom(&effective) {
-        return Instructions { mode: effective, body };
+        return Instructions {
+            mode: effective,
+            body,
+        };
     }
 
     let skill_body = if let Some(path) = skill_path {
@@ -82,6 +85,7 @@ fn compression_deconfliction() -> String {
     )
 }
 
+#[must_use]
 pub fn filter_skill_body(body: &str, mode: &str) -> String {
     let effective = config::normalize_mode(mode).unwrap_or(config::DEFAULT_MODE);
     body.lines()
@@ -122,7 +126,9 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn build_appends_deconfliction_when_compression_plugin_present() {
-        let _guard = config::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = config::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join("ponytail_test_instructions_compression");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("settings.json"), r#"{"plugins": ["caveman"]}"#).unwrap();

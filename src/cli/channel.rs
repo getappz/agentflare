@@ -26,9 +26,15 @@ pub enum ChannelAction {
 impl ChannelArgs {
     pub fn run(self) {
         match self.action {
-            ChannelAction::Send { to, target, message } => {
+            ChannelAction::Send {
+                to,
+                target,
+                message,
+            } => {
                 let Some(platform) = crate::channels::Platform::parse(&to) else {
-                    eprintln!("error: unknown platform '{to}' (expected telegram, slack, or discord)");
+                    eprintln!(
+                        "error: unknown platform '{to}' (expected telegram, slack, or discord)"
+                    );
                     std::process::exit(1);
                 };
                 let conn = match crate::db::open() {

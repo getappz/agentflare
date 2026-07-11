@@ -67,11 +67,22 @@ fn recall_with_conn(conn: &rusqlite::Connection, input: RecallInput) -> Result<S
     }
     let limit = input.limit.unwrap_or(10).min(50);
     let results = if let Some(ref q) = input.query.filter(|q| !q.trim().is_empty()) {
-        search::search(conn, q, input.project.as_deref(), input.r#type.as_deref(), limit)
-            .map_err(|e| format!("search failed: {e}"))?
+        search::search(
+            conn,
+            q,
+            input.project.as_deref(),
+            input.r#type.as_deref(),
+            limit,
+        )
+        .map_err(|e| format!("search failed: {e}"))?
     } else {
-        observations::list_recent(conn, input.project.as_deref(), input.r#type.as_deref(), limit)
-            .map_err(|e| format!("list failed: {e}"))?
+        observations::list_recent(
+            conn,
+            input.project.as_deref(),
+            input.r#type.as_deref(),
+            limit,
+        )
+        .map_err(|e| format!("list failed: {e}"))?
     };
     Ok(json!(results).to_string())
 }
@@ -85,7 +96,9 @@ pub struct ContextInput {
 pub fn handle_context(input: ContextInput) -> Result<String, String> {
     let conn = open_db()?;
     let session = match input.session_id.as_deref() {
-        Some(id) if !id.is_empty() => sessions::get(&conn, id).map_err(|e| format!("session lookup: {e}"))?,
+        Some(id) if !id.is_empty() => {
+            sessions::get(&conn, id).map_err(|e| format!("session lookup: {e}"))?
+        }
         _ => None,
     };
     let recent_sessions = sessions::list_recent(&conn, input.project.as_deref(), 5)
@@ -128,23 +141,38 @@ fn handoff_with_conn(conn: &rusqlite::Connection, input: HandoffInput) -> Result
     // `&mut Connection`) so enrich+close+append commit atomically: a failure
     // partway through used to leave the session closed without its summary,
     // with no way to retry since it was already closed.
-    let tx = conn.unchecked_transaction().map_err(|e| format!("begin transaction: {e}"))?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin transaction: {e}"))?;
 
     // `sessions::create` was never called from any CLI subcommand or MCP
     // tool, so the sessions table was always empty in practice and this
     // lookup would unconditionally fail with "session not found" for every
     // session_id. Auto-create instead, so handoff works standalone.
-    let session = match sessions::get(&tx, &input.session_id).map_err(|e| format!("session lookup: {e}"))? {
-        Some(session) => session,
-        None => sessions::create(&tx, &input.session_id, None, None)
-            .map_err(|e| format!("create session: {e}"))?,
-    };
+    let session =
+        match sessions::get(&tx, &input.session_id).map_err(|e| format!("session lookup: {e}"))? {
+            Some(session) => session,
+            None => sessions::create(&tx, &input.session_id, None, None)
+                .map_err(|e| format!("create session: {e}"))?,
+        };
 
     let project = session.project.clone().unwrap_or_default();
-    let findings = input.findings.as_ref().map(|v| serde_json::to_string(&v).unwrap_or_default());
-    let decisions = input.decisions.as_ref().map(|v| serde_json::to_string(&v).unwrap_or_default());
-    let files = input.files_touched.as_ref().map(|v| serde_json::to_string(&v).unwrap_or_default());
-    let evidence = input.evidence.as_ref().map(|v| serde_json::to_string(&v).unwrap_or_default());
+    let findings = input
+        .findings
+        .as_ref()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default());
+    let decisions = input
+        .decisions
+        .as_ref()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default());
+    let files = input
+        .files_touched
+        .as_ref()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default());
+    let evidence = input
+        .evidence
+        .as_ref()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default());
 
     let snapshot = json!({
         "session_id": input.session_id,
@@ -231,26 +259,34 @@ pub fn handle_curate(input: CurateInput) -> Result<String, String> {
     let conn = open_db()?;
     match input.action.as_str() {
         "update" => {
-            let ok = observations::update(&conn, input.id, input.title.as_deref(), input.content.as_deref(), input.r#type.as_deref(), input.pinned)
-                .map_err(|e| format!("update: {e}"))?;
+            let ok = observations::update(
+                &conn,
+                input.id,
+                input.title.as_deref(),
+                input.content.as_deref(),
+                input.r#type.as_deref(),
+                input.pinned,
+            )
+            .map_err(|e| format!("update: {e}"))?;
             Ok(json!({"status": if ok { "updated" } else { "not_found" }}).to_string())
         }
         "delete" => {
-            let ok = observations::soft_delete(&conn, input.id)
-                .map_err(|e| format!("delete: {e}"))?;
+            let ok =
+                observations::soft_delete(&conn, input.id).map_err(|e| format!("delete: {e}"))?;
             Ok(json!({"status": if ok { "deleted" } else { "not_found" }}).to_string())
         }
         "pin" => {
-            let ok = observations::pin(&conn, input.id, true)
-                .map_err(|e| format!("pin: {e}"))?;
+            let ok = observations::pin(&conn, input.id, true).map_err(|e| format!("pin: {e}"))?;
             Ok(json!({"status": if ok { "pinned" } else { "not_found" }}).to_string())
         }
         "unpin" => {
-            let ok = observations::pin(&conn, input.id, false)
-                .map_err(|e| format!("unpin: {e}"))?;
+            let ok =
+                observations::pin(&conn, input.id, false).map_err(|e| format!("unpin: {e}"))?;
             Ok(json!({"status": if ok { "unpinned" } else { "not_found" }}).to_string())
         }
-        other => Err(format!("unknown action '{other}'; use update, delete, pin, or unpin")),
+        other => Err(format!(
+            "unknown action '{other}'; use update, delete, pin, or unpin"
+        )),
     }
 }
 
@@ -299,7 +335,9 @@ mod tests {
         let input = HandoffInput {
             session_id: "sess-enrich".to_string(),
             summary: "did the thing".to_string(),
-            findings: Some(vec![serde_json::json!({"file": "a.rs", "summary": "found x"})]),
+            findings: Some(vec![
+                serde_json::json!({"file": "a.rs", "summary": "found x"}),
+            ]),
             decisions: None,
             files_touched: None,
             evidence: None,
@@ -309,7 +347,12 @@ mod tests {
         let session = sessions::get(&conn, "sess-enrich").unwrap().unwrap();
         assert!(session.findings.contains("found x"));
         assert!(session.compaction_snapshot.is_some());
-        assert!(session.compaction_snapshot.unwrap().contains("did the thing"));
+        assert!(
+            session
+                .compaction_snapshot
+                .unwrap()
+                .contains("did the thing")
+        );
     }
 
     // Regression test for item 7: the type filter used to be applied via
@@ -323,9 +366,31 @@ mod tests {
         // follow it. list_recent orders by created_at DESC, so a naive
         // "fetch top-N then filter by type" with a small limit would only
         // ever see the newer bugfix rows and never reach the decision row.
-        observations::save(&conn, None, "decision", "the one decision", "the only decision here", None, Some("proj-a"), None, None).unwrap();
+        observations::save(
+            &conn,
+            None,
+            "decision",
+            "the one decision",
+            "the only decision here",
+            None,
+            Some("proj-a"),
+            None,
+            None,
+        )
+        .unwrap();
         for i in 0..5 {
-            observations::save(&conn, None, "bugfix", &format!("bug {i}"), "irrelevant filler content", None, Some("proj-a"), None, None).unwrap();
+            observations::save(
+                &conn,
+                None,
+                "bugfix",
+                &format!("bug {i}"),
+                "irrelevant filler content",
+                None,
+                Some("proj-a"),
+                None,
+                None,
+            )
+            .unwrap();
         }
 
         let input = RecallInput {

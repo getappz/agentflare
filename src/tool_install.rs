@@ -168,10 +168,12 @@ mod tests {
                 && argv.contains(&"agentflare")
                 && argv.contains(&"mise")
         }));
-        assert!(LEAN_CTX
-            .post_install
-            .iter()
-            .any(|argv| argv.contains(&"compression_level") && argv.contains(&"max")));
+        assert!(
+            LEAN_CTX
+                .post_install
+                .iter()
+                .any(|argv| argv.contains(&"compression_level") && argv.contains(&"max"))
+        );
     }
 
     #[test]

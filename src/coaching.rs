@@ -58,7 +58,7 @@ fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
         }
         if in_header {
             if let Some(rest) = line.strip_prefix("# Pattern:") {
-                if let Some(t) = rest.splitn(2, '\u{2014}').nth(1) {
+                if let Some(t) = rest.split_once('\u{2014}').map(|x| x.1) {
                     title = t.trim().to_string();
                 }
             } else if let Some(rest) = line.strip_prefix("# Applied:") {
@@ -109,7 +109,8 @@ pub fn list_rules() -> Vec<CoachingRule> {
 fn write_rule_file(id: &str, title: &str, body: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(rules_dir())?;
     let date = chrono::Local::now().date_naive();
-    let content = format!("---\n# Pattern: {id} \u{2014} {title}\n# Applied: {date}\n---\n\n{body}\n");
+    let content =
+        format!("---\n# Pattern: {id} \u{2014} {title}\n# Applied: {date}\n---\n\n{body}\n");
     std::fs::write(rules_dir().join(format!("coaching-{id}.md")), content)
 }
 
@@ -126,7 +127,9 @@ pub fn apply_rule(id: &str, title: &str, body: &str) -> Result<CoachingRule, Str
     let existing = list_rules();
     let is_overwrite = existing.iter().any(|r| r.id == id);
     if !is_overwrite && existing.len() >= MAX_RULES {
-        return Err(format!("maximum {MAX_RULES} coaching rules reached — remove one first"));
+        return Err(format!(
+            "maximum {MAX_RULES} coaching rules reached — remove one first"
+        ));
     }
 
     write_rule_file(id, title, body).map_err(|e| format!("failed to write rule file: {e}"))?;
@@ -220,7 +223,12 @@ mod tests {
     #[test]
     fn apply_rule_then_list_rules_roundtrips() {
         with_temp_home(|| {
-            let applied = apply_rule("hygiene", "Close sessions promptly", "Wrap up each phase before starting the next.").unwrap();
+            let applied = apply_rule(
+                "hygiene",
+                "Close sessions promptly",
+                "Wrap up each phase before starting the next.",
+            )
+            .unwrap();
             assert_eq!(applied.id, "hygiene");
             assert_eq!(applied.title, "Close sessions promptly");
             assert_eq!(applied.body, "Wrap up each phase before starting the next.");
@@ -289,7 +297,11 @@ mod tests {
             apply_rule("good", "T", "B").unwrap();
 
             let rules = list_rules();
-            assert_eq!(rules.len(), 1, "malformed file with no # Applied: header is skipped");
+            assert_eq!(
+                rules.len(),
+                1,
+                "malformed file with no # Applied: header is skipped"
+            );
             assert_eq!(rules[0].id, "good");
         });
     }
@@ -299,7 +311,10 @@ mod tests {
         with_temp_home(|| {
             apply_rule("b-rule", "Title B", "Body B").unwrap();
             apply_rule("a-rule", "Title A", "Body A").unwrap();
-            assert_eq!(active_rule_bodies(), vec!["Body A".to_string(), "Body B".to_string()]);
+            assert_eq!(
+                active_rule_bodies(),
+                vec!["Body A".to_string(), "Body B".to_string()]
+            );
         });
     }
 
@@ -307,8 +322,16 @@ mod tests {
     fn apply_rule_body_with_dashes_line_is_not_truncated() {
         with_temp_home(|| {
             let applied = apply_rule("dashes", "Title", "before\n---\nafter").unwrap();
-            assert!(applied.body.contains("before"), "body should contain text before the --- line: {}", applied.body);
-            assert!(applied.body.contains("after"), "body should contain text after the --- line: {}", applied.body);
+            assert!(
+                applied.body.contains("before"),
+                "body should contain text before the --- line: {}",
+                applied.body
+            );
+            assert!(
+                applied.body.contains("after"),
+                "body should contain text after the --- line: {}",
+                applied.body
+            );
 
             let rules = list_rules();
             assert_eq!(rules.len(), 1);

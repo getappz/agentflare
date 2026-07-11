@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionSummary {
@@ -37,7 +37,11 @@ pub fn append(
     Ok(conn.last_insert_rowid())
 }
 
-pub fn list_recent(conn: &Connection, project: Option<&str>, limit: usize) -> rusqlite::Result<Vec<SessionSummary>> {
+pub fn list_recent(
+    conn: &Connection,
+    project: Option<&str>,
+    limit: usize,
+) -> rusqlite::Result<Vec<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, project, session_id, seq, summary, searchable_text, created_at
          FROM session_summaries
@@ -60,7 +64,9 @@ pub fn list_recent(conn: &Connection, project: Option<&str>, limit: usize) -> ru
 }
 
 fn now_iso() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 #[cfg(test)]

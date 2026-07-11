@@ -27,9 +27,7 @@ static CATALOG: &[AuthCatalog] = &[
     },
     AuthCatalog {
         agent_key: "codex",
-        files: &[
-            ".codex/auth.json",
-        ],
+        files: &[".codex/auth.json"],
     },
     AuthCatalog {
         agent_key: "antigravity",
@@ -40,22 +38,15 @@ static CATALOG: &[AuthCatalog] = &[
     },
     AuthCatalog {
         agent_key: "gemini",
-        files: &[
-            ".gemini/settings.json",
-            ".gemini/oauth_creds.json",
-        ],
+        files: &[".gemini/settings.json", ".gemini/oauth_creds.json"],
     },
     AuthCatalog {
         agent_key: "opencode",
-        files: &[
-            ".opencode/auth.json",
-        ],
+        files: &[".opencode/auth.json"],
     },
     AuthCatalog {
         agent_key: "copilot",
-        files: &[
-            ".copilot/auth.json",
-        ],
+        files: &[".copilot/auth.json"],
     },
 ];
 
@@ -64,7 +55,11 @@ fn catalog_for(agent: &str) -> Option<&'static AuthCatalog> {
 }
 
 fn vault_dir() -> PathBuf {
-    home().join(".local").join("share").join("agentflare").join(VAULT_DIR)
+    home()
+        .join(".local")
+        .join("share")
+        .join("agentflare")
+        .join(VAULT_DIR)
 }
 
 fn profile_dir(agent: &str, profile: &str) -> PathBuf {
@@ -73,7 +68,10 @@ fn profile_dir(agent: &str, profile: &str) -> PathBuf {
 
 fn validate_name(name: &str, kind: &'static str) -> Result<(), AuthError> {
     if name.is_empty() || name.contains('/') || name.contains('\\') {
-        Err(AuthError::InvalidName { name: name.to_string(), kind: kind.to_string() })
+        Err(AuthError::InvalidName {
+            name: name.to_string(),
+            kind: kind.to_string(),
+        })
     } else {
         Ok(())
     }
@@ -166,7 +164,10 @@ pub fn activate_with(agent: &str, profile: &str, reload_daemon: bool, json: bool
     let vault = profile_dir(agent, &profile);
     if !vault.exists() {
         if json {
-            println!("{}", serde_json::json!({"error": "profile not found", "profile": profile}));
+            println!(
+                "{}",
+                serde_json::json!({"error": "profile not found", "profile": profile})
+            );
         } else {
             eprintln!("error: profile '{profile}' not found for {agent}");
         }
@@ -176,9 +177,7 @@ pub fn activate_with(agent: &str, profile: &str, reload_daemon: bool, json: bool
     let mut restored = 0;
     let passphrase = auth_crypt::get_passphrase();
     for &rel in cat.files {
-        let src = vault.join(
-            rel.split('/').next_back().unwrap_or(rel)
-        );
+        let src = vault.join(rel.split('/').next_back().unwrap_or(rel));
         if src.exists() {
             let dest = home().join(rel);
             if let Some(parent) = dest.parent() {
@@ -190,7 +189,10 @@ pub fn activate_with(agent: &str, profile: &str, reload_daemon: bool, json: bool
                     if let Some(decrypted) = auth_crypt::decrypt(&data, pw) {
                         fs::write(&dest, decrypted).expect("write");
                     } else {
-                        eprintln!("warning: cannot decrypt {} — wrong passphrase", src.display());
+                        eprintln!(
+                            "warning: cannot decrypt {} — wrong passphrase",
+                            src.display()
+                        );
                         continue;
                     }
                 } else {
@@ -211,11 +213,14 @@ pub fn activate_with(agent: &str, profile: &str, reload_daemon: bool, json: bool
     crate::auth_db::touch_last_used(&conn, agent, &profile);
 
     if json {
-        println!("{}", serde_json::json!({
-            "agent": agent,
-            "profile": profile,
-            "restored": restored,
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "agent": agent,
+                "profile": profile,
+                "restored": restored,
+            })
+        );
     } else {
         println!("activated {agent}/{profile} — restored {restored} file(s)");
     }
@@ -229,7 +234,9 @@ pub fn activate_with(agent: &str, profile: &str, reload_daemon: bool, json: bool
                 println!("daemon restarted — auth changes now active");
             }
         } else if !json {
-            eprintln!("warning: {agent} daemon is running — auth changes won't take effect until restart. Use --reload-daemon to auto-restart.");
+            eprintln!(
+                "warning: {agent} daemon is running — auth changes won't take effect until restart. Use --reload-daemon to auto-restart."
+            );
         }
     }
 }
@@ -256,7 +263,11 @@ pub fn status(agent: Option<&str>, json: bool) {
         } else {
             println!("{}:", cat.agent_key);
             for p in &profiles {
-                let mark = if Some(p.as_str()) == active.as_deref() { " *" } else { "" };
+                let mark = if Some(p.as_str()) == active.as_deref() {
+                    " *"
+                } else {
+                    ""
+                };
                 println!("  {p}{mark}");
             }
             if active.is_none() {
@@ -282,7 +293,7 @@ pub fn list_agents(json: bool) {
 }
 
 pub fn ls(agent: &str, json: bool) {
-    if !catalog_for(agent).is_some() {
+    if catalog_for(agent).is_none() {
         fail("unknown agent", agent, json);
         return;
     }
@@ -310,7 +321,10 @@ pub fn delete(agent: &str, profile: &str, json: bool) {
     }
     fs::remove_dir_all(&dir).expect("remove dir");
     if json {
-        println!("{}", serde_json::json!({"deleted": true, "agent": agent, "profile": profile}));
+        println!(
+            "{}",
+            serde_json::json!({"deleted": true, "agent": agent, "profile": profile})
+        );
     } else {
         println!("deleted {agent}/{profile}");
     }
@@ -333,7 +347,10 @@ pub fn clear(agent: &str, json: bool) {
         }
     }
     if json {
-        println!("{}", serde_json::json!({"cleared": removed, "agent": agent}));
+        println!(
+            "{}",
+            serde_json::json!({"cleared": removed, "agent": agent})
+        );
     } else {
         println!("cleared {removed} auth file(s) for {agent}");
     }
@@ -361,7 +378,10 @@ pub fn rename(agent: &str, old: &str, new: &str, json: bool) {
     fs::create_dir_all(new_dir.parent().unwrap()).expect("create parent");
     fs::rename(&old_dir, &new_dir).expect("rename");
     if json {
-        println!("{}", serde_json::json!({"renamed": true, "agent": agent, "old": old, "new": new}));
+        println!(
+            "{}",
+            serde_json::json!({"renamed": true, "agent": agent, "old": old, "new": new})
+        );
     } else {
         println!("renamed {agent}/{old} → {new}");
     }
@@ -408,11 +428,11 @@ fn hash_live_files(cat: &AuthCatalog) -> String {
     let mut hasher = Sha256::new();
     for &rel in cat.files {
         let path = home().join(rel);
-        if path.exists() {
-            if let Ok(data) = fs::read(&path) {
-                hasher.update(rel.as_bytes());
-                hasher.update(data);
-            }
+        if path.exists()
+            && let Ok(data) = fs::read(&path)
+        {
+            hasher.update(rel.as_bytes());
+            hasher.update(data);
         }
     }
     format!("{:x}", hasher.finalize())
@@ -424,11 +444,11 @@ fn hash_vault_profile(cat: &AuthCatalog, profile: &str) -> String {
     for &rel in cat.files {
         let fname = rel.split('/').next_back().unwrap_or(rel);
         let path = dir.join(fname);
-        if path.exists() {
-            if let Ok(data) = fs::read(&path) {
-                hasher.update(rel.as_bytes());
-                hasher.update(data);
-            }
+        if path.exists()
+            && let Ok(data) = fs::read(&path)
+        {
+            hasher.update(rel.as_bytes());
+            hasher.update(data);
         }
     }
     format!("{:x}", hasher.finalize())
@@ -436,7 +456,10 @@ fn hash_vault_profile(cat: &AuthCatalog, profile: &str) -> String {
 
 fn fail(msg: &(impl std::fmt::Display + ?Sized), detail: &str, json: bool) {
     if json {
-        println!("{}", serde_json::json!({"error": msg.to_string(), "detail": detail}));
+        println!(
+            "{}",
+            serde_json::json!({"error": msg.to_string(), "detail": detail})
+        );
     } else {
         eprintln!("error: {msg}: {detail}");
     }
@@ -452,7 +475,10 @@ fn validate_algorithm(name: &str) -> Result<&str, AuthError> {
 pub fn rotate(agent: &str, algorithm: &str, json: bool) {
     let algorithm = match validate_algorithm(algorithm) {
         Ok(a) => a,
-        Err(e) => { fail(&e, "", json); return; }
+        Err(e) => {
+            fail(&e, "", json);
+            return;
+        }
     };
     let conn = auth_db::open_or_rebuild();
     let cooldowns = auth_db::list_cooldowns(&conn, Some(agent));
@@ -462,7 +488,10 @@ pub fn rotate(agent: &str, algorithm: &str, json: bool) {
 
     if active.is_empty() {
         if json {
-            println!("{}", serde_json::json!({"error": "no non-cooldown profiles available"}));
+            println!(
+                "{}",
+                serde_json::json!({"error": "no non-cooldown profiles available"})
+            );
         } else {
             eprintln!("error: all profiles are in cooldown");
         }
@@ -508,7 +537,11 @@ fn smart_pick(health: &[ProfileHealth], profiles: &[String]) -> String {
                 _ => 100.0,
             };
             let penalty = h.map(|h| h.penalty).unwrap_or(0.0);
-            let recency = if h.and_then(|h| h.last_used_at.as_ref()).is_some() { 0.0 } else { 10.0 };
+            let recency = if h.and_then(|h| h.last_used_at.as_ref()).is_some() {
+                0.0
+            } else {
+                10.0
+            };
             let jitter = (rand::random::<f64>() * 10.0) - 5.0;
             (p.clone(), base - penalty + recency + jitter)
         })
@@ -518,11 +551,11 @@ fn smart_pick(health: &[ProfileHealth], profiles: &[String]) -> String {
 }
 
 fn round_robin(conn: &Connection, agent: &str, profiles: &[String]) -> String {
-    if let Some((last, _)) = auth_db::get_rotation_last(conn, agent) {
-        if let Some(pos) = profiles.iter().position(|p| *p == last) {
-            let next = (pos + 1) % profiles.len();
-            return profiles[next].clone();
-        }
+    if let Some((last, _)) = auth_db::get_rotation_last(conn, agent)
+        && let Some(pos) = profiles.iter().position(|p| *p == last)
+    {
+        let next = (pos + 1) % profiles.len();
+        return profiles[next].clone();
     }
     profiles[0].clone()
 }
@@ -535,7 +568,10 @@ fn random_pick(profiles: &[String]) -> String {
 pub fn next(agent: &str, algorithm: &str, json: bool) {
     let algorithm = match validate_algorithm(algorithm) {
         Ok(a) => a,
-        Err(e) => { fail(&e, "", json); return; }
+        Err(e) => {
+            fail(&e, "", json);
+            return;
+        }
     };
     let conn = auth_db::open_or_rebuild();
     let cooldowns = auth_db::list_cooldowns(&conn, Some(agent));
@@ -549,7 +585,10 @@ pub fn next(agent: &str, algorithm: &str, json: bool) {
         select_profile(&conn, agent, algorithm, &health, &active)
     };
     if json {
-        println!("{}", serde_json::json!({"agent": agent, "next": chosen, "algorithm": algorithm}));
+        println!(
+            "{}",
+            serde_json::json!({"agent": agent, "next": chosen, "algorithm": algorithm})
+        );
     } else {
         println!("next rotation for {agent} [{algorithm}]: {chosen}");
     }
@@ -569,11 +608,12 @@ pub fn pick(agent: &str) {
     std::io::stdout().flush().ok();
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).ok();
-    if let Ok(idx) = input.trim().parse::<usize>() {
-        if idx > 0 && idx <= profiles.len() {
-            activate(agent, &profiles[idx - 1], false);
-            return;
-        }
+    if let Ok(idx) = input.trim().parse::<usize>()
+        && idx > 0
+        && idx <= profiles.len()
+    {
+        activate(agent, &profiles[idx - 1], false);
+        return;
     }
     eprintln!("invalid selection");
 }
@@ -583,7 +623,10 @@ pub fn cooldown_set(target: &str, minutes: Option<u32>, json: bool) {
         Some(p) => p,
         None => {
             if json {
-                println!("{}", serde_json::json!({"error": "expected <agent>/<profile>"}));
+                println!(
+                    "{}",
+                    serde_json::json!({"error": "expected <agent>/<profile>"})
+                );
             } else {
                 eprintln!("error: expected <agent>/<profile>");
             }
@@ -642,7 +685,10 @@ pub fn cooldown_clear(target: &str, json: bool) {
         Some(p) => p,
         None => {
             if json {
-                println!("{}", serde_json::json!({"error": "expected <agent>/<profile>"}));
+                println!(
+                    "{}",
+                    serde_json::json!({"error": "expected <agent>/<profile>"})
+                );
             } else {
                 eprintln!("error: expected <agent>/<profile>");
             }
@@ -662,7 +708,9 @@ pub fn cooldown_clear(target: &str, json: bool) {
 }
 
 fn parse_target(target: &str) -> Option<(String, String)> {
-    if target.is_empty() { return None; }
+    if target.is_empty() {
+        return None;
+    }
     let parts: Vec<&str> = target.splitn(2, '/').collect();
     if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
         Some((parts[0].to_string(), parts[1].to_string()))
@@ -739,7 +787,11 @@ pub fn project_unset(agent: &str, json: bool) {
 const ISOLATE_DIR: &str = "isolate";
 
 fn isolates_dir() -> PathBuf {
-    home().join(".local").join("share").join("agentflare").join(ISOLATE_DIR)
+    home()
+        .join(".local")
+        .join("share")
+        .join("agentflare")
+        .join(ISOLATE_DIR)
 }
 
 pub fn isolate_add(agent: &str, profile: &str, json: bool) {
@@ -750,7 +802,10 @@ pub fn isolate_add_with(agent: &str, profile: &str, shallow: bool, json: bool) {
     let dir = isolates_dir().join(agent).join(profile);
     if dir.exists() {
         if json {
-            println!("{}", serde_json::json!({"error": "isolated profile already exists"}));
+            println!(
+                "{}",
+                serde_json::json!({"error": "isolated profile already exists"})
+            );
         } else {
             eprintln!("isolated profile '{agent}/{profile}' already exists");
         }
@@ -782,12 +837,22 @@ pub fn isolate_add_with(agent: &str, profile: &str, shallow: bool, json: bool) {
 
     // Store metadata
     let meta = serde_json::json!({"mode": if shallow { "shallow" } else { "deep" }, "agent": agent, "profile": profile});
-    fs::write(dir.join("isolate.json"), serde_json::to_string_pretty(&meta).unwrap() + "\n").ok();
+    fs::write(
+        dir.join("isolate.json"),
+        serde_json::to_string_pretty(&meta).unwrap() + "\n",
+    )
+    .ok();
 
     if json {
-        println!("{}", serde_json::json!({"agent": agent, "profile": profile, "isolate_dir": dir.to_string_lossy()}));
+        println!(
+            "{}",
+            serde_json::json!({"agent": agent, "profile": profile, "isolate_dir": dir.to_string_lossy()})
+        );
     } else {
-        println!("isolated profile created: {agent}/{profile} at {}", dir.display());
+        println!(
+            "isolated profile created: {agent}/{profile} at {}",
+            dir.display()
+        );
     }
 }
 
@@ -804,14 +869,22 @@ pub fn isolate_ls(agent: Option<&str>, json: bool) {
     let mut results: Vec<serde_json::Value> = Vec::new();
     let agents: Vec<String> = match agent {
         Some(a) => vec![a.to_string()],
-        None => fs::read_dir(&dir).ok().map(|entries| {
-            entries.flatten().filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                .map(|e| e.file_name().to_string_lossy().to_string()).collect()
-        }).unwrap_or_default(),
+        None => fs::read_dir(&dir)
+            .ok()
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
     for a in &agents {
         let agent_dir = dir.join(a);
-        if !agent_dir.exists() { continue; }
+        if !agent_dir.exists() {
+            continue;
+        }
         if let Ok(entries) = fs::read_dir(&agent_dir) {
             for entry in entries.flatten() {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -844,7 +917,10 @@ pub fn isolate_delete(agent: &str, profile: &str, json: bool) {
     }
     fs::remove_dir_all(&dir).expect("remove isolate dir");
     if json {
-        println!("{}", serde_json::json!({"deleted": true, "agent": agent, "profile": profile}));
+        println!(
+            "{}",
+            serde_json::json!({"deleted": true, "agent": agent, "profile": profile})
+        );
     } else {
         println!("deleted isolated profile: {agent}/{profile}");
     }
@@ -854,9 +930,14 @@ pub fn auth_exec(agent: &str, profile: &str, args: &[String], json: bool) {
     let dir = isolates_dir().join(agent).join(profile);
     if !dir.exists() {
         if json {
-            println!("{}", serde_json::json!({"error": "isolated profile not found"}));
+            println!(
+                "{}",
+                serde_json::json!({"error": "isolated profile not found"})
+            );
         } else {
-            eprintln!("error: isolated profile '{agent}/{profile}' not found — run 'auth isolate add' first");
+            eprintln!(
+                "error: isolated profile '{agent}/{profile}' not found — run 'auth isolate add' first"
+            );
         }
         return;
     }
@@ -878,13 +959,10 @@ pub fn auth_exec(agent: &str, profile: &str, args: &[String], json: bool) {
         cmd.env("HOMEDRIVE", "");
         cmd.env("HOMEPATH", &dir);
     }
-    let status = cmd
-        .spawn()
-        .and_then(|mut c| c.wait())
-        .unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        });
+    let status = cmd.spawn().and_then(|mut c| c.wait()).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
@@ -915,18 +993,20 @@ pub fn auth_login(agent: &str, profile: &str, args: &[String], json: bool) {
         cmd.env("HOMEDRIVE", "");
         cmd.env("HOMEPATH", &dir);
     }
-    let status = cmd
-        .spawn()
-        .and_then(|mut c| c.wait())
-        .unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        });
+    let status = cmd.spawn().and_then(|mut c| c.wait()).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
 
     if status.success() {
         let passphrase = auth_crypt::get_passphrase();
         let dir = isolates_dir().join(agent).join(profile);
-        for &rel in CATALOG.iter().find(|c| c.agent_key == agent).map(|c| c.files).unwrap_or(&[]) {
+        for &rel in CATALOG
+            .iter()
+            .find(|c| c.agent_key == agent)
+            .map(|c| c.files)
+            .unwrap_or(&[])
+        {
             let dest = profile_dir(agent, profile).join(rel.rsplit('/').next().unwrap_or(rel));
             let src = dir.join(rel);
             if src.exists() {
@@ -948,19 +1028,23 @@ pub fn auth_login(agent: &str, profile: &str, args: &[String], json: bool) {
     }
 }
 
-
 fn read_isolate_mode(dir: &std::path::Path) -> Option<String> {
     let meta_path = dir.join("isolate.json");
-    if let Ok(data) = fs::read_to_string(&meta_path) {
-        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&data) {
-            return meta["mode"].as_str().map(|s| s.to_string());
-        }
+    if let Ok(data) = fs::read_to_string(&meta_path)
+        && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&data)
+    {
+        return meta["mode"].as_str().map(|s| s.to_string());
     }
     None
 }
 
 fn activate_into(agent: &str, profile: &str, target_dir: &std::path::Path) {
-    let cat = match catalog_for(agent) { Some(c) => c, None => { return; } };
+    let cat = match catalog_for(agent) {
+        Some(c) => c,
+        None => {
+            return;
+        }
+    };
     let vault = profile_dir(agent, profile);
     let passphrase = auth_crypt::get_passphrase();
     for &rel in cat.files {
@@ -976,11 +1060,17 @@ fn activate_into(agent: &str, profile: &str, target_dir: &std::path::Path) {
                     if let Some(decrypted) = auth_crypt::decrypt(&data, pw) {
                         fs::write(&dest, decrypted).expect("write");
                     } else {
-                        eprintln!("warning: cannot decrypt {} — wrong passphrase", src.display());
+                        eprintln!(
+                            "warning: cannot decrypt {} — wrong passphrase",
+                            src.display()
+                        );
                         continue;
                     }
                 } else {
-                    eprintln!("warning: {} is encrypted but no passphrase set", src.display());
+                    eprintln!(
+                        "warning: {} is encrypted but no passphrase set",
+                        src.display()
+                    );
                     continue;
                 }
             } else {
@@ -1171,13 +1261,19 @@ mod tests {
 
     #[test]
     fn parse_target_validates() {
-        assert_eq!(parse_target("claude-code/alice"), Some(("claude-code".to_string(), "alice".to_string())));
+        assert_eq!(
+            parse_target("claude-code/alice"),
+            Some(("claude-code".to_string(), "alice".to_string()))
+        );
         assert_eq!(parse_target(""), None);
         assert_eq!(parse_target("/"), None);
         assert_eq!(parse_target("a/"), None);
         assert_eq!(parse_target("/b"), None);
         assert_eq!(parse_target("no-slash"), None);
-        assert_eq!(parse_target("a/b/c"), Some(("a".to_string(), "b/c".to_string())));
+        assert_eq!(
+            parse_target("a/b/c"),
+            Some(("a".to_string(), "b/c".to_string()))
+        );
     }
 
     #[test]

@@ -3,12 +3,14 @@
 //! (see #138 — gateway secrets fold in later). The rebuildable caches under
 //! `~/.local/share/agentflare/` (skills index, gateway tool-index) stay
 //! separate: they belong in the data dir, not next to source-of-truth state.
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::PathBuf;
 use std::time::Duration;
 
 pub fn agentflare_db_path() -> PathBuf {
-    crate::paths::home().join(".agentflare").join("agentflare.db")
+    crate::paths::home()
+        .join(".agentflare")
+        .join("agentflare.db")
 }
 
 fn old_gateway_db_path() -> PathBuf {
@@ -144,13 +146,21 @@ mod tests {
         let conn = new_db();
         import_legacy_secrets(&conn, &old_path).unwrap();
         let present: i64 = conn
-            .query_row("SELECT COUNT(*) FROM gateway_secrets WHERE name='github_pat'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM gateway_secrets WHERE name='github_pat'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(present, 1, "secret should import on first open");
 
         // Legacy file is renamed once migrated, so a re-import can't resurrect.
-        assert!(!old_path.exists(), "legacy file should be renamed after migration");
-        conn.execute("DELETE FROM gateway_secrets WHERE name='github_pat'", []).unwrap();
+        assert!(
+            !old_path.exists(),
+            "legacy file should be renamed after migration"
+        );
+        conn.execute("DELETE FROM gateway_secrets WHERE name='github_pat'", [])
+            .unwrap();
         import_legacy_secrets(&conn, &old_path).unwrap();
         let after: i64 = conn
             .query_row("SELECT COUNT(*) FROM gateway_secrets", [], |r| r.get(0))
@@ -164,8 +174,13 @@ mod tests {
         let old_path = dir.path().join("gateway.db");
         // gateway_secrets exists but lacks the `ciphertext` column.
         let old = Connection::open(&old_path).unwrap();
-        old.execute_batch("CREATE TABLE gateway_secrets (name TEXT, blob BLOB);").unwrap();
-        old.execute("INSERT INTO gateway_secrets (name, blob) VALUES ('x', X'00')", []).unwrap();
+        old.execute_batch("CREATE TABLE gateway_secrets (name TEXT, blob BLOB);")
+            .unwrap();
+        old.execute(
+            "INSERT INTO gateway_secrets (name, blob) VALUES ('x', X'00')",
+            [],
+        )
+        .unwrap();
         drop(old);
 
         let conn = new_db();

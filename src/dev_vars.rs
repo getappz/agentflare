@@ -87,7 +87,8 @@ mod tests {
 
     #[test]
     fn returns_none_when_no_file() {
-        let dir = std::env::temp_dir().join(format!("agentflare-devvars-none-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agentflare-devvars-none-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(load(&dir, None).is_none());

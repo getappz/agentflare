@@ -3,11 +3,11 @@
 //! end-to-end. Exposes one tool: `echo`.
 
 use rmcp::{
+    ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
     model::{Implementation, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
     transport::stdio,
-    ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
 
@@ -72,7 +72,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // rather than just that some later call happened to succeed.
     if let Ok(marker_path) = std::env::var("GATEWAY_FIXTURE_MARKER_FILE") {
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(marker_path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(marker_path)
+        {
             let _ = writeln!(f, "{}", std::process::id());
         }
     }

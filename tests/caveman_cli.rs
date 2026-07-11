@@ -43,7 +43,12 @@ fn caveman_compress_generic_uses_the_stubbed_claude_cli() {
     std::fs::write(&source, "verbose original text").unwrap();
 
     let existing_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}{}{}", stub_dir.display(), if cfg!(windows) { ";" } else { ":" }, existing_path);
+    let new_path = format!(
+        "{}{}{}",
+        stub_dir.display(),
+        if cfg!(windows) { ";" } else { ":" },
+        existing_path
+    );
 
     let output = Command::new(agentflare_bin())
         .args(["caveman", "compress"])
@@ -53,10 +58,20 @@ fn caveman_compress_generic_uses_the_stubbed_claude_cli() {
         .output()
         .expect("failed to run agentflare");
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("B ▼"), "expected a summary line, got: {stdout}");
-    assert_eq!(std::fs::read_to_string(&source).unwrap(), "compressed output");
+    assert!(
+        stdout.contains("B ▼"),
+        "expected a summary line, got: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source).unwrap(),
+        "compressed output"
+    );
     // Generic compression defaults to BackupMode::OutOfTree, so the backup
     // does NOT live next to the source as doc.md.orig — it lives under
     // dirs::cache_dir()/agentflare/caveman/backups/. Not asserted here

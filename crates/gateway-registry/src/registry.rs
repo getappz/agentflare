@@ -4,11 +4,11 @@
 use crate::backend::Backend;
 use crate::config::{GatewayConfig, ServerConfig};
 use crate::db::{self, ServerTools};
-use crate::error::{suggest, GatewayError};
+use crate::error::{GatewayError, suggest};
 use crate::mcp_http::McpHttpBackend;
 use crate::mcp_stdio::McpStdioBackend;
 use crate::sanitize::sanitize_tool_entry;
-use crate::search::{search, MatchMode, ToolHit};
+use crate::search::{MatchMode, ToolHit, search};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -46,7 +46,12 @@ impl Registry {
         let conn = db::open_db(db_path)?;
         let backends = build_backends(config, secrets);
         let audit_log_path = Some(db_path.with_file_name("gateway-audit.log"));
-        let mut reg = Self { conn: std::sync::Mutex::new(conn), backends, last_refresh: None, audit_log_path };
+        let mut reg = Self {
+            conn: std::sync::Mutex::new(conn),
+            backends,
+            last_refresh: None,
+            audit_log_path,
+        };
         reg.ensure_fresh().await?;
         Ok(reg)
     }
@@ -65,28 +70,33 @@ impl Registry {
     ) -> Result<Self, GatewayError> {
         let conn = db::open_in_memory()?;
         let backends = build_backends(config, secrets);
-        let mut reg =
-            Self { conn: std::sync::Mutex::new(conn), backends, last_refresh: None, audit_log_path: None };
+        let mut reg = Self {
+            conn: std::sync::Mutex::new(conn),
+            backends,
+            last_refresh: None,
+            audit_log_path: None,
+        };
         reg.ensure_fresh().await?;
         Ok(reg)
     }
 
     pub async fn ensure_fresh(&mut self) -> Result<(), GatewayError> {
-        if let Some(t) = self.last_refresh {
-            if t.elapsed() < REFRESH_DEBOUNCE {
-                return Ok(());
-            }
+        if let Some(t) = self.last_refresh
+            && t.elapsed() < REFRESH_DEBOUNCE
+        {
+            return Ok(());
         }
         // Backends are independent (each owns its own child-process
         // connection), so discover() runs concurrently across all of them
         // instead of one-at-a-time — with N configured servers, a single
         // slow/hanging backend no longer serializes the others' startup
         // behind it (each still bounded by its own DEFAULT_TIMEOUT).
-        let discovered = futures_util::future::join_all(self.backends.iter().map(|(name, backend)| {
-            let name = name.clone();
-            async move { (name, backend.discover().await) }
-        }))
-        .await;
+        let discovered =
+            futures_util::future::join_all(self.backends.iter().map(|(name, backend)| {
+                let name = name.clone();
+                async move { (name, backend.discover().await) }
+            }))
+            .await;
 
         let mut entries = Vec::new();
         for (name, result) in discovered {
@@ -103,7 +113,10 @@ impl Registry {
                 // first discovered, so it doesn't need this again.
                 Ok(tools) => {
                     let tools = tools.into_iter().map(sanitize_tool_entry).collect();
-                    entries.push(ServerTools { server: name, tools });
+                    entries.push(ServerTools {
+                        server: name,
+                        tools,
+                    });
                 }
                 Err(e) => {
                     eprintln!("gateway-registry: discover failed for backend '{name}': {e}");
@@ -115,29 +128,51 @@ impl Registry {
                     // for this server as of the previous successful refresh,
                     // if any, rather than contributing nothing.
                     let previous = {
-                        let conn = self.conn.lock().expect("gateway registry db mutex poisoned");
+                        let conn = self
+                            .conn
+                            .lock()
+                            .expect("gateway registry db mutex poisoned");
                         db::server_tools(&conn, &name).unwrap_or_default()
                     };
                     if !previous.is_empty() {
-                        entries.push(ServerTools { server: name, tools: previous });
+                        entries.push(ServerTools {
+                            server: name,
+                            tools: previous,
+                        });
                     }
                 }
             }
         }
         {
-            let mut conn = self.conn.lock().expect("gateway registry db mutex poisoned");
+            let mut conn = self
+                .conn
+                .lock()
+                .expect("gateway registry db mutex poisoned");
             db::rebuild(&mut conn, &entries)?;
         }
         self.last_refresh = Some(Instant::now());
         Ok(())
     }
 
-    pub fn search(&self, query: &str, limit: usize, mode: MatchMode) -> Result<Vec<ToolHit>, GatewayError> {
-        let conn = self.conn.lock().expect("gateway registry db mutex poisoned");
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        mode: MatchMode,
+    ) -> Result<Vec<ToolHit>, GatewayError> {
+        let conn = self
+            .conn
+            .lock()
+            .expect("gateway registry db mutex poisoned");
         Ok(search(&conn, query, limit, mode)?)
     }
 
-    pub async fn execute(&self, server: &str, tool: &str, args: Value) -> Result<Value, GatewayError> {
+    pub async fn execute(
+        &self,
+        server: &str,
+        tool: &str,
+        args: Value,
+    ) -> Result<Value, GatewayError> {
         let backend = match self.backends.get(server) {
             Some(b) => b,
             None => {
@@ -150,12 +185,17 @@ impl Registry {
             }
         };
         let known_tools = {
-            let conn = self.conn.lock().expect("gateway registry db mutex poisoned");
+            let conn = self
+                .conn
+                .lock()
+                .expect("gateway registry db mutex poisoned");
             db::tool_names(&conn, server)?
         };
         if !known_tools.is_empty() && !known_tools.contains(&tool.to_string()) {
             let msg = match suggest(tool, &known_tools) {
-                Some(s) => format!("tool '{tool}' not found on server '{server}' — did you mean '{s}'?"),
+                Some(s) => {
+                    format!("tool '{tool}' not found on server '{server}' — did you mean '{s}'?")
+                }
                 None => format!("tool '{tool}' not found on server '{server}'"),
             };
             return Err(GatewayError::ToolNotFound(msg));
@@ -188,11 +228,19 @@ fn error_kind(e: &GatewayError) -> &'static str {
     }
 }
 
-fn build_backends(config: &GatewayConfig, secrets: &HashMap<String, String>) -> HashMap<String, Backend> {
+fn build_backends(
+    config: &GatewayConfig,
+    secrets: &HashMap<String, String>,
+) -> HashMap<String, Backend> {
     let mut out = HashMap::new();
     for (name, server_config) in &config.servers {
         let backend = match server_config {
-            ServerConfig::McpStdio { command, args, auth_ref, auth_env } => {
+            ServerConfig::McpStdio {
+                command,
+                args,
+                auth_ref,
+                auth_env,
+            } => {
                 let mut env = HashMap::new();
                 if let (Some(auth_ref), Some(auth_env)) = (auth_ref, auth_env) {
                     match secrets.get(auth_ref) {
@@ -214,8 +262,14 @@ fn build_backends(config: &GatewayConfig, secrets: &HashMap<String, String>) -> 
                 }
                 Backend::McpStdio(McpStdioBackend::new(command.clone(), args.clone(), env))
             }
-            ServerConfig::McpHttp { url, auth_ref, auth_env, auth_header } => {
-                let resolved = resolve_mcp_http_auth_header(name, auth_ref, auth_env, auth_header, secrets);
+            ServerConfig::McpHttp {
+                url,
+                auth_ref,
+                auth_env,
+                auth_header,
+            } => {
+                let resolved =
+                    resolve_mcp_http_auth_header(name, auth_ref, auth_env, auth_header, secrets);
                 Backend::McpHttp(McpHttpBackend::new(url.clone(), resolved))
             }
         };
@@ -248,7 +302,9 @@ fn resolve_mcp_http_auth_header(
     };
     match secrets.get(auth_ref) {
         Some(secret) => {
-            let header_name = auth_header.clone().unwrap_or_else(|| "Authorization".to_string());
+            let header_name = auth_header
+                .clone()
+                .unwrap_or_else(|| "Authorization".to_string());
             Some((header_name, secret.clone()))
         }
         None => {
@@ -308,15 +364,23 @@ mod tests {
         );
         // `last_refresh: None` so `ensure_fresh` doesn't skip via the
         // debounce and actually runs the discover-fails-then-fallback path.
-        let mut reg =
-            Registry { conn: std::sync::Mutex::new(conn), backends, last_refresh: None, audit_log_path: None };
+        let mut reg = Registry {
+            conn: std::sync::Mutex::new(conn),
+            backends,
+            last_refresh: None,
+            audit_log_path: None,
+        };
 
         reg.ensure_fresh().await.unwrap();
 
         // The failed refresh must NOT have wiped "flaky"'s previously
         // indexed tool — it should still be searchable/known.
         let hits = reg.search("old_tool", 5, MatchMode::All).unwrap();
-        assert_eq!(hits.len(), 1, "expected previously-indexed tool to survive a failed discover(), got {hits:?}");
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected previously-indexed tool to survive a failed discover(), got {hits:?}"
+        );
         assert_eq!(hits[0].server, "flaky");
         assert_eq!(hits[0].tool, "old_tool");
 

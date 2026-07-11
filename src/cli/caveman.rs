@@ -27,7 +27,12 @@ pub struct CavemanArgs {
 impl CavemanArgs {
     pub fn run(self) {
         match self.action {
-            CavemanAction::Compress { source, target, spec_file, backup } => {
+            CavemanAction::Compress {
+                source,
+                target,
+                spec_file,
+                backup,
+            } => {
                 let target = target.unwrap_or_else(|| source.clone());
                 let prompt = match &spec_file {
                     Some(path) => match std::fs::read_to_string(path) {
@@ -47,12 +52,16 @@ impl CavemanArgs {
                         std::process::exit(1);
                     }
                 };
-                let result = caveman::compress(&caveman::RealLlm, &source, &target, prompt, backup_mode);
+                let result =
+                    caveman::compress(&caveman::RealLlm, &source, &target, prompt, backup_mode);
                 match result {
                     Ok(report) => {
                         let ratio = 100 * report.compressed_bytes / report.original_bytes.max(1);
                         let pct = 100usize.saturating_sub(ratio);
-                        println!("{}→{}B ▼{pct}%", report.original_bytes, report.compressed_bytes);
+                        println!(
+                            "{}→{}B ▼{pct}%",
+                            report.original_bytes, report.compressed_bytes
+                        );
                     }
                     Err(e) => {
                         eprintln!("{e}");

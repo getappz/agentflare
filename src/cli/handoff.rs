@@ -44,7 +44,10 @@ impl HandoffArgs {
         let recipient = self.recipient.clone();
         match self.publish() {
             Ok(out) => {
-                println!("Handed off artifact {} (v{}) to {recipient}", out.id, out.version);
+                println!(
+                    "Handed off artifact {} (v{}) to {recipient}",
+                    out.id, out.version
+                );
                 println!("  thread: {}", out.thread_id);
                 println!("  hint: {recipient} reads it via /flare:handoff inbox (or artifact_get)");
             }
@@ -78,7 +81,11 @@ impl HandoffArgs {
         });
         let sender = self
             .sender
-            .or_else(|| std::env::var("AGENTFLARE_AGENT").ok().filter(|s| !s.is_empty()))
+            .or_else(|| {
+                std::env::var("AGENTFLARE_AGENT")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            })
             .or_else(agent_detector::agent_name)
             .unwrap_or_else(|| "cli".into());
 
@@ -105,7 +112,11 @@ impl HandoffArgs {
             git: crate::mcp_server::AgentflareMcp::git_provenance(),
         };
         let resp = store.publish(&req).map_err(|e| e.to_string())?;
-        Ok(HandoffOutcome { id: resp.id, version: resp.version, thread_id })
+        Ok(HandoffOutcome {
+            id: resp.id,
+            version: resp.version,
+            thread_id,
+        })
     }
 }
 
@@ -148,7 +159,10 @@ mod tests {
         assert_eq!(artifact.sender.as_deref(), Some("claude-code"));
         assert_eq!(artifact.thread_id.as_deref(), Some("t-pr42"));
         assert_eq!(artifact.name, "review-notes");
-        assert_eq!(artifact.artifact_type, agentflare_artifacts::ArtifactType::Markdown);
+        assert_eq!(
+            artifact.artifact_type,
+            agentflare_artifacts::ArtifactType::Markdown
+        );
         assert!(artifact.content.contains("please review"));
     }
 

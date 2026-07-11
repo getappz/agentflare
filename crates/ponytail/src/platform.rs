@@ -9,6 +9,7 @@ pub enum AgentPlatform {
     Fallback,
 }
 
+#[must_use]
 pub fn detect_platform() -> AgentPlatform {
     if let Some(result) = detect::detect() {
         match result.name.as_str() {
@@ -22,17 +23,16 @@ pub fn detect_platform() -> AgentPlatform {
     }
 }
 
+#[must_use]
 pub fn format_hook_output(event: &str, ctx: &str, platform: &AgentPlatform) -> String {
     match platform {
-        AgentPlatform::Claude => {
-            json!({
-                "hookSpecificOutput": {
-                    "hookEventName": event,
-                    "additionalContext": ctx,
-                }
-            })
-            .to_string()
-        }
+        AgentPlatform::Claude => json!({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": ctx,
+            }
+        })
+        .to_string(),
         AgentPlatform::Codex => {
             let mut output = json!({ "additionalContext": ctx });
             if event == "SessionStart" {

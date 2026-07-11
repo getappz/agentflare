@@ -1,5 +1,5 @@
 use crate::paths::home;
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{Connection, Result as SqlResult, params};
 use std::path::PathBuf;
 
 const SCHEMA_VERSION: i32 = 1;
@@ -11,6 +11,7 @@ pub struct CooldownRow {
     pub reason: Option<String>,
 }
 
+#[allow(dead_code)]
 pub struct ProfileHealth {
     pub agent: String,
     pub profile: String,
@@ -21,7 +22,11 @@ pub struct ProfileHealth {
 }
 
 fn db_path() -> PathBuf {
-    home().join(".local").join("share").join("agentflare").join("auth.db")
+    home()
+        .join(".local")
+        .join("share")
+        .join("agentflare")
+        .join("auth.db")
 }
 
 pub fn migrate(conn: &Connection) -> SqlResult<()> {
@@ -105,9 +110,13 @@ fn penalty_for_error(msg: &str) -> f64 {
         10.0
     } else if m.contains("401") || m.contains("403") || m.contains("unauthorized") {
         100.0
-    } else if m.contains("timeout") || m.contains("deadline exceeded") {
-        5.0
-    } else if m.contains("500") || m.contains("502") || m.contains("503") || m.contains("504") {
+    } else if m.contains("timeout")
+        || m.contains("deadline exceeded")
+        || m.contains("500")
+        || m.contains("502")
+        || m.contains("503")
+        || m.contains("504")
+    {
         5.0
     } else {
         3.0
@@ -259,6 +268,7 @@ pub fn clear_cooldown(conn: &Connection, agent: &str, profile: &str) {
     .ok();
 }
 
+#[allow(dead_code)]
 pub fn get_health(conn: &Connection, agent: &str, profile: &str) -> ProfileHealth {
     conn.query_row(
         "SELECT agent, profile, status, error_count_1h, penalty, last_used_at FROM profile_health WHERE agent = ?1 AND profile = ?2",
@@ -484,10 +494,7 @@ mod tests {
             let conn = open_or_rebuild();
             set_rotation_last(&conn, "claude-code", "alice", "smart");
             let last = get_rotation_last(&conn, "claude-code");
-            assert_eq!(
-                last,
-                Some(("alice".to_string(), "smart".to_string()))
-            );
+            assert_eq!(last, Some(("alice".to_string(), "smart".to_string())));
         });
     }
 }

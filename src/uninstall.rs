@@ -58,36 +58,45 @@ fn clean_claude_code(dry_run: bool) {
     let settings_path = home().join(".claude").join("settings.json");
     if settings_path.exists() {
         let content = fs::read_to_string(&settings_path).unwrap_or_default();
-        if content.contains("agentflare") {
-            if let Ok(mut settings) = serde_json::from_str::<Value>(&content) {
-                if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-                    for key in &["SessionStart", "UserPromptSubmit", "PreToolUse"] {
-                        if let Some(arr) = hooks.get(*key).and_then(|v| v.as_array()) {
-                            hooks[*key] = Value::Array(
-                                arr.iter()
-                                    .filter(|entry| !entry.to_string().contains("agentflare"))
-                                    .cloned()
-                                    .collect(),
-                            );
-                        }
-                    }
-                    if hooks.get("SessionStart").map_or(true, |v| v.as_array().map_or(true, |a| a.is_empty()))
-                        && hooks.get("UserPromptSubmit").map_or(true, |v| v.as_array().map_or(true, |a| a.is_empty()))
-                        && hooks.get("PreToolUse").map_or(true, |v| v.as_array().map_or(true, |a| a.is_empty()))
-                    {
-                        hooks.remove("SessionStart");
-                        hooks.remove("UserPromptSubmit");
-                        hooks.remove("PreToolUse");
-                    }
-                    if hooks.is_empty() {
-                        settings.as_object_mut().unwrap().remove("hooks");
+        if content.contains("agentflare")
+            && let Ok(mut settings) = serde_json::from_str::<Value>(&content)
+        {
+            if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+                for key in &["SessionStart", "UserPromptSubmit", "PreToolUse"] {
+                    if let Some(arr) = hooks.get(*key).and_then(|v| v.as_array()) {
+                        hooks[*key] = Value::Array(
+                            arr.iter()
+                                .filter(|entry| !entry.to_string().contains("agentflare"))
+                                .cloned()
+                                .collect(),
+                        );
                     }
                 }
-                if dry_run {
-                    println!("  clean ~/.claude/settings.json (remove agentflare hooks)");
-                } else {
-                    let _ = fs::write(&settings_path, serde_json::to_string_pretty(&settings).unwrap() + "\n");
+                if hooks
+                    .get("SessionStart")
+                    .is_none_or(|v| v.as_array().is_none_or(|a| a.is_empty()))
+                    && hooks
+                        .get("UserPromptSubmit")
+                        .is_none_or(|v| v.as_array().is_none_or(|a| a.is_empty()))
+                    && hooks
+                        .get("PreToolUse")
+                        .is_none_or(|v| v.as_array().is_none_or(|a| a.is_empty()))
+                {
+                    hooks.remove("SessionStart");
+                    hooks.remove("UserPromptSubmit");
+                    hooks.remove("PreToolUse");
                 }
+                if hooks.is_empty() {
+                    settings.as_object_mut().unwrap().remove("hooks");
+                }
+            }
+            if dry_run {
+                println!("  clean ~/.claude/settings.json (remove agentflare hooks)");
+            } else {
+                let _ = fs::write(
+                    &settings_path,
+                    serde_json::to_string_pretty(&settings).unwrap() + "\n",
+                );
             }
         }
     }
@@ -99,28 +108,41 @@ fn clean_opencode(dry_run: bool) {
         remove_file(&rules_dir.join(f), dry_run);
     }
 
-    let config_path = home().join(".config").join("opencode").join("opencode.jsonc");
+    let config_path = home()
+        .join(".config")
+        .join("opencode")
+        .join("opencode.jsonc");
     if config_path.exists() {
         let content = fs::read_to_string(&config_path).unwrap_or_default();
-        if content.contains("agentflare") || content.contains("exa.md") || content.contains("engram.md") {
-            if let Ok(mut config) = serde_json::from_str::<Value>(&content) {
-                if let Some(instructions) = config.get_mut("instructions").and_then(|v| v.as_array_mut()) {
-                    instructions.retain(|v| {
-                        let s = v.as_str().unwrap_or("");
-                        !s.contains("exa.md")
-                            && !s.contains("git.md")
-                            && !s.contains("lean-ctx.md")
-                            && !s.contains("engram.md")
-                    });
-                    if instructions.is_empty() {
-                        config.as_object_mut().unwrap().remove("instructions");
-                    }
+        if (content.contains("agentflare")
+            || content.contains("exa.md")
+            || content.contains("engram.md"))
+            && let Ok(mut config) = serde_json::from_str::<Value>(&content)
+        {
+            if let Some(instructions) = config
+                .get_mut("instructions")
+                .and_then(|v| v.as_array_mut())
+            {
+                instructions.retain(|v| {
+                    let s = v.as_str().unwrap_or("");
+                    !s.contains("exa.md")
+                        && !s.contains("git.md")
+                        && !s.contains("lean-ctx.md")
+                        && !s.contains("engram.md")
+                });
+                if instructions.is_empty() {
+                    config.as_object_mut().unwrap().remove("instructions");
                 }
-                if dry_run {
-                    println!("  clean ~/.config/opencode/opencode.jsonc (remove agentflare instructions)");
-                } else {
-                    let _ = fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap() + "\n");
-                }
+            }
+            if dry_run {
+                println!(
+                    "  clean ~/.config/opencode/opencode.jsonc (remove agentflare instructions)"
+                );
+            } else {
+                let _ = fs::write(
+                    &config_path,
+                    serde_json::to_string_pretty(&config).unwrap() + "\n",
+                );
             }
         }
     }
@@ -154,22 +176,31 @@ fn clean_mcp_configs(dry_run: bool) {
 
     let cwd = std::env::current_dir().unwrap_or_default();
     let engram_mcp = cwd.join(".continue").join("mcpServers").join("engram.json");
-    let agentflare_mcp = cwd.join(".continue").join("mcpServers").join("agentflare.json");
+    let agentflare_mcp = cwd
+        .join(".continue")
+        .join("mcpServers")
+        .join("agentflare.json");
     remove_file(&engram_mcp, dry_run);
     remove_file(&agentflare_mcp, dry_run);
 }
 
 fn clean_mcp_entry(path: &PathBuf, dry_run: bool) {
-    if !path.exists() { return; }
+    if !path.exists() {
+        return;
+    }
     let content = fs::read_to_string(path).unwrap_or_default();
     // "flare" also matches "agentflare", covering the legacy entry name.
     if !content.contains("engram") && !content.contains("lean-ctx") && !content.contains("flare") {
         return;
     }
     if let Ok(mut config) = serde_json::from_str::<Value>(&content) {
-        let key = if config.get("mcpServers").is_some() { "mcpServers" }
-                  else if config.get("mcp").is_some() { "mcp" }
-                  else { return };
+        let key = if config.get("mcpServers").is_some() {
+            "mcpServers"
+        } else if config.get("mcp").is_some() {
+            "mcp"
+        } else {
+            return;
+        };
         if let Some(mcp) = config.get_mut(key).and_then(|v| v.as_object_mut()) {
             mcp.remove("engram");
             mcp.remove("lean-ctx");
@@ -188,8 +219,14 @@ fn clean_mcp_entry(path: &PathBuf, dry_run: bool) {
 }
 
 fn clean_ponytail_caveman(dry_run: bool) {
-    remove_file(&home().join(".config").join("ponytail").join("config.json"), dry_run);
-    remove_file(&home().join(".config").join("caveman").join("config.json"), dry_run);
+    remove_file(
+        &home().join(".config").join("ponytail").join("config.json"),
+        dry_run,
+    );
+    remove_file(
+        &home().join(".config").join("caveman").join("config.json"),
+        dry_run,
+    );
 }
 
 fn clean_state_dir(dry_run: bool) {
@@ -203,17 +240,27 @@ fn clean_binary(dry_run: bool) {
         .unwrap_or_else(|_| home().join(".local").join("bin"));
 
     let current = std::env::current_exe().ok();
-    if let Some(ref current) = current {
-        if current.to_string_lossy().contains("/target/") {
-            if !dry_run {
-                println!("  skip binary (running from dev build at {})", current.display());
-            }
-            return;
+    if let Some(ref current) = current
+        && current.to_string_lossy().contains("/target/")
+    {
+        if !dry_run {
+            println!(
+                "  skip binary (running from dev build at {})",
+                current.display()
+            );
         }
+        return;
     }
 
-    let binary_name = if cfg!(windows) { "agentflare.exe" } else { "agentflare" };
-    let locations = &[install_dir.join(binary_name), PathBuf::from("/usr/local/bin").join(binary_name)];
+    let binary_name = if cfg!(windows) {
+        "agentflare.exe"
+    } else {
+        "agentflare"
+    };
+    let locations = &[
+        install_dir.join(binary_name),
+        PathBuf::from("/usr/local/bin").join(binary_name),
+    ];
 
     for loc in locations {
         if loc.exists() {

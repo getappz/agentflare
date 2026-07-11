@@ -32,7 +32,10 @@ pub fn load() -> State {
     fs::read_to_string(state_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| State { active: true, ..Default::default() })
+        .unwrap_or_else(|| State {
+            active: true,
+            ..Default::default()
+        })
 }
 
 pub fn save(state: &State) {
@@ -65,7 +68,10 @@ mod tests {
     #[test]
     fn save_then_load_roundtrips() {
         with_temp_home(|| {
-            save(&State { active: false, ..Default::default() });
+            save(&State {
+                active: false,
+                ..Default::default()
+            });
             assert!(!load().active);
         });
     }
