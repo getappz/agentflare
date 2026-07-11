@@ -217,7 +217,38 @@ pub fn run(agent: &str, yes: bool) {
         _ => {}
     }
 
+    confirm_gateway_integrations(agent, yes);
+
     println!("\nDone. Restart {agent} if it was already running.");
+}
+
+/// Detects project context (e.g. a GitHub remote) and offers to register the
+/// matching MCP server behind agentflare's gateway. Separate consent from the
+/// rest of `init` since it wires an outside service; idempotent via
+/// `already_registered`, so re-running never re-prompts once wired.
+fn confirm_gateway_integrations(agent: &str, yes: bool) {
+    use crate::gateway_integrations::{already_registered, register, INTEGRATIONS};
+
+    for intg in INTEGRATIONS {
+        if !(intg.detect)() {
+            continue;
+        }
+        if already_registered(intg.name) {
+            println!("  skip  {} MCP already registered behind the gateway", intg.name);
+            continue;
+        }
+
+        println!();
+        println!("{}", intg.prompt);
+        if !prompt_yes("  Register it behind the agentflare gateway? [Y/n] ", agent, yes) {
+            continue;
+        }
+
+        println!("  {}", register(intg));
+        for line in (intg.post_note)() {
+            println!("{line}");
+        }
+    }
 }
 
 /// Adds one hook entry for `event` unless an agentflare-owned entry for it
