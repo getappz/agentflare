@@ -35,6 +35,8 @@ jobs:
   build:
     needs: changes
     if: always()
+    permissions:
+      contents: read
     # A hung test would otherwise pin a runner for GitHub's 6h default and
     # block the branch's required check indefinitely; fail fast instead. A
     # cold-cache build+test finishes well under this on every OS.
@@ -72,6 +74,8 @@ jobs:
   clippy:
     needs: changes
     if: always()
+    permissions:
+      contents: read
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
@@ -91,11 +95,13 @@ jobs:
       # pedantic overrides are deliberately warn-only, not deny — exempt both
       # groups here so this gate doesn't silently escalate that policy.
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings -A unsafe_code -A clippy::pedantic
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -A unsafe_code -A clippy::pedantic
 
   fmt:
     needs: changes
     if: always()
+    permissions:
+      contents: read
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
@@ -116,6 +122,8 @@ jobs:
     # blocking the merge forever. cargo-deny is cheap enough to run always.
     name: cargo-deny
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
@@ -134,6 +142,7 @@ jobs:
       - fmt
       - deny
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
       - name: Verify no required job failed
         shell: bash

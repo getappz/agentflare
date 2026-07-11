@@ -8,6 +8,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[derive(Debug)]
 pub enum LaunchOutcome {
     Launched,
     NotFound(String),
@@ -319,8 +320,9 @@ mod tests {
     fn launch_not_on_path_errors() {
         let reg = test_registry();
         // "aider" unlikely to be on a test PATH
-        if let LaunchOutcome::NotFound(msg) = run_launch(&reg, "aider", None, None, &[]) {
-            assert!(msg.contains("not found on PATH"))
+        match run_launch(&reg, "aider", None, None, &[]) {
+            LaunchOutcome::NotFound(msg) => assert!(msg.contains("not found on PATH")),
+            other => panic!("expected NotFound, got {other:?}"),
         }
     }
 
