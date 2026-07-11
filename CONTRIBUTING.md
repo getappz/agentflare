@@ -38,8 +38,8 @@ agentflare/
 │   ├── components.rs        # registry: each entry checks + fixes itself, host-aware
 │   ├── paths.rs             # home-dir resolution
 │   ├── state.rs             # ~/.agentflare/state.json — on/off flag for hooks
-│   ├── rule_text.rs         # shared rule copy (Exa, git, lean-ctx, engram usage)
-│   ├── engram_install.rs    # engram safe-install logic (go install/brew only)
+│   ├── rule_text.rs         # shared rule copy (Exa, git, lean-ctx usage)
+│   ├── memory/              # built-in persistent memory (SQLite + FTS5)
 │   ├── cost.rs              # cost tracking
 │   ├── optimize.rs          # optimization logic
 │   └── pricing.rs           # model pricing data

@@ -1,10 +1,9 @@
-<#
+﻿<#
 install.ps1 - Build agentflare locally on Windows and install it into Cargo's bin directory.
 
 Building locally (rather than downloading a prebuilt .exe) means the binary
 compiled on your own machine, so there's no unsigned-binary AV heuristic to
-trip — the same reason engram's own install docs steer Windows users to
-`go install` over their prebuilt release.
+trip.
 
 Usage:
     .\install.ps1

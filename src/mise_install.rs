@@ -1,10 +1,6 @@
 // Cross-platform detect-or-install for mise (github.com/jdx/mise), a dev-tool
-// version manager. agentflare uses it as a uniform, host-independent way to
-// provide the external toolchains its integrations need — Go for the engram
-// binary, Node/npm for lean-ctx — on machines that don't already have them.
-//
-// This module only handles mise itself (detection + bootstrap). Installing the
-// individual tools through mise happens at each tool's install site.
+// version manager. `agentflare run` uses it to launch agents with mise-managed
+// tools on PATH for the session, on machines that don't already have mise.
 use crate::paths::home;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -117,51 +113,6 @@ fn install_windows() -> Result<(), String> {
          one (or mise directly) per https://mise.jdx.dev/installing-mise.html"
             .to_string(),
     )
-}
-
-/// `mise use -g <spec>` — install/activate a tool globally. Run from $HOME so
-/// an untrusted project-local mise config in the user's cwd can't block a
-/// global install.
-pub fn use_global(mise: &str, spec: &str) -> bool {
-    Command::new(mise)
-        .current_dir(home())
-        .args(["use", "-g", spec])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Install a tool globally from a backend spec (e.g.
-/// `github:Gentleman-Programming/engram`) and return the absolute path mise
-/// resolves `bin` to. mise installs into its own data dir, which is NOT on
-/// PATH — so callers use this absolute path directly (as an MCP command, etc.)
-/// rather than expecting the bare name to resolve. That's the whole point of
-/// routing through mise: a PATH-independent, cross-platform install path.
-pub fn install_tool(mise: &str, spec: &str, bin: &str) -> Result<String, String> {
-    if !use_global(mise, spec) {
-        return Err(format!("`mise use -g {spec}` failed"));
-    }
-    which_tool(mise, bin)
-        .ok_or_else(|| format!("mise installed {spec} but `mise which {bin}` returned no path"))
-}
-
-/// Absolute path mise resolves `bin` to, or `None`. Reads stdout only — mise
-/// can emit unrelated warnings on stderr.
-pub fn which_tool(mise: &str, bin: &str) -> Option<String> {
-    let out = Command::new(mise)
-        .current_dir(home())
-        .args(["which", bin])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .last()
-        .map(|l| l.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 fn which(cmd: &str) -> Option<String> {

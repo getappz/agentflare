@@ -72,7 +72,7 @@ fn session_start_message(agent: &str) -> String {
 
     lines.push(String::new());
     lines.push(
-        "AGENTFLARE ACTIVE — lean-ctx/engram tools, Exa search, clean git commits. Off: /agentflare off."
+        "AGENTFLARE ACTIVE — lean-ctx tools, Exa search, clean git commits. Off: /agentflare off."
             .to_string(),
     );
     lines.push(
@@ -80,7 +80,7 @@ fn session_start_message(agent: &str) -> String {
             .to_string(),
     );
     lines.push(
-        "Memory on-demand: gateway_search(query)->gateway_execute(server=\"engram\",tool,args). Not auto-loaded."
+        "Memory: agentflare's built-in memory_remember/memory_recall/memory_context/memory_handoff/memory_relate/memory_curate MCP tools (or `agentflare memory ...` CLI) — no install needed, call directly."
             .to_string(),
     );
 
@@ -163,67 +163,17 @@ pub fn pre_tool_use(_agent: &str) {
 
     if !nudges.is_empty() {
         let out = json!({
-            "systemMessage": nudges.join(" ")
+            "systemMessage": format!("agentflare: {}", nudges.join(" "))
         });
         println!("{out}");
     }
 }
 
-fn session_end_reason(input: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(input)
-        .ok()
-        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
-        .unwrap_or_default()
-}
-
-/// Fires a memory handoff via `engram-cli` when a session genuinely ends
-/// (`/exit`, closing the terminal). Skipped for `/clear` and `resume` —
-/// those aren't the end of a work session, just a context reset.
-pub fn session_end(_agent: &str) {
-    let Some(input) = read_stdin_or_skip("SessionEnd") else { return };
-    let reason = session_end_reason(&input);
-    if reason == "clear" || reason == "resume" {
-        return;
-    }
-    if !state::load().active || !crate::config::handoff_on_session_end() {
-        return;
-    }
-    trigger_handoff(&input);
-}
-
-/// Test-only escape hatch — points `trigger_handoff` at a binary name that
-/// can never resolve, so tests never spawn the real `engram-cli` and write
-/// to the developer's actual memory store (see paths.rs's AGENTFLARE_HOME_OVERRIDE
-/// for the same lesson learned about `~/.claude/settings.json`).
-fn handoff_cli_binary() -> String {
-    std::env::var("AGENTFLARE_HANDOFF_CLI_OVERRIDE").unwrap_or_else(|_| "engram-cli".to_string())
-}
-
-fn trigger_handoff(stdin_payload: &str) {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let child = Command::new(handoff_cli_binary())
-        .args(["hook-event", "SessionEnd"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    let mut child = match child {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!(
-                "[agentflare] handoff-on-exit: engram-cli not found on PATH — install engram to enable (see ~/.claude/rules/engram.md), or disable via ~/.agentflare/config.jsonc"
-            );
-            return;
-        }
-    };
-    if let Some(stdin) = child.stdin.as_mut() {
-        let _ = stdin.write_all(stdin_payload.as_bytes());
-    }
-    let _ = child.wait();
-}
+/// No-op, kept only so a `settings.json` entry written by an older agentflare
+/// version (which fired an `engram-cli` handoff here — removed along with the
+/// rest of the engram integration) doesn't start erroring on every session
+/// end after an upgrade. New installs never wire this hook (see init.rs).
+pub fn session_end(_agent: &str) {}
 
 pub fn prompt_submit(agent: &str) {
     let Some(input) = read_stdin_or_skip("UserPromptSubmit") else { return };
@@ -392,30 +342,6 @@ mod tests {
     }
 
     #[test]
-    fn session_end_reason_reads_reason_key() {
-        assert_eq!(session_end_reason(r#"{"reason": "other"}"#), "other");
-    }
-
-    #[test]
-    fn session_end_reason_returns_empty_on_invalid_json() {
-        assert_eq!(session_end_reason("not json"), "");
-    }
-
-    #[test]
-    fn trigger_handoff_does_not_panic_when_engram_cli_missing() {
-        // Points at a binary name that can never resolve so this never
-        // spawns the developer's real engram-cli / writes real memory data.
-        let _guard = agent_registry::detect::PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("AGENTFLARE_HANDOFF_CLI_OVERRIDE", "agentflare-test-nonexistent-cli-binary");
-        }
-        trigger_handoff(r#"{"reason": "other"}"#);
-        unsafe {
-            std::env::remove_var("AGENTFLARE_HANDOFF_CLI_OVERRIDE");
-        }
-    }
-
-    #[test]
     fn session_start_includes_active_coaching_rule_bodies() {
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
@@ -445,12 +371,12 @@ mod tests {
     }
 
     #[test]
-    fn session_start_message_nudges_engram_via_gateway() {
+    fn session_start_message_points_to_builtin_memory_tools() {
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
             let msg = session_start_message("claude-code");
-            assert!(msg.contains("gateway_search(query)"));
-            assert!(msg.contains("gateway_execute(server=\"engram\""));
+            assert!(msg.contains("memory_remember"));
+            assert!(msg.contains("memory_recall"));
         });
     }
 }

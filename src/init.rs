@@ -154,9 +154,9 @@ fn prompt_yes(message: &str, agent: &str, yes: bool) -> bool {
 
 /// Rule files under `rule_targets` are only ever written when absent (see
 /// components.rs's "rules" component) — safe by default, but it means a rule
-/// whose wording we later fix (e.g. the engram gateway-discovery bug fixed
-/// 2026-07-09) stays stale forever on machines that already have the old
-/// file. Offer to refresh it, same consent pattern as ponytail migration.
+/// whose wording we later fix stays stale forever on machines that already
+/// have the old file. Offer to refresh it, same consent pattern as ponytail
+/// migration.
 fn confirm_rule_refresh(agent: &str, yes: bool) {
     for (path, current) in rule_targets(agent) {
         if !is_stale_rule(&path, &current) {
@@ -258,12 +258,14 @@ fn confirm_gateway_integrations(agent: &str, yes: bool) {
 }
 
 /// Adds one hook entry for `event` unless an agentflare-owned entry for it
-/// (matched by `marker`, e.g. `"hook session-end --agent"`) is already
-/// present — lets re-running `agentflare init` backfill newly-added hook
-/// types (like SessionEnd) into installs wired by an older agentflare
-/// version, instead of the old all-or-nothing "SessionStart present? skip
-/// everything" gate. `marker` must not match ponytail's own hook commands
-/// (`"<bin>" ponytail hook X"`, no `--agent`), so both can coexist per event.
+/// (matched by `marker`, e.g. `"hook pre-tool-use"`) is already present —
+/// lets re-running `agentflare init` backfill newly-added hook types into
+/// installs wired by an older agentflare version, instead of the old
+/// all-or-nothing "SessionStart present? skip everything" gate.
+/// `marker` is a plain substring of `"hook <event>"`, matching both current
+/// flagless commands and older installs that still carry `--agent <host>`
+/// (upgrades stay idempotent either way). It must not match ponytail's own
+/// hook commands (`"<bin>" ponytail hook X"`), so both can coexist per event.
 fn add_hook_entry(hooks_obj: &mut Map<String, Value>, event: &str, marker: &str, command: String, timeout: u64) -> bool {
     let arr = hooks_obj.entry(event).or_insert_with(|| json!([])).as_array_mut().unwrap();
     if arr.iter().any(|v| v.to_string().contains(marker)) {
@@ -290,20 +292,16 @@ fn wire_claude_code() {
 
     let mut added = false;
     added |= add_hook_entry(
-        hooks_obj, "SessionStart", "hook session-start --agent",
-        format!("\"{bin}\" hook session-start --agent claude-code"), 10,
+        hooks_obj, "SessionStart", "hook session-start",
+        format!("\"{bin}\" hook session-start"), 10,
     );
     added |= add_hook_entry(
-        hooks_obj, "UserPromptSubmit", "hook prompt-submit --agent",
-        format!("\"{bin}\" hook prompt-submit --agent claude-code"), 5,
+        hooks_obj, "UserPromptSubmit", "hook prompt-submit",
+        format!("\"{bin}\" hook prompt-submit"), 5,
     );
     added |= add_hook_entry(
-        hooks_obj, "PreToolUse", "hook pre-tool-use --agent",
-        format!("\"{bin}\" hook pre-tool-use --agent claude-code"), 5,
-    );
-    added |= add_hook_entry(
-        hooks_obj, "SessionEnd", "hook session-end --agent",
-        format!("\"{bin}\" hook session-end --agent claude-code"), 10,
+        hooks_obj, "PreToolUse", "hook pre-tool-use",
+        format!("\"{bin}\" hook pre-tool-use"), 5,
     );
 
     if !added {
@@ -335,8 +333,8 @@ fn wire_cursor() {
     let content = json!({
         "version": 1,
         "hooks": {
-            "sessionStart": [{ "command": format!("\"{bin}\" hook session-start --agent cursor"), "type": "command", "timeout": 30 }],
-            "beforeSubmitPrompt": [{ "command": format!("\"{bin}\" hook prompt-submit --agent cursor"), "type": "command", "timeout": 10 }]
+            "sessionStart": [{ "command": format!("\"{bin}\" hook session-start"), "type": "command", "timeout": 30 }],
+            "beforeSubmitPrompt": [{ "command": format!("\"{bin}\" hook prompt-submit"), "type": "command", "timeout": 10 }]
         }
     });
     if let Some(parent) = path.parent() {
@@ -351,7 +349,7 @@ fn wire_cursor() {
 fn wire_opencode() {
     let path = home().join(".config").join("opencode").join("opencode.jsonc");
     let rules_dir = home().join(".config").join("opencode").join("rules");
-    let rule_files: &[&str] = &["exa.md", "git.md", "lean-ctx.md", "engram.md"];
+    let rule_files: &[&str] = &["exa.md", "git.md", "lean-ctx.md"];
 
     let mut config: Value = fs::read_to_string(&path)
         .ok()
@@ -375,6 +373,14 @@ fn wire_opencode() {
         }
     };
 
+    // Drop a legacy engram.md entry from an install wired before engram was
+    // removed — `rule_files` no longer lists it, so it would otherwise sit
+    // there forever, unrewritten, since nothing below ever adds it back.
+    let legacy_engram_path = rules_dir.join("engram.md").to_string_lossy().replace('\\', "/");
+    let before_cleanup = arr.len();
+    arr.retain(|v| v.as_str() != Some(legacy_engram_path.as_str()));
+    let removed_legacy = arr.len() != before_cleanup;
+
     let mut added = 0;
     for &file in rule_files {
         let rule_path = rules_dir.join(file);
@@ -390,11 +396,14 @@ fn wire_opencode() {
         }
     }
 
-    if added > 0 {
+    if added > 0 || removed_legacy {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
         match fs::write(&path, serde_json::to_string_pretty(&config).unwrap() + "\n") {
+            Ok(_) if removed_legacy => {
+                println!("  ok    opencode.jsonc instructions wired ({added} rule(s), removed stale engram.md)")
+            }
             Ok(_) => println!("  ok    opencode.jsonc instructions wired ({added} rule(s))"),
             Err(e) => println!("  fail  writing opencode.jsonc: {e}"),
         }
@@ -561,68 +570,68 @@ mod tests {
     #[test]
     fn is_stale_rule_true_for_known_superseded_content() {
         with_temp_home(|| {
-            let path = home().join(".claude").join("rules").join("engram.md");
+            let path = home().join(".claude").join("rules").join("git.md");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, format!("{}\n", rule_text::ENGRAM_SUPERSEDED[0])).unwrap();
-            assert!(is_stale_rule(&path, rule_text::ENGRAM));
+            fs::write(&path, format!("{}\n", rule_text::GIT_SUPERSEDED[0])).unwrap();
+            assert!(is_stale_rule(&path, rule_text::GIT));
         });
     }
 
     #[test]
     fn is_stale_rule_false_when_already_current() {
         with_temp_home(|| {
-            let path = home().join(".claude").join("rules").join("engram.md");
+            let path = home().join(".claude").join("rules").join("git.md");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, format!("{}\n", rule_text::ENGRAM)).unwrap();
-            assert!(!is_stale_rule(&path, rule_text::ENGRAM));
+            fs::write(&path, format!("{}\n", rule_text::GIT)).unwrap();
+            assert!(!is_stale_rule(&path, rule_text::GIT));
         });
     }
 
     #[test]
     fn is_stale_rule_false_for_user_edited_content() {
         with_temp_home(|| {
-            let path = home().join(".claude").join("rules").join("engram.md");
+            let path = home().join(".claude").join("rules").join("git.md");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, "my own custom engram notes\n").unwrap();
-            assert!(!is_stale_rule(&path, rule_text::ENGRAM));
+            fs::write(&path, "my own custom git notes\n").unwrap();
+            assert!(!is_stale_rule(&path, rule_text::GIT));
         });
     }
 
     #[test]
     fn is_stale_rule_false_for_rule_with_no_superseded_versions() {
         with_temp_home(|| {
-            let path = home().join(".claude").join("rules").join("git.md");
+            let path = home().join(".claude").join("rules").join("lean-ctx.md");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, "some old git rule text\n").unwrap();
-            assert!(!is_stale_rule(&path, rule_text::GIT));
+            fs::write(&path, "some old lean-ctx rule text\n").unwrap();
+            assert!(!is_stale_rule(&path, rule_text::LEANCTX));
         });
     }
 
     #[test]
     fn confirm_rule_refresh_updates_stale_file_when_yes() {
         with_temp_home(|| {
-            let path = home().join(".claude").join("rules").join("engram.md");
+            let path = home().join(".claude").join("rules").join("git.md");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, format!("{}\n", rule_text::ENGRAM_SUPERSEDED[0])).unwrap();
+            fs::write(&path, format!("{}\n", rule_text::GIT_SUPERSEDED[0])).unwrap();
 
             confirm_rule_refresh("claude-code", true);
 
             let content = fs::read_to_string(&path).unwrap();
-            assert_eq!(content.trim_end(), rule_text::ENGRAM);
+            assert_eq!(content.trim_end(), rule_text::GIT);
         });
     }
 
     #[test]
     fn confirm_rule_refresh_leaves_user_edited_file_alone() {
         with_temp_home(|| {
-            let path = home().join(".claude").join("rules").join("engram.md");
+            let path = home().join(".claude").join("rules").join("git.md");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, "my own custom engram notes\n").unwrap();
+            fs::write(&path, "my own custom git notes\n").unwrap();
 
             confirm_rule_refresh("claude-code", true);
 
             let content = fs::read_to_string(&path).unwrap();
-            assert_eq!(content.trim_end(), "my own custom engram notes");
+            assert_eq!(content.trim_end(), "my own custom git notes");
         });
     }
 
@@ -678,27 +687,28 @@ mod tests {
     }
 
     #[test]
-    fn wire_claude_code_writes_session_end_hook() {
+    fn wire_claude_code_does_not_wire_session_end() {
+        // SessionEnd used to fire an engram-cli handoff; that integration is
+        // gone (`hook session-end` is now a backward-compat no-op for old
+        // installs, see hook.rs), so fresh installs must not wire it at all.
         with_temp_home(|| {
             wire_claude_code();
             let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
-            assert!(content.contains("SessionEnd"));
-            assert!(content.contains("hook session-end --agent claude-code"));
+            assert!(!content.contains("SessionEnd"));
         });
     }
 
     #[test]
-    fn wire_claude_code_backfills_session_end_into_already_wired_install() {
+    fn wire_claude_code_backfills_pre_tool_use_into_already_wired_install() {
         with_temp_home(|| {
             let path = home().join(".claude").join("settings.json");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             // Simulates an install wired by an older agentflare version,
-            // before the SessionEnd hook existed.
+            // before the PreToolUse hook existed.
             fs::write(&path, serde_json::to_string_pretty(&json!({
                 "hooks": {
                     "SessionStart": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook session-start --agent claude-code", "timeout": 10 }] }],
-                    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook prompt-submit --agent claude-code", "timeout": 5 }] }],
-                    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook pre-tool-use --agent claude-code", "timeout": 5 }] }]
+                    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook prompt-submit --agent claude-code", "timeout": 5 }] }]
                 }
             })).unwrap()).unwrap();
 
@@ -706,21 +716,13 @@ mod tests {
 
             let content = fs::read_to_string(&path).unwrap();
             let parsed: Value = serde_json::from_str(&content).unwrap();
-            assert!(content.contains("hook session-end --agent claude-code"));
-            // Pre-existing hooks weren't duplicated.
+            // Backfilled fresh, so it's the new flagless form...
+            assert!(content.contains("hook pre-tool-use"));
+            assert!(!content.contains("hook pre-tool-use --agent"));
+            // ...while the pre-existing old-format entries are left as-is,
+            // not duplicated or rewritten.
+            assert!(content.contains("hook session-start --agent claude-code"));
             assert_eq!(parsed["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
-        });
-    }
-
-    #[test]
-    fn wire_claude_code_does_not_duplicate_session_end_on_rerun() {
-        with_temp_home(|| {
-            let path = home().join(".claude").join("settings.json");
-            wire_claude_code();
-            wire_claude_code();
-            let content = fs::read_to_string(&path).unwrap();
-            let parsed: Value = serde_json::from_str(&content).unwrap();
-            assert_eq!(parsed["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
         });
     }
 
@@ -764,7 +766,7 @@ mod tests {
             let config_path = home().join(".config").join("opencode").join("opencode.jsonc");
             let rules_dir = home().join(".config").join("opencode").join("rules");
             fs::create_dir_all(&rules_dir).unwrap();
-            for &f in &["exa.md", "git.md", "lean-ctx.md", "engram.md"] {
+            for &f in &["exa.md", "git.md", "lean-ctx.md"] {
                 fs::write(rules_dir.join(f), format!("# {f}\n")).unwrap();
             }
 
@@ -808,6 +810,42 @@ mod tests {
             assert!(content.contains("/some/existing/rule.md"));
             let parsed: Value = serde_json::from_str(&content).unwrap();
             assert!(parsed["mcp"].is_object());
+        });
+    }
+
+    #[test]
+    fn wire_opencode_removes_legacy_engram_instruction_on_upgrade() {
+        with_temp_home(|| {
+            let config_path = home().join(".config").join("opencode").join("opencode.jsonc");
+            let rules_dir = home().join(".config").join("opencode").join("rules");
+            fs::create_dir_all(&rules_dir).unwrap();
+            // Simulates an install wired before engram was removed: all three
+            // remaining rules are already present, plus the stale engram one.
+            for f in ["exa.md", "git.md", "lean-ctx.md"] {
+                fs::write(rules_dir.join(f), format!("# {f}\n")).unwrap();
+            }
+            let legacy_engram_path = rules_dir.join("engram.md").to_string_lossy().replace('\\', "/");
+            fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+            fs::write(
+                &config_path,
+                serde_json::to_string(&json!({
+                    "instructions": [
+                        format!("{}/exa.md", rules_dir.to_string_lossy().replace('\\', "/")),
+                        format!("{}/git.md", rules_dir.to_string_lossy().replace('\\', "/")),
+                        format!("{}/lean-ctx.md", rules_dir.to_string_lossy().replace('\\', "/")),
+                        legacy_engram_path.clone(),
+                    ]
+                })).unwrap(),
+            ).unwrap();
+
+            // Nothing new to add (all 3 current rules already wired), so this
+            // exercises the "rewrite triggered by removal alone" path.
+            wire_opencode();
+
+            let content = fs::read_to_string(&config_path).unwrap();
+            assert!(!content.contains(&legacy_engram_path), "stale engram.md entry should be removed: {content}");
+            assert!(content.contains("exa.md"));
+            assert!(content.contains("lean-ctx.md"));
         });
     }
 
