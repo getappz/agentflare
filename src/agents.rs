@@ -215,6 +215,25 @@ pub fn cli_run(agent: &str, stage: Option<&str>, model: Option<&str>, mode: Opti
     }
 }
 
+/// Headless variant of `cli_run`: run the agent non-interactively with `prompt`,
+/// print its captured reply to stdout, and return a process exit code (0 on
+/// success, 1 on any failure). The caller decides whether to `exit`.
+pub fn cli_run_headless(agent: &str, prompt: &str, timeout: std::time::Duration) -> i32 {
+    match agent_launch::run_headless(agent_registry::REGISTRY, agent, prompt, timeout) {
+        agent_launch::HeadlessOutcome::Ok(reply) => {
+            print!("{reply}");
+            0
+        }
+        agent_launch::HeadlessOutcome::UnknownAgent(msg)
+        | agent_launch::HeadlessOutcome::NotHeadless(msg)
+        | agent_launch::HeadlessOutcome::NotFound(msg)
+        | agent_launch::HeadlessOutcome::Failed(msg) => {
+            eprintln!("error: {msg}");
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +416,11 @@ mod tests {
             assert!(json.contains("\"agent\": \"dr-agent\""));
             assert!(json.contains("\"version\": \"7.8.9\""));
         });
+    }
+
+    #[test]
+    fn cli_run_headless_unknown_agent_returns_error_code() {
+        let code = cli_run_headless("nope-not-an-agent", "hi", std::time::Duration::from_secs(1));
+        assert_eq!(code, 1);
     }
 }

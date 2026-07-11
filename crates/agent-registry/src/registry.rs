@@ -286,6 +286,22 @@ pub fn spec(agent: Agent) -> &'static AgentSpec {
         .expect("every Agent variant has exactly one REGISTRY entry")
 }
 
+/// The subcommand/flags that put an agent's CLI into non-interactive "print"
+/// mode, to be followed by the prompt as the final argument (e.g. `claude -p
+/// "<prompt>"`, `codex exec "<prompt>"`). `None` for agents with no headless
+/// invocation (editor-embedded, or simply not yet mapped).
+#[allow(dead_code)]
+#[must_use]
+pub fn headless_args(agent: Agent) -> Option<&'static [&'static str]> {
+    match agent {
+        Agent::ClaudeCode => Some(&["-p"]),
+        Agent::Codex => Some(&["exec"]),
+        Agent::GeminiCli => Some(&["-p"]),
+        Agent::Opencode => Some(&["run"]),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +353,20 @@ mod tests {
         for s in REGISTRY {
             assert_eq!(s.id.as_str(), s.display_name);
         }
+    }
+
+    #[test]
+    fn headless_args_map_known_print_modes() {
+        assert_eq!(headless_args(Agent::ClaudeCode), Some(&["-p"][..]));
+        assert_eq!(headless_args(Agent::Codex), Some(&["exec"][..]));
+        assert_eq!(headless_args(Agent::GeminiCli), Some(&["-p"][..]));
+        assert_eq!(headless_args(Agent::Opencode), Some(&["run"][..]));
+    }
+
+    #[test]
+    fn headless_args_none_for_agents_without_a_print_mode() {
+        // Editor-embedded / unmapped agents have no headless invocation.
+        assert_eq!(headless_args(Agent::Cursor), None);
+        assert_eq!(headless_args(Agent::VscodeCopilot), None);
     }
 }
