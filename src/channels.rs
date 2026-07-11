@@ -107,9 +107,51 @@ pub fn interpret_response(platform: Platform, status: u16, body: &str) -> Result
     }
 }
 
+/// A shared `ureq` agent with explicit connect/read timeouts so a stalled or
+/// silent platform can't hang the caller indefinitely. `ureq` 2.x defaults to
+/// a 30s connect timeout but leaves the read/write timeout unset, so we build
+/// our own agent instead of using the bare `ureq::post` free function.
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+    })
+}
+
+/// Describe a transport-level send failure (DNS, connection refused, TLS,
+/// timeout — anything short of getting an HTTP status back).
+///
+/// This must NOT use `ureq::Error`'s own `Display` impl (`{err}`) or
+/// `Transport::url()`: `ureq`'s `Display` for both `Error` and `Transport`
+/// unconditionally prepends the request URL (see `ureq`'s `error.rs`), and
+/// for Telegram that URL embeds the live bot token
+/// (`https://api.telegram.org/bot{token}/sendMessage`). This error string can
+/// end up in CLI stderr or MCP client logs, so it's built instead from the
+/// safe, URL-free pieces `ureq` exposes: the error's `kind()` classification,
+/// its optional higher-level `message()`, and the underlying `source()` (a
+/// plain `std::io::Error`/TLS error with no knowledge of the request URL).
+/// `platform`'s `Debug` output (e.g. "Telegram") stands in for the URL.
+fn describe_send_error(platform: Platform, err: &ureq::Error) -> String {
+    let mut msg = format!("request to {platform:?} failed: {}", err.kind());
+    if let ureq::Error::Transport(transport) = err {
+        if let Some(detail) = transport.message() {
+            msg.push_str(": ");
+            msg.push_str(detail);
+        }
+        if let Some(source) = std::error::Error::source(transport) {
+            msg.push_str(": ");
+            msg.push_str(&source.to_string());
+        }
+    }
+    msg
+}
+
 /// Execute a built request over blocking HTTP and interpret the outcome.
 fn send(platform: Platform, req: &OutboundRequest) -> Result<(), String> {
-    let mut r = ureq::post(&req.url);
+    let mut r = http_agent().post(&req.url);
     if let Some(auth) = &req.auth {
         r = r.set("Authorization", auth);
     }
@@ -118,7 +160,7 @@ fn send(platform: Platform, req: &OutboundRequest) -> Result<(), String> {
     let (status, body) = match r.send_json(&req.body) {
         Ok(resp) => (resp.status(), resp.into_string().unwrap_or_default()),
         Err(ureq::Error::Status(code, resp)) => (code, resp.into_string().unwrap_or_default()),
-        Err(e) => return Err(format!("request to {} failed: {e}", req.url)),
+        Err(e) => return Err(describe_send_error(platform, &e)),
     };
     interpret_response(platform, status, &body)
 }
@@ -200,6 +242,35 @@ mod tests {
         let err = interpret_response(Platform::Slack, 200, r#"{"ok":false,"error":"channel_not_found"}"#)
             .unwrap_err();
         assert!(err.contains("channel_not_found"), "error should surface Slack's reason: {err}");
+    }
+
+    #[test]
+    fn describe_send_error_never_leaks_the_url_or_token() {
+        // Force a real transport-level failure (connection refused — nothing
+        // listens on 127.0.0.1:1) against a URL that embeds a fake bot token,
+        // the same shape Telegram's real URL takes. This is not a flaky
+        // network test: the connection is refused locally and immediately,
+        // with a short timeout as a backstop.
+        let token = "SUPER-SECRET-TELEGRAM-TOKEN";
+        let url = format!("http://127.0.0.1:1/bot{token}/sendMessage");
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_millis(500))
+            .build();
+        let err = agent
+            .post(&url)
+            .send_json(json!({}))
+            .expect_err("connecting to a closed local port must fail");
+        // Sanity: confirm this really is the transport-error arm (not an HTTP
+        // status), i.e. the same arm `send()` routes through `describe_send_error`.
+        assert!(
+            matches!(err, ureq::Error::Transport(_)),
+            "expected a transport-level error, got: {err}"
+        );
+
+        let msg = describe_send_error(Platform::Telegram, &err);
+        assert!(!msg.contains(token), "error message must not leak the bot token: {msg}");
+        assert!(!msg.contains(&url), "error message must not leak the request URL: {msg}");
+        assert!(msg.contains("Telegram"), "error message should name the platform: {msg}");
     }
 
     #[test]
