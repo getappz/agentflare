@@ -142,7 +142,7 @@ impl ArtifactStore {
         fs::write(dir.join(META_FILE), serde_json::to_string_pretty(&meta)?)?;
         fs::write(dir.join(CONTENT_FILE), &req.content)?;
 
-        let url = format!("/{}", &id);
+        let url = format!("/{id}");
         let response = PublishResponse {
             id,
             url,
