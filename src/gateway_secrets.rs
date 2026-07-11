@@ -8,18 +8,15 @@ use crate::auth_crypt;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-pub fn open_db(path: &Path) -> rusqlite::Result<Connection> {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let conn = Connection::open(path)?;
+/// Creates the `gateway_secrets` table in an existing connection (called
+/// from `db::open()` so the table lives in `agentflare.db`).
+pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS gateway_secrets (
             name TEXT PRIMARY KEY,
             ciphertext BLOB NOT NULL
         );",
-    )?;
-    Ok(conn)
+    )
 }
 
 #[derive(Debug)]
@@ -112,12 +109,17 @@ mod tests {
         unsafe { std::env::remove_var("AGENTFLARE_VAULT_PASSPHRASE") };
     }
 
+    fn mem_migrated() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn
+    }
+
     #[test]
     fn roundtrip_set_get() {
         let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_passphrase("test-pass");
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE gateway_secrets (name TEXT PRIMARY KEY, ciphertext BLOB NOT NULL);").unwrap();
+        let conn = mem_migrated();
         set_secret(&conn, "github_pat", "ghp_abc123").unwrap();
         assert_eq!(get_secret(&conn, "github_pat").unwrap(), Some("ghp_abc123".to_string()));
         clear_passphrase();
@@ -126,8 +128,7 @@ mod tests {
     #[test]
     fn get_missing_secret_returns_none() {
         let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE gateway_secrets (name TEXT PRIMARY KEY, ciphertext BLOB NOT NULL);").unwrap();
+        let conn = mem_migrated();
         assert_eq!(get_secret(&conn, "missing").unwrap(), None);
     }
 
@@ -135,8 +136,7 @@ mod tests {
     fn wrong_passphrase_is_a_clear_error_not_silent_empty_string() {
         let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_passphrase("right-pass");
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE gateway_secrets (name TEXT PRIMARY KEY, ciphertext BLOB NOT NULL);").unwrap();
+        let conn = mem_migrated();
         set_secret(&conn, "s", "value").unwrap();
         set_passphrase("wrong-pass");
         let err = get_secret(&conn, "s").unwrap_err();
@@ -148,8 +148,7 @@ mod tests {
     fn list_and_remove() {
         let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_passphrase("test-pass");
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE gateway_secrets (name TEXT PRIMARY KEY, ciphertext BLOB NOT NULL);").unwrap();
+        let conn = mem_migrated();
         set_secret(&conn, "a", "1").unwrap();
         set_secret(&conn, "b", "2").unwrap();
         assert_eq!(list_secrets(&conn).unwrap(), vec!["a".to_string(), "b".to_string()]);

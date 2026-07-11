@@ -3,12 +3,16 @@
 //! (see #138 — gateway secrets fold in later). The rebuildable caches under
 //! `~/.local/share/agentflare/` (skills index, gateway tool-index) stay
 //! separate: they belong in the data dir, not next to source-of-truth state.
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use std::path::PathBuf;
 use std::time::Duration;
 
 pub fn agentflare_db_path() -> PathBuf {
     crate::paths::home().join(".agentflare").join("agentflare.db")
+}
+
+fn old_gateway_db_path() -> PathBuf {
+    crate::paths::home().join(".agentflare").join("gateway.db")
 }
 
 /// Opens (creating if absent) `agentflare.db` and applies every table's
@@ -26,7 +30,50 @@ pub fn open() -> rusqlite::Result<Connection> {
     restrict(&path, 0o600);
     tune(&conn)?;
     crate::claims::migrate(&conn)?;
+    crate::gateway_secrets::migrate(&conn)?;
+    // One-time migration: copy secrets from old gateway.db
+    // (pre-#138 separate file) into agentflare.db.
+    migrate_old_gateway_db(&conn)?;
     Ok(conn)
+}
+
+/// If `~/.agentflare/gateway.db` exists with a `gateway_secrets` table,
+/// copy rows into `agentflare.db` that don't already exist (so re-running
+/// the migration is idempotent). Leaves the old file in place.
+fn migrate_old_gateway_db(conn: &Connection) -> rusqlite::Result<()> {
+    let old_path = old_gateway_db_path();
+    if !old_path.exists() {
+        return Ok(());
+    }
+    // Probe: does the old file have a gateway_secrets table with rows?
+    let old = match Connection::open(&old_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+    let count: i64 = match old.query_row(
+        "SELECT COUNT(*) FROM gateway_secrets",
+        [],
+        |r| r.get(0),
+    ) {
+        Ok(n) => n,
+        Err(_) => return Ok(()),
+    };
+    if count == 0 {
+        return Ok(());
+    }
+    // Copy each row that doesn't already exist in the new db.
+    let mut stmt = old.prepare("SELECT name, ciphertext FROM gateway_secrets")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+    for row in rows {
+        let (name, ciphertext) = row?;
+        conn.execute(
+            "INSERT OR IGNORE INTO gateway_secrets (name, ciphertext) VALUES (?1, ?2)",
+            params![name, ciphertext],
+        )?;
+    }
+    Ok(())
 }
 
 /// Best-effort owner-only permissions (no-op off Unix).

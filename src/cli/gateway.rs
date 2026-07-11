@@ -34,11 +34,10 @@ impl GatewayArgs {
 }
 
 fn run_secret(action: GatewaySecretAction) {
-    let db_path = crate::paths::home().join(".agentflare").join("gateway.db");
-    let conn = match crate::gateway_secrets::open_db(&db_path) {
+    let conn = match crate::db::open() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("failed to open gateway secrets db: {e}");
+            eprintln!("failed to open agentflare.db: {e}");
             std::process::exit(1);
         }
     };

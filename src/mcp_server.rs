@@ -796,10 +796,6 @@ impl AgentflareMcp {
         dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("agentflare").join("gateway.db")
     }
 
-    fn gateway_secrets_db_path() -> std::path::PathBuf {
-        crate::paths::home().join(".agentflare").join("gateway.db")
-    }
-
     fn load_gateway_config() -> gateway_registry::GatewayConfig {
         let path = crate::paths::home().join(".agentflare").join("gateway.toml");
         match std::fs::read_to_string(&path) {
@@ -828,14 +824,10 @@ impl AgentflareMcp {
     }
 
     fn resolve_gateway_secrets() -> std::collections::HashMap<String, String> {
-        let db_path = Self::gateway_secrets_db_path();
-        let conn = match crate::gateway_secrets::open_db(&db_path) {
+        let conn = match crate::db::open() {
             Ok(conn) => conn,
             Err(e) => {
-                eprintln!(
-                    "agentflare: failed to open gateway secrets db at {}: {e}",
-                    db_path.display()
-                );
+                eprintln!("agentflare: failed to open agentflare.db for gateway secrets: {e}");
                 return std::collections::HashMap::new();
             }
         };
