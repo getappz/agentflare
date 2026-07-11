@@ -3,7 +3,9 @@ name = "agentflare-gateway-registry"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
+description = "Gateway registry — intent-first discovery and execution across MCP servers"
 license = "MIT"
+repository = "https://github.com/getappz/agentflare"
 
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
