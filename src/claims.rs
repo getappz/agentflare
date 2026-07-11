@@ -161,6 +161,13 @@ pub fn list(
 
 /// `<agent>:<instance>` — same agent chain as handoff, plus an instance
 /// discriminator so two parallel sessions of one agent are distinct owners.
+///
+/// Instance is `AGENTFLARE_SESSION` if set, else the process pid. A long-lived
+/// MCP server has a stable pid, so all its `claim_*` calls share one owner —
+/// the common case. The CLI, however, is a fresh process per command, so
+/// `AGENTFLARE_SESSION` must be set to keep ownership continuous across
+/// separate `agentflare claim` invocations (acquire in one, release in
+/// another); otherwise each command is a distinct owner.
 pub fn owner_id() -> String {
     let agent = std::env::var("AGENTFLARE_AGENT")
         .ok()
