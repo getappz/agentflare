@@ -35,16 +35,23 @@ pub struct AppState {
     /// cross-origin POST at 127.0.0.1, but it cannot read this token, and the
     /// custom header forces a CORS preflight that never passes.
     pub token: Arc<String>,
+    /// Shared agentflare artifact store served under /artifacts; None when
+    /// disabled in config.
+    pub artifacts: Option<Arc<agentflare_artifacts::ArtifactStore>>,
 }
 
 impl AppState {
     pub fn new(cfg: Arc<Config>, state_dir: PathBuf) -> Self {
+        let artifacts = cfg.artifacts_enabled.then(|| {
+            Arc::new(agentflare_artifacts::ArtifactStore::new(cfg.artifacts_dir.clone()))
+        });
         Self {
             cfg,
             snapshot: SharedSnapshot::default(),
             store: Arc::new(LeaseStore::new(&state_dir)),
             log: Arc::new(EventLog::new(&state_dir)),
             token: Arc::new(load_or_create_token(&state_dir)),
+            artifacts,
         }
     }
 }
@@ -121,7 +128,8 @@ fn default_events_n() -> usize {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let artifacts = state.artifacts.clone();
+    let router = Router::new()
         .route("/", get(dashboard))
         .route("/status", get(status))
         .route("/processes", get(processes))
@@ -135,7 +143,13 @@ pub fn router(state: AppState) -> Router {
         .route("/clean", post(clean_dry_run))
         .route("/clean/execute", post(clean_execute))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
-        .with_state(state)
+        .with_state(state);
+    match artifacts {
+        // Merged outside the token layer: the artifact routes are read-only
+        // GETs, and the guard only gates mutating methods anyway.
+        Some(store) => router.merge(crate::artifacts::router(store)),
+        None => router,
+    }
 }
 
 async fn dashboard() -> Html<&'static str> {
@@ -308,13 +322,61 @@ mod tests {
 
     fn state() -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().unwrap();
-        let state = AppState::new(Arc::new(Config::default()), dir.path().to_path_buf());
+        let cfg = Config {
+            // keep artifact serving inside the temp dir, not the real store
+            artifacts_dir: dir.path().join("artifacts-store"),
+            ..Config::default()
+        };
+        let state = AppState::new(Arc::new(cfg), dir.path().to_path_buf());
         (dir, state)
     }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn artifact_routes_are_mounted_and_need_no_token() {
+        let (_dir, state) = state();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/artifacts")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("agentflare artifacts"),
+            "artifact index must serve under /artifacts"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_routes_absent_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            artifacts_enabled: false,
+            artifacts_dir: dir.path().join("artifacts-store"),
+            ..Config::default()
+        };
+        let state = AppState::new(Arc::new(cfg), dir.path().to_path_buf());
+        let app = router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/artifacts")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

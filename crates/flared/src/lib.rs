@@ -6,6 +6,7 @@
 //! (exe name + start time) so a reused PID is never killed by mistake.
 
 pub mod actions;
+pub mod artifacts;
 pub mod config;
 pub mod daemon;
 pub mod events;

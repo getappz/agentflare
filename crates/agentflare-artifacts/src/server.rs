@@ -3,6 +3,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
+
+/// Canonical fixed port for the shared artifact server. flared serves the
+/// store here so artifact URLs survive individual agent sessions; MCP
+/// sessions probe it before starting their own listener.
+pub const DEFAULT_PORT: u16 = 64009;
 
 pub struct ArtifactServer {
     host: String,
@@ -53,6 +59,33 @@ impl ArtifactServer {
     pub fn base_url(&self) -> String {
         format!("http://{}:{}", self.host, self.port)
     }
+}
+
+/// True when an agentflare artifact server answers on `port` (loopback).
+/// Fetches the index and checks for its marker so a foreign service
+/// squatting on the port is not mistaken for ours. Bounded by short
+/// connect/read timeouts — safe to call on every URL handout.
+pub fn probe(port: u16) -> bool {
+    probe_path(port, "/")
+}
+
+/// Like [`probe`] but for an index mounted under a path prefix (flared
+/// serves the store under `/artifacts/`).
+pub fn probe_path(port: u16, path: &str) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let request = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let _ = stream.flush();
+    let mut body = String::new();
+    use std::io::Read;
+    let _ = stream.take(64 * 1024).read_to_string(&mut body);
+    body.contains("agentflare artifacts")
 }
 
 fn handle_connection(mut stream: TcpStream, store: &ArtifactStore) {
@@ -127,7 +160,9 @@ fn handle_connection(mut stream: TcpStream, store: &ArtifactStore) {
 
 /// Artifact ids are single path segments (UUIDs); anything that could
 /// navigate the filesystem is rejected before it reaches a path join.
-fn valid_id(id: &str) -> bool {
+/// Public so other hosts of the store (flared's `/artifacts` routes)
+/// apply the same rejection before `ArtifactStore` path joins.
+pub fn valid_id(id: &str) -> bool {
     !id.is_empty() && !id.contains(['/', '\\']) && !id.contains("..")
 }
 
@@ -171,7 +206,7 @@ fn serve_artifact(store: &ArtifactStore, id: &str, version: Option<u32>) -> (Str
     };
     match artifact {
         Ok(artifact) => {
-            let body = render_artifact_page(&artifact, version.is_none());
+            let body = render_artifact_page(&artifact, version.is_none(), "");
             http_200("text/html; charset=utf-8", &body)
         }
         Err(_) => not_found(),
@@ -192,6 +227,13 @@ fn versions_json(store: &ArtifactStore, id: &str) -> (String,) {
 }
 
 fn index_page(store: &ArtifactStore) -> (String,) {
+    http_200("text/html; charset=utf-8", &render_index(store, ""))
+}
+
+/// Render the artifact index (gallery) HTML. `prefix` is the URL path the
+/// artifact routes are mounted under ("" for a root-mounted server,
+/// "/artifacts" when served from flared) and is baked into every link.
+pub fn render_index(store: &ArtifactStore, prefix: &str) -> String {
     let artifacts = store.list(None).unwrap_or_default();
     // Group by session, newest session activity first (list() is already
     // sorted newest-first, and BTreeMap keeps session groups stable).
@@ -212,7 +254,7 @@ fn index_page(store: &ArtifactStore) -> (String,) {
                 .map(|d| format!("<br><small>{}</small>", html_escape(d)))
                 .unwrap_or_default();
             groups.push_str(&format!(
-                r#"<li>{} <a href="/{}">{}</a> <small>({}, v{}) · <a href="/{}/versions">history</a></small>{}</li>"#,
+                r#"<li>{} <a href="{prefix}/{}">{}</a> <small>({}, v{}) · <a href="{prefix}/{}/versions">history</a></small>{}</li>"#,
                 html_escape(icon),
                 a.id,
                 html_escape(&a.name),
@@ -228,7 +270,7 @@ fn index_page(store: &ArtifactStore) -> (String,) {
     if groups.is_empty() {
         groups = "<p>No artifacts published yet.</p>".into();
     }
-    let body = format!(
+    format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>agentflare artifacts</title>
@@ -236,13 +278,12 @@ fn index_page(store: &ArtifactStore) -> (String,) {
 </head>
 <body><h1>agentflare artifacts</h1>{groups}</body>
 </html>"#
-    );
-    http_200("text/html; charset=utf-8", &body)
+    )
 }
 
 /// Shared `<head>` chunk: escaped title, optional emoji favicon, live-reload
 /// wiring (only on the latest version — snapshots are immutable).
-fn page_head(artifact: &crate::types::Artifact, live: bool) -> String {
+fn page_head(artifact: &crate::types::Artifact, live: bool, prefix: &str) -> String {
     let mut head = format!(
         "<meta charset=\"utf-8\"><title>{}</title>\n",
         html_escape(&artifact.name)
@@ -255,21 +296,25 @@ fn page_head(artifact: &crate::types::Artifact, live: bool) -> String {
     }
     if live {
         head.push_str(&format!(
-            "<script>const es=new EventSource('/{}/live');es.onmessage=()=>location.reload()</script>\n",
+            "<script>const es=new EventSource('{prefix}/{}/live');es.onmessage=()=>location.reload()</script>\n",
             artifact.id
         ));
     }
     head
 }
 
-fn render_artifact_page(artifact: &crate::types::Artifact, live: bool) -> String {
-    let head = page_head(artifact, live);
+/// Render a full artifact page. `live` wires up SSE auto-reload (latest
+/// version only); `prefix` is the URL path the artifact routes are mounted
+/// under ("" for a root-mounted server, "/artifacts" when served from
+/// flared) and is baked into the page's internal links.
+pub fn render_artifact_page(artifact: &crate::types::Artifact, live: bool, prefix: &str) -> String {
+    let head = page_head(artifact, live, prefix);
     let title = html_escape(&artifact.name);
     let snapshot_banner = if live {
         String::new()
     } else {
         format!(
-            r#"<p style="background:#fff3cd;padding:.5rem 1rem;border-radius:4px">viewing v{} (read-only snapshot) — <a href="/{}">back to latest</a></p>"#,
+            r#"<p style="background:#fff3cd;padding:.5rem 1rem;border-radius:4px">viewing v{} (read-only snapshot) — <a href="{prefix}/{}">back to latest</a></p>"#,
             artifact.version, artifact.id
         )
     };
@@ -307,9 +352,26 @@ fn serve_sse(stream: &mut TcpStream, store: &ArtifactStore, id: &str) {
     }
     let _ = stream.flush();
 
+    // In-process publishes arrive on the broadcast channel; publishes from
+    // OTHER processes (an MCP session while flared serves the store) never
+    // reach this process's channel, so poll the disk store as a fallback.
     let rx = store.subscribe(id);
-    while let Ok(event) = rx.recv() {
-        let msg = format!("event: {event}\ndata: {event}\n\n");
+    let mut last = store.get(id).ok().map(|a| (a.version, a.updated_at));
+    loop {
+        let event = match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(event) => Some(event),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let now = store.get(id).ok().map(|a| (a.version, a.updated_at));
+                (now.is_some() && now != last).then(|| "update".to_string())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        last = store.get(id).ok().map(|a| (a.version, a.updated_at));
+        let msg = match event {
+            Some(event) => format!("event: {event}\ndata: {event}\n\n"),
+            // Comment keepalive: detects dead sockets between updates.
+            None => ": keepalive\n\n".to_string(),
+        };
         if stream.write_all(msg.as_bytes()).is_err() {
             break;
         }

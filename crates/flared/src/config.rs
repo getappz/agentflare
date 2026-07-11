@@ -33,6 +33,11 @@ pub struct Config {
     pub build_patterns: Vec<String>,
     pub orphan_rules: Vec<OrphanRule>,
     pub registries: Vec<RegistryCheckConfig>,
+    /// Serve the shared agentflare artifact store under /artifacts on
+    /// flared's HTTP port so artifact URLs survive individual agent sessions.
+    pub artifacts_enabled: bool,
+    /// Store directory shared with the MCP server's artifact tools.
+    pub artifacts_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -81,6 +86,11 @@ impl Default for Config {
                 path: lean_ctx_registry,
                 expected_exe: "lean-ctx".into(),
             }],
+            artifacts_enabled: true,
+            artifacts_dir: dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".agentflare")
+                .join("artifacts"),
         }
     }
 }
@@ -130,6 +140,9 @@ mod tests {
         assert_eq!(cfg.registries.len(), 1);
         assert_eq!(cfg.registries[0].kind, "lean-ctx");
         assert_eq!(cfg.registries[0].expected_exe, "lean-ctx");
+        // artifact serving ships on by default: durable URLs under /artifacts
+        assert!(cfg.artifacts_enabled);
+        assert!(cfg.artifacts_dir.ends_with(".agentflare/artifacts"));
     }
 
     #[test]

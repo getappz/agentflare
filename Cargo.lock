@@ -862,6 +862,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 name = "flared"
 version = "0.1.0"
 dependencies = [
+ "agentflare-artifacts",
  "axum",
  "chrono",
  "clap",
@@ -876,6 +877,7 @@ dependencies = [
  "sysinfo 0.38.4",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "toml 0.9.12+spec-1.1.0",
  "tower",
  "tracing",

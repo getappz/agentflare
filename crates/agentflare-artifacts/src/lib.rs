@@ -2,7 +2,9 @@ pub mod server;
 pub mod store;
 pub mod types;
 
-pub use server::ArtifactServer;
+pub use server::{
+    probe, probe_path, render_artifact_page, render_index, valid_id, ArtifactServer, DEFAULT_PORT,
+};
 pub use store::ArtifactStore;
 pub use types::*;
 
@@ -564,5 +566,85 @@ mod tests {
         assert!(index.contains("a fancy description"), "{index}");
         assert!(index.contains("📊"), "{index}");
         assert!(index.contains("ses-42"), "grouped by session: {index}");
+    }
+
+    #[test]
+    fn probe_detects_artifact_server_only() {
+        let (_store, port) = served_store("probe_detects_artifact_server_only");
+        assert!(probe(port), "running artifact server must probe true");
+
+        // nothing listening: bind to learn a free port, release it, probe it
+        let free = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert!(!probe(free), "free port must probe false");
+
+        // a listener that answers HTTP but is not an artifact server
+        let foreign = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fport = foreign.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = foreign.accept() {
+                use std::io::Write;
+                let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\nhello");
+            }
+        });
+        assert!(!probe(fport), "foreign http server must probe false");
+    }
+
+    #[test]
+    fn sse_live_reload_fires_for_cross_process_publish() {
+        let (store, port) = served_store("sse_cross_process_publish");
+        let id = store
+            .publish(&PublishRequest {
+                name: "doc".into(),
+                content: "v1".into(),
+                session_id: "s".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .id;
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        use std::io::{Read, Write};
+        write!(stream, "GET /{id}/live HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+
+        // Wait for the SSE headers (and a beat for the handler to snapshot
+        // its baseline version) before publishing, else the handler's first
+        // look at the store already sees v2 and no change is ever detected.
+        let mut header_buf = [0u8; 512];
+        let n = stream.read(&mut header_buf).unwrap();
+        assert!(n > 0, "SSE headers must arrive");
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Publish v2 through a SECOND store instance on the same directory:
+        // its broadcast channel never reaches the serving store's SSE
+        // subscribers, exactly like a publish from another process. Only
+        // the poll fallback can deliver this one.
+        let other = ArtifactStore::new(store.base_path().parent().unwrap().to_path_buf());
+        other
+            .publish(&PublishRequest {
+                name: "doc".into(),
+                content: "v2".into(),
+                session_id: "s".into(),
+                update_id: Some(id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let mut buf = String::new();
+        let mut bytes = [0u8; 1024];
+        while std::time::Instant::now() < deadline && !buf.contains("event:") {
+            match stream.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(n) => buf.push_str(&String::from_utf8_lossy(&bytes[..n])),
+                Err(_) => break,
+            }
+        }
+        assert!(buf.contains("event:"), "poll fallback must emit an update event: {buf}");
     }
 }
