@@ -99,12 +99,14 @@ fn restrict(_path: &std::path::Path, _mode: u32) {}
 /// SQLITE_BUSY immediately and an acquire surfaces as "database is locked"
 /// instead of serializing behind the current writer — so a 5s timeout lets
 /// writers wait their turn. WAL lets readers (`claim_list`) proceed while a
-/// write is in flight.
+/// write is in flight. synchronous=NORMAL is safe under WAL and avoids the
+/// fsync-on-every-commit cost of FULL.
 fn tune(conn: &Connection) -> rusqlite::Result<()> {
     conn.busy_timeout(Duration::from_secs(5))?;
     // journal_mode returns a row; query_row consumes it. WAL is a no-op on
     // in-memory dbs (tests), which is fine.
     let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+    conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     Ok(())
 }
 

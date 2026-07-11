@@ -11,6 +11,7 @@ mod handoff;
 mod hook;
 mod init;
 mod mcp;
+mod memory;
 mod ponytail;
 mod review;
 mod run;
@@ -56,6 +57,7 @@ pub enum Commands {
     Caveman(caveman::CavemanArgs),
     Claim(claim::ClaimArgs),
     Review(review::ReviewArgs),
+    Memory(memory::MemoryArgs),
 }
 
 impl Commands {
@@ -79,6 +81,7 @@ impl Commands {
             Self::Caveman(cmd) => cmd.run(),
             Self::Claim(cmd) => cmd.run(),
             Self::Review(cmd) => cmd.run(),
+            Self::Memory(cmd) => cmd.run(),
         }
     }
 }

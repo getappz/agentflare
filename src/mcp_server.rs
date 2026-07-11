@@ -271,6 +271,115 @@ struct ArtifactDeleteRequest {
     id: String,
 }
 
+// --- Memory tool request types ---
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemoryRememberRequest {
+    #[schemars(description = "Title of the observation")]
+    title: String,
+    #[schemars(description = "Content body of the observation")]
+    content: String,
+    #[schemars(description = "Type: decision|bugfix|discovery|pattern|learning|manual")]
+    r#type: String,
+    #[schemars(description = "Session ID to associate with")]
+    #[serde(default)]
+    session_id: Option<String>,
+    #[schemars(description = "Project name")]
+    #[serde(default)]
+    project: Option<String>,
+    #[schemars(description = "Stable topic key for upsert dedup")]
+    #[serde(default)]
+    topic_key: Option<String>,
+    #[schemars(description = "Scope: project (default) or personal")]
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemoryRecallRequest {
+    #[schemars(description = "Search query (FTS5 BM25); omit for recent listing")]
+    #[serde(default)]
+    query: Option<String>,
+    #[schemars(description = "Direct lookup by ID")]
+    #[serde(default)]
+    id: Option<i64>,
+    #[schemars(description = "Filter by type: decision|bugfix|discovery|pattern|learning")]
+    #[serde(default)]
+    r#type: Option<String>,
+    #[schemars(description = "Filter by project")]
+    #[serde(default)]
+    project: Option<String>,
+    #[schemars(description = "Max results (default 10, max 50)")]
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemoryContextRequest {
+    #[schemars(description = "Session ID to focus on")]
+    #[serde(default)]
+    session_id: Option<String>,
+    #[schemars(description = "Filter by project")]
+    #[serde(default)]
+    project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemoryHandoffRequest {
+    #[schemars(description = "Session ID to close")]
+    session_id: String,
+    #[schemars(description = "Session summary")]
+    summary: String,
+    #[schemars(description = "Findings array [{file, line?, summary}]")]
+    #[serde(default)]
+    findings: Option<Vec<serde_json::Value>>,
+    #[schemars(description = "Decisions array [{summary, rationale?}]")]
+    #[serde(default)]
+    decisions: Option<Vec<serde_json::Value>>,
+    #[schemars(description = "Files touched array [{path, modified?, tokens}]")]
+    #[serde(default)]
+    files_touched: Option<Vec<serde_json::Value>>,
+    #[schemars(description = "Evidence array [{kind, action, detail}]")]
+    #[serde(default)]
+    evidence: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemoryRelateRequest {
+    #[schemars(description = "Source observation ID")]
+    source_id: i64,
+    #[schemars(description = "Target observation ID")]
+    target_id: i64,
+    #[schemars(description = "Relation: related|compatible|scoped|conflicts_with|supersedes|not_conflict")]
+    relation: String,
+    #[schemars(description = "Reason for the relation")]
+    #[serde(default)]
+    reason: Option<String>,
+    #[schemars(description = "Confidence score 0.0..1.0")]
+    #[serde(default)]
+    confidence: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemoryCurateRequest {
+    #[schemars(description = "Action: update|delete|pin|unpin")]
+    action: String,
+    #[schemars(description = "Observation ID")]
+    id: i64,
+    #[schemars(description = "New title (update only)")]
+    #[serde(default)]
+    title: Option<String>,
+    #[schemars(description = "New content (update only)")]
+    #[serde(default)]
+    content: Option<String>,
+    #[schemars(description = "New type (update only)")]
+    #[serde(default)]
+    r#type: Option<String>,
+    #[schemars(description = "Pin status (pin/unpin actions)")]
+    #[serde(default)]
+    pinned: Option<bool>,
+}
+
 #[derive(Default)]
 pub struct AgentflareMcp {
     /// Persisted across calls so `Registry::ensure_fresh`'s 60s debounce is
@@ -1294,6 +1403,105 @@ impl AgentflareMcp {
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             text, uri,
         )]))
+    }
+
+    // --- Memory tools ---
+
+    #[tool(description = "Save an observation to persistent memory. Creates, updates (by topic_key), or deduplicates. Returns status: created|updated|duplicate.")]
+    fn memory_remember(
+        &self,
+        Parameters(MemoryRememberRequest { title, content, r#type, session_id, project, topic_key, scope }): Parameters<MemoryRememberRequest>,
+    ) -> Result<String, ErrorData> {
+        let input = crate::memory::mcp::RememberInput {
+            title,
+            content,
+            r#type,
+            session_id,
+            project,
+            topic_key,
+            scope,
+        };
+        crate::memory::mcp::handle_remember(input)
+            .map_err(|e| ErrorData::internal_error(e, None))
+    }
+
+    #[tool(description = "Search or retrieve observations. Pass id for direct lookup, query for FTS5 BM25 search, omit query for recent listing. Filters by type/project.")]
+    fn memory_recall(
+        &self,
+        Parameters(MemoryRecallRequest { query, id, r#type, project, limit }): Parameters<MemoryRecallRequest>,
+    ) -> Result<String, ErrorData> {
+        let input = crate::memory::mcp::RecallInput {
+            query,
+            id,
+            r#type,
+            project,
+            limit,
+        };
+        crate::memory::mcp::handle_recall(input)
+            .map_err(|e| ErrorData::internal_error(e, None))
+    }
+
+    #[tool(description = "Return session context: active session (findings/decisions/files_touched), recent sessions, recent observations, and recent session summaries.")]
+    fn memory_context(
+        &self,
+        Parameters(MemoryContextRequest { session_id, project }): Parameters<MemoryContextRequest>,
+    ) -> Result<String, ErrorData> {
+        let input = crate::memory::mcp::ContextInput {
+            session_id,
+            project,
+        };
+        crate::memory::mcp::handle_context(input)
+            .map_err(|e| ErrorData::internal_error(e, None))
+    }
+
+    #[tool(description = "Close a session with a handoff summary. Enriches the session with findings/decisions/files_touched/evidence, builds a compaction snapshot, appends to session_summaries, and marks the session closed.")]
+    fn memory_handoff(
+        &self,
+        Parameters(MemoryHandoffRequest { session_id, summary, findings, decisions, files_touched, evidence }): Parameters<MemoryHandoffRequest>,
+    ) -> Result<String, ErrorData> {
+        let input = crate::memory::mcp::HandoffInput {
+            session_id,
+            summary,
+            findings,
+            decisions,
+            files_touched,
+            evidence,
+        };
+        crate::memory::mcp::handle_handoff(input)
+            .map_err(|e| ErrorData::internal_error(e, None))
+    }
+
+    #[tool(description = "Record a semantic relation verdict between two observations. Relation: related|compatible|scoped|conflicts_with|supersedes|not_conflict.")]
+    fn memory_relate(
+        &self,
+        Parameters(MemoryRelateRequest { source_id, target_id, relation, reason, confidence }): Parameters<MemoryRelateRequest>,
+    ) -> Result<String, ErrorData> {
+        let input = crate::memory::mcp::RelateInput {
+            source_id,
+            target_id,
+            relation,
+            reason,
+            confidence,
+        };
+        crate::memory::mcp::handle_relate(input)
+            .map_err(|e| ErrorData::internal_error(e, None))
+    }
+
+    #[tool(description = "Update, soft-delete, pin, or unpin an observation by ID. Actions: update (title/content/type/pinned), delete, pin, unpin.")]
+    fn memory_curate(
+        &self,
+        Parameters(MemoryCurateRequest { action, id, title, content, r#type, pinned }): Parameters<MemoryCurateRequest>,
+    ) -> Result<String, ErrorData> {
+        let input = crate::memory::mcp::CurateInput {
+            action,
+            id,
+            title,
+            content,
+            r#type,
+            pinned,
+        };
+        crate::memory::mcp::handle_curate(input)
+            .map_err(|e| ErrorData::internal_error(e, None))
     }
 }
 
