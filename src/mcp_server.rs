@@ -630,6 +630,8 @@ impl AgentflareMcp {
         if content.is_empty() {
             return Err(ErrorData::invalid_params("content is required", None));
         }
+        let recipient = recipient.trim().to_string();
+        let name = name.trim().to_string();
         let (store, base) = self.ensure_artifact_server()?;
         let req = agentflare_artifacts::PublishRequest {
             name,
@@ -1844,6 +1846,38 @@ mod tests {
         assert_eq!(inbox.as_array().unwrap().len(), 1);
         assert_eq!(inbox[0]["name"], "review-packet");
         assert_eq!(inbox[0]["sender"], "claude-code");
+        assert_eq!(inbox[0]["recipient"], "opencode");
+    }
+
+    #[test]
+    fn handoff_trims_whitespace_padded_recipient() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            artifacts_dir_override: Some(tmp.path().to_path_buf()),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+
+        // A whitespace-padded recipient passes the emptiness check but must
+        // still be stored trimmed, or exact-match inbox lookups miss it.
+        s.handoff(Parameters(HandoffRequest {
+            recipient: "  opencode  ".into(),
+            name: "review-packet".into(),
+            content: "please review".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        let inbox: serde_json::Value = serde_json::from_str(
+            &s.artifact_list(Parameters(ArtifactListRequest {
+                recipient: Some("opencode".into()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inbox.as_array().unwrap().len(), 1);
+        assert_eq!(inbox[0]["name"], "review-packet");
         assert_eq!(inbox[0]["recipient"], "opencode");
     }
 
