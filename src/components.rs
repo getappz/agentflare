@@ -2,7 +2,6 @@
 // fix itself. `init` runs every entry; `hook session-start` only runs the
 // non-consent ones (rules/mode-pinning) since installing packages happens
 // only via the explicit `init` command, never from an auto-firing hook.
-use crate::engram_install;
 use crate::paths::home;
 use crate::rule_text;
 use serde_json::Value;
@@ -18,12 +17,6 @@ pub struct Component {
     pub apply: Box<dyn Fn() -> String>,
 }
 
-// engram's own `engram setup <name>` covers these hosts natively (verified
-// via `engram --help`). Cline/Continue aren't in that list, so they get a
-// manual MCP config entry instead — same shape as lean-ctx's fallback.
-const ENGRAM_NATIVE_HOSTS: &[&str] = &["codex", "cursor", "windsurf", "vscode-copilot"];
-const ENGRAM_MCP_ARGS: &[&str] = &["mcp", "--tools=agent"];
-
 fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_default()
 }
@@ -38,7 +31,7 @@ fn run_ok(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn claude_settings() -> Value {
+fn claude_settings() -> Value {
     fs::read_to_string(home().join(".claude").join("settings.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -61,7 +54,7 @@ fn json_at(path: &PathBuf) -> Value {
         .unwrap_or(Value::Null)
 }
 
-pub(crate) fn plugin_enabled(settings: &Value, key: &str) -> bool {
+fn plugin_enabled(settings: &Value, key: &str) -> bool {
     settings
         .get("enabledPlugins")
         .and_then(|p| p.get(key))
@@ -124,7 +117,7 @@ fn merge_opencode_mcp(path: &PathBuf, key: &str, entry: Value) -> bool {
                 .and_then(|a| a.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
-            let mut cmd = vec![command.unwrap_or_else(|| "engram".to_string())];
+            let mut cmd = vec![command.unwrap_or_else(|| key.to_string())];
             cmd.extend(args);
             m.insert(
                 key.to_string(),
@@ -166,7 +159,6 @@ pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
                 (dir.join("exa.md"), rule_text::EXA.to_string()),
                 (dir.join("git.md"), rule_text::GIT.to_string()),
                 (dir.join("lean-ctx.md"), rule_text::LEANCTX.to_string()),
-                (dir.join("engram.md"), rule_text::ENGRAM.to_string()),
             ]
         }
         "cursor" => {
@@ -192,25 +184,10 @@ pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
                 (dir.join("exa.md"), rule_text::EXA.to_string()),
                 (dir.join("git.md"), rule_text::GIT.to_string()),
                 (dir.join("lean-ctx.md"), rule_text::LEANCTX.to_string()),
-                (dir.join("engram.md"), rule_text::ENGRAM.to_string()),
             ]
         }
         _ => vec![], // "continue" — no dedicated rules convention found
     }
-}
-
-/// Per-host completion marker for components whose "done" state can't be
-/// read back from the target's own config (or where re-checking would need
-/// per-host format parsing). engram-setup specifically: `installed_via_mise()`
-/// alone can't tell "set up for THIS host" from "set up for some other host
-/// on this machine" once the binary exists globally.
-fn host_marker(component: &str, host: &str) -> PathBuf {
-    crate::state::state_dir().join(format!("{component}-{host}.done"))
-}
-
-fn mark_done(path: &PathBuf) {
-    let _ = fs::create_dir_all(path.parent().unwrap());
-    let _ = fs::write(path, format!("{:?}", std::time::SystemTime::now()));
 }
 
 /// Every skill name the shared skill_registry cache currently knows about —
@@ -268,7 +245,6 @@ fn sync_skill_overrides() -> Result<usize, String> {
 pub fn get_components(host: &str) -> Vec<Component> {
     let claude_code_only = host == "claude-code";
     let host_owned = host.to_string();
-    let host_owned2 = host.to_string();
     let leanctx_log = crate::state::state_dir().join("leanctx-install.log");
     let ponytail_config = home().join(".config").join("ponytail").join("config.json");
     let caveman_config = home().join(".config").join("caveman").join("config.json");
@@ -305,15 +281,15 @@ pub fn get_components(host: &str) -> Vec<Component> {
                 })
             },
         },
-        // mise (dev-tool version manager) — the cross-platform, dependency-free
-        // installer for engram's prebuilt binary (mise's `github:` backend
-        // downloads + checksum-verifies it, no toolchain). Installed before
-        // engram so its install site can rely on it. Host-independent. (lean-ctx
-        // has its own native installer and doesn't need mise; see tool_install.)
+        // mise (dev-tool version manager) — powers `agentflare run`'s
+        // mise-wrapped agent launches (mise-managed tools on PATH for the
+        // session) and any future mise-backed tool install. Host-independent.
+        // (lean-ctx has its own native installer and doesn't need mise; see
+        // tool_install.)
         Component {
             id: "mise",
             needs_consent: true,
-            describe: "mise (dev-tool manager) — installs engram's prebuilt binary via its github backend; https://mise.run".to_string(),
+            describe: "mise (dev-tool manager) — used by `agentflare run` to launch agents with mise-managed tools on PATH; https://mise.run".to_string(),
             check: Box::new(|| crate::mise_install::mise_bin().is_some()),
             apply: Box::new(|| match crate::mise_install::ensure_mise() {
                 crate::mise_install::MiseOutcome::Present(_) => "mise already installed".to_string(),
@@ -328,8 +304,8 @@ pub fn get_components(host: &str) -> Vec<Component> {
             needs_consent: true,
             // lean-ctx's own installer (and `onboard`) wires MCP into whichever
             // supported tool it detects, so no per-host branching needed here —
-            // same as engram, trust the upstream tool's own setup. Installed via
-            // its native prebuilt-binary installer (see tool_install), not mise:
+            // trust the upstream tool's own setup. Installed via its native
+            // prebuilt-binary installer (see tool_install), not mise:
             // lean-ctx ships a proper `curl | sh` that downloads, verifies, and
             // onboards on its own.
             describe: "lean-ctx (context compression) — native installer (curl | sh, or brew) + onboard".to_string(),
@@ -350,134 +326,10 @@ pub fn get_components(host: &str) -> Vec<Component> {
                 })
             },
         },
-        Component {
-            id: "engram",
-            needs_consent: true,
-            describe: if claude_code_only {
-                "engram (cross-session memory) — claude plugin marketplace add Gentleman-Programming/engram && claude plugin install engram".to_string()
-            } else if ENGRAM_NATIVE_HOSTS.contains(&host) {
-                format!("engram (cross-session memory) — mise installs the prebuilt engram binary, then engram setup {host}")
-            } else {
-                format!("engram (cross-session memory) — mise installs the prebuilt engram binary, then manual MCP registration (no native `engram setup {host}`)")
-            },
-            check: {
-                let host = host_owned2.clone();
-                Box::new(move || {
-                    if host == "claude-code" {
-                        // Working engram needs the plugin (memory skill) AND a
-                        // reachable MCP server. The plugin's own server calls a
-                        // bare `engram` off PATH (ENOENT), so agentflare
-                        // registers one itself against a mise-provided absolute
-                        // path. "Done" = plugin enabled AND our `engram` entry
-                        // present in ~/.claude.json.
-                        return plugin_enabled(&claude_settings(), "engram@engram")
-                            && claude_json()
-                                .get("mcpServers")
-                                .and_then(|m| m.get("engram"))
-                                .is_some();
-                    }
-                    // Binary existing globally isn't enough — this specific
-                    // host's setup/registration must have run too.
-                    engram_install::installed_via_mise() && host_marker("engram-setup", &host).exists()
-                })
-            },
-            apply: {
-                let host = host_owned2.clone();
-                Box::new(move || {
-                    if host == "claude-code" {
-                        let plugin_ok = run_ok("claude", &["plugin", "marketplace", "add", "Gentleman-Programming/engram"])
-                            && run_ok("claude", &["plugin", "install", "engram"]);
-                        if !plugin_ok {
-                            return "engram plugin install failed — run manually: claude plugin marketplace add Gentleman-Programming/engram && claude plugin install engram".to_string();
-                        }
-                        // The plugin's MCP server calls a bare `engram` that
-                        // isn't on PATH. Install the binary through mise and
-                        // register our own MCP server against its absolute path
-                        // — PATH-independent, no symlinks or PATH edits.
-                        let Some(mise) = crate::mise_install::mise_bin() else {
-                            return "engram plugin installed, but the engram binary needs mise — re-run `agentflare init` after the mise component sets it up".to_string();
-                        };
-                        let bin = match engram_install::install_via_mise(&mise) {
-                            Ok(p) => p,
-                            Err(e) => return format!("engram plugin installed, but binary install via mise failed — {e}"),
-                        };
-                        return if run_ok("claude", &["mcp", "add", "engram", "-s", "user", "--", &bin, "mcp", "--tools=agent"]) {
-                            "engram installed via mise + MCP registered — restart to activate".to_string()
-                        } else {
-                            format!("engram installed at {bin}, but MCP registration failed — run: claude mcp add engram -s user -- \"{bin}\" mcp --tools=agent")
-                        };
-                    }
-
-                    // Every non-claude host installs engram through mise (the
-                    // github backend — a prebuilt binary, no toolchain) and is
-                    // wired against the returned absolute path, so GUI-launched
-                    // clients that don't inherit ~/.local/bin on PATH still
-                    // resolve it. mise is the only install backend we ship.
-                    let Some(mise) = crate::mise_install::mise_bin() else {
-                        return "engram needs mise — re-run `agentflare init` after the mise component installs it".to_string();
-                    };
-                    let bin = match engram_install::install_via_mise(&mise) {
-                        Ok(p) => p,
-                        Err(e) => return format!("engram install via mise failed — {e}"),
-                    };
-
-                    let marker = host_marker("engram-setup", &host);
-
-                    if ENGRAM_NATIVE_HOSTS.contains(&host.as_str()) {
-                        // `engram setup` writes the invoked binary's absolute
-                        // path into the host's MCP config (and installs the
-                        // memory persona), so run it through the mise path to
-                        // get a PATH-independent entry.
-                        return if run_ok(&bin, &["setup", &host]) {
-                            mark_done(&marker);
-                            format!("engram installed via mise + setup {host} done")
-                        } else {
-                            format!("engram installed at {bin}, but `engram setup {host}` failed — run manually: {bin} setup {host}")
-                        };
-                    }
-
-                    // cline/continue/opencode: no native `engram setup` —
-                    // register the MCP command directly in the host's config,
-                    // same shape engram's docs use for "any other MCP client",
-                    // against the mise absolute path.
-                    let entry = serde_json::json!({ "command": bin, "args": ENGRAM_MCP_ARGS });
-                    let result = match host.as_str() {
-                        "cline" => {
-                            let path = home().join(".cline").join("mcp.json");
-                            if merge_json(&path, "engram", entry) {
-                                format!("{} (engram registered)", path.display())
-                            } else {
-                                format!("failed to write {}", path.display())
-                            }
-                        }
-                        "continue" => {
-                            let path = cwd().join(".continue").join("mcpServers").join("engram.json");
-                            if write_if_absent(&path, &(serde_json::to_string_pretty(&entry).unwrap() + "\n")) {
-                                format!("{} written", path.display())
-                            } else {
-                                format!("{} exists, skipped", path.display())
-                            }
-                        }
-                        "opencode" => {
-                            let path = home().join(".config").join("opencode").join("opencode.jsonc");
-                            if merge_opencode_mcp(&path, "engram", entry) {
-                                format!("{} (engram registered)", path.display())
-                            } else {
-                                format!("failed to write {}", path.display())
-                            }
-                        }
-                        _ => format!("no engram integration defined for host '{host}'"),
-                    };
-                    mark_done(&marker);
-                    result
-                })
-            },
-        },
         // agentflare's own MCP server exposes skill_search/skill_load — the
         // on-demand replacement for the always-listed skill descriptions
-        // this same init wires `skillOverrides` to suppress (below). Same 4
-        // hosts engram's manual-registration branch covers; other hosts
-        // report satisfied until their MCP config format is verified here.
+        // this same init wires `skillOverrides` to suppress (below). Other
+        // hosts report satisfied until their MCP config format is verified here.
         Component {
             id: "agentflare-mcp",
             needs_consent: true,
@@ -703,7 +555,6 @@ mod tests {
             "rules",
             "mise",
             "leanctx",
-            "engram",
             "agentflare-mcp",
             "ponytail-plugin",
             "ponytail-mode",
@@ -714,7 +565,6 @@ mod tests {
             "rules",
             "mise",
             "leanctx",
-            "engram",
             "agentflare-mcp",
             "ponytail-plugin",
             "ponytail-mode",

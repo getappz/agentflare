@@ -19,12 +19,12 @@ Two non-overlapping layers, plus two Claude-Code-only companions:
 | Layer | What it compresses | Tool |
 |---|---|---|
 | **lean-ctx** | tool I/O *within* a session — reads, shell output, search, up to 99% | [yvgude/lean-ctx](https://github.com/yvgude/lean-ctx) |
-| **engram** | knowledge *across* sessions — decisions, facts, preferences that survive a session ending | [Gentleman-Programming/engram](https://github.com/Gentleman-Programming/engram) |
+| **memory** (built-in) | knowledge *across* sessions — decisions, facts, preferences that survive a session ending | ships in the binary, SQLite + FTS5, no separate install |
 | **Caveman** (Claude Code only) | conversation verbosity, ~65% | companion plugin |
 | **Ponytail** (Claude Code only) | code-writing over-engineering | companion plugin |
 
-lean-ctx and engram aren't substitutes for each other — one saves tokens inside a
-session, the other saves the re-explaining tax across sessions.
+lean-ctx and the built-in memory aren't substitutes for each other — one saves
+tokens inside a session, the other saves the re-explaining tax across sessions.
 
 **Why Rust, not Node:** Claude Code doesn't bundle or require Node.js — it's a
 standalone compiled binary. A plugin whose hooks shell out to `node` breaks on
@@ -49,7 +49,6 @@ supporting evidence in its own repo, it's flagged instead of repeated.
 | lean-ctx | 98.1% compression (`map` mode), 96.7% (`signatures`), ~99.99% cached re-read | CI-gated, reproducible via `lean-ctx benchmark report .`, measured on a 50-file repo with the GPT-4o tokenizer | High — real, reproducible, methodology named |
 | Caveman | 65% avg output-token reduction (range 22–87%, 10 prompts) | Committed in `benchmarks/`/`evals/` — and its own docs flag the failure mode: ~1–1.5k input-token overhead per turn can make it net-negative on already-terse workloads (`docs/HONEST-NUMBERS.md`) | High — reproducible, unusually transparent about limits |
 | Ponytail | ~54% less code (94% ceiling on best task), ~20% cheaper, ~27% faster, 100% safe | 12 real feature tasks on a FastAPI+React repo, Haiku 4.5, n=4 — self-corrected an earlier overgeneralized single-shot figure | High — reproducible, self-corrected once already |
-| engram | "95.8% accuracy on LongMemEval-S — #1 globally" | **Not citing this.** No benchmark directory, results file, or harness exists anywhere in the repo, despite being listed as a shipped feature. | Unverifiable — flagged, not repeated |
 
 ### Real usage, one live project
 
@@ -60,11 +59,11 @@ for a sense of scale. Not a controlled benchmark; one data point, your mileage v
 lean-ctx   34.2M tokens saved   92% compression   $88.45 saved   (lifetime; lean-ctx gain)
 caveman    1.16M tokens saved (~65%)                              (single session; caveman-stats hook)
 ponytail   23 `ponytail:` shortcut markers logged, no token figure (ponytail doesn't measure per-repo savings)
-engram     2 sessions, 11 observations tracked, across 2 projects  (engram stats)
+memory     2 sessions, 11 observations tracked, across 2 projects  (agentflare memory sessions/search)
 ```
 
 Check your own: `lean-ctx gain` · `/caveman-stats` (Claude Code) · `ponytail-debt` skill ·
-`engram stats`. Don't trust this table blindly either — re-run those commands yourself.
+`agentflare memory context`. Don't trust this table blindly either — re-run those commands yourself.
 
 ---
 
@@ -127,20 +126,14 @@ plugin loader:
 codex plugin marketplace add getappz/agentflare
 codex plugin install agentflare
 ```
-then `agentflare init --agent codex` for the rules/lean-ctx/engram setup (Codex's
+then `agentflare init --agent codex` for the rules/lean-ctx setup (Codex's
 hook wiring itself comes from the plugin manifest, not `init`).
 
-Each run: writes rule files (if absent), installs lean-ctx (`npm install -g
-lean-ctx-bin && lean-ctx onboard`) and engram (`go install`/`brew`, never the
-prebuilt Windows binary — see below) if missing, wires hooks/MCP where the host
-supports it. Detection-first — already-satisfied components are skipped, nothing
-gets clobbered.
-
-**engram's install safety**: the project's own docs say prebuilt Windows binaries
-get flagged as AV false positives, and explicitly recommend `go install` or
-Homebrew instead. `agentflare init` only auto-installs engram through one of those
-two paths; if neither is available, it prints the exact command instead of
-downloading something that might trip your AV.
+Each run: writes rule files (if absent), installs lean-ctx (native `curl | sh`
+or Homebrew installer) if missing, wires hooks/MCP where the host supports
+it. Detection-first — already-satisfied components are skipped, nothing gets
+clobbered. Persistent memory ships in the binary itself — nothing to install
+for it.
 
 ## Docs-only fallback (Aider, other AGENTS.md readers)
 
@@ -158,8 +151,8 @@ src/
 │                         # dirs::home_dir() ignores HOME/USERPROFILE overrides on
 │                         # Windows, learned the hard way)
 ├── state.rs              # ~/.agentflare/state.json — on/off flag for the hooks
-├── rule_text.rs           # shared rule copy (Exa, git, lean-ctx, engram usage)
-├── engram_install.rs      # engram's safe-install logic (go install/brew only)
+├── rule_text.rs           # shared rule copy (Exa, git, lean-ctx usage)
+├── memory/                # built-in persistent memory (SQLite + FTS5)
 ├── components.rs          # registry: each entry checks + fixes itself, host-aware
 ├── init.rs                # `agentflare init --agent X` — runs every component,
 │                           # wires hooks directly for claude-code/cursor
@@ -178,15 +171,15 @@ Adding a new managed component means adding one entry to `components.rs` — nei
 
 ## What Gets Created
 
-**Claude Code**: `~/.claude/rules/{exa,git,lean-ctx,engram}.md`, `~/.claude/settings.json` hooks section, `~/.config/{caveman,ponytail}/config.json`, `~/.agentflare/`.
+**Claude Code**: `~/.claude/rules/{exa,git,lean-ctx}.md`, `~/.claude/settings.json` hooks section, `~/.config/{caveman,ponytail}/config.json`, `~/.agentflare/` (includes the built-in memory database).
 
 **Codex**: project-local `AGENTS.md` (only if absent), `~/.agentflare/`.
 
 **Cursor**: project-local `.cursor/rules/agentflare.mdc`, `.cursor/hooks.json`, `~/.cursor/mcp.json`, `~/.agentflare/`.
 
-**Windsurf/VS Code/Cline**: project-local rules file (see table above), MCP config for lean-ctx/engram.
+**Windsurf/VS Code/Cline**: project-local rules file (see table above), MCP config for lean-ctx.
 
-**Continue**: `.continue/mcpServers/{agentflare,engram}.json`.
+**Continue**: `.continue/mcpServers/agentflare.json`.
 
 Nothing is created if it already exists.
 
@@ -196,8 +189,7 @@ Nothing is created if it already exists.
 
 Remove the binary (see Install section above), then remove whatever `init`
 wrote for the hosts you set up — see "What Gets Created" above. Ponytail/
-Caveman/engram plugins themselves stay installed (uninstall separately if
-wanted).
+Caveman plugins themselves stay installed (uninstall separately if wanted).
 
 ---
 

@@ -168,7 +168,7 @@ fn get_handoff_command(
              <recipient> <brief> — hand the relevant work product to that agent (e.g. `codex review the API design above`)\n\
              inbox [me] — list artifacts addressed to an agent (default: {me})\n\
              thread <id> — show a handoff thread's artifacts in order\n\
-             Work products only — facts and decisions belong in engram memory.",
+             Work products only — facts and decisions belong in memory (memory_remember), not artifacts.",
         ));
     }
 
@@ -188,7 +188,7 @@ fn get_handoff_command(
          - `thread <id>` → artifact_list with thread_id=<id>; present in chronological order with \
          reply lineage.\n\
          Report the resulting URL (or listing) afterwards. Work products only — facts/decisions \
-         go to engram, not artifacts."
+         go to memory (memory_remember), not artifacts."
     ))
 }
 

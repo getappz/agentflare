@@ -1,5 +1,5 @@
-//! BM25 search over the FTS5 index. Engram-style query sanitization: every
-//! token is double-quoted so FTS5 operators in user text cannot alter the query.
+//! BM25 search over the FTS5 index. Every token is double-quoted so FTS5
+//! operators in user text cannot alter the query.
 
 use rusqlite::Connection;
 

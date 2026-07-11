@@ -193,7 +193,7 @@ struct ArtifactPublishRequest {
     #[schemars(description = "Handoff envelope: which agent/runtime is publishing (e.g. claude-code, codex)")]
     #[serde(default)]
     sender: Option<String>,
-    #[schemars(description = "Handoff envelope: agent/runtime this artifact is addressed to — for WORK PRODUCTS only; facts and decisions belong in memory (engram), not artifacts")]
+    #[schemars(description = "Handoff envelope: agent/runtime this artifact is addressed to — for WORK PRODUCTS only; facts and decisions belong in memory (memory_remember), not artifacts")]
     #[serde(default)]
     recipient: Option<String>,
     #[schemars(description = "Handoff envelope: thread this belongs to; replies reuse the sender's thread_id")]

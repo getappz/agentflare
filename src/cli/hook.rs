@@ -15,6 +15,9 @@ pub enum HookEvent {
         #[arg(long, value_enum)]
         agent: Option<agent_registry::Agent>,
     },
+    /// No-op — kept only so an old settings.json entry from a prior
+    /// agentflare version doesn't start erroring after an upgrade. New
+    /// installs never wire this (see init.rs).
     SessionEnd {
         #[arg(long, value_enum)]
         agent: Option<agent_registry::Agent>,

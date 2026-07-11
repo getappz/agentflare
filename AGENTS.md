@@ -17,17 +17,19 @@ unfamiliar code with its composed-context command before exploring.
 npm install -g lean-ctx-bin && lean-ctx onboard
 ```
 
-## Cross-session memory — engram
+## Cross-session memory
 
-Use [engram](https://github.com/Gentleman-Programming/engram) MCP tools for
-persistent cross-session memory: recall relevant context at session start,
-store durable decisions/facts as you learn them, create a handoff before a
-long session ends.
+agentflare ships persistent memory in the binary itself — no separate
+install. Recall relevant context at session start via the CLI (works even
+without MCP support):
 
 ```bash
-go install github.com/Gentleman-Programming/engram/cmd/engram@latest
-engram mcp   # or whatever your tool's MCP config points at
+agentflare memory context
+agentflare memory search "<query>"
 ```
+
+Storing new memories (`memory_remember`) is exposed as an MCP tool; if your
+tool has MCP support, prefer it there. Recall-only via the CLI otherwise.
 
 ## Web search
 

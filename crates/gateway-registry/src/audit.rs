@@ -66,8 +66,8 @@ mod tests {
         let path = tmp.path();
         let args = serde_json::json!({"secret_value": "do-not-leak-me"});
 
-        record(path, "engram", "memory_store", &args, Ok(()));
-        record(path, "engram", "memory_store", &args, Err("Upstream"));
+        record(path, "acme", "do_thing", &args, Ok(()));
+        record(path, "acme", "do_thing", &args, Err("Upstream"));
 
         let contents = std::fs::read_to_string(path).unwrap();
         assert!(!contents.contains("do-not-leak-me"), "{contents}");
@@ -75,8 +75,8 @@ mod tests {
         assert_eq!(lines.len(), 2);
 
         let first: Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(first["server"], "engram");
-        assert_eq!(first["tool"], "memory_store");
+        assert_eq!(first["server"], "acme");
+        assert_eq!(first["tool"], "do_thing");
         assert_eq!(first["outcome"], "ok");
         assert!(first["args_hash"].is_string());
 

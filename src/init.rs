@@ -154,9 +154,9 @@ fn prompt_yes(message: &str, agent: &str, yes: bool) -> bool {
 
 /// Rule files under `rule_targets` are only ever written when absent (see
 /// components.rs's "rules" component) — safe by default, but it means a rule
-/// whose wording we later fix (e.g. the engram gateway-discovery bug fixed
-/// 2026-07-09) stays stale forever on machines that already have the old
-/// file. Offer to refresh it, same consent pattern as ponytail migration.
+/// whose wording we later fix stays stale forever on machines that already
+/// have the old file. Offer to refresh it, same consent pattern as ponytail
+/// migration.
 fn confirm_rule_refresh(agent: &str, yes: bool) {
     for (path, current) in rule_targets(agent) {
         if !is_stale_rule(&path, &current) {
@@ -258,10 +258,10 @@ fn confirm_gateway_integrations(agent: &str, yes: bool) {
 }
 
 /// Adds one hook entry for `event` unless an agentflare-owned entry for it
-/// (matched by `marker`, e.g. `"hook session-end"`) is already present — lets
-/// re-running `agentflare init` backfill newly-added hook types (like
-/// SessionEnd) into installs wired by an older agentflare version, instead
-/// of the old all-or-nothing "SessionStart present? skip everything" gate.
+/// (matched by `marker`, e.g. `"hook pre-tool-use"`) is already present —
+/// lets re-running `agentflare init` backfill newly-added hook types into
+/// installs wired by an older agentflare version, instead of the old
+/// all-or-nothing "SessionStart present? skip everything" gate.
 /// `marker` is a plain substring of `"hook <event>"`, matching both current
 /// flagless commands and older installs that still carry `--agent <host>`
 /// (upgrades stay idempotent either way). It must not match ponytail's own
@@ -302,10 +302,6 @@ fn wire_claude_code() {
     added |= add_hook_entry(
         hooks_obj, "PreToolUse", "hook pre-tool-use",
         format!("\"{bin}\" hook pre-tool-use"), 5,
-    );
-    added |= add_hook_entry(
-        hooks_obj, "SessionEnd", "hook session-end",
-        format!("\"{bin}\" hook session-end"), 10,
     );
 
     if !added {
@@ -353,7 +349,7 @@ fn wire_cursor() {
 fn wire_opencode() {
     let path = home().join(".config").join("opencode").join("opencode.jsonc");
     let rules_dir = home().join(".config").join("opencode").join("rules");
-    let rule_files: &[&str] = &["exa.md", "git.md", "lean-ctx.md", "engram.md"];
+    let rule_files: &[&str] = &["exa.md", "git.md", "lean-ctx.md"];
 
     let mut config: Value = fs::read_to_string(&path)
         .ok()
@@ -563,68 +559,68 @@ mod tests {
     #[test]
     fn is_stale_rule_true_for_known_superseded_content() {
         with_temp_home(|| {
-            let path = home().join(".claude").join("rules").join("engram.md");
+            let path = home().join(".claude").join("rules").join("git.md");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, format!("{}\n", rule_text::ENGRAM_SUPERSEDED[0])).unwrap();
-            assert!(is_stale_rule(&path, rule_text::ENGRAM));
+            fs::write(&path, format!("{}\n", rule_text::GIT_SUPERSEDED[0])).unwrap();
+            assert!(is_stale_rule(&path, rule_text::GIT));
         });
     }
 
     #[test]
     fn is_stale_rule_false_when_already_current() {
         with_temp_home(|| {
-            let path = home().join(".claude").join("rules").join("engram.md");
+            let path = home().join(".claude").join("rules").join("git.md");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, format!("{}\n", rule_text::ENGRAM)).unwrap();
-            assert!(!is_stale_rule(&path, rule_text::ENGRAM));
+            fs::write(&path, format!("{}\n", rule_text::GIT)).unwrap();
+            assert!(!is_stale_rule(&path, rule_text::GIT));
         });
     }
 
     #[test]
     fn is_stale_rule_false_for_user_edited_content() {
         with_temp_home(|| {
-            let path = home().join(".claude").join("rules").join("engram.md");
+            let path = home().join(".claude").join("rules").join("git.md");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, "my own custom engram notes\n").unwrap();
-            assert!(!is_stale_rule(&path, rule_text::ENGRAM));
+            fs::write(&path, "my own custom git notes\n").unwrap();
+            assert!(!is_stale_rule(&path, rule_text::GIT));
         });
     }
 
     #[test]
     fn is_stale_rule_false_for_rule_with_no_superseded_versions() {
         with_temp_home(|| {
-            let path = home().join(".claude").join("rules").join("git.md");
+            let path = home().join(".claude").join("rules").join("lean-ctx.md");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, "some old git rule text\n").unwrap();
-            assert!(!is_stale_rule(&path, rule_text::GIT));
+            fs::write(&path, "some old lean-ctx rule text\n").unwrap();
+            assert!(!is_stale_rule(&path, rule_text::LEANCTX));
         });
     }
 
     #[test]
     fn confirm_rule_refresh_updates_stale_file_when_yes() {
         with_temp_home(|| {
-            let path = home().join(".claude").join("rules").join("engram.md");
+            let path = home().join(".claude").join("rules").join("git.md");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, format!("{}\n", rule_text::ENGRAM_SUPERSEDED[0])).unwrap();
+            fs::write(&path, format!("{}\n", rule_text::GIT_SUPERSEDED[0])).unwrap();
 
             confirm_rule_refresh("claude-code", true);
 
             let content = fs::read_to_string(&path).unwrap();
-            assert_eq!(content.trim_end(), rule_text::ENGRAM);
+            assert_eq!(content.trim_end(), rule_text::GIT);
         });
     }
 
     #[test]
     fn confirm_rule_refresh_leaves_user_edited_file_alone() {
         with_temp_home(|| {
-            let path = home().join(".claude").join("rules").join("engram.md");
+            let path = home().join(".claude").join("rules").join("git.md");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, "my own custom engram notes\n").unwrap();
+            fs::write(&path, "my own custom git notes\n").unwrap();
 
             confirm_rule_refresh("claude-code", true);
 
             let content = fs::read_to_string(&path).unwrap();
-            assert_eq!(content.trim_end(), "my own custom engram notes");
+            assert_eq!(content.trim_end(), "my own custom git notes");
         });
     }
 
@@ -680,28 +676,28 @@ mod tests {
     }
 
     #[test]
-    fn wire_claude_code_writes_session_end_hook() {
+    fn wire_claude_code_does_not_wire_session_end() {
+        // SessionEnd used to fire an engram-cli handoff; that integration is
+        // gone (`hook session-end` is now a backward-compat no-op for old
+        // installs, see hook.rs), so fresh installs must not wire it at all.
         with_temp_home(|| {
             wire_claude_code();
             let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
-            assert!(content.contains("SessionEnd"));
-            assert!(content.contains("hook session-end"));
-            assert!(!content.contains("hook session-end --agent"));
+            assert!(!content.contains("SessionEnd"));
         });
     }
 
     #[test]
-    fn wire_claude_code_backfills_session_end_into_already_wired_install() {
+    fn wire_claude_code_backfills_pre_tool_use_into_already_wired_install() {
         with_temp_home(|| {
             let path = home().join(".claude").join("settings.json");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             // Simulates an install wired by an older agentflare version,
-            // before the SessionEnd hook existed.
+            // before the PreToolUse hook existed.
             fs::write(&path, serde_json::to_string_pretty(&json!({
                 "hooks": {
                     "SessionStart": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook session-start --agent claude-code", "timeout": 10 }] }],
-                    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook prompt-submit --agent claude-code", "timeout": 5 }] }],
-                    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook pre-tool-use --agent claude-code", "timeout": 5 }] }]
+                    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook prompt-submit --agent claude-code", "timeout": 5 }] }]
                 }
             })).unwrap()).unwrap();
 
@@ -710,24 +706,12 @@ mod tests {
             let content = fs::read_to_string(&path).unwrap();
             let parsed: Value = serde_json::from_str(&content).unwrap();
             // Backfilled fresh, so it's the new flagless form...
-            assert!(content.contains("hook session-end"));
-            assert!(!content.contains("hook session-end --agent"));
+            assert!(content.contains("hook pre-tool-use"));
+            assert!(!content.contains("hook pre-tool-use --agent"));
             // ...while the pre-existing old-format entries are left as-is,
             // not duplicated or rewritten.
             assert!(content.contains("hook session-start --agent claude-code"));
             assert_eq!(parsed["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
-        });
-    }
-
-    #[test]
-    fn wire_claude_code_does_not_duplicate_session_end_on_rerun() {
-        with_temp_home(|| {
-            let path = home().join(".claude").join("settings.json");
-            wire_claude_code();
-            wire_claude_code();
-            let content = fs::read_to_string(&path).unwrap();
-            let parsed: Value = serde_json::from_str(&content).unwrap();
-            assert_eq!(parsed["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
         });
     }
 
@@ -771,7 +755,7 @@ mod tests {
             let config_path = home().join(".config").join("opencode").join("opencode.jsonc");
             let rules_dir = home().join(".config").join("opencode").join("rules");
             fs::create_dir_all(&rules_dir).unwrap();
-            for &f in &["exa.md", "git.md", "lean-ctx.md", "engram.md"] {
+            for &f in &["exa.md", "git.md", "lean-ctx.md"] {
                 fs::write(rules_dir.join(f), format!("# {f}\n")).unwrap();
             }
 

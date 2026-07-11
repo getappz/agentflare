@@ -167,7 +167,7 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(
                 &path,
-                "[servers.engram]\nkind = \"mcp_stdio\"\ncommand = \"engram\"\n",
+                "[servers.acme]\nkind = \"mcp_stdio\"\ncommand = \"acme\"\n",
             )
             .unwrap();
 
@@ -175,7 +175,7 @@ mod tests {
 
             let content = fs::read_to_string(&path).unwrap();
             let cfg = gateway_registry::parse_config(&content).unwrap();
-            assert!(cfg.servers.contains_key("engram"));
+            assert!(cfg.servers.contains_key("acme"));
             assert!(cfg.servers.contains_key("github"));
         });
     }
