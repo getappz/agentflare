@@ -103,6 +103,16 @@ struct ClaimListRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ChannelSendRequest {
+    #[schemars(description = "Platform to send to: telegram, slack, or discord")]
+    platform: String,
+    #[schemars(description = "Recipient id: Telegram chat_id, or Slack/Discord channel id")]
+    target: String,
+    #[schemars(description = "The message text to send")]
+    message: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ReviewSubmitRequest {
     #[schemars(description = "Findings, each {file, line, message, severity?, category?}")]
     findings: Vec<serde_json::Value>,
@@ -726,6 +736,24 @@ impl AgentflareMcp {
         let (store, _base) = self.ensure_artifact_server()?;
         let deleted = store.delete(&id).map_err(Self::artifact_error)?;
         Ok(serde_json::json!({ "deleted": deleted }).to_string())
+    }
+
+    #[tool(description = "Send a text message out to a chat platform (telegram, slack, or discord). The bot token must already be stored as the gateway secret '<platform>_bot_token'. target is the Telegram chat_id or Slack/Discord channel id.")]
+    fn channel_send(
+        &self,
+        Parameters(ChannelSendRequest { platform, target, message }): Parameters<ChannelSendRequest>,
+    ) -> Result<String, ErrorData> {
+        let plat = crate::channels::Platform::parse(&platform).ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!("unknown platform '{platform}' (expected telegram, slack, or discord)"),
+                None,
+            )
+        })?;
+        let conn = crate::db::open()
+            .map_err(|e| ErrorData::internal_error(format!("cannot open database: {e}"), None))?;
+        crate::channels::send_message(&conn, plat, &target, &message)
+            .map_err(|e| ErrorData::internal_error(e, None))?;
+        Ok(serde_json::json!({ "sent": true, "platform": platform, "target": target }).to_string())
     }
 
     #[tool(description = "Claim a GitHub issue/PR so other agents don't duplicate the work. Returns 'acquired' if you now own it, or 'held' with the current owner if a live claim exists. Only stale (past-TTL) or done claims are stolen. Re-heartbeat periodically to keep it.")]

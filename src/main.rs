@@ -8,6 +8,7 @@ mod auth_crypt;
 mod auth_db;
 mod auth_runner;
 mod build_time;
+mod channels;
 mod claims;
 mod gateway_integrations;
 mod gateway_secrets;
