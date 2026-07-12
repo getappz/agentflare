@@ -270,7 +270,7 @@ agentflare makes **no network requests on its own**. It contains no telemetry, n
 
 The only network activity occurs at explicit user request:
 1. **`agentflare update`** (`src/update.rs`): Fetches release assets from `https://github.com/getappz/agentflare/releases/` over HTTPS. Uses a custom `User-Agent: agentflare` header and `Accept: application/vnd.github+json`. Downloads are verified against published `SHA256SUMS` before the binary is replaced.
-2. **Component installers**: Shells out to `npm`, `go install`, `brew`, and `git` — each package manager with its own HTTPS transport and integrity verification.
+2. **Component installers**: Shells out to `sh` (curl pipe) and `brew` — each package manager with its own HTTPS transport and integrity verification.
 3. **MCP server** (`src/mcp_server.rs`): Operates exclusively over **stdio** (JSON-RPC 2.0 via the `rmcp` crate). No network socket is opened; all communication is local pipe I/O.
 
 ## Secrets Management

@@ -64,7 +64,7 @@ mod tests {
     fn record_appends_a_line_with_expected_fields_and_no_raw_args() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path();
-        let args = serde_json::json!({"query": "x", "limit": 5});
+        let args = serde_json::json!({"query": "do-not-leak-me", "limit": 5});
 
         record(path, "memory_store", "search", &args, Ok(()));
         record(path, "memory_store", "search", &args, Err("Upstream"));

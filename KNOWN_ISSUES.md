@@ -17,7 +17,7 @@
 
 ### Hung child process on version probe timeout
 
-`src/agent_detect.rs:206-212` — `run_version_command` spawns a child process on a helper thread and waits up to `VERSION_TIMEOUT` (5s). On timeout, the helper thread is abandoned and the hung child is never killed. This leaks OS process handles. The code acknowledges this limitation with a comment ("killing cross-platform requires platform-specific process-group handling, which is overkill"), but repeated timeouts during `agentflare agents list` could accumulate zombie processes.
+`src/agent_detect.rs:206-212` — `run_version_command` spawns a child process on a helper thread and waits up to `VERSION_TIMEOUT` (5s). On timeout, the helper thread is abandoned and the hung child is never killed. This leaks OS process handles. The code acknowledges this limitation with a comment ("killing cross-platform requires platform-specific process-group handling, which is overkill"), but repeated timeouts during `agentflare agents list` could accumulate orphaned/running child processes.
 
 **Impact: Medium** | **Likelihood: Low** (version probes are rare and fast)
 
@@ -107,7 +107,7 @@ All dependencies in `Cargo.toml` use current, maintained versions:
 | `thiserror` | 2 | Current |
 | `eyre` / `color-eyre` | 0.6 | Current |
 
-**Overall: No deprecated dependencies detected.** Rust toolchain pinned at `rust-version = "1.91"` with `edition = "2024"` — both recent and well-supported.
+**Overall: No deprecated dependencies detected.** Minimum supported Rust version set at `rust-version = "1.91"` (audited 2025-07) with `edition = "2024"` — both recent and well-supported.
 
 ---
 
@@ -235,7 +235,7 @@ All modules call `crate::paths::home()` and `crate::state::state_dir()` directly
 
 ### State management is split across JSON and SQLite
 
-The codebase uses three separate state stores:
+The codebase uses four separate state stores:
 1. `~/.agentflare/state.json` — global on/off toggle + version cache (JSON)
 2. `~/.agentflare/runtime-state.json` — session tracking (JSON)
 3. `~/.local/share/agentflare/auth.db` — auth vault (SQLite)
@@ -270,7 +270,7 @@ Two JSON files for transient state and two SQLite databases for persistent stora
 | Category | Count | Highest Priority |
 |----------|-------|-----------------|
 | Known Bugs | 4 | Hung child process on version timeout (Medium) |
-| Technical Debt | 6 | Monolithic `main.rs` dispatch and large `auth.rs` (Medium) |
+| Technical Debt | 7 | Monolithic `main.rs` dispatch and large `auth.rs` (Medium) |
 | Deprecated Dependencies | 0 | None |
 | Performance Concerns | 3 | Full cache sync on cost (Low — mitigated by cache) |
 | Security Concerns | 5 | rpassword silent failure (Medium) |

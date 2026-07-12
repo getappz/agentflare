@@ -369,7 +369,7 @@ agentflare auth login <AGENT> <PROFILE> [--json] -- <ARGS>...
 | `exec` | Run a command with an isolated profile's `$HOME` |
 | `login` | Run a login command in an isolated `$HOME`, then back up resulting auth to vault |
 
-**Encryption:** AES-256-GCM with PBKDF2 key derivation (600,000 iterations, SHA-256). Encrypted files start with `AFVE` magic bytes. Set `AGENTFLARE_VAULT_PASSPHRASE` to enable; if unset, files are stored in plaintext.
+**Encryption:** AES-256-GCM with PBKDF2 key derivation (600,000 iterations, SHA-256). Encrypted files start with `AFVE` magic bytes. Set `AGENTFLARE_VAULT_PASSPHRASE` to enable; if unset, interactive sessions prompt on TTY, non-interactive sessions store files in plaintext.
 
 **Profile resolution order** (`resolve_name`):
 1. Check aliases (explicit user mapping) — always wins

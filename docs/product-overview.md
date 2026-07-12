@@ -57,8 +57,8 @@ Supported agents:
 
 | Tier | Agents |
 |------|--------|
-| **CLI** (standalone binary) | Claude Code, Codex, Cursor, Windsurf, OpenCode, Gemini CLI, GitHub Copilot CLI, Aider, Cline, Continue, and more |
-| **Extension** (editor-embedded) | VS Code Copilot, VS Code Cline, Continue VS Code |
+| **CLI** (standalone binary) | Claude Code, Codex, Cursor, Windsurf, OpenCode, Gemini CLI, GitHub Copilot CLI, Aider, and more |
+| **Extension** (editor-embedded) | VS Code Copilot, Cline, Continue |
 
 ### Context Compression (lean-ctx)
 
@@ -145,9 +145,8 @@ CLI (standalone binary, 17 agents) and Extension (editor-embedded, 3 agents).
 
 agentflare exposes an MCP (Model Context Protocol) stdio server that makes
 optimization state available as MCP resources and tools. Agents that support
-MCP can query agentflare's state, toggle the global on/off flag, and receive
-cost and health data — all through the standardized MCP transport (`rmcp` crate
-with `transport-io`).
+MCP can query session health and routing data through the standardized MCP
+transport (`rmcp` crate with `transport-io`).
 
 ## Target Audience
 
@@ -195,20 +194,19 @@ flowchart TB
    per-turn I/O tokens), and to follow Caveman/Ponytail conventions. It then wires hook triggers
    into the agent's own config so these layers activate automatically.
 
-2. **At session start**: The `SessionStart` hook fires. It verifies all
-   components (rules, lean-ctx, plugins) are present and active,
-   reporting status without re-installing anything (consent-gated components
-   install only during explicit `init`).
+2. **At session start**: The `SessionStart` hook fires. It auto-applies
+   non-consent components (rules, mode-pinning) and reports any pending
+   consent-gated components (install only during explicit `init`).
 
-3. **Before each prompt**: The `PromptSubmit` hook can inject Caveman-style
-   compression instructions into the agent's context.
+3. **Before each prompt**: The `PromptSubmit` hook injects standard context
+   (lean-ctx, Exa, git conventions) and routing suggestions into the agent.
 
-4. **Before each tool use**: The `PreToolUse` hook can enforce Ponytail's
-   lazy-first coding rules before the agent writes or edits code.
+4. **Before each tool use**: The `PreToolUse` hook emits batching nudges and
+   schedule-wakeup guidance based on recent tool call patterns.
 
 5. **Default-off escape hatch**: agentflare maintains a `~/.agentflare/state.json`
-   on/off flag. Toggling it off disables all hooks globally without uninstalling
-   anything — useful for debugging or when working without internet.
+   on/off flag. When off, prompt-submit context injection is skipped; hook
+   wiring and session-start checks still run. Useful for debugging.
 
 ## Technology Stack
 

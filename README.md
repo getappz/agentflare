@@ -126,8 +126,7 @@ codex plugin install agentflare
 then `agentflare init --agent codex` for rules/lean-ctx setup (Codex's
 hook wiring itself comes from the plugin manifest, not `init`).
 
-Each run: writes rule files (if absent), installs lean-ctx (`npm install -g
-lean-ctx-bin && lean-ctx onboard`) if missing, wires hooks/MCP where the host
+Each run: writes rule files (if absent), installs lean-ctx (`curl -fsSL https://raw.githubusercontent.com/yvgude/lean-ctx/main/install.sh | sh` or `brew tap yvgude/lean-ctx && brew install lean-ctx && lean-ctx onboard`) if missing, wires hooks/MCP where the host
 supports it. Detection-first — already-satisfied components are skipped, nothing
 gets clobbered.
 

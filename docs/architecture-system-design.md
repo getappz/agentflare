@@ -107,7 +107,6 @@ graph TD
     AUTH --> AUTH_CRYPT
     AUTH --> AUTH_RUNNER
     
-    COMP --> ENGRAM_INSTALL
     COMP --> RULE_TEXT
     COMP --> STATE
     
@@ -130,7 +129,7 @@ The architectural linchpin. A `Component` is a tuple of `(id, needs_consent, des
 - **`apply`**: Runs the fix and returns a human-readable result string.
 - **`needs_consent`**: If `true`, the component is only installed during explicit `init` (user consent). If `false`, it can auto-heal during `hook session-start`.
 
-Six components per host:
+Five components per host:
 | Component | Consent | What it does |
 |-----------|---------|--------------|
 | `rules` | No | Writes Exa/Git/lean-ctx rule files per host |
@@ -468,7 +467,7 @@ flowchart LR
 |-------|---------|-------------|
 | Version cache | `state.json` (in-memory HashMap, persisted to disk) | `(binary_path, mtime)` mismatch |
 | Cost rollup | `analytics.db` (SQLite) | `(mtime, size)` mismatch per file + pricing fingerprint on upgrade |
-| Dedup keys | `analytics.db` (SQLite) | Never invalidated (cross-file dedup is exact by key) |
+| Dedup keys | `analytics.db` (SQLite) | Full cache rebuild on pricing-fingerprint change (exact-key dedup otherwise) |
 | Pricing table | `OnceLock` (static, parsed once) | Invalidation on agentflare upgrade via fingerprint |
 
 ### Concurrency

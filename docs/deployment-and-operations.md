@@ -483,7 +483,7 @@ All state stored under `~/.agentflare/` (`src/state.rs:48`). Path redirectable v
 
 Used by the MCP server for session hygiene nudges and model routing suggestions. Stale sessions (>24h) auto-pruned on load (`src/optimize.rs:47-51`).
 
-**`vault/` directory** (`src/auth_db.rs`) — Encrypted auth profiles stored in SQLite (`rusqlite` with bundled SQLite). Schema includes profiles, cooldowns, project associations, and aliases.
+**`vault/` directory** (`~/.local/share/agentflare/vault/`) — Filesystem directory containing encrypted auth profile files. Auth state (cooldowns, aliases, project associations) stored separately in `auth.db` SQLite database.
 
 All state files are JSON, fallback-safe on corrupt/missing files (return defaults; `src/state.rs:36-39`).
 
@@ -731,8 +731,9 @@ curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/master/install.s
 |---|---|---|
 | `~/.agentflare/state.json` | Global state, version cache | Yes (auto-recreated) |
 | `~/.agentflare/runtime-state.json` | Session tracking data | Yes (auto-recreated) |
-| `~/.agentflare/vault/` | Encrypted auth profiles (SQLite) | **No** — backup first |
-| `~/.agentflare/` (entire dir) | All state + vault | Yes (after vault backup) |
+| `~/.local/share/agentflare/vault/` | Auth profile files (encrypted) | **No** — backup first |
+| `~/.agentflare/auth.db` | Auth state SQLite (cooldowns, aliases) | **No** — backup first |
+| `~/.agentflare/` (entire dir) | All state files (excl. vault) | Yes (after vault+auth.db backup) |
 | `~/.claude/rules/{exa,git,lean-ctx}.md` | Agent rules | Yes (agentflare-authored) |
 | `~/.claude/settings.json` (hooks section) | Hook configuration | Remove entries containing `"agentflare"` |
 | `.cursor/hooks.json` | Cursor hook config | Yes (if agentflare-authored) |

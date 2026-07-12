@@ -313,8 +313,7 @@ on local filesystem state, and its primary integration points are:
 - Reading/writing agent auth files under `~/.claude/`, `~/.codex/`,
   `~/.gemini/`, `~/.opencode/`, `~/.copilot/`
 - Managing vault profiles under `~/.local/share/agentflare/vault/`
-- Querying a SQLite analytics cache under
-  `~/.local/share/agentflare/rollup.db`
+- Querying a SQLite analytics cache under `~/.agentflare/analytics.db`
 - Spawning agent binaries for `--version` detection and `hook` relay
 
 Full end-to-end testing would require a multi-agent environment with actual

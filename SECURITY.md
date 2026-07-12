@@ -19,15 +19,15 @@ paths listed in the README's "What Gets Created" section.
 **Does:**
 - Read/write its own state at `~/.agentflare/state.json`
 - Write hook/rule config into the target agent's own settings files (only if absent — never overwrites)
-- Shell out to `npm`, `go`, `brew`, `git` to install/check lean-ctx
+- Shell out to `sh`, `brew` to install/check lean-ctx via its native installer
+  (`curl | sh` or Homebrew)
 
 **Does NOT:**
 - Make any network requests itself (no telemetry, no update check, no dependencies that touch the network — see `Cargo.toml`: `clap`, `serde`, `serde_json`, `dirs` only)
 - Read or transmit file contents from your project
 - Require elevated privileges
 
-The main risk surface is the installer subprocess calls (`npm install -g
-lean-ctx-bin`, `go install`, `brew install`) — agentflare only ever invokes
+The main risk surface is the installer subprocess calls (`sh`, `brew`) — agentflare only ever invokes
 these with fixed, hardcoded package names, never with user-supplied input.
 
 ## Automated Checks
