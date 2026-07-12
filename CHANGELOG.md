@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - remove engram integration — replaced by built-in memory module
 - Merge remote-tracking branch 'origin/master' into refactor/db-consolidate-secrets
 - Merge remote-tracking branch 'origin/master' into feat/review-consensus
-- cap build/test job at 25min so a hung test fails fast instead of pinning a runner for 6h
+- cap build/test job at 25 min so a hung test fails fast instead of pinning a runner for 6h
 - Merge remote-tracking branch 'origin/master' into feat/claim-ledger
 
 ## [1.2.0](https://github.com/getappz/agentflare/compare/agentflare-v1.1.0...agentflare-v1.2.0) - 2026-07-08
