@@ -48,7 +48,7 @@ fn classify(tool_name: &str, tool_input: Option<&Value>) -> Option<String> {
                 .and_then(Value::as_str)?;
             is_spec_like_path(path).then(|| {
                 format!(
-                    "specs/design docs/plans belong in agentflare artifacts (artifact_publish), not committed to the repo at '{path}' — see CLAUDE.md's 'Plans & specs live in agentflare artifacts' rule."
+                    "specs/design docs/plans belong attached to the relevant item as an asset (the `asset` tool, action=attach), not committed to the repo at '{path}' — create/assign an item first if one doesn't already track this work."
                 )
             })
         }
@@ -87,7 +87,7 @@ mod tests {
     fn classify_redirects_spec_path_write() {
         let input = json!({ "file_path": "docs/superpowers/specs/2026-07-13-foo.md" });
         let reason = classify("Write", Some(&input)).unwrap();
-        assert!(reason.contains("artifact_publish"));
+        assert!(reason.contains("`asset` tool"));
     }
 
     #[test]
