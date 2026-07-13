@@ -146,7 +146,11 @@ fn get_artifact_command(request: &GetPromptRequestParams) -> GetPromptResult {
         // across versions (/agentflare:artifact vs /mcp__agentflare__artifact),
         // so the usage card only shows the argument part.
         return assistant_text(
-            "Artifact commands (live-shareable local pages) — pass as this command's argument:\n\
+            "Artifact commands (live-shareable local pages) — pass as this command's argument.\n\
+             Deprecated for agent-to-agent handoffs: `/handoff` now assigns items and attaches \
+             content as versioned assets instead of publishing artifacts. This command remains \
+             for standalone shareable pages (dashboards, reports) — kept for reference/backward \
+             compatibility, not the recommended path for new agent-to-agent work.\n\
              publish [--name N] [--type html|markdown|mermaid|diagram|text] [--session S] [--label L] [--description D] [--favicon 🚀] — publish preceding/attached content\n\
              update <id> [--base-version N] [options] — update in place (open tabs live-reload)\n\
              list [--session S]\n\
@@ -157,6 +161,8 @@ fn get_artifact_command(request: &GetPromptRequestParams) -> GetPromptResult {
 
     assistant_text(format!(
         "Artifact command requested: `{command}`\n\n\
+         Deprecated for agent-to-agent handoffs (use `/handoff` instead); still fine for \
+         standalone shareable pages.\n\n\
          Parse the subcommand and options, then execute with the agentflare MCP tools \
          (load via ToolSearch if deferred):\n\
          - publish → artifact_publish; content is the inline content if given, otherwise \
@@ -185,11 +191,11 @@ fn get_handoff_command(request: &GetPromptRequestParams, agent: Option<&str>) ->
 
     if command.is_empty() {
         return assistant_text(format!(
-            "Handoff — agent-to-agent work exchange via artifacts. Pass as this command's argument:\n\
+            "Handoff — agent-to-agent work exchange via items and assets. Pass as this command's argument:\n\
              <recipient> <brief> — hand the relevant work product to that agent (e.g. `codex review the API design above`)\n\
-             inbox [me] — list artifacts addressed to an agent (default: {me})\n\
-             thread <id> — show a handoff thread's artifacts in order\n\
-             Work products only — facts and decisions belong in memory (memory_remember), not artifacts.",
+             inbox [me] — list this project's tasks assigned to (or unclaimed for) an agent (default: {me})\n\
+             thread <id> — show a handoff thread's items in order\n\
+             Work products only — facts and decisions belong in memory (memory_remember), not items.",
         ));
     }
 
@@ -199,17 +205,24 @@ fn get_handoff_command(request: &GetPromptRequestParams, agent: Option<&str>) ->
          - `<recipient> <brief>` → call the `handoff` tool with recipient=<recipient>, \
          name from the brief, content = the work product the brief points at (the preceding \
          conversation content, diff, review, or document — ask only if genuinely ambiguous), \
-         and a thread_id when continuing an exchange. Prepend the brief to the content so the \
-         recipient knows what is being asked (sender is set to your identity, {me}, \
-         automatically). Use the `handoff` tool, not artifact_publish, so recipient can't be \
-         omitted. When answering an item from your inbox, set reply_to=<that artifact id> and \
-         reuse its thread_id.\n\
-         - `inbox [me]` → artifact_list with recipient=<me or {me}>; summarize sender, \
-         name, and brief for each.\n\
-         - `thread <id>` → artifact_list with thread_id=<id>; present in chronological order with \
-         reply lineage.\n\
-         Report the resulting URL (or listing) afterwards. Work products only — facts/decisions \
-         go to memory (memory_remember), not artifacts."
+         and a thread_id when continuing an exchange. This assigns/creates an item for the \
+         recipient and attaches the content to it as a versioned asset — prepend the brief to \
+         the content so the recipient knows what is being asked (sender is set to your \
+         identity, {me}, automatically). Use the `handoff` tool, not a bare item update, so \
+         recipient can't be omitted. When answering an item from your inbox, set \
+         item_id=<that item's id> (so the reply becomes the next asset version instead of a new \
+         item) and reply_to=<id of the specific message you're answering>, reusing its \
+         thread_id.\n\
+         - `inbox [me]` → call the `item` tool (action=list; already scoped to this repo's \
+         linked project) and filter to items where assignee_agent is <me or {me}> or unassigned; \
+         summarize name, state, and brief per item. Pull an item's full content only if you need \
+         it, via the `asset` tool (action=list, item_id=<id>) and asset get on the latest \
+         version.\n\
+         - `thread <id>` → call `item` (action=list), filter client-side to items whose \
+         metadata.thread matches <id>, then pull each item's assets (asset tool) for content; \
+         present in chronological order with reply lineage.\n\
+         Report the resulting listing afterwards. Work products only — facts/decisions go to \
+         memory (memory_remember), not items."
     ))
 }
 
@@ -315,7 +328,10 @@ mod tests {
         let result = get_prompt(&params, Some("opencode")).unwrap();
         let text = format!("{:?}", result.messages[0].content);
         assert!(text.contains("identity, opencode"), "{text}");
-        assert!(text.contains("recipient=<me or opencode>"), "{text}");
+        assert!(
+            text.contains("assignee_agent is <me or opencode>"),
+            "{text}"
+        );
         assert!(!text.contains("claude-code"), "{text}");
     }
 
