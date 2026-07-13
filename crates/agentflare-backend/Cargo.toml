@@ -1,0 +1,22 @@
+[package]
+name = "agentflare-backend"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+description = "Universal agent backend: workspace/project/item schema + CRUD, ported from Plane's domain model."
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v7"] }
+thiserror = "2"
+ureq = { version = "2", features = ["json"] }
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -2,6 +2,13 @@
 /docs/superpowers/
 /.worktrees/
 
+# opencode CLI's own local state (node_modules, package.json/lock, plans dir)
+/.opencode/
+
+# Per-repo agentflare-backend project link (Vercel-style .vercel/project.json
+# equivalent) — machine-local, not something to share via git.
+/.agentflare/
+
 # Local onpush doc-generation tooling (machine-specific, not part of the project)
 /.onpush/
 /onpush_run.log

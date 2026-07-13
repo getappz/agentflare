@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ponytail", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/caveman", "crates/agentflare-artifacts"]
+members = ["crates/ponytail", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/caveman", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit"]
 resolver = "2"
 
 [package]
@@ -65,6 +65,8 @@ caveman = { package = "agentflare-caveman", path = "crates/caveman", version = "
 regex = "1"
 sysinfo = { version = "0.34", optional = true, default-features = false, features = ["system"] }
 agentflare-artifacts = { version = "0.1.1", path = "crates/agentflare-artifacts" }
+agentflare-backend = { package = "agentflare-backend", path = "crates/agentflare-backend", version = "0.1.0" }
+db_kit = { package = "agentflare-db-kit", path = "crates/agentflare-db-kit", version = "0.1.0" }
 agent-detector = "0.2.1"
 
 [features]

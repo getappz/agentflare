@@ -4,11 +4,25 @@
 //! stale-steal are ONE atomic statement, which a filesystem lock can't give
 //! for the steal case. Models [Beads](https://github.com/gastownhall/beads)'s
 //! claim/close model, minus the full issue-tracker surface.
+//!
+//! `acquire`/`heartbeat`/`release`/`done` are thin wrappers over
+//! `db_kit::claim::ClaimLedger` — the generic, table/key-agnostic version of
+//! this same atomic-upsert lease pattern, shared with
+//! `agentflare-backend`'s `item_claims`. `migrate`/`list` stay as direct SQL
+//! here rather than delegating: this table's `git_commit` column is a
+//! git-provenance concern specific to the GitHub-issue/PR claim use case, not
+//! something the generic ledger models (bolting it onto the generic API for
+//! one caller would defeat the point of generalizing) — see `acquire()`
+//! below for how it's threaded through instead.
+pub use db_kit::claim::Acquire;
+use db_kit::claim::ClaimLedger;
 use rusqlite::{Connection, params};
 
 /// Default lease: a claim whose owner hasn't heartbeat within this window is
 /// stealable, so a crashed/hung agent can't wedge a target forever.
 const DEFAULT_TTL_SECS: u64 = 1800; // 30 min
+
+const LEDGER: ClaimLedger = ClaimLedger::new("claims", &["repo", "target"]);
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -38,18 +52,12 @@ pub struct Claim {
     pub stale: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Acquire {
-    /// We now hold the claim (fresh, stolen-stale, or re-taken our own).
-    Acquired,
-    /// A live claim is held by someone else; `age_secs` since their heartbeat.
-    Held { owner: String, age_secs: i64 },
-}
-
-/// Attempts to claim `target`. Atomic: the upsert only overwrites an existing
-/// row that is done, stale (heartbeat < now-ttl), or already ours — so it can
-/// never steal another owner's live claim. `now`/`ttl_secs` are passed in so
-/// the logic is pure and unit-testable without mocking the clock.
+/// Attempts to claim `target`. Delegates the atomic acquire/steal upsert to
+/// the generic ledger, then — only once we actually hold the claim — stores
+/// `git_commit` with a follow-up UPDATE. `git_commit` isn't a column the
+/// generic `ClaimLedger` knows about, so it can't be part of the atomic
+/// upsert itself; this is a deliberate two-step, not an oversight, and it's
+/// safe because the second statement only ever touches a row we just won.
 pub fn acquire(
     conn: &Connection,
     repo: &str,
@@ -59,38 +67,14 @@ pub fn acquire(
     now: i64,
     ttl_secs: i64,
 ) -> rusqlite::Result<Acquire> {
-    let stale_before = now - ttl_secs;
-    conn.execute(
-        "INSERT INTO claims (repo, target, owner, status, created_at, heartbeat_at, git_commit)
-         VALUES (?1, ?2, ?3, 'claimed', ?4, ?4, ?5)
-         ON CONFLICT(repo, target) DO UPDATE SET
-             owner = excluded.owner,
-             status = 'claimed',
-             created_at = excluded.created_at,
-             heartbeat_at = excluded.heartbeat_at,
-             git_commit = excluded.git_commit
-         WHERE claims.status = 'done'
-            OR claims.heartbeat_at < ?6
-            OR claims.owner = excluded.owner",
-        params![repo, target, owner, now, git_commit, stale_before],
-    )?;
-
-    // Read back the authoritative row: if it's us, we won; otherwise a live
-    // claim by someone else blocked the upsert.
-    let (row_owner, heartbeat_at): (String, i64) = conn.query_row(
-        "SELECT owner, heartbeat_at FROM claims WHERE repo = ?1 AND target = ?2",
-        params![repo, target],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-
-    Ok(if row_owner == owner {
-        Acquire::Acquired
-    } else {
-        Acquire::Held {
-            owner: row_owner,
-            age_secs: now - heartbeat_at,
-        }
-    })
+    let outcome = LEDGER.acquire(conn, &[repo, target], owner, now, ttl_secs)?;
+    if outcome == Acquire::Acquired {
+        conn.execute(
+            "UPDATE claims SET git_commit = ?3 WHERE repo = ?1 AND target = ?2",
+            params![repo, target, git_commit],
+        )?;
+    }
+    Ok(outcome)
 }
 
 /// Refreshes the lease on a claim we own. Returns false if the claim is gone
@@ -102,20 +86,12 @@ pub fn heartbeat(
     owner: &str,
     now: i64,
 ) -> rusqlite::Result<bool> {
-    let changed = conn.execute(
-        "UPDATE claims SET heartbeat_at = ?4 WHERE repo = ?1 AND target = ?2 AND owner = ?3",
-        params![repo, target, owner, now],
-    )?;
-    Ok(changed > 0)
+    LEDGER.heartbeat(conn, &[repo, target], owner, now)
 }
 
 /// Drops our claim entirely (frees the target). Owner-scoped.
 pub fn release(conn: &Connection, repo: &str, target: &str, owner: &str) -> rusqlite::Result<bool> {
-    let changed = conn.execute(
-        "DELETE FROM claims WHERE repo = ?1 AND target = ?2 AND owner = ?3",
-        params![repo, target, owner],
-    )?;
-    Ok(changed > 0)
+    LEDGER.release(conn, &[repo, target], owner)
 }
 
 /// Marks our claim done (kept for audit; a done target is re-acquirable).
@@ -126,11 +102,7 @@ pub fn done(
     owner: &str,
     now: i64,
 ) -> rusqlite::Result<bool> {
-    let changed = conn.execute(
-        "UPDATE claims SET status = 'done', heartbeat_at = ?4 WHERE repo = ?1 AND target = ?2 AND owner = ?3",
-        params![repo, target, owner, now],
-    )?;
-    Ok(changed > 0)
+    LEDGER.done(conn, &[repo, target], owner, now)
 }
 
 /// Lists claims (optionally scoped to `repo`). With `include_stale = false`,
@@ -206,10 +178,7 @@ pub fn ttl_secs() -> i64 {
 }
 
 pub fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    db_kit::ids::now()
 }
 
 /// Normalizes a git remote URL to a stable `owner/name` key, so https and ssh

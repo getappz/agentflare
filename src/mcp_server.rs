@@ -17,6 +17,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
     transport::stdio,
 };
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -452,8 +453,26 @@ pub struct AgentflareMcp {
     /// An overridden store is never shared: it always gets its own
     /// OS-assigned port, since the fixed-port server serves the default dir.
     artifacts_dir_override: Option<std::path::PathBuf>,
+    /// Lazily-opened connection to agentflare-backend's own database.
+    /// Persisted across calls for the same reason as skills_registry: a
+    /// fresh connection per call would re-run migrations every time. Unlike
+    /// skills (filesystem-derived, needs ensure_fresh), the backend DB is
+    /// its own source of truth, so nothing to refresh.
+    backend_db: std::sync::Mutex<Option<rusqlite::Connection>>,
+    /// Tests inject a temp path here so they never touch the shared backend.db.
+    backend_db_override: Option<std::path::PathBuf>,
+    /// Tests inject a temp file path here so project-link resolution never
+    /// reads/writes this actual repo's `.agentflare/project.json`.
+    backend_project_link_override: Option<std::path::PathBuf>,
+    /// Tests inject a fake repo identity here — real resolution shells out
+    /// to `git`/reads cwd, both process-global and unsafe to fake by
+    /// mutating cwd across parallel test threads.
+    backend_repo_key_override: Option<String>,
 }
 
+/// All local artifact backends (flared, another session, or our own
+/// owned server) bind loopback-only — never advertise anything else.
+const LOCAL_HOST: &str = "127.0.0.1";
 /// flared's default HTTP port; its artifact routes live under /artifacts.
 const FLARED_DEFAULT_PORT: u16 = 35273;
 const FLARED_ARTIFACTS_PATH: &str = "/artifacts/";
@@ -507,11 +526,169 @@ impl ArtifactBackend {
         match self {
             ArtifactBackend::Owned(server) => server.base_url(),
             ArtifactBackend::External { port, path } => {
-                format!("http://127.0.0.1:{port}{}", path.trim_end_matches('/'))
+                format!("http://{LOCAL_HOST}:{port}{}", path.trim_end_matches('/'))
             }
         }
     }
 }
+
+// --- agentflare-backend MCP tools -----------------------------------------
+//
+// Workspace is fully hidden: exactly one per system, auto-created lazily on
+// first use. Project is Vercel-style auto-linked: `.agentflare/project.json`
+// at the repo root maps this checkout to a project, created on first use and
+// re-linked (never duplicated — see `resolve_project`) if the link file goes
+// missing. Neither workspace_id nor project_id is ever an MCP-exposed
+// parameter; every backend_* tool resolves both from cwd/git context.
+
+/// The `.agentflare/project.json` link file's shape.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ProjectLink {
+    workspace_id: String,
+    project_id: String,
+    identifier: String,
+}
+
+/// NotFound/Duplicate/InvalidTransition are caller-fixable → invalid_params;
+/// a raw database error is ours to fix → internal_error. Same split as
+/// `skill_load`'s NotFound/Ambiguous handling above.
+fn map_backend_err(e: agentflare_backend::Error) -> ErrorData {
+    match e {
+        agentflare_backend::Error::NotFound(msg)
+        | agentflare_backend::Error::Duplicate(msg)
+        | agentflare_backend::Error::InvalidTransition(msg) => ErrorData::invalid_params(msg, None),
+        agentflare_backend::Error::Database(e) => ErrorData::internal_error(e.to_string(), None),
+    }
+}
+
+/// 24 random bytes, hex-encoded — used as a webhook's HMAC signing secret
+/// when the caller doesn't supply one.
+fn generate_webhook_secret() -> String {
+    use rand::Rng;
+    let bytes: [u8; 24] = rand::thread_rng().r#gen();
+    hex::encode(bytes)
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BackendItemCreateRequest {
+    #[schemars(description = "Item name/title")]
+    name: String,
+    #[schemars(description = "State ID; omit to use the project's default (Backlog) state")]
+    #[serde(default)]
+    state_id: Option<String>,
+    #[schemars(description = "Markdown description body")]
+    #[serde(default)]
+    description: Option<String>,
+    #[schemars(description = "Priority: none|low|medium|high|urgent")]
+    #[serde(default)]
+    priority: Option<String>,
+    #[schemars(description = "Parent item ID, for sub-items")]
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[schemars(description = "Agent ID to assign, if any")]
+    #[serde(default)]
+    assignee_agent: Option<String>,
+    #[schemars(description = "Domain-specific fields as a JSON object, e.g. {\"budget\": 500}")]
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+    #[schemars(description = "Label IDs to attach on creation")]
+    #[serde(default)]
+    label_ids: Vec<String>,
+    #[schemars(description = "Item IDs this item depends on")]
+    #[serde(default)]
+    dependency_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BackendItemGetRequest {
+    #[schemars(description = "Item ID")]
+    id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BackendItemListRequest {
+    #[schemars(
+        description = "Filter by state group: backlog|unstarted|started|completed|cancelled|triage"
+    )]
+    #[serde(default)]
+    state_group: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BackendItemUpdateRequest {
+    #[schemars(description = "Item ID")]
+    id: String,
+    #[schemars(description = "New name/title")]
+    #[serde(default)]
+    name: Option<String>,
+    #[schemars(description = "New description")]
+    #[serde(default)]
+    description: Option<String>,
+    #[schemars(description = "New priority: none|low|medium|high|urgent")]
+    #[serde(default)]
+    priority: Option<String>,
+    #[schemars(description = "New assignee agent ID")]
+    #[serde(default)]
+    assignee_agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BackendItemUpdateStateRequest {
+    #[schemars(description = "Item ID")]
+    id: String,
+    #[schemars(description = "Target state ID, from backend_item_list or backend_project_info")]
+    state_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BackendItemDeleteRequest {
+    #[schemars(description = "Item ID")]
+    id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BackendLabelCreateRequest {
+    #[schemars(description = "Label name")]
+    name: String,
+    #[schemars(description = "Hex color, e.g. #F59E0B")]
+    #[serde(default)]
+    color: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BackendItemLabelRequest {
+    #[schemars(description = "Item ID")]
+    item_id: String,
+    #[schemars(description = "Label ID")]
+    label_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BackendWebhookCreateRequest {
+    #[schemars(description = "HTTPS/HTTP URL to deliver events to (not localhost/loopback)")]
+    url: String,
+    #[schemars(description = "HMAC signing secret; auto-generated if omitted")]
+    #[serde(default)]
+    secret: Option<String>,
+    #[schemars(description = "Fire on item create/update/delete")]
+    #[serde(default)]
+    on_item: Option<bool>,
+    #[schemars(description = "Fire on state changes")]
+    #[serde(default)]
+    on_state: Option<bool>,
+    #[schemars(description = "Fire on project changes")]
+    #[serde(default)]
+    on_project: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BackendWebhookDeleteRequest {
+    #[schemars(description = "Webhook ID")]
+    id: String,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct BackendNoArgs {}
 
 #[tool_router]
 impl AgentflareMcp {
@@ -829,23 +1006,226 @@ impl AgentflareMcp {
         Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
     }
 
+    /// Runs `git` in the current cwd; None on any failure (not a repo, git
+    /// not on PATH, etc). Shared by `git_provenance` and the backend
+    /// project-link resolution below.
+    fn run_git(args: &[&str]) -> Option<String> {
+        let out = std::process::Command::new("git").args(args).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+
     /// Best-effort git context of this process's cwd (the project the MCP
     /// server was launched in). None outside a repo; never fails a publish.
     pub(crate) fn git_provenance() -> Option<agentflare_artifacts::GitProvenance> {
-        fn git(args: &[&str]) -> Option<String> {
-            let out = std::process::Command::new("git").args(args).output().ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            (!s.is_empty()).then_some(s)
-        }
-        let commit = git(&["rev-parse", "HEAD"])?;
+        let commit = Self::run_git(&["rev-parse", "HEAD"])?;
         Some(agentflare_artifacts::GitProvenance {
-            repo: git(&["remote", "get-url", "origin"]),
-            r#ref: git(&["rev-parse", "--abbrev-ref", "HEAD"]),
+            repo: Self::run_git(&["remote", "get-url", "origin"]),
+            r#ref: Self::run_git(&["rev-parse", "--abbrev-ref", "HEAD"]),
             commit: Some(commit),
         })
+    }
+
+    /// Repo root (`git rev-parse --show-toplevel`), or cwd outside a repo —
+    /// where the `.agentflare/project.json` link file lives.
+    fn repo_root() -> std::path::PathBuf {
+        Self::run_git(&["rev-parse", "--show-toplevel"])
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default()
+    }
+
+    fn project_link_path(&self) -> std::path::PathBuf {
+        self.backend_project_link_override
+            .clone()
+            .unwrap_or_else(|| Self::repo_root().join(".agentflare").join("project.json"))
+    }
+
+    /// Derives a project name from the git remote (`getappz/agentflare` →
+    /// `agentflare`) or, outside a repo, the directory basename.
+    fn resolve_project_name() -> String {
+        if let Some(repo) = Self::run_git(&["remote", "get-url", "origin"]) {
+            let normalized = crate::claims::normalize_repo(&repo);
+            if let Some(name) = normalized.rsplit('/').next().filter(|s| !s.is_empty()) {
+                return name.to_string();
+            }
+        }
+        std::env::current_dir()
+            .ok()
+            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// Short uppercase alnum identifier for a project (used for issue-key
+    /// prefixes like `AGENTFLARE-42`).
+    fn derive_project_identifier(name: &str) -> String {
+        let ident: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_uppercase();
+        if ident.is_empty() {
+            "PROJ".to_string()
+        } else {
+            ident.chars().take(10).collect()
+        }
+    }
+
+    /// Lock the backend connection, lazily opening it (and running its
+    /// migrations) on first use, then run `f` against it. The backend DB is
+    /// its own source of truth — no filesystem-derived refresh needed,
+    /// unlike `with_fresh_registry` above.
+    fn with_backend_db<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> T,
+    ) -> Result<T, ErrorData> {
+        let mut guard = self
+            .backend_db
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if guard.is_none() {
+            let db_path = self
+                .backend_db_override
+                .clone()
+                .unwrap_or_else(|| crate::paths::home().join(".agentflare").join("backend.db"));
+            let conn = agentflare_backend::db::open_db(&db_path)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            *guard = Some(conn);
+        }
+        Ok(f(guard.as_ref().expect("just initialized above")))
+    }
+
+    /// The one and only workspace on this system: reused if it already
+    /// exists, auto-created (named "default") on first use. Never exposed
+    /// as an MCP parameter.
+    fn resolve_workspace_id(conn: &rusqlite::Connection) -> Result<String, ErrorData> {
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        let ws = agentflare_backend::workspace::create(
+            conn,
+            agentflare_backend::workspace::CreateWorkspace {
+                name: "default".to_string(),
+                slug: "default".to_string(),
+                owner_agent: None,
+                item_label: None,
+            },
+        )
+        .map_err(map_backend_err)?;
+        Ok(ws.id)
+    }
+
+    /// Marks a project as auto-provisioned by this resolver, in `external_source`.
+    const REPO_EXTERNAL_SOURCE: &'static str = "agentflare-repo";
+
+    /// Stable identity key for "this repo" — normalized git remote when
+    /// available (so multiple clones/worktrees of the same remote share one
+    /// project, matching `claims.rs`'s own repo-key model), else the
+    /// canonicalized repo root path. Deliberately NOT the derived display
+    /// name/identifier: two unrelated directories can easily share a
+    /// basename (`~/work/foo` and `~/scratch/foo`), and conflating them
+    /// would silently merge one project's items into the other's.
+    fn resolve_repo_key(&self) -> String {
+        if let Some(key) = self.backend_repo_key_override.clone() {
+            return key;
+        }
+        if let Some(remote) = Self::run_git(&["remote", "get-url", "origin"]) {
+            return format!("git:{}", crate::claims::normalize_repo(&remote));
+        }
+        let root = Self::repo_root();
+        let canonical = std::fs::canonicalize(&root).unwrap_or(root);
+        format!("path:{}", canonical.to_string_lossy())
+    }
+
+    /// Vercel-style auto-link: reads `.agentflare/project.json` at the repo
+    /// root if present; otherwise derives a project from git/cwd context and
+    /// creates or reconnects to it. Reconnects rather than duplicates when
+    /// the link file is missing but this repo's project already exists
+    /// (deleted link file, wiped worktree, etc.) — matched by
+    /// `resolve_repo_key()`, not by the derived display identifier, so two
+    /// differently-located repos that happen to share a name are never
+    /// conflated; the identifier only gets a disambiguating suffix.
+    fn resolve_project(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> Result<agentflare_backend::project::Project, ErrorData> {
+        let link_path = self.project_link_path();
+        if let Ok(bytes) = std::fs::read(&link_path)
+            && let Ok(link) = serde_json::from_slice::<ProjectLink>(&bytes)
+        {
+            match agentflare_backend::project::get(conn, &link.project_id) {
+                Ok(project) => return Ok(project),
+                Err(agentflare_backend::Error::NotFound(_)) => {} // stale link — re-resolve below
+                Err(e) => return Err(map_backend_err(e)),
+            }
+        }
+
+        let workspace_id = Self::resolve_workspace_id(conn)?;
+        let name = Self::resolve_project_name();
+        let identifier = Self::derive_project_identifier(&name);
+        let repo_key = self.resolve_repo_key();
+
+        let existing = agentflare_backend::project::list_by_workspace(conn, &workspace_id)
+            .map_err(map_backend_err)?
+            .into_iter()
+            .find(|p| {
+                p.external_source.as_deref() == Some(Self::REPO_EXTERNAL_SOURCE)
+                    && p.external_id.as_deref() == Some(repo_key.as_str())
+            });
+        let project = if let Some(project) = existing {
+            project
+        } else {
+            let mut attempt = 0u32;
+            loop {
+                let suffix = if attempt == 0 {
+                    String::new()
+                } else {
+                    format!("-{}", attempt + 1)
+                };
+                match agentflare_backend::project::create(
+                    conn,
+                    agentflare_backend::project::CreateProject {
+                        workspace_id: workspace_id.clone(),
+                        name: format!("{name}{suffix}"),
+                        identifier: format!("{identifier}{suffix}"),
+                        external_source: Some(Self::REPO_EXTERNAL_SOURCE.to_string()),
+                        external_id: Some(repo_key.clone()),
+                    },
+                ) {
+                    Ok(p) => break p,
+                    Err(agentflare_backend::Error::Duplicate(_)) if attempt < 20 => {
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(map_backend_err(e)),
+                }
+            }
+        };
+
+        let link = ProjectLink {
+            workspace_id,
+            project_id: project.id.clone(),
+            identifier: project.identifier.clone(),
+        };
+        if let Some(parent) = link_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            &link_path,
+            serde_json::to_vec_pretty(&link).unwrap_or_default(),
+        );
+        Ok(project)
     }
 
     /// NotFound and InvalidInput (version conflict) are caller-fixable →
@@ -1662,6 +2042,303 @@ impl AgentflareMcp {
             pinned,
         };
         crate::memory::mcp::handle_curate(input).map_err(|e| ErrorData::internal_error(e, None))
+    }
+
+    #[tool(
+        description = "Create a work item in the repo's linked project (auto-detected/created on first use — no workspace or project setup needed). Auto-assigns the project's default (Backlog) state if state_id is omitted, and a per-project sequence number."
+    )]
+    fn backend_item_create(
+        &self,
+        Parameters(BackendItemCreateRequest {
+            name,
+            state_id,
+            description,
+            priority,
+            parent_id,
+            assignee_agent,
+            metadata,
+            label_ids,
+            dependency_ids,
+        }): Parameters<BackendItemCreateRequest>,
+    ) -> Result<String, ErrorData> {
+        if name.trim().is_empty() {
+            return Err(ErrorData::invalid_params("name is required", None));
+        }
+        self.with_backend_db(|conn| {
+            let project = self.resolve_project(conn)?;
+            let state_id = match state_id {
+                Some(s) => s,
+                None => {
+                    agentflare_backend::state::list_by_project(conn, &project.id)
+                        .map_err(map_backend_err)?
+                        .into_iter()
+                        .find(|s| s.is_default)
+                        .ok_or_else(|| {
+                            ErrorData::internal_error("project has no default state", None)
+                        })?
+                        .id
+                }
+            };
+            let input = agentflare_backend::item::CreateItem {
+                project_id: project.id,
+                state_id,
+                name,
+                description,
+                priority,
+                parent_id,
+                assignee_agent,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: metadata.map(|v| v.to_string()),
+                label_ids,
+                assignee_ids: vec![],
+                dependency_ids,
+            };
+            let item = agentflare_backend::item::create(conn, input).map_err(map_backend_err)?;
+            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
+        })?
+    }
+
+    #[tool(description = "Get a work item by ID.")]
+    fn backend_item_get(
+        &self,
+        Parameters(BackendItemGetRequest { id }): Parameters<BackendItemGetRequest>,
+    ) -> Result<String, ErrorData> {
+        if id.trim().is_empty() {
+            return Err(ErrorData::invalid_params("id is required", None));
+        }
+        self.with_backend_db(|conn| {
+            let item = agentflare_backend::item::get(conn, &id).map_err(map_backend_err)?;
+            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
+        })?
+    }
+
+    #[tool(
+        description = "List work items in the repo's linked project. Optionally filter by state group: backlog|unstarted|started|completed|cancelled|triage."
+    )]
+    fn backend_item_list(
+        &self,
+        Parameters(BackendItemListRequest { state_group }): Parameters<BackendItemListRequest>,
+    ) -> Result<String, ErrorData> {
+        self.with_backend_db(|conn| {
+            let project = self.resolve_project(conn)?;
+            let mut items = agentflare_backend::item::list_by_project(conn, &project.id)
+                .map_err(map_backend_err)?;
+            if let Some(group) = state_group {
+                let matching: std::collections::HashSet<String> =
+                    agentflare_backend::state::list_by_project(conn, &project.id)
+                        .map_err(map_backend_err)?
+                        .into_iter()
+                        .filter(|s| s.group_name == group)
+                        .map(|s| s.id)
+                        .collect();
+                items.retain(|i| matching.contains(&i.state_id));
+            }
+            Ok(serde_json::to_string_pretty(&items).unwrap_or_default())
+        })?
+    }
+
+    #[tool(
+        description = "Update a work item's name, description, priority, or assignee. Use backend_item_update_state to change its state."
+    )]
+    fn backend_item_update(
+        &self,
+        Parameters(BackendItemUpdateRequest {
+            id,
+            name,
+            description,
+            priority,
+            assignee_agent,
+        }): Parameters<BackendItemUpdateRequest>,
+    ) -> Result<String, ErrorData> {
+        if id.trim().is_empty() {
+            return Err(ErrorData::invalid_params("id is required", None));
+        }
+        self.with_backend_db(|conn| {
+            let input = agentflare_backend::item::UpdateItem {
+                name,
+                description,
+                priority,
+                state_id: None,
+                assignee_agent,
+                sort_order: None,
+            };
+            let item =
+                agentflare_backend::item::update(conn, &id, input).map_err(map_backend_err)?;
+            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
+        })?
+    }
+
+    #[tool(
+        description = "Move an item to a different state within its project. Sets started_at/completed_at automatically based on the target state's group."
+    )]
+    fn backend_item_update_state(
+        &self,
+        Parameters(BackendItemUpdateStateRequest { id, state_id }): Parameters<
+            BackendItemUpdateStateRequest,
+        >,
+    ) -> Result<String, ErrorData> {
+        if id.trim().is_empty() || state_id.trim().is_empty() {
+            return Err(ErrorData::invalid_params(
+                "id and state_id are required",
+                None,
+            ));
+        }
+        self.with_backend_db(|conn| {
+            let item = agentflare_backend::item::update_state(conn, &id, &state_id)
+                .map_err(map_backend_err)?;
+            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
+        })?
+    }
+
+    #[tool(description = "Soft-delete a work item.")]
+    fn backend_item_delete(
+        &self,
+        Parameters(BackendItemDeleteRequest { id }): Parameters<BackendItemDeleteRequest>,
+    ) -> Result<String, ErrorData> {
+        if id.trim().is_empty() {
+            return Err(ErrorData::invalid_params("id is required", None));
+        }
+        self.with_backend_db(|conn| {
+            agentflare_backend::item::delete(conn, &id).map_err(map_backend_err)?;
+            Ok(serde_json::json!({"deleted": true, "id": id}).to_string())
+        })?
+    }
+
+    #[tool(description = "Create a label in the repo's linked project.")]
+    fn backend_label_create(
+        &self,
+        Parameters(BackendLabelCreateRequest { name, color }): Parameters<
+            BackendLabelCreateRequest,
+        >,
+    ) -> Result<String, ErrorData> {
+        if name.trim().is_empty() {
+            return Err(ErrorData::invalid_params("name is required", None));
+        }
+        self.with_backend_db(|conn| {
+            let project = self.resolve_project(conn)?;
+            let input = agentflare_backend::label::CreateLabel {
+                project_id: Some(project.id.clone()),
+                workspace_id: project.workspace_id,
+                name,
+                color,
+                parent_id: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+            };
+            let label = agentflare_backend::label::create(conn, input).map_err(map_backend_err)?;
+            Ok(serde_json::to_string_pretty(&label).unwrap_or_default())
+        })?
+    }
+
+    #[tool(description = "Attach a label to an item.")]
+    fn backend_item_add_label(
+        &self,
+        Parameters(BackendItemLabelRequest { item_id, label_id }): Parameters<
+            BackendItemLabelRequest,
+        >,
+    ) -> Result<String, ErrorData> {
+        self.with_backend_db(|conn| {
+            agentflare_backend::item::add_label(conn, &item_id, &label_id)
+                .map_err(map_backend_err)?;
+            Ok(
+                serde_json::json!({"attached": true, "item_id": item_id, "label_id": label_id})
+                    .to_string(),
+            )
+        })?
+    }
+
+    #[tool(description = "Remove a label from an item.")]
+    fn backend_item_remove_label(
+        &self,
+        Parameters(BackendItemLabelRequest { item_id, label_id }): Parameters<
+            BackendItemLabelRequest,
+        >,
+    ) -> Result<String, ErrorData> {
+        self.with_backend_db(|conn| {
+            agentflare_backend::item::remove_label(conn, &item_id, &label_id)
+                .map_err(map_backend_err)?;
+            Ok(
+                serde_json::json!({"removed": true, "item_id": item_id, "label_id": label_id})
+                    .to_string(),
+            )
+        })?
+    }
+
+    #[tool(
+        description = "Register a webhook that fires on item/state/project changes in the repo's linked workspace. secret is auto-generated if omitted — save the returned value, it isn't shown again."
+    )]
+    fn backend_webhook_create(
+        &self,
+        Parameters(BackendWebhookCreateRequest {
+            url,
+            secret,
+            on_item,
+            on_state,
+            on_project,
+        }): Parameters<BackendWebhookCreateRequest>,
+    ) -> Result<String, ErrorData> {
+        if url.trim().is_empty() {
+            return Err(ErrorData::invalid_params("url is required", None));
+        }
+        self.with_backend_db(|conn| {
+            let project = self.resolve_project(conn)?;
+            let secret_key = secret.unwrap_or_else(generate_webhook_secret);
+            let input = agentflare_backend::webhook::CreateWebhook {
+                workspace_id: project.workspace_id,
+                url,
+                secret_key,
+                on_item,
+                on_state,
+                on_project,
+            };
+            let webhook =
+                agentflare_backend::webhook::create(conn, input).map_err(map_backend_err)?;
+            Ok(serde_json::to_string_pretty(&webhook).unwrap_or_default())
+        })?
+    }
+
+    #[tool(description = "List webhooks registered on the repo's linked workspace.")]
+    fn backend_webhook_list(
+        &self,
+        Parameters(BackendNoArgs {}): Parameters<BackendNoArgs>,
+    ) -> Result<String, ErrorData> {
+        self.with_backend_db(|conn| {
+            let project = self.resolve_project(conn)?;
+            let webhooks =
+                agentflare_backend::webhook::list_by_workspace(conn, &project.workspace_id)
+                    .map_err(map_backend_err)?;
+            Ok(serde_json::to_string_pretty(&webhooks).unwrap_or_default())
+        })?
+    }
+
+    #[tool(description = "Delete a webhook.")]
+    fn backend_webhook_delete(
+        &self,
+        Parameters(BackendWebhookDeleteRequest { id }): Parameters<BackendWebhookDeleteRequest>,
+    ) -> Result<String, ErrorData> {
+        if id.trim().is_empty() {
+            return Err(ErrorData::invalid_params("id is required", None));
+        }
+        self.with_backend_db(|conn| {
+            agentflare_backend::webhook::delete(conn, &id).map_err(map_backend_err)?;
+            Ok(serde_json::json!({"deleted": true, "id": id}).to_string())
+        })?
+    }
+
+    #[tool(
+        description = "Show the workspace/project this repo is currently linked to (auto-created/linked on first use)."
+    )]
+    fn backend_project_info(
+        &self,
+        Parameters(BackendNoArgs {}): Parameters<BackendNoArgs>,
+    ) -> Result<String, ErrorData> {
+        self.with_backend_db(|conn| {
+            let project = self.resolve_project(conn)?;
+            Ok(serde_json::to_string_pretty(&project).unwrap_or_default())
+        })?
     }
 }
 
@@ -2592,5 +3269,181 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         }
+    }
+
+    /// Guards against the exact bug Phase 2's spec was written to avoid: a
+    /// second, untagged `impl AgentflareMcp` block would compile fine and
+    /// its `#[tool]` methods would still be directly callable (which is why
+    /// unit tests calling them would pass either way) but be invisible to
+    /// every real MCP client. Not fully sufficient on its own (see the
+    /// spec) but catches the single-router invariant cheaply.
+    #[test]
+    fn exactly_one_tool_router_block_exists() {
+        // Matches the attribute directly annotating `impl AgentflareMcp {`,
+        // not every prose mention of it (e.g. the placement-rule doc comment
+        // on the memory tools, or this test's own description).
+        let marker = ["#[", "tool_router", "]\nimpl AgentflareMcp {"].concat();
+        let src = include_str!("mcp_server.rs");
+        assert_eq!(
+            src.matches(&marker).count(),
+            1,
+            "all #[tool] methods must live in the one tool-router-tagged impl block"
+        );
+    }
+
+    fn backend_harness() -> (tempfile::TempDir, AgentflareMcp) {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            backend_db_override: Some(tmp.path().join("backend.db")),
+            backend_project_link_override: Some(tmp.path().join("project.json")),
+            ..Default::default()
+        };
+        (tmp, s)
+    }
+
+    fn backend_conn(tmp: &tempfile::TempDir) -> rusqlite::Connection {
+        agentflare_backend::db::open_db(&tmp.path().join("backend.db")).unwrap()
+    }
+
+    fn empty_item_create(name: &str) -> BackendItemCreateRequest {
+        BackendItemCreateRequest {
+            name: name.to_string(),
+            state_id: None,
+            description: None,
+            priority: None,
+            parent_id: None,
+            assignee_agent: None,
+            metadata: None,
+            label_ids: vec![],
+            dependency_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn backend_item_create_auto_provisions_workspace_and_project() {
+        let (_tmp, s) = backend_harness();
+        let created: serde_json::Value = serde_json::from_str(
+            &s.backend_item_create(Parameters(empty_item_create("Test Item")))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created["name"], "Test Item");
+        assert_eq!(created["sequence_id"], 1);
+        assert!(created["project_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn backend_item_create_rejects_empty_name() {
+        let (_tmp, s) = backend_harness();
+        let err = s
+            .backend_item_create(Parameters(empty_item_create("")))
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn backend_item_update_state_sets_timestamps_via_mcp() {
+        let (tmp, s) = backend_harness();
+        let created: serde_json::Value = serde_json::from_str(
+            &s.backend_item_create(Parameters(empty_item_create("Test")))
+                .unwrap(),
+        )
+        .unwrap();
+        let item_id = created["id"].as_str().unwrap().to_string();
+        let project_id = created["project_id"].as_str().unwrap().to_string();
+
+        let started_state_id = {
+            let conn = backend_conn(&tmp);
+            agentflare_backend::state::list_by_project(&conn, &project_id)
+                .unwrap()
+                .into_iter()
+                .find(|st| st.group_name == "started")
+                .unwrap()
+                .id
+        };
+
+        let updated: serde_json::Value = serde_json::from_str(
+            &s.backend_item_update_state(Parameters(BackendItemUpdateStateRequest {
+                id: item_id,
+                state_id: started_state_id,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(updated["started_at"].is_number());
+        assert!(updated["completed_at"].is_null());
+    }
+
+    #[test]
+    fn resolve_workspace_id_creates_once_and_reuses() {
+        let (tmp, _s) = backend_harness();
+        let conn = backend_conn(&tmp);
+        let id1 = AgentflareMcp::resolve_workspace_id(&conn).unwrap();
+        let id2 = AgentflareMcp::resolve_workspace_id(&conn).unwrap();
+        assert_eq!(id1, id2);
+    }
+
+    /// If `.agentflare/project.json` is deleted (wiped worktree, `rm -rf`,
+    /// etc.) while the project it pointed to still exists, resolving again
+    /// must reconnect to that same project — not silently fork a duplicate,
+    /// which would strand the original project's items.
+    #[test]
+    fn resolve_project_relinks_to_existing_project_when_link_file_is_deleted() {
+        let (tmp, s) = backend_harness();
+        let conn = backend_conn(&tmp);
+        let first = s.resolve_project(&conn).unwrap();
+
+        std::fs::remove_file(s.project_link_path()).unwrap();
+
+        let second = s.resolve_project(&conn).unwrap();
+        assert_eq!(
+            first.id, second.id,
+            "must reconnect to the same project, not fork a duplicate"
+        );
+        let all =
+            agentflare_backend::project::list_by_workspace(&conn, &first.workspace_id).unwrap();
+        assert_eq!(
+            all.len(),
+            1,
+            "no duplicate project should have been created: {all:?}"
+        );
+    }
+
+    /// Two different repos can easily share a directory basename (or, for
+    /// non-git dirs, no distinguishing info at all beyond the name). They
+    /// must never be conflated into one project just because they'd derive
+    /// the same display identifier — each gets its own project, with the
+    /// second disambiguated by a suffix.
+    #[test]
+    fn resolve_project_does_not_conflate_different_repos_with_the_same_derived_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("backend.db");
+        let s1 = AgentflareMcp {
+            backend_db_override: Some(db_path.clone()),
+            backend_project_link_override: Some(tmp.path().join("link1.json")),
+            backend_repo_key_override: Some("path:/repo/one".to_string()),
+            ..Default::default()
+        };
+        let s2 = AgentflareMcp {
+            backend_db_override: Some(db_path.clone()),
+            backend_project_link_override: Some(tmp.path().join("link2.json")),
+            backend_repo_key_override: Some("path:/repo/two".to_string()),
+            ..Default::default()
+        };
+        let conn = agentflare_backend::db::open_db(&db_path).unwrap();
+        let p1 = s1.resolve_project(&conn).unwrap();
+        let p2 = s2.resolve_project(&conn).unwrap();
+        assert_ne!(
+            p1.id, p2.id,
+            "different repos must never share a project even with the same derived name"
+        );
+        assert_ne!(
+            p1.identifier, p2.identifier,
+            "the second project must get a disambiguating suffix"
+        );
+
+        // Each keeps resolving to its own project on repeat calls.
+        assert_eq!(s1.resolve_project(&conn).unwrap().id, p1.id);
+        assert_eq!(s2.resolve_project(&conn).unwrap().id, p2.id);
     }
 }

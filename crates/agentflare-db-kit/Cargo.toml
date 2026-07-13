@@ -1,0 +1,17 @@
+[package]
+name = "agentflare-db-kit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+description = "Shared SQLite connection/migration/lease-ledger boilerplate for agentflare's crates. Not an ORM — no query layer, no schema modeling."
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite_migration = "2"
+uuid = { version = "1", features = ["v7"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
