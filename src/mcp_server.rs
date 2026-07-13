@@ -3,6 +3,7 @@
 //! dependency, not ported code; no /NOTICE entry needed).
 
 use crate::optimize;
+use base64::Engine as _;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
@@ -580,6 +581,11 @@ fn generate_webhook_secret() -> String {
     hex::encode(bytes)
 }
 
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::engine::general_purpose;
+    general_purpose::STANDARD.encode(bytes)
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct BackendItemCreateRequest {
     #[schemars(description = "Item name/title")]
@@ -707,6 +713,29 @@ struct BackendWebhookDeleteRequest {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct BackendNoArgs {}
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AssetRequest {
+    #[schemars(description = "Action: attach|get|list|delete")]
+    action: String,
+    #[schemars(description = "Asset ID (required for get, delete)")]
+    #[serde(default)]
+    id: Option<String>,
+    #[schemars(description = "Item ID to attach to (xor project_id)")]
+    #[serde(default)]
+    item_id: Option<String>,
+    #[schemars(description = "Project ID to attach to (xor item_id)")]
+    #[serde(default)]
+    project_id: Option<String>,
+    #[schemars(
+        description = "Filename (required for attach) — must exist in ~/.agentflare/staging/"
+    )]
+    #[serde(default)]
+    filename: Option<String>,
+    #[schemars(description = "JSON metadata (optional, attach only)")]
+    #[serde(default)]
+    metadata: Option<String>,
+}
+
 #[tool_router]
 impl AgentflareMcp {
     #[tool(
@@ -831,6 +860,57 @@ impl AgentflareMcp {
             }
             Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
         }
+    }
+
+    fn content_hash(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(bytes);
+        hex::encode(&digest[..])
+    }
+
+    fn infer_mime_type(ext: &str) -> String {
+        match ext.to_lowercase().as_str() {
+            "pdf" => "application/pdf".into(),
+            "png" => "image/png".into(),
+            "jpg" | "jpeg" => "image/jpeg".into(),
+            "gif" => "image/gif".into(),
+            "svg" => "image/svg+xml".into(),
+            "webp" => "image/webp".into(),
+            "txt" => "text/plain".into(),
+            "md" => "text/markdown".into(),
+            "json" => "application/json".into(),
+            "csv" => "text/csv".into(),
+            "yaml" | "yml" => "application/x-yaml".into(),
+            "xml" => "application/xml".into(),
+            "html" | "htm" => "text/html".into(),
+            "css" => "text/css".into(),
+            "js" => "application/javascript".into(),
+            "ts" | "tsx" => "application/typescript".into(),
+            "rs" => "text/x-rust".into(),
+            "py" => "text/x-python".into(),
+            "toml" => "application/toml".into(),
+            "zip" => "application/zip".into(),
+            "tar" => "application/x-tar".into(),
+            "gz" => "application/gzip".into(),
+            "mp4" => "video/mp4".into(),
+            "mp3" => "audio/mpeg".into(),
+            "wasm" => "application/wasm".into(),
+            _ => "application/octet-stream".into(),
+        }
+    }
+
+    fn asset_max_attach_bytes() -> u64 {
+        std::env::var("AGENTFLARE_BACKEND_ASSET_MAX_ATTACH_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5 * 1024 * 1024)
+    }
+
+    fn asset_max_inline_bytes() -> u64 {
+        std::env::var("AGENTFLARE_BACKEND_ASSET_MAX_INLINE_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024 * 1024)
     }
 
     /// Lock the artifact store + backend pair, resolving the backend on
@@ -2540,6 +2620,199 @@ impl AgentflareMcp {
             let project = self.resolve_project(conn)?;
             Ok(serde_json::to_string_pretty(&project).unwrap_or_default())
         })?
+    }
+
+    #[tool(
+        description = "Attach, get, list, or delete file assets on items/projects. Attach requires the file to exist in ~/.agentflare/staging/<filename> first."
+    )]
+    fn asset(
+        &self,
+        Parameters(AssetRequest {
+            action,
+            id,
+            item_id,
+            project_id,
+            filename,
+            metadata,
+        }): Parameters<AssetRequest>,
+    ) -> Result<String, ErrorData> {
+        match action.as_str() {
+            "attach" => {
+                let has_item = item_id.is_some();
+                let has_project = project_id.is_some();
+                if has_item == has_project {
+                    return Err(ErrorData::invalid_params(
+                        "exactly one of item_id or project_id is required for attach",
+                        None,
+                    ));
+                }
+                let staging_dir = crate::paths::home().join(".agentflare").join("staging");
+                let fn_val = filename.ok_or_else(|| {
+                    ErrorData::invalid_params("filename is required for attach", None)
+                })?;
+                let staged = staging_dir.join(&fn_val);
+                if !staged.exists() {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "file not found at staging path: {} — write the file there before calling attach",
+                            staged.display()
+                        ),
+                        None,
+                    ));
+                }
+                let size = std::fs::metadata(&staged)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                    .len();
+                let max_attach = Self::asset_max_attach_bytes();
+                if size > max_attach {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "file is {} bytes, exceeds the {} byte attach limit",
+                            size, max_attach
+                        ),
+                        None,
+                    ));
+                }
+                let bytes = std::fs::read(&staged)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let hash = Self::content_hash(&bytes);
+                let meta = metadata.unwrap_or_else(|| "{}".to_string());
+                self.with_backend_db(|conn| {
+                    let ws_id = Self::resolve_workspace_id(conn)?;
+                    let (entity_type, entity_id) = if has_item {
+                        agentflare_backend::item::get(conn, item_id.as_ref().unwrap())
+                            .map_err(map_backend_err)?;
+                        ("item_attachment", item_id.as_ref().unwrap().clone())
+                    } else {
+                        agentflare_backend::project::get(conn, project_id.as_ref().unwrap())
+                            .map_err(map_backend_err)?;
+                        ("project_attachment", project_id.as_ref().unwrap().clone())
+                    };
+                    let ext = std::path::Path::new(&fn_val)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("");
+                    let mime = Self::infer_mime_type(ext);
+                    let stem = std::path::Path::new(&fn_val)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&fn_val);
+                    let safe_stem: String = {
+                        let s: String = stem
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                            .collect();
+                        if s.is_empty() { "file".to_string() } else { s }
+                    };
+                    let full_storage = if ext.is_empty() {
+                        format!("{}/assets/{}-{}", ws_id, safe_stem, &hash[..10])
+                    } else {
+                        format!("{}/assets/{}-{}.{}", ws_id, safe_stem, &hash[..10], ext)
+                    };
+                    let base_path = crate::paths::home().join(".agentflare");
+                    // only write if file doesn't already exist (same content already stored)
+                    let target = base_path.join(&full_storage);
+                    if !target.exists() {
+                        agentflare_backend::asset::write_file(&base_path, &full_storage, &bytes)
+                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                    }
+                    let _ = std::fs::remove_file(&staged);
+                    let asset = agentflare_backend::asset::create(
+                        conn,
+                        agentflare_backend::asset::CreateAsset {
+                            workspace_id: Some(ws_id.clone()),
+                            entity_type: entity_type.into(),
+                            entity_id,
+                            filename: fn_val.clone(),
+                            size: size as i64,
+                            mime_type: Some(mime),
+                            metadata: Some(meta),
+                        },
+                    )
+                    .map_err(map_backend_err)?;
+                    Ok(serde_json::to_string_pretty(&asset).unwrap_or_default())
+                })?
+            }
+            "get" => {
+                let id =
+                    id.ok_or_else(|| ErrorData::invalid_params("id is required for get", None))?;
+                self.with_backend_db(|conn| {
+                    let asset = agentflare_backend::asset::get(conn, &id)
+                        .map_err(map_backend_err)?;
+                    let base_path = crate::paths::home().join(".agentflare");
+                    let max_inline = Self::asset_max_inline_bytes();
+                    let meta = serde_json::to_value(&asset).unwrap_or_default();
+                    let size = asset.size as u64;
+                    if size <= max_inline {
+                        match agentflare_backend::asset::read_file(&base_path, &asset.storage_path) {
+                            Ok(bytes) => {
+                                let b64 = base64_encode(&bytes);
+                                let result = serde_json::json!({
+                                    "asset": meta,
+                                    "content": b64,
+                                });
+                                Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+                            }
+                            Err(e) => {
+                                let result = serde_json::json!({
+                                    "asset": meta,
+                                    "content": null,
+                                    "content_omitted_reason": format!("could not read file: {}", e),
+                                });
+                                Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+                            }
+                        }
+                    } else {
+                        let result = serde_json::json!({
+                            "asset": meta,
+                            "content": null,
+                            "content_omitted_reason": format!("file is {} bytes, exceeds the {} byte inline limit", size, max_inline),
+                        });
+                        Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+                    }
+                })?
+            }
+            "list" => self.with_backend_db(|conn| {
+                let ws_id = Self::resolve_workspace_id(conn)?;
+                let assets: Vec<agentflare_backend::asset::Asset> = match (item_id, project_id) {
+                    (Some(iid), _) => {
+                        agentflare_backend::asset::list_by_entity(conn, "item_attachment", &iid)
+                            .map_err(map_backend_err)?
+                    }
+                    _ => agentflare_backend::asset::list_by_workspace(conn, &ws_id)
+                        .map_err(map_backend_err)?,
+                };
+                Ok(serde_json::to_string_pretty(&assets).unwrap_or_default())
+            })?,
+            "delete" => {
+                let id =
+                    id.ok_or_else(|| ErrorData::invalid_params("id is required for delete", None))?;
+                self.with_backend_db(|conn| {
+                    let asset = agentflare_backend::asset::get(conn, &id)
+                        .map_err(map_backend_err)?;
+                    // soft-delete the row
+                    agentflare_backend::asset::delete(conn, &id)
+                        .map_err(map_backend_err)?;
+                    // only unlink from disk if no other live row references the same storage_path
+                    let remaining: i64 = conn
+                        .query_row(
+                            "SELECT count(*) FROM assets WHERE storage_path = ?1 AND deleted_at IS NULL",
+                            rusqlite::params![&asset.storage_path],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    if remaining == 0 {
+                        let base_path = crate::paths::home().join(".agentflare");
+                        let _ = agentflare_backend::asset::delete_file(&base_path, &asset.storage_path);
+                    }
+                    Ok(serde_json::json!({"deleted": true, "id": id}).to_string())
+                })?
+            }
+            other => Err(ErrorData::invalid_params(
+                format!("unknown action '{other}'; expected attach|get|list|delete"),
+                None,
+            )),
+        }
     }
 }
 
