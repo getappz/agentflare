@@ -21,7 +21,7 @@ Add `agentflare agents auth <subcommand>` — secure local vault for AI
 agent OAuth tokens with instant profile switching, smart multi-account
 rotation, and automatic rate-limit failover.
 
-```
+```text
 agentflare agents auth backup <agent> <profile>     # Save current auth to vault
 agentflare agents auth activate <agent> <profile>   # Restore auth (<100ms switch)
 agentflare agents auth status [agent]               # Show active profile (content-hash)
@@ -63,7 +63,7 @@ agentflare agents auth login <agent> <profile>      # Login flow for isolated pr
 
 ### Vault storage
 
-```
+```text
 ~/.local/share/agentflare/vault/
 ├── claude/
 │   ├── alice@gmail.com/
@@ -133,7 +133,7 @@ a cooldown'd profile produces a warning + confirmation prompt (bypass with
 
 ### Automatic failover (`agents auth run`)
 
-```
+```text
 agentflare agents auth run claude -- "explain this code"
 ```
 

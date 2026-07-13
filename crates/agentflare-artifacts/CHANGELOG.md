@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(artifacts)* handoff envelope, version diff, git provenance, dedupe, search
 - *(artifacts)* version history, CAS updates, md/mermaid rendering, LAN sharing
 - *(artifacts)* add agentflare artifacts serve CLI, fix tests
-- *(hook)* add SessionEnd hook with engram handoff
+- *(hook)* add SessionEnd hook
 
 ### Fixed
 

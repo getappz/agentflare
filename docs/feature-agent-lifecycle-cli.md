@@ -17,7 +17,7 @@ fragmented.
 Add `agentflare agents <subcommand>` — a single CLI surface for the full
 lifecycle of popular AI coding assistant CLIs:
 
-```
+```text
 agentflare agents install <agent>[@version]  # install or pin a version
 agentflare agents list                       # show installed agents and version
 agentflare agents update <agent>             # update to latest
@@ -81,7 +81,7 @@ full registry with ✓/✗ columns. Status is binary for this ticket: `ready`
 (version resolved) or `unknown` (binary found, version resolution failed).
 Auth-based status (`needs auth`, `needs init`) is deferred to #23.
 
-```
+```text
 $ agentflare agents list
 
   AGENT           VERSION    STATUS

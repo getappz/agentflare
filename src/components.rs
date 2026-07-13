@@ -358,6 +358,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
                 })
             },
         },
+
         // agentflare's own MCP server exposes skill_search/skill_load — the
         // on-demand replacement for the always-listed skill descriptions
         // this same init wires `skillOverrides` to suppress (below). Other

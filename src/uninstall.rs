@@ -51,7 +51,7 @@ fn remove_dir(path: &PathBuf, dry_run: bool) {
 
 fn clean_claude_code(dry_run: bool) {
     let rules = home().join(".claude").join("rules");
-    for f in &["exa.md", "git.md", "lean-ctx.md", "engram.md"] {
+    for f in &["exa.md", "git.md", "lean-ctx.md"] {
         remove_file(&rules.join(f), dry_run);
     }
 
@@ -104,7 +104,7 @@ fn clean_claude_code(dry_run: bool) {
 
 fn clean_opencode(dry_run: bool) {
     let rules_dir = home().join(".config").join("opencode").join("rules");
-    for f in &["exa.md", "git.md", "lean-ctx.md", "engram.md"] {
+    for f in &["exa.md", "git.md", "lean-ctx.md"] {
         remove_file(&rules_dir.join(f), dry_run);
     }
 
