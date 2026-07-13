@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.91"
 license = "MIT"
 description = "Universal agent backend: workspace/project/item schema + CRUD, ported from Plane's domain model."
+publish = false
 
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }

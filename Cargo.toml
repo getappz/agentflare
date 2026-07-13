@@ -4,12 +4,13 @@ resolver = "2"
 
 [package]
 name = "agentflare"
-version = "1.3.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.91"
 description = "Optimize AI CLI agents for cost and performance."
 license = "MIT"
 repository = "https://github.com/getappz/agentflare"
+publish = false
 
 [package.metadata.binstall]
 bin-dir = "agentflare{ binary-ext }"
@@ -57,16 +58,16 @@ rpassword = "7"
 thiserror = "2"
 eyre = "0.6"
 color-eyre = "0.6"
-ponytail = { path = "crates/ponytail", version = "0.1.1" }
-agent-registry = { package = "agentflare-agent-registry", path = "crates/agent-registry", version = "0.1.1" }
-skill-registry = { package = "agentflare-skill-registry", path = "crates/skill-registry", version = "0.1.2" }
-gateway-registry = { package = "agentflare-gateway-registry", path = "crates/gateway-registry", version = "0.1.1" }
-caveman = { package = "agentflare-caveman", path = "crates/caveman", version = "0.1.1" }
+ponytail = { path = "crates/ponytail" }
+agent-registry = { package = "agentflare-agent-registry", path = "crates/agent-registry" }
+skill-registry = { package = "agentflare-skill-registry", path = "crates/skill-registry" }
+gateway-registry = { package = "agentflare-gateway-registry", path = "crates/gateway-registry" }
+caveman = { package = "agentflare-caveman", path = "crates/caveman" }
 regex = "1"
 sysinfo = { version = "0.34", optional = true, default-features = false, features = ["system"] }
-agentflare-artifacts = { version = "0.1.1", path = "crates/agentflare-artifacts" }
-agentflare-backend = { package = "agentflare-backend", path = "crates/agentflare-backend", version = "0.1.0" }
-db_kit = { package = "agentflare-db-kit", path = "crates/agentflare-db-kit", version = "0.1.0" }
+agentflare-artifacts = { path = "crates/agentflare-artifacts" }
+agentflare-backend = { package = "agentflare-backend", path = "crates/agentflare-backend" }
+db_kit = { package = "agentflare-db-kit", path = "crates/agentflare-db-kit" }
 agent-detector = "0.2.1"
 
 [features]

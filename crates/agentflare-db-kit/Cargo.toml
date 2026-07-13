@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.91"
 license = "MIT"
 description = "Shared SQLite connection/migration/lease-ledger boilerplate for agentflare's crates. Not an ORM — no query layer, no schema modeling."
+publish = false
 
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }

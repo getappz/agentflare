@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "agentflare"
-version = "1.3.0"
+version = "1.2.0"
 dependencies = [
  "aes-gcm",
  "agent-detector",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "agentflare-agent-registry"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "clap",
  "dirs",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "agentflare-artifacts"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "agentflare-caveman"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "dirs",
  "regex",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "agentflare-gateway-registry"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "agentflare-skill-registry"
-version = "0.1.2"
+version = "0.1.1"
 dependencies = [
  "agentflare-agent-registry",
  "dirs",
@@ -1644,7 +1644,7 @@ dependencies = [
 
 [[package]]
 name = "ponytail"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "dirs",
  "serde",
