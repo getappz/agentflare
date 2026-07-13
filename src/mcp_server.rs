@@ -2484,7 +2484,7 @@ impl AgentflareMcp {
                         } else {
                             (None, None)
                         };
-                    Ok((outcome, item, target_branch))
+                    Ok::<_, ErrorData>((outcome, item, target_branch))
                 })??;
                 let worktree_path = match (&item, &target_branch) {
                     (Some(item), Some(target)) => {
