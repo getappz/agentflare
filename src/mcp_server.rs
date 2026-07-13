@@ -3,6 +3,7 @@
 //! dependency, not ported code; no /NOTICE entry needed).
 
 use crate::optimize;
+use base64::Engine as _;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
@@ -580,6 +581,11 @@ fn generate_webhook_secret() -> String {
     hex::encode(bytes)
 }
 
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::engine::general_purpose;
+    general_purpose::STANDARD.encode(bytes)
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct BackendItemCreateRequest {
     #[schemars(description = "Item name/title")]
@@ -707,6 +713,29 @@ struct BackendWebhookDeleteRequest {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct BackendNoArgs {}
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AssetRequest {
+    #[schemars(description = "Action: attach|get|list|delete")]
+    action: String,
+    #[schemars(description = "Asset ID (required for get, delete)")]
+    #[serde(default)]
+    id: Option<String>,
+    #[schemars(description = "Item ID to attach to (xor project_id)")]
+    #[serde(default)]
+    item_id: Option<String>,
+    #[schemars(description = "Project ID to attach to (xor item_id)")]
+    #[serde(default)]
+    project_id: Option<String>,
+    #[schemars(
+        description = "Filename (required for attach) — must exist in ~/.agentflare/staging/"
+    )]
+    #[serde(default)]
+    filename: Option<String>,
+    #[schemars(description = "JSON metadata (optional, attach only)")]
+    #[serde(default)]
+    metadata: Option<String>,
+}
+
 #[tool_router]
 impl AgentflareMcp {
     #[tool(
@@ -831,6 +860,65 @@ impl AgentflareMcp {
             }
             Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
         }
+    }
+
+    fn content_hash(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(bytes);
+        hex::encode(&digest[..])
+    }
+
+    fn infer_mime_type(ext: &str) -> String {
+        match ext.to_lowercase().as_str() {
+            "pdf" => "application/pdf".into(),
+            "png" => "image/png".into(),
+            "jpg" | "jpeg" => "image/jpeg".into(),
+            "gif" => "image/gif".into(),
+            "svg" => "image/svg+xml".into(),
+            "webp" => "image/webp".into(),
+            "txt" => "text/plain".into(),
+            "md" => "text/markdown".into(),
+            "json" => "application/json".into(),
+            "csv" => "text/csv".into(),
+            "yaml" | "yml" => "application/x-yaml".into(),
+            "xml" => "application/xml".into(),
+            "html" | "htm" => "text/html".into(),
+            "css" => "text/css".into(),
+            "js" => "application/javascript".into(),
+            "ts" | "tsx" => "application/typescript".into(),
+            "rs" => "text/x-rust".into(),
+            "py" => "text/x-python".into(),
+            "toml" => "application/toml".into(),
+            "zip" => "application/zip".into(),
+            "tar" => "application/x-tar".into(),
+            "gz" => "application/gzip".into(),
+            "mp4" => "video/mp4".into(),
+            "mp3" => "audio/mpeg".into(),
+            "wasm" => "application/wasm".into(),
+            _ => "application/octet-stream".into(),
+        }
+    }
+
+    fn asset_max_attach_bytes() -> u64 {
+        std::env::var("AGENTFLARE_BACKEND_ASSET_MAX_ATTACH_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5 * 1024 * 1024)
+    }
+
+    fn asset_max_inline_bytes() -> u64 {
+        std::env::var("AGENTFLARE_BACKEND_ASSET_MAX_INLINE_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024 * 1024)
+    }
+
+    fn strip_storage_path(asset: &agentflare_backend::asset::Asset) -> serde_json::Value {
+        let mut v = serde_json::to_value(asset).unwrap_or_default();
+        if let serde_json::Value::Object(ref mut map) = v {
+            map.remove("storage_path");
+        }
+        v
     }
 
     /// Lock the artifact store + backend pair, resolving the backend on
@@ -2541,6 +2629,238 @@ impl AgentflareMcp {
             Ok(serde_json::to_string_pretty(&project).unwrap_or_default())
         })?
     }
+
+    #[tool(
+        description = "Attach, get, list, or delete file assets on items/projects. Attach requires the file to exist in ~/.agentflare/staging/<filename> first."
+    )]
+    fn asset(
+        &self,
+        Parameters(AssetRequest {
+            action,
+            id,
+            item_id,
+            project_id,
+            filename,
+            metadata,
+        }): Parameters<AssetRequest>,
+    ) -> Result<String, ErrorData> {
+        match action.as_str() {
+            "attach" => {
+                let has_item = item_id.is_some();
+                let has_project = project_id.is_some();
+                if has_item == has_project {
+                    return Err(ErrorData::invalid_params(
+                        "exactly one of item_id or project_id is required for attach",
+                        None,
+                    ));
+                }
+                let fn_val = filename.ok_or_else(|| {
+                    ErrorData::invalid_params("filename is required for attach", None)
+                })?;
+                // path traversal guard: reject filename with .. or absolute components
+                let staged_rel = std::path::Path::new(&fn_val);
+                if staged_rel
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "filename '{fn_val}' contains path separators or parent-refs — not allowed"
+                        ),
+                        None,
+                    ));
+                }
+                let staging_dir = crate::paths::home().join(".agentflare").join("staging");
+                let staged = staging_dir.join(&fn_val);
+                if !staged.exists() {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "file not found at staging path: {} — write the file there before calling attach",
+                            staged.display()
+                        ),
+                        None,
+                    ));
+                }
+                let size = std::fs::metadata(&staged)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                    .len();
+                let max_attach = Self::asset_max_attach_bytes();
+                if size > max_attach {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "file is {} bytes, exceeds the {} byte attach limit",
+                            size, max_attach
+                        ),
+                        None,
+                    ));
+                }
+                let bytes = std::fs::read(&staged)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let hash = Self::content_hash(&bytes);
+                let meta = metadata.unwrap_or_else(|| "{}".to_string());
+                self.with_backend_db(|conn| {
+                    let ws_id = Self::resolve_workspace_id(conn)?;
+                    let (entity_type, entity_id) = if has_item {
+                        agentflare_backend::item::get(conn, item_id.as_ref().unwrap())
+                            .map_err(map_backend_err)?;
+                        ("item_attachment", item_id.as_ref().unwrap().clone())
+                    } else {
+                        agentflare_backend::project::get(conn, project_id.as_ref().unwrap())
+                            .map_err(map_backend_err)?;
+                        ("project_attachment", project_id.as_ref().unwrap().clone())
+                    };
+                    let ext = std::path::Path::new(&fn_val)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("");
+                    let mime = Self::infer_mime_type(ext);
+                    let stem = std::path::Path::new(&fn_val)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&fn_val);
+                    let safe_stem: String = {
+                        let s: String = stem
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                            .collect();
+                        if s.is_empty() { "file".to_string() } else { s }
+                    };
+                    let full_storage = if ext.is_empty() {
+                        format!("{}/assets/{}-{}", ws_id, safe_stem, hash)
+                    } else {
+                        format!("{}/assets/{}-{}.{}", ws_id, safe_stem, hash, ext)
+                    };
+                    let base_path = crate::paths::home().join(".agentflare");
+                    // only write if file doesn't already exist (same content already stored)
+                    let target = base_path.join(&full_storage);
+                    if !target.exists() {
+                        agentflare_backend::asset::write_file(&base_path, &full_storage, &bytes)
+                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                    }
+                    let asset = agentflare_backend::asset::create(
+                        conn,
+                        agentflare_backend::asset::CreateAsset {
+                            workspace_id: Some(ws_id.clone()),
+                            entity_type: entity_type.into(),
+                            entity_id,
+                            filename: fn_val.clone(),
+                            size: size as i64,
+                            mime_type: Some(mime),
+                            metadata: Some(meta),
+                            storage_path: Some(full_storage),
+                        },
+                    )
+                    .map_err(map_backend_err)?;
+                    // remove staging file only after the DB insert succeeds
+                    let _ = std::fs::remove_file(&staged);
+                    Ok(
+                        serde_json::to_string_pretty(&Self::strip_storage_path(&asset))
+                            .unwrap_or_default(),
+                    )
+                })?
+            }
+            "get" => {
+                let id =
+                    id.ok_or_else(|| ErrorData::invalid_params("id is required for get", None))?;
+                self.with_backend_db(|conn| {
+                    let asset = agentflare_backend::asset::get(conn, &id)
+                        .map_err(map_backend_err)?;
+                    let base_path = crate::paths::home().join(".agentflare");
+                    let max_inline = Self::asset_max_inline_bytes();
+                    let meta = Self::strip_storage_path(&asset);
+                    let size = asset.size as u64;
+                    if size <= max_inline {
+                        match agentflare_backend::asset::read_file(&base_path, &asset.storage_path) {
+                            Ok(bytes) => {
+                                let b64 = base64_encode(&bytes);
+                                let result = serde_json::json!({
+                                    "asset": meta,
+                                    "content": b64,
+                                });
+                                Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+                            }
+                            Err(e) => {
+                                let result = serde_json::json!({
+                                    "asset": meta,
+                                    "content": null,
+                                    "content_omitted_reason": format!("could not read file: {}", e),
+                                });
+                                Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+                            }
+                        }
+                    } else {
+                        let result = serde_json::json!({
+                            "asset": meta,
+                            "content": null,
+                            "content_omitted_reason": format!("file is {} bytes, exceeds the {} byte inline limit", size, max_inline),
+                        });
+                        Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+                    }
+                })?
+            }
+            "list" => self.with_backend_db(|conn| {
+                let ws_id = Self::resolve_workspace_id(conn)?;
+                let assets: Vec<agentflare_backend::asset::Asset> = match (item_id, project_id) {
+                    (Some(iid), None) => {
+                        agentflare_backend::asset::list_by_entity(conn, "item_attachment", &iid)
+                            .map_err(map_backend_err)?
+                    }
+                    (None, Some(pid)) => {
+                        agentflare_backend::asset::list_by_entity(conn, "project_attachment", &pid)
+                            .map_err(map_backend_err)?
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(ErrorData::invalid_params(
+                            "only one of item_id or project_id allowed for list, not both",
+                            None,
+                        ));
+                    }
+                    (None, None) => {
+                        let mut assets: Vec<serde_json::Value> = Vec::new();
+                        for a in agentflare_backend::asset::list_by_workspace(conn, &ws_id)
+                            .map_err(map_backend_err)?
+                        {
+                            assets.push(Self::strip_storage_path(&a));
+                        }
+                        return Ok(serde_json::to_string_pretty(&assets).unwrap_or_default());
+                    }
+                };
+                let mut stripped: Vec<serde_json::Value> = Vec::new();
+                for a in assets {
+                    stripped.push(Self::strip_storage_path(&a));
+                }
+                Ok(serde_json::to_string_pretty(&stripped).unwrap_or_default())
+            })?,
+            "delete" => {
+                let id =
+                    id.ok_or_else(|| ErrorData::invalid_params("id is required for delete", None))?;
+                self.with_backend_db(|conn| {
+                    let asset = agentflare_backend::asset::get(conn, &id)
+                        .map_err(map_backend_err)?;
+                    // soft-delete the row
+                    agentflare_backend::asset::delete(conn, &id)
+                        .map_err(map_backend_err)?;
+                    // only unlink from disk if no other live row references the same storage_path
+                    let remaining: i64 = conn
+                        .query_row(
+                            "SELECT count(*) FROM assets WHERE storage_path = ?1 AND deleted_at IS NULL",
+                            rusqlite::params![&asset.storage_path],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                    if remaining == 0 {
+                        let base_path = crate::paths::home().join(".agentflare");
+                        let _ = agentflare_backend::asset::delete_file(&base_path, &asset.storage_path);
+                    }
+                    Ok(serde_json::json!({"deleted": true, "id": id}).to_string())
+                })?
+            }
+            other => Err(ErrorData::invalid_params(
+                format!("unknown action '{other}'; expected attach|get|list|delete"),
+                None,
+            )),
+        }
+    }
 }
 
 impl AgentflareMcp {
@@ -3717,4 +4037,523 @@ mod tests {
     // depend on what markers happen to exist above the OS temp directory on
     // whatever machine runs this — not a property this test can control. The
     // fallback itself is a single trivial `None => return start`.
+
+    #[test]
+    fn asset_attach_get_list_delete_round_trip() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = backend_harness();
+            let home = crate::paths::home();
+            let staging = home.join(".agentflare").join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+
+            let item: serde_json::Value = serde_json::from_str(
+                &s.backend_item_create(Parameters(empty_item_create("asset-test")))
+                    .unwrap(),
+            )
+            .unwrap();
+            let item_id = item["id"].as_str().unwrap().to_string();
+
+            let content = b"hello asset test";
+            std::fs::write(staging.join("test.txt"), content).unwrap();
+
+            let attached: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: Some(item_id.clone()),
+                    project_id: None,
+                    filename: Some("test.txt".into()),
+                    metadata: Some(r#"{"source":"test"}"#.into()),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(attached["filename"], "test.txt");
+            let asset_id = attached["id"].as_str().unwrap().to_string();
+
+            let got: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "get".into(),
+                    id: Some(asset_id.clone()),
+                    item_id: None,
+                    project_id: None,
+                    filename: None,
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(got["asset"]["filename"], "test.txt");
+            assert!(got["content"].as_str().is_some());
+
+            let list: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "list".into(),
+                    id: None,
+                    item_id: Some(item_id.clone()),
+                    project_id: None,
+                    filename: None,
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(list.as_array().unwrap().len(), 1);
+            assert_eq!(list[0]["id"], asset_id);
+
+            let del: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "delete".into(),
+                    id: Some(asset_id.clone()),
+                    item_id: None,
+                    project_id: None,
+                    filename: None,
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(del["deleted"], true);
+
+            let after: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "list".into(),
+                    id: None,
+                    item_id: Some(item_id),
+                    project_id: None,
+                    filename: None,
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(after.as_array().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn asset_attach_rejects_path_traversal() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = backend_harness();
+            let err = s
+                .asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: Some("item-1".into()),
+                    project_id: None,
+                    filename: Some("../etc/hosts".into()),
+                    metadata: None,
+                }))
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        });
+    }
+
+    #[test]
+    fn asset_attach_rejects_missing_filename() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = backend_harness();
+            let err = s
+                .asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: Some("item-1".into()),
+                    project_id: None,
+                    filename: None,
+                    metadata: None,
+                }))
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        });
+    }
+
+    #[test]
+    fn asset_attach_rejects_both_item_and_project() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = backend_harness();
+            let err = s
+                .asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: Some("item-1".into()),
+                    project_id: Some("proj-1".into()),
+                    filename: Some("anything.txt".into()),
+                    metadata: None,
+                }))
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        });
+    }
+
+    #[test]
+    fn asset_get_rejects_missing_id() {
+        let (_tmp, s) = backend_harness();
+        let err = s
+            .asset(Parameters(AssetRequest {
+                action: "get".into(),
+                id: None,
+                item_id: None,
+                project_id: None,
+                filename: None,
+                metadata: None,
+            }))
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn asset_shared_storage_delete_safety() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = backend_harness();
+            let home = crate::paths::home();
+            let staging = home.join(".agentflare").join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+
+            let item1: serde_json::Value = serde_json::from_str(
+                &s.backend_item_create(Parameters(empty_item_create("shared-1")))
+                    .unwrap(),
+            )
+            .unwrap();
+            let item2: serde_json::Value = serde_json::from_str(
+                &s.backend_item_create(Parameters(empty_item_create("shared-2")))
+                    .unwrap(),
+            )
+            .unwrap();
+            let id1 = item1["id"].as_str().unwrap().to_string();
+            let id2 = item2["id"].as_str().unwrap().to_string();
+
+            let content = b"same content for shared delete test";
+            std::fs::write(staging.join("shared.txt"), content).unwrap();
+            let asset1: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: Some(id1.clone()),
+                    project_id: None,
+                    filename: Some("shared.txt".into()),
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let a1_id = asset1["id"].as_str().unwrap().to_string();
+
+            // re-stage the same content for item2
+            std::fs::write(staging.join("shared.txt"), content).unwrap();
+            let asset2: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: Some(id2.clone()),
+                    project_id: None,
+                    filename: Some("shared.txt".into()),
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let a2_id = asset2["id"].as_str().unwrap().to_string();
+
+            // delete first — second should still be readable
+            let del1: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "delete".into(),
+                    id: Some(a1_id.clone()),
+                    item_id: None,
+                    project_id: None,
+                    filename: None,
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(del1["deleted"], true);
+
+            let got2_raw = s
+                .asset(Parameters(AssetRequest {
+                    action: "get".into(),
+                    id: Some(a2_id.clone()),
+                    item_id: None,
+                    project_id: None,
+                    filename: None,
+                    metadata: None,
+                }))
+                .unwrap();
+            let got2: serde_json::Value = serde_json::from_str(&got2_raw).unwrap();
+            assert!(
+                got2["content"].as_str().is_some(),
+                "item2 must still be readable after item1 deletion: {got2_raw}"
+            );
+
+            // delete second — now file should be gone
+            let del2: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "delete".into(),
+                    id: Some(a2_id.clone()),
+                    item_id: None,
+                    project_id: None,
+                    filename: None,
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(del2["deleted"], true);
+        });
+    }
+
+    #[test]
+    fn asset_content_dedup() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (tmp, s) = backend_harness();
+            let home = crate::paths::home();
+            let staging = home.join(".agentflare").join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+
+            let item_a: serde_json::Value = serde_json::from_str(
+                &s.backend_item_create(Parameters(empty_item_create("dedup-a")))
+                    .unwrap(),
+            )
+            .unwrap();
+            let item_b: serde_json::Value = serde_json::from_str(
+                &s.backend_item_create(Parameters(empty_item_create("dedup-b")))
+                    .unwrap(),
+            )
+            .unwrap();
+            let id_a = item_a["id"].as_str().unwrap().to_string();
+            let id_b = item_b["id"].as_str().unwrap().to_string();
+
+            let content = b"dedup me please";
+            std::fs::write(staging.join("dedup.txt"), content).unwrap();
+            s.asset(Parameters(AssetRequest {
+                action: "attach".into(),
+                id: None,
+                item_id: Some(id_a.clone()),
+                project_id: None,
+                filename: Some("dedup.txt".into()),
+                metadata: None,
+            }))
+            .unwrap();
+
+            std::fs::write(staging.join("dedup.txt"), content).unwrap();
+            s.asset(Parameters(AssetRequest {
+                action: "attach".into(),
+                id: None,
+                item_id: Some(id_b.clone()),
+                project_id: None,
+                filename: Some("dedup.txt".into()),
+                metadata: None,
+            }))
+            .unwrap();
+
+            // two rows, one file on disk: count unique storage_path values
+            let conn = backend_conn(&tmp);
+            let unique_paths: i64 = conn
+                .query_row(
+                    "SELECT count(DISTINCT storage_path) FROM assets WHERE deleted_at IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(unique_paths, 1, "same content must share one storage_path");
+
+            let total_rows: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM assets WHERE deleted_at IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(total_rows, 2, "two rows despite one file on disk");
+        });
+    }
+
+    #[test]
+    fn asset_attach_to_project() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = backend_harness();
+            let home = crate::paths::home();
+            let staging = home.join(".agentflare").join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+
+            let project: serde_json::Value = serde_json::from_str(
+                &s.backend_project_info(Parameters(BackendNoArgs {}))
+                    .unwrap(),
+            )
+            .unwrap();
+            let project_id = project["id"].as_str().unwrap().to_string();
+
+            std::fs::write(staging.join("project-file.txt"), b"project attachment").unwrap();
+            let attached: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: None,
+                    project_id: Some(project_id.clone()),
+                    filename: Some("project-file.txt".into()),
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(attached["filename"], "project-file.txt");
+
+            let list: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "list".into(),
+                    id: None,
+                    item_id: None,
+                    project_id: Some(project_id),
+                    filename: None,
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(list.as_array().unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn asset_attach_rejects_neither_item_nor_project() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = backend_harness();
+            let err = s
+                .asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: None,
+                    project_id: None,
+                    filename: Some("anything.txt".into()),
+                    metadata: None,
+                }))
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        });
+    }
+
+    #[test]
+    fn asset_attach_rejects_nonexistent_item() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = backend_harness();
+            let home = crate::paths::home();
+            let staging = home.join(".agentflare").join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+            std::fs::write(staging.join("f.txt"), b"data").unwrap();
+            let err = s
+                .asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: Some("nonexistent-item".into()),
+                    project_id: None,
+                    filename: Some("f.txt".into()),
+                    metadata: None,
+                }))
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        });
+    }
+
+    #[test]
+    fn asset_attach_rejects_missing_staging_file() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = backend_harness();
+            let err = s
+                .asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: Some("item-1".into()),
+                    project_id: None,
+                    filename: Some("does-not-exist.txt".into()),
+                    metadata: None,
+                }))
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        });
+    }
+
+    #[test]
+    fn asset_attach_rejects_oversized_file() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = backend_harness();
+            let home = crate::paths::home();
+            let staging = home.join(".agentflare").join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+            // write a file just past the default 5 MB limit
+            let big = vec![0u8; 5 * 1024 * 1024 + 1];
+            std::fs::write(staging.join("big.bin"), &big).unwrap();
+            let err = s
+                .asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: Some("item-1".into()),
+                    project_id: None,
+                    filename: Some("big.bin".into()),
+                    metadata: None,
+                }))
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        });
+    }
+
+    #[test]
+    fn asset_get_over_max_inline_omits_content() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = backend_harness();
+            let home = crate::paths::home();
+            let staging = home.join(".agentflare").join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+
+            let item: serde_json::Value = serde_json::from_str(
+                &s.backend_item_create(Parameters(empty_item_create("big-inline-test")))
+                    .unwrap(),
+            )
+            .unwrap();
+            let item_id = item["id"].as_str().unwrap().to_string();
+
+            // write a small file, but set a tiny inline cap for this test
+            std::fs::write(staging.join("small.txt"), b"hello inline cap").unwrap();
+            let attached: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: Some(item_id.clone()),
+                    project_id: None,
+                    filename: Some("small.txt".into()),
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let asset_id = attached["id"].as_str().unwrap().to_string();
+
+            // override inline limit to 1 byte so our file exceeds it
+            // SAFETY: with_temp_home holds GLOBAL_STATE_LOCK so no concurrent env mutation.
+            let saved = std::env::var("AGENTFLARE_BACKEND_ASSET_MAX_INLINE_BYTES").ok();
+            unsafe { std::env::set_var("AGENTFLARE_BACKEND_ASSET_MAX_INLINE_BYTES", "1") };
+            let got: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "get".into(),
+                    id: Some(asset_id),
+                    item_id: None,
+                    project_id: None,
+                    filename: None,
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(got["content"].is_null());
+            assert!(got["content_omitted_reason"].as_str().is_some());
+            // restore to avoid leaking to sibling tests
+            match saved {
+                Some(v) => unsafe {
+                    std::env::set_var("AGENTFLARE_BACKEND_ASSET_MAX_INLINE_BYTES", v)
+                },
+                None => unsafe {
+                    std::env::remove_var("AGENTFLARE_BACKEND_ASSET_MAX_INLINE_BYTES")
+                },
+            }
+        });
+    }
 }

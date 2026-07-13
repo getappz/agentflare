@@ -28,6 +28,9 @@ pub struct CreateAsset {
     pub size: i64,
     pub mime_type: Option<String>,
     pub metadata: Option<String>,
+    /// Caller-supplied storage path (e.g. content-hash derived); when set,
+    /// used as-is instead of generating a UUID-based path.
+    pub storage_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -112,12 +115,15 @@ fn row_to_asset(row: &rusqlite::Row) -> rusqlite::Result<Asset> {
 pub fn create(conn: &Connection, input: CreateAsset) -> Result<Asset> {
     let id = uuid::Uuid::now_v7().to_string();
     let ts = now();
-    let sp = match &input.workspace_id {
-        Some(wid) => storage_path(wid, &input.filename),
-        None => {
-            let id = uuid::Uuid::now_v7().to_string();
-            format!("assets/{}-{}", id, input.filename)
-        }
+    let sp = match input.storage_path {
+        Some(ref path) => path.clone(),
+        None => match &input.workspace_id {
+            Some(wid) => storage_path(wid, &input.filename),
+            None => {
+                let id = uuid::Uuid::now_v7().to_string();
+                format!("assets/{}-{}", id, input.filename)
+            }
+        },
     };
     let metadata = input.metadata.unwrap_or_else(|| "{}".to_string());
     conn.execute(
@@ -254,6 +260,7 @@ mod tests {
                 size: 1024,
                 mime_type: Some("application/pdf".into()),
                 metadata: None,
+                storage_path: None,
             },
         )
         .unwrap();
@@ -300,6 +307,7 @@ mod tests {
                 size: 100,
                 mime_type: None,
                 metadata: None,
+                storage_path: None,
             },
         )
         .unwrap();
@@ -313,6 +321,7 @@ mod tests {
                 size: 200,
                 mime_type: None,
                 metadata: None,
+                storage_path: None,
             },
         )
         .unwrap();
@@ -326,6 +335,7 @@ mod tests {
                 size: 300,
                 mime_type: None,
                 metadata: None,
+                storage_path: None,
             },
         )
         .unwrap();

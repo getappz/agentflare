@@ -74,6 +74,7 @@ dependencies = [
  "agentflare-db-kit",
  "agentflare-gateway-registry",
  "agentflare-skill-registry",
+ "base64",
  "built",
  "chrono",
  "clap",
