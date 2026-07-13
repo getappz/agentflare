@@ -226,35 +226,50 @@ struct ArtifactPublishRequest {
     reply_to: Option<String>,
 }
 
-/// A handoff is an artifact routed to another agent's inbox. Unlike
-/// `ArtifactPublishRequest`, `recipient` is a required field, not `Option` —
-/// the schema itself makes an unaddressed handoff unrepresentable, so an
-/// intended handoff can't silently land in no inbox.
+/// A handoff assigns an item to another agent and attaches the work product
+/// to it as an asset. Unlike a bare item update, `recipient` is a required
+/// field, not `Option` — the schema itself makes an unaddressed handoff
+/// unrepresentable, so an intended handoff can't silently land with no
+/// assignee. Re-attaching under the same `item_id` (or the same generated
+/// filename on a freshly created item) becomes the next asset version, not
+/// a duplicate.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct HandoffRequest {
     #[schemars(
-        description = "Agent/runtime this handoff is addressed to — its inbox (artifact_list recipient=...). Required."
+        description = "Agent/runtime this handoff is addressed to — becomes the item's assignee_agent. Required."
     )]
     recipient: String,
-    #[schemars(description = "Short name/brief for the handoff, shown in the recipient's inbox")]
+    #[schemars(
+        description = "Short name/brief for the handoff — the item's name when creating one"
+    )]
     name: String,
     #[schemars(
-        description = "The work product being handed off (diff, review, document, ...). Prepend the brief so the recipient knows the ask."
+        description = "The work product being handed off (diff, review, document, ...). Prepend the brief so the recipient knows the ask. Attached to the item as an asset."
     )]
     content: String,
-    #[schemars(description = "html | markdown | mermaid | diagram | text (default: markdown)")]
+    #[schemars(
+        description = "html | markdown | mermaid | diagram | text (default: markdown) — picks the attached asset's extension/mime type"
+    )]
     #[serde(default)]
     r#type: Option<String>,
-    #[schemars(description = "Handoff thread to continue; omit to start a new one")]
+    #[schemars(
+        description = "Existing item ID to assign and attach to, instead of creating a new item"
+    )]
+    #[serde(default)]
+    item_id: Option<String>,
+    #[schemars(
+        description = "Handoff thread to continue; omit to start a new one. Stored in the new item's metadata, or the attached asset's metadata when item_id is given."
+    )]
     #[serde(default)]
     thread_id: Option<String>,
-    #[schemars(description = "Artifact id this replies to (when answering an inbox item)")]
+    #[schemars(
+        description = "Id this replies to (when answering an inbox item) — stored in the attached asset's metadata for provenance"
+    )]
     #[serde(default)]
     reply_to: Option<String>,
-    #[schemars(description = "Session ID for grouping (optional)")]
-    #[serde(default)]
-    session_id: Option<String>,
-    #[schemars(description = "One-line description shown in the gallery")]
+    #[schemars(
+        description = "One-line description; used as the new item's description when creating one"
+    )]
     #[serde(default)]
     description: Option<String>,
 }
@@ -827,6 +842,23 @@ impl AgentflareMcp {
         }
     }
 
+    /// Filesystem/URL-safe stem derived from a display name — lowercased,
+    /// non-alphanumerics collapsed to `-`, falling back to "handoff" if that
+    /// leaves nothing.
+    fn slugify(name: &str) -> String {
+        let s: String = name
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let trimmed = s.trim_matches('-');
+        if trimmed.is_empty() {
+            "handoff".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
     fn content_hash(bytes: &[u8]) -> String {
         use sha2::Digest;
         let digest = sha2::Sha256::digest(bytes);
@@ -1017,7 +1049,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Hand a work product to another agent's inbox. Like artifact_publish, but recipient is REQUIRED, so the artifact is routed and shows up in that agent's artifact_list(recipient=...) inbox — it can't silently land nowhere. Use for agent-to-agent handoffs (reviews, diffs, docs); use artifact_publish for plain shareable pages. Sender is this runtime's own identity."
+        description = "Hand a work product to another agent: assigns/creates an item for the recipient (in the repo's linked project) and attaches the content to it as an asset. Re-attaching under the same item_id creates the next asset version, not a duplicate. Sender is this runtime's own identity."
     )]
     fn handoff(
         &self,
@@ -1026,15 +1058,15 @@ impl AgentflareMcp {
             name,
             content,
             r#type,
+            item_id,
             thread_id,
             reply_to,
-            session_id,
             description,
         }): Parameters<HandoffRequest>,
     ) -> Result<String, ErrorData> {
         if recipient.trim().is_empty() {
             return Err(ErrorData::invalid_params(
-                "recipient is required for a handoff — without it the artifact lands in no inbox",
+                "recipient is required for a handoff — without it the item lands with no assignee",
                 None,
             ));
         }
@@ -1046,34 +1078,104 @@ impl AgentflareMcp {
         }
         let recipient = recipient.trim().to_string();
         let name = name.trim().to_string();
-        let (store, base) = self.ensure_artifact_server()?;
-        let req = agentflare_artifacts::PublishRequest {
-            name,
-            artifact_type: agentflare_artifacts::ArtifactType::from(
-                r#type.as_deref().unwrap_or("markdown"),
-            ),
-            content,
-            session_id: session_id.unwrap_or_default(),
-            update_id: None,
-            label: None,
-            description,
-            favicon: None,
-            base_version: None,
-            sender: self.agent.clone(),
-            recipient: Some(recipient),
-            thread_id,
-            reply_to,
-            git: Self::git_provenance(),
+        let ext = match r#type.as_deref() {
+            Some("html") => "html",
+            Some("mermaid") | Some("diagram") => "mmd",
+            Some("text") => "txt",
+            _ => "md",
         };
-        let resp = store.publish(&req).map_err(Self::artifact_error)?;
-        let result = serde_json::json!({
-            "id": resp.id,
-            "version": resp.version,
-            "url": format!("{base}/{}", resp.id),
-            "index": format!("{base}/"),
-            "recipient": req.recipient,
-        });
-        Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+
+        self.with_backend_db(|conn| {
+            let project = self.resolve_project(conn)?;
+            let ws_id = Self::resolve_workspace_id(conn)?;
+
+            let item = match &item_id {
+                Some(id) => {
+                    let input = agentflare_backend::item::UpdateItem {
+                        assignee_agent: Some(recipient.clone()),
+                        ..Default::default()
+                    };
+                    agentflare_backend::item::update(conn, id, input).map_err(map_backend_err)?
+                }
+                None => {
+                    let state_id = agentflare_backend::state::list_by_project(conn, &project.id)
+                        .map_err(map_backend_err)?
+                        .into_iter()
+                        .find(|s| s.is_default)
+                        .ok_or_else(|| {
+                            ErrorData::internal_error("project has no default state", None)
+                        })?
+                        .id;
+                    let metadata = thread_id
+                        .as_ref()
+                        .map(|t| serde_json::json!({ "thread": t }).to_string());
+                    let input = agentflare_backend::item::CreateItem {
+                        project_id: project.id.clone(),
+                        state_id,
+                        name: name.clone(),
+                        description: description.clone().or_else(|| Some(content.clone())),
+                        priority: None,
+                        parent_id: None,
+                        assignee_agent: Some(recipient.clone()),
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                        metadata,
+                        label_ids: vec![],
+                        assignee_ids: vec![],
+                        dependency_ids: vec![],
+                    };
+                    agentflare_backend::item::create(conn, input).map_err(map_backend_err)?
+                }
+            };
+
+            let bytes = content.as_bytes();
+            let hash = Self::content_hash(bytes);
+            // Keyed on item.id, not name — name is the per-call brief and
+            // can legitimately differ between messages on the same item
+            // (e.g. a reply's brief vs. the original ask); keying on it
+            // would silently reset versioning to 1 instead of continuing
+            // the chain.
+            let safe_stem = Self::slugify(&item.id);
+            let filename = format!("{safe_stem}.{ext}");
+            let full_storage = format!("{ws_id}/assets/{safe_stem}-{hash}.{ext}");
+            let base_path = crate::paths::home().join(".agentflare");
+            let target = base_path.join(&full_storage);
+            if !target.exists() {
+                agentflare_backend::asset::write_file(&base_path, &full_storage, bytes)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            }
+            let mut meta = serde_json::json!({ "sender": self.agent, "recipient": recipient });
+            if let Some(t) = &thread_id {
+                meta["thread_id"] = serde_json::json!(t);
+            }
+            if let Some(r) = &reply_to {
+                meta["reply_to"] = serde_json::json!(r);
+            }
+            let asset = agentflare_backend::asset::create(
+                conn,
+                agentflare_backend::asset::CreateAsset {
+                    workspace_id: Some(ws_id),
+                    entity_type: "item_attachment".into(),
+                    entity_id: item.id.clone(),
+                    filename,
+                    size: bytes.len() as i64,
+                    mime_type: Some(Self::infer_mime_type(ext)),
+                    metadata: Some(meta.to_string()),
+                    storage_path: Some(full_storage),
+                },
+            )
+            .map_err(map_backend_err)?;
+
+            let result = serde_json::json!({
+                "item_id": item.id,
+                "item_sequence_id": item.sequence_id,
+                "asset_id": asset.id,
+                "asset_version": asset.version,
+                "recipient": recipient,
+            });
+            Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+        })?
     }
 
     /// Runs `git` in the current cwd; None on any failure (not a repo, git
@@ -3458,79 +3560,168 @@ mod tests {
         assert_eq!(thread.as_array().unwrap().len(), 2);
     }
 
-    #[test]
-    fn handoff_tool_requires_recipient_and_routes_to_inbox() {
+    fn handoff_harness() -> (tempfile::TempDir, AgentflareMcp) {
         let tmp = tempfile::tempdir().unwrap();
         let s = AgentflareMcp {
-            artifacts_dir_override: Some(tmp.path().to_path_buf()),
+            backend_db_override: Some(tmp.path().join("backend.db")),
+            backend_project_link_override: Some(tmp.path().join("project.json")),
             agent: Some("claude-code".into()),
             ..Default::default()
         };
+        (tmp, s)
+    }
 
-        // A blank recipient is rejected — the whole reason this tool exists.
-        let err = s
-            .handoff(Parameters(HandoffRequest {
-                recipient: "  ".into(),
-                name: "orphan".into(),
-                content: "for someone".into(),
-                ..Default::default()
-            }))
-            .unwrap_err();
-        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-
-        // A real handoff lands in the recipient's inbox; sender is our identity.
-        s.handoff(Parameters(HandoffRequest {
-            recipient: "opencode".into(),
-            name: "review-packet".into(),
-            content: "please review".into(),
-            ..Default::default()
-        }))
-        .unwrap();
-
-        let inbox: serde_json::Value = serde_json::from_str(
-            &s.artifact_list(Parameters(ArtifactListRequest {
-                recipient: Some("opencode".into()),
-                ..Default::default()
+    fn item_assets(s: &AgentflareMcp, item_id: &str) -> serde_json::Value {
+        serde_json::from_str(
+            &s.asset(Parameters(AssetRequest {
+                action: "list".into(),
+                id: None,
+                item_id: Some(item_id.to_string()),
+                project_id: None,
+                filename: None,
+                metadata: None,
             }))
             .unwrap(),
         )
-        .unwrap();
-        assert_eq!(inbox.as_array().unwrap().len(), 1);
-        assert_eq!(inbox[0]["name"], "review-packet");
-        assert_eq!(inbox[0]["sender"], "claude-code");
-        assert_eq!(inbox[0]["recipient"], "opencode");
+        .unwrap()
+    }
+
+    #[test]
+    fn handoff_tool_requires_recipient_and_assigns_item() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = handoff_harness();
+
+            // A blank recipient is rejected — the whole reason this tool exists.
+            let err = s
+                .handoff(Parameters(HandoffRequest {
+                    recipient: "  ".into(),
+                    name: "orphan".into(),
+                    content: "for someone".into(),
+                    ..Default::default()
+                }))
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+            // A real handoff creates an item assigned to the recipient and
+            // attaches the content to it as an asset.
+            let result: serde_json::Value = serde_json::from_str(
+                &s.handoff(Parameters(HandoffRequest {
+                    recipient: "opencode".into(),
+                    name: "review-packet".into(),
+                    content: "please review".into(),
+                    ..Default::default()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let item_id = result["item_id"].as_str().unwrap().to_string();
+            assert_eq!(result["recipient"], "opencode");
+            assert_eq!(result["asset_version"], 1);
+
+            let item: serde_json::Value = serde_json::from_str(
+                &s.item(Parameters(ItemRequest {
+                    action: "get".into(),
+                    id: Some(item_id.clone()),
+                    ..Default::default()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(item["name"], "review-packet");
+            assert_eq!(item["assignee_agent"], "opencode");
+
+            let assets = item_assets(&s, &item_id);
+            assert_eq!(assets.as_array().unwrap().len(), 1);
+            assert_eq!(assets[0]["filename"], format!("{item_id}.md"));
+        });
     }
 
     #[test]
     fn handoff_trims_whitespace_padded_recipient() {
-        let tmp = tempfile::tempdir().unwrap();
-        let s = AgentflareMcp {
-            artifacts_dir_override: Some(tmp.path().to_path_buf()),
-            agent: Some("claude-code".into()),
-            ..Default::default()
-        };
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = handoff_harness();
 
-        // A whitespace-padded recipient passes the emptiness check but must
-        // still be stored trimmed, or exact-match inbox lookups miss it.
-        s.handoff(Parameters(HandoffRequest {
-            recipient: "  opencode  ".into(),
-            name: "review-packet".into(),
-            content: "please review".into(),
-            ..Default::default()
-        }))
-        .unwrap();
+            // A whitespace-padded recipient passes the emptiness check but must
+            // still be stored trimmed, or exact-match assignee lookups miss it.
+            let result: serde_json::Value = serde_json::from_str(
+                &s.handoff(Parameters(HandoffRequest {
+                    recipient: "  opencode  ".into(),
+                    name: "review-packet".into(),
+                    content: "please review".into(),
+                    ..Default::default()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(result["recipient"], "opencode");
 
-        let inbox: serde_json::Value = serde_json::from_str(
-            &s.artifact_list(Parameters(ArtifactListRequest {
-                recipient: Some("opencode".into()),
-                ..Default::default()
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(inbox.as_array().unwrap().len(), 1);
-        assert_eq!(inbox[0]["name"], "review-packet");
-        assert_eq!(inbox[0]["recipient"], "opencode");
+            let item_id = result["item_id"].as_str().unwrap().to_string();
+            let item: serde_json::Value = serde_json::from_str(
+                &s.item(Parameters(ItemRequest {
+                    action: "get".into(),
+                    id: Some(item_id),
+                    ..Default::default()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(item["assignee_agent"], "opencode");
+        });
+    }
+
+    #[test]
+    fn handoff_with_item_id_assigns_existing_item_and_versions_the_asset() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = handoff_harness();
+            let created: serde_json::Value = serde_json::from_str(
+                &s.item(Parameters(empty_item_create("Existing task")))
+                    .unwrap(),
+            )
+            .unwrap();
+            let item_id = created["id"].as_str().unwrap().to_string();
+
+            let first: serde_json::Value = serde_json::from_str(
+                &s.handoff(Parameters(HandoffRequest {
+                    recipient: "opencode".into(),
+                    name: "Existing task".into(),
+                    content: "v1 content".into(),
+                    item_id: Some(item_id.clone()),
+                    ..Default::default()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(first["item_id"], item_id);
+            assert_eq!(first["asset_version"], 1);
+
+            // A different brief/name on the reply must not reset the version
+            // chain — it's keyed on item_id, not name.
+            let second: serde_json::Value = serde_json::from_str(
+                &s.handoff(Parameters(HandoffRequest {
+                    recipient: "opencode".into(),
+                    name: "Addressed feedback".into(),
+                    content: "v2 content".into(),
+                    item_id: Some(item_id.clone()),
+                    ..Default::default()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(second["asset_version"], 2);
+
+            // no duplicate item was created
+            let item: serde_json::Value = serde_json::from_str(
+                &s.item(Parameters(ItemRequest {
+                    action: "get".into(),
+                    id: Some(item_id.clone()),
+                    ..Default::default()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(item["assignee_agent"], "opencode");
+            assert_eq!(item_assets(&s, &item_id).as_array().unwrap().len(), 2);
+        });
     }
 
     #[test]

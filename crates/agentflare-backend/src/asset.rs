@@ -17,6 +17,9 @@ pub struct Asset {
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
+    /// Ordinal among rows sharing (entity_type, entity_id, filename) —
+    /// computed at insert time in `create`, not caller-supplied.
+    pub version: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +112,7 @@ fn row_to_asset(row: &rusqlite::Row) -> rusqlite::Result<Asset> {
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
         deleted_at: row.get(11)?,
+        version: row.get(12)?,
     })
 }
 
@@ -126,9 +130,15 @@ pub fn create(conn: &Connection, input: CreateAsset) -> Result<Asset> {
         },
     };
     let metadata = input.metadata.unwrap_or_else(|| "{}".to_string());
+    let version: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM assets
+         WHERE entity_type = ?1 AND entity_id = ?2 AND filename = ?3 AND deleted_at IS NULL",
+        rusqlite::params![input.entity_type, input.entity_id, input.filename],
+        |r| r.get(0),
+    )?;
     conn.execute(
-        "INSERT INTO assets (id, workspace_id, entity_type, entity_id, filename, size, storage_path, mime_type, metadata, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO assets (id, workspace_id, entity_type, entity_id, filename, size, storage_path, mime_type, metadata, created_at, updated_at, version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![
             id,
             input.workspace_id,
@@ -141,6 +151,7 @@ pub fn create(conn: &Connection, input: CreateAsset) -> Result<Asset> {
             metadata,
             ts,
             ts,
+            version,
         ],
     )?;
     get(conn, &id)
@@ -148,7 +159,7 @@ pub fn create(conn: &Connection, input: CreateAsset) -> Result<Asset> {
 
 pub fn get(conn: &Connection, id: &str) -> Result<Asset> {
     conn.query_row(
-        "SELECT id, workspace_id, entity_type, entity_id, filename, size, storage_path, mime_type, metadata, created_at, updated_at, deleted_at
+        "SELECT id, workspace_id, entity_type, entity_id, filename, size, storage_path, mime_type, metadata, created_at, updated_at, deleted_at, version
          FROM assets WHERE id = ?1 AND deleted_at IS NULL",
         rusqlite::params![id],
         row_to_asset,
@@ -161,7 +172,7 @@ pub fn get(conn: &Connection, id: &str) -> Result<Asset> {
 
 pub fn list_by_entity(conn: &Connection, entity_type: &str, entity_id: &str) -> Result<Vec<Asset>> {
     let mut stmt = conn.prepare(
-        "SELECT id, workspace_id, entity_type, entity_id, filename, size, storage_path, mime_type, metadata, created_at, updated_at, deleted_at
+        "SELECT id, workspace_id, entity_type, entity_id, filename, size, storage_path, mime_type, metadata, created_at, updated_at, deleted_at, version
          FROM assets WHERE entity_type = ?1 AND entity_id = ?2 AND deleted_at IS NULL ORDER BY created_at",
     )?;
     let rows = stmt.query_map(rusqlite::params![entity_type, entity_id], row_to_asset)?;
@@ -170,7 +181,7 @@ pub fn list_by_entity(conn: &Connection, entity_type: &str, entity_id: &str) -> 
 
 pub fn list_by_workspace(conn: &Connection, workspace_id: &str) -> Result<Vec<Asset>> {
     let mut stmt = conn.prepare(
-        "SELECT id, workspace_id, entity_type, entity_id, filename, size, storage_path, mime_type, metadata, created_at, updated_at, deleted_at
+        "SELECT id, workspace_id, entity_type, entity_id, filename, size, storage_path, mime_type, metadata, created_at, updated_at, deleted_at, version
          FROM assets WHERE workspace_id = ?1 AND deleted_at IS NULL ORDER BY created_at",
     )?;
     let rows = stmt.query_map(rusqlite::params![workspace_id], row_to_asset)?;
@@ -266,8 +277,38 @@ mod tests {
         .unwrap();
         assert_eq!(asset.filename, "report.pdf");
         assert_eq!(asset.size, 1024);
+        assert_eq!(asset.version, 1);
         let got = get(&conn, &asset.id).unwrap();
         assert_eq!(got.id, asset.id);
+    }
+
+    #[test]
+    fn reattaching_same_entity_and_filename_increments_version() {
+        let conn = db::open_in_memory().unwrap();
+        let make = |content_len: i64| CreateAsset {
+            workspace_id: Some("ws-1".into()),
+            entity_type: "item_attachment".into(),
+            entity_id: "item-1".into(),
+            filename: "handoff.md".into(),
+            size: content_len,
+            mime_type: Some("text/markdown".into()),
+            metadata: None,
+            storage_path: None,
+        };
+        let v1 = create(&conn, make(10)).unwrap();
+        let v2 = create(&conn, make(20)).unwrap();
+        assert_eq!(v1.version, 1);
+        assert_eq!(v2.version, 2);
+        // a different filename on the same entity starts its own chain at 1
+        let other = create(
+            &conn,
+            CreateAsset {
+                filename: "notes.md".into(),
+                ..make(5)
+            },
+        )
+        .unwrap();
+        assert_eq!(other.version, 1);
     }
 
     #[test]

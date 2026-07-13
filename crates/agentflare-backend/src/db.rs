@@ -11,6 +11,7 @@ use std::path::Path;
 const MIGRATION_LIST: &[M<'static>] = &[
     M::up(include_str!("migrations/0001_initial.sql")),
     M::up(include_str!("migrations/0002_schema_constraints.sql")),
+    M::up(include_str!("migrations/0003_asset_versioning.sql")),
 ];
 const MIGRATIONS: Migrations = Migrations::from_slice(MIGRATION_LIST);
 
