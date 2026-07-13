@@ -1,10 +1,11 @@
 [package]
 name = "agentflare-agent-registry"
-version = "0.1.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 description = "AI agent definitions and detection for agentflare"
 license = "MIT"
+publish = false
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
