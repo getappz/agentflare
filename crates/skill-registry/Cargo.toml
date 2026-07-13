@@ -1,10 +1,11 @@
 [package]
 name = "agentflare-skill-registry"
-version = "0.1.2"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
 description = "Local SKILL.md registry: scan, BM25 search (SQLite FTS5), shadow-aware load."
+publish = false
 
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }

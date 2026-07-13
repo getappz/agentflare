@@ -1,9 +1,10 @@
 [package]
 name = "agentflare-artifacts"
-version = "0.1.1"
+version = "0.1.0"
 edition = "2021"
 description = "Live shareable artifact pages from AI agent sessions"
 license = "MIT"
+publish = false
 
 [dependencies]
 similar = "2"
