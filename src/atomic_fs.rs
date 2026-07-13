@@ -12,6 +12,7 @@
 //! read-only but the file inode itself is writable. Ported from lean-ctx's
 //! `core/atomic_fs.rs`.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,16 +20,49 @@ fn invalid_input(msg: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
 }
 
+/// Resolves one level of symlink indirection so an atomic write lands on the
+/// real file `path` points at, not on a new plain file replacing the symlink
+/// itself — `rename()` does not follow a symlink destination, it unlinks it
+/// and puts the new file in its place. A relative link target is resolved
+/// against the symlink's own parent directory. Non-symlinks (and symlinks
+/// this can't stat, e.g. a dangling one) pass through unchanged.
+fn resolve_symlink_target(path: &Path) -> Cow<'_, Path> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Cow::Borrowed(path);
+    };
+    if !meta.file_type().is_symlink() {
+        return Cow::Borrowed(path);
+    }
+    let Ok(target) = std::fs::read_link(path) else {
+        return Cow::Borrowed(path);
+    };
+    if target.is_absolute() {
+        Cow::Owned(target)
+    } else {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        Cow::Owned(parent.join(target))
+    }
+}
+
 /// Durable, crash-atomic write: a temp file in the **same directory** as `path`
-/// followed by `rename` over the target. Requires write permission on the parent
-/// directory; the read-only-directory fallback is handled by
-/// [`write_bytes_with_fallback`].
+/// (after resolving one level of symlink, so a symlinked target is written
+/// through rather than replaced) followed by `rename` over the target.
+/// Requires write permission on the parent directory; the read-only-directory
+/// fallback is handled by [`write_bytes_with_fallback`].
+///
+/// When `permissions` is `None` and the target already exists, its current
+/// permissions are carried over to the replacement — otherwise the new inode
+/// would get the process's default (umask-masked) mode, silently loosening
+/// e.g. a `0600` credential file to world-readable.
 pub fn try_atomic_write(
     path: &Path,
     bytes: &[u8],
     permissions: Option<&std::fs::Permissions>,
 ) -> std::io::Result<()> {
     use std::io::Write;
+
+    let resolved = resolve_symlink_target(path);
+    let path: &Path = &resolved;
 
     let parent = path
         .parent()
@@ -37,6 +71,15 @@ pub fn try_atomic_write(
         .file_name()
         .ok_or_else(|| invalid_input("invalid path (no filename)"))?
         .to_string_lossy();
+
+    let owned_perms;
+    let permissions = match permissions {
+        Some(p) => Some(p),
+        None => {
+            owned_perms = std::fs::metadata(path).ok().map(|m| m.permissions());
+            owned_perms.as_ref()
+        }
+    };
 
     let pid = std::process::id();
     let nanos = SystemTime::now()
@@ -58,13 +101,10 @@ pub fn try_atomic_write(
         let _ = std::fs::set_permissions(&tmp, perms.clone());
     }
 
-    #[cfg(windows)]
-    {
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
+    // std::fs::rename already replaces an existing destination on every
+    // platform we build for (including Windows, via MoveFileExW's
+    // MOVEFILE_REPLACE_EXISTING) — no separate pre-removal needed, and one
+    // would only open a window where neither the old nor new file exists.
     if let Err(e) = std::fs::rename(&tmp, path) {
         // Don't leave a half-written temp behind before the caller decides
         // whether to fall back.
@@ -190,6 +230,41 @@ mod tests {
         assert!(strays.is_empty(), "temp file must not linger");
         try_atomic_write(&path, b"second", None).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_atomic_write_preserves_existing_permissions_when_none_given() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.json");
+        std::fs::write(&path, b"original").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        try_atomic_write(&path, b"updated", None).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "replacement must keep the original file's mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_atomic_write_writes_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.txt");
+        let link = dir.path().join("link.txt");
+        std::fs::write(&real, b"original").unwrap();
+        symlink(&real, &link).unwrap();
+
+        try_atomic_write(&link, b"updated", None).unwrap();
+
+        assert!(link.is_symlink(), "the symlink itself must survive");
+        assert_eq!(std::fs::read_link(&link).unwrap(), real);
+        assert_eq!(std::fs::read(&real).unwrap(), b"updated");
     }
 
     #[cfg(unix)]
