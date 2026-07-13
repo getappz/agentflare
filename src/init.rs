@@ -510,7 +510,7 @@ fn wire_opencode() {
 
     let mut config: Value = fs::read_to_string(&path)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| crate::jsonc::parse_jsonc(&s).ok())
         .unwrap_or_else(|| json!({}));
     if !config.is_object() {
         config = json!({});
@@ -1012,6 +1012,44 @@ mod tests {
             assert!(content.contains("/some/existing/rule.md"));
             let parsed: Value = serde_json::from_str(&content).unwrap();
             assert!(parsed["mcp"].is_object());
+        });
+    }
+
+    #[test]
+    fn wire_opencode_preserves_existing_content_with_comments() {
+        with_temp_home(|| {
+            let config_path = home()
+                .join(".config")
+                .join("opencode")
+                .join("opencode.jsonc");
+            let rules_dir = home().join(".config").join("opencode").join("rules");
+            fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+            // Real jsonc: comments + a trailing comma + an existing mcp
+            // server entry that must survive. Before the jsonc parser, this
+            // parse failure was treated as "no existing config" and every
+            // key below (including `mcp`) was silently dropped on write.
+            fs::write(
+                &config_path,
+                r#"{
+  // OpenCode configuration
+  "mcp": {
+    "some-server": { "type": "local", "command": ["some-server"] }
+  },
+}"#,
+            )
+            .unwrap();
+            fs::create_dir_all(&rules_dir).unwrap();
+            fs::write(rules_dir.join("exa.md"), "# exa\n").unwrap();
+
+            wire_opencode();
+
+            let content = fs::read_to_string(&config_path).unwrap();
+            let parsed: Value = crate::jsonc::parse_jsonc(&content).unwrap();
+            assert!(
+                parsed["mcp"]["some-server"].is_object(),
+                "existing mcp server entry must survive: {content}"
+            );
+            assert!(content.contains("exa.md"));
         });
     }
 
