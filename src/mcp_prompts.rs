@@ -185,9 +185,9 @@ fn get_handoff_command(request: &GetPromptRequestParams, agent: Option<&str>) ->
 
     if command.is_empty() {
         return assistant_text(format!(
-            "Handoff — agent-to-agent work exchange via artifacts. Pass as this command's argument:\n\
+            "Handoff — agent-to-agent work exchange via items and artifacts. Pass as this command's argument:\n\
              <recipient> <brief> — hand the relevant work product to that agent (e.g. `codex review the API design above`)\n\
-             inbox [me] — list artifacts addressed to an agent (default: {me})\n\
+             inbox [me] — list this project's tasks assigned to (or unclaimed for) an agent (default: {me})\n\
              thread <id> — show a handoff thread's artifacts in order\n\
              Work products only — facts and decisions belong in memory (memory_remember), not artifacts.",
         ));
@@ -204,11 +204,14 @@ fn get_handoff_command(request: &GetPromptRequestParams, agent: Option<&str>) ->
          automatically). Use the `handoff` tool, not artifact_publish, so recipient can't be \
          omitted. When answering an item from your inbox, set reply_to=<that artifact id> and \
          reuse its thread_id.\n\
-         - `inbox [me]` → artifact_list with recipient=<me or {me}>; summarize sender, \
-         name, and brief for each.\n\
+         - `inbox [me]` → call the `item` tool (action=list; already scoped to this repo's \
+         linked project) and filter to items where assignee_agent is <me or {me}> or unassigned; \
+         summarize name, state, and brief per item. Only pull an item's full content if you need \
+         it — via artifact_get on its metadata.artifact_id, or the `asset` tool for file \
+         attachments (both already scoped to project/item).\n\
          - `thread <id>` → artifact_list with thread_id=<id>; present in chronological order with \
          reply lineage.\n\
-         Report the resulting URL (or listing) afterwards. Work products only — facts/decisions \
+         Report the resulting listing (or URL) afterwards. Work products only — facts/decisions \
          go to memory (memory_remember), not artifacts."
     ))
 }
@@ -315,7 +318,10 @@ mod tests {
         let result = get_prompt(&params, Some("opencode")).unwrap();
         let text = format!("{:?}", result.messages[0].content);
         assert!(text.contains("identity, opencode"), "{text}");
-        assert!(text.contains("recipient=<me or opencode>"), "{text}");
+        assert!(
+            text.contains("assignee_agent is <me or opencode>"),
+            "{text}"
+        );
         assert!(!text.contains("claude-code"), "{text}");
     }
 
