@@ -1131,7 +1131,12 @@ impl AgentflareMcp {
 
             let bytes = content.as_bytes();
             let hash = Self::content_hash(bytes);
-            let safe_stem = Self::slugify(&name);
+            // Keyed on item.id, not name — name is the per-call brief and
+            // can legitimately differ between messages on the same item
+            // (e.g. a reply's brief vs. the original ask); keying on it
+            // would silently reset versioning to 1 instead of continuing
+            // the chain.
+            let safe_stem = Self::slugify(&item.id);
             let filename = format!("{safe_stem}.{ext}");
             let full_storage = format!("{ws_id}/assets/{safe_stem}-{hash}.{ext}");
             let base_path = crate::paths::home().join(".agentflare");
@@ -3627,7 +3632,7 @@ mod tests {
 
             let assets = item_assets(&s, &item_id);
             assert_eq!(assets.as_array().unwrap().len(), 1);
-            assert_eq!(assets[0]["filename"], "review-packet.md");
+            assert_eq!(assets[0]["filename"], format!("{item_id}.md"));
         });
     }
 
@@ -3689,10 +3694,12 @@ mod tests {
             assert_eq!(first["item_id"], item_id);
             assert_eq!(first["asset_version"], 1);
 
+            // A different brief/name on the reply must not reset the version
+            // chain — it's keyed on item_id, not name.
             let second: serde_json::Value = serde_json::from_str(
                 &s.handoff(Parameters(HandoffRequest {
                     recipient: "opencode".into(),
-                    name: "Existing task".into(),
+                    name: "Addressed feedback".into(),
                     content: "v2 content".into(),
                     item_id: Some(item_id.clone()),
                     ..Default::default()
