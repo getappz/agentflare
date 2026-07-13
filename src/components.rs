@@ -80,7 +80,7 @@ fn write_pinned_mode(path: &PathBuf) -> bool {
     fs::write(path, "{\"defaultMode\": \"ultra\"}\n").is_ok()
 }
 
-fn merge_json(path: &PathBuf, key: &str, value: Value) -> bool {
+fn merge_json(path: &PathBuf, root_key: &str, key: &str, value: Value) -> bool {
     let mut existing: Value = fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -89,9 +89,7 @@ fn merge_json(path: &PathBuf, key: &str, value: Value) -> bool {
         existing = serde_json::json!({});
     }
     let obj = existing.as_object_mut().unwrap();
-    let servers = obj
-        .entry("mcpServers")
-        .or_insert_with(|| serde_json::json!({}));
+    let servers = obj.entry(root_key).or_insert_with(|| serde_json::json!({}));
     if let Some(m) = servers.as_object_mut() {
         m.insert(key.to_string(), value);
     }
@@ -368,7 +366,9 @@ pub fn get_components(host: &str) -> Vec<Component> {
             needs_consent: true,
             describe: if host_owned == "claude-code" {
                 "agentflare MCP server (skill_search/skill_load) — claude mcp add flare -- agentflare mcp".to_string()
-            } else if matches!(host_owned.as_str(), "cline" | "continue" | "opencode") {
+            } else if host_owned == "codex" {
+                "agentflare MCP server (skill_search/skill_load) — codex mcp add flare -- agentflare mcp".to_string()
+            } else if matches!(host_owned.as_str(), "cline" | "continue" | "opencode" | "cursor" | "windsurf" | "vscode-copilot") {
                 format!("agentflare MCP server (skill_search/skill_load) — manual MCP registration for {host_owned}")
             } else {
                 "agentflare MCP server — not yet supported for this host".to_string()
@@ -378,6 +378,21 @@ pub fn get_components(host: &str) -> Vec<Component> {
                 Box::new(move || match host.as_str() {
                     "claude-code" => claude_json()
                         .get("mcpServers")
+                        .and_then(|m| m.get("flare"))
+                        .is_some(),
+                    "codex" => fs::read_to_string(home().join(".codex").join("config.toml"))
+                        .map(|s| s.contains("[mcp_servers.flare]"))
+                        .unwrap_or(false),
+                    "cursor" => json_at(&home().join(".cursor").join("mcp.json"))
+                        .get("mcpServers")
+                        .and_then(|m| m.get("flare"))
+                        .is_some(),
+                    "windsurf" => json_at(&home().join(".codeium").join("windsurf").join("mcp_config.json"))
+                        .get("mcpServers")
+                        .and_then(|m| m.get("flare"))
+                        .is_some(),
+                    "vscode-copilot" => json_at(&cwd().join(".vscode").join("mcp.json"))
+                        .get("servers")
                         .and_then(|m| m.get("flare"))
                         .is_some(),
                     "cline" => json_at(&home().join(".cline").join("mcp.json"))
@@ -415,9 +430,44 @@ pub fn get_components(host: &str) -> Vec<Component> {
                                 format!("agentflare MCP registration failed — run manually: claude mcp add flare -s user -- \"{bin}\" mcp")
                             }
                         }
+                        "codex" => {
+                            if run_ok("codex", &["mcp", "add", "flare", "--", &bin, "mcp"]) {
+                                "agentflare MCP server registered with codex as 'flare'".to_string()
+                            } else {
+                                format!("agentflare MCP registration failed — run manually: codex mcp add flare -- \"{bin}\" mcp")
+                            }
+                        }
+                        "cursor" => {
+                            let path = home().join(".cursor").join("mcp.json");
+                            if merge_json(&path, "mcpServers", "flare", entry) {
+                                format!("{} (flare registered)", path.display())
+                            } else {
+                                format!("failed to write {}", path.display())
+                            }
+                        }
+                        "windsurf" => {
+                            let path = home().join(".codeium").join("windsurf").join("mcp_config.json");
+                            if merge_json(&path, "mcpServers", "flare", entry) {
+                                format!("{} (flare registered)", path.display())
+                            } else {
+                                format!("failed to write {}", path.display())
+                            }
+                        }
+                        "vscode-copilot" => {
+                            let mut entry = entry;
+                            if let Some(obj) = entry.as_object_mut() {
+                                obj.insert("type".to_string(), serde_json::Value::String("stdio".to_string()));
+                            }
+                            let path = cwd().join(".vscode").join("mcp.json");
+                            if merge_json(&path, "servers", "flare", entry) {
+                                format!("{} (flare registered)", path.display())
+                            } else {
+                                format!("failed to write {}", path.display())
+                            }
+                        }
                         "cline" => {
                             let path = home().join(".cline").join("mcp.json");
-                            if merge_json(&path, "flare", entry) {
+                            if merge_json(&path, "mcpServers", "flare", entry) {
                                 format!("{} (flare registered)", path.display())
                             } else {
                                 format!("failed to write {}", path.display())
@@ -693,20 +743,121 @@ mod tests {
     }
 
     #[test]
-    fn agentflare_mcp_reports_satisfied_on_hosts_without_a_wired_format() {
-        // codex/cursor/windsurf/vscode-copilot have no verified MCP config
-        // format wired here yet — must never nag or attempt registration.
-        for host in ["codex", "cursor", "windsurf", "vscode-copilot"] {
-            let components = get_components(host);
+    fn agentflare_mcp_check_reflects_codex_config_toml_substring() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("codex");
             let agentflare_mcp = components
                 .iter()
                 .find(|c| c.id == "agentflare-mcp")
                 .unwrap();
             assert!(
-                (agentflare_mcp.check)(),
-                "agentflare-mcp should be satisfied on '{host}'"
+                !(agentflare_mcp.check)(),
+                "no config.toml yet — should not be satisfied"
             );
-        }
+
+            let config = home().join(".codex").join("config.toml");
+            fs::create_dir_all(config.parent().unwrap()).unwrap();
+            // unrelated entry present — must not false-positive
+            fs::write(&config, "[mcp_servers.other]\ncommand = \"foo\"\n").unwrap();
+            assert!(
+                !(agentflare_mcp.check)(),
+                "unrelated entry must not satisfy the check"
+            );
+
+            fs::write(&config, "[mcp_servers.other]\ncommand = \"foo\"\n\n[mcp_servers.flare]\ncommand = \"agentflare\"\n").unwrap();
+            assert!(
+                (agentflare_mcp.check)(),
+                "flare entry present — should be satisfied"
+            );
+        });
+    }
+
+    #[test]
+    fn agentflare_mcp_cursor_check_then_apply_then_check() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("cursor");
+            let agentflare_mcp = components
+                .iter()
+                .find(|c| c.id == "agentflare-mcp")
+                .unwrap();
+            assert!(!(agentflare_mcp.check)());
+            (agentflare_mcp.apply)();
+            assert!((agentflare_mcp.check)());
+        });
+    }
+
+    #[test]
+    fn agentflare_mcp_cursor_apply_does_not_clobber_existing_servers() {
+        crate::paths::test_support::with_temp_home(|| {
+            let path = home().join(".cursor").join("mcp.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, r#"{"mcpServers": {"other": {"command": "foo"}}}"#).unwrap();
+
+            let components = get_components("cursor");
+            let agentflare_mcp = components
+                .iter()
+                .find(|c| c.id == "agentflare-mcp")
+                .unwrap();
+            (agentflare_mcp.apply)();
+
+            let value = json_at(&path);
+            assert!(
+                value["mcpServers"]["other"].is_object(),
+                "existing entry must survive"
+            );
+            assert!(
+                value["mcpServers"]["flare"].is_object(),
+                "flare entry must be added"
+            );
+        });
+    }
+
+    #[test]
+    fn agentflare_mcp_windsurf_check_then_apply_then_check() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("windsurf");
+            let agentflare_mcp = components
+                .iter()
+                .find(|c| c.id == "agentflare-mcp")
+                .unwrap();
+            assert!(!(agentflare_mcp.check)());
+            (agentflare_mcp.apply)();
+            assert!((agentflare_mcp.check)());
+        });
+    }
+
+    #[test]
+    fn agentflare_mcp_vscode_copilot_check_then_apply_then_check() {
+        crate::paths::test_support::with_temp_cwd(|| {
+            let components = get_components("vscode-copilot");
+            let agentflare_mcp = components
+                .iter()
+                .find(|c| c.id == "agentflare-mcp")
+                .unwrap();
+            assert!(!(agentflare_mcp.check)());
+            (agentflare_mcp.apply)();
+            assert!((agentflare_mcp.check)());
+        });
+    }
+
+    #[test]
+    fn agentflare_mcp_vscode_copilot_writes_servers_key_with_stdio_type() {
+        crate::paths::test_support::with_temp_cwd(|| {
+            let components = get_components("vscode-copilot");
+            let agentflare_mcp = components
+                .iter()
+                .find(|c| c.id == "agentflare-mcp")
+                .unwrap();
+            (agentflare_mcp.apply)();
+
+            let path = cwd().join(".vscode").join("mcp.json");
+            let value = json_at(&path);
+            assert!(
+                value.get("mcpServers").is_none(),
+                "must use 'servers', not 'mcpServers'"
+            );
+            assert_eq!(value["servers"]["flare"]["type"], "stdio");
+        });
     }
 
     #[test]
