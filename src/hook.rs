@@ -103,6 +103,7 @@ fn extract_prompt(input: &str) -> String {
 struct PreToolUseInput {
     session_id: String,
     tool_name: String,
+    tool_input: Option<serde_json::Value>,
     delay_seconds: Option<u64>,
 }
 
@@ -110,13 +111,15 @@ fn parse_pre_tool_use(input: &str) -> Option<PreToolUseInput> {
     let v: serde_json::Value = serde_json::from_str(input).ok()?;
     let session_id = v.get("session_id")?.as_str()?.to_string();
     let tool_name = v.get("tool_name")?.as_str()?.to_string();
-    let delay_seconds = v
-        .get("tool_input")
+    let tool_input = v.get("tool_input").cloned();
+    let delay_seconds = tool_input
+        .as_ref()
         .and_then(|ti| ti.get("delaySeconds"))
         .and_then(|d| d.as_u64());
     Some(PreToolUseInput {
         session_id,
         tool_name,
+        tool_input,
         delay_seconds,
     })
 }
@@ -128,6 +131,13 @@ pub fn pre_tool_use(_agent: &str) {
     let Some(parsed) = parse_pre_tool_use(&input) else {
         return;
     };
+
+    if let Some(decision) =
+        crate::hook_redirect::redirect_decision(&parsed.tool_name, parsed.tool_input.as_ref())
+    {
+        println!("{decision}");
+        return;
+    }
 
     let mut runtime = crate::optimize::load_runtime();
     let now = std::time::SystemTime::now()

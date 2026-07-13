@@ -1,10 +1,10 @@
 // `agentflare init --agent X` — the one explicit, consent-is-the-invocation
 // setup command. Runs every component (installs included — no separate
 // confirm step, since running this command IS the consent), then wires the
-// host's hook config directly where a hook mechanism exists and can be
-// written without going through a plugin marketplace (Claude Code, Cursor).
-// Codex's hook only activates through its plugin system, so that wiring
-// lives in .codex-plugin/ instead, not here.
+// host's hook config directly where a hook mechanism exists (Claude Code,
+// Cursor, Codex). Codex's hooks are gated behind an experimental feature
+// flag (`[features] codex_hooks = true` in config.toml) that Codex itself
+// requires — wire_codex_hooks() upserts it alongside hooks.json.
 use crate::components::{get_components, rule_targets};
 use crate::paths::{agentflare_binary, home};
 use crate::rule_text;
@@ -215,6 +215,9 @@ pub fn run(agent: &str, yes: bool) {
                 wire_ponytail_hooks(agent);
             }
         }
+        "codex" => {
+            wire_codex_hooks();
+        }
         "opencode" => {
             wire_opencode();
             if has_existing_ponytail_opencode() {
@@ -361,23 +364,69 @@ fn wire_claude_code() {
 
 fn wire_cursor() {
     let path = cwd().join(".cursor").join("hooks.json");
-    if path.exists() {
-        let existing = fs::read_to_string(&path).unwrap_or_default();
-        if existing.contains("agentflare") {
-            println!("  skip  .cursor/hooks.json (already wired)");
-            return;
-        }
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    if !existing.is_empty() && !existing.contains("agentflare") {
         println!("  skip  .cursor/hooks.json (exists, not agentflare's — not overwriting)");
         return;
     }
+
+    let mut content: Value = serde_json::from_str(&existing).unwrap_or_else(|_| json!({}));
+    if !content.is_object() {
+        content = json!({});
+    }
     let bin = agentflare_binary();
-    let content = json!({
-        "version": 1,
-        "hooks": {
-            "sessionStart": [{ "command": format!("\"{bin}\" hook session-start"), "type": "command", "timeout": 30 }],
-            "beforeSubmitPrompt": [{ "command": format!("\"{bin}\" hook prompt-submit"), "type": "command", "timeout": 10 }]
-        }
-    });
+    let obj = content.as_object_mut().unwrap();
+    obj.entry("version").or_insert_with(|| json!(1));
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .unwrap();
+
+    let mut added = false;
+    if !hooks
+        .get("sessionStart")
+        .is_some_and(|v| v.to_string().contains("hook session-start"))
+    {
+        hooks.insert(
+            "sessionStart".to_string(),
+            json!([{ "command": format!("\"{bin}\" hook session-start"), "type": "command", "timeout": 30 }]),
+        );
+        added = true;
+    }
+    if !hooks
+        .get("beforeSubmitPrompt")
+        .is_some_and(|v| v.to_string().contains("hook prompt-submit"))
+    {
+        hooks.insert(
+            "beforeSubmitPrompt".to_string(),
+            json!([{ "command": format!("\"{bin}\" hook prompt-submit"), "type": "command", "timeout": 10 }]),
+        );
+        added = true;
+    }
+    // preToolUse entries carry a `matcher` instead of `type`/`timeout` — Cursor's
+    // own hook schema for this event (Shell|Read|Write|Grep|Delete|Task|MCP:* are
+    // the only valid matchers; Cursor has no Glob/Edit/TodoWrite tools, so `Write`
+    // is the only matcher agentflare's redirect classifier needs here).
+    let pre_arr = hooks
+        .entry("preToolUse")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .unwrap();
+    if !pre_arr
+        .iter()
+        .any(|v| v.to_string().contains("hook pre-tool-use"))
+    {
+        pre_arr
+            .push(json!({ "matcher": "Write", "command": format!("\"{bin}\" hook pre-tool-use") }));
+        added = true;
+    }
+
+    if !added {
+        println!("  skip  .cursor/hooks.json (already wired)");
+        return;
+    }
+
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -385,8 +434,69 @@ fn wire_cursor() {
         &path,
         serde_json::to_string_pretty(&content).unwrap() + "\n",
     ) {
-        Ok(_) => println!("  ok    .cursor/hooks.json written"),
+        Ok(_) => println!("  ok    .cursor/hooks.json wired"),
         Err(e) => println!("  fail  writing .cursor/hooks.json: {e}"),
+    }
+}
+
+/// Codex hooks (`~/.codex/hooks.json`, same shape as Claude Code's
+/// settings.json hooks) are gated behind an experimental feature flag Codex
+/// itself requires. Source: https://learn.chatgpt.com/docs/extend/mcp?surface=cli
+/// (verified 2026-07-13) — the flag lives in `config.toml`, not hooks.json.
+fn wire_codex_hooks() {
+    let codex_dir = home().join(".codex");
+    let hooks_path = codex_dir.join("hooks.json");
+    let mut settings: Value = fs::read_to_string(&hooks_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !settings.is_object() {
+        settings = json!({});
+    }
+    let bin = agentflare_binary();
+
+    let obj = settings.as_object_mut().unwrap();
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    let hooks_obj = hooks.as_object_mut().unwrap();
+
+    let mut added = false;
+    added |= add_hook_entry(
+        hooks_obj,
+        "PreToolUse",
+        "hook pre-tool-use",
+        format!("\"{bin}\" hook pre-tool-use"),
+        5,
+    );
+
+    if let Some(parent) = hooks_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if added {
+        match fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&settings).unwrap() + "\n",
+        ) {
+            Ok(_) => println!("  ok    ~/.codex/hooks.json wired"),
+            Err(e) => println!("  fail  writing ~/.codex/hooks.json: {e}"),
+        }
+    } else {
+        println!("  skip  ~/.codex/hooks.json (already wired)");
+    }
+
+    let config_path = codex_dir.join("config.toml");
+    let config_content = fs::read_to_string(&config_path).unwrap_or_default();
+    if config_content.contains("codex_hooks") {
+        println!("  skip  ~/.codex/config.toml (codex_hooks flag already present)");
+        return;
+    }
+    let mut updated = config_content.clone();
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str("[features]\ncodex_hooks = true\n");
+    match fs::write(&config_path, updated) {
+        Ok(_) => println!("  ok    ~/.codex/config.toml: codex_hooks feature flag enabled"),
+        Err(e) => println!("  fail  writing ~/.codex/config.toml: {e}"),
     }
 }
 
