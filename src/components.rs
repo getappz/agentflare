@@ -50,7 +50,7 @@ fn claude_json() -> Value {
 fn json_at(path: &PathBuf) -> Value {
     fs::read_to_string(path)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| crate::jsonc::parse_jsonc(&s).ok())
         .unwrap_or(Value::Null)
 }
 
@@ -83,7 +83,7 @@ fn write_pinned_mode(path: &PathBuf) -> bool {
 fn merge_json(path: &PathBuf, root_key: &str, key: &str, value: Value) -> bool {
     let mut existing: Value = fs::read_to_string(path)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| crate::jsonc::parse_jsonc(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     if !existing.is_object() {
         existing = serde_json::json!({});
@@ -106,7 +106,7 @@ fn merge_json(path: &PathBuf, root_key: &str, key: &str, value: Value) -> bool {
 fn merge_opencode_mcp(path: &PathBuf, key: &str, entry: Value) -> bool {
     let mut existing: Value = fs::read_to_string(path)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| crate::jsonc::parse_jsonc(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     if !existing.is_object() {
         existing = serde_json::json!({});
@@ -807,6 +807,48 @@ mod tests {
             );
             assert!(
                 value["mcpServers"]["flare"].is_object(),
+                "flare entry must be added"
+            );
+        });
+    }
+
+    #[test]
+    fn agentflare_mcp_opencode_apply_survives_jsonc_comments_and_trailing_comma() {
+        crate::paths::test_support::with_temp_home(|| {
+            let path = home()
+                .join(".config")
+                .join("opencode")
+                .join("opencode.jsonc");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Real jsonc: comments + trailing comma + an existing mcp server
+            // entry that must survive. Before the jsonc parser, this parse
+            // failure was treated as "no existing config" and everything
+            // below (including `other-server`) was silently dropped on write.
+            fs::write(
+                &path,
+                r#"{
+  // OpenCode configuration
+  "mcp": {
+    "other-server": { "type": "local", "command": ["other-server"] },
+  },
+}"#,
+            )
+            .unwrap();
+
+            let components = get_components("opencode");
+            let agentflare_mcp = components
+                .iter()
+                .find(|c| c.id == "agentflare-mcp")
+                .unwrap();
+            (agentflare_mcp.apply)();
+
+            let value = json_at(&path);
+            assert!(
+                value["mcp"]["other-server"].is_object(),
+                "existing entry must survive"
+            );
+            assert!(
+                value["mcp"]["flare"].is_object(),
                 "flare entry must be added"
             );
         });

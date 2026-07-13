@@ -22,6 +22,7 @@ mod gateway_secrets;
 mod hook;
 mod hook_redirect;
 mod init;
+mod jsonc;
 mod mcp_prompts;
 mod mcp_server;
 mod memory;
