@@ -592,6 +592,19 @@ fn map_backend_err(e: agentflare_backend::Error) -> ErrorData {
     }
 }
 
+/// Converts the unified dispatch-layer error type once, at whichever `?`
+/// first needs an `ErrorData` — lets internal helpers (`with_fresh_registry`,
+/// `claim_db`, `resolve_workspace_id`, ...) chain heterogeneous fallible
+/// steps with `?` instead of mapping each one to `ErrorData` individually.
+impl From<crate::errors::AgentflareError> for ErrorData {
+    fn from(e: crate::errors::AgentflareError) -> Self {
+        match e {
+            crate::errors::AgentflareError::Backend(e) => map_backend_err(e),
+            other => ErrorData::internal_error(other.to_string(), None),
+        }
+    }
+}
+
 /// 24 random bytes, hex-encoded — used as a webhook's HMAC signing secret
 /// when the caller doesn't supply one.
 fn generate_webhook_secret() -> String {
@@ -794,23 +807,21 @@ impl AgentflareMcp {
     fn with_fresh_registry<T>(
         &self,
         f: impl FnOnce(&skill_registry::Registry) -> T,
-    ) -> Result<T, ErrorData> {
+    ) -> crate::errors::Result<T> {
         let mut guard = self
             .skills_registry
             .lock()
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            .map_err(|e| crate::errors::AgentflareError::Lock(e.to_string()))?;
         if guard.is_none() {
             let db_path = self
                 .skills_db_override
                 .clone()
                 .unwrap_or_else(crate::paths::skills_db_path);
-            let reg = skill_registry::Registry::open_default(&db_path)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            let reg = skill_registry::Registry::open_default(&db_path)?;
             *guard = Some(reg);
         }
         let reg = guard.as_mut().expect("just initialized above");
-        reg.ensure_fresh()
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        reg.ensure_fresh()?;
         Ok(f(reg))
     }
 
@@ -1380,15 +1391,14 @@ impl AgentflareMcp {
     /// The one and only workspace on this system: reused if it already
     /// exists, auto-created (named "default") on first use. Never exposed
     /// as an MCP parameter.
-    fn resolve_workspace_id(conn: &rusqlite::Connection) -> Result<String, ErrorData> {
+    fn resolve_workspace_id(conn: &rusqlite::Connection) -> crate::errors::Result<String> {
         let existing: Option<String> = conn
             .query_row(
                 "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
                 [],
                 |r| r.get(0),
             )
-            .optional()
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            .optional()?;
         if let Some(id) = existing {
             return Ok(id);
         }
@@ -1400,8 +1410,7 @@ impl AgentflareMcp {
                 owner_agent: None,
                 item_label: None,
             },
-        )
-        .map_err(map_backend_err)?;
+        )?;
         Ok(ws.id)
     }
 
@@ -1803,10 +1812,9 @@ impl AgentflareMcp {
         Ok(serde_json::to_string_pretty(&claims).unwrap_or_default())
     }
 
-    /// Opens the ledger db, mapping errors to MCP internal_error.
-    fn claim_db() -> Result<rusqlite::Connection, ErrorData> {
-        crate::db::open()
-            .map_err(|e| ErrorData::internal_error(format!("cannot open ledger: {e}"), None))
+    /// Opens the ledger db.
+    fn claim_db() -> crate::errors::Result<rusqlite::Connection> {
+        Ok(crate::db::open()?)
     }
 
     /// Shared prelude for the per-target claim tools: validate target, open the

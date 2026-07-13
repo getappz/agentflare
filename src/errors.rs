@@ -81,3 +81,24 @@ pub enum CoachingError {
     #[error("coaching rule not found: {0}")]
     NotFound(String),
 }
+
+/// Unified error type for MCP dispatch-layer helpers that touch more than
+/// one fallible source (lock, database, sub-crate registry, ...). Lets those
+/// helpers use `?` throughout instead of `.map_err(|e| ErrorData::internal_error(...))`
+/// at every step; callers convert once, at their own `?`, via
+/// `impl From<AgentflareError> for ErrorData` (mcp_server.rs).
+#[derive(Error, Debug)]
+pub enum AgentflareError {
+    #[error("lock poisoned: {0}")]
+    Lock(String),
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Skill(#[from] skill_registry::LoadError),
+    #[error(transparent)]
+    Backend(#[from] agentflare_backend::Error),
+}
+
+pub type Result<T> = std::result::Result<T, AgentflareError>;
