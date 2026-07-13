@@ -2726,9 +2726,9 @@ impl AgentflareMcp {
                         if s.is_empty() { "file".to_string() } else { s }
                     };
                     let full_storage = if ext.is_empty() {
-                        format!("{}/assets/{}-{}", ws_id, safe_stem, &hash[..10])
+                        format!("{}/assets/{}-{}", ws_id, safe_stem, hash)
                     } else {
-                        format!("{}/assets/{}-{}.{}", ws_id, safe_stem, &hash[..10], ext)
+                        format!("{}/assets/{}-{}.{}", ws_id, safe_stem, hash, ext)
                     };
                     let base_path = crate::paths::home().join(".agentflare");
                     // only write if file doesn't already exist (same content already stored)
