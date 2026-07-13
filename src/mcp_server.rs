@@ -913,6 +913,14 @@ impl AgentflareMcp {
             .unwrap_or(1024 * 1024)
     }
 
+    fn strip_storage_path(asset: &agentflare_backend::asset::Asset) -> serde_json::Value {
+        let mut v = serde_json::to_value(asset).unwrap_or_default();
+        if let serde_json::Value::Object(ref mut map) = v {
+            map.remove("storage_path");
+        }
+        v
+    }
+
     /// Lock the artifact store + backend pair, resolving the backend on
     /// first use: reuse an already-running artifact server (flared's
     /// /artifacts routes, or another session), else bind the fixed port
@@ -2646,10 +2654,23 @@ impl AgentflareMcp {
                         None,
                     ));
                 }
-                let staging_dir = crate::paths::home().join(".agentflare").join("staging");
                 let fn_val = filename.ok_or_else(|| {
                     ErrorData::invalid_params("filename is required for attach", None)
                 })?;
+                // path traversal guard: reject filename with .. or absolute components
+                let staged_rel = std::path::Path::new(&fn_val);
+                if staged_rel
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "filename '{fn_val}' contains path separators or parent-refs — not allowed"
+                        ),
+                        None,
+                    ));
+                }
+                let staging_dir = crate::paths::home().join(".agentflare").join("staging");
                 let staged = staging_dir.join(&fn_val);
                 if !staged.exists() {
                     return Err(ErrorData::invalid_params(
@@ -2716,7 +2737,6 @@ impl AgentflareMcp {
                         agentflare_backend::asset::write_file(&base_path, &full_storage, &bytes)
                             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                     }
-                    let _ = std::fs::remove_file(&staged);
                     let asset = agentflare_backend::asset::create(
                         conn,
                         agentflare_backend::asset::CreateAsset {
@@ -2727,10 +2747,16 @@ impl AgentflareMcp {
                             size: size as i64,
                             mime_type: Some(mime),
                             metadata: Some(meta),
+                            storage_path: Some(full_storage),
                         },
                     )
                     .map_err(map_backend_err)?;
-                    Ok(serde_json::to_string_pretty(&asset).unwrap_or_default())
+                    // remove staging file only after the DB insert succeeds
+                    let _ = std::fs::remove_file(&staged);
+                    Ok(
+                        serde_json::to_string_pretty(&Self::strip_storage_path(&asset))
+                            .unwrap_or_default(),
+                    )
                 })?
             }
             "get" => {
@@ -2741,7 +2767,7 @@ impl AgentflareMcp {
                         .map_err(map_backend_err)?;
                     let base_path = crate::paths::home().join(".agentflare");
                     let max_inline = Self::asset_max_inline_bytes();
-                    let meta = serde_json::to_value(&asset).unwrap_or_default();
+                    let meta = Self::strip_storage_path(&asset);
                     let size = asset.size as u64;
                     if size <= max_inline {
                         match agentflare_backend::asset::read_file(&base_path, &asset.storage_path) {
@@ -2775,14 +2801,35 @@ impl AgentflareMcp {
             "list" => self.with_backend_db(|conn| {
                 let ws_id = Self::resolve_workspace_id(conn)?;
                 let assets: Vec<agentflare_backend::asset::Asset> = match (item_id, project_id) {
-                    (Some(iid), _) => {
+                    (Some(iid), None) => {
                         agentflare_backend::asset::list_by_entity(conn, "item_attachment", &iid)
                             .map_err(map_backend_err)?
                     }
-                    _ => agentflare_backend::asset::list_by_workspace(conn, &ws_id)
-                        .map_err(map_backend_err)?,
+                    (None, Some(pid)) => {
+                        agentflare_backend::asset::list_by_entity(conn, "project_attachment", &pid)
+                            .map_err(map_backend_err)?
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(ErrorData::invalid_params(
+                            "only one of item_id or project_id allowed for list, not both",
+                            None,
+                        ));
+                    }
+                    (None, None) => {
+                        let mut assets: Vec<serde_json::Value> = Vec::new();
+                        for a in agentflare_backend::asset::list_by_workspace(conn, &ws_id)
+                            .map_err(map_backend_err)?
+                        {
+                            assets.push(Self::strip_storage_path(&a));
+                        }
+                        return Ok(serde_json::to_string_pretty(&assets).unwrap_or_default());
+                    }
                 };
-                Ok(serde_json::to_string_pretty(&assets).unwrap_or_default())
+                let mut stripped: Vec<serde_json::Value> = Vec::new();
+                for a in assets {
+                    stripped.push(Self::strip_storage_path(&a));
+                }
+                Ok(serde_json::to_string_pretty(&stripped).unwrap_or_default())
             })?,
             "delete" => {
                 let id =
@@ -2800,7 +2847,7 @@ impl AgentflareMcp {
                             rusqlite::params![&asset.storage_path],
                             |r| r.get(0),
                         )
-                        .unwrap_or(0);
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                     if remaining == 0 {
                         let base_path = crate::paths::home().join(".agentflare");
                         let _ = agentflare_backend::asset::delete_file(&base_path, &asset.storage_path);
