@@ -6,8 +6,9 @@
 /.opencode/
 
 # Per-repo agentflare-backend project link (Vercel-style .vercel/project.json
-# equivalent) — machine-local, not something to share via git.
-/.agentflare/
+# equivalent) — machine-local, not something to share via git. Deliberately
+# not named .agentflare — that's the separate global ~/.agentflare data dir.
+/.agentflare-project/
 
 # Local onpush doc-generation tooling (machine-specific, not part of the project)
 /.onpush/
