@@ -80,10 +80,11 @@ impl AgentflareMcp {
                 states.iter().map(|s| (s.id.as_str(), s)).collect();
 
             if let Some(group) = &req.state_group {
+                let wanted: Vec<&str> = group.split(',').map(str::trim).collect();
                 items.retain(|i| {
                     state_by_id
                         .get(i.state_id.as_str())
-                        .map(|s| &s.group_name == group)
+                        .map(|s| wanted.contains(&s.group_name.as_str()))
                         .unwrap_or(false)
                 });
             }

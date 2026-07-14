@@ -585,7 +585,7 @@ struct ItemRequest {
     #[serde(default)]
     label_id: Option<String>,
     #[schemars(
-        description = "Filter by state group: backlog|unstarted|started|completed|cancelled|triage (list)"
+        description = "Filter by state group (list); one of backlog|unstarted|started|completed|cancelled|triage, or a comma-separated list (e.g. \"backlog,unstarted,started\") to match any"
     )]
     #[serde(default)]
     state_group: Option<String>,
@@ -4079,6 +4079,67 @@ mod tests {
             .map(|i| i["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, vec!["Mine open", "Unassigned", "Mine done"]);
+    }
+
+    #[test]
+    fn item_list_state_group_filter_accepts_comma_separated_groups() {
+        let (tmp, s) = harness();
+        let open_item: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("Open"))).unwrap()).unwrap();
+        let project_id = open_item["project_id"].as_str().unwrap().to_string();
+        let done_item: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("Done"))).unwrap()).unwrap();
+        let cancelled_item: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("Cancelled"))).unwrap())
+                .unwrap();
+
+        let conn = backend_conn(&tmp);
+        let states = agentflare_backend::state::list_by_project(&conn, &project_id).unwrap();
+        let done_state_id = states
+            .iter()
+            .find(|st| st.group_name == "completed")
+            .unwrap()
+            .id
+            .clone();
+        let cancelled_state_id = states
+            .iter()
+            .find(|st| st.group_name == "cancelled")
+            .unwrap()
+            .id
+            .clone();
+        drop(conn);
+
+        s.item(Parameters(ItemRequest {
+            action: "update_state".into(),
+            id: Some(done_item["id"].as_str().unwrap().to_string()),
+            state_id: Some(done_state_id),
+            ..Default::default()
+        }))
+        .unwrap();
+        s.item(Parameters(ItemRequest {
+            action: "update_state".into(),
+            id: Some(cancelled_item["id"].as_str().unwrap().to_string()),
+            state_id: Some(cancelled_state_id),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        let listed: serde_json::Value = serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                action: "list".into(),
+                state_group: Some("backlog,completed".into()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let names: Vec<&str> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Open", "Done"]);
     }
 
     #[test]
