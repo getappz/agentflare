@@ -115,7 +115,9 @@ struct ChannelSendRequest {
 struct ReviewRequest {
     #[schemars(description = "Action: clear|consensus|list|record|scores|submit")]
     action: String,
-    #[schemars(description = "Findings, each {file, line, message, severity?, category?} (submit)")]
+    #[schemars(
+        description = "Findings, each {file, line, message, severity?, category?} (submit)"
+    )]
     #[serde(default)]
     findings: Option<Vec<serde_json::Value>>,
     #[schemars(description = "Review round id (default: current branch)")]
@@ -196,7 +198,9 @@ struct ArtifactRequest {
     #[schemars(description = "Display name of the artifact (publish)")]
     #[serde(default)]
     name: Option<String>,
-    #[schemars(description = "html | markdown | mermaid | diagram | text (default: text) (publish)")]
+    #[schemars(
+        description = "html | markdown | mermaid | diagram | text (default: text) (publish)"
+    )]
     #[serde(default)]
     r#type: Option<String>,
     #[schemars(
@@ -252,13 +256,17 @@ struct ArtifactRequest {
     #[schemars(description = "Newer version number (omit for latest) (diff)")]
     #[serde(default)]
     to_version: Option<u32>,
-    #[schemars(description = "Case-insensitive text to find in names, descriptions, or content (search)")]
+    #[schemars(
+        description = "Case-insensitive text to find in names, descriptions, or content (search)"
+    )]
     #[serde(default)]
     query: Option<String>,
     #[schemars(description = "Specific version to fetch (omit for latest) (get)")]
     #[serde(default)]
     version: Option<u32>,
-    #[schemars(description = "Inbox filter: only artifacts addressed to this agent/runtime (list)")]
+    #[schemars(
+        description = "Inbox filter: only artifacts addressed to this agent/runtime (list)"
+    )]
     #[serde(default)]
     inbox_recipient: Option<String>,
 }
@@ -273,7 +281,9 @@ struct MemoryRequest {
     #[schemars(description = "Content body of the observation (remember, curate)")]
     #[serde(default)]
     content: Option<String>,
-    #[schemars(description = "Type: decision|bugfix|discovery|pattern|learning|manual (remember, recall)")]
+    #[schemars(
+        description = "Type: decision|bugfix|discovery|pattern|learning|manual (remember, recall)"
+    )]
     #[serde(default)]
     r#type: Option<String>,
     #[schemars(description = "Session ID to associate with")]
@@ -332,6 +342,9 @@ struct MemoryRequest {
     #[schemars(description = "Pin status (curate pin/unpin actions)")]
     #[serde(default)]
     pinned: Option<bool>,
+    #[schemars(description = "Sub-action for curate: update|delete|pin|unpin")]
+    #[serde(default)]
+    curate_action: Option<String>,
 }
 
 #[derive(Default)]
@@ -752,35 +765,54 @@ impl AgentflareMcp {
     #[tool(
         description = "Skill operations — search installed skills or load one by name. Single consolidated tool with `action` field (search|load)."
     )]
-    fn skill(
-        &self,
-        Parameters(req): Parameters<SkillRequest>,
-    ) -> Result<String, ErrorData> {
+    fn skill(&self, Parameters(req): Parameters<SkillRequest>) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "search" => {
-                let query = req.query.ok_or_else(|| ErrorData::invalid_params("query is required", None))?;
-                if query.trim().is_empty() { return Err(ErrorData::invalid_params("query is required", None)); }
+                let query = req
+                    .query
+                    .ok_or_else(|| ErrorData::invalid_params("query is required", None))?;
+                if query.trim().is_empty() {
+                    return Err(ErrorData::invalid_params("query is required", None));
+                }
                 let mode = match req.mode.as_deref() {
                     None | Some("all") => skill_registry::MatchMode::All,
                     Some("any") => skill_registry::MatchMode::Any,
-                    Some(other) => return Err(ErrorData::invalid_params(format!("mode must be 'all' or 'any', got '{other}'"), None)),
+                    Some(other) => {
+                        return Err(ErrorData::invalid_params(
+                            format!("mode must be 'all' or 'any', got '{other}'"),
+                            None,
+                        ));
+                    }
                 };
-                let hits = self.with_fresh_registry(|reg| reg.search(&query, req.limit.unwrap_or(5), mode))?.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let hits = self
+                    .with_fresh_registry(|reg| reg.search(&query, req.limit.unwrap_or(5), mode))?
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
             }
             "load" => {
-                let name = req.name.ok_or_else(|| ErrorData::invalid_params("name is required", None))?;
-                if name.trim().is_empty() { return Err(ErrorData::invalid_params("name is required", None)); }
+                let name = req
+                    .name
+                    .ok_or_else(|| ErrorData::invalid_params("name is required", None))?;
+                if name.trim().is_empty() {
+                    return Err(ErrorData::invalid_params("name is required", None));
+                }
                 let result = self.with_fresh_registry(|reg| reg.load(&name, req.original))?;
                 match result {
                     Ok(s) => Ok(serde_json::to_string_pretty(&s).unwrap_or_default()),
-                    Err(e @ skill_registry::LoadError::NotFound(_)) | Err(e @ skill_registry::LoadError::Ambiguous(_)) => Err(ErrorData::invalid_params(e.to_string(), None)),
+                    Err(e @ skill_registry::LoadError::NotFound(_))
+                    | Err(e @ skill_registry::LoadError::Ambiguous(_)) => {
+                        Err(ErrorData::invalid_params(e.to_string(), None))
+                    }
                     Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
                 }
             }
-            other => Err(ErrorData::invalid_params(format!("unknown action: {other}"), None)),
+            other => Err(ErrorData::invalid_params(
+                format!("unknown action: {other}"),
+                None,
+            )),
         }
-    }    /// Filesystem/URL-safe stem derived from a display name — lowercased,
+    }
+    /// Filesystem/URL-safe stem derived from a display name — lowercased,
     /// non-alphanumerics collapsed to `-`, falling back to "handoff" if that
     /// leaves nothing.
     fn slugify(name: &str) -> String {
@@ -932,55 +964,165 @@ impl AgentflareMcp {
     #[tool(
         description = "Artifact operations — publish, list, get, diff, search, or delete. Single consolidated tool with `action` field (delete|diff|get|list|publish|search)."
     )]
-    fn artifact(
-        &self,
-        Parameters(req): Parameters<ArtifactRequest>,
-    ) -> Result<String, ErrorData> {
+    fn artifact(&self, Parameters(req): Parameters<ArtifactRequest>) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "publish" => {
-                let name = req.name.ok_or_else(|| ErrorData::invalid_params("name is required", None))?;
-                if name.trim().is_empty() { return Err(ErrorData::invalid_params("name is required", None)); }
-                let content = req.content.ok_or_else(|| ErrorData::invalid_params("content is required", None))?;
-                if content.is_empty() { return Err(ErrorData::invalid_params("content is required", None)); }
+                let name = req
+                    .name
+                    .ok_or_else(|| ErrorData::invalid_params("name is required", None))?;
+                if name.trim().is_empty() {
+                    return Err(ErrorData::invalid_params("name is required", None));
+                }
+                let content = req
+                    .content
+                    .ok_or_else(|| ErrorData::invalid_params("content is required", None))?;
+                if content.is_empty() {
+                    return Err(ErrorData::invalid_params("content is required", None));
+                }
                 let (store, base) = self.ensure_artifact_server()?;
-                let req2 = agentflare_artifacts::PublishRequest { name, artifact_type: agentflare_artifacts::ArtifactType::from(req.r#type.as_deref().unwrap_or("text")), content, session_id: req.session_id.unwrap_or_default(), update_id: req.update_id, label: req.label, description: req.description, favicon: req.favicon, base_version: req.base_version, sender: req.sender.or_else(|| self.agent.clone()), recipient: req.recipient, thread_id: req.thread_id, reply_to: req.reply_to, git: Self::git_provenance() };
+                let req2 = agentflare_artifacts::PublishRequest {
+                    name,
+                    artifact_type: agentflare_artifacts::ArtifactType::from(
+                        req.r#type.as_deref().unwrap_or("text"),
+                    ),
+                    content,
+                    session_id: req.session_id.unwrap_or_default(),
+                    update_id: req.update_id,
+                    label: req.label,
+                    description: req.description,
+                    favicon: req.favicon,
+                    base_version: req.base_version,
+                    sender: req.sender.or_else(|| self.agent.clone()),
+                    recipient: req.recipient,
+                    thread_id: req.thread_id,
+                    reply_to: req.reply_to,
+                    git: Self::git_provenance(),
+                };
                 let resp = store.publish(&req2).map_err(Self::artifact_error)?;
                 Ok(serde_json::to_string_pretty(&serde_json::json!({ "id": resp.id, "version": resp.version, "url": format!("{base}/{}", resp.id), "index": format!("{base}/") })).unwrap_or_default())
             }
             "list" => {
                 let (store, base) = self.ensure_artifact_server()?;
-                let summaries = store.list(req.session_id.as_deref()).map_err(Self::artifact_error)?;
-                let items: Vec<serde_json::Value> = summaries.iter().filter(|s| { req.inbox_recipient.as_deref().is_none_or(|r| s.recipient.as_deref() == Some(r)) && req.thread_id.as_deref().is_none_or(|t| s.thread_id.as_deref() == Some(t)) }).map(|s| { let mut v = serde_json::to_value(s).unwrap_or_default(); if let Some(obj) = v.as_object_mut() { obj.insert("url".into(), serde_json::json!(format!("{base}/{}", s.id))); } v }).collect();
+                let summaries = store
+                    .list(req.session_id.as_deref())
+                    .map_err(Self::artifact_error)?;
+                let items: Vec<serde_json::Value> = summaries
+                    .iter()
+                    .filter(|s| {
+                        req.inbox_recipient
+                            .as_deref()
+                            .is_none_or(|r| s.recipient.as_deref() == Some(r))
+                            && req
+                                .thread_id
+                                .as_deref()
+                                .is_none_or(|t| s.thread_id.as_deref() == Some(t))
+                    })
+                    .map(|s| {
+                        let mut v = serde_json::to_value(s).unwrap_or_default();
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert("url".into(), serde_json::json!(format!("{base}/{}", s.id)));
+                        }
+                        v
+                    })
+                    .collect();
                 Ok(serde_json::to_string_pretty(&items).unwrap_or_default())
             }
             "get" => {
-                let id = req.id.ok_or_else(|| ErrorData::invalid_params("id is required", None))?;
+                let id = req
+                    .id
+                    .ok_or_else(|| ErrorData::invalid_params("id is required", None))?;
                 let (store, _) = self.ensure_artifact_server()?;
-                let artifact = store.get(&id, req.version).map_err(Self::artifact_error)?;
+                let artifact = match req.version {
+                    Some(n) => store.get_version(&id, n),
+                    None => store.get(&id),
+                }
+                .map_err(Self::artifact_error)?;
                 Ok(serde_json::to_string_pretty(&artifact).unwrap_or_default())
             }
             "diff" => {
-                let id = req.id.ok_or_else(|| ErrorData::invalid_params("id is required", None))?;
-                let from_version = req.from_version.ok_or_else(|| ErrorData::invalid_params("from_version is required", None))?;
+                let id = req
+                    .id
+                    .ok_or_else(|| ErrorData::invalid_params("id is required", None))?;
+                let from_version = req
+                    .from_version
+                    .ok_or_else(|| ErrorData::invalid_params("from_version is required", None))?;
                 let (store, _) = self.ensure_artifact_server()?;
-                let diff = store.diff(&id, from_version, req.to_version).map_err(Self::artifact_error)?;
+                let to = match req.to_version {
+                    Some(v) => v,
+                    None => store.get(&id).map_err(Self::artifact_error)?.version,
+                };
+                let diff = store
+                    .diff(&id, from_version, to)
+                    .map_err(Self::artifact_error)?;
                 Ok(serde_json::to_string_pretty(&diff).unwrap_or_default())
             }
             "search" => {
-                let query = req.query.ok_or_else(|| ErrorData::invalid_params("query is required", None))?;
-                let (store, _) = self.ensure_artifact_server()?;
-                let results = store.search(&query, req.session_id.as_deref()).map_err(Self::artifact_error)?;
-                Ok(serde_json::to_string_pretty(&results).unwrap_or_default())
+                let query = req
+                    .query
+                    .ok_or_else(|| ErrorData::invalid_params("query is required", None))?;
+                if query.trim().is_empty() {
+                    return Err(ErrorData::invalid_params("query is required", None));
+                }
+                let (store, base) = self.ensure_artifact_server()?;
+                let needle = query.to_lowercase();
+                let mut hits = Vec::new();
+                for summary in store
+                    .list(req.session_id.as_deref())
+                    .map_err(Self::artifact_error)?
+                {
+                    let name_hit = summary.name.to_lowercase().contains(&needle);
+                    let desc_hit = summary
+                        .description
+                        .as_deref()
+                        .is_some_and(|d| d.to_lowercase().contains(&needle));
+                    let content = store
+                        .get(&summary.id)
+                        .map(|a| a.content)
+                        .unwrap_or_default();
+                    let content_pos = content.to_lowercase().find(&needle);
+                    if !(name_hit || desc_hit || content_pos.is_some()) {
+                        continue;
+                    }
+                    let snippet = content_pos.map(|pos| {
+                        let mut start = pos.saturating_sub(40);
+                        while !content.is_char_boundary(start) {
+                            start -= 1;
+                        }
+                        let mut end = (pos + needle.len() + 40).min(content.len());
+                        while !content.is_char_boundary(end) {
+                            end += 1;
+                        }
+                        content[start..end].to_string()
+                    });
+                    let mut v = serde_json::to_value(&summary).unwrap_or_default();
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert(
+                            "url".into(),
+                            serde_json::json!(format!("{base}/{}", summary.id)),
+                        );
+                        if let Some(snippet) = snippet {
+                            obj.insert("snippet".into(), serde_json::json!(snippet));
+                        }
+                    }
+                    hits.push(v);
+                }
+                Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
             }
             "delete" => {
-                let id = req.id.ok_or_else(|| ErrorData::invalid_params("id is required", None))?;
+                let id = req
+                    .id
+                    .ok_or_else(|| ErrorData::invalid_params("id is required", None))?;
                 let (store, _) = self.ensure_artifact_server()?;
                 store.delete(&id).map_err(Self::artifact_error)?;
                 Ok(serde_json::json!({"deleted": id}).to_string())
             }
-            other => Err(ErrorData::invalid_params(format!("unknown action: {other}"), None)),
+            other => Err(ErrorData::invalid_params(
+                format!("unknown action: {other}"),
+                None,
+            )),
         }
-    }    #[tool(
+    }
+    #[tool(
         description = "Hand a work product to another agent: assigns/creates an item for the recipient (in the repo's linked project) and attaches the content to it as an asset. Re-attaching under the same item_id creates the next asset version, not a duplicate. Sender is this runtime's own identity."
     )]
     fn handoff(
@@ -1455,54 +1597,97 @@ impl AgentflareMcp {
     #[tool(
         description = "Manage work claims — acquire, heartbeat, release, done, or list. Single consolidated tool with `action` field (acquire|done|heartbeat|list|release)."
     )]
-    fn claim(
-        &self,
-        Parameters(req): Parameters<ClaimRequest>,
-    ) -> Result<String, ErrorData> {
+    fn claim(&self, Parameters(req): Parameters<ClaimRequest>) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "acquire" => {
-                let target = req.target.ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
+                let target = req
+                    .target
+                    .ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
                 let repo_opt = req.repo;
                 let repo_overridden = repo_opt.as_ref().is_some_and(|r| !r.is_empty());
                 let (conn, repo) = Self::claim_ctx(&target, repo_opt)?;
                 let owner = crate::claims::owner_id();
-                let commit = if repo_overridden { None } else { Self::git_provenance().and_then(|g| g.commit) };
-                let outcome = crate::claims::acquire(&conn, &repo, &target, &owner, commit.as_deref(), crate::claims::now(), crate::claims::ttl_secs()).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let commit = if repo_overridden {
+                    None
+                } else {
+                    Self::git_provenance().and_then(|g| g.commit)
+                };
+                let outcome = crate::claims::acquire(
+                    &conn,
+                    &repo,
+                    &target,
+                    &owner,
+                    commit.as_deref(),
+                    crate::claims::now(),
+                    crate::claims::ttl_secs(),
+                )
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(match outcome {
                     crate::claims::Acquire::Acquired => serde_json::json!({ "status": "acquired", "repo": repo, "target": target, "owner": owner }),
                     crate::claims::Acquire::Held { owner: holder, age_secs } => serde_json::json!({ "status": "held", "repo": repo, "target": target, "owner": holder, "age_secs": age_secs }),
                 }.to_string())
             }
             "heartbeat" => {
-                let target = req.target.ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
+                let target = req
+                    .target
+                    .ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
                 let (conn, repo) = Self::claim_ctx(&target, req.repo)?;
                 let owner = crate::claims::owner_id();
-                let ok = crate::claims::heartbeat(&conn, &repo, &target, &owner, crate::claims::now()).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                Ok(serde_json::json!({ "refreshed": ok, "repo": repo, "target": target }).to_string())
+                let ok =
+                    crate::claims::heartbeat(&conn, &repo, &target, &owner, crate::claims::now())
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                Ok(
+                    serde_json::json!({ "refreshed": ok, "repo": repo, "target": target })
+                        .to_string(),
+                )
             }
             "release" => {
-                let target = req.target.ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
+                let target = req
+                    .target
+                    .ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
                 let (conn, repo) = Self::claim_ctx(&target, req.repo)?;
                 let owner = crate::claims::owner_id();
-                let ok = crate::claims::release(&conn, &repo, &target, &owner).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                Ok(serde_json::json!({ "released": ok, "repo": repo, "target": target }).to_string())
+                let ok = crate::claims::release(&conn, &repo, &target, &owner)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                Ok(
+                    serde_json::json!({ "released": ok, "repo": repo, "target": target })
+                        .to_string(),
+                )
             }
             "done" => {
-                let target = req.target.ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
+                let target = req
+                    .target
+                    .ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
                 let (conn, repo) = Self::claim_ctx(&target, req.repo)?;
                 let owner = crate::claims::owner_id();
-                let ok = crate::claims::done(&conn, &repo, &target, &owner, crate::claims::now()).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let ok = crate::claims::done(&conn, &repo, &target, &owner, crate::claims::now())
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(serde_json::json!({ "done": ok, "repo": repo, "target": target }).to_string())
             }
             "list" => {
                 let conn = Self::claim_db()?;
-                let scope = if req.all_repos { None } else { Some(crate::claims::resolve_repo(req.repo).ok_or_else(|| ErrorData::invalid_params("could not determine repo — run in a git repo or pass repo=owner/name (or all_repos=true)", None))?) };
-                let claims = crate::claims::list(&conn, scope.as_deref(), req.all, crate::claims::now(), crate::claims::ttl_secs()).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let scope = if req.all_repos {
+                    None
+                } else {
+                    Some(crate::claims::resolve_repo(req.repo).ok_or_else(|| ErrorData::invalid_params("could not determine repo — run in a git repo or pass repo=owner/name (or all_repos=true)", None))?)
+                };
+                let claims = crate::claims::list(
+                    &conn,
+                    scope.as_deref(),
+                    req.all,
+                    crate::claims::now(),
+                    crate::claims::ttl_secs(),
+                )
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(serde_json::to_string_pretty(&claims).unwrap_or_default())
             }
-            other => Err(ErrorData::invalid_params(format!("unknown action: {other}"), None)),
+            other => Err(ErrorData::invalid_params(
+                format!("unknown action: {other}"),
+                None,
+            )),
         }
-    }    /// Opens the ledger db.
+    }
+    /// Opens the ledger db.
     fn claim_db() -> crate::errors::Result<rusqlite::Connection> {
         Ok(crate::db::open()?)
     }
@@ -1528,35 +1713,52 @@ impl AgentflareMcp {
     #[tool(
         description = "Review operations — submit findings, run consensus, list/clear/record rounds, check scores. Single consolidated tool with `action` field (clear|consensus|list|record|scores|submit)."
     )]
-    fn review(
-        &self,
-        Parameters(req): Parameters<ReviewRequest>,
-    ) -> Result<String, ErrorData> {
+    fn review(&self, Parameters(req): Parameters<ReviewRequest>) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "submit" => {
-                let findings = req.findings.ok_or_else(|| ErrorData::invalid_params("findings is required", None))?;
+                let findings = req
+                    .findings
+                    .ok_or_else(|| ErrorData::invalid_params("findings is required", None))?;
                 let conn = Self::claim_db()?;
                 let repo = Self::resolve_repo_or_err(req.repo)?;
                 let pr = Self::resolve_round(req.pr)?;
-                let agent = req.agent.filter(|s| !s.is_empty()).unwrap_or_else(crate::review::submitter_name);
-                let parsed: Vec<crate::review::Finding> = findings.into_iter().map(serde_json::from_value).collect::<Result<_, _>>().map_err(|e| ErrorData::invalid_params(format!("invalid finding: {e}"), None))?;
-                let n = crate::review::submit(&conn, &repo, &pr, &agent, &parsed, crate::claims::now()).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                Ok(serde_json::json!({ "submitted": n, "repo": repo, "pr": pr, "agent": agent }).to_string())
+                let agent = req
+                    .agent
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(crate::review::submitter_name);
+                let parsed: Vec<crate::review::Finding> = findings
+                    .into_iter()
+                    .map(serde_json::from_value)
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| {
+                        ErrorData::invalid_params(format!("invalid finding: {e}"), None)
+                    })?;
+                let n =
+                    crate::review::submit(&conn, &repo, &pr, &agent, &parsed, crate::claims::now())
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                Ok(
+                    serde_json::json!({ "submitted": n, "repo": repo, "pr": pr, "agent": agent })
+                        .to_string(),
+                )
             }
             "consensus" => {
                 let conn = Self::claim_db()?;
                 let repo = Self::resolve_repo_or_err(req.repo)?;
                 let pr = Self::resolve_round(req.pr)?;
-                let base = req.base.unwrap_or_else(|| "master".into());
-                let head = req.head.unwrap_or_else(|| "HEAD".into());
-                let result = crate::review::consensus(&conn, &repo, &pr, &base, &head).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let findings = crate::review::load(&conn, &repo, &pr)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let diff = crate::review::compute_diff(req.base.as_deref(), req.head.as_deref())
+                    .map_err(|e| ErrorData::invalid_params(e, None))?;
+                let changed = crate::review::changed_lines(&diff);
+                let result = crate::review::consensus(&findings, &changed);
                 Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
             }
             "list" => {
                 let conn = Self::claim_db()?;
                 let repo = Self::resolve_repo_or_err(req.repo)?;
                 let pr = Self::resolve_round(req.pr)?;
-                let findings = crate::review::load(&conn, &repo, &pr).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let findings = crate::review::load(&conn, &repo, &pr)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 let rows: Vec<serde_json::Value> = findings.iter().map(|sf| serde_json::json!({ "agent": sf.agent, "file": sf.finding.file, "line": sf.finding.line, "message": sf.finding.message, "severity": sf.finding.severity })).collect();
                 Ok(serde_json::to_string_pretty(&rows).unwrap_or_default())
             }
@@ -1564,32 +1766,50 @@ impl AgentflareMcp {
                 let conn = Self::claim_db()?;
                 let repo = Self::resolve_repo_or_err(req.repo)?;
                 let pr = Self::resolve_round(req.pr)?;
-                crate::review::clear(&conn, &repo, &pr).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                crate::review::clear(&conn, &repo, &pr)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(serde_json::json!({"cleared": true}).to_string())
             }
             "record" => {
                 let conn = Self::claim_db()?;
                 let repo = Self::resolve_repo_or_err(req.repo)?;
                 let pr = Self::resolve_round(req.pr)?;
-                let base = req.base.unwrap_or_else(|| "master".into());
-                let head = req.head.unwrap_or_else(|| "HEAD".into());
-                let findings = crate::review::load(&conn, &repo, &pr).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                let diff = crate::review::compute_diff(req.base.as_deref(), req.head.as_deref()).map_err(|e| ErrorData::invalid_params(e, None))?;
+                let findings = crate::review::load(&conn, &repo, &pr)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let diff = crate::review::compute_diff(req.base.as_deref(), req.head.as_deref())
+                    .map_err(|e| ErrorData::invalid_params(e, None))?;
                 let changed = crate::review::changed_lines(&diff);
-                let n = crate::review::record_round(&conn, &repo, &pr, &findings, &changed, crate::claims::now()).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let n = crate::review::record_round(
+                    &conn,
+                    &repo,
+                    &pr,
+                    &findings,
+                    &changed,
+                    crate::claims::now(),
+                )
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(serde_json::json!({ "recorded_agents": n, "repo": repo, "pr": pr }).to_string())
             }
             "scores" => {
                 let conn = Self::claim_db()?;
                 let repo = req.repo;
                 let all_repos = req.all_repos;
-                let scope = if all_repos { None } else { Some(Self::resolve_repo_or_err(repo)?) };
-                let scores = crate::review::scores(&conn, scope.as_deref()).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let scope = if all_repos {
+                    None
+                } else {
+                    Some(Self::resolve_repo_or_err(repo)?)
+                };
+                let scores = crate::review::scores(&conn, scope.as_deref())
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(serde_json::to_string_pretty(&scores).unwrap_or_default())
             }
-            other => Err(ErrorData::invalid_params(format!("unknown action: {other}"), None)),
+            other => Err(ErrorData::invalid_params(
+                format!("unknown action: {other}"),
+                None,
+            )),
         }
-    }    fn resolve_repo_or_err(repo: Option<String>) -> Result<String, ErrorData> {
+    }
+    fn resolve_repo_or_err(repo: Option<String>) -> Result<String, ErrorData> {
         crate::claims::resolve_repo(repo).ok_or_else(|| {
             ErrorData::invalid_params(
                 "could not determine repo — run in a git repo or pass repo=owner/name",
@@ -1728,78 +1948,185 @@ impl AgentflareMcp {
     ) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "search" => {
-                let query = req.query.ok_or_else(|| ErrorData::invalid_params("query is required", None))?;
-                if query.trim().is_empty() { return Err(ErrorData::invalid_params("query is required", None)); }
+                let query = req
+                    .query
+                    .ok_or_else(|| ErrorData::invalid_params("query is required", None))?;
+                if query.trim().is_empty() {
+                    return Err(ErrorData::invalid_params("query is required", None));
+                }
                 let mode = match req.mode.as_deref() {
                     None | Some("all") => gateway_registry::MatchMode::All,
                     Some("any") => gateway_registry::MatchMode::Any,
-                    Some(other) => return Err(ErrorData::invalid_params(format!("mode must be 'all' or 'any', got '{other}'"), None)),
+                    Some(other) => {
+                        return Err(ErrorData::invalid_params(
+                            format!("mode must be 'all' or 'any', got '{other}'"),
+                            None,
+                        ));
+                    }
                 };
                 let guard = self.ensure_gateway_registry().await?;
                 let reg = guard.as_ref().expect("ensured above");
-                let hits = reg.search(&query, req.limit.unwrap_or(5), mode).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let hits = reg
+                    .search(&query, req.limit.unwrap_or(5), mode)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
             }
             "execute" => {
-                let server = req.server.ok_or_else(|| ErrorData::invalid_params("server is required", None))?;
-                let tool = req.tool.ok_or_else(|| ErrorData::invalid_params("tool is required", None))?;
-                if server.trim().is_empty() || tool.trim().is_empty() { return Err(ErrorData::invalid_params("server and tool are required", None)); }
-                let args = req.args.map(serde_json::Value::Object).unwrap_or(serde_json::Value::Null);
+                let server = req
+                    .server
+                    .ok_or_else(|| ErrorData::invalid_params("server is required", None))?;
+                let tool = req
+                    .tool
+                    .ok_or_else(|| ErrorData::invalid_params("tool is required", None))?;
+                if server.trim().is_empty() || tool.trim().is_empty() {
+                    return Err(ErrorData::invalid_params(
+                        "server and tool are required",
+                        None,
+                    ));
+                }
+                let args = req
+                    .args
+                    .map(serde_json::Value::Object)
+                    .unwrap_or(serde_json::Value::Null);
                 let guard = self.ensure_gateway_registry().await?;
                 let reg = guard.as_ref().expect("ensured above");
                 match reg.execute(&server, &tool, args).await {
-                    Ok(value) => { let capped = gateway_registry::truncate_if_needed(&value, gateway_registry::DEFAULT_MAX_CHARS); Ok(serde_json::to_string_pretty(&capped).unwrap_or_default()) }
-                    Err(e @ gateway_registry::GatewayError::ServerNotFound(_)) | Err(e @ gateway_registry::GatewayError::ToolNotFound(_)) | Err(e @ gateway_registry::GatewayError::InvalidArgument(_)) => Err(ErrorData::invalid_params(e.to_string(), None)),
-                    Err(e) => Err(ErrorData::internal_error(gateway_registry::redact_error_for_llm(&e.to_string()), None)),
+                    Ok(value) => {
+                        let capped = gateway_registry::truncate_if_needed(
+                            &value,
+                            gateway_registry::DEFAULT_MAX_CHARS,
+                        );
+                        Ok(serde_json::to_string_pretty(&capped).unwrap_or_default())
+                    }
+                    Err(e @ gateway_registry::GatewayError::ServerNotFound(_))
+                    | Err(e @ gateway_registry::GatewayError::ToolNotFound(_))
+                    | Err(e @ gateway_registry::GatewayError::InvalidArgument(_)) => {
+                        Err(ErrorData::invalid_params(e.to_string(), None))
+                    }
+                    Err(e) => Err(ErrorData::internal_error(
+                        gateway_registry::redact_error_for_llm(&e.to_string()),
+                        None,
+                    )),
                 }
             }
-            other => Err(ErrorData::invalid_params(format!("unknown action: {other}"), None)),
+            other => Err(ErrorData::invalid_params(
+                format!("unknown action: {other}"),
+                None,
+            )),
         }
-    }    // --- Memory tools ---
+    } // --- Memory tools ---
     #[tool(
         description = "Memory operations — remember, recall, context, curate, handoff, or relate observations. Single consolidated tool with `action` field (context|curate|handoff|recall|relate|remember)."
     )]
-    fn memory(
-        &self,
-        Parameters(req): Parameters<MemoryRequest>,
-    ) -> Result<String, ErrorData> {
+    fn memory(&self, Parameters(req): Parameters<MemoryRequest>) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "remember" => {
-                let title = req.title.ok_or_else(|| ErrorData::invalid_params("title is required", None))?;
-                let content = req.content.ok_or_else(|| ErrorData::invalid_params("content is required", None))?;
-                let r#type = req.r#type.ok_or_else(|| ErrorData::invalid_params("type is required", None))?;
-                let input = crate::memory::mcp::RememberInput { title, content, r#type, session_id: req.session_id, project: req.project, topic_key: req.topic_key, scope: req.scope };
-                crate::memory::mcp::handle_remember(input).map_err(|e| ErrorData::internal_error(e, None))
+                let title = req
+                    .title
+                    .ok_or_else(|| ErrorData::invalid_params("title is required", None))?;
+                let content = req
+                    .content
+                    .ok_or_else(|| ErrorData::invalid_params("content is required", None))?;
+                let r#type = req
+                    .r#type
+                    .ok_or_else(|| ErrorData::invalid_params("type is required", None))?;
+                let input = crate::memory::mcp::RememberInput {
+                    title,
+                    content,
+                    r#type,
+                    session_id: req.session_id,
+                    project: req.project,
+                    topic_key: req.topic_key,
+                    scope: req.scope,
+                };
+                crate::memory::mcp::handle_remember(input)
+                    .map_err(|e| ErrorData::internal_error(e, None))
             }
             "recall" => {
-                let input = crate::memory::mcp::RecallInput { query: req.query, id: req.id, r#type: req.r#type, project: req.project, limit: req.limit };
-                crate::memory::mcp::handle_recall(input).map_err(|e| ErrorData::internal_error(e, None))
+                let input = crate::memory::mcp::RecallInput {
+                    query: req.query,
+                    id: req.id,
+                    r#type: req.r#type,
+                    project: req.project,
+                    limit: req.limit,
+                };
+                crate::memory::mcp::handle_recall(input)
+                    .map_err(|e| ErrorData::internal_error(e, None))
             }
             "context" => {
-                let input = crate::memory::mcp::ContextInput { session_id: req.session_id, project: req.project };
-                crate::memory::mcp::handle_context(input).map_err(|e| ErrorData::internal_error(e, None))
+                let input = crate::memory::mcp::ContextInput {
+                    session_id: req.session_id,
+                    project: req.project,
+                };
+                crate::memory::mcp::handle_context(input)
+                    .map_err(|e| ErrorData::internal_error(e, None))
             }
             "handoff" => {
-                let session_id = req.session_id.ok_or_else(|| ErrorData::invalid_params("session_id is required", None))?;
-                let summary = req.summary.ok_or_else(|| ErrorData::invalid_params("summary is required", None))?;
-                let input = crate::memory::mcp::HandoffInput { session_id, summary, findings: req.findings, decisions: req.decisions, files_touched: req.files_touched, evidence: req.evidence };
-                crate::memory::mcp::handle_handoff(input).map_err(|e| ErrorData::internal_error(e, None))
+                let session_id = req
+                    .session_id
+                    .ok_or_else(|| ErrorData::invalid_params("session_id is required", None))?;
+                let summary = req
+                    .summary
+                    .ok_or_else(|| ErrorData::invalid_params("summary is required", None))?;
+                let input = crate::memory::mcp::HandoffInput {
+                    session_id,
+                    summary,
+                    findings: req.findings,
+                    decisions: req.decisions,
+                    files_touched: req.files_touched,
+                    evidence: req.evidence,
+                };
+                crate::memory::mcp::handle_handoff(input)
+                    .map_err(|e| ErrorData::internal_error(e, None))
             }
             "relate" => {
-                let source_id = req.source_id.ok_or_else(|| ErrorData::invalid_params("source_id is required", None))?;
-                let target_id = req.target_id.ok_or_else(|| ErrorData::invalid_params("target_id is required", None))?;
-                let relation = req.relation.ok_or_else(|| ErrorData::invalid_params("relation is required", None))?;
-                let input = crate::memory::mcp::RelateInput { source_id, target_id, relation, reason: req.reason, confidence: req.confidence };
-                crate::memory::mcp::handle_relate(input).map_err(|e| ErrorData::internal_error(e, None))
+                let source_id = req
+                    .source_id
+                    .ok_or_else(|| ErrorData::invalid_params("source_id is required", None))?;
+                let target_id = req
+                    .target_id
+                    .ok_or_else(|| ErrorData::invalid_params("target_id is required", None))?;
+                let relation = req
+                    .relation
+                    .ok_or_else(|| ErrorData::invalid_params("relation is required", None))?;
+                let input = crate::memory::mcp::RelateInput {
+                    source_id,
+                    target_id,
+                    relation,
+                    reason: req.reason,
+                    confidence: req.confidence,
+                };
+                crate::memory::mcp::handle_relate(input)
+                    .map_err(|e| ErrorData::internal_error(e, None))
             }
             "curate" => {
-                let id = req.id.ok_or_else(|| ErrorData::invalid_params("id is required", None))?;
-                let input = crate::memory::mcp::CurateInput { action: req.action.clone(), id, title: req.title, content: req.content, r#type: req.r#type, pinned: req.pinned };
-                crate::memory::mcp::handle_curate(input).map_err(|e| ErrorData::internal_error(e, None))
+                let id = req
+                    .id
+                    .ok_or_else(|| ErrorData::invalid_params("id is required", None))?;
+                let curate_action = req.curate_action.ok_or_else(|| {
+                    ErrorData::invalid_params(
+                        "curate_action is required (update|delete|pin|unpin)",
+                        None,
+                    )
+                })?;
+                let input = crate::memory::mcp::CurateInput {
+                    action: curate_action,
+                    id,
+                    title: req.title,
+                    content: req.content,
+                    r#type: req.r#type,
+                    pinned: req.pinned,
+                };
+                crate::memory::mcp::handle_curate(input)
+                    .map_err(|e| ErrorData::internal_error(e, None))
             }
-            other => Err(ErrorData::invalid_params(format!("unknown action: {other}"), None)),
+            other => Err(ErrorData::invalid_params(
+                format!("unknown action: {other}"),
+                None,
+            )),
         }
-    }    fn item_inner(&self, req: ItemRequest) -> Result<String, ErrorData> {
+    }
+    fn item_inner(&self, req: ItemRequest) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "create" => {
                 let name = req.name.ok_or_else(|| {
@@ -3077,10 +3404,10 @@ mod tests {
     fn skill_search_empty_query_is_invalid_params() {
         let s = AgentflareMcp::default();
         let err = s
-            .skill_search(Parameters(SkillSearchRequest {
-                query: "".into(),
-                limit: None,
-                mode: None,
+            .skill(Parameters(SkillRequest {
+                action: "search".into(),
+                query: Some("".into()),
+                ..Default::default()
             }))
             .unwrap_err();
         assert!(err.to_string().contains("query"));
@@ -3095,9 +3422,11 @@ mod tests {
             ..Default::default()
         };
         let out = s
-            .skill_load(Parameters(SkillLoadRequest {
-                name: "definitely-not-a-skill-xyz".into(),
+            .skill(Parameters(SkillRequest {
+                action: "load".into(),
+                name: Some("definitely-not-a-skill-xyz".into()),
                 original: false,
+                ..Default::default()
             }))
             .unwrap_err();
         assert!(out.to_string().contains("skill_search"));
@@ -3107,10 +3436,11 @@ mod tests {
     fn skill_search_mode_rejects_unknown_value() {
         let s = AgentflareMcp::default();
         let err = s
-            .skill_search(Parameters(SkillSearchRequest {
-                query: "anything".into(),
-                limit: None,
+            .skill(Parameters(SkillRequest {
+                action: "search".into(),
+                query: Some("anything".into()),
                 mode: Some("fuzzy".into()),
+                ..Default::default()
             }))
             .unwrap_err();
         assert!(err.to_string().contains("mode"));
@@ -3125,10 +3455,10 @@ mod tests {
             ..Default::default()
         };
         let err = s
-            .gateway_search(Parameters(GatewaySearchRequest {
-                query: "".into(),
-                limit: None,
-                mode: None,
+            .gateway(Parameters(GatewayRequest {
+                action: "search".into(),
+                query: Some("".into()),
+                ..Default::default()
             }))
             .await
             .unwrap_err();
@@ -3143,10 +3473,11 @@ mod tests {
             ..Default::default()
         };
         let err = s
-            .gateway_search(Parameters(GatewaySearchRequest {
-                query: "x".into(),
-                limit: None,
+            .gateway(Parameters(GatewayRequest {
+                action: "search".into(),
+                query: Some("x".into()),
                 mode: Some("bogus".into()),
+                ..Default::default()
             }))
             .await
             .unwrap_err();
@@ -3161,10 +3492,12 @@ mod tests {
             ..Default::default()
         };
         let err = s
-            .gateway_execute(Parameters(GatewayExecuteRequest {
-                server: "".into(),
-                tool: "x".into(),
+            .gateway(Parameters(GatewayRequest {
+                action: "execute".into(),
+                server: Some("".into()),
+                tool: Some("x".into()),
                 args: Some(serde_json::Map::new()),
+                ..Default::default()
             }))
             .await
             .unwrap_err();
@@ -3182,10 +3515,12 @@ mod tests {
             ..Default::default()
         };
         let err = s
-            .gateway_execute(Parameters(GatewayExecuteRequest {
-                server: "definitely-not-a-configured-server".into(),
-                tool: "x".into(),
+            .gateway(Parameters(GatewayRequest {
+                action: "execute".into(),
+                server: Some("definitely-not-a-configured-server".into()),
+                tool: Some("x".into()),
                 args: Some(serde_json::Map::new()),
+                ..Default::default()
             }))
             .await
             .unwrap_err();
@@ -3195,7 +3530,7 @@ mod tests {
 
     #[test]
     fn gateway_execute_args_schema_is_object_or_null() {
-        let schema = schemars::schema_for!(GatewayExecuteRequest);
+        let schema = schemars::schema_for!(GatewayRequest);
         let schema_json = serde_json::to_value(&schema).unwrap();
         let args_schema = schema_json
             .get("properties")
@@ -3232,10 +3567,11 @@ mod tests {
             ..Default::default()
         };
         let out = s
-            .artifact_publish(Parameters(ArtifactPublishRequest {
-                name: "hello".into(),
+            .artifact(Parameters(ArtifactRequest {
+                action: "publish".into(),
+                name: Some("hello".into()),
                 r#type: None,
-                content: "artifact-body-marker".into(),
+                content: Some("artifact-body-marker".into()),
                 session_id: None,
                 update_id: None,
                 ..Default::default()
@@ -3262,10 +3598,11 @@ mod tests {
             ..Default::default()
         };
         let first: serde_json::Value = serde_json::from_str(
-            &s.artifact_publish(Parameters(ArtifactPublishRequest {
-                name: "doc".into(),
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "publish".into(),
+                name: Some("doc".into()),
                 r#type: Some("markdown".into()),
-                content: "v1".into(),
+                content: Some("v1".into()),
                 session_id: Some("ses-1".into()),
                 update_id: None,
                 ..Default::default()
@@ -3276,10 +3613,11 @@ mod tests {
         let id = first["id"].as_str().unwrap().to_string();
 
         let second: serde_json::Value = serde_json::from_str(
-            &s.artifact_publish(Parameters(ArtifactPublishRequest {
-                name: "doc".into(),
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "publish".into(),
+                name: Some("doc".into()),
                 r#type: Some("markdown".into()),
-                content: "v2".into(),
+                content: Some("v2".into()),
                 session_id: Some("ses-1".into()),
                 update_id: Some(id.clone()),
                 ..Default::default()
@@ -3300,10 +3638,11 @@ mod tests {
         };
         let publish = |name: &str, session: &str| -> serde_json::Value {
             serde_json::from_str(
-                &s.artifact_publish(Parameters(ArtifactPublishRequest {
-                    name: name.into(),
+                &s.artifact(Parameters(ArtifactRequest {
+                    action: "publish".into(),
+                    name: Some(name.into()),
                     r#type: None,
-                    content: format!("content-of-{name}"),
+                    content: Some(format!("content-of-{name}")),
                     session_id: Some(session.into()),
                     update_id: None,
                     description: Some(format!("desc-{name}")),
@@ -3317,14 +3656,18 @@ mod tests {
         let _b = publish("beta", "ses-2");
 
         let all: serde_json::Value = serde_json::from_str(
-            &s.artifact_list(Parameters(ArtifactListRequest::default()))
-                .unwrap(),
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "list".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(all.as_array().unwrap().len(), 2);
 
         let one: serde_json::Value = serde_json::from_str(
-            &s.artifact_list(Parameters(ArtifactListRequest {
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "list".into(),
                 session_id: Some("ses-1".into()),
                 ..Default::default()
             }))
@@ -3337,9 +3680,11 @@ mod tests {
 
         let id = a["id"].as_str().unwrap().to_string();
         let got: serde_json::Value = serde_json::from_str(
-            &s.artifact_get(Parameters(ArtifactGetRequest {
-                id: id.clone(),
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "get".into(),
+                id: Some(id.clone()),
                 version: None,
+                ..Default::default()
             }))
             .unwrap(),
         )
@@ -3347,14 +3692,23 @@ mod tests {
         assert_eq!(got["content"], "content-of-alpha");
 
         let del: serde_json::Value = serde_json::from_str(
-            &s.artifact_delete(Parameters(ArtifactDeleteRequest { id: id.clone() }))
-                .unwrap(),
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "delete".into(),
+                id: Some(id.clone()),
+                ..Default::default()
+            }))
+            .unwrap(),
         )
         .unwrap();
-        assert_eq!(del["deleted"], true);
+        assert_eq!(del["deleted"], id);
 
         let err = s
-            .artifact_get(Parameters(ArtifactGetRequest { id, version: None }))
+            .artifact(Parameters(ArtifactRequest {
+                action: "get".into(),
+                id: Some(id),
+                version: None,
+                ..Default::default()
+            }))
             .unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
@@ -3367,10 +3721,11 @@ mod tests {
             ..Default::default()
         };
         let first: serde_json::Value = serde_json::from_str(
-            &s.artifact_publish(Parameters(ArtifactPublishRequest {
-                name: "doc".into(),
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "publish".into(),
+                name: Some("doc".into()),
                 r#type: None,
-                content: "v1".into(),
+                content: Some("v1".into()),
                 session_id: None,
                 update_id: None,
                 label: Some("draft".into()),
@@ -3384,10 +3739,11 @@ mod tests {
 
         // stale base_version maps to invalid_params, not internal_error
         let update = |base: Option<u32>, content: &str| {
-            s.artifact_publish(Parameters(ArtifactPublishRequest {
-                name: "doc".into(),
+            s.artifact(Parameters(ArtifactRequest {
+                action: "publish".into(),
+                name: Some("doc".into()),
                 r#type: None,
-                content: content.into(),
+                content: Some(content.into()),
                 session_id: None,
                 update_id: Some(id.clone()),
                 base_version: base,
@@ -3413,9 +3769,10 @@ mod tests {
         let publish =
             |name: &str, recipient: Option<&str>, thread: Option<&str>| -> serde_json::Value {
                 serde_json::from_str(
-                    &s.artifact_publish(Parameters(ArtifactPublishRequest {
-                        name: name.into(),
-                        content: format!("content {name}"),
+                    &s.artifact(Parameters(ArtifactRequest {
+                        action: "publish".into(),
+                        name: Some(name.into()),
+                        content: Some(format!("content {name}")),
                         sender: Some("claude-code".into()),
                         recipient: recipient.map(Into::into),
                         thread_id: thread.map(Into::into),
@@ -3430,8 +3787,9 @@ mod tests {
         publish("other", None, None);
 
         let inbox: serde_json::Value = serde_json::from_str(
-            &s.artifact_list(Parameters(ArtifactListRequest {
-                recipient: Some("codex".into()),
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "list".into(),
+                inbox_recipient: Some("codex".into()),
                 ..Default::default()
             }))
             .unwrap(),
@@ -3441,7 +3799,8 @@ mod tests {
         assert_eq!(inbox[0]["name"], "packet");
 
         let thread: serde_json::Value = serde_json::from_str(
-            &s.artifact_list(Parameters(ArtifactListRequest {
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "list".into(),
                 thread_id: Some("t1".into()),
                 ..Default::default()
             }))
@@ -3623,18 +3982,20 @@ mod tests {
             ..Default::default()
         };
         let first: serde_json::Value = serde_json::from_str(
-            &s.artifact_publish(Parameters(ArtifactPublishRequest {
-                name: "doc".into(),
-                content: "alpha\nbeta\n".into(),
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "publish".into(),
+                name: Some("doc".into()),
+                content: Some("alpha\nbeta\n".into()),
                 ..Default::default()
             }))
             .unwrap(),
         )
         .unwrap();
         let id = first["id"].as_str().unwrap().to_string();
-        s.artifact_publish(Parameters(ArtifactPublishRequest {
-            name: "doc".into(),
-            content: "alpha\ngamma\n".into(),
+        s.artifact(Parameters(ArtifactRequest {
+            action: "publish".into(),
+            name: Some("doc".into()),
+            content: Some("alpha\ngamma\n".into()),
             update_id: Some(id.clone()),
             ..Default::default()
         }))
@@ -3642,10 +4003,12 @@ mod tests {
 
         // to_version omitted = latest
         let diff = s
-            .artifact_diff(Parameters(ArtifactDiffRequest {
-                id,
-                from_version: 1,
+            .artifact(Parameters(ArtifactRequest {
+                action: "diff".into(),
+                id: Some(id),
+                from_version: Some(1),
                 to_version: None,
+                ..Default::default()
             }))
             .unwrap();
         assert!(diff.contains("-beta"), "{diff}");
@@ -3659,23 +4022,27 @@ mod tests {
             artifacts_dir_override: Some(tmp.path().to_path_buf()),
             ..Default::default()
         };
-        s.artifact_publish(Parameters(ArtifactPublishRequest {
-            name: "alpha".into(),
-            content: "there is a hidden NEEDLE in here".into(),
+        s.artifact(Parameters(ArtifactRequest {
+            action: "publish".into(),
+            name: Some("alpha".into()),
+            content: Some("there is a hidden NEEDLE in here".into()),
             ..Default::default()
         }))
         .unwrap();
-        s.artifact_publish(Parameters(ArtifactPublishRequest {
-            name: "beta".into(),
-            content: "nothing to see".into(),
+        s.artifact(Parameters(ArtifactRequest {
+            action: "publish".into(),
+            name: Some("beta".into()),
+            content: Some("nothing to see".into()),
             ..Default::default()
         }))
         .unwrap();
 
         let hits: serde_json::Value = serde_json::from_str(
-            &s.artifact_search(Parameters(ArtifactSearchRequest {
-                query: "needle".into(),
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "search".into(),
+                query: Some("needle".into()),
                 session_id: None,
+                ..Default::default()
             }))
             .unwrap(),
         )
@@ -3692,9 +4059,11 @@ mod tests {
         );
 
         let by_name: serde_json::Value = serde_json::from_str(
-            &s.artifact_search(Parameters(ArtifactSearchRequest {
-                query: "beta".into(),
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "search".into(),
+                query: Some("beta".into()),
                 session_id: None,
+                ..Default::default()
             }))
             .unwrap(),
         )
@@ -3711,18 +4080,21 @@ mod tests {
             ..Default::default()
         };
         let out: serde_json::Value = serde_json::from_str(
-            &s.artifact_publish(Parameters(ArtifactPublishRequest {
-                name: "prov".into(),
-                content: "x".into(),
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "publish".into(),
+                name: Some("prov".into()),
+                content: Some("x".into()),
                 ..Default::default()
             }))
             .unwrap(),
         )
         .unwrap();
         let got: serde_json::Value = serde_json::from_str(
-            &s.artifact_get(Parameters(ArtifactGetRequest {
-                id: out["id"].as_str().unwrap().into(),
+            &s.artifact(Parameters(ArtifactRequest {
+                action: "get".into(),
+                id: Some(out["id"].as_str().unwrap().into()),
                 version: None,
+                ..Default::default()
             }))
             .unwrap(),
         )
@@ -3739,13 +4111,15 @@ mod tests {
             agent: Some("opencode".into()),
             ..Default::default()
         };
-        let sender_of = |req: ArtifactPublishRequest| -> serde_json::Value {
+        let sender_of = |req: ArtifactRequest| -> serde_json::Value {
             let out: serde_json::Value =
-                serde_json::from_str(&s.artifact_publish(Parameters(req)).unwrap()).unwrap();
+                serde_json::from_str(&s.artifact(Parameters(req)).unwrap()).unwrap();
             let got: serde_json::Value = serde_json::from_str(
-                &s.artifact_get(Parameters(ArtifactGetRequest {
-                    id: out["id"].as_str().unwrap().into(),
+                &s.artifact(Parameters(ArtifactRequest {
+                    action: "get".into(),
+                    id: Some(out["id"].as_str().unwrap().into()),
                     version: None,
+                    ..Default::default()
                 }))
                 .unwrap(),
             )
@@ -3753,17 +4127,19 @@ mod tests {
             got["sender"].clone()
         };
 
-        let defaulted = sender_of(ArtifactPublishRequest {
-            name: "defaulted".into(),
-            content: "x".into(),
+        let defaulted = sender_of(ArtifactRequest {
+            action: "publish".into(),
+            name: Some("defaulted".into()),
+            content: Some("x".into()),
             ..Default::default()
         });
         assert_eq!(defaulted, "opencode");
 
         // An explicit sender always wins over the identity default.
-        let explicit = sender_of(ArtifactPublishRequest {
-            name: "explicit".into(),
-            content: "x".into(),
+        let explicit = sender_of(ArtifactRequest {
+            action: "publish".into(),
+            name: Some("explicit".into()),
+            content: Some("x".into()),
             sender: Some("codex".into()),
             ..Default::default()
         });
@@ -3795,10 +4171,11 @@ mod tests {
         };
         for (name, content) in [("", "x"), ("x", "")] {
             let err = s
-                .artifact_publish(Parameters(ArtifactPublishRequest {
-                    name: name.into(),
+                .artifact(Parameters(ArtifactRequest {
+                    action: "publish".into(),
+                    name: Some(name.into()),
                     r#type: None,
-                    content: content.into(),
+                    content: Some(content.into()),
                     session_id: None,
                     update_id: None,
                     ..Default::default()

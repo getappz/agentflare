@@ -444,13 +444,19 @@ pub fn claim(
 /// via `claim::done`. Returns `Ok(true)` when the item was actually moved
 /// to completed, `Ok(false)` when the caller doesn't own the claim.
 pub fn mark_completed(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
-    // Guards: don't advance state unless the caller still holds the lease.
-    if !crate::claim::is_owner(conn, item_id, owner)? {
+    // One transaction start to finish so the ownership check can't go stale
+    // between the guard and the write — without this, a concurrent
+    // release()+claim() by a different owner could slip in between the
+    // check and update_state below, completing the item out from under its
+    // new owner.
+    let tx = conn.unchecked_transaction()?;
+    if !crate::claim::is_owner(&tx, item_id, owner)? {
         return Ok(false);
     }
-    let item = get(conn, item_id)?;
-    let completed_state = crate::state::first_in_group(conn, &item.project_id, "completed")?;
-    update_state(conn, item_id, &completed_state.id)?;
+    let item = get(&tx, item_id)?;
+    let completed_state = crate::state::first_in_group(&tx, &item.project_id, "completed")?;
+    update_state(&tx, item_id, &completed_state.id)?;
+    tx.commit()?;
     // Keep the claim lease held for the MCP caller's deferred release.
     Ok(true)
 }

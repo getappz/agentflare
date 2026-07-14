@@ -179,12 +179,7 @@ impl ClaimLedger {
     /// Ownership check without mutation — used by the `mark_completed` +
     /// deferred-release split to verify the caller still holds the claim
     /// before advancing the item's state.
-    pub fn is_owner(
-        &self,
-        conn: &Connection,
-        key: &[&str],
-        owner: &str,
-    ) -> rusqlite::Result<bool> {
+    pub fn is_owner(&self, conn: &Connection, key: &[&str], owner: &str) -> rusqlite::Result<bool> {
         let sql = format!(
             "SELECT 1 FROM {t} WHERE {pred} AND owner = ?{owner_p} AND status = 'claimed'",
             t = self.table,
