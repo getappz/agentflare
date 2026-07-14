@@ -1,4 +1,4 @@
-//! Caps oversized `gateway_execute` results so one chatty downstream tool
+//! Caps oversized `tool_execute` results so one chatty downstream tool
 //! can't blow out the LLM's context. Same motivation as forgemax's
 //! `MAX_RESULT_CHARS` envelope, written fresh (no code shared — FSL).
 
@@ -51,7 +51,7 @@ fn build_envelope(json: &str, cut: usize) -> Value {
 }
 
 /// The ACTUAL serialized size of a candidate envelope — matches
-/// `gateway_execute` (`src/mcp_server.rs`), which serializes the capped
+/// `tool_execute` (`src/mcp_server.rs`), which serializes the capped
 /// value with `serde_json::to_string_pretty` before returning it.
 fn envelope_len(envelope: &Value) -> usize {
     serde_json::to_string_pretty(envelope)

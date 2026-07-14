@@ -19,7 +19,7 @@ pub enum GatewayError {
     /// A local, pre-flight validation failure (e.g. malformed `args`) that
     /// happens entirely before any downstream I/O — distinct from
     /// `Upstream`, which is reserved for the downstream server itself
-    /// failing. Callers (see `src/mcp_server.rs::gateway_execute`) map this
+    /// failing. Callers (see `src/mcp_server.rs::tool_execute`) map this
     /// to `invalid_params` like `ServerNotFound`/`ToolNotFound`, since it's
     /// a caller-fixable mistake, not an infrastructure failure.
     #[error("{0}")]

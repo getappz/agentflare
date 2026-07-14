@@ -28,10 +28,12 @@ pub const GIT_SUPERSEDED: &[&str] = &[
 
 pub const LEANCTX: &str = r#"@use: lean-ctx over native tools — ctx_read>Read/cat, ctx_shell>Bash, ctx_search>Grep, ctx_glob>Glob, ctx_callgraph>grep for "who calls X"
 @when: unfamiliar code — ctx_compose FIRST, one call vs search→read→search chain
+@fallback: ctx_* missing from your tool list? It's behind the gateway — tool(action="search", query="ctx_read") then tool(action="execute", server="leanctx", tool=<name>, args={...})
 @scope: every subagent"#;
 
 pub const LEANCTX_SUPERSEDED: &[&str] = &[
     "Prefer lean-ctx over native tools: ctx_read > Read/cat, ctx_shell > Bash, ctx_search > Grep, ctx_glob > Glob. Orient with ctx_compose before exploring unfamiliar code — one call instead of a search-read-search chain. ctx_callgraph answers \"who calls X\", not grep. Same rule for every subagent.",
+    "@use: lean-ctx over native tools — ctx_read>Read/cat, ctx_shell>Bash, ctx_search>Grep, ctx_glob>Glob, ctx_callgraph>grep for \"who calls X\"\n@when: unfamiliar code — ctx_compose FIRST, one call vs search→read→search chain\n@scope: every subagent",
 ];
 
 pub fn all() -> Vec<&'static str> {

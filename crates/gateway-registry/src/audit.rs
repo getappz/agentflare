@@ -1,4 +1,4 @@
-//! Minimal append-only audit trail for `gateway_execute` calls: timestamp,
+//! Minimal append-only audit trail for `tool_execute` calls: timestamp,
 //! server, tool, a hash of the args (never the raw args — they may contain
 //! secrets), and outcome. Same category of guard forgemax's
 //! `forge-audit` documents; written fresh here, not ported — see
