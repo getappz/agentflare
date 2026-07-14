@@ -1947,10 +1947,7 @@ impl AgentflareMcp {
     #[tool(
         description = "Tool operations — search downstream MCP servers' tools by task description or execute one. Single consolidated tool with `action` field (search|execute)."
     )]
-    async fn tool(
-        &self,
-        Parameters(req): Parameters<ToolRequest>,
-    ) -> Result<String, ErrorData> {
+    async fn tool(&self, Parameters(req): Parameters<ToolRequest>) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "search" => {
                 let query = req
