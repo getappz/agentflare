@@ -1,18 +1,12 @@
-//! BM25 search over the FTS5 tools index. Same query-sanitization approach
-//! as `crates/skill-registry/src/search.rs`: every whitespace token is
-//! double-quoted so FTS5 operators embedded in free-text queries can't
-//! alter the query.
+//! BM25 search over the FTS5 tools index. Uses shared primitives from
+//! `flare-search-kit` for query sanitization and limit clamping.
 
+// Re-exports for external consumers building their own FTS5 queries.
+#[allow(unused_imports)]
+pub use flare_search_kit::{Bm25Weights, MatchMode};
+use flare_search_kit::{clamped_limit, fts_query};
 use rusqlite::Connection;
 use serde_json::Value;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchMode {
-    /// AND semantics (default): every token must match.
-    All,
-    /// OR semantics: broader recall for retries.
-    Any,
-}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolHit {
@@ -21,39 +15,6 @@ pub struct ToolHit {
     pub description: String,
     pub input_schema: Value,
     pub score: f64,
-}
-
-/// Ceiling applied to a caller-supplied `limit` before it's used in
-/// SQLite's `LIMIT` clause. Two reasons: (1) casting a huge `usize` (e.g.
-/// `usize::MAX`, reachable via `tool_search`'s MCP request) straight to
-/// `i64` can wrap around to a negative number in two's-complement, and
-/// SQLite treats a negative `LIMIT` as "no limit" — silently defeating the
-/// cap; (2) even ignoring the cast, tool search results are meant to be a
-/// short top-K list in this crate's v1 usage, not an unbounded dump.
-pub const MAX_LIMIT: usize = 1000;
-
-/// Clamps `limit` to [`MAX_LIMIT`] and converts to `i64` for the SQLite
-/// `LIMIT` clause, so the `usize -> i64` cast can never produce a negative
-/// number regardless of what a caller supplies.
-fn clamped_limit(limit: usize) -> i64 {
-    limit.min(MAX_LIMIT) as i64
-}
-
-fn fts_query(query: &str, mode: MatchMode) -> Option<String> {
-    let tokens: Vec<String> = query
-        .split_whitespace()
-        .map(|t| t.replace('"', ""))
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{t}\""))
-        .collect();
-    if tokens.is_empty() {
-        return None;
-    }
-    let joiner = match mode {
-        MatchMode::All => " AND ",
-        MatchMode::Any => " OR ",
-    };
-    Some(tokens.join(joiner))
 }
 
 pub fn search(
@@ -164,20 +125,6 @@ mod tests {
     fn empty_query_returns_empty() {
         let conn = seed();
         assert!(search(&conn, "  ", 5, MatchMode::All).unwrap().is_empty());
-    }
-
-    #[test]
-    fn clamped_limit_never_goes_negative_for_a_huge_input() {
-        // usize::MAX cast straight to i64 would be -1 — SQLite treats a
-        // negative LIMIT as "no limit", silently defeating the cap.
-        let clamped = clamped_limit(usize::MAX);
-        assert!(clamped > 0, "clamped limit went non-positive: {clamped}");
-        assert_eq!(clamped, MAX_LIMIT as i64);
-    }
-
-    #[test]
-    fn clamped_limit_leaves_small_values_untouched() {
-        assert_eq!(clamped_limit(5), 5);
     }
 
     #[test]

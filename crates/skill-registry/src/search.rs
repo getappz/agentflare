@@ -1,15 +1,9 @@
-//! BM25 search over the FTS5 index. Every token is double-quoted so FTS5
-//! operators in user text cannot alter the query.
+//! BM25 search over the FTS5 index. Uses shared primitives from
+//! `flare-search-kit` for query sanitization.
 
+pub use flare_search_kit::MatchMode;
+use flare_search_kit::fts_query;
 use rusqlite::Connection;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchMode {
-    /// AND semantics (default): every token must match.
-    All,
-    /// OR semantics: broader recall for retries.
-    Any,
-}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SkillHit {
@@ -19,23 +13,6 @@ pub struct SkillHit {
     pub est_tokens: i64,
     pub compressed: bool,
     pub score: f64,
-}
-
-fn fts_query(query: &str, mode: MatchMode) -> Option<String> {
-    let tokens: Vec<String> = query
-        .split_whitespace()
-        .map(|t| t.replace('"', "")) // strip embedded quotes, then quote whole token
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{t}\""))
-        .collect();
-    if tokens.is_empty() {
-        return None;
-    }
-    let joiner = match mode {
-        MatchMode::All => " AND ",
-        MatchMode::Any => " OR ",
-    };
-    Some(tokens.join(joiner))
 }
 
 pub fn search(
