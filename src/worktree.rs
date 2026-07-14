@@ -169,17 +169,31 @@ pub fn create_worktree(
     // when there's no remote, we're offline, or the branch was never pushed
     // (common for a parent item's task/N branch) — never blocks a claim on
     // network reachability, matching every other soft-fail in this file.
-    let start_point = if run_git_in(repo_root, &["fetch", "origin", target_branch]).is_ok()
-        && run_git_in_ok(
-            repo_root,
-            &["rev-parse", "--verify", &format!("origin/{target_branch}")],
-        ) {
-        format!("origin/{target_branch}")
-    } else {
-        eprintln!(
-            "worktree: could not fetch '{target_branch}' from origin, branching off the local ref instead"
-        );
-        target_branch.to_string()
+    // Routed through `run_output_timeout` (not the plain blocking
+    // `run_git_in`): an unreachable remote or a credential prompt must not
+    // be able to hang a claim indefinitely.
+    let fetch_timeout_secs = 30;
+    let start_point = match run_output_timeout(
+        "git",
+        &["fetch", "origin", target_branch],
+        repo_root,
+        fetch_timeout_secs,
+    ) {
+        Ok(out)
+            if out.status.success()
+                && run_git_in_ok(
+                    repo_root,
+                    &["rev-parse", "--verify", &format!("origin/{target_branch}")],
+                ) =>
+        {
+            format!("origin/{target_branch}")
+        }
+        _ => {
+            eprintln!(
+                "worktree: could not fetch '{target_branch}' from origin, branching off the local ref instead"
+            );
+            target_branch.to_string()
+        }
     };
     match run_git_in(
         repo_root,
