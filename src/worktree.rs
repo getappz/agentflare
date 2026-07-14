@@ -167,6 +167,79 @@ pub fn create_worktree(
     }
 }
 
+/// Pushes `item`'s isolated worktree branch and opens a PR against
+/// `target_branch` — the `done`-side counterpart to `create_worktree`.
+/// Deliberately never merges: unreviewed code should never land on the
+/// target branch automatically, so the worktree/branch are left in place
+/// for the PR to actually get reviewed and merged. Soft-fails (eprintln, no
+/// error surfaced, returns `None`) on any failure — nothing here, including
+/// `gh` being unavailable, should block `done` since the item's completion
+/// is already committed to the DB by the time this runs.
+pub fn push_and_open_pr(
+    item: &agentflare_backend::item::Item,
+    repo_root: &Path,
+    target_branch: &str,
+) -> Option<String> {
+    let branch = format!("task/{}", item.sequence_id);
+    let worktree_path = repo_root
+        .join(".worktrees")
+        .join("task")
+        .join(item.sequence_id.to_string());
+    if !worktree_path.exists() {
+        return None; // nothing was ever claimed into a worktree for this item
+    }
+    // Nothing to push (and nothing worth a PR) if the branch never
+    // diverged from its target — e.g. `done` called with no commits made.
+    match run_git_in(
+        repo_root,
+        &["rev-list", "--count", &format!("{target_branch}..{branch}")],
+    ) {
+        Ok(count) if count != "0" => {}
+        _ => return None,
+    }
+    if let Err(e) = run_git_in(repo_root, &["push", "-u", "origin", &branch]) {
+        eprintln!("worktree: push skipped for item {}: {e}", item.id);
+        return None;
+    }
+    let body = format!("Auto-opened on `item done` for {}.", item.id);
+    match Command::new("gh")
+        .args([
+            "pr",
+            "create",
+            "--base",
+            target_branch,
+            "--head",
+            &branch,
+            "--title",
+            &item.name,
+            "--body",
+            &body,
+        ])
+        .current_dir(repo_root)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if url.is_empty() { None } else { Some(url) }
+        }
+        Ok(out) => {
+            eprintln!(
+                "worktree: gh pr create failed for item {}: {}",
+                item.id,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "worktree: gh unavailable, skipping PR for item {}: {e}",
+                item.id
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +365,24 @@ mod tests {
         let item = test_item(1);
         let result = create_worktree(&item, &bad_root, "master");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn push_and_open_pr_returns_none_when_no_worktree_exists() {
+        let repo = init_repo();
+        let item = test_item(1);
+        assert!(push_and_open_pr(&item, &repo.path, "master").is_none());
+    }
+
+    #[test]
+    fn push_and_open_pr_returns_none_when_branch_has_no_new_commits() {
+        let repo = init_repo();
+        let item = test_item(1);
+        let target = resolve_default_branch(&repo.path);
+        create_worktree(&item, &repo.path, &target).unwrap();
+        // No commits were made in the worktree — nothing to push, so this
+        // must return early without attempting a real `git push`/`gh pr
+        // create` (which would fail anyway: no remote configured here).
+        assert!(push_and_open_pr(&item, &repo.path, &target).is_none());
     }
 }

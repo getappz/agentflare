@@ -2502,6 +2502,10 @@ impl AgentflareMcp {
                         if let Some(ref path) = worktree_path {
                             resp["worktree_path"] =
                                 serde_json::Value::String(path.to_string_lossy().to_string());
+                            resp["next"] = serde_json::Value::String(
+                                "cd into worktree_path — do all work for this item there"
+                                    .to_string(),
+                            );
                         }
                         resp.to_string()
                     }
@@ -2549,11 +2553,39 @@ impl AgentflareMcp {
                 }
                 let owner = crate::claims::owner_id();
                 let now = crate::claims::now();
-                self.with_backend_db(|conn| {
+                let repo_root = self.worktree_repo_root();
+                // Same split as `claim`: resolve (DB reads) under the
+                // backend lock, then run the blocking git/gh push+PR outside
+                // it — `git push`/`gh pr create` have no business running
+                // while the shared DB mutex is held.
+                let (done, item, target_branch) = self.with_backend_db(|conn| {
                     let done = agentflare_backend::item::claim_done(conn, &item_id, &owner, now)
                         .map_err(map_backend_err)?;
-                    Ok(serde_json::json!({"done": done, "item_id": item_id}).to_string())
-                })?
+                    let (item, target_branch) = if done {
+                        let item = agentflare_backend::item::get(conn, &item_id).ok();
+                        let target_branch = item
+                            .as_ref()
+                            .map(|i| crate::worktree::resolve_target_branch(conn, i, &repo_root));
+                        (item, target_branch)
+                    } else {
+                        (None, None)
+                    };
+                    Ok::<_, ErrorData>((done, item, target_branch))
+                })??;
+                let pr_url = match (&item, &target_branch) {
+                    (Some(item), Some(target)) => {
+                        crate::worktree::push_and_open_pr(item, &repo_root, target)
+                    }
+                    _ => None,
+                };
+                let mut resp = serde_json::json!({"done": done, "item_id": item_id});
+                if let Some(url) = pr_url {
+                    resp["pr_url"] = serde_json::Value::String(url.clone());
+                    resp["next"] = serde_json::Value::String(format!(
+                        "PR opened at {url} — wait for review/merge before removing the worktree"
+                    ));
+                }
+                Ok(resp.to_string())
             }
             "add_label" => {
                 let item_id = req.id.ok_or_else(|| {
@@ -5193,6 +5225,62 @@ mod tests {
         assert!(result.get("worktree_path").is_some());
         let path = result["worktree_path"].as_str().unwrap();
         assert!(std::path::Path::new(path).exists());
+        assert!(
+            result["next"].as_str().unwrap().contains("worktree_path"),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn item_done_without_new_commits_omits_pr_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_root = repo_dir.path().to_path_buf();
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_root)
+                .output()
+                .unwrap()
+        };
+        run_git(&["init", "-b", "master"]);
+        run_git(&["config", "user.email", "test@test.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["commit", "--allow-empty", "-m", "initial"]);
+
+        let s = AgentflareMcp {
+            backend_db_override: Some(tmp.path().join("backend.db")),
+            backend_project_link_override: Some(tmp.path().join("project.json")),
+            worktree_repo_root_override: Some(repo_root),
+            ..Default::default()
+        };
+
+        let created: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+        let item_id = created["id"].as_str().unwrap().to_string();
+
+        s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        // No commits were made in the claimed worktree, so `done` has
+        // nothing to push/PR — must not attempt a real push (no remote
+        // configured on this throwaway repo).
+        let result: serde_json::Value = serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                action: "done".into(),
+                id: Some(item_id),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["done"], true);
+        assert!(result.get("pr_url").is_none());
+        assert!(result.get("next").is_none());
     }
 
     #[test]
