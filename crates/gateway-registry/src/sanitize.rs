@@ -1,5 +1,5 @@
 //! Bounds and cleans up whatever a downstream `tools/list` response hands
-//! back before it's indexed and surfaced to the LLM via `gateway_search`.
+//! back before it's indexed and surfaced to the LLM via `tool_search`.
 //! A downstream server (especially a third-party or compromised one) fully
 //! controls its own tool names/descriptions — this is the one place that
 //! data crosses into our own storage and eventually into LLM context, so
@@ -15,7 +15,7 @@ const MAX_DESCRIPTION_LEN: usize = 1024;
 
 /// Restrict a tool name to `[A-Za-z0-9._-]`, truncated to [`MAX_NAME_LEN`].
 /// Falls back to `"unnamed"` if nothing safe survives — an empty server-
-/// or tool-name would otherwise break `gateway_execute`'s addressing.
+/// or tool-name would otherwise break `tool_execute`'s addressing.
 fn sanitize_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -32,7 +32,7 @@ fn sanitize_name(name: &str) -> String {
 /// Strip control characters (kept: newline/tab, since descriptions are
 /// legitimately multi-line) and truncate to [`MAX_DESCRIPTION_LEN`] chars —
 /// bounds how much of a single tool's description a hostile downstream
-/// server can push into `gateway_search` results / LLM context.
+/// server can push into `tool_search` results / LLM context.
 fn sanitize_description(description: &str) -> String {
     description
         .chars()

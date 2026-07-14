@@ -1,7 +1,7 @@
 // During `init`, detect project context (e.g. a GitHub remote) and, with the
 // user's OK, register the matching MCP server BEHIND agentflare's own gateway
 // (`~/.agentflare/gateway.toml`) — so its tools stay reachable through
-// `gateway_search`/`gateway_execute` instead of bloating the host's always-on
+// `tool_search`/`tool_execute` instead of bloating the host's always-on
 // tool list. Adding another gateway-fronted MCP later is one more entry in
 // `INTEGRATIONS`; the plumbing (detect → consent → idempotent append) is shared.
 use crate::paths::home;
@@ -24,12 +24,12 @@ pub struct GatewayIntegration {
     pub post_note: fn() -> Vec<String>,
 }
 
-pub const INTEGRATIONS: &[GatewayIntegration] = &[GITHUB];
+pub const INTEGRATIONS: &[GatewayIntegration] = &[GITHUB, LEANCTX];
 
 const GITHUB: GatewayIntegration = GatewayIntegration {
     name: "github",
     detect: git_remote_is_github,
-    prompt: "⚑ GitHub repo detected. github-mcp-server can sit behind the agentflare gateway\n  (its tools stay under gateway_search/gateway_execute, not the host's tool list).",
+    prompt: "⚑ GitHub repo detected. github-mcp-server can sit behind the agentflare gateway\n  (its tools stay under tool_search/tool_execute, not the host's tool list).",
     // Remote HTTP backend — zero-install (no docker/binary). The gateway
     // sends `auth_header` verbatim, so the stored secret is the full header
     // value (`Bearer <token>`), see `post_note`.
@@ -42,6 +42,34 @@ fn github_post_note() -> Vec<String> {
     vec![
         format!("  next  store your token:  {bin} gateway secret set github_token"),
         "  next    then paste:  Bearer ghp_<your-token>   ('Bearer ' prefix required)".to_string(),
+    ]
+}
+
+/// lean-ctx's own installer/`onboard` wires its ~80 `ctx_*` tools straight
+/// into the host's native MCP config — exactly the always-on tool-list bloat
+/// this gateway exists to avoid. Once the binary is on PATH, this puts it
+/// behind the gateway instead; `components.rs`'s `"leanctx"` component also
+/// strips whatever native registration the upstream onboarder already
+/// created, so the same tools don't end up declared twice.
+pub const LEANCTX: GatewayIntegration = GatewayIntegration {
+    name: "leanctx",
+    detect: leanctx_installed,
+    prompt: "⚑ lean-ctx detected. Its ~80 ctx_* tools can sit behind the agentflare gateway\n  (reachable via tool_search/tool_execute) instead of bloating the host's tool list.",
+    // Local stdio backend — same binary lean-ctx's own installer already put
+    // on PATH; the gateway just spawns it instead of the host declaring it
+    // natively. No auth needed (local process).
+    toml_block: "[servers.leanctx]\nkind = \"mcp_stdio\"\ncommand = \"lean-ctx\"\nargs = []",
+    post_note: leanctx_post_note,
+};
+
+fn leanctx_installed() -> bool {
+    crate::tool_install::installed(&crate::tool_install::LEAN_CTX)
+}
+
+fn leanctx_post_note() -> Vec<String> {
+    vec![
+        "  next  its ctx_* tools are now reached via tool_search/tool_execute, not called natively"
+            .to_string(),
     ]
 }
 
@@ -194,5 +222,39 @@ mod tests {
             assert!(cfg.servers.contains_key("acme"));
             assert!(cfg.servers.contains_key("github"));
         });
+    }
+
+    #[test]
+    fn register_writes_a_valid_parseable_leanctx_server() {
+        with_temp_home(|| {
+            assert!(!already_registered("leanctx"));
+            let msg = register(&LEANCTX);
+            assert!(msg.starts_with("ok"), "unexpected: {msg}");
+
+            let content = fs::read_to_string(gateway_toml_path()).unwrap();
+            assert!(content.contains("[servers.leanctx]"));
+            let cfg = gateway_registry::parse_config(&content).unwrap();
+            assert!(cfg.servers.contains_key("leanctx"));
+            assert!(already_registered("leanctx"));
+        });
+    }
+
+    #[test]
+    fn register_leanctx_is_idempotent_and_never_duplicates() {
+        with_temp_home(|| {
+            let msg1 = register(&LEANCTX);
+            assert!(msg1.starts_with("ok"), "first: {msg1}");
+            let msg2 = register(&LEANCTX);
+            assert!(msg2.starts_with("skip"), "second: {msg2}");
+            let content = fs::read_to_string(gateway_toml_path()).unwrap();
+            assert_eq!(content.matches("[servers.leanctx]").count(), 1);
+        });
+    }
+
+    #[test]
+    fn integrations_list_includes_github_and_leanctx() {
+        let names: Vec<&str> = INTEGRATIONS.iter().map(|i| i.name).collect();
+        assert!(names.contains(&"github"));
+        assert!(names.contains(&"leanctx"));
     }
 }

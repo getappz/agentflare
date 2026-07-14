@@ -25,7 +25,7 @@ pub struct ToolHit {
 
 /// Ceiling applied to a caller-supplied `limit` before it's used in
 /// SQLite's `LIMIT` clause. Two reasons: (1) casting a huge `usize` (e.g.
-/// `usize::MAX`, reachable via `gateway_search`'s MCP request) straight to
+/// `usize::MAX`, reachable via `tool_search`'s MCP request) straight to
 /// `i64` can wrap around to a negative number in two's-complement, and
 /// SQLite treats a negative `LIMIT` as "no limit" — silently defeating the
 /// cap; (2) even ignoring the cast, tool search results are meant to be a

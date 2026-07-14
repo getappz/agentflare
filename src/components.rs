@@ -47,6 +47,27 @@ fn claude_json() -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// Removes a server entry from `~/.claude.json`'s `mcpServers` map, if
+/// present — used to undo a native MCP registration another tool's own
+/// installer created (e.g. lean-ctx's `onboard`) once that server has been
+/// re-registered behind the agentflare gateway instead. Returns true only if
+/// an entry was actually found and removed.
+fn remove_claude_mcp_server(name: &str) -> bool {
+    let path = home().join(".claude.json");
+    let mut root = claude_json();
+    let Some(servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut()) else {
+        return false;
+    };
+    if servers.remove(name).is_none() {
+        return false;
+    }
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&root).unwrap_or_default() + "\n",
+    )
+    .is_ok()
+}
+
 fn json_at(path: &PathBuf) -> Value {
     fs::read_to_string(path)
         .ok()
@@ -333,26 +354,40 @@ pub fn get_components(host: &str) -> Vec<Component> {
             id: "leanctx",
             needs_consent: true,
             // lean-ctx's own installer (and `onboard`) wires MCP into whichever
-            // supported tool it detects, so no per-host branching needed here —
-            // trust the upstream tool's own setup. Installed via its native
-            // prebuilt-binary installer (see tool_install), not mise:
-            // lean-ctx ships a proper `curl | sh` that downloads, verifies, and
-            // onboards on its own.
-            describe: "lean-ctx (context compression) — native installer (curl | sh, or brew) + onboard".to_string(),
-            check: Box::new(|| crate::tool_install::installed(&crate::tool_install::LEAN_CTX)),
+            // supported tool it detects natively — exactly the always-on
+            // tool-list bloat the agentflare gateway exists to avoid. Right
+            // after installing, register it behind the gateway instead
+            // (`gateway_integrations::LEANCTX`) and, for claude-code, strip
+            // whatever native entry the upstream onboarder already created so
+            // the same ~80 ctx_* tools aren't declared twice.
+            describe: "lean-ctx (context compression) — native installer (curl | sh, or brew), registered behind the agentflare gateway (tool_search/tool_execute), not the host's native tool list".to_string(),
+            check: Box::new(|| {
+                crate::tool_install::installed(&crate::tool_install::LEAN_CTX)
+                    && crate::gateway_integrations::already_registered("leanctx")
+            }),
             apply: {
                 let log = leanctx_log.clone();
+                let host = host_owned.clone();
                 Box::new(move || {
-                    if log.exists() {
-                        return format!("lean-ctx install already triggered — check {}", log.display());
+                    let mut msg = if log.exists() {
+                        format!("lean-ctx install already triggered — check {}", log.display())
+                    } else {
+                        let _ = fs::create_dir_all(log.parent().unwrap());
+                        let outcome = crate::tool_install::install(&crate::tool_install::LEAN_CTX);
+                        let _ = fs::write(&log, format!("{:?}", std::time::SystemTime::now()));
+                        match outcome {
+                            Ok(m) => m,
+                            Err(e) => return e,
+                        }
+                    };
+                    msg = format!(
+                        "{msg} + {}",
+                        crate::gateway_integrations::register(&crate::gateway_integrations::LEANCTX)
+                    );
+                    if host == "claude-code" && remove_claude_mcp_server("lean-ctx") {
+                        msg = format!("{msg} + removed native claude-code MCP entry (now gateway-only)");
                     }
-                    let _ = fs::create_dir_all(log.parent().unwrap());
-                    let outcome = crate::tool_install::install(&crate::tool_install::LEAN_CTX);
-                    let _ = fs::write(&log, format!("{:?}", std::time::SystemTime::now()));
-                    match outcome {
-                        Ok(m) => format!("{m} + onboarded"),
-                        Err(e) => e,
-                    }
+                    msg
                 })
             },
         },
@@ -955,5 +990,36 @@ mod tests {
         let names = vec!["skill-a".to_string()];
         assert_eq!(apply_skill_overrides(&names, &mut settings).unwrap(), 1);
         assert_eq!(apply_skill_overrides(&names, &mut settings).unwrap(), 0);
+    }
+
+    #[test]
+    fn remove_claude_mcp_server_removes_only_the_named_entry() {
+        crate::paths::test_support::with_temp_home(|| {
+            let path = home().join(".claude.json");
+            fs::write(
+                &path,
+                serde_json::json!({
+                    "mcpServers": {
+                        "lean-ctx": {"command": "lean-ctx"},
+                        "flare": {"command": "agentflare"}
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            assert!(remove_claude_mcp_server("lean-ctx"));
+
+            let value = json_at(&path);
+            assert!(value["mcpServers"]["lean-ctx"].is_null());
+            assert!(value["mcpServers"]["flare"].is_object());
+        });
+    }
+
+    #[test]
+    fn remove_claude_mcp_server_is_a_noop_when_absent() {
+        crate::paths::test_support::with_temp_home(|| {
+            assert!(!remove_claude_mcp_server("lean-ctx"));
+        });
     }
 }

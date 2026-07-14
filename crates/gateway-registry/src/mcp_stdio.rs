@@ -196,7 +196,7 @@ impl McpStdioBackend {
                 // Local, pre-flight validation — happens before any
                 // downstream I/O, so this is the caller's mistake, not the
                 // downstream server's. `InvalidArgument`, not `Upstream`,
-                // so `gateway_execute` maps it to `invalid_params`.
+                // so `tool_execute` maps it to `invalid_params`.
                 return Err(GatewayError::InvalidArgument(format!(
                     "args must be a JSON object, got {other}"
                 )));

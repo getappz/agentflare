@@ -60,7 +60,7 @@ struct SkillLoadRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct GatewaySearchRequest {
+struct ToolSearchRequest {
     #[schemars(description = "What tool you need; keyword-style works best")]
     query: String,
     #[schemars(description = "Max results (default 5)")]
@@ -74,14 +74,14 @@ struct GatewaySearchRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct GatewayExecuteRequest {
-    #[schemars(description = "Server name from gateway_search")]
+struct ToolExecuteRequest {
+    #[schemars(description = "Server name from tool_search")]
     server: String,
-    #[schemars(description = "Tool name from gateway_search")]
+    #[schemars(description = "Tool name from tool_search")]
     tool: String,
     // A bare `serde_json::Value` here made schemars emit a typeless schema
     // (Value can be anything), so callers had no signal to send a nested
-    // JSON object rather than a stringified one — gateway_execute couldn't
+    // JSON object rather than a stringified one — tool_execute couldn't
     // actually be invoked with arguments. `Map` renders as `{"type":
     // ["object", "null"]}`, a real hint.
     #[schemars(description = "Arguments object matching the tool's input_schema")]
@@ -2105,7 +2105,7 @@ impl AgentflareMcp {
     /// `gateway_registry` is a `tokio::sync::Mutex` and `skills_registry`
     /// isn't. (An earlier draft tried to fold `Registry::execute` — an
     /// async fn — into a plain `FnOnce(&Registry) -> T` callback shared
-    /// with `gateway_search`; that doesn't compile without unstable
+    /// with `tool_search`; that doesn't compile without unstable
     /// async-closure/HRTB machinery, so each tool method just calls this
     /// helper and then works with the guard itself.)
     async fn ensure_gateway_registry(
@@ -2134,11 +2134,11 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Search downstream MCP servers' tools by task description. Returns server, tool, description, and input_schema; call gateway_execute to run one."
+        description = "Search downstream MCP servers' tools by task description. Returns server, tool, description, and input_schema; call tool_execute to run one."
     )]
-    async fn gateway_search(
+    async fn tool_search(
         &self,
-        Parameters(GatewaySearchRequest { query, limit, mode }): Parameters<GatewaySearchRequest>,
+        Parameters(ToolSearchRequest { query, limit, mode }): Parameters<ToolSearchRequest>,
     ) -> Result<String, ErrorData> {
         if query.trim().is_empty() {
             return Err(ErrorData::invalid_params("query is required", None));
@@ -2162,11 +2162,11 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Execute a tool on a downstream MCP server found via gateway_search. args must match that tool's input_schema."
+        description = "Execute a tool on a downstream MCP server found via tool_search. args must match that tool's input_schema."
     )]
-    async fn gateway_execute(
+    async fn tool_execute(
         &self,
-        Parameters(GatewayExecuteRequest { server, tool, args }): Parameters<GatewayExecuteRequest>,
+        Parameters(ToolExecuteRequest { server, tool, args }): Parameters<ToolExecuteRequest>,
     ) -> Result<String, ErrorData> {
         if server.trim().is_empty() || tool.trim().is_empty() {
             return Err(ErrorData::invalid_params(
@@ -3674,7 +3674,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_search_empty_query_is_invalid_params() {
+    async fn tool_search_empty_query_is_invalid_params() {
         // Isolated DB path so the test never opens/refreshes the shared gateway.db.
         let tmp = tempfile::tempdir().unwrap();
         let s = AgentflareMcp {
@@ -3682,7 +3682,7 @@ mod tests {
             ..Default::default()
         };
         let err = s
-            .gateway_search(Parameters(GatewaySearchRequest {
+            .tool_search(Parameters(ToolSearchRequest {
                 query: "".into(),
                 limit: None,
                 mode: None,
@@ -3693,14 +3693,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_search_mode_rejects_unknown_value() {
+    async fn tool_search_mode_rejects_unknown_value() {
         let tmp = tempfile::tempdir().unwrap();
         let s = AgentflareMcp {
             gateway_db_override: Some(tmp.path().join("gateway.db")),
             ..Default::default()
         };
         let err = s
-            .gateway_search(Parameters(GatewaySearchRequest {
+            .tool_search(Parameters(ToolSearchRequest {
                 query: "x".into(),
                 limit: None,
                 mode: Some("bogus".into()),
@@ -3711,14 +3711,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_execute_requires_server_and_tool() {
+    async fn tool_execute_requires_server_and_tool() {
         let tmp = tempfile::tempdir().unwrap();
         let s = AgentflareMcp {
             gateway_db_override: Some(tmp.path().join("gateway.db")),
             ..Default::default()
         };
         let err = s
-            .gateway_execute(Parameters(GatewayExecuteRequest {
+            .tool_execute(Parameters(ToolExecuteRequest {
                 server: "".into(),
                 tool: "x".into(),
                 args: Some(serde_json::Map::new()),
@@ -3729,7 +3729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_execute_unknown_server_is_invalid_params() {
+    async fn tool_execute_unknown_server_is_invalid_params() {
         // Isolated DB path, no servers configured — `Registry::execute` is
         // guaranteed to hit `GatewayError::ServerNotFound`, which must map to
         // `invalid_params` (a caller-fixable mistake), not `internal_error`.
@@ -3739,7 +3739,7 @@ mod tests {
             ..Default::default()
         };
         let err = s
-            .gateway_execute(Parameters(GatewayExecuteRequest {
+            .tool_execute(Parameters(ToolExecuteRequest {
                 server: "definitely-not-a-configured-server".into(),
                 tool: "x".into(),
                 args: Some(serde_json::Map::new()),
@@ -3751,8 +3751,8 @@ mod tests {
     }
 
     #[test]
-    fn gateway_execute_args_schema_is_object_or_null() {
-        let schema = schemars::schema_for!(GatewayExecuteRequest);
+    fn tool_execute_args_schema_is_object_or_null() {
+        let schema = schemars::schema_for!(ToolExecuteRequest);
         let schema_json = serde_json::to_value(&schema).unwrap();
         let args_schema = schema_json
             .get("properties")
