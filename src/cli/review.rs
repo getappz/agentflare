@@ -227,13 +227,7 @@ impl ReviewArgs {
 /// Round id: explicit --pr, else the current branch name.
 fn resolve_pr(explicit: Option<String>) -> String {
     explicit.filter(|s| !s.is_empty()).unwrap_or_else(|| {
-        std::process::Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty())
+        crate::git::current_branch(&std::env::current_dir().unwrap_or_default())
             .unwrap_or_else(|| fail("could not determine round — pass --pr".to_string()))
     })
 }

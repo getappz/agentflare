@@ -6,28 +6,9 @@ use std::time::Duration;
 
 use crate::progress::ProgressSender;
 
-fn run_git_in(repo_root: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(repo_root)
-        .output()
-        .map_err(|e| format!("git not available: {e}"))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(stderr);
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok(stdout)
-}
-
-fn run_git_in_ok(repo_root: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .args(args)
-        .current_dir(repo_root)
-        .output()
-        .ok()
-        .is_some_and(|o| o.status.success())
-}
+use crate::git::resolve_default_branch;
+use crate::git::run_in as run_git_in;
+use crate::git::run_in_ok as run_git_in_ok;
 
 pub fn resolve_target_branch(
     conn: &rusqlite::Connection,
@@ -42,27 +23,6 @@ pub fn resolve_target_branch(
         return branch.to_string();
     }
     resolve_default_branch(repo_root)
-}
-
-fn resolve_default_branch(repo_root: &Path) -> String {
-    if let Ok(out) = run_git_in(
-        repo_root,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    ) && let Some(stripped) = out.strip_prefix("origin/")
-    {
-        return stripped.to_string();
-    }
-    if run_git_in_ok(repo_root, &["rev-parse", "--verify", "main"]) {
-        return "main".to_string();
-    }
-    if run_git_in_ok(repo_root, &["rev-parse", "--verify", "master"]) {
-        return "master".to_string();
-    }
-    // Last resort: whatever branch is actually checked out here, so repos
-    // using trunk/develop/anything else still get a real branch instead of
-    // a hardcoded guess that may not exist.
-    run_git_in(repo_root, &["symbolic-ref", "--short", "HEAD"])
-        .unwrap_or_else(|_| "master".to_string())
 }
 
 pub fn already_isolated_for(branch: &str, repo_root: &Path) -> bool {

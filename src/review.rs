@@ -452,20 +452,11 @@ pub fn submitter_name() -> String {
 /// Computes a unified diff via git for the local branch. `base`/`head` default
 /// to `master`/`HEAD` (three-dot: changes on HEAD since it diverged from base).
 pub fn compute_diff(base: Option<&str>, head: Option<&str>) -> Result<String, String> {
-    let base = base.unwrap_or("master");
-    let head = head.unwrap_or("HEAD");
-    let range = format!("{base}...{head}");
-    let out = std::process::Command::new("git")
-        .args(["diff", "--unified=3", &range])
-        .output()
-        .map_err(|e| format!("git diff failed: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git diff {range}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    crate::git::diff(
+        &std::env::current_dir().unwrap_or_default(),
+        base.unwrap_or("master"),
+        head.unwrap_or("HEAD"),
+    )
 }
 
 #[cfg(test)]

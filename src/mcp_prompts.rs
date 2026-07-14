@@ -211,11 +211,12 @@ fn get_handoff_command(request: &GetPromptRequestParams, agent: Option<&str>) ->
          item_id=<that item's id> (so the reply becomes the next asset version instead of a new \
          item) and reply_to=<id of the specific message you're answering>, reusing its \
          thread_id.\n\
-         - `inbox [me]` → call the `item` tool (action=list; already scoped to this repo's \
-         linked project) and filter to items where assignee_agent is <me or {me}> or unassigned; \
-         summarize name, state, and brief per item. Pull an item's full content only if you need \
-         it, via the `asset` tool (action=list, item_id=<id>) and asset get on the latest \
-         version.\n\
+         - `inbox [me]` → call the `item` tool (action=list, state_group=\"backlog,unstarted,started\" \
+         by default to hide completed/cancelled items — omit state_group only if the command \
+         explicitly says `all`) — already scoped to this repo's linked project — and filter to \
+         items where assignee_agent is <me or {me}> or unassigned; summarize name, state, and \
+         brief per item. Pull an item's full content only if you need it, via the `asset` tool \
+         (action=list, item_id=<id>) and asset get on the latest version.\n\
          - `thread <id>` → call `item` (action=list), filter client-side to items whose \
          metadata.thread matches <id>, then pull each item's assets (asset tool) for content; \
          present in chronological order with reply lineage.\n\
@@ -364,6 +365,14 @@ mod tests {
             format!("{:?}", bare.messages[0].content),
             format!("{:?}", explicit.messages[0].content),
         );
+    }
+
+    #[test]
+    fn inbox_grammar_defaults_state_group_to_open_states_unless_all() {
+        let result = get_prompt(&GetPromptRequestParams::new("handoff"), None).unwrap();
+        let text = format!("{:?}", result.messages[0].content);
+        assert!(text.contains("backlog,unstarted,started"), "{text}");
+        assert!(text.contains("`all`"), "{text}");
     }
 
     #[test]
