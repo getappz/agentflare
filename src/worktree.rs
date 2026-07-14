@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -185,6 +186,67 @@ pub fn create_worktree(
     }
 }
 
+/// Runs `program` with a deadline, returning its output. Puts the child in
+/// its own process group (Unix) and kills that whole group — not just the
+/// direct child — if it outlives `timeout_secs`, via the same `kill_tree`
+/// used for headless agent runs; a plain `child.kill()` would leave a
+/// grandchild (e.g. a `git` credential helper) running and the process
+/// genuinely un-reaped, not just "late". Stdout/stderr are drained on
+/// separate threads so a child that fills an OS pipe buffer can't deadlock
+/// the wait loop.
+fn run_output_timeout(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("{program}: spawn failed: {e}"))?;
+    let mut stdout_pipe = child.stdout.take().expect("stdout piped above");
+    let mut stderr_pipe = child.stderr.take().expect("stderr piped above");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    crate::agent_launch::kill_tree(&mut child);
+                    let _ = child.wait();
+                    return Err(format!("{program} timed out after {timeout_secs}s"));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("{program}: {e}")),
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout_reader.join().unwrap_or_default(),
+        stderr: stderr_reader.join().unwrap_or_default(),
+    })
+}
+
 /// Pushes `item`'s isolated worktree branch and opens a PR against
 /// `target_branch` — the `done`-side counterpart to `create_worktree`.
 /// Deliberately never merges: unreviewed code should never land on the
@@ -219,16 +281,35 @@ pub fn push_and_open_pr(
     if let Some(p) = progress {
         p.send(0.0, Some(1.0), Some(format!("Pushing branch {branch}...")));
     }
-    if let Err(e) = run_git_in(repo_root, &["push", "-u", "origin", &branch]) {
-        eprintln!("worktree: push skipped for item {}: {e}", item.id);
-        return None;
+    let push_timeout = 120;
+    match run_output_timeout(
+        "git",
+        &["push", "-u", "origin", &branch],
+        repo_root,
+        push_timeout,
+    ) {
+        Ok(out) if !out.status.success() => {
+            eprintln!(
+                "worktree: push skipped for item {}: {}",
+                item.id,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return None;
+        }
+        Err(e) => {
+            eprintln!("worktree: push skipped for item {}: {e}", item.id);
+            return None;
+        }
+        _ => {}
     }
     if let Some(p) = progress {
         p.send(0.5, Some(1.0), Some("Creating PR...".into()));
     }
     let body = format!("Auto-opened on `item done` for {}.", item.id);
-    match Command::new("gh")
-        .args([
+    let pr_timeout = 60;
+    match run_output_timeout(
+        "gh",
+        &[
             "pr",
             "create",
             "--base",
@@ -239,10 +320,10 @@ pub fn push_and_open_pr(
             &item.name,
             "--body",
             &body,
-        ])
-        .current_dir(repo_root)
-        .output()
-    {
+        ],
+        repo_root,
+        pr_timeout,
+    ) {
         Ok(out) if out.status.success() => {
             let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if url.is_empty() {
@@ -416,5 +497,49 @@ mod tests {
         // must return early without attempting a real `git push`/`gh pr
         // create` (which would fail anyway: no remote configured here).
         assert!(push_and_open_pr(&item, &repo.path, &target, None).is_none());
+    }
+
+    #[test]
+    fn run_output_timeout_kills_the_child_not_just_abandons_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("marker");
+        // A command that, left alone, outlives our 1s timeout and then
+        // writes `marker`. If the timeout only abandoned the child (the bug
+        // this replaced) rather than killing it, the marker would still
+        // show up once the sleep finishes on its own.
+        #[cfg(unix)]
+        let (program, owned_args): (&str, Vec<String>) = (
+            "sh",
+            vec![
+                "-c".into(),
+                format!("sleep 3 && touch {}", marker.display()),
+            ],
+        );
+        #[cfg(windows)]
+        let (program, owned_args): (&str, Vec<String>) = (
+            "cmd",
+            vec![
+                "/C".into(),
+                format!(
+                    "ping 127.0.0.1 -n 4 >NUL & echo done > {}",
+                    marker.display()
+                ),
+            ],
+        );
+        let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+
+        let result = run_output_timeout(program, &args, tmp.path(), 1);
+        assert!(
+            matches!(&result, Err(e) if e.contains("timed out")),
+            "{result:?}"
+        );
+
+        // Give the command's natural (un-killed) duration time to elapse
+        // before checking the marker never showed up.
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(
+            !marker.exists(),
+            "child kept running after the timeout — it was abandoned, not killed"
+        );
     }
 }
