@@ -14,6 +14,17 @@ use std::time::Duration;
 /// so a hang here can never eat the whole hook budget.
 const GATING_TIMEOUT: Duration = Duration::from_millis(2000);
 
+/// Native/MCP tools that mutate files on disk — every one of these is gated
+/// by `branch_guard_reason` so a direct edit can never land on the repo's
+/// default branch, regardless of which of these the agent reaches for.
+const MUTATING_TOOLS: &[&str] = &[
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "mcp__lean-ctx__ctx_patch",
+    "mcp__lean-ctx__ctx_edit",
+];
+
 /// Run `work` under a hard timeout, returning `None` (allow-passthrough) if
 /// it doesn't finish in time. `work` only sends to a channel, never prints,
 /// so a timed-out worker can't double-write stdout once it eventually
@@ -34,10 +45,47 @@ fn is_spec_like_path(path: &str) -> bool {
     normalized.contains("/specs/") && normalized.ends_with(".md")
 }
 
+fn current_branch() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    crate::git::current_branch(&cwd)
+}
+
+fn default_branch() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    Some(crate::git::resolve_default_branch(&cwd))
+}
+
+/// Pure decision core for the branch guard — no git process spawned here, so
+/// it's unit-testable with fake branch names regardless of which branch this
+/// actual repo happens to be on when `cargo test` runs (same reason
+/// `AgentflareMcp` carries a `worktree_repo_root_override` for its own git
+/// operations). `branch` is `None` outside a git repo (git missing, not a
+/// repo) — never blocked, since "on the default branch" doesn't apply.
+fn branch_guard_reason_for(branch: Option<&str>, default: Option<&str>) -> Option<String> {
+    let branch = branch?;
+    let default = default.unwrap_or("main");
+    let is_protected = branch == default || branch == "main" || branch == "master";
+    is_protected.then(|| {
+        format!(
+            "'{branch}' is this repo's default branch — direct edits are blocked. Create an isolated worktree first (e.g. `git worktree add ../<dir> -b <branch-name>`) and retry the edit there; a plain `git checkout -b <branch-name>` works too if a full worktree isn't needed."
+        )
+    })
+}
+
 /// Classify one PreToolUse payload into a redirect reason, if any. Returns
 /// `None` for every tool call that isn't one of agentflare's own redirect
-/// targets.
-fn classify(tool_name: &str, tool_input: Option<&Value>) -> Option<String> {
+/// targets. `branch_ctx` carries the (current, default) branch pair so tests
+/// can inject fake git state instead of depending on this repo's real branch.
+fn classify(
+    tool_name: &str,
+    tool_input: Option<&Value>,
+    branch_ctx: (Option<&str>, Option<&str>),
+) -> Option<String> {
+    if MUTATING_TOOLS.contains(&tool_name)
+        && let Some(reason) = branch_guard_reason_for(branch_ctx.0, branch_ctx.1)
+    {
+        return Some(reason);
+    }
     match tool_name {
         "TodoWrite" => Some(
             "agentflare-backend's item tracker is wired up for this repo — use the `item` MCP tool (action=create) instead of TodoWrite for anything that should survive past this session.".to_string(),
@@ -62,7 +110,13 @@ pub fn redirect_decision(tool_name: &str, tool_input: Option<&Value>) -> Option<
     let tool_name = tool_name.to_string();
     let tool_input = tool_input.cloned();
     decide_with_timeout(GATING_TIMEOUT, move || {
-        let reason = classify(&tool_name, tool_input.as_ref())?;
+        let current = current_branch();
+        let default = default_branch();
+        let reason = classify(
+            &tool_name,
+            tool_input.as_ref(),
+            (current.as_deref(), default.as_deref()),
+        )?;
         Some(json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -77,41 +131,91 @@ pub fn redirect_decision(tool_name: &str, tool_input: Option<&Value>) -> Option<
 mod tests {
     use super::*;
 
+    const NOT_A_REPO: (Option<&str>, Option<&str>) = (None, None);
+    const ON_FEATURE_BRANCH: (Option<&str>, Option<&str>) = (Some("feature/x"), Some("main"));
+
     #[test]
     fn classify_redirects_todo_write() {
-        let reason = classify("TodoWrite", None).unwrap();
+        let reason = classify("TodoWrite", None, NOT_A_REPO).unwrap();
         assert!(reason.contains("`item` MCP tool"));
     }
 
     #[test]
     fn classify_redirects_spec_path_write() {
         let input = json!({ "file_path": "docs/superpowers/specs/2026-07-13-foo.md" });
-        let reason = classify("Write", Some(&input)).unwrap();
+        let reason = classify("Write", Some(&input), ON_FEATURE_BRANCH).unwrap();
         assert!(reason.contains("`asset` tool"));
     }
 
     #[test]
     fn classify_redirects_spec_path_edit_on_windows_backslashes() {
         let input = json!({ "file_path": "docs\\superpowers\\specs\\foo.md" });
-        assert!(classify("Edit", Some(&input)).is_some());
+        assert!(classify("Edit", Some(&input), ON_FEATURE_BRANCH).is_some());
     }
 
     #[test]
     fn classify_ignores_non_spec_write() {
         let input = json!({ "file_path": "src/main.rs" });
-        assert!(classify("Write", Some(&input)).is_none());
+        assert!(classify("Write", Some(&input), ON_FEATURE_BRANCH).is_none());
     }
 
     #[test]
     fn classify_ignores_unrelated_tools() {
-        assert!(classify("Read", None).is_none());
-        assert!(classify("Bash", None).is_none());
+        assert!(classify("Read", None, NOT_A_REPO).is_none());
+        assert!(classify("Bash", None, NOT_A_REPO).is_none());
     }
 
     #[test]
     fn classify_write_with_no_path_falls_through() {
-        assert!(classify("Write", None).is_none());
-        assert!(classify("Write", Some(&json!({}))).is_none());
+        assert!(classify("Write", None, ON_FEATURE_BRANCH).is_none());
+        assert!(classify("Write", Some(&json!({})), ON_FEATURE_BRANCH).is_none());
+    }
+
+    #[test]
+    fn classify_blocks_write_on_default_branch_named_master() {
+        let reason = classify(
+            "Write",
+            Some(&json!({"file_path": "src/main.rs"})),
+            (Some("master"), None),
+        )
+        .unwrap();
+        assert!(reason.contains("worktree"), "{reason}");
+        assert!(reason.contains("default branch"), "{reason}");
+    }
+
+    #[test]
+    fn classify_blocks_edit_on_resolved_default_branch_name() {
+        let ctx = (Some("trunk"), Some("trunk"));
+        let reason = classify("Edit", Some(&json!({"file_path": "src/main.rs"})), ctx).unwrap();
+        assert!(reason.contains("'trunk'"), "{reason}");
+    }
+
+    #[test]
+    fn classify_blocks_notebook_edit_and_ctx_patch_and_ctx_edit_on_master() {
+        let ctx = (Some("master"), None);
+        assert!(classify("NotebookEdit", None, ctx).is_some());
+        assert!(classify("mcp__lean-ctx__ctx_patch", None, ctx).is_some());
+        assert!(classify("mcp__lean-ctx__ctx_edit", None, ctx).is_some());
+    }
+
+    #[test]
+    fn classify_allows_mutating_tools_on_a_feature_branch() {
+        assert!(classify("NotebookEdit", None, ON_FEATURE_BRANCH).is_none());
+        assert!(classify("mcp__lean-ctx__ctx_patch", None, ON_FEATURE_BRANCH).is_none());
+    }
+
+    #[test]
+    fn classify_allows_writes_outside_any_git_repo() {
+        let input = json!({ "file_path": "src/main.rs" });
+        assert!(classify("Write", Some(&input), NOT_A_REPO).is_none());
+    }
+
+    #[test]
+    fn branch_guard_reason_for_prefers_default_over_hardcoded_names() {
+        // A repo whose default branch is deliberately named neither
+        // main nor master must still be caught via the resolved default.
+        assert!(branch_guard_reason_for(Some("develop"), Some("develop")).is_some());
+        assert!(branch_guard_reason_for(Some("feature/y"), Some("develop")).is_none());
     }
 
     #[test]

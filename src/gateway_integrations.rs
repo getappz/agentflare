@@ -7,7 +7,6 @@
 use crate::paths::home;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 pub struct GatewayIntegration {
     /// gateway.toml server key — also the idempotency key.
@@ -87,13 +86,11 @@ fn remotes_mention_github(remotes: &str) -> bool {
 }
 
 fn git_remote_is_github() -> bool {
-    Command::new("git")
-        .args(["remote", "-v"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| remotes_mention_github(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or(false)
+    crate::git::run_in_opt(
+        &std::env::current_dir().unwrap_or_default(),
+        &["remote", "-v"],
+    )
+    .is_some_and(|remotes| remotes_mention_github(&remotes))
 }
 
 /// True if a server named `name` is already configured in gateway.toml — the

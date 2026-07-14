@@ -1263,12 +1263,7 @@ impl AgentflareMcp {
     /// not on PATH, etc). Shared by `git_provenance` and the backend
     /// project-link resolution below.
     fn run_git(args: &[&str]) -> Option<String> {
-        let out = std::process::Command::new("git").args(args).output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!s.is_empty()).then_some(s)
+        crate::git::run_in_opt(&std::env::current_dir().unwrap_or_default(), args)
     }
 
     /// Best-effort git context of this process's cwd (the project the MCP
@@ -1323,10 +1318,10 @@ impl AgentflareMcp {
     /// tool was invoked from. Falls back to raw cwd only when nothing is
     /// found anywhere above it.
     fn repo_root() -> std::path::PathBuf {
-        if let Some(root) = Self::run_git(&["rev-parse", "--show-toplevel"]) {
-            return std::path::PathBuf::from(root);
-        }
         let cwd = std::env::current_dir().unwrap_or_default();
+        if let Some(root) = crate::git::repo_toplevel(&cwd) {
+            return root;
+        }
         Self::find_root_from(&cwd, &crate::paths::home())
     }
 
@@ -1830,13 +1825,7 @@ impl AgentflareMcp {
         if let Some(pr) = pr.filter(|s| !s.is_empty()) {
             return Ok(pr);
         }
-        std::process::Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty())
+        crate::git::current_branch(&std::env::current_dir().unwrap_or_default())
             .ok_or_else(|| ErrorData::invalid_params("could not determine round — pass pr", None))
     }
 
