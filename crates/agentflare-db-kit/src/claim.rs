@@ -12,7 +12,7 @@
 //! single-column-key table have different enough `PRIMARY KEY` shapes that
 //! hand-writing each as a migration string is clearer than codegen.
 
-use rusqlite::{Connection, ToSql};
+use rusqlite::{Connection, OptionalExtension, ToSql};
 
 pub struct ClaimLedger {
     table: &'static str,
@@ -174,6 +174,24 @@ impl ClaimLedger {
         let mut params = self.key_params(key);
         params.push(&owner);
         Ok(conn.execute(&sql, params.as_slice())? > 0)
+    }
+
+    /// True if `owner` currently holds the claim record for this key
+    /// (regardless of status) — lets a caller gate a follow-up action on
+    /// still owning the lease without mutating anything.
+    pub fn is_owner(&self, conn: &Connection, key: &[&str], owner: &str) -> rusqlite::Result<bool> {
+        let owner_p = key.len() + 1;
+        let sql = format!(
+            "SELECT 1 FROM {t} WHERE {pred} AND owner = ?{owner_p} LIMIT 1",
+            t = self.table,
+            pred = self.where_pred()
+        );
+        let mut params = self.key_params(key);
+        params.push(&owner);
+        Ok(conn
+            .query_row(&sql, params.as_slice(), |_| Ok(()))
+            .optional()?
+            .is_some())
     }
 
     /// Marks our claim done (kept for audit; a done key is re-acquirable).

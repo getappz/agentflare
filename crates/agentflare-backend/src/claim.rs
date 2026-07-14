@@ -36,6 +36,10 @@ pub fn done(conn: &Connection, item_id: &str, owner: &str, now: i64) -> rusqlite
     LEDGER.done(conn, &[item_id], owner, now)
 }
 
+pub fn is_owner(conn: &Connection, item_id: &str, owner: &str) -> rusqlite::Result<bool> {
+    LEDGER.is_owner(conn, &[item_id], owner)
+}
+
 /// Returns true if there is an active (live, non-stale) claim on this item
 /// whose owner differs from `owner`. Used by the comment edit/delete gates
 /// to prevent modifying a comment when another agent has started work.
