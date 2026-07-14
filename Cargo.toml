@@ -50,7 +50,7 @@ hex = "0.4"
 base64 = "0.22"
 flate2 = "1"
 tar = "0.4"
-zip = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rand = "0.8"
 aes-gcm = "0.10"
@@ -98,6 +98,7 @@ unsafe_code = "warn"
 opt-level = 3
 lto = "thin"
 strip = true
+panic = "abort"
 
 [profile.dev]
 debug = 1
