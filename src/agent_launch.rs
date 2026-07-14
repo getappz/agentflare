@@ -121,7 +121,7 @@ pub struct Captured {
 /// `read_to_string` (it blocks until every writer closes the pipe) forever,
 /// defeating the timeout entirely. `run_captured` puts the child in its own
 /// process group (Unix) so we can kill the whole group here.
-fn kill_tree(child: &mut std::process::Child) {
+pub(crate) fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         // `kill -KILL -<pid>` packs the signal and the (negative, i.e.
