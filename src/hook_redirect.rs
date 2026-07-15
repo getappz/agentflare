@@ -214,6 +214,14 @@ mod tests {
     }
 
     #[test]
+    fn classify_blocks_lowercase_edit_and_write_on_master() {
+        let ctx = (Some("master"), None);
+        assert!(classify("edit", None, ctx).is_some());
+        assert!(classify("write", None, ctx).is_some());
+        assert!(classify("notebookedit", None, ctx).is_some());
+    }
+
+    #[test]
     fn classify_allows_mutating_tools_on_a_feature_branch() {
         assert!(classify("NotebookEdit", None, ON_FEATURE_BRANCH).is_none());
         assert!(classify("mcp__lean-ctx__ctx_patch", None, ON_FEATURE_BRANCH).is_none());
