@@ -9,6 +9,7 @@
 pub mod code;
 pub mod context;
 pub mod output;
+pub mod retrieve;
 pub mod runtime;
 
 // Re-exports for backward compat — old CLI files reference crate::optimize::Prompt etc.
