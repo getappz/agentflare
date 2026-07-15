@@ -32,7 +32,19 @@ fn read_stdin_or_skip(label: &str) -> Option<String> {
 }
 
 pub fn session_start(agent: &str) {
-    println!("{}", session_start_message(agent));
+    let msg = session_start_message(agent);
+    // Plain stdout reaches Claude's context for this event (see module
+    // comment) but is NOT shown to the user in the terminal. `systemMessage`
+    // is the only field that renders visibly, so emit both: the user sees
+    // it, and Claude still gets it via additionalContext.
+    let out = json!({
+        "systemMessage": msg,
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": msg,
+        }
+    });
+    println!("{out}");
 }
 
 fn session_start_message(agent: &str) -> String {
