@@ -358,6 +358,13 @@ pub enum FlareAction {
     },
     /// Show flare system status
     Status,
+    /// Retrieve an original that the output layer compressed away (CCR)
+    Retrieve {
+        /// Registered id (e.g. r-a1b2c3); omit and pass --list to enumerate
+        id: Option<String>,
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -377,6 +384,16 @@ pub struct OptimizeArgs {
     pub action: FlareAction,
 }
 
+fn retrieve_list_line(e: &crate::optimize::retrieve::CompressionEntry) -> String {
+    format!(
+        "{}\t{}\u{2192}{}\t{}",
+        e.id,
+        e.size_before,
+        e.size_after,
+        crate::optimize::retrieve::describe_origin(&e.kind)
+    )
+}
+
 impl OptimizeArgs {
     pub fn run(self) {
         match self.action {
@@ -384,6 +401,7 @@ impl OptimizeArgs {
             FlareAction::Code { action } => action.run(),
             FlareAction::Context { ref action } => self.run_context(action),
             FlareAction::Status => self.run_status(),
+            FlareAction::Retrieve { ref id, list } => self.run_retrieve(id.as_deref(), list),
         }
     }
 
@@ -444,6 +462,32 @@ impl OptimizeArgs {
              context: available (FTS5/BM25)\n\
              runtime: {runtime_turns} total turns tracked"
         );
+    }
+
+    fn run_retrieve(&self, id: Option<&str>, list: bool) {
+        use crate::optimize::retrieve;
+        if list {
+            let state = retrieve::load_state();
+            let mut entries: Vec<_> = state.entries.values().collect();
+            entries.sort_by_key(|e| std::cmp::Reverse(e.created_ts));
+            for e in entries {
+                println!("{}", retrieve_list_line(e));
+            }
+            return;
+        }
+        match id {
+            Some(id) => match retrieve::retrieve(id) {
+                Ok(content) => print!("{content}"),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            },
+            None => {
+                eprintln!("provide an id, or pass --list to enumerate");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -516,5 +560,23 @@ mod tests {
                 .expect("marker should contain an r- id");
             assert_eq!(crate::optimize::retrieve::retrieve(id).unwrap(), "ORIGINAL");
         });
+    }
+
+    #[test]
+    fn retrieve_list_line_shows_id_sizes_and_origin() {
+        use crate::optimize::retrieve::{CompressionEntry, EntryKind};
+        let e = CompressionEntry {
+            id: "r-abc123".into(),
+            kind: EntryKind::FileBackup {
+                backup_path: "/tmp/x.md".into(),
+            },
+            size_before: 100,
+            size_after: 10,
+            created_ts: 0,
+        };
+        let line = super::retrieve_list_line(&e);
+        assert!(line.contains("r-abc123"), "line: {line}");
+        assert!(line.contains("100") && line.contains("10"), "line: {line}");
+        assert!(line.contains("file:/tmp/x.md"), "line: {line}");
     }
 }
