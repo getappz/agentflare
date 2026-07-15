@@ -4,10 +4,10 @@ resolver = "2"
 
 [package]
 name = "agentflare"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
 rust-version = "1.91"
-description = "Optimize AI CLI agents for cost and performance."
+description = "Run AI coding agents efficiently, and coordinate more than one of them."
 license = "MIT"
 repository = "https://github.com/getappz/agentflare"
 publish = false
