@@ -272,9 +272,10 @@ jobs:
       actions: write # gh workflow run
     steps:
       - name: Dispatch ppa-publish workflow
-        if: secrets.PPA_GPG_KEY != ''
+        if: env.PPA_GPG_KEY != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          PPA_GPG_KEY: ${{ secrets.PPA_GPG_KEY }}
         run: |
           gh workflow run ppa-publish.yml \
             --repo getappz/agentflare \
