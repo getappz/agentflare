@@ -153,8 +153,8 @@ struct ConfigFile {
 
 #[must_use]
 pub fn default_mode() -> String {
-    if let Ok(val) = std::env::var("FLARE_CODE_DEFAULT_MODE")
-        .or_else(|_| std::env::var("PONYTAIL_DEFAULT_MODE"))
+    if let Ok(val) =
+        std::env::var("FLARE_CODE_DEFAULT_MODE").or_else(|_| std::env::var("PONYTAIL_DEFAULT_MODE"))
         && let Some(m) = normalize_extended_mode(&val)
     {
         return m;

@@ -107,8 +107,12 @@ mod tests {
 
     #[test]
     fn detects_mode_switch() {
-        assert!(matches!(detect("/flare-code lite"), Some(SwitchAction::SetMode(m)) if m == "lite"));
-        assert!(matches!(detect("/flare-code full"), Some(SwitchAction::SetMode(m)) if m == "full"));
+        assert!(
+            matches!(detect("/flare-code lite"), Some(SwitchAction::SetMode(m)) if m == "lite")
+        );
+        assert!(
+            matches!(detect("/flare-code full"), Some(SwitchAction::SetMode(m)) if m == "full")
+        );
     }
 
     #[test]
@@ -195,6 +199,8 @@ mod tests {
         assert!(
             matches!(detect("/flare-code-ultra"), Some(SwitchAction::SetMode(m)) if m == "ultra")
         );
-        assert!(matches!(detect("/flare-code-lite"), Some(SwitchAction::SetMode(m)) if m == "lite"));
+        assert!(
+            matches!(detect("/flare-code-lite"), Some(SwitchAction::SetMode(m)) if m == "lite")
+        );
     }
 }
