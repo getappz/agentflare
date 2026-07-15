@@ -1518,7 +1518,7 @@ impl AgentflareMcp {
     /// `resolve_repo_key()`, not by the derived display identifier, so two
     /// differently-located repos that happen to share a name are never
     /// conflated; the identifier only gets a disambiguating suffix.
-    fn resolve_project(
+    pub(crate) fn resolve_project(
         &self,
         conn: &rusqlite::Connection,
     ) -> Result<agentflare_backend::project::Project, ErrorData> {

@@ -197,6 +197,30 @@ pub fn list_by_project(conn: &Connection, project_id: &str) -> Result<Vec<Item>>
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// List non-deleted items assigned to an agent (excludes completed/cancelled).
+pub fn list_by_assignee_agent(
+    conn: &Connection,
+    project_id: &str,
+    agent: &str,
+) -> Result<Vec<Item>> {
+    let mut stmt = conn.prepare(
+        "SELECT i.id, i.project_id, i.state_id, i.name, i.description,
+                i.priority, i.parent_id, i.assignee_agent, i.sequence_id,
+                i.sort_order, i.started_at, i.completed_at, i.archived_at,
+                i.external_source, i.external_id, i.metadata,
+                i.created_at, i.updated_at, i.deleted_at
+         FROM items i
+         JOIN states s ON s.id = i.state_id
+         WHERE i.project_id = ?1
+           AND i.assignee_agent = ?2
+           AND i.deleted_at IS NULL
+           AND s.group_name NOT IN ('completed', 'cancelled')
+         ORDER BY i.sort_order",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![project_id, agent], row_to_item)?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
     let ts = now();
     let mut sets = vec!["updated_at = ?2".to_string()];
