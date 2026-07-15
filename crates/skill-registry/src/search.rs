@@ -19,6 +19,10 @@ pub struct SkillHit {
     pub est_tokens: i64,
     pub compressed: bool,
     pub score: f64,
+    /// How to install this as an MCP server (only set for registry fallback hits).
+    pub install_hint: Option<String>,
+    /// Streamable HTTP URL (only set for registry hits with remotes).
+    pub remote_url: Option<String>,
 }
 
 fn fts_query(query: &str, mode: MatchMode) -> Option<String> {
@@ -65,9 +69,49 @@ pub fn search(
             est_tokens: r.get(3)?,
             compressed: r.get(4)?,
             score: r.get(5)?,
+            install_hint: None,
+            remote_url: None,
         })
     })?;
     rows.collect()
+}
+
+/// Search local index first. If fewer than `limit` results, fall back to the
+/// official MCP Registry. Registry hits are scored lower so local results
+/// outrank them.
+pub fn search_with_fallback(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    mode: MatchMode,
+) -> Vec<SkillHit> {
+    let local = search(conn, query, limit, mode).unwrap_or_default();
+    if local.len() >= limit {
+        return local;
+    }
+    let remaining = limit.saturating_sub(local.len());
+    let registry =
+        gateway_registry::registry_search::search_registry(query, remaining);
+    let mut results = local;
+    for hit in registry {
+        results.push(SkillHit {
+            name: hit.server,
+            source: String::new(),
+            description: hit.description,
+            est_tokens: 0,
+            compressed: false,
+            score: hit.score,
+            install_hint: hit.install_hint.map(|h| {
+                if let Some(runtime) = h.runtime_hint {
+                    format!("{} {}", runtime, h.identifier)
+                } else {
+                    format!("{}:{}", h.registry_type, h.identifier)
+                }
+            }),
+            remote_url: hit.remote_url,
+        });
+    }
+    results
 }
 
 /// Every distinct skill name currently indexed, regardless of source. Used

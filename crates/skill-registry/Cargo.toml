@@ -15,6 +15,7 @@ regex = "1"
 thiserror = "2"
 dirs = "6"
 agent-registry = { package = "agentflare-agent-registry", path = "../agent-registry" }
+gateway-registry = { package = "agentflare-gateway-registry", path = "../gateway-registry" }
 
 [dev-dependencies]
 tempfile = "3"

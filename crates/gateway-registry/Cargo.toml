@@ -21,6 +21,7 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 regex = "1"
 sha2 = "0.10"
 http = "1.4"
+ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
 tempfile = "3"

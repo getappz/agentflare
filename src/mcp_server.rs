@@ -792,8 +792,7 @@ impl AgentflareMcp {
                     }
                 };
                 let hits = self
-                    .with_fresh_registry(|reg| reg.search(&query, req.limit.unwrap_or(5), mode))?
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                    .with_fresh_registry(|reg| reg.search_with_fallback(&query, req.limit.unwrap_or(5), mode))?;
                 Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
             }
             "load" => {

@@ -3,6 +3,7 @@
 //! double-quoted so FTS5 operators embedded in free-text queries can't
 //! alter the query.
 
+use crate::registry_search::search_registry;
 use rusqlite::Connection;
 use serde_json::Value;
 
@@ -14,6 +15,24 @@ pub enum MatchMode {
     Any,
 }
 
+/// How to install a server found via the MCP Registry fallback.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InstallHint {
+    /// Package registry type: "npm", "pypi", "oci", etc.
+    pub registry_type: String,
+    /// Package identifier (e.g. "@gitkraken/gk" or "githits").
+    pub identifier: String,
+    /// Hint about the runtime command: "npx", "uvx", "docker".
+    pub runtime_hint: Option<String>,
+}
+
+/// Whether a `ToolHit` came from the local index or the remote registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum HitSource {
+    Local,
+    Registry,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolHit {
     pub server: String,
@@ -21,6 +40,12 @@ pub struct ToolHit {
     pub description: String,
     pub input_schema: Value,
     pub score: f64,
+    /// Where this hit was found (local index or remote registry).
+    pub source: HitSource,
+    /// How to install the server (only present for registry hits).
+    pub install_hint: Option<InstallHint>,
+    /// Streamable HTTP URL for registry hits with remotes.
+    pub remote_url: Option<String>,
 }
 
 /// Ceiling applied to a caller-supplied `limit` before it's used in
@@ -83,9 +108,43 @@ pub fn search(
             description: r.get(2)?,
             input_schema,
             score: r.get(4)?,
+            source: HitSource::Local,
+            install_hint: None,
+            remote_url: None,
         })
     })?;
     rows.collect()
+}
+
+/// Search local index first. If fewer than `limit` results, fall back to the
+/// official MCP Registry. Registry hits are scored lower (0.5 × local score
+/// floor) so local results outrank them.
+pub fn search_with_fallback(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    mode: MatchMode,
+) -> Vec<ToolHit> {
+    let local = search(conn, query, limit, mode).unwrap_or_default();
+    if local.len() >= limit {
+        return local;
+    }
+    let remaining = limit.saturating_sub(local.len());
+    let registry = search_registry(query, remaining);
+    let mut results = local;
+    for hit in registry {
+        results.push(ToolHit {
+            server: hit.server,
+            tool: String::new(),
+            description: hit.description,
+            input_schema: Value::Null,
+            score: hit.score,
+            source: HitSource::Registry,
+            install_hint: hit.install_hint,
+            remote_url: hit.remote_url,
+        });
+    }
+    results
 }
 
 #[cfg(test)]
@@ -127,6 +186,8 @@ mod tests {
         let hits = search(&conn, "symbol references", 5, MatchMode::All).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].tool, "references");
+        assert_eq!(hits[0].source, HitSource::Local);
+        assert!(hits[0].install_hint.is_none());
     }
 
     #[test]
@@ -137,6 +198,9 @@ mod tests {
         assert!(tools.contains(&"find_symbols"));
         assert!(tools.contains(&"references"));
         assert!(tools.contains(&"list_issues"));
+        for h in &hits {
+            assert_eq!(h.source, HitSource::Local);
+        }
     }
 
     #[test]
