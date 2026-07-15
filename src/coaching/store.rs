@@ -37,7 +37,12 @@ pub(super) fn list_rules() -> Vec<CoachingRule> {
 /// Create or overwrite a coaching rule file. Enforces `MAX_RULES` only when
 /// `id` is new — updating an existing rule's content never counts against
 /// the cap.
-pub fn apply_rule(id: &str, title: &str, body: &str) -> Result<CoachingRule, String> {
+pub fn apply_rule(
+    id: &str,
+    title: &str,
+    body: &str,
+    trigger: Option<rule::RuleTrigger>,
+) -> Result<CoachingRule, String> {
     if !rule::is_valid_rule_id(id) {
         return Err(format!(
             "invalid rule id '{id}': must be 1-10 chars, start with a letter, and contain only letters, digits, or hyphens"
@@ -52,7 +57,7 @@ pub fn apply_rule(id: &str, title: &str, body: &str) -> Result<CoachingRule, Str
         ));
     }
 
-    rule::write_rule_file(&rules_dir(), id, title, body)
+    rule::write_rule_file(&rules_dir(), id, title, body, trigger.as_ref())
         .map_err(|e| format!("failed to write rule file: {e}"))?;
 
     list_rules()
@@ -73,9 +78,58 @@ pub(super) fn remove_rule(id: &str) -> Result<(), String> {
     std::fs::remove_file(&path).map_err(|e| format!("failed to remove rule file: {e}"))
 }
 
-/// All active rule bodies, in id order — what `hook session-start` surfaces.
-pub fn active_rule_bodies() -> Vec<String> {
-    list_rules().into_iter().map(|r| r.body).collect()
+/// Bodies of rules with no `# Trigger:` declared, in id order — what
+/// `hook session-start` surfaces unconditionally.
+pub fn untriggered_rule_bodies() -> Vec<String> {
+    list_rules()
+        .into_iter()
+        .filter(|r| r.trigger.is_none())
+        .map(|r| r.body)
+        .collect()
+}
+
+/// Bodies of rules whose trigger declares this exact tool name.
+pub fn rule_bodies_for_tool(tool_name: &str) -> Vec<String> {
+    list_rules()
+        .into_iter()
+        .filter(|r| {
+            r.trigger
+                .as_ref()
+                .is_some_and(|trigger| trigger.tools.iter().any(|t| t == tool_name))
+        })
+        .map(|r| r.body)
+        .collect()
+}
+
+/// Bodies of rules with `auto_match: true` whose title+body BM25-matches
+/// `prompt`, via the same ephemeral FTS5 scorer `crate::compact` already
+/// built for the PreCompact hook. No numeric threshold: appearing in
+/// `score_lines`'s result set is itself the fire/no-fire decision.
+pub fn rule_bodies_for_prompt(prompt: &str) -> Vec<String> {
+    let candidates: Vec<CoachingRule> = list_rules()
+        .into_iter()
+        .filter(|r| r.trigger.as_ref().is_some_and(|trigger| trigger.auto_match))
+        .collect();
+    if candidates.is_empty() {
+        return vec![];
+    }
+
+    let entries: Vec<crate::compact::LineEntry> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, r)| crate::compact::LineEntry {
+            index: i,
+            text: format!("{} {}", r.title, r.body),
+        })
+        .collect();
+
+    match crate::compact::score_lines(&entries, prompt) {
+        Ok(scored) => scored
+            .into_iter()
+            .map(|s| candidates[s.index].body.clone())
+            .collect(),
+        Err(_) => vec![],
+    }
 }
 
 #[cfg(test)]
@@ -97,6 +151,7 @@ mod tests {
                 "hygiene",
                 "Close sessions promptly",
                 "Wrap up each phase before starting the next.",
+                None,
             )
             .unwrap();
             assert_eq!(applied.id, "hygiene");
@@ -112,7 +167,7 @@ mod tests {
     #[test]
     fn apply_rule_rejects_invalid_id() {
         with_temp_home(|| {
-            let err = apply_rule("1bad", "Title", "Body").unwrap_err();
+            let err = apply_rule("1bad", "Title", "Body", None).unwrap_err();
             assert!(err.contains("invalid rule id"));
             assert!(list_rules().is_empty());
         });
@@ -122,9 +177,9 @@ mod tests {
     fn apply_rule_enforces_max_rules_for_new_ids() {
         with_temp_home(|| {
             for i in 0..MAX_RULES {
-                apply_rule(&format!("r{i}"), "T", "B").unwrap();
+                apply_rule(&format!("r{i}"), "T", "B", None).unwrap();
             }
-            let err = apply_rule("one-more", "T", "B").unwrap_err();
+            let err = apply_rule("one-more", "T", "B", None).unwrap_err();
             assert!(err.contains("maximum"));
             assert_eq!(list_rules().len(), MAX_RULES);
         });
@@ -134,9 +189,9 @@ mod tests {
     fn apply_rule_allows_overwriting_existing_id_at_capacity() {
         with_temp_home(|| {
             for i in 0..MAX_RULES {
-                apply_rule(&format!("r{i}"), "T", "B").unwrap();
+                apply_rule(&format!("r{i}"), "T", "B", None).unwrap();
             }
-            let updated = apply_rule("r0", "New Title", "New Body").unwrap();
+            let updated = apply_rule("r0", "New Title", "New Body", None).unwrap();
             assert_eq!(updated.title, "New Title");
             assert_eq!(list_rules().len(), MAX_RULES);
         });
@@ -145,7 +200,7 @@ mod tests {
     #[test]
     fn remove_rule_deletes_existing_file() {
         with_temp_home(|| {
-            apply_rule("hygiene", "T", "B").unwrap();
+            apply_rule("hygiene", "T", "B", None).unwrap();
             remove_rule("hygiene").unwrap();
             assert!(list_rules().is_empty());
         });
@@ -164,7 +219,7 @@ mod tests {
         with_temp_home(|| {
             std::fs::create_dir_all(rules_dir()).unwrap();
             std::fs::write(rules_dir().join("coaching-broken.md"), "").unwrap();
-            apply_rule("good", "T", "B").unwrap();
+            apply_rule("good", "T", "B", None).unwrap();
 
             let rules = list_rules();
             assert_eq!(
@@ -177,12 +232,12 @@ mod tests {
     }
 
     #[test]
-    fn active_rule_bodies_returns_all_bodies_in_id_order() {
+    fn untriggered_rule_bodies_returns_all_untriggered_bodies_in_id_order() {
         with_temp_home(|| {
-            apply_rule("b-rule", "Title B", "Body B").unwrap();
-            apply_rule("a-rule", "Title A", "Body A").unwrap();
+            apply_rule("b-rule", "Title B", "Body B", None).unwrap();
+            apply_rule("a-rule", "Title A", "Body A", None).unwrap();
             assert_eq!(
-                active_rule_bodies(),
+                untriggered_rule_bodies(),
                 vec!["Body A".to_string(), "Body B".to_string()]
             );
         });
@@ -191,7 +246,8 @@ mod tests {
     #[test]
     fn apply_rule_body_with_dashes_line_is_not_truncated() {
         with_temp_home(|| {
-            let applied = apply_rule("dashes", "Title", "before\n---\nafter").unwrap();
+            let applied =
+                apply_rule("dashes", "Title", "before\n---\nafter", None).unwrap();
             assert!(
                 applied.body.contains("before"),
                 "body should contain text before the --- line: {}",
@@ -213,12 +269,142 @@ mod tests {
     #[test]
     fn apply_rule_title_with_em_dash_is_not_truncated() {
         with_temp_home(|| {
-            let applied = apply_rule("emdash", "Foo \u{2014} Bar", "Body").unwrap();
+            let applied =
+                apply_rule("emdash", "Foo \u{2014} Bar", "Body", None).unwrap();
             assert_eq!(applied.title, "Foo \u{2014} Bar");
 
             let rules = list_rules();
             assert_eq!(rules.len(), 1);
             assert_eq!(rules[0].title, "Foo \u{2014} Bar");
+        });
+    }
+
+    #[test]
+    fn apply_rule_with_trigger_roundtrips() {
+        with_temp_home(|| {
+            let trigger = rule::RuleTrigger {
+                tools: vec!["mcp__flare__review".to_string()],
+                auto_match: true,
+            };
+            let applied = apply_rule("revfix", "Title", "Body", Some(trigger.clone())).unwrap();
+            assert_eq!(applied.trigger, Some(trigger.clone()));
+
+            let rules = list_rules();
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].trigger, Some(trigger));
+        });
+    }
+
+    #[test]
+    fn apply_rule_without_trigger_is_untriggered() {
+        with_temp_home(|| {
+            let applied = apply_rule("hygiene", "Title", "Body", None).unwrap();
+            assert_eq!(applied.trigger, None);
+        });
+    }
+
+    #[test]
+    fn untriggered_rule_bodies_excludes_triggered_rules() {
+        with_temp_home(|| {
+            apply_rule("plain", "T", "Plain body", None).unwrap();
+            apply_rule(
+                "scoped",
+                "T",
+                "Scoped body",
+                Some(rule::RuleTrigger {
+                    tools: vec!["mcp__flare__review".to_string()],
+                    auto_match: false,
+                }),
+            )
+            .unwrap();
+
+            assert_eq!(untriggered_rule_bodies(), vec!["Plain body".to_string()]);
+        });
+    }
+
+    #[test]
+    fn rule_bodies_for_tool_matches_exact_tool_name_only() {
+        with_temp_home(|| {
+            apply_rule(
+                "scoped",
+                "T",
+                "Scoped body",
+                Some(rule::RuleTrigger {
+                    tools: vec!["mcp__flare__review".to_string()],
+                    auto_match: false,
+                }),
+            )
+            .unwrap();
+
+            assert_eq!(
+                rule_bodies_for_tool("mcp__flare__review"),
+                vec!["Scoped body".to_string()]
+            );
+            assert!(rule_bodies_for_tool("mcp__flare__comment").is_empty());
+            assert!(rule_bodies_for_tool("mcp__flare__revie").is_empty());
+        });
+    }
+
+    #[test]
+    fn rule_bodies_for_prompt_fires_auto_match_rule_on_shared_term() {
+        with_temp_home(|| {
+            apply_rule(
+                "revfix",
+                "Reviews ship with fixes",
+                "Every review finding needs a diff.",
+                Some(rule::RuleTrigger {
+                    tools: vec![],
+                    auto_match: true,
+                }),
+            )
+            .unwrap();
+
+            let bodies = rule_bodies_for_prompt("please review this change");
+            assert_eq!(bodies, vec!["Every review finding needs a diff.".to_string()]);
+        });
+    }
+
+    #[test]
+    fn rule_bodies_for_prompt_does_not_fire_on_unrelated_prompt() {
+        with_temp_home(|| {
+            apply_rule(
+                "revfix",
+                "Reviews ship with fixes",
+                "Every review finding needs a diff.",
+                Some(rule::RuleTrigger {
+                    tools: vec![],
+                    auto_match: true,
+                }),
+            )
+            .unwrap();
+
+            assert!(rule_bodies_for_prompt("what's the weather like today").is_empty());
+        });
+    }
+
+    #[test]
+    fn rule_bodies_for_prompt_ignores_non_auto_match_rules() {
+        with_temp_home(|| {
+            apply_rule("plain", "T", "Plain body", None).unwrap();
+            apply_rule(
+                "tool-only",
+                "T",
+                "Tool only body",
+                Some(rule::RuleTrigger {
+                    tools: vec!["mcp__flare__review".to_string()],
+                    auto_match: false,
+                }),
+            )
+            .unwrap();
+
+            assert!(rule_bodies_for_prompt("anything at all").is_empty());
+        });
+    }
+
+    #[test]
+    fn rule_bodies_for_prompt_returns_empty_when_no_auto_match_candidates() {
+        with_temp_home(|| {
+            assert!(rule_bodies_for_prompt("anything").is_empty());
         });
     }
 }

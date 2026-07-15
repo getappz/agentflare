@@ -61,7 +61,7 @@ fn session_start_message(agent: &str) -> String {
         }
     }
 
-    let rule_bodies = crate::coaching::active_rule_bodies();
+    let rule_bodies = crate::coaching::untriggered_rule_bodies();
     if !rule_bodies.is_empty() {
         lines.push(String::new());
         lines.push("Coaching rules:".to_string());
@@ -192,6 +192,8 @@ pub fn pre_tool_use(_agent: &str) {
     {
         nudges.push(nudge);
     }
+
+    nudges.extend(crate::coaching::rule_bodies_for_tool(&parsed.tool_name));
 
     if parsed.tool_name == "ScheduleWakeup"
         && let Some(delay) = parsed.delay_seconds
@@ -409,6 +411,8 @@ pub fn prompt_submit(agent: &str) {
         }
     }
 
+    bits.extend(crate::coaching::rule_bodies_for_prompt(prompt));
+
     let out = json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
@@ -540,25 +544,20 @@ second line
     }
 
     #[test]
-    fn session_start_includes_active_coaching_rule_bodies() {
+    fn session_start_includes_untriggered_coaching_rule_bodies() {
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
             crate::coaching::apply_rule(
                 "hygiene",
                 "Close sessions promptly",
                 "Wrap up each phase before starting the next.",
+                None,
             )
             .unwrap();
 
-            // session_start prints via println!; session_start_message
-            // (below) covers the actual message content, this just confirms
-            // the printing entry point doesn't panic when a coaching rule is
-            // active. The underlying data source's correctness (ordering,
-            // content) is covered by Task 1's active_rule_bodies tests in
-            // coaching/store.rs.
             session_start("claude-code");
 
-            let bodies = crate::coaching::active_rule_bodies();
+            let bodies = crate::coaching::untriggered_rule_bodies();
             assert_eq!(
                 bodies,
                 vec!["Wrap up each phase before starting the next.".to_string()]
@@ -583,6 +582,45 @@ second line
             let msg = session_start_message("claude-code");
             assert!(msg.contains("memory_remember"));
             assert!(msg.contains("memory_recall"));
+        });
+    }
+
+    #[test]
+    fn pre_tool_use_surfaces_tool_triggered_coaching_rule() {
+        use crate::paths::test_support::with_temp_home;
+        with_temp_home(|| {
+            crate::coaching::apply_rule(
+                "revfix",
+                "Reviews ship with fixes",
+                "Every finding needs a diff.",
+                Some(crate::coaching::test_support::trigger(
+                    vec!["mcp__flare__review".to_string()],
+                    false,
+                )),
+            )
+            .unwrap();
+
+            let bodies = crate::coaching::rule_bodies_for_tool("mcp__flare__review");
+            assert_eq!(bodies, vec!["Every finding needs a diff.".to_string()]);
+            assert!(crate::coaching::rule_bodies_for_tool("mcp__flare__comment").is_empty());
+        });
+    }
+
+    #[test]
+    fn prompt_submit_surfaces_auto_match_coaching_rule() {
+        use crate::paths::test_support::with_temp_home;
+        with_temp_home(|| {
+            crate::coaching::apply_rule(
+                "revfix",
+                "Reviews ship with fixes",
+                "Every review finding needs a diff.",
+                Some(crate::coaching::test_support::trigger(vec![], true)),
+            )
+            .unwrap();
+
+            let bodies = crate::coaching::rule_bodies_for_prompt("please review this PR");
+            assert_eq!(bodies, vec!["Every review finding needs a diff.".to_string()]);
+            assert!(crate::coaching::rule_bodies_for_prompt("what's for lunch").is_empty());
         });
     }
 

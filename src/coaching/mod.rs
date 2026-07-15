@@ -14,14 +14,23 @@
 //! - `cli`   — presentation glue for `agentflare coaching {list,apply,remove}`.
 
 mod cli;
-mod rule;
+pub(crate) mod rule;
 mod store;
 
 pub use cli::{cli_apply, cli_remove, print_list};
-pub use store::active_rule_bodies;
+pub use store::{rule_bodies_for_prompt, rule_bodies_for_tool, untriggered_rule_bodies};
 
 // Only reached from hook.rs's SessionStart test (#[cfg(test)]), to seed a
 // rule before asserting it appears in the printed message — a plain,
 // non-test build has no caller for it.
 #[allow(unused_imports)]
 pub use store::apply_rule;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::rule::RuleTrigger;
+
+    pub(crate) fn trigger(tools: Vec<String>, auto_match: bool) -> RuleTrigger {
+        RuleTrigger { tools, auto_match }
+    }
+}
