@@ -19,8 +19,11 @@ const GATING_TIMEOUT: Duration = Duration::from_millis(2000);
 /// default branch, regardless of which of these the agent reaches for.
 const MUTATING_TOOLS: &[&str] = &[
     "Write",
+    "write",
     "Edit",
+    "edit",
     "NotebookEdit",
+    "notebookedit",
     "mcp__lean-ctx__ctx_patch",
     "mcp__lean-ctx__ctx_edit",
 ];
