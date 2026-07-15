@@ -246,6 +246,91 @@ pub fn handle_relate(input: RelateInput) -> Result<String, String> {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CompactInput {
+    pub lines: String,
+    pub query: Option<String>,
+    pub compression_ratio: Option<f64>,
+    pub preserve_recent: Option<usize>,
+    pub scorer: Option<String>,
+}
+
+pub fn handle_compact(input: CompactInput) -> Result<String, String> {
+    if input.query.as_deref().is_none_or(|q| q.trim().is_empty()) {
+        return Err("query is required".into());
+    }
+    let query = input.query.unwrap();
+
+    let entries: Vec<crate::compact::LineEntry> = input
+        .lines
+        .lines()
+        .enumerate()
+        .map(|(i, text)| crate::compact::LineEntry {
+            index: i,
+            text: text.to_string(),
+        })
+        .collect();
+
+    if entries.is_empty() {
+        return Ok(serde_json::json!({"lines": [], "kept": 0, "total": 0}).to_string());
+    }
+
+    let scored = crate::compact::score_lines(&entries, &query);
+
+    let target = input
+        .compression_ratio
+        .unwrap_or(0.5)
+        .clamp(0.0, 1.0);
+    let preserve = input.preserve_recent.unwrap_or(3);
+
+    // Keep top scored lines up to target ratio, but protect recent ones.
+    let keep_count = (entries.len() as f64 * target).ceil() as usize;
+    let mut keep: Vec<bool> = vec![false; entries.len()];
+
+    // Mark most recent N for unconditional keep.
+    for i in entries.len().saturating_sub(preserve)..entries.len() {
+        keep[i] = true;
+    }
+
+    // Fill remaining keep quota with highest-scored (lowest BM25 score).
+    let mut by_relevance: Vec<usize> = scored.iter().map(|s| s.index).collect();
+    // Deduplicate — a line might be both recent and high-scored.
+    by_relevance.sort();
+    by_relevance.dedup();
+    let mut filled: usize = keep.iter().filter(|&&k| k).count();
+    for idx in by_relevance {
+        if filled >= keep_count {
+            break;
+        }
+        if !keep[idx] {
+            keep[idx] = true;
+            filled += 1;
+        }
+    }
+
+    let output: Vec<serde_json::Value> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let score = scored.iter().find(|s| s.index == i).map(|s| s.score);
+            serde_json::json!({
+                "index": entry.index,
+                "text": entry.text,
+                "score": score,
+                "keep": keep[i],
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "lines": output,
+        "kept": keep.iter().filter(|&&k| k).count(),
+        "total": entries.len(),
+        "query": query,
+    })
+    .to_string())
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CurateInput {
     pub action: String,
     pub id: i64,
