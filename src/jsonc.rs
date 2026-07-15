@@ -14,6 +14,32 @@ pub fn parse_jsonc(input: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str(&cleaned)
 }
 
+/// Reads `path`, parses it as JSONC, and falls back to `default()` on any
+/// failure (missing file, unreadable, or invalid JSON/JSONC) — the shared
+/// read-then-fallback contract every agent-config call site needs.
+pub fn read_jsonc(path: &std::path::Path, default: impl FnOnce() -> Value) -> Value {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| parse_jsonc(&s).ok())
+        .unwrap_or_else(default)
+}
+/// Advances past a `"..."` string starting at `bytes[i] == b'"'`, honoring
+/// backslash escapes. Returns the index just past the closing quote (or
+/// `bytes.len()` if unterminated).
+fn skip_string(bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+    i += 1;
+    while i < len {
+        let c = bytes[i];
+        i += 1;
+        if c == b'\\' && i < len {
+            i += 1;
+        } else if c == b'"' {
+            break;
+        }
+    }
+    i
+}
 fn strip_json_comments(input: &str) -> String {
     let bytes = input.as_bytes();
     let len = bytes.len();
@@ -25,16 +51,7 @@ fn strip_json_comments(input: &str) -> String {
         let b = bytes[i];
 
         if b == b'"' {
-            i += 1;
-            while i < len {
-                let c = bytes[i];
-                i += 1;
-                if c == b'\\' && i < len {
-                    i += 1;
-                } else if c == b'"' {
-                    break;
-                }
-            }
+            i = skip_string(bytes, i);
             continue;
         }
 
@@ -86,16 +103,7 @@ fn strip_trailing_commas(input: &str) -> String {
         let b = bytes[i];
 
         if b == b'"' {
-            i += 1;
-            while i < len {
-                let c = bytes[i];
-                i += 1;
-                if c == b'\\' && i < len {
-                    i += 1;
-                } else if c == b'"' {
-                    break;
-                }
-            }
+            i = skip_string(bytes, i);
             continue;
         }
 

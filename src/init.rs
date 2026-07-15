@@ -508,10 +508,7 @@ fn wire_opencode() {
     let rules_dir = home().join(".config").join("opencode").join("rules");
     let rule_files: &[&str] = &["exa.md", "git.md", "lean-ctx.md"];
 
-    let mut config: Value = fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| crate::jsonc::parse_jsonc(&s).ok())
-        .unwrap_or_else(|| json!({}));
+    let mut config: Value = crate::jsonc::read_jsonc(&path, || json!({}));
     if !config.is_object() {
         config = json!({});
     }
