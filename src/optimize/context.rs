@@ -74,9 +74,18 @@ mod tests {
     #[test]
     fn score_lines_matches_in_or_mode() {
         let lines = vec![
-            LineEntry { index: 0, text: "Let me check the database schema.".to_string() },
-            LineEntry { index: 1, text: "The weather is nice today.".to_string() },
-            LineEntry { index: 2, text: "I need to query the users table.".to_string() },
+            LineEntry {
+                index: 0,
+                text: "Let me check the database schema.".to_string(),
+            },
+            LineEntry {
+                index: 1,
+                text: "The weather is nice today.".to_string(),
+            },
+            LineEntry {
+                index: 2,
+                text: "I need to query the users table.".to_string(),
+            },
         ];
         let scored = score_lines(&lines, "database query").unwrap();
         assert!(!scored.is_empty());
@@ -88,7 +97,10 @@ mod tests {
 
     #[test]
     fn score_lines_returns_empty_for_no_match() {
-        let lines = vec![LineEntry { index: 0, text: "Fix the login button color.".to_string() }];
+        let lines = vec![LineEntry {
+            index: 0,
+            text: "Fix the login button color.".to_string(),
+        }];
         let scored = score_lines(&lines, "quantum physics").unwrap();
         assert!(scored.is_empty());
     }
@@ -101,14 +113,20 @@ mod tests {
 
     #[test]
     fn score_lines_returns_empty_for_empty_query() {
-        let lines = vec![LineEntry { index: 0, text: "Hello world.".to_string() }];
+        let lines = vec![LineEntry {
+            index: 0,
+            text: "Hello world.".to_string(),
+        }];
         let scored = score_lines(&lines, "").unwrap();
         assert!(scored.is_empty());
     }
 
     #[test]
     fn score_lines_returns_empty_for_punctuation_only_query() {
-        let lines = vec![LineEntry { index: 0, text: "Hello world.".to_string() }];
+        let lines = vec![LineEntry {
+            index: 0,
+            text: "Hello world.".to_string(),
+        }];
         let scored = score_lines(&lines, "***").unwrap();
         assert!(scored.is_empty());
     }
@@ -116,8 +134,14 @@ mod tests {
     #[test]
     fn score_lines_handles_special_characters() {
         let lines = vec![
-            LineEntry { index: 0, text: "Run npm install && cargo build --release.".to_string() },
-            LineEntry { index: 1, text: "The price is $19.99 + tax (10%).".to_string() },
+            LineEntry {
+                index: 0,
+                text: "Run npm install && cargo build --release.".to_string(),
+            },
+            LineEntry {
+                index: 1,
+                text: "The price is $19.99 + tax (10%).".to_string(),
+            },
         ];
         let scored = score_lines(&lines, "cargo build").unwrap();
         assert_eq!(scored.len(), 1);
@@ -127,8 +151,14 @@ mod tests {
     #[test]
     fn score_lines_preserves_line_order_within_same_score() {
         let lines = vec![
-            LineEntry { index: 0, text: "database schema".to_string() },
-            LineEntry { index: 1, text: "database schema".to_string() },
+            LineEntry {
+                index: 0,
+                text: "database schema".to_string(),
+            },
+            LineEntry {
+                index: 1,
+                text: "database schema".to_string(),
+            },
         ];
         let scored = score_lines(&lines, "database").unwrap();
         assert_eq!(scored.len(), 2);

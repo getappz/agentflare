@@ -19,7 +19,6 @@ mod cost;
 mod db;
 mod dev_vars;
 mod errors;
-mod flare;
 mod gateway_integrations;
 mod gateway_secrets;
 mod git;

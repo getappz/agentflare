@@ -22,28 +22,33 @@ pub enum OutputAction {
 impl OutputAction {
     fn run(self) {
         match self {
-            OutputAction::Compress { source, target, spec_file, backup } => {
+            OutputAction::Compress {
+                source,
+                target,
+                spec_file,
+                backup,
+            } => {
                 let target = target.unwrap_or_else(|| source.clone());
                 let prompt = match &spec_file {
                     Some(path) => match std::fs::read_to_string(path) {
-                        Ok(spec) => crate::flare::output::Prompt::Custom(spec),
+                        Ok(spec) => crate::optimize::output::Prompt::Custom(spec),
                         Err(e) => {
                             eprintln!("failed to read spec file {}: {e}", path.display());
                             std::process::exit(1);
                         }
                     },
-                    None => crate::flare::output::Prompt::Generic,
+                    None => crate::optimize::output::Prompt::Generic,
                 };
                 let backup_mode = match backup.as_deref() {
-                    Some("sibling") => crate::flare::output::BackupMode::Sibling,
-                    Some("out-of-tree") | None => crate::flare::output::BackupMode::OutOfTree,
+                    Some("sibling") => crate::optimize::output::BackupMode::Sibling,
+                    Some("out-of-tree") | None => crate::optimize::output::BackupMode::OutOfTree,
                     Some(other) => {
                         eprintln!("--backup must be 'sibling' or 'out-of-tree', got '{other}'");
                         std::process::exit(1);
                     }
                 };
-                let result = crate::flare::output::compress(
-                    &crate::flare::output::RealLlm,
+                let result = crate::optimize::output::compress(
+                    &crate::optimize::output::RealLlm,
                     &source,
                     &target,
                     prompt,
@@ -51,8 +56,12 @@ impl OutputAction {
                 );
                 match result {
                     Ok(report) => {
-                        let pct = 100 - (100 * report.compressed_bytes / report.original_bytes.max(1));
-                        println!("{}→{}B ▼{pct}%", report.original_bytes, report.compressed_bytes);
+                        let pct =
+                            100 - (100 * report.compressed_bytes / report.original_bytes.max(1));
+                        println!(
+                            "{}→{}B ▼{pct}%",
+                            report.original_bytes, report.compressed_bytes
+                        );
                     }
                     Err(e) => {
                         eprintln!("{e}");
@@ -71,8 +80,12 @@ impl OutputAction {
 #[derive(Subcommand)]
 pub enum CodeAction {
     Status,
-    Set { mode: String },
-    Default { mode: String },
+    Set {
+        mode: String,
+    },
+    Default {
+        mode: String,
+    },
     Off,
     Review,
     Audit,
@@ -96,15 +109,16 @@ pub enum CodeHookEvent {
 }
 
 fn code_emit_hook(event: &str, off_guard: bool) {
-    let mode = crate::flare::code::active_mode().unwrap_or_else(crate::flare::code::default_mode);
+    let mode =
+        crate::optimize::code::active_mode().unwrap_or_else(crate::optimize::code::default_mode);
     if off_guard && mode == "off" {
-        crate::flare::code::clear_active();
+        crate::optimize::code::clear_active();
         println!("OK");
         return;
     }
-    let instructions = crate::flare::code::build_instructions(&mode, None);
-    let platform = crate::flare::code::detect_platform();
-    let output = crate::flare::code::format_hook_output(event, &instructions.body, &platform);
+    let instructions = crate::optimize::code::build_instructions(&mode, None);
+    let platform = crate::optimize::code::detect_platform();
+    let output = crate::optimize::code::format_hook_output(event, &instructions.body, &platform);
     println!("{output}");
 }
 
@@ -122,7 +136,9 @@ fn code_should_inject_for(agent_type: &str, override_matcher: Option<&str>) -> b
     let re = match regex::Regex::new(&format!("(?i){pattern}")) {
         Ok(r) => r,
         Err(_) => {
-            eprintln!("[flare code] invalid FLARE_CODE_SUBAGENT_MATCHER regex — injecting everywhere");
+            eprintln!(
+                "[flare code] invalid FLARE_CODE_SUBAGENT_MATCHER regex — injecting everywhere"
+            );
             return true;
         }
     };
@@ -151,7 +167,10 @@ fn code_subagent_should_inject() -> bool {
         Ok(v) => v,
         Err(_) => return true,
     };
-    let agent_type = data.get("agent_type").and_then(|v| v.as_str()).unwrap_or("");
+    let agent_type = data
+        .get("agent_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     code_should_inject_for(agent_type, override_matcher.as_deref())
 }
 
@@ -167,67 +186,67 @@ impl CodeAction {
     fn run(self) {
         match self {
             CodeAction::Status => {
-                let mode = crate::flare::code::active_mode()
-                    .unwrap_or_else(crate::flare::code::default_mode);
+                let mode = crate::optimize::code::active_mode()
+                    .unwrap_or_else(crate::optimize::code::default_mode);
                 println!("{mode}");
             }
             CodeAction::Set { mode } => {
-                let normalized = crate::flare::code::normalize_config_mode(&mode)
+                let normalized = crate::optimize::code::normalize_config_mode(&mode)
                     .unwrap_or_else(|| {
                         eprintln!("error: invalid mode: {mode}");
                         std::process::exit(1);
                     });
-                crate::flare::code::set_active(normalized).unwrap_or_else(|e| {
+                crate::optimize::code::set_active(normalized).unwrap_or_else(|e| {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 });
                 println!("{normalized}");
             }
             CodeAction::Default { mode } => {
-                let normalized = crate::flare::code::normalize_config_mode(&mode)
+                let normalized = crate::optimize::code::normalize_config_mode(&mode)
                     .unwrap_or_else(|| {
                         eprintln!("error: invalid mode: {mode}");
                         std::process::exit(1);
                     });
-                crate::flare::code::set_default_mode(normalized).unwrap_or_else(|e| {
+                crate::optimize::code::set_default_mode(normalized).unwrap_or_else(|e| {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 });
-                crate::flare::code::set_active(normalized).ok();
+                crate::optimize::code::set_active(normalized).ok();
                 println!("default: {normalized}");
             }
             CodeAction::Off => {
-                crate::flare::code::clear_active();
+                crate::optimize::code::clear_active();
                 println!("off");
             }
             CodeAction::Review => {
-                println!("{}", crate::flare::code::SKILL_REVIEW);
+                println!("{}", crate::optimize::code::SKILL_REVIEW);
             }
             CodeAction::Audit => {
-                println!("{}", crate::flare::code::SKILL_AUDIT);
+                println!("{}", crate::optimize::code::SKILL_AUDIT);
             }
             CodeAction::Debt => {
-                println!("{}", crate::flare::code::SKILL_DEBT);
+                println!("{}", crate::optimize::code::SKILL_DEBT);
             }
             CodeAction::Gain => {
-                println!("{}", crate::flare::code::SKILL_GAIN);
+                println!("{}", crate::optimize::code::SKILL_GAIN);
             }
             CodeAction::Info => {
-                println!("{}", crate::flare::code::SKILL_HELP);
+                println!("{}", crate::optimize::code::SKILL_HELP);
             }
             CodeAction::Playbook => {
-                println!("{}", crate::flare::code::SKILL_PLAYBOOK);
+                println!("{}", crate::optimize::code::SKILL_PLAYBOOK);
             }
             CodeAction::NoHallucination => {
-                println!("{}", crate::flare::code::SKILL_NO_HALLUCINATION);
+                println!("{}", crate::optimize::code::SKILL_NO_HALLUCINATION);
             }
             CodeAction::Hook { event } => match event {
                 CodeHookEvent::SessionStart => {
-                    crate::flare::code::clear_session();
-                    let mode = crate::flare::code::active_mode()
-                        .unwrap_or_else(crate::flare::code::default_mode);
+                    crate::optimize::code::clear_session();
+                    let mode = crate::optimize::code::active_mode()
+                        .unwrap_or_else(crate::optimize::code::default_mode);
                     if mode != "off" {
-                        crate::flare::code::set_active(&mode).ok();
+                        crate::optimize::code::set_active(&mode).ok();
                     }
                     code_emit_hook("SessionStart", true);
                 }
@@ -239,28 +258,30 @@ impl CodeAction {
                 CodeHookEvent::PromptSubmit => {
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input).ok();
-                    if let Some(action) = crate::flare::code::detect_switch_action(&input) {
+                    if let Some(action) = crate::optimize::code::detect_switch_action(&input) {
                         match action {
-                            crate::flare::code::SwitchAction::SetMode(m) => {
-                                crate::flare::code::set_active(&m).ok();
+                            crate::optimize::code::SwitchAction::SetMode(m) => {
+                                crate::optimize::code::set_active(&m).ok();
                             }
-                            crate::flare::code::SwitchAction::SetSession(m) => {
-                                crate::flare::code::set_session(&m).ok();
+                            crate::optimize::code::SwitchAction::SetSession(m) => {
+                                crate::optimize::code::set_session(&m).ok();
                             }
-                            crate::flare::code::SwitchAction::SetDefault(m) => {
-                                crate::flare::code::set_default_mode(&m).ok();
-                                crate::flare::code::set_active(&m).ok();
+                            crate::optimize::code::SwitchAction::SetDefault(m) => {
+                                crate::optimize::code::set_default_mode(&m).ok();
+                                crate::optimize::code::set_active(&m).ok();
                             }
-                            crate::flare::code::SwitchAction::Off => {
-                                crate::flare::code::clear_active();
+                            crate::optimize::code::SwitchAction::Off => {
+                                crate::optimize::code::clear_active();
                             }
-                            crate::flare::code::SwitchAction::Report => {
-                                let mode = crate::flare::code::active_mode()
-                                    .unwrap_or_else(crate::flare::code::default_mode);
-                                let platform = crate::flare::code::detect_platform();
+                            crate::optimize::code::SwitchAction::Report => {
+                                let mode = crate::optimize::code::active_mode()
+                                    .unwrap_or_else(crate::optimize::code::default_mode);
+                                let platform = crate::optimize::code::detect_platform();
                                 let ctx = code_report_message(&mode);
-                                let output = crate::flare::code::format_hook_output(
-                                    "UserPromptSubmit", &ctx, &platform,
+                                let output = crate::optimize::code::format_hook_output(
+                                    "UserPromptSubmit",
+                                    &ctx,
+                                    &platform,
                                 );
                                 println!("{output}");
                                 return;
@@ -270,8 +291,8 @@ impl CodeAction {
                     println!("OK");
                 }
                 CodeHookEvent::Statusline => {
-                    let mode = crate::flare::code::active_mode()
-                        .unwrap_or_else(crate::flare::code::default_mode);
+                    let mode = crate::optimize::code::active_mode()
+                        .unwrap_or_else(crate::optimize::code::default_mode);
                     if mode == "off" || mode.is_empty() {
                         return;
                     }
@@ -288,7 +309,7 @@ impl CodeAction {
 }
 
 // ---------------------------------------------------------------------------
-// Top-level FlareArgs
+// Top-level OptimizeArgs
 // ---------------------------------------------------------------------------
 
 #[derive(Subcommand)]
@@ -324,12 +345,12 @@ pub enum ContextAction {
 }
 
 #[derive(Args)]
-pub struct FlareArgs {
+pub struct OptimizeArgs {
     #[command(subcommand)]
     pub action: FlareAction,
 }
 
-impl FlareArgs {
+impl OptimizeArgs {
     pub fn run(self) {
         match self.action {
             FlareAction::Output { action } => action.run(),
@@ -349,10 +370,10 @@ impl FlareArgs {
                         std::process::exit(1);
                     }
                 };
-                let entries: Vec<crate::flare::context::LineEntry> = content
+                let entries: Vec<crate::optimize::context::LineEntry> = content
                     .lines()
                     .enumerate()
-                    .map(|(i, text)| crate::flare::context::LineEntry {
+                    .map(|(i, text)| crate::optimize::context::LineEntry {
                         index: i,
                         text: text.to_string(),
                     })
@@ -365,7 +386,7 @@ impl FlareArgs {
                         .unwrap_or("")
                         .to_string()
                 });
-                match crate::flare::context::score_lines(&entries, &q) {
+                match crate::optimize::context::score_lines(&entries, &q) {
                     Ok(scored) => {
                         if let Ok(json) = serde_json::to_string(&scored) {
                             println!("{json}");
@@ -382,8 +403,8 @@ impl FlareArgs {
 
     fn run_status(&self) {
         let output_mode = "available"; // always available when compiled
-        let code_mode = crate::flare::code::active_mode()
-            .unwrap_or_else(crate::flare::code::default_mode);
+        let code_mode = crate::optimize::code::active_mode()
+            .unwrap_or_else(crate::optimize::code::default_mode);
         let runtime_turns = crate::optimize::load_runtime()
             .sessions
             .iter()

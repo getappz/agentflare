@@ -109,7 +109,8 @@ fn get_ponytail_mode(request: &GetPromptRequestParams) -> GetPromptResult {
         .to_lowercase();
 
     if mode_arg.is_empty() || mode_arg == "status" {
-        let mode = crate::flare::code::active_mode().unwrap_or_else(crate::flare::code::default_mode);
+        let mode = crate::optimize::code::active_mode()
+            .unwrap_or_else(crate::optimize::code::default_mode);
         return assistant_text(if mode == "off" {
             "ponytail is off. Use /ponytail mode=lite|full|ultra to activate.".to_string()
         } else {
@@ -117,12 +118,14 @@ fn get_ponytail_mode(request: &GetPromptRequestParams) -> GetPromptResult {
         });
     }
     if mode_arg == "off" {
-        crate::flare::code::clear_active();
+        crate::optimize::code::clear_active();
         return assistant_text("ponytail is now off.");
     }
-    match crate::flare::code::normalize_config_mode(&mode_arg) {
-        Some(normalized) => match crate::flare::code::set_active(normalized) {
-            Ok(()) => assistant_text(crate::flare::code::build_instructions(normalized, None).body),
+    match crate::optimize::code::normalize_config_mode(&mode_arg) {
+        Some(normalized) => match crate::optimize::code::set_active(normalized) {
+            Ok(()) => {
+                assistant_text(crate::optimize::code::build_instructions(normalized, None).body)
+            }
             Err(e) => assistant_text(format!("Failed to persist ponytail mode: {e}")),
         },
         None => assistant_text(format!(
@@ -226,10 +229,10 @@ fn get_handoff_command(request: &GetPromptRequestParams, agent: Option<&str>) ->
 }
 
 fn get_ponytail_skill(skill: &str) -> GetPromptResult {
-    if let Err(e) = crate::flare::code::set_active(skill) {
+    if let Err(e) = crate::optimize::code::set_active(skill) {
         return assistant_text(format!("Failed to persist ponytail mode: {e}"));
     }
-    let body = crate::flare::code::sub_skills::get(skill).unwrap_or_default();
+    let body = crate::optimize::code::sub_skills::get(skill).unwrap_or_default();
     assistant_text(body)
 }
 

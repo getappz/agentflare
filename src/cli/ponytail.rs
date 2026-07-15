@@ -43,15 +43,22 @@ fn subagent_should_inject() -> bool {
         Ok(v) => v,
         Err(_) => return true,
     };
-    let agent_type = data.get("agent_type").and_then(|v| v.as_str()).unwrap_or("");
+    let agent_type = data
+        .get("agent_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     should_inject_for(agent_type, override_matcher.as_deref())
 }
 
 #[derive(Subcommand)]
 pub enum PonytailAction {
     Status,
-    Set { mode: String },
-    Default { mode: String },
+    Set {
+        mode: String,
+    },
+    Default {
+        mode: String,
+    },
     Off,
     Review,
     Audit,
@@ -89,16 +96,16 @@ fn report_message(mode: &str) -> String {
 }
 
 fn emit_hook(event: &str, off_guard: bool) {
-    let mode = crate::flare::code::active_mode()
-        .unwrap_or_else(crate::flare::code::default_mode);
+    let mode =
+        crate::optimize::code::active_mode().unwrap_or_else(crate::optimize::code::default_mode);
     if off_guard && mode == "off" {
-        crate::flare::code::clear_active();
+        crate::optimize::code::clear_active();
         println!("OK");
         return;
     }
-    let instructions = crate::flare::code::build_instructions(&mode, None);
-    let platform = crate::flare::code::detect_platform();
-    let output = crate::flare::code::format_hook_output(event, &instructions.body, &platform);
+    let instructions = crate::optimize::code::build_instructions(&mode, None);
+    let platform = crate::optimize::code::detect_platform();
+    let output = crate::optimize::code::format_hook_output(event, &instructions.body, &platform);
     println!("{output}");
 }
 
@@ -106,53 +113,55 @@ impl PonytailArgs {
     pub fn run(self) {
         match self.action {
             PonytailAction::Status => {
-                let mode = crate::flare::code::active_mode()
-                    .unwrap_or_else(crate::flare::code::default_mode);
+                let mode = crate::optimize::code::active_mode()
+                    .unwrap_or_else(crate::optimize::code::default_mode);
                 println!("{mode}");
             }
             PonytailAction::Set { mode } => {
-                let normalized = crate::flare::code::normalize_config_mode(&mode)
+                let normalized = crate::optimize::code::normalize_config_mode(&mode)
                     .unwrap_or_else(|| {
                         eprintln!("error: invalid mode: {mode}");
                         std::process::exit(1);
                     });
-                crate::flare::code::set_active(normalized).unwrap_or_else(|e| {
+                crate::optimize::code::set_active(normalized).unwrap_or_else(|e| {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 });
                 println!("{normalized}");
             }
             PonytailAction::Default { mode } => {
-                let normalized = crate::flare::code::normalize_config_mode(&mode)
+                let normalized = crate::optimize::code::normalize_config_mode(&mode)
                     .unwrap_or_else(|| {
                         eprintln!("error: invalid mode: {mode}");
                         std::process::exit(1);
                     });
-                crate::flare::code::set_default_mode(normalized).unwrap_or_else(|e| {
+                crate::optimize::code::set_default_mode(normalized).unwrap_or_else(|e| {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 });
-                crate::flare::code::set_active(normalized).ok();
+                crate::optimize::code::set_active(normalized).ok();
                 println!("default: {normalized}");
             }
             PonytailAction::Off => {
-                crate::flare::code::clear_active();
+                crate::optimize::code::clear_active();
                 println!("off");
             }
-            PonytailAction::Review => println!("{}", crate::flare::code::SKILL_REVIEW),
-            PonytailAction::Audit => println!("{}", crate::flare::code::SKILL_AUDIT),
-            PonytailAction::Debt => println!("{}", crate::flare::code::SKILL_DEBT),
-            PonytailAction::Gain => println!("{}", crate::flare::code::SKILL_GAIN),
-            PonytailAction::Info => println!("{}", crate::flare::code::SKILL_HELP),
-            PonytailAction::Playbook => println!("{}", crate::flare::code::SKILL_PLAYBOOK),
-            PonytailAction::NoHallucination => println!("{}", crate::flare::code::SKILL_NO_HALLUCINATION),
+            PonytailAction::Review => println!("{}", crate::optimize::code::SKILL_REVIEW),
+            PonytailAction::Audit => println!("{}", crate::optimize::code::SKILL_AUDIT),
+            PonytailAction::Debt => println!("{}", crate::optimize::code::SKILL_DEBT),
+            PonytailAction::Gain => println!("{}", crate::optimize::code::SKILL_GAIN),
+            PonytailAction::Info => println!("{}", crate::optimize::code::SKILL_HELP),
+            PonytailAction::Playbook => println!("{}", crate::optimize::code::SKILL_PLAYBOOK),
+            PonytailAction::NoHallucination => {
+                println!("{}", crate::optimize::code::SKILL_NO_HALLUCINATION)
+            }
             PonytailAction::Hook { event } => match event {
                 PonytailHookEvent::SessionStart => {
-                    crate::flare::code::clear_session();
-                    let mode = crate::flare::code::active_mode()
-                        .unwrap_or_else(crate::flare::code::default_mode);
+                    crate::optimize::code::clear_session();
+                    let mode = crate::optimize::code::active_mode()
+                        .unwrap_or_else(crate::optimize::code::default_mode);
                     if mode != "off" {
-                        crate::flare::code::set_active(&mode).ok();
+                        crate::optimize::code::set_active(&mode).ok();
                     }
                     emit_hook("SessionStart", true);
                 }
@@ -164,28 +173,30 @@ impl PonytailArgs {
                 PonytailHookEvent::PromptSubmit => {
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input).ok();
-                    if let Some(action) = crate::flare::code::detect_switch_action(&input) {
+                    if let Some(action) = crate::optimize::code::detect_switch_action(&input) {
                         match action {
-                            crate::flare::code::SwitchAction::SetMode(m) => {
-                                crate::flare::code::set_active(&m).ok();
+                            crate::optimize::code::SwitchAction::SetMode(m) => {
+                                crate::optimize::code::set_active(&m).ok();
                             }
-                            crate::flare::code::SwitchAction::SetSession(m) => {
-                                crate::flare::code::set_session(&m).ok();
+                            crate::optimize::code::SwitchAction::SetSession(m) => {
+                                crate::optimize::code::set_session(&m).ok();
                             }
-                            crate::flare::code::SwitchAction::SetDefault(m) => {
-                                crate::flare::code::set_default_mode(&m).ok();
-                                crate::flare::code::set_active(&m).ok();
+                            crate::optimize::code::SwitchAction::SetDefault(m) => {
+                                crate::optimize::code::set_default_mode(&m).ok();
+                                crate::optimize::code::set_active(&m).ok();
                             }
-                            crate::flare::code::SwitchAction::Off => {
-                                crate::flare::code::clear_active();
+                            crate::optimize::code::SwitchAction::Off => {
+                                crate::optimize::code::clear_active();
                             }
-                            crate::flare::code::SwitchAction::Report => {
-                                let mode = crate::flare::code::active_mode()
-                                    .unwrap_or_else(crate::flare::code::default_mode);
-                                let platform = crate::flare::code::detect_platform();
+                            crate::optimize::code::SwitchAction::Report => {
+                                let mode = crate::optimize::code::active_mode()
+                                    .unwrap_or_else(crate::optimize::code::default_mode);
+                                let platform = crate::optimize::code::detect_platform();
                                 let ctx = report_message(&mode);
-                                let output = crate::flare::code::format_hook_output(
-                                    "UserPromptSubmit", &ctx, &platform,
+                                let output = crate::optimize::code::format_hook_output(
+                                    "UserPromptSubmit",
+                                    &ctx,
+                                    &platform,
                                 );
                                 println!("{output}");
                                 return;
@@ -195,8 +206,8 @@ impl PonytailArgs {
                     println!("OK");
                 }
                 PonytailHookEvent::Statusline => {
-                    let mode = crate::flare::code::active_mode()
-                        .unwrap_or_else(crate::flare::code::default_mode);
+                    let mode = crate::optimize::code::active_mode()
+                        .unwrap_or_else(crate::optimize::code::default_mode);
                     if mode == "off" || mode.is_empty() {
                         return;
                     }

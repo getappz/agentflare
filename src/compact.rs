@@ -1,3 +1,3 @@
-//! DEPRECATED — use crate::flare::context instead.
+//! DEPRECATED — use crate::optimize::context instead.
 //! Thin re-export for backward compatibility.
-pub use crate::flare::context::*;
+pub use crate::optimize::context::*;
