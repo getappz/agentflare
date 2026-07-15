@@ -19,6 +19,24 @@ pub enum OutputAction {
     },
 }
 
+/// Register an output-layer compression's original and return its expand-marker.
+fn record_and_marker(
+    original_path: std::path::PathBuf,
+    before: u64,
+    after: u64,
+    now: u64,
+) -> String {
+    let entry = crate::optimize::retrieve::register(
+        crate::optimize::retrieve::EntryKind::FileBackup {
+            backup_path: original_path,
+        },
+        before,
+        after,
+        now,
+    );
+    crate::optimize::retrieve::marker(&entry)
+}
+
 impl OutputAction {
     fn run(self) {
         match self {
@@ -61,6 +79,15 @@ impl OutputAction {
                         println!(
                             "{}→{}B ▼{pct}%",
                             report.original_bytes, report.compressed_bytes
+                        );
+                        println!(
+                            "{}",
+                            record_and_marker(
+                                report.original_path.clone(),
+                                report.original_bytes as u64,
+                                report.compressed_bytes as u64,
+                                crate::optimize::retrieve::now_unix(),
+                            )
                         );
                     }
                     Err(e) => {
@@ -469,5 +496,25 @@ mod tests {
             code_report_message("off"),
             "flare code is off. Use /flare code lite|full|ultra to activate."
         );
+    }
+
+    #[test]
+    fn record_and_marker_registers_a_retrievable_original() {
+        use crate::paths::test_support::with_temp_home;
+        with_temp_home(|| {
+            let backup = crate::state::state_dir().join("orig.md");
+            std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+            std::fs::write(&backup, "ORIGINAL").unwrap();
+
+            let m = super::record_and_marker(backup.clone(), 100, 10, 1_000);
+            assert!(m.contains("optimize retrieve"), "marker text: {m}");
+
+            // the first r-xxxxxx token in the marker is the id; it must be retrievable
+            let id = m
+                .split_whitespace()
+                .find(|w| w.starts_with("r-"))
+                .expect("marker should contain an r- id");
+            assert_eq!(crate::optimize::retrieve::retrieve(id).unwrap(), "ORIGINAL");
+        });
     }
 }
