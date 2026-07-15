@@ -25,13 +25,8 @@ fn asset_ext() -> &'static str {
     if cfg!(windows) { "zip" } else { "tar.gz" }
 }
 
-fn asset_name(version: &str) -> String {
-    format!(
-        "agentflare-{}-{}.{}",
-        target_triple(),
-        clear_v(version),
-        asset_ext()
-    )
+fn asset_name(_version: &str) -> String {
+    format!("agentflare-{}.{}", target_triple(), asset_ext())
 }
 
 fn checksums_name() -> String {
@@ -40,10 +35,6 @@ fn checksums_name() -> String {
 
 fn release_url(version: &str, asset: &str) -> String {
     format!("https://github.com/{REPO}/releases/download/{version}/{asset}")
-}
-
-fn clear_v(version: &str) -> &str {
-    version.strip_prefix('v').unwrap_or(version)
 }
 
 fn gh_get(url: &str) -> Result<ureq::Response, String> {
@@ -252,12 +243,6 @@ fn replace_binary(new_binary: &Path, current: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clear_v_strips_prefix() {
-        assert_eq!(clear_v("v1.0.0"), "1.0.0");
-        assert_eq!(clear_v("1.0.0"), "1.0.0");
-    }
 
     #[test]
     fn asset_name_uses_target_triple() {
