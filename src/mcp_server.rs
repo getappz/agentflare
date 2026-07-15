@@ -279,6 +279,15 @@ struct ArtifactRequest {
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct OptimizeRequest {
+    #[schemars(description = "Action: retrieve | list")]
+    action: String,
+    #[serde(default)]
+    #[schemars(description = "Registered compression id (required for retrieve)")]
+    id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct MemoryRequest {
     #[schemars(description = "Action: compact|context|curate|handoff|recall|relate|remember")]
     action: String,
@@ -2171,6 +2180,30 @@ impl AgentflareMcp {
             )),
         }
     }
+    #[tool(
+        description = "Optimize layer — reversible-compression retrieval (CCR). action=retrieve returns the original for a registered id; action=list enumerates live entries."
+    )]
+    fn optimize(&self, Parameters(req): Parameters<OptimizeRequest>) -> Result<String, ErrorData> {
+        match req.action.as_str() {
+            "retrieve" => {
+                let id = req.id.ok_or_else(|| {
+                    ErrorData::invalid_params("id is required for retrieve", None)
+                })?;
+                crate::optimize::retrieve::retrieve(&id)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            }
+            "list" => {
+                let state = crate::optimize::retrieve::load_state();
+                let entries: Vec<_> = state.entries.values().collect();
+                serde_json::to_string(&entries)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            }
+            other => Err(ErrorData::invalid_params(
+                format!("unknown action: {other}"),
+                None,
+            )),
+        }
+    }
     fn item_inner(&self, req: ItemRequest) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "create" => self.item_create(req),
@@ -3013,6 +3046,32 @@ mod tests {
             }))
             .unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn optimize_tool_retrieve_returns_registered_original() {
+        crate::paths::test_support::with_temp_home(|| {
+            let backup = crate::state::state_dir().join("o.md");
+            std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+            std::fs::write(&backup, "ORIG").unwrap();
+            let e = crate::optimize::retrieve::register(
+                crate::optimize::retrieve::EntryKind::FileBackup {
+                    backup_path: backup,
+                },
+                4,
+                1,
+                1,
+            );
+
+            let s = AgentflareMcp::default();
+            let out = s
+                .optimize(Parameters(OptimizeRequest {
+                    action: "retrieve".into(),
+                    id: Some(e.id),
+                }))
+                .unwrap();
+            assert_eq!(out, "ORIG");
+        });
     }
 
     // NOTE: `list_resources`/`read_resource` on `ServerHandler` take a
