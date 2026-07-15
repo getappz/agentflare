@@ -358,7 +358,7 @@ struct MemoryRequest {
     #[schemars(description = "Keep N most recent messages verbatim (compact)")]
     #[serde(default)]
     preserve_recent: Option<usize>,
-    #[schemars(description = "Scorer backend: fts5|keyword (compact)")]
+    #[schemars(description = "Scorer backend: fts5 (compact)")]
     #[serde(default)]
     scorer: Option<String>,
 }
@@ -598,7 +598,9 @@ struct ItemRequest {
     )]
     #[serde(default)]
     state_group: Option<String>,
-    #[schemars(description = "Max items to return (list); omit for no limit")]
+    #[schemars(
+        description = "Max items to return (list: omit for no limit; search: omit for 20, capped at 1000)"
+    )]
     #[serde(default)]
     limit: Option<i64>,
     #[schemars(description = "Items to skip before applying limit (list); default 0")]
@@ -784,7 +786,7 @@ impl AgentflareMcp {
     #[tool(
         description = "Skill operations — search installed skills or load one by name. Single consolidated tool with `action` field (search|load)."
     )]
-    fn skill(&self, Parameters(req): Parameters<SkillRequest>) -> Result<String, ErrorData> {
+    async fn skill(&self, Parameters(req): Parameters<SkillRequest>) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "search" => {
                 let query = req
@@ -803,9 +805,22 @@ impl AgentflareMcp {
                         ));
                     }
                 };
-                let hits = self
-                    .with_fresh_registry(|reg| reg.search(&query, req.limit.unwrap_or(5), mode))?
+                let limit = req.limit.unwrap_or(5);
+                let local = self
+                    .with_fresh_registry(|reg| reg.search(&query, limit, mode))?
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let hits = if local.len() < limit {
+                    let remaining = limit - local.len();
+                    let query_owned = query.clone();
+                    let registry = tokio::task::spawn_blocking(move || {
+                        gateway_registry::registry_search::search_registry(&query_owned, remaining)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    skill_registry::merge_registry_hits(local, limit, registry)
+                } else {
+                    local
+                };
                 Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
             }
             "load" => {
@@ -1969,11 +1984,25 @@ impl AgentflareMcp {
                         ));
                     }
                 };
-                let guard = self.ensure_gateway_registry().await?;
-                let reg = guard.as_ref().expect("ensured above");
-                let hits = reg
-                    .search(&query, req.limit.unwrap_or(5), mode)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let limit = req.limit.unwrap_or(5);
+                let local = {
+                    let guard = self.ensure_gateway_registry().await?;
+                    let reg = guard.as_ref().expect("ensured above");
+                    reg.search(&query, limit, mode)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                };
+                let hits = if local.len() < limit {
+                    let remaining = limit - local.len();
+                    let query_owned = query.clone();
+                    let registry = tokio::task::spawn_blocking(move || {
+                        gateway_registry::registry_search::search_registry(&query_owned, remaining)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    gateway_registry::merge_registry_hits(local, limit, registry)
+                } else {
+                    local
+                };
                 Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
             }
             "execute" => {
@@ -3029,8 +3058,8 @@ mod tests {
         assert_eq!(err.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
     }
 
-    #[test]
-    fn skill_search_empty_query_is_invalid_params() {
+    #[tokio::test]
+    async fn skill_search_empty_query_is_invalid_params() {
         let s = AgentflareMcp::default();
         let err = s
             .skill(Parameters(SkillRequest {
@@ -3038,12 +3067,13 @@ mod tests {
                 query: Some("".into()),
                 ..Default::default()
             }))
+            .await
             .unwrap_err();
         assert!(err.to_string().contains("query"));
     }
 
-    #[test]
-    fn skill_load_unknown_name_reports_not_found_with_search_hint() {
+    #[tokio::test]
+    async fn skill_load_unknown_name_reports_not_found_with_search_hint() {
         // Isolated DB path so the test never opens/refreshes the shared skills.db.
         let tmp = tempfile::tempdir().unwrap();
         let s = AgentflareMcp {
@@ -3057,12 +3087,13 @@ mod tests {
                 original: false,
                 ..Default::default()
             }))
+            .await
             .unwrap_err();
         assert!(out.to_string().contains("skill_search"));
     }
 
-    #[test]
-    fn skill_search_mode_rejects_unknown_value() {
+    #[tokio::test]
+    async fn skill_search_mode_rejects_unknown_value() {
         let s = AgentflareMcp::default();
         let err = s
             .skill(Parameters(SkillRequest {
@@ -3071,6 +3102,7 @@ mod tests {
                 mode: Some("fuzzy".into()),
                 ..Default::default()
             }))
+            .await
             .unwrap_err();
         assert!(err.to_string().contains("mode"));
     }

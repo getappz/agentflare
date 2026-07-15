@@ -13,6 +13,10 @@ pub struct SkillHit {
     pub est_tokens: i64,
     pub compressed: bool,
     pub score: f64,
+    /// How to install this as an MCP server (only set for registry fallback hits).
+    pub install_hint: Option<String>,
+    /// Streamable HTTP URL (only set for registry hits with remotes).
+    pub remote_url: Option<String>,
 }
 
 pub fn search(
@@ -42,9 +46,42 @@ pub fn search(
             est_tokens: r.get(3)?,
             compressed: r.get(4)?,
             score: r.get(5)?,
+            install_hint: None,
+            remote_url: None,
         })
     })?;
     rows.collect()
+}
+
+/// Fold registry-fallback hits into an already-fetched local result set, up
+/// to `limit` total. Pure/no I/O by design -- the caller fetches `registry`
+/// (typically via `gateway_registry::registry_search::search_registry`)
+/// AFTER releasing whatever lock guarded the local `search()` call, so a
+/// slow or hung registry request can never block other callers of the
+/// local index.
+pub fn merge_registry_hits(
+    mut local: Vec<SkillHit>,
+    limit: usize,
+    registry: Vec<gateway_registry::registry_search::RegistryHit>,
+) -> Vec<SkillHit> {
+    let remaining = limit.saturating_sub(local.len());
+    local.extend(registry.into_iter().take(remaining).map(|hit| SkillHit {
+        name: hit.server,
+        source: "mcp_registry".to_string(),
+        description: hit.description,
+        est_tokens: 0,
+        compressed: false,
+        score: gateway_registry::REGISTRY_FALLBACK_SCORE,
+        install_hint: hit.install_hint.map(|h| {
+            if let Some(runtime) = h.runtime_hint {
+                format!("{} {}", runtime, h.identifier)
+            } else {
+                format!("{}:{}", h.registry_type, h.identifier)
+            }
+        }),
+        remote_url: hit.remote_url,
+    }));
+    local
 }
 
 /// Every distinct skill name currently indexed, regardless of source. Used
@@ -171,6 +208,22 @@ mod tests {
                 "live".to_string(),
                 "win-cleanup".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn merge_registry_hits_marks_fallback_hits_as_registry_sourced() {
+        let registry = vec![gateway_registry::registry_search::RegistryHit {
+            server: "some-server".to_string(),
+            description: "from the registry".to_string(),
+            install_hint: None,
+            remote_url: None,
+        }];
+        let merged = merge_registry_hits(vec![], 1, registry);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].source, "mcp_registry",
+            "registry-fallback hits must carry a distinguishable source, not an empty string local skills could also have"
         );
     }
 }

@@ -8,6 +8,7 @@ mod mcp_http;
 mod mcp_stdio;
 mod redact;
 mod registry;
+pub mod registry_search;
 mod sanitize;
 mod search;
 mod truncate;
@@ -20,6 +21,9 @@ pub use mcp_http::McpHttpBackend;
 pub use mcp_stdio::{DEFAULT_TIMEOUT, McpStdioBackend};
 pub use redact::redact_error_for_llm;
 pub use registry::Registry;
-pub use search::{MatchMode, ToolHit, search as search_tools};
+pub use search::{
+    HitSource, InstallHint, MatchMode, REGISTRY_FALLBACK_SCORE, ToolHit, merge_registry_hits,
+    search as search_tools,
+};
 pub use truncate::{DEFAULT_MAX_CHARS, truncate_if_needed};
 pub use types::ToolEntry;

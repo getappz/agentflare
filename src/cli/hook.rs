@@ -22,6 +22,12 @@ pub enum HookEvent {
         #[arg(long, value_enum)]
         agent: Option<agent_registry::Agent>,
     },
+    /// Fires before context compaction (Claude Code). Hook can read the
+    /// transcript and persist state before the conversation is compacted.
+    PreCompact {
+        #[arg(long, value_enum)]
+        agent: Option<agent_registry::Agent>,
+    },
 }
 
 #[derive(Args)]
@@ -47,6 +53,7 @@ impl HookArgs {
             HookEvent::PromptSubmit { agent } => crate::hook::prompt_submit(&resolve_agent(agent)),
             HookEvent::PreToolUse { agent } => crate::hook::pre_tool_use(&resolve_agent(agent)),
             HookEvent::SessionEnd { agent } => crate::hook::session_end(&resolve_agent(agent)),
+            HookEvent::PreCompact { agent } => crate::hook::pre_compact(&resolve_agent(agent)),
         }
     }
 }

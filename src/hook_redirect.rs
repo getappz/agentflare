@@ -19,8 +19,11 @@ const GATING_TIMEOUT: Duration = Duration::from_millis(2000);
 /// default branch, regardless of which of these the agent reaches for.
 const MUTATING_TOOLS: &[&str] = &[
     "Write",
+    "write",
     "Edit",
+    "edit",
     "NotebookEdit",
+    "notebookedit",
     "mcp__lean-ctx__ctx_patch",
     "mcp__lean-ctx__ctx_edit",
 ];
@@ -208,6 +211,14 @@ mod tests {
         assert!(classify("NotebookEdit", None, ctx).is_some());
         assert!(classify("mcp__lean-ctx__ctx_patch", None, ctx).is_some());
         assert!(classify("mcp__lean-ctx__ctx_edit", None, ctx).is_some());
+    }
+
+    #[test]
+    fn classify_blocks_lowercase_edit_and_write_on_master() {
+        let ctx = (Some("master"), None);
+        assert!(classify("edit", None, ctx).is_some());
+        assert!(classify("write", None, ctx).is_some());
+        assert!(classify("notebookedit", None, ctx).is_some());
     }
 
     #[test]

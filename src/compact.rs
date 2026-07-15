@@ -2,7 +2,7 @@
 //! Creates an in-memory SQLite FTS5 table per call and ranks lines by
 //! relevance to a query. Used by the PreCompact hook (Phase 2) to
 //! identify which transcript lines to keep during compaction.
-use flare_search_kit::{fts_query, Bm25Weights, MatchMode};
+use flare_search_kit::{Bm25Weights, MatchMode, fts_query};
 use rusqlite::Connection;
 
 /// A single line from a session transcript.
@@ -43,19 +43,21 @@ pub fn score_lines(lines: &[LineEntry], query: &str) -> Vec<ScoredLine> {
 
     let conn = Connection::open_in_memory().expect("in-memory SQLite connection");
 
-    conn.execute_batch(
-        "CREATE VIRTUAL TABLE transcript_fts USING fts5(\"ix\" UNINDEXED, text);",
-    )
-    .expect("create FTS5 table");
+    conn.execute_batch("CREATE VIRTUAL TABLE transcript_fts USING fts5(\"ix\" UNINDEXED, text);")
+        .expect("create FTS5 table");
 
     {
-        let mut stmt = conn
-            .prepare("INSERT INTO transcript_fts(\"ix\", text) VALUES(?1, ?2);")
-            .expect("prepare insert");
-        for line in lines {
-            stmt.execute(rusqlite::params![line.index as i64, &line.text])
-                .expect("insert line");
+        let tx = conn.unchecked_transaction().expect("start transaction");
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO transcript_fts(\"ix\", text) VALUES(?1, ?2);")
+                .expect("prepare insert");
+            for line in lines {
+                stmt.execute(rusqlite::params![line.index as i64, &line.text])
+                    .expect("insert line");
+            }
         }
+        tx.commit().expect("commit transcript insert batch");
     }
 
     let weights = Bm25Weights::new(vec![]);
@@ -63,7 +65,7 @@ pub fn score_lines(lines: &[LineEntry], query: &str) -> Vec<ScoredLine> {
         "SELECT \"ix\", text, bm25(transcript_fts{}) AS score \
          FROM transcript_fts \
          WHERE transcript_fts MATCH ?1 \
-         ORDER BY score",
+         ORDER BY score, \"ix\"",
         weights.sql_args()
     );
 
@@ -115,12 +117,10 @@ mod tests {
 
     #[test]
     fn score_lines_returns_empty_for_no_match() {
-        let lines = vec![
-            LineEntry {
-                index: 0,
-                text: "Fix the login button color.".to_string(),
-            },
-        ];
+        let lines = vec![LineEntry {
+            index: 0,
+            text: "Fix the login button color.".to_string(),
+        }];
         let scored = score_lines(&lines, "quantum physics");
         assert!(scored.is_empty());
     }

@@ -413,8 +413,8 @@ pub fn search(
     limit: Option<usize>,
 ) -> Result<Vec<Item>> {
     let limit = limit.unwrap_or(20);
-    let safe = flare_search_kit::fts_query(query, flare_search_kit::MatchMode::All)
-        .unwrap_or_default();
+    let safe =
+        flare_search_kit::fts_query(query, flare_search_kit::MatchMode::All).unwrap_or_default();
     if safe.is_empty() {
         return Ok(vec![]);
     }
@@ -432,7 +432,10 @@ pub fn search(
          ORDER BY bm25(items_fts, 3.0, 1.0, 1.0)
          LIMIT ?3",
     )?;
-    let rows = stmt.query_map(rusqlite::params![project_id, safe, limit as i64], row_to_item)?;
+    let rows = stmt.query_map(
+        rusqlite::params![project_id, safe, flare_search_kit::clamped_limit(limit)],
+        row_to_item,
+    )?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
@@ -1182,8 +1185,13 @@ mod tests {
         assert_eq!(db_results.len(), 2);
         // Both matched — "Database" is in name of item 1, "database"
         // is in name of item 3. BM25 ranking may tie; verify both match.
-        assert!(db_results[0].name.to_lowercase().contains("database")
-            || db_results[0].description.to_lowercase().contains("database"));
+        assert!(
+            db_results[0].name.to_lowercase().contains("database")
+                || db_results[0]
+                    .description
+                    .to_lowercase()
+                    .contains("database")
+        );
     }
 
     #[test]

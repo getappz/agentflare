@@ -374,16 +374,21 @@ impl AgentflareMcp {
     }
 
     pub(super) fn item_search(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let query = req.query.ok_or_else(|| {
-            ErrorData::invalid_params("query is required for search", None)
-        })?;
+        let query = req
+            .query
+            .ok_or_else(|| ErrorData::invalid_params("query is required for search", None))?;
         if query.trim().is_empty() {
             return Err(ErrorData::invalid_params("query is required", None));
         }
         self.with_backend_db(|conn| {
             let project = self.resolve_project(conn)?;
-            let items = agentflare_backend::item::search(conn, &project.id, &query, req.limit.map(|l| l as usize))
-                .map_err(map_backend_err)?;
+            let items = agentflare_backend::item::search(
+                conn,
+                &project.id,
+                &query,
+                req.limit.map(|l| l as usize),
+            )
+            .map_err(map_backend_err)?;
             Ok(serde_json::to_string_pretty(&items).unwrap_or_default())
         })?
     }

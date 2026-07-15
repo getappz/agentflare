@@ -344,6 +344,13 @@ fn wire_claude_code() {
         format!("\"{bin}\" hook pre-tool-use"),
         5,
     );
+    added |= add_hook_entry(
+        hooks_obj,
+        "PreCompact",
+        "hook pre-compact",
+        format!("\"{bin}\" hook pre-compact"),
+        5,
+    );
 
     if !added {
         println!("  skip  ~/.claude/settings.json hooks (already wired)");
@@ -823,6 +830,7 @@ mod tests {
             assert!(content.contains("SessionStart"));
             assert!(content.contains("UserPromptSubmit"));
             assert!(content.contains("PreToolUse"));
+            assert!(content.contains("PreCompact"));
         });
     }
 
@@ -901,6 +909,31 @@ mod tests {
             // ...while the pre-existing old-format entries are left as-is,
             // not duplicated or rewritten.
             assert!(content.contains("hook session-start --agent claude-code"));
+            assert_eq!(parsed["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_backfills_pre_compact_into_already_wired_install() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("settings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Simulates an install without PreCompact.
+            fs::write(&path, serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "SessionStart": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook session-start", "timeout": 10 }] }],
+                    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook prompt-submit", "timeout": 5 }] }],
+                    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "\"agentflare\" hook pre-tool-use", "timeout": 5 }] }]
+                }
+            })).unwrap()).unwrap();
+
+            wire_claude_code();
+
+            let content = fs::read_to_string(&path).unwrap();
+            let parsed: Value = serde_json::from_str(&content).unwrap();
+            assert!(content.contains("hook pre-compact"));
+            assert_eq!(parsed["hooks"]["PreCompact"].as_array().unwrap().len(), 1);
+            // Pre-existing hooks are not duplicated.
             assert_eq!(parsed["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         });
     }
