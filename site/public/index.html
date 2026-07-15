@@ -19,7 +19,19 @@
 
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3CradialGradient id='g' cx='50%25' cy='42%25' r='60%25'%3E%3Cstop offset='0' stop-color='%23FFD37A'/%3E%3Cstop offset='0.5' stop-color='%23FFB020'/%3E%3Cstop offset='1' stop-color='%23FF5E3A'/%3E%3C/radialGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='%230B0D12'/%3E%3Cpath d='M16 5 L18.4 13.6 L27 16 L18.4 18.4 L16 27 L13.6 18.4 L5 16 L13.6 13.6 Z' fill='url(%23g)'/%3E%3C/svg%3E" />
 
+<link rel="preload" href="/fonts/commit-mono-400.woff2" as="font" type="font/woff2" crossorigin />
+<link rel="preload" href="/fonts/commit-mono-700.woff2" as="font" type="font/woff2" crossorigin />
+
 <style>
+  /* Commit Mono (OFL) — self-hosted, same-origin, served from /fonts by the Worker */
+  @font-face{
+    font-family:"Commit Mono"; font-style:normal; font-weight:400; font-display:swap;
+    src:url("/fonts/commit-mono-400.woff2") format("woff2");
+  }
+  @font-face{
+    font-family:"Commit Mono"; font-style:normal; font-weight:700; font-display:swap;
+    src:url("/fonts/commit-mono-700.woff2") format("woff2");
+  }
   :root{
     color-scheme: light dark;
     --bg:#0B0D12; --bg-2:#0E1119; --surface:#14171F; --surface-2:#1A1E29;
@@ -30,7 +42,7 @@
     --shadow: 0 24px 60px -20px rgba(0,0,0,.6);
     --glow: 0 0 0 1px rgba(255,176,32,.14), 0 30px 90px -30px rgba(255,94,58,.35);
     --maxw: 1120px;
-    --mono: ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace;
+    --mono: "Commit Mono",ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace;
     --sans: system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
     --r: 14px; --r-sm:10px;
   }

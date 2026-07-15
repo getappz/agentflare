@@ -1,0 +1,5 @@
+# wrangler local state / cache — never commit (may hold account/session data)
+.wrangler/
+
+# deps
+node_modules/

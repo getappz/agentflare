@@ -11,8 +11,9 @@ site/
 ├── src/
 │   └── worker.ts      # serves ./public from ASSETS; proxies /install.sh + /install.ps1 → raw GitHub
 └── public/
-    ├── index.html     # the site — self-contained (inline CSS/JS, SVG favicon, system fonts)
-    └── 404.html       # on-brand not-found page
+    ├── index.html     # the site — self-contained (inline CSS/JS, SVG favicon, self-hosted Commit Mono)
+    ├── 404.html       # on-brand not-found page
+    └── fonts/         # Commit Mono woff2 (400 + 700) + OFL LICENSE.txt
 ```
 
 There is **no build step** — `public/index.html` is hand-authored and shipped as-is.
@@ -48,12 +49,16 @@ animated hero terminal are inline and commented. Keep the numbers in sync with t
 repo's root `README.md` metrics table; the site deliberately mirrors its
 "attributed, not blended" framing.
 
-## Optional polish (free tiers, none required)
-- **Fonts** — the page uses a system monospace/sans stack, so it needs no network. To
-  push the display type further, self-host a face (Commit Mono, Geist Mono, Departure
-  Mono) under `public/fonts/` and add a `@font-face` — keep it self-hosted so the page
-  stays request-free.
-- **Analytics** — Cloudflare Web Analytics (free, cookieless) via the dashboard, or a
-  `<script>` beacon.
+## Shipped extras
+- **Font** — [Commit Mono](https://commitmono.com) (OFL-1.1) is self-hosted under
+  `public/fonts/` (weights 400 + 700, `@font-face` + `<link rel="preload">`), served
+  same-origin by the Worker so the page makes no third-party font request. License at
+  `public/fonts/LICENSE.txt`.
+- **Analytics** — Cloudflare Web Analytics is enabled on the zone (automatic, cookieless
+  — no beacon code in the page). For explicit control instead, add the manual beacon
+  `<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token":"…"}'></script>`
+  to `<head>`.
+
+## Optional, not yet done (free tiers)
 - **Social image** — add a real `og:image` PNG (1200×630) under `public/` and reference
   it in `<head>` for richer link unfurls on X / Slack / Discord.
