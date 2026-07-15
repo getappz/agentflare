@@ -59,6 +59,9 @@ repo's root `README.md` metrics table; the site deliberately mirrors its
   `<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token":"…"}'></script>`
   to `<head>`.
 
-## Optional, not yet done (free tiers)
-- **Social image** — add a real `og:image` PNG (1200×630) under `public/` and reference
-  it in `<head>` for richer link unfurls on X / Slack / Discord.
+- **Social image** — `public/og.png` (1200×630) is referenced via `og:image` /
+  `twitter:image` for rich link unfurls on X / Slack / Discord. Source of truth is
+  `og.svg`; regenerate with:
+  ```bash
+  cd site && npm install --no-save @resvg/resvg-js && node scripts/render-og.mjs
+  ```
