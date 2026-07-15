@@ -13,6 +13,7 @@ mod channels;
 mod claims;
 mod cli;
 mod coaching;
+mod compact;
 mod components;
 mod cost;
 mod db;

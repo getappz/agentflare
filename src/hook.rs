@@ -190,6 +190,82 @@ pub fn pre_tool_use(_agent: &str) {
     }
 }
 
+#[allow(dead_code)]
+struct PreCompactInput {
+    session_id: String,
+    transcript_path: Option<String>,
+    trigger: String,
+}
+
+fn parse_pre_compact(input: &str) -> Option<PreCompactInput> {
+    let v: serde_json::Value = serde_json::from_str(input).ok()?;
+    let session_id = v.get("session_id")?.as_str()?.to_string();
+    let transcript_path = v
+        .get("transcript_path")
+        .and_then(|t| t.as_str())
+        .map(String::from);
+    let trigger = v
+        .get("trigger")
+        .and_then(|t| t.as_str())
+        .unwrap_or("auto")
+        .to_string();
+    Some(PreCompactInput {
+        session_id,
+        transcript_path,
+        trigger,
+    })
+}
+
+/// `session_id` is a UUID, not natural-language text -- FTS5-matching it
+/// against transcript content would essentially never hit, making
+/// relevance scoring a no-op. Use the transcript's own last non-empty
+/// line (the most recent turn) as a proxy for what the user is currently
+/// focused on, so older lines get ranked by relevance to that instead of
+/// to an opaque session identifier. Falls back to `session_id` only when
+/// the whole transcript is empty.
+fn relevance_query<'a>(content: &'a str, session_id: &'a str) -> &'a str {
+    content
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(session_id)
+}
+
+/// Handles PreCompact hook. Reads transcript from `transcript_path` and
+/// scores lines by relevance using FTS5/BM25. Outputs scored lines as JSON
+/// so Claude Code's compaction can prioritise keeping relevant context.
+pub fn pre_compact(_agent: &str) {
+    let Some(input) = read_stdin_or_skip("PreCompact") else {
+        return;
+    };
+    let Some(parsed) = parse_pre_compact(&input) else {
+        return;
+    };
+    let Some(path) = parsed.transcript_path else {
+        return;
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[agentflare] PreCompact: cannot read transcript {path}: {e}");
+            return;
+        }
+    };
+    let entries: Vec<crate::compact::LineEntry> = content
+        .lines()
+        .enumerate()
+        .map(|(i, text)| crate::compact::LineEntry {
+            index: i,
+            text: text.to_string(),
+        })
+        .collect();
+    let query = relevance_query(&content, &parsed.session_id);
+    let scored = crate::compact::score_lines(&entries, query);
+    if let Ok(json) = serde_json::to_string(&scored) {
+        println!("{json}");
+    }
+}
+
 /// No-op, kept only so a `settings.json` entry written by an older agentflare
 /// version (which fired an `engram-cli` handoff here — removed along with the
 /// rest of the engram integration) doesn't start erroring on every session
@@ -370,6 +446,60 @@ mod tests {
         let input = r#"{"session_id": "abc", "tool_name": "ScheduleWakeup", "tool_input": {"delaySeconds": 280}}"#;
         let parsed = parse_pre_tool_use(input).unwrap();
         assert_eq!(parsed.delay_seconds, Some(280));
+    }
+
+    #[test]
+    fn parse_pre_compact_reads_session_and_trigger() {
+        let input = r#"{"session_id": "abc", "transcript_path": "/x.jsonl", "hook_event_name": "PreCompact", "trigger": "auto"}"#;
+        let parsed = parse_pre_compact(input).unwrap();
+        assert_eq!(parsed.session_id, "abc");
+        assert_eq!(parsed.transcript_path.as_deref(), Some("/x.jsonl"));
+        assert_eq!(parsed.trigger, "auto");
+    }
+
+    #[test]
+    fn parse_pre_compact_defaults_trigger_when_missing() {
+        let input = r#"{"session_id": "abc", "hook_event_name": "PreCompact"}"#;
+        let parsed = parse_pre_compact(input).unwrap();
+        assert_eq!(parsed.trigger, "auto");
+        assert!(parsed.transcript_path.is_none());
+    }
+
+    #[test]
+    fn parse_pre_compact_rejects_invalid_json() {
+        assert!(parse_pre_compact("not json").is_none());
+    }
+
+    #[test]
+    fn parse_pre_compact_rejects_missing_session() {
+        let input = r#"{"trigger": "manual"}"#;
+        assert!(parse_pre_compact(input).is_none());
+    }
+
+    #[test]
+    fn relevance_query_uses_last_non_empty_transcript_line() {
+        let content = "first line
+second line
+
+";
+        assert_eq!(relevance_query(content, "some-session-uuid"), "second line");
+    }
+
+    #[test]
+    fn relevance_query_falls_back_to_session_id_when_transcript_empty() {
+        assert_eq!(
+            relevance_query("", "some-session-uuid"),
+            "some-session-uuid"
+        );
+        assert_eq!(
+            relevance_query(
+                "   
+	
+",
+                "some-session-uuid"
+            ),
+            "some-session-uuid"
+        );
     }
 
     #[test]
