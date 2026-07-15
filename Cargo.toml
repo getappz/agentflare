@@ -70,6 +70,7 @@ agentflare-artifacts = { path = "crates/agentflare-artifacts" }
 agentflare-backend = { package = "agentflare-backend", path = "crates/agentflare-backend" }
 db_kit = { package = "agentflare-db-kit", path = "crates/agentflare-db-kit" }
 agent-detector = "0.2.1"
+flare-search-kit = { path = "crates/flare-search-kit" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

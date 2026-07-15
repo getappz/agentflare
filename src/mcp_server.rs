@@ -280,7 +280,7 @@ struct ArtifactRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct MemoryRequest {
-    #[schemars(description = "Action: context|curate|handoff|recall|relate|remember")]
+    #[schemars(description = "Action: compact|context|curate|handoff|recall|relate|remember")]
     action: String,
     #[schemars(description = "Title of the observation (remember)")]
     #[serde(default)]
@@ -352,6 +352,15 @@ struct MemoryRequest {
     #[schemars(description = "Sub-action for curate: update|delete|pin|unpin")]
     #[serde(default)]
     curate_action: Option<String>,
+    #[schemars(description = "Target fraction of lines to keep (0.0-1.0, compact)")]
+    #[serde(default)]
+    compression_ratio: Option<f64>,
+    #[schemars(description = "Keep N most recent messages verbatim (compact)")]
+    #[serde(default)]
+    preserve_recent: Option<usize>,
+    #[schemars(description = "Scorer backend: fts5 (compact)")]
+    #[serde(default)]
+    scorer: Option<String>,
 }
 
 #[derive(Default)]
@@ -2028,7 +2037,7 @@ impl AgentflareMcp {
         }
     } // --- Memory tools ---
     #[tool(
-        description = "Memory operations — remember, recall, context, curate, handoff, or relate observations. Single consolidated tool with `action` field (context|curate|handoff|recall|relate|remember)."
+        description = "Memory operations — compact, context, curate, handoff, recall, relate, or remember observations. Single consolidated tool with `action` field (compact|context|curate|handoff|recall|relate|remember)."
     )]
     fn memory(&self, Parameters(req): Parameters<MemoryRequest>) -> Result<String, ErrorData> {
         match req.action.as_str() {
@@ -2089,6 +2098,17 @@ impl AgentflareMcp {
                     evidence: req.evidence,
                 };
                 crate::memory::mcp::handle_handoff(input)
+                    .map_err(|e| ErrorData::internal_error(e, None))
+            }
+            "compact" => {
+                let input = crate::memory::mcp::CompactInput {
+                    lines: req.content.unwrap_or_default(),
+                    query: req.query,
+                    compression_ratio: req.compression_ratio,
+                    preserve_recent: req.preserve_recent,
+                    scorer: req.scorer,
+                };
+                crate::memory::mcp::handle_compact(input)
                     .map_err(|e| ErrorData::internal_error(e, None))
             }
             "relate" => {
