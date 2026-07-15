@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ponytail", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/caveman", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit"]
+members = ["crates/ponytail", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/caveman", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit"]
 resolver = "2"
 
 [package]

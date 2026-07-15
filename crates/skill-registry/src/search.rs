@@ -1,15 +1,9 @@
-//! BM25 search over the FTS5 index. Every token is double-quoted so FTS5
-//! operators in user text cannot alter the query.
+//! BM25 search over the FTS5 index. Uses shared primitives from
+//! `flare-search-kit` for query sanitization.
 
+pub use flare_search_kit::MatchMode;
+use flare_search_kit::{clamped_limit, fts_query};
 use rusqlite::Connection;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchMode {
-    /// AND semantics (default): every token must match.
-    All,
-    /// OR semantics: broader recall for retries.
-    Any,
-}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SkillHit {
@@ -19,23 +13,6 @@ pub struct SkillHit {
     pub est_tokens: i64,
     pub compressed: bool,
     pub score: f64,
-}
-
-fn fts_query(query: &str, mode: MatchMode) -> Option<String> {
-    let tokens: Vec<String> = query
-        .split_whitespace()
-        .map(|t| t.replace('"', "")) // strip embedded quotes, then quote whole token
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{t}\""))
-        .collect();
-    if tokens.is_empty() {
-        return None;
-    }
-    let joiner = match mode {
-        MatchMode::All => " AND ",
-        MatchMode::Any => " OR ",
-    };
-    Some(tokens.join(joiner))
 }
 
 pub fn search(
@@ -57,7 +34,7 @@ pub fn search(
          ORDER BY score
          LIMIT ?2",
     )?;
-    let rows = stmt.query_map(rusqlite::params![fts, limit as i64], |r| {
+    let rows = stmt.query_map(rusqlite::params![fts, clamped_limit(limit)], |r| {
         Ok(SkillHit {
             name: r.get(0)?,
             source: r.get(1)?,
@@ -173,6 +150,15 @@ mod tests {
     fn empty_query_returns_empty() {
         let conn = seed();
         assert!(search(&conn, "  ", 5, MatchMode::All).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_with_a_huge_limit_does_not_panic_and_still_returns_results() {
+        // usize::MAX cast straight to i64 would be -1 -- SQLite treats a
+        // negative LIMIT as "no limit", silently defeating clamped_limit's cap.
+        let conn = seed();
+        let hits = search(&conn, "usage", usize::MAX, MatchMode::Any).unwrap();
+        assert!(!hits.is_empty());
     }
 
     #[test]

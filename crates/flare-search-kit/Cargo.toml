@@ -1,0 +1,19 @@
+[package]
+name = "flare-search-kit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Shared FTS5/BM25 search primitives — query sanitization, MatchMode, Bm25Weights, clamped limits"
+license = "MIT"
+repository = "https://github.com/getappz/agentflare"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[lints.rust]
+unsafe_code = "warn"
