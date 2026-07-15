@@ -68,11 +68,8 @@ fn remove_claude_mcp_server(name: &str) -> bool {
     .is_ok()
 }
 
-fn json_at(path: &PathBuf) -> Value {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| crate::jsonc::parse_jsonc(&s).ok())
-        .unwrap_or(Value::Null)
+fn json_at(path: &std::path::Path) -> Value {
+    crate::jsonc::read_jsonc(path, || Value::Null)
 }
 
 fn plugin_enabled(settings: &Value, key: &str) -> bool {
@@ -102,10 +99,7 @@ fn write_pinned_mode(path: &PathBuf) -> bool {
 }
 
 fn merge_json(path: &PathBuf, root_key: &str, key: &str, value: Value) -> bool {
-    let mut existing: Value = fs::read_to_string(path)
-        .ok()
-        .and_then(|s| crate::jsonc::parse_jsonc(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+    let mut existing: Value = crate::jsonc::read_jsonc(path, || serde_json::json!({}));
     if !existing.is_object() {
         existing = serde_json::json!({});
     }
@@ -125,10 +119,7 @@ fn merge_json(path: &PathBuf, root_key: &str, key: &str, value: Value) -> bool {
 }
 
 fn merge_opencode_mcp(path: &PathBuf, key: &str, entry: Value) -> bool {
-    let mut existing: Value = fs::read_to_string(path)
-        .ok()
-        .and_then(|s| crate::jsonc::parse_jsonc(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+    let mut existing: Value = crate::jsonc::read_jsonc(path, || serde_json::json!({}));
     if !existing.is_object() {
         existing = serde_json::json!({});
     }

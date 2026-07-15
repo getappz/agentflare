@@ -20,6 +20,7 @@ schemars = "1.0"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 regex = "1"
 sha2 = "0.10"
+flare-search-kit = { path = "../flare-search-kit" }
 http = "1.4"
 ureq = { version = "2", features = ["json"] }
 

@@ -8,7 +8,7 @@ use crate::error::{GatewayError, suggest};
 use crate::mcp_http::McpHttpBackend;
 use crate::mcp_stdio::McpStdioBackend;
 use crate::sanitize::sanitize_tool_entry;
-use crate::search::{MatchMode, ToolHit, search, search_with_fallback};
+use crate::search::{MatchMode, ToolHit, search};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -165,21 +165,6 @@ impl Registry {
             .lock()
             .expect("gateway registry db mutex poisoned");
         Ok(search(&conn, query, limit, mode)?)
-    }
-
-    /// Search local index, then fall back to the official MCP Registry if
-    /// fewer than `limit` results were found locally.
-    pub fn search_with_fallback(
-        &self,
-        query: &str,
-        limit: usize,
-        mode: MatchMode,
-    ) -> Vec<ToolHit> {
-        let conn = self
-            .conn
-            .lock()
-            .expect("gateway registry db mutex poisoned");
-        search_with_fallback(&conn, query, limit, mode)
     }
 
     pub async fn execute(

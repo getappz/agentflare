@@ -1,15 +1,9 @@
-//! BM25 search over the FTS5 index. Every token is double-quoted so FTS5
-//! operators in user text cannot alter the query.
+//! BM25 search over the FTS5 index. Uses shared primitives from
+//! `flare-search-kit` for query sanitization.
 
+pub use flare_search_kit::MatchMode;
+use flare_search_kit::{clamped_limit, fts_query};
 use rusqlite::Connection;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchMode {
-    /// AND semantics (default): every token must match.
-    All,
-    /// OR semantics: broader recall for retries.
-    Any,
-}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SkillHit {
@@ -23,23 +17,6 @@ pub struct SkillHit {
     pub install_hint: Option<String>,
     /// Streamable HTTP URL (only set for registry hits with remotes).
     pub remote_url: Option<String>,
-}
-
-fn fts_query(query: &str, mode: MatchMode) -> Option<String> {
-    let tokens: Vec<String> = query
-        .split_whitespace()
-        .map(|t| t.replace('"', "")) // strip embedded quotes, then quote whole token
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{t}\""))
-        .collect();
-    if tokens.is_empty() {
-        return None;
-    }
-    let joiner = match mode {
-        MatchMode::All => " AND ",
-        MatchMode::Any => " OR ",
-    };
-    Some(tokens.join(joiner))
 }
 
 pub fn search(
@@ -61,7 +38,7 @@ pub fn search(
          ORDER BY score
          LIMIT ?2",
     )?;
-    let rows = stmt.query_map(rusqlite::params![fts, limit as i64], |r| {
+    let rows = stmt.query_map(rusqlite::params![fts, clamped_limit(limit)], |r| {
         Ok(SkillHit {
             name: r.get(0)?,
             source: r.get(1)?,
@@ -76,42 +53,35 @@ pub fn search(
     rows.collect()
 }
 
-/// Search local index first. If fewer than `limit` results, fall back to the
-/// official MCP Registry. Registry hits are scored lower so local results
-/// outrank them.
-pub fn search_with_fallback(
-    conn: &Connection,
-    query: &str,
+/// Fold registry-fallback hits into an already-fetched local result set, up
+/// to `limit` total. Pure/no I/O by design -- the caller fetches `registry`
+/// (typically via `gateway_registry::registry_search::search_registry`)
+/// AFTER releasing whatever lock guarded the local `search()` call, so a
+/// slow or hung registry request can never block other callers of the
+/// local index.
+pub fn merge_registry_hits(
+    mut local: Vec<SkillHit>,
     limit: usize,
-    mode: MatchMode,
+    registry: Vec<gateway_registry::registry_search::RegistryHit>,
 ) -> Vec<SkillHit> {
-    let local = search(conn, query, limit, mode).unwrap_or_default();
-    if local.len() >= limit {
-        return local;
-    }
     let remaining = limit.saturating_sub(local.len());
-    let registry =
-        gateway_registry::registry_search::search_registry(query, remaining);
-    let mut results = local;
-    for hit in registry {
-        results.push(SkillHit {
-            name: hit.server,
-            source: String::new(),
-            description: hit.description,
-            est_tokens: 0,
-            compressed: false,
-            score: hit.score,
-            install_hint: hit.install_hint.map(|h| {
-                if let Some(runtime) = h.runtime_hint {
-                    format!("{} {}", runtime, h.identifier)
-                } else {
-                    format!("{}:{}", h.registry_type, h.identifier)
-                }
-            }),
-            remote_url: hit.remote_url,
-        });
-    }
-    results
+    local.extend(registry.into_iter().take(remaining).map(|hit| SkillHit {
+        name: hit.server,
+        source: String::new(),
+        description: hit.description,
+        est_tokens: 0,
+        compressed: false,
+        score: gateway_registry::REGISTRY_FALLBACK_SCORE,
+        install_hint: hit.install_hint.map(|h| {
+            if let Some(runtime) = h.runtime_hint {
+                format!("{} {}", runtime, h.identifier)
+            } else {
+                format!("{}:{}", h.registry_type, h.identifier)
+            }
+        }),
+        remote_url: hit.remote_url,
+    }));
+    local
 }
 
 /// Every distinct skill name currently indexed, regardless of source. Used
@@ -217,6 +187,15 @@ mod tests {
     fn empty_query_returns_empty() {
         let conn = seed();
         assert!(search(&conn, "  ", 5, MatchMode::All).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_with_a_huge_limit_does_not_panic_and_still_returns_results() {
+        // usize::MAX cast straight to i64 would be -1 -- SQLite treats a
+        // negative LIMIT as "no limit", silently defeating clamped_limit's cap.
+        let conn = seed();
+        let hits = search(&conn, "usage", usize::MAX, MatchMode::Any).unwrap();
+        assert!(!hits.is_empty());
     }
 
     #[test]

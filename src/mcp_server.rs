@@ -791,8 +791,18 @@ impl AgentflareMcp {
                         ));
                     }
                 };
-                let hits = self
-                    .with_fresh_registry(|reg| reg.search_with_fallback(&query, req.limit.unwrap_or(5), mode))?;
+                let limit = req.limit.unwrap_or(5);
+                let local = self
+                    .with_fresh_registry(|reg| reg.search(&query, limit, mode))?
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let hits = if local.len() < limit {
+                    let remaining = limit - local.len();
+                    let registry =
+                        gateway_registry::registry_search::search_registry(&query, remaining);
+                    skill_registry::merge_registry_hits(local, limit, registry)
+                } else {
+                    local
+                };
                 Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
             }
             "load" => {
@@ -1956,11 +1966,21 @@ impl AgentflareMcp {
                         ));
                     }
                 };
-                let guard = self.ensure_gateway_registry().await?;
-                let reg = guard.as_ref().expect("ensured above");
-                let hits = reg
-                    .search(&query, req.limit.unwrap_or(5), mode)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let limit = req.limit.unwrap_or(5);
+                let local = {
+                    let guard = self.ensure_gateway_registry().await?;
+                    let reg = guard.as_ref().expect("ensured above");
+                    reg.search(&query, limit, mode)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                };
+                let hits = if local.len() < limit {
+                    let remaining = limit - local.len();
+                    let registry =
+                        gateway_registry::registry_search::search_registry(&query, remaining);
+                    gateway_registry::merge_registry_hits(local, limit, registry)
+                } else {
+                    local
+                };
                 Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
             }
             "execute" => {

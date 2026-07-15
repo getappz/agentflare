@@ -4,8 +4,15 @@
 
 use crate::search::InstallHint;
 use serde::Deserialize;
+use std::time::Duration;
 
 const REGISTRY_BASE: &str = "https://registry.modelcontextprotocol.io/v0/servers";
+
+/// Wall-clock budget for the fallback request to the official MCP
+/// Registry. Deliberately short -- this is a best-effort fallback path,
+/// not a critical dependency, and callers rely on it never blocking a
+/// search for longer than this regardless of network conditions.
+const REGISTRY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A server entry from the registry's JSON response.
 #[derive(Debug, Deserialize)]
@@ -74,7 +81,6 @@ pub struct RegistryHit {
     pub description: String,
     pub install_hint: Option<InstallHint>,
     pub remote_url: Option<String>,
-    pub score: f64,
 }
 
 /// Search the official MCP Registry for servers matching `query`.
@@ -85,7 +91,7 @@ pub fn search_registry(query: &str, limit: usize) -> Vec<RegistryHit> {
         return Vec::new();
     }
     let url = format!("{REGISTRY_BASE}?search={}&version=latest", urlencode(query));
-    let resp = match ureq::get(&url).call() {
+    let resp = match ureq::get(&url).timeout(REGISTRY_TIMEOUT).call() {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
@@ -114,17 +120,21 @@ pub fn search_registry(query: &str, limit: usize) -> Vec<RegistryHit> {
                 description,
                 install_hint,
                 remote_url,
-                score: 0.5,
             }
         })
         .collect()
 }
 
 fn urlencode(s: &str) -> String {
-    s.as_bytes().iter().map(|&b| match b {
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-        _ => format!("%{:02X}", b),
-    }).collect()
+    s.as_bytes()
+        .iter()
+        .map(|&b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
 }
 
 #[cfg(test)]

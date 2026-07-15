@@ -1,19 +1,12 @@
-//! BM25 search over the FTS5 tools index. Same query-sanitization approach
-//! as `crates/skill-registry/src/search.rs`: every whitespace token is
-//! double-quoted so FTS5 operators embedded in free-text queries can't
-//! alter the query.
+//! BM25 search over the FTS5 tools index. Uses shared primitives from
+//! `flare-search-kit` for query sanitization and limit clamping.
 
-use crate::registry_search::search_registry;
+// Re-exports for external consumers building their own FTS5 queries.
+#[allow(unused_imports)]
+pub use flare_search_kit::{Bm25Weights, MatchMode};
+use flare_search_kit::{clamped_limit, fts_query};
 use rusqlite::Connection;
 use serde_json::Value;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchMode {
-    /// AND semantics (default): every token must match.
-    All,
-    /// OR semantics: broader recall for retries.
-    Any,
-}
 
 /// How to install a server found via the MCP Registry fallback.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -33,6 +26,16 @@ pub enum HitSource {
     Registry,
 }
 
+/// Score assigned to every MCP-Registry fallback hit. Local hits come from
+/// SQLite FTS5 bm25(), which ranks ASCENDING -- a lower, more-negative
+/// number is a better match (see ORDER BY score in search() below, with no
+/// DESC). This sentinel is larger than any realistic bm25 score, so
+/// registry hits always sort after every local hit if the merged list is
+/// ever re-sorted by score using that same ascending convention -- unlike
+/// a small positive placeholder, which would sort before real (negative)
+/// local scores and invert the intended ranking.
+pub const REGISTRY_FALLBACK_SCORE: f64 = f64::MAX;
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolHit {
     pub server: String,
@@ -46,39 +49,6 @@ pub struct ToolHit {
     pub install_hint: Option<InstallHint>,
     /// Streamable HTTP URL for registry hits with remotes.
     pub remote_url: Option<String>,
-}
-
-/// Ceiling applied to a caller-supplied `limit` before it's used in
-/// SQLite's `LIMIT` clause. Two reasons: (1) casting a huge `usize` (e.g.
-/// `usize::MAX`, reachable via `tool_search`'s MCP request) straight to
-/// `i64` can wrap around to a negative number in two's-complement, and
-/// SQLite treats a negative `LIMIT` as "no limit" — silently defeating the
-/// cap; (2) even ignoring the cast, tool search results are meant to be a
-/// short top-K list in this crate's v1 usage, not an unbounded dump.
-pub const MAX_LIMIT: usize = 1000;
-
-/// Clamps `limit` to [`MAX_LIMIT`] and converts to `i64` for the SQLite
-/// `LIMIT` clause, so the `usize -> i64` cast can never produce a negative
-/// number regardless of what a caller supplies.
-fn clamped_limit(limit: usize) -> i64 {
-    limit.min(MAX_LIMIT) as i64
-}
-
-fn fts_query(query: &str, mode: MatchMode) -> Option<String> {
-    let tokens: Vec<String> = query
-        .split_whitespace()
-        .map(|t| t.replace('"', ""))
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{t}\""))
-        .collect();
-    if tokens.is_empty() {
-        return None;
-    }
-    let joiner = match mode {
-        MatchMode::All => " AND ",
-        MatchMode::Any => " OR ",
-    };
-    Some(tokens.join(joiner))
 }
 
 pub fn search(
@@ -116,42 +86,45 @@ pub fn search(
     rows.collect()
 }
 
-/// Search local index first. If fewer than `limit` results, fall back to the
-/// official MCP Registry. Registry hits are scored lower (0.5 × local score
-/// floor) so local results outrank them.
-pub fn search_with_fallback(
-    conn: &Connection,
-    query: &str,
+/// Fold registry-fallback hits into an already-fetched local result set, up
+/// to `limit` total. Pure/no I/O by design -- the caller fetches `registry`
+/// (typically via `registry_search::search_registry`) AFTER releasing
+/// whatever lock guarded the local `search()` call, so a slow or hung
+/// registry request can never block other callers of the local index.
+pub fn merge_registry_hits(
+    mut local: Vec<ToolHit>,
     limit: usize,
-    mode: MatchMode,
+    registry: Vec<crate::registry_search::RegistryHit>,
 ) -> Vec<ToolHit> {
-    let local = search(conn, query, limit, mode).unwrap_or_default();
-    if local.len() >= limit {
-        return local;
-    }
     let remaining = limit.saturating_sub(local.len());
-    let registry = search_registry(query, remaining);
-    let mut results = local;
-    for hit in registry {
-        results.push(ToolHit {
-            server: hit.server,
-            tool: String::new(),
-            description: hit.description,
-            input_schema: Value::Null,
-            score: hit.score,
-            source: HitSource::Registry,
-            install_hint: hit.install_hint,
-            remote_url: hit.remote_url,
-        });
-    }
-    results
+    local.extend(registry.into_iter().take(remaining).map(|hit| ToolHit {
+        server: hit.server,
+        tool: String::new(),
+        description: hit.description,
+        input_schema: Value::Null,
+        score: REGISTRY_FALLBACK_SCORE,
+        source: HitSource::Registry,
+        install_hint: hit.install_hint,
+        remote_url: hit.remote_url,
+    }));
+    local
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::{ServerTools, open_in_memory, rebuild};
+    use crate::registry_search::RegistryHit;
     use crate::types::ToolEntry;
+
+    fn registry_hit(server: &str) -> RegistryHit {
+        RegistryHit {
+            server: server.to_string(),
+            description: "from the registry".to_string(),
+            install_hint: None,
+            remote_url: None,
+        }
+    }
 
     fn seed() -> Connection {
         let mut conn = open_in_memory().unwrap();
@@ -186,8 +159,6 @@ mod tests {
         let hits = search(&conn, "symbol references", 5, MatchMode::All).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].tool, "references");
-        assert_eq!(hits[0].source, HitSource::Local);
-        assert!(hits[0].install_hint.is_none());
     }
 
     #[test]
@@ -198,9 +169,6 @@ mod tests {
         assert!(tools.contains(&"find_symbols"));
         assert!(tools.contains(&"references"));
         assert!(tools.contains(&"list_issues"));
-        for h in &hits {
-            assert_eq!(h.source, HitSource::Local);
-        }
     }
 
     #[test]
@@ -231,23 +199,55 @@ mod tests {
     }
 
     #[test]
-    fn clamped_limit_never_goes_negative_for_a_huge_input() {
-        // usize::MAX cast straight to i64 would be -1 — SQLite treats a
-        // negative LIMIT as "no limit", silently defeating the cap.
-        let clamped = clamped_limit(usize::MAX);
-        assert!(clamped > 0, "clamped limit went non-positive: {clamped}");
-        assert_eq!(clamped, MAX_LIMIT as i64);
-    }
-
-    #[test]
-    fn clamped_limit_leaves_small_values_untouched() {
-        assert_eq!(clamped_limit(5), 5);
-    }
-
-    #[test]
     fn search_with_a_huge_limit_does_not_panic_and_still_returns_results() {
         let conn = seed();
         let hits = search(&conn, "symbol references", usize::MAX, MatchMode::All).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn local_hits_carry_hit_source_local_and_no_install_hint() {
+        let conn = seed();
+        let hits = search(&conn, "symbol references", 5, MatchMode::All).unwrap();
+        assert_eq!(hits[0].source, HitSource::Local);
+        assert!(hits[0].install_hint.is_none());
+    }
+
+    #[test]
+    fn merge_registry_hits_fills_remaining_quota_only() {
+        let conn = seed();
+        let local = search(&conn, "symbol references", 5, MatchMode::All).unwrap();
+        assert_eq!(local.len(), 1);
+        let merged = merge_registry_hits(
+            local,
+            3,
+            vec![registry_hit("a"), registry_hit("b"), registry_hit("c")],
+        );
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].source, HitSource::Local);
+        assert_eq!(merged[1].source, HitSource::Registry);
+        assert_eq!(merged[2].source, HitSource::Registry);
+    }
+
+    #[test]
+    fn merge_registry_hits_skips_registry_when_local_already_meets_limit() {
+        let conn = seed();
+        let local = search(&conn, "symbol references", 5, MatchMode::All).unwrap();
+        let merged = merge_registry_hits(local.clone(), local.len(), vec![registry_hit("a")]);
+        assert_eq!(merged.len(), local.len());
+        assert!(merged.iter().all(|h| h.source == HitSource::Local));
+    }
+
+    #[test]
+    fn merge_registry_hits_scores_registry_hits_worse_than_every_local_hit() {
+        let conn = seed();
+        let local = search(&conn, "symbol references", 5, MatchMode::All).unwrap();
+        let local_scores: Vec<f64> = local.iter().map(|h| h.score).collect();
+        let merged = merge_registry_hits(local, 5, vec![registry_hit("a")]);
+        let reg_hit = merged
+            .iter()
+            .find(|h| h.source == HitSource::Registry)
+            .unwrap();
+        assert!(local_scores.iter().all(|&s| s < reg_hit.score));
     }
 }

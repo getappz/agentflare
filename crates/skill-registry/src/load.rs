@@ -153,17 +153,6 @@ impl Registry {
             .map_err(|e| LoadError::Db(e.to_string()))
     }
 
-    /// Search local index, then fall back to the official MCP Registry if
-    /// fewer than `limit` results were found locally.
-    pub fn search_with_fallback(
-        &self,
-        query: &str,
-        limit: usize,
-        mode: MatchMode,
-    ) -> Vec<SkillHit> {
-        crate::search::search_with_fallback(&self.conn, query, limit, mode)
-    }
-
     /// Every distinct skill name currently indexed, regardless of source.
     pub fn list_all_names(&self) -> Result<Vec<String>, LoadError> {
         crate::search::list_all_names(&self.conn).map_err(|e| LoadError::Db(e.to_string()))
