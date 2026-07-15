@@ -40,6 +40,20 @@ pub fn is_owner(conn: &Connection, item_id: &str, owner: &str) -> rusqlite::Resu
     LEDGER.is_owner(conn, &[item_id], owner)
 }
 
+/// Returns the current owner of an active claim on this item, if any.
+/// Includes stale-but-not-done claims so stale locks can be cleaned up.
+pub fn current_owner(conn: &Connection, item_id: &str) -> Option<String> {
+    let now = db_kit::ids::now();
+    let ttl = 14400;
+    LEDGER
+        .list(conn, true, now, ttl)
+        .ok()
+        .into_iter()
+        .flatten()
+        .find(|c| c.key == [item_id] && c.status == "claimed")
+        .map(|c| c.owner)
+}
+
 /// Returns true if there is an active (live, non-stale) claim on this item
 /// whose owner differs from `owner`. Used by the comment edit/delete gates
 /// to prevent modifying a comment when another agent has started work.
