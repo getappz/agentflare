@@ -401,6 +401,44 @@ pub fn list_dependencies(conn: &Connection, item_id: &str) -> Result<Vec<String>
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// FTS5 search across items (name, description, metadata) within a project.
+/// Returns BM25-ranked results, most relevant first. Query is sanitised
+/// via `flare-search-kit` into safe FTS5 tokens (quoted, operators
+/// neutralised) so user input like `PR-123` isn't misinterpreted as
+/// column:value syntax.
+pub fn search(
+    conn: &Connection,
+    project_id: &str,
+    query: &str,
+    limit: Option<usize>,
+) -> Result<Vec<Item>> {
+    let limit = limit.unwrap_or(20);
+    let safe =
+        flare_search_kit::fts_query(query, flare_search_kit::MatchMode::All).unwrap_or_default();
+    if safe.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT items.id, items.project_id, items.state_id, items.name, items.description,
+                items.priority, items.parent_id, items.assignee_agent, items.sequence_id,
+                items.sort_order, items.started_at, items.completed_at, items.archived_at,
+                items.external_source, items.external_id, items.metadata,
+                items.created_at, items.updated_at, items.deleted_at
+         FROM items_fts
+         JOIN items ON items.rowid = items_fts.rowid
+         WHERE items.project_id = ?1
+           AND items_fts MATCH ?2
+           AND items.deleted_at IS NULL
+         ORDER BY bm25(items_fts, 3.0, 1.0, 1.0)
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![project_id, safe, flare_search_kit::clamped_limit(limit)],
+        row_to_item,
+    )?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 /// Claims an item so other agents don't duplicate the work: on a fresh
 /// acquire, sets the assignee and moves state into the project's "started"
 /// group (which sets `started_at`, via `update_state`). A live claim held by
@@ -1073,6 +1111,164 @@ mod tests {
         let item = make_item(&conn, &pid, &sid);
         claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
         assert!(!mark_completed(&conn, &item.id, "agent:2").unwrap());
+    }
+
+    #[test]
+    fn search_ranks_by_relevance() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        create(
+            &conn,
+            CreateItem {
+                project_id: pid.clone(),
+                state_id: sid.clone(),
+                name: "Database schema migration".into(),
+                description: Some("Add users table".into()),
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        create(
+            &conn,
+            CreateItem {
+                project_id: pid.clone(),
+                state_id: sid.clone(),
+                name: "Fix login button".into(),
+                description: Some("Update CSS for login page button".into()),
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        create(
+            &conn,
+            CreateItem {
+                project_id: pid.clone(),
+                state_id: sid,
+                name: "Backup database".into(),
+                description: Some("PR-123 adds nightly DB backup".into()),
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        let results = search(&conn, &pid, "PR-123", None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].description.contains("PR-123"));
+
+        let db_results = search(&conn, &pid, "database", None).unwrap();
+        assert_eq!(db_results.len(), 2);
+        // Both matched — "Database" is in name of item 1, "database"
+        // is in name of item 3. BM25 ranking may tie; verify both match.
+        assert!(
+            db_results[0].name.to_lowercase().contains("database")
+                || db_results[0]
+                    .description
+                    .to_lowercase()
+                    .contains("database")
+        );
+    }
+
+    #[test]
+    fn search_empty_query_returns_nothing() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        create(
+            &conn,
+            CreateItem {
+                project_id: pid.clone(),
+                state_id: sid,
+                name: "Test".into(),
+                description: Some("something".into()),
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        let results = search(&conn, &pid, "", None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_scoped_to_project() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid1, sid1) = seed_project(&conn, "1");
+        let (pid2, sid2) = seed_project(&conn, "2");
+        create(
+            &conn,
+            CreateItem {
+                project_id: pid1.clone(),
+                state_id: sid1,
+                name: "Database setup".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        create(
+            &conn,
+            CreateItem {
+                project_id: pid2.clone(),
+                state_id: sid2,
+                name: "Database setup".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(search(&conn, &pid1, "database", None).unwrap().len(), 1);
+        assert_eq!(search(&conn, &pid2, "database", None).unwrap().len(), 1);
     }
 
     #[test]

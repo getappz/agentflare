@@ -551,7 +551,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct ItemRequest {
     #[schemars(
-        description = "Action: create|get|list|update|update_state|delete|claim|heartbeat|release|done|cancel|add_label|remove_label"
+        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|cancel|add_label|remove_label"
     )]
     action: String,
     #[schemars(
@@ -598,12 +598,17 @@ struct ItemRequest {
     )]
     #[serde(default)]
     state_group: Option<String>,
-    #[schemars(description = "Max items to return (list); omit for no limit")]
+    #[schemars(
+        description = "Max items to return (list: omit for no limit; search: omit for 20, capped at 1000)"
+    )]
     #[serde(default)]
     limit: Option<i64>,
     #[schemars(description = "Items to skip before applying limit (list); default 0")]
     #[serde(default)]
     offset: Option<i64>,
+    #[schemars(description = "FTS5 search query (search)")]
+    #[serde(default)]
+    query: Option<String>,
 }
 
 /// Lean per-item projection for `item(list)` — the raw 19-field `Item` (full
@@ -2179,11 +2184,12 @@ impl AgentflareMcp {
             "release" => self.item_release(req),
             "done" => self.item_done(req),
             "cancel" => self.item_cancel(req),
+            "search" => self.item_search(req),
             "add_label" => self.item_add_label(req),
             "remove_label" => self.item_remove_label(req),
             other => Err(ErrorData::invalid_params(
                 format!(
-                    "unknown item action: '{other}' — expected create|get|list|update|update_state|delete|claim|heartbeat|release|done|cancel|add_label|remove_label"
+                    "unknown item action: '{other}' — expected create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|cancel|add_label|remove_label"
                 ),
                 None,
             )),
@@ -2191,7 +2197,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|update|update_state|delete|claim|heartbeat|release|done|cancel|add_label|remove_label). See each field's description for when it's required."
+        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|cancel|add_label|remove_label). See each field's description for when it's required."
     )]
     fn item(&self, Parameters(req): Parameters<ItemRequest>) -> Result<String, ErrorData> {
         self.item_inner(req)

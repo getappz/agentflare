@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 db_kit = { package = "agentflare-db-kit", path = "../agentflare-db-kit" }
+flare-search-kit = { path = "../flare-search-kit" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2"
 serde = { version = "1", features = ["derive"] }

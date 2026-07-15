@@ -13,6 +13,7 @@ const MIGRATION_LIST: &[M<'static>] = &[
     M::up(include_str!("migrations/0002_schema_constraints.sql")),
     M::up(include_str!("migrations/0003_asset_versioning.sql")),
     M::up(include_str!("migrations/0004_item_comments.sql")),
+    M::up(include_str!("migrations/0005_items_fts.sql")),
 ];
 const MIGRATIONS: Migrations = Migrations::from_slice(MIGRATION_LIST);
 
