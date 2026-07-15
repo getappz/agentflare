@@ -1,8 +1,9 @@
 /// Search mode: AND (every token must match) or OR (broader recall).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MatchMode {
     /// AND semantics (default): every token must match.
+    #[default]
     All,
     /// OR semantics: broader recall for retries.
     Any,
@@ -14,12 +15,6 @@ impl MatchMode {
             MatchMode::All => " AND ",
             MatchMode::Any => " OR ",
         }
-    }
-}
-
-impl Default for MatchMode {
-    fn default() -> Self {
-        MatchMode::All
     }
 }
 
