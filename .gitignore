@@ -1,5 +1,5 @@
 /target
-/docs/superpowers/
+/.docs/
 /.worktrees/
 
 # opencode CLI's own local state (node_modules, package.json/lock, plans dir)

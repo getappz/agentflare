@@ -2,19 +2,34 @@
 
 # agentflare
 
-**Optimize AI CLI agents for cost and performance. A single Rust binary, no
-Node, no runtime dependencies — across Claude Code, Codex, Cursor, Windsurf,
-VS Code, Cline, and Continue.**
+**Run AI coding agents efficiently, and coordinate more than one of them.**
+**A single Rust binary, no Node, no runtime dependencies — across Claude Code,
+Codex, Cursor, Windsurf, VS Code, Cline, and Continue.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Status: Beta](https://img.shields.io/badge/status-beta-yellow.svg)](STATUS.md)
 
 </div>
 
 ---
 
+## Status: Beta
+
+agentflare is under active development. The optimization layer (lean-ctx
+integration, memory, Caveman/Ponytail wiring) is the most mature part — CI-gated,
+tested, in daily use. The multi-agent coordination layer (tasks, review, coaching,
+artifacts, handoffs) is newer and still finding its shape: CLI flags, MCP tool
+names, and on-disk formats there can change without a major version bump.
+
+See **[STATUS.md](STATUS.md)** for what's stable vs. still moving, before you
+build automation on top of a specific flag or MCP tool signature.
+
 ## What this is
 
-Two non-overlapping layers, plus two Claude-Code-only companions:
+agentflare is two things bundled into one binary:
+
+**1. Optimization** — cut the token/cost overhead of running a single AI coding
+agent session.
 
 | Layer | What it compresses | Tool |
 |---|---|---|
@@ -23,8 +38,28 @@ Two non-overlapping layers, plus two Claude-Code-only companions:
 | **Caveman** (Claude Code only) | conversation verbosity, ~65% | companion plugin |
 | **Ponytail** (Claude Code only) | code-writing over-engineering | companion plugin |
 
+**2. Coordination** — a lightweight, local-first backend for running *more than
+one* agent (or agent session) against the same body of work, exposed as MCP
+tools any MCP-capable agent can call:
+
+| Capability | What it's for |
+|---|---|
+| **Work items** (`item`, `claim`) | A shared backlog — create/list/search items, claim one before working it so two agents don't collide, mark done. |
+| **Review** (`review`) | Submit findings against a diff/PR, run consensus across reviewers, track scores over time. |
+| **Artifacts** (`artifact`) | Publish specs, plans, and docs as versioned, shareable pages — a durable handoff surface between agents (and to you) instead of scratch files that vanish with the session. |
+| **Handoff** (`handoff`) | Pass context to a specific agent/runtime, addressed and threaded, when work moves from one agent to another. |
+| **Coaching** (`coaching` CLI + hook) | Small persistent nudges surfaced to an agent — at session start today, moving toward contextual triggers (tool-name and prompt-relevance) so rules only show up when actually relevant. |
+| **Comments, labels, projects, webhooks, channel_send** | Threaded discussion on items, categorization, cross-project views, and outbound notifications. |
+
+Everything above is local-first (SQLite-backed), no daemon, reachable over the
+same stdio MCP transport agentflare already exposes for the optimization layer.
+
 lean-ctx and the built-in memory aren't substitutes for each other — one saves
 tokens inside a session, the other saves the re-explaining tax across sessions.
+The coordination layer is a different axis entirely: it's not about a single
+session's token bill, it's about multiple agents (or multiple sessions of the
+same agent, over time) staying out of each other's way and handing off work
+cleanly.
 
 **Why Rust, not Node:** Claude Code doesn't bundle or require Node.js — it's a
 standalone compiled binary. A plugin whose hooks shell out to `node` breaks on
@@ -42,7 +77,9 @@ that wiring ships as a small `.codex-plugin/` manifest instead.
 
 Numbers below are each project's own published, reproducible benchmarks — attributed,
 not blended into a fake combined total, and not accepted on faith. Where a claim had no
-supporting evidence in its own repo, it's flagged instead of repeated.
+supporting evidence in its own repo, it's flagged instead of repeated. These cover the
+**optimization layer** specifically — the coordination layer is too new for a
+comparable benchmark suite yet (see [STATUS.md](STATUS.md)).
 
 | Tool | Published claim | Methodology | Confidence |
 |---|---|---|---|
@@ -153,11 +190,17 @@ src/
 ├── state.rs              # ~/.agentflare/state.json — on/off flag for the hooks
 ├── rule_text.rs           # shared rule copy (Exa, git, lean-ctx usage)
 ├── memory/                # built-in persistent memory (SQLite + FTS5)
+├── compact.rs             # ephemeral FTS5/BM25 relevance scorer (PreCompact hook)
+├── coaching/               # session nudges: rule storage, CRUD, CLI presentation
+├── claims.rs, review.rs    # work-item claiming, review/consensus (coordination layer)
+├── artifacts.rs, channels.rs   # artifact publishing, outbound notifications
+├── mcp_server.rs, mcp_prompts.rs  # MCP stdio server exposing both layers as tools
+├── auth.rs, auth_crypt.rs, auth_db.rs, auth_runner.rs  # auth profile vault
 ├── components.rs          # registry: each entry checks + fixes itself, host-aware
 ├── init.rs                # `agentflare init --agent X` — runs every component,
 │                           # wires hooks directly for claude-code/cursor
-├── hook.rs                # `agentflare hook session-start|prompt-submit --agent X`
-└── main.rs                 # clap CLI, dispatch
+├── hook.rs                # `agentflare hook session-start|prompt-submit|... --agent X`
+└── main.rs                 # clap CLI, dispatch across 45 modules
 
 .codex-plugin/              # Codex only — its hooks require the plugin loader
 install.sh, install.ps1      # installers (checksum-verified download / local build)
