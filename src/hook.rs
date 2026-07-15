@@ -151,7 +151,10 @@ fn session_start_message(agent: &str) -> String {
     if !project_queries.is_empty() {
         let db_path = crate::paths::skills_db_path();
         if db_path.exists()
-            && let Ok(mut registry) = skill_registry::Registry::open_default(&db_path)
+            && let Ok(mut registry) = skill_registry::Registry::open_default(
+                &db_path,
+                crate::components::detected_skill_agents(),
+            )
         {
             let _ = registry.ensure_fresh();
             for q in &project_queries {
@@ -513,7 +516,10 @@ pub fn prompt_submit(agent: &str) {
     if intent.confidence >= 0.5 {
         let db_path = crate::paths::skills_db_path();
         if db_path.exists()
-            && let Ok(mut registry) = skill_registry::Registry::open_default(&db_path)
+            && let Ok(mut registry) = skill_registry::Registry::open_default(
+                &db_path,
+                crate::components::detected_skill_agents(),
+            )
         {
             let _ = registry.ensure_fresh();
             if let Ok(skills) = crate::skill_detect::find_skills(

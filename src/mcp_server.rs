@@ -169,7 +169,8 @@ impl AgentflareMcp {
                 .skills_db_override
                 .clone()
                 .unwrap_or_else(crate::paths::skills_db_path);
-            let reg = skill_registry::Registry::open_default(&db_path)?;
+            let detected = crate::components::detected_skill_agents();
+            let reg = skill_registry::Registry::open_default(&db_path, detected)?;
             *guard = Some(reg);
         }
         let reg = guard.as_mut().expect("just initialized above");

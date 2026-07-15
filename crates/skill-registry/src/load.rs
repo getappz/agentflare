@@ -103,6 +103,7 @@ pub fn load(conn: &Connection, name: &str, original: bool) -> Result<LoadedSkill
 /// Facade owning the connection + refresh debounce.
 pub struct Registry {
     conn: Connection,
+    detected_agents: Vec<String>,
     last_refresh: std::time::Instant,
     refreshed_once: bool,
 }
@@ -110,10 +111,11 @@ pub struct Registry {
 pub const REFRESH_DEBOUNCE_SECS: u64 = 60;
 
 impl Registry {
-    pub fn open_default(db_path: &Path) -> Result<Self, LoadError> {
+    pub fn open_default(db_path: &Path, detected_agents: Vec<String>) -> Result<Self, LoadError> {
         let conn = crate::db::open_db(db_path).map_err(|e| LoadError::Db(e.to_string()))?;
         Ok(Registry {
             conn,
+            detected_agents,
             last_refresh: std::time::Instant::now(),
             refreshed_once: false,
         })
@@ -126,15 +128,7 @@ impl Registry {
         }
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        // Detected agents: agent-registry's detect_all needs a version cache;
-        // skill discovery only needs agent IDs, so pass an empty cache.
-        let mut cache = std::collections::HashMap::new();
-        let detected: Vec<String> =
-            agent_registry::detect_all(agent_registry::REGISTRY, &mut cache)
-                .into_iter()
-                .map(|d| d.id.to_lowercase())
-                .collect();
-        let sources = crate::sources::default_sources(&home, &cwd, &detected);
+        let sources = crate::sources::default_sources(&home, &cwd, &self.detected_agents);
         let out = crate::sources::scan_sources(&sources);
         crate::db::rebuild(&mut self.conn, &out.entries)
             .map_err(|e| LoadError::Db(e.to_string()))?;
