@@ -69,15 +69,15 @@ Arg: staleness threshold in days (default 14).
 
 Arg: capacity hint like "~8" (optional; caps the Now bucket).
 
-1. Reuse the groom ranking (steps 1–2 of /pm:groom).
-2. Bucket by rank and readiness:
-   - **Now**: highest-ranked items that are ready (have an estimate, not blocked
-     by an open dependency). Cap to the capacity hint if provided.
-   - **Next**: next tier by rank.
-   - **Later**: the tail + anything low-confidence.
-3. Separately list **Needs estimation** (unestimated items) — cannot be planned.
-4. Print each bucket as an ordered list of `FIX-NN · name · score`.
-5. Print the time-signal caveat. Read-only — this proposes a plan, it does not
+1. One call: `item action="groom" state_group="backlog,unstarted" capacity=<hint or a sane default like 5>`.
+   The server does the bucketing: `now` (top-`capacity` ready items — unblocked,
+   has a `size`), `next` (remaining ready items), `later` (blocked items),
+   `needs_estimation` (unestimated — excluded from planning). No hand-bucketing.
+2. Score each item with reference/rubric.md for the printed rationale (RICE
+   using `size`, ICE fallback for `unestimated` ones) — your judgment covers
+   Reach/Confidence, the buckets themselves are already computed.
+3. Print each bucket as an ordered list of `FIX-NN · name · score`.
+4. Print the time-signal caveat. Read-only — this proposes a plan, it does not
    assign or move items.
 
 ### /pm:health — team health scorecard

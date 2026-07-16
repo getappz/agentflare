@@ -621,6 +621,11 @@ struct ItemRequest {
     )]
     #[serde(default)]
     staleness_days: Option<i64>,
+    #[schemars(
+        description = "Now-bucket size (groom only) — when set, additionally buckets the shortlist into now/next/later/needs_estimation for sprint planning"
+    )]
+    #[serde(default)]
+    capacity: Option<i64>,
 }
 
 /// Lean per-item projection for `item(list)` — the raw 19-field `Item` (full
@@ -679,6 +684,16 @@ struct GroomResponse {
     items: Vec<GroomItem>,
     /// Top unassigned, not-stale, unblocked items from the shortlist.
     pull_next: Vec<String>,
+    /// Only populated when the `capacity` request field is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    now: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    later: Option<Vec<String>>,
+    /// Unestimated items — excluded from now/next/later, can't be planned yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    needs_estimation: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -4699,6 +4714,83 @@ mod tests {
             .unwrap();
         assert_eq!(entry["size"], "M");
         assert_eq!(entry["unestimated"], false);
+    }
+
+    #[test]
+    fn item_groom_capacity_buckets_now_next_later_and_needs_estimation() {
+        let (_tmp, s) = harness();
+        let sized = |name: &str, size: &str| ItemRequest {
+            action: "create".into(),
+            name: Some(name.into()),
+            metadata: Some(serde_json::json!({"size": size})),
+            ..Default::default()
+        };
+        let ready_a: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(sized("Ready A", "S"))).unwrap()).unwrap();
+        let ready_b: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(sized("Ready B", "S"))).unwrap()).unwrap();
+        let dep: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("Dep"))).unwrap()).unwrap();
+        let blocked: serde_json::Value = serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                dependency_ids: Some(vec![dep["id"].as_str().unwrap().to_string()]),
+                ..sized("Blocked", "M")
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let unestimated: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("Unsized"))).unwrap())
+                .unwrap();
+
+        // No capacity: buckets omitted entirely (backward compatible).
+        let unbucketed: serde_json::Value = serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                action: "groom".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(unbucketed.get("now").is_none());
+
+        let groomed: serde_json::Value = serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                action: "groom".into(),
+                capacity: Some(1),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let ids = |key: &str| -> Vec<String> {
+            groomed[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        let now = ids("now");
+        let next = ids("next");
+        assert_eq!(now.len(), 1, "capacity=1 caps now to 1 ready item");
+        assert!(
+            now.contains(&ready_a["id"].as_str().unwrap().to_string())
+                || now.contains(&ready_b["id"].as_str().unwrap().to_string())
+        );
+        // Whichever ready item didn't make `now` spills into `next`.
+        assert_eq!(now.len() + next.len(), 2);
+        assert_eq!(ids("later"), vec![blocked["id"].as_str().unwrap()]);
+        // "Dep" has no size either — unestimated, same as the dedicated "Unsized" item.
+        let mut needs_est = ids("needs_estimation");
+        needs_est.sort_unstable();
+        let mut expected = vec![
+            dep["id"].as_str().unwrap().to_string(),
+            unestimated["id"].as_str().unwrap().to_string(),
+        ];
+        expected.sort_unstable();
+        assert_eq!(needs_est, expected);
     }
 
     /// Real measured comparison, not an estimate: one `groom` call vs. the

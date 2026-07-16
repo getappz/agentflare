@@ -6,6 +6,122 @@
 
 use super::*;
 
+fn priority_rank(p: &str) -> u8 {
+    match p {
+        "urgent" => 5,
+        "high" => 4,
+        "medium" => 3,
+        "low" => 2,
+        _ => 1,
+    }
+}
+
+/// `size` lives in the free-form `metadata` JSON blob (`{"size": "S"|"M"|"L"}`)
+/// rather than a regex over description prose — sets via `item(update)`.
+fn parsed_size(metadata: &str) -> Option<String> {
+    let mut value = serde_json::from_str::<serde_json::Value>(metadata).ok()?;
+    // Defensive: some callers double-encode an object-typed param as a JSON
+    // string containing JSON (observed live — item(create) with
+    // metadata={"size":"S"} stored `"{\"size\": \"S\"}"` instead of the
+    // object). Unwrap one extra layer before giving up.
+    if let serde_json::Value::String(inner) = &value
+        && let Ok(reparsed) = serde_json::from_str::<serde_json::Value>(inner)
+    {
+        value = reparsed;
+    }
+    value
+        .get("size")?
+        .as_str()
+        .filter(|s| matches!(*s, "S" | "M" | "L"))
+        .map(str::to_string)
+}
+
+/// Fan-in count and open-dependency blocking per item, from a flat edge list.
+fn dependency_signals<'a>(
+    edges: &[(String, String)],
+    state_group_of: impl Fn(&str) -> &'a str,
+) -> (
+    std::collections::HashMap<String, i64>,
+    std::collections::HashMap<String, Vec<String>>,
+) {
+    let mut fanin: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut blocked_by: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (item_id, depends_on) in edges {
+        *fanin.entry(depends_on.clone()).or_insert(0) += 1;
+        if !matches!(state_group_of(depends_on), "completed" | "cancelled") {
+            blocked_by
+                .entry(item_id.clone())
+                .or_default()
+                .push(depends_on.clone());
+        }
+    }
+    (fanin, blocked_by)
+}
+
+/// Near-duplicate names within a shortlist (token-Jaccard ≥ 0.5) — no
+/// embeddings needed at this backlog scale.
+fn near_duplicates(
+    shortlist: &[agentflare_backend::item::Item],
+) -> std::collections::HashMap<String, Vec<String>> {
+    fn name_tokens(name: &str) -> std::collections::HashSet<String> {
+        name.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| s.len() > 2)
+            .map(str::to_string)
+            .collect()
+    }
+    let token_sets: Vec<_> = shortlist.iter().map(|i| name_tokens(&i.name)).collect();
+    let mut duplicates: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for a in 0..shortlist.len() {
+        for b in (a + 1)..shortlist.len() {
+            let (sa, sb) = (&token_sets[a], &token_sets[b]);
+            if sa.is_empty() || sb.is_empty() {
+                continue;
+            }
+            let inter = sa.intersection(sb).count() as f64;
+            let union = sa.union(sb).count() as f64;
+            if union > 0.0 && inter / union >= 0.5 {
+                duplicates
+                    .entry(shortlist[a].id.clone())
+                    .or_default()
+                    .push(shortlist[b].id.clone());
+                duplicates
+                    .entry(shortlist[b].id.clone())
+                    .or_default()
+                    .push(shortlist[a].id.clone());
+            }
+        }
+    }
+    duplicates
+}
+
+/// Now/Next/Later planning buckets. Unestimated items are excluded outright
+/// (can't be planned without a size); of the rest, blocked items go to
+/// `later`, and ready items split into `now` (first `capacity`, in existing
+/// rank order) and `next` (the remainder).
+fn capacity_buckets(
+    items: &[GroomItem],
+    capacity: i64,
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let capacity = capacity.max(0) as usize;
+    let mut needs_estimation = Vec::new();
+    let mut later = Vec::new();
+    let mut ready = Vec::new();
+    for i in items {
+        if i.unestimated {
+            needs_estimation.push(i.id.clone());
+        } else if !i.blocked_by.is_empty() {
+            later.push(i.id.clone());
+        } else {
+            ready.push(i.id.clone());
+        }
+    }
+    let next = ready.split_off(capacity.min(ready.len()));
+    (ready, next, later, needs_estimation)
+}
+
 impl AgentflareMcp {
     pub(super) fn item_create(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let name = req
@@ -486,15 +602,6 @@ impl AgentflareMcp {
                 .unwrap_or(0);
             let stale_cutoff = now - staleness_days.saturating_mul(86_400);
 
-            fn priority_rank(p: &str) -> u8 {
-                match p {
-                    "urgent" => 5,
-                    "high" => 4,
-                    "medium" => 3,
-                    "low" => 2,
-                    _ => 1,
-                }
-            }
             // Priority first, then most-recently-touched within a priority tier.
             items.sort_by(|a, b| {
                 priority_rank(&b.priority)
@@ -506,79 +613,15 @@ impl AgentflareMcp {
             let ids: Vec<String> = shortlist.iter().map(|i| i.id.clone()).collect();
             let edges = agentflare_backend::item::dependencies_for_items(conn, &ids)
                 .map_err(map_backend_err)?;
-            let group_of = |id: &str| -> &str {
+            let (fanin, blocked_by) = dependency_signals(&edges, |id| {
                 shortlist
                     .iter()
                     .find(|i| i.id == id)
                     .and_then(|i| state_by_id.get(i.state_id.as_str()))
                     .map(|s| s.group_name.as_str())
                     .unwrap_or("")
-            };
-            let mut fanin: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-            let mut blocked_by: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            for (item_id, depends_on) in &edges {
-                *fanin.entry(depends_on.clone()).or_insert(0) += 1;
-                if !matches!(group_of(depends_on), "completed" | "cancelled") {
-                    blocked_by
-                        .entry(item_id.clone())
-                        .or_default()
-                        .push(depends_on.clone());
-                }
-            }
-
-            // Near-duplicate names within the shortlist (token-Jaccard, no
-            // embeddings needed at this backlog scale).
-            fn name_tokens(name: &str) -> std::collections::HashSet<String> {
-                name.to_lowercase()
-                    .split(|c: char| !c.is_alphanumeric())
-                    .filter(|s| s.len() > 2)
-                    .map(str::to_string)
-                    .collect()
-            }
-            let token_sets: Vec<_> = shortlist.iter().map(|i| name_tokens(&i.name)).collect();
-            let mut duplicates: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            for a in 0..shortlist.len() {
-                for b in (a + 1)..shortlist.len() {
-                    let (sa, sb) = (&token_sets[a], &token_sets[b]);
-                    if sa.is_empty() || sb.is_empty() {
-                        continue;
-                    }
-                    let inter = sa.intersection(sb).count() as f64;
-                    let union = sa.union(sb).count() as f64;
-                    if union > 0.0 && inter / union >= 0.5 {
-                        duplicates
-                            .entry(shortlist[a].id.clone())
-                            .or_default()
-                            .push(shortlist[b].id.clone());
-                        duplicates
-                            .entry(shortlist[b].id.clone())
-                            .or_default()
-                            .push(shortlist[a].id.clone());
-                    }
-                }
-            }
-
-            // `size` lives in the free-form `metadata` JSON blob (`{"size": "S"|"M"|"L"}`)
-            // rather than a regex over description prose — sets via `item(update)`.
-            fn parsed_size(metadata: &str) -> Option<String> {
-                let mut value = serde_json::from_str::<serde_json::Value>(metadata).ok()?;
-                // Defensive: some callers double-encode an object-typed param as a
-                // JSON string containing JSON (observed live — item(create) with
-                // metadata={"size":"S"} stored `"{\"size\": \"S\"}"` instead of the
-                // object). Unwrap one extra layer before giving up.
-                if let serde_json::Value::String(inner) = &value
-                    && let Ok(reparsed) = serde_json::from_str::<serde_json::Value>(inner)
-                {
-                    value = reparsed;
-                }
-                value
-                    .get("size")?
-                    .as_str()
-                    .filter(|s| matches!(*s, "S" | "M" | "L"))
-                    .map(str::to_string)
-            }
+            });
+            let duplicates = near_duplicates(&shortlist);
 
             let groom_items: Vec<GroomItem> = shortlist
                 .into_iter()
@@ -616,6 +659,17 @@ impl AgentflareMcp {
                 .map(|i| i.id.clone())
                 .collect();
 
+            // Only computed when `capacity` is set — omitted from the response
+            // otherwise (backward compatible).
+            let (now, next, later, needs_estimation) = match req.capacity {
+                Some(capacity) => {
+                    let (now, next, later, needs_estimation) =
+                        capacity_buckets(&groom_items, capacity);
+                    (Some(now), Some(next), Some(later), Some(needs_estimation))
+                }
+                None => (None, None, None, None),
+            };
+
             let resp = GroomResponse {
                 staleness_days,
                 stale_count: groom_items.iter().filter(|i| i.stale).count(),
@@ -623,6 +677,10 @@ impl AgentflareMcp {
                 unestimated_count: groom_items.iter().filter(|i| i.unestimated).count(),
                 items: groom_items,
                 pull_next,
+                now,
+                next,
+                later,
+                needs_estimation,
             };
             Ok(serde_json::to_string_pretty(&resp).unwrap_or_default())
         })?
