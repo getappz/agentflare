@@ -241,6 +241,7 @@ struct PreCompactInput {
     trigger: String,
 }
 
+#[allow(dead_code)]
 fn parse_pre_compact(input: &str) -> Option<PreCompactInput> {
     let v: serde_json::Value = serde_json::from_str(input).ok()?;
     let session_id = v.get("session_id")?.as_str()?.to_string();
@@ -267,6 +268,7 @@ fn parse_pre_compact(input: &str) -> Option<PreCompactInput> {
 /// focused on, so older lines get ranked by relevance to that instead of
 /// to an opaque session identifier. Falls back to `session_id` only when
 /// the whole transcript is empty.
+#[allow(dead_code)]
 fn relevance_query<'a>(content: &'a str, session_id: &'a str) -> &'a str {
     content
         .lines()
@@ -275,42 +277,22 @@ fn relevance_query<'a>(content: &'a str, session_id: &'a str) -> &'a str {
         .unwrap_or(session_id)
 }
 
-/// Handles PreCompact hook. Reads transcript from `transcript_path` and
-/// scores lines by relevance using FTS5/BM25. Outputs scored lines as JSON
-/// so Claude Code's compaction can prioritise keeping relevant context.
-pub fn pre_compact(_agent: &str) {
-    let Some(input) = read_stdin_or_skip("PreCompact") else {
-        return;
-    };
-    let Some(parsed) = parse_pre_compact(&input) else {
-        return;
-    };
-    let Some(path) = parsed.transcript_path else {
-        return;
-    };
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[agentflare] PreCompact: cannot read transcript {path}: {e}");
-            return;
-        }
-    };
-    let entries: Vec<crate::compact::LineEntry> = content
-        .lines()
-        .enumerate()
-        .map(|(i, text)| crate::compact::LineEntry {
-            index: i,
-            text: text.to_string(),
-        })
-        .collect();
-    let query = relevance_query(&content, &parsed.session_id);
-    let Ok(scored) = crate::compact::score_lines(&entries, query) else {
-        return;
-    };
-    if let Ok(json) = serde_json::to_string(&scored) {
-        println!("{json}");
-    }
-}
+/// DEPRECATED / unsupported no-op. This used to score transcript lines by
+/// FTS5/BM25 relevance and print them as JSON, on the theory that Claude
+/// Code's compaction would prioritise keeping relevant context. It never
+/// did anything: Claude Code's PreCompact hook is blocking-only and does
+/// not consume `hookSpecificOutput.additionalContext`, so the scored
+/// output was discarded unread. Compaction-survival is now handled
+/// end-to-end by the lean-ctx sidecar (PostToolUse state accumulation +
+/// SessionStart re-injection), which agentflare should not duplicate.
+///
+/// Kept as a stub (rather than deleted) so existing `settings.json`
+/// PreCompact wiring from prior installs doesn't start erroring after an
+/// upgrade, and so `parse_pre_compact`/`relevance_query` above stay
+/// available if compaction-survival is ever reactivated here. The FTS5
+/// scorer itself (`crate::compact::score_lines`) is not dead code — it's
+/// still used by the coaching-rule digest (`coaching::store`).
+pub fn pre_compact(_agent: &str) {}
 
 /// No-op, kept only so a `settings.json` entry written by an older agentflare
 /// version (which fired an `engram-cli` handoff here — removed along with the
