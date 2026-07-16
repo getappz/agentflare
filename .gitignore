@@ -1,5 +1,6 @@
 /target
 /.docs/
+/domain-research/
 /.worktrees/
 
 # Machine-local docs output / notes, not part of the project
@@ -21,4 +22,3 @@
 /install_onpush.ps1
 /run_onpush.bat
 /serve_docs.py
-.worktrees/
