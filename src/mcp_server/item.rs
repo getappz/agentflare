@@ -88,7 +88,14 @@ impl AgentflareMcp {
                         .unwrap_or(false)
                 });
             }
-            if let Some(agent) = &req.assignee_agent {
+            // #75: default the filter to the server-derived identity when the
+            // caller omits it, so a bare `item(list)` behaves like an inbox
+            // (mine + unassigned) instead of dumping every item. An explicit
+            // value is still honored — this is a read-only visibility filter,
+            // not an authorization boundary, so viewing a teammate's queue is
+            // allowed. Falls back to no filter only when identity is undetected.
+            let assignee = req.assignee_agent.clone().or_else(|| self.agent.clone());
+            if let Some(agent) = &assignee {
                 items.retain(|i| {
                     i.assignee_agent.as_deref() == Some(agent.as_str())
                         || i.assignee_agent.is_none()
