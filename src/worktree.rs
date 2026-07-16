@@ -87,6 +87,64 @@ pub fn ensure_worktrees_ignored(repo_root: &Path) {
     }
 }
 
+/// Warns (does not fail) when an ambient `CARGO_TARGET_DIR` is set in the
+/// environment at claim time. A shared `CARGO_TARGET_DIR` across worktrees
+/// is a silent correctness bug: Cargo's fingerprint hash omits the worktree
+/// path, so two worktrees of the same repo reuse each other's stale local
+/// crate artifacts (cargo #12516/#14053/#7740; OpenBlob #522).
+///
+/// NOTE: this is a mitigation, NOT a fix for the ambient-env case of #133.
+/// Per Cargo's precedence (CLI flag > env var > config file), an ambient
+/// `CARGO_TARGET_DIR` *always* wins over the `.cargo/config.toml` that
+/// `isolate_worktree_target_dir` writes — so when the env var is set, the
+/// worktree's isolated `target/` is silently shadowed and the bug persists.
+/// Nothing in code can force Cargo to prefer the config file over the env var;
+/// the only safe remedies are unsetting the var or trusting CI. #133 therefore
+/// remains OPEN for the ambient-env case.
+fn warn_if_ambient_target_dir() {
+    if std::env::var_os("CARGO_TARGET_DIR").is_some() {
+        eprintln!(
+            "worktree: ambient CARGO_TARGET_DIR is set — it is SHARED across worktrees and \
+             can leak stale artifacts between divergent checkouts. Prefer trusting CI for \
+             local test builds, or unset it and rely on the worktree's isolated target dir."
+        );
+    }
+}
+
+/// Writes a per-worktree `.cargo/config.toml` so the worktree's `target/`
+/// resolves locally instead of inheriting a shared `CARGO_TARGET_DIR`.
+///
+/// Caveat: this only takes effect when `CARGO_TARGET_DIR` is *unset* in the
+/// ambient environment. Per Cargo's precedence (CLI flag > env var > config
+/// file), an ambient `CARGO_TARGET_DIR` still overrides this file — so this
+/// isolates ONLY the default-target case, not the ambient-env case that #133
+/// originally described. `warn_if_ambient_target_dir` is the only mitigation
+/// for that case. No config-file change can outrank the env var.
+///
+/// Local workspace crates must NOT be shared across worktrees (silent
+/// contamination); registry deps are safe but are better served by a shared
+/// sccache. A relative `target-dir = "target"` resolves per-checkout, giving
+/// each worktree its own isolated cache. Soft-fails (eprintln) — never blocks
+/// a claim.
+fn isolate_worktree_target_dir(worktree_path: &Path) {
+    let cargo_dir = worktree_path.join(".cargo");
+    let _ = std::fs::create_dir_all(&cargo_dir);
+    let config_path = cargo_dir.join("config.toml");
+    if config_path.exists() {
+        return; // don't clobber an intentional worktree-local override
+    }
+    let content = "[build]\n# Isolated per worktree (see item #133). Registry deps are\n\
+                   # better shared via sccache (RUSTC_WRAPPER + SCCACHE_BASEDIRS),\n\
+                   # not a shared CARGO_TARGET_DIR, which leaks artifacts across worktrees.\n\
+                   target-dir = \"target\"\n";
+    if let Err(e) = std::fs::write(&config_path, content) {
+        eprintln!(
+            "worktree: could not write isolated .cargo/config.toml for {}: {e}",
+            worktree_path.display()
+        );
+    }
+}
+
 /// Creates an isolated git worktree for `item` against `target_branch`.
 ///
 /// Deliberately takes an already-resolved `target_branch` instead of a
@@ -107,12 +165,18 @@ pub fn create_worktree(
         .join("task")
         .join(item.sequence_id.to_string());
     if already_isolated_for(&branch, repo_root) {
+        // Re-claiming an existing worktree: nothing to create, but still
+        // ensure its target dir is isolated (idempotent, no-op if present),
+        // and re-warn since the ambient env can still be shadowing it.
+        warn_if_ambient_target_dir();
+        isolate_worktree_target_dir(&worktree_path);
         return Some(worktree_path);
     }
     ensure_worktrees_ignored(repo_root);
     if let Some(parent) = worktree_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    warn_if_ambient_target_dir();
     if let Some(p) = progress {
         p.send(
             0.0,
@@ -170,6 +234,7 @@ pub fn create_worktree(
             if let Some(p) = progress {
                 p.send(1.0, Some(1.0), Some("Worktree created".into()));
             }
+            isolate_worktree_target_dir(&worktree_path);
             Some(worktree_path)
         }
         Err(e) => {
@@ -452,6 +517,61 @@ mod tests {
     fn already_isolated_for_false_in_regular_repo() {
         let repo = init_repo();
         assert!(!already_isolated_for("task/1", &repo.path));
+    }
+
+    #[test]
+    fn isolate_worktree_target_dir_writes_relative_target_dir() {
+        let tmp = TempDir::new().unwrap();
+        let wt = tmp.path().join(".worktrees").join("task").join("1");
+        std::fs::create_dir_all(&wt).unwrap();
+        isolate_worktree_target_dir(&wt);
+        let config = wt.join(".cargo").join("config.toml");
+        assert!(config.exists(), "expected .cargo/config.toml in worktree");
+        let content = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            content.contains("target-dir = \"target\""),
+            "must set a relative, per-checkout target dir, got: {content}"
+        );
+        assert!(
+            !content.contains("target-dir = \"/")
+                && !content.contains("target-dir = \"~")
+                && !content.contains("CARGO_TARGET_DIR ="),
+            "must not set an absolute/shared target dir"
+        );
+    }
+
+    #[test]
+    fn isolate_worktree_target_dir_does_not_clobber_existing_config() {
+        let tmp = TempDir::new().unwrap();
+        let wt = tmp.path().join(".worktrees").join("task").join("1");
+        let cargo_dir = wt.join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        let config = cargo_dir.join("config.toml");
+        std::fs::write(
+            &config,
+            "[build]\ntarget-dir = \"/some/intentional/path\"\n",
+        )
+        .unwrap();
+        isolate_worktree_target_dir(&wt);
+        let content = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            content.contains("/some/intentional/path"),
+            "existing worktree-local config must be preserved"
+        );
+    }
+
+    #[test]
+    fn warn_if_ambient_target_dir_warns_when_set() {
+        // Just asserts the function runs without panicking whether or not the
+        // var is set; the warning is an ephemeral eprintln, not assertable here.
+        unsafe {
+            std::env::set_var("CARGO_TARGET_DIR", "/tmp/shared");
+        }
+        warn_if_ambient_target_dir();
+        unsafe {
+            std::env::remove_var("CARGO_TARGET_DIR");
+        }
+        warn_if_ambient_target_dir();
     }
 
     #[test]
