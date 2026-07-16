@@ -1,6 +1,13 @@
 /target
 /.docs/
+/domain-research/
 /.worktrees/
+
+# Machine-local docs output / notes, not part of the project
+/docs/
+
+# Local opencode config — carries per-machine MCP server paths, not shared
+/opencode.json
 
 # opencode CLI's own local state (node_modules, package.json/lock, plans dir)
 /.opencode/
@@ -15,4 +22,3 @@
 /install_onpush.ps1
 /run_onpush.bat
 /serve_docs.py
-.worktrees/
