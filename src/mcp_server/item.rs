@@ -580,7 +580,10 @@ impl AgentflareMcp {
     /// manual groom otherwise costs.
     pub(super) fn item_groom(&self, req: ItemRequest) -> Result<String, ErrorData> {
         if req.limit.is_some_and(|l| l < 0) {
-            return Err(ErrorData::invalid_params("limit must be non-negative", None));
+            return Err(ErrorData::invalid_params(
+                "limit must be non-negative",
+                None,
+            ));
         }
         let staleness_days = req.staleness_days.unwrap_or(14).max(0);
         let cap = req.limit.unwrap_or(15).max(0) as usize;
@@ -758,7 +761,11 @@ impl AgentflareMcp {
                 std::collections::BTreeMap::new();
             for i in &in_progress_items {
                 by_assignee
-                    .entry(i.assignee_agent.clone().unwrap_or_else(|| "unassigned".into()))
+                    .entry(
+                        i.assignee_agent
+                            .clone()
+                            .unwrap_or_else(|| "unassigned".into()),
+                    )
                     .or_default()
                     .push(to_standup_item(i));
             }

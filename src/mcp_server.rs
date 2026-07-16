@@ -4692,8 +4692,7 @@ mod tests {
     fn item_update_sets_metadata() {
         let (_tmp, s) = harness();
         let created: serde_json::Value =
-            serde_json::from_str(&s.item(Parameters(empty_item_create("Sized"))).unwrap())
-                .unwrap();
+            serde_json::from_str(&s.item(Parameters(empty_item_create("Sized"))).unwrap()).unwrap();
         let updated: serde_json::Value = serde_json::from_str(
             &s.item(Parameters(ItemRequest {
                 action: "update".into(),
@@ -4704,7 +4703,10 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(updated["metadata"], serde_json::json!({"size": "M"}).to_string());
+        assert_eq!(
+            updated["metadata"],
+            serde_json::json!({"size": "M"}).to_string()
+        );
     }
 
     #[test]
@@ -4862,10 +4864,9 @@ mod tests {
     #[test]
     fn item_standup_buckets_done_in_progress_grouped_and_stuck() {
         let (_tmp, s) = harness();
-        let project_id: serde_json::Value = serde_json::from_str(
-            &s.item(Parameters(empty_item_create("bootstrap"))).unwrap(),
-        )
-        .unwrap();
+        let project_id: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("bootstrap"))).unwrap())
+                .unwrap();
         let project_id = project_id["project_id"].as_str().unwrap().to_string();
         let conn = backend_conn(&_tmp);
         let states = agentflare_backend::state::list_by_project(&conn, &project_id).unwrap();
@@ -4942,10 +4943,9 @@ mod tests {
     #[test]
     fn item_health_reports_velocity_wip_and_bottleneck_placeholder() {
         let (_tmp, s) = harness();
-        let project_id: serde_json::Value = serde_json::from_str(
-            &s.item(Parameters(empty_item_create("bootstrap"))).unwrap(),
-        )
-        .unwrap();
+        let project_id: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("bootstrap"))).unwrap())
+                .unwrap();
         let project_id = project_id["project_id"].as_str().unwrap().to_string();
         let conn = backend_conn(&_tmp);
         let states = agentflare_backend::state::list_by_project(&conn, &project_id).unwrap();
@@ -4964,10 +4964,9 @@ mod tests {
         drop(conn);
 
         let move_to = |name: &str, state_id: &str| {
-            let created: serde_json::Value = serde_json::from_str(
-                &s.item(Parameters(empty_item_create(name))).unwrap(),
-            )
-            .unwrap();
+            let created: serde_json::Value =
+                serde_json::from_str(&s.item(Parameters(empty_item_create(name))).unwrap())
+                    .unwrap();
             s.item(Parameters(ItemRequest {
                 action: "update_state".into(),
                 id: Some(created["id"].as_str().unwrap().to_string()),
@@ -4992,13 +4991,21 @@ mod tests {
 
         let velocity = health["velocity"].as_array().unwrap();
         assert_eq!(velocity.len(), 2, "oldest -> newest, 2 requested windows");
-        assert_eq!(velocity[1]["completed_count"], 2, "current week has both Done items");
+        assert_eq!(
+            velocity[1]["completed_count"], 2,
+            "current week has both Done items"
+        );
         assert_eq!(velocity[0]["completed_count"], 0, "prior week is empty");
         assert_eq!(health["velocity_trend"], "up");
         assert_eq!(health["wip_count"], 1);
         assert_eq!(health["stuck_count"], 0);
         assert_eq!(health["bottlenecks"].as_array().unwrap().len(), 0);
-        assert!(health["bottleneck_note"].as_str().unwrap().contains("no handoff history"));
+        assert!(
+            health["bottleneck_note"]
+                .as_str()
+                .unwrap()
+                .contains("no handoff history")
+        );
     }
 
     /// Real measured comparison, not an estimate: one `groom` call vs. the
