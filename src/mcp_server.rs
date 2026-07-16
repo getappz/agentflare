@@ -240,11 +240,6 @@ struct ArtifactRequest {
     #[serde(default)]
     base_version: Option<u32>,
     #[schemars(
-        description = "Handoff envelope: which agent/runtime is publishing (e.g. claude-code, codex) (publish)"
-    )]
-    #[serde(default)]
-    sender: Option<String>,
-    #[schemars(
         description = "Handoff envelope: agent/runtime this artifact is addressed to — for WORK PRODUCTS only; facts and decisions belong in memory (memory_remember), not artifacts (publish)"
     )]
     #[serde(default)]
@@ -1067,7 +1062,7 @@ impl AgentflareMcp {
                     description: req.description,
                     favicon: req.favicon,
                     base_version: req.base_version,
-                    sender: req.sender.or_else(|| self.agent.clone()),
+                    sender: self.agent.clone(),
                     recipient: req.recipient,
                     thread_id: req.thread_id,
                     reply_to: req.reply_to,
@@ -1792,6 +1787,14 @@ impl AgentflareMcp {
                 let conn = Self::claim_db()?;
                 let repo = Self::resolve_repo_or_err(req.repo)?;
                 let pr = Self::resolve_round(req.pr)?;
+                // SECURITY / step-3 classification (#75): the finder `agent`
+                // stays caller-settable BY DESIGN. Unlike artifact authorship,
+                // review findings live in a local, per-repo, single-user DB, and
+                // a `/code-review` orchestrator legitimately submits on behalf
+                // of many finder sub-agents — consensus counts DISTINCT finder
+                // names, so collapsing them to one server identity would break
+                // it. No cross-principal trust boundary exists here; the
+                // server-derived `submitter_name` is the fallback when unset.
                 let agent = req
                     .agent
                     .filter(|s| !s.is_empty())
@@ -3597,7 +3600,6 @@ mod tests {
                         action: "publish".into(),
                         name: Some(name.into()),
                         content: Some(format!("content {name}")),
-                        sender: Some("claude-code".into()),
                         recipient: recipient.map(Into::into),
                         thread_id: thread.map(Into::into),
                         ..Default::default()
@@ -3959,15 +3961,10 @@ mod tests {
         });
         assert_eq!(defaulted, "opencode");
 
-        // An explicit sender always wins over the identity default.
-        let explicit = sender_of(ArtifactRequest {
-            action: "publish".into(),
-            name: Some("explicit".into()),
-            content: Some("x".into()),
-            sender: Some("codex".into()),
-            ..Default::default()
-        });
-        assert_eq!(explicit, "codex");
+        // ArtifactRequest has no `sender` field (removed in #75): authorship is
+        // always the server-derived identity, so a caller cannot attribute a
+        // published artifact to another agent. The spoof is unrepresentable at
+        // the type level — stronger than a runtime "override ignored" check.
     }
 
     #[test]
@@ -4287,6 +4284,82 @@ mod tests {
             .map(|i| i["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, vec!["Mine open", "Unassigned", "Mine done"]);
+    }
+
+    #[test]
+    fn item_list_defaults_assignee_filter_to_server_identity() {
+        // #75: a bare `item(list)` (no assignee_agent) must default to the
+        // server-derived identity — mine + unassigned — not dump every item.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            backend_db_override: Some(tmp.path().join("backend.db")),
+            backend_project_link_override: Some(tmp.path().join("project.json")),
+            agent: Some("me".into()),
+            ..Default::default()
+        };
+
+        let mine: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("Mine"))).unwrap()).unwrap();
+        s.item(Parameters(ItemRequest {
+            action: "update".into(),
+            id: Some(mine["id"].as_str().unwrap().to_string()),
+            assignee_agent: Some("me".into()),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        serde_json::from_str::<serde_json::Value>(
+            &s.item(Parameters(empty_item_create("Unassigned"))).unwrap(),
+        )
+        .unwrap();
+
+        let others: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("Others"))).unwrap())
+                .unwrap();
+        s.item(Parameters(ItemRequest {
+            action: "update".into(),
+            id: Some(others["id"].as_str().unwrap().to_string()),
+            assignee_agent: Some("someone-else".into()),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        // Bare list: no assignee_agent → defaults to "me" (mine + unassigned).
+        let defaulted: serde_json::Value = serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                action: "list".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut names: Vec<&str> = defaulted
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Mine", "Unassigned"]);
+
+        // An explicit assignee_agent is still honored (view a teammate's queue).
+        let explicit: serde_json::Value = serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                action: "list".into(),
+                assignee_agent: Some("someone-else".into()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut names2: Vec<&str> = explicit
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        names2.sort_unstable();
+        assert_eq!(names2, vec!["Others", "Unassigned"]);
     }
 
     #[test]
