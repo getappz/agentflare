@@ -93,3 +93,18 @@ ambient `CARGO_TARGET_DIR`.
 
 Never add "Generated with Claude Code" or "Co-Authored-By: Claude" signatures.
 Commit messages are the message only.
+
+## Build isolation (claim worktrees)
+
+Each claim worktree (`.worktrees/task/<id>/`) gets its own `.cargo/config.toml`
+with a relative `target-dir`, so `cargo build`/`test` in one worktree can't
+reuse another worktree's stale local-crate artifacts (item #133; cargo
+#12516/#14053/#7740). If `sccache` is on `PATH`, the same config also sets it
+as `rustc-wrapper` with `SCCACHE_BASEDIRS` pointed at the worktree's own path,
+so registry-dependency compiles still share a cache across worktrees.
+
+**Known gap:** an ambient `CARGO_TARGET_DIR` environment variable always
+overrides that config file (Cargo's CLI-flag > env-var > config-file
+precedence) — no per-worktree config can outrank it. If you have
+`CARGO_TARGET_DIR` set globally, either unset it or trust CI over local test
+runs in a claim worktree (tracked in item #139).

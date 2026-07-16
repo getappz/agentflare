@@ -143,8 +143,14 @@ fn warn_if_ambient_target_dir() {
 /// Local workspace crates must NOT be shared across worktrees (silent
 /// contamination); registry deps are safe but are better served by a shared
 /// sccache. A relative `target-dir = "target"` resolves per-checkout, giving
-/// each worktree its own isolated cache. Soft-fails (eprintln) — never blocks
-/// a claim.
+/// each worktree its own isolated cache. When `sccache` is on `PATH`, also
+/// wires it up as the `rustc-wrapper` with `SCCACHE_BASEDIRS` set to this
+/// worktree's own absolute path — sccache hashes absolute source paths into
+/// its cache key by default, so without stripping that prefix, identical
+/// dependency source in a sibling worktree would never hit
+/// (mozilla/sccache#196; a `--remap-path-prefix` rustflag looks tempting but
+/// itself varies per worktree and defeats the cache key instead). Soft-fails
+/// (eprintln) — never blocks a claim.
 fn isolate_worktree_target_dir(worktree_path: &Path) {
     let cargo_dir = worktree_path.join(".cargo");
     let _ = std::fs::create_dir_all(&cargo_dir);
@@ -152,16 +158,33 @@ fn isolate_worktree_target_dir(worktree_path: &Path) {
     if config_path.exists() {
         return; // don't clobber an intentional worktree-local override
     }
-    let content = "[build]\n# Isolated per worktree (see item #133). Registry deps are\n\
+    let mut content = "[build]\n# Isolated per worktree (see item #133). Registry deps are\n\
                    # better shared via sccache (RUSTC_WRAPPER + SCCACHE_BASEDIRS),\n\
                    # not a shared CARGO_TARGET_DIR, which leaks artifacts across worktrees.\n\
-                   target-dir = \"target\"\n";
+                   target-dir = \"target\"\n"
+        .to_string();
+    if sccache_available() {
+        content.push_str("rustc-wrapper = \"sccache\"\n\n[env]\nSCCACHE_BASEDIRS = '");
+        content.push_str(&worktree_path.to_string_lossy());
+        content.push_str("'\n");
+    }
     if let Err(e) = std::fs::write(&config_path, content) {
         eprintln!(
             "worktree: could not write isolated .cargo/config.toml for {}: {e}",
             worktree_path.display()
         );
     }
+}
+
+/// True when the `sccache` binary is reachable on `PATH`.
+fn sccache_available() -> bool {
+    Command::new("sccache")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Creates an isolated git worktree for `item` against `target_branch`.
@@ -536,6 +559,32 @@ mod tests {
             content.contains("/some/intentional/path"),
             "existing worktree-local config must be preserved"
         );
+    }
+
+    #[test]
+    fn isolate_worktree_target_dir_wires_sccache_when_available() {
+        let tmp = TempDir::new().unwrap();
+        let wt = tmp.path().join(".worktrees").join("task").join("1");
+        std::fs::create_dir_all(&wt).unwrap();
+        isolate_worktree_target_dir(&wt);
+        let config = wt.join(".cargo").join("config.toml");
+        let content = std::fs::read_to_string(&config).unwrap();
+        if sccache_available() {
+            assert!(
+                content.contains("rustc-wrapper = \"sccache\""),
+                "expected sccache wired up as rustc-wrapper, got: {content}"
+            );
+            let basedir_line = format!("SCCACHE_BASEDIRS = '{}'", wt.to_string_lossy());
+            assert!(
+                content.contains(&basedir_line),
+                "expected SCCACHE_BASEDIRS to strip this worktree's own path, got: {content}"
+            );
+        } else {
+            assert!(
+                !content.contains("rustc-wrapper") && !content.contains("SCCACHE_BASEDIRS"),
+                "must not reference sccache when it isn't on PATH, got: {content}"
+            );
+        }
     }
 
     #[test]
