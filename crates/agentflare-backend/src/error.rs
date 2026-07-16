@@ -6,6 +6,8 @@ pub enum Error {
     Duplicate(String),
     #[error("invalid state transition: {0}")]
     InvalidTransition(String),
+    #[error("validation: {0}")]
+    Validation(String),
     #[error(transparent)]
     Database(rusqlite::Error),
 }
