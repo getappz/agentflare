@@ -273,12 +273,12 @@ pub fn push_and_open_pr(
         _ => return None,
     }
     // Content-diff guard: even when the branch has new commits, its
-    // *content* may already be on the target (squash-merge). If
-    // `git diff --quiet <target>...<branch>` exits 0, no content
-    // differs → skip the PR.
+    // *content* may already be on the target (squash-merge). Compares
+    // target→branch tree (two-dot, not three-dot: we want whether the
+    // two tips are identical, not whether branch differs from merge-base).
     if run_git_in_ok(
         repo_root,
-        &["diff", "--quiet", &format!("{target_branch}...{branch}")],
+        &["diff", "--quiet", &format!("{target_branch}..{branch}")],
     ) {
         return None;
     }
