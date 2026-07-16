@@ -14,7 +14,7 @@ fn find_workspace_agents_md() -> Option<String> {
     loop {
         let path = dir.join("AGENTS.md");
         if let Ok(content) = std::fs::read_to_string(&path)
-            && content.contains("PONYTAIL")
+            && content.contains("FLARE CODE")
         {
             return Some(content);
         }
@@ -36,12 +36,12 @@ pub fn build(mode: &str, skill_path: Option<&Path>) -> Instructions {
         return Instructions {
             mode: effective.clone(),
             body: format!(
-                "PONYTAIL MODE ACTIVE — level: {effective}. Behavior defined by /ponytail-{effective} skill."
+                "FLARE CODE MODE ACTIVE — level: {effective}. Behavior defined by /flare-code-{effective} skill."
             ),
         };
     }
 
-    // Custom skills have no harness-installed /ponytail-<name> skill to point
+    // Custom skills have no harness-installed /flare-code-<name> skill to point
     // at, so their authored body is delivered inline.
     if let Some(body) = crate::sub_skills::get_custom(&effective) {
         return Instructions {
@@ -67,7 +67,7 @@ pub fn build(mode: &str, skill_path: Option<&Path>) -> Instructions {
 
 /// If a known compression/persona plugin (e.g. caveman) is also wired into
 /// the agent's settings, add a short note so the two don't read as
-/// contradictory: ponytail governs code structure, the peer plugin governs
+/// contradictory: flare-code governs code structure, the peer plugin governs
 /// output style.
 fn compression_deconfliction() -> String {
     let peers = config::detect_compression_plugins();
@@ -76,10 +76,10 @@ fn compression_deconfliction() -> String {
     }
     format!(
         "\n\n## Compression plugin coexistence\n\n\
-         Detected: {}. Ponytail governs WHAT to build (the ladder, YAGNI, \
+         Detected: {}. Flare Code governs WHAT to build (the ladder, YAGNI, \
          stdlib-first, minimal diffs). Defer to the other plugin for output \
          STYLE (brevity, tone, formatting). If rules conflict, the \
-         structural rule (ponytail) wins for code decisions; the style rule \
+         structural rule (flare-code) wins for code decisions; the style rule \
          (peer plugin) wins for prose and formatting.",
         peers.join(", ")
     )
@@ -129,7 +129,7 @@ mod tests {
         let _guard = config::ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = std::env::temp_dir().join("ponytail_test_instructions_compression");
+        let dir = std::env::temp_dir().join("flare-code_test_instructions_compression");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("settings.json"), r#"{"plugins": ["caveman"]}"#).unwrap();
         unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &dir) };

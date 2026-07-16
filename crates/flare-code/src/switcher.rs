@@ -44,8 +44,8 @@ pub fn detect(input: &str) -> Option<SwitchAction> {
     }
 
     for name in all_mode_names() {
-        let prefixed = format!("/ponytail-{name}");
-        let alt = format!("/ponytail:{name}");
+        let prefixed = format!("/flare-code-{name}");
+        let alt = format!("/flare-code:{name}");
         if prompt == prefixed || prompt.starts_with(&format!("{prefixed} ")) {
             let normalized = config::normalize_extended_mode(&name)?;
             return Some(SwitchAction::SetMode(normalized));
@@ -57,9 +57,9 @@ pub fn detect(input: &str) -> Option<SwitchAction> {
     }
 
     let cmd = prompt
-        .strip_prefix("/ponytail")
-        .or_else(|| prompt.strip_prefix("@ponytail"))
-        .or_else(|| prompt.strip_prefix("$ponytail"))?;
+        .strip_prefix("/flare-code")
+        .or_else(|| prompt.strip_prefix("@flare-code"))
+        .or_else(|| prompt.strip_prefix("$flare-code"))?;
 
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     let sub = parts.first().copied().unwrap_or("");
@@ -107,94 +107,100 @@ mod tests {
 
     #[test]
     fn detects_mode_switch() {
-        assert!(matches!(detect("/ponytail lite"), Some(SwitchAction::SetMode(m)) if m == "lite"));
-        assert!(matches!(detect("/ponytail full"), Some(SwitchAction::SetMode(m)) if m == "full"));
+        assert!(
+            matches!(detect("/flare-code lite"), Some(SwitchAction::SetMode(m)) if m == "lite")
+        );
+        assert!(
+            matches!(detect("/flare-code full"), Some(SwitchAction::SetMode(m)) if m == "full")
+        );
     }
 
     #[test]
     fn detects_off() {
-        assert!(matches!(detect("/ponytail off"), Some(SwitchAction::Off)));
+        assert!(matches!(detect("/flare-code off"), Some(SwitchAction::Off)));
     }
 
     #[test]
     fn detects_deactivation_phrase() {
-        assert!(matches!(detect("stop ponytail"), Some(SwitchAction::Off)));
+        assert!(matches!(detect("stop flare-code"), Some(SwitchAction::Off)));
     }
 
     #[test]
     fn detects_default() {
         assert!(
-            matches!(detect("/ponytail default ultra"), Some(SwitchAction::SetDefault(m)) if m == "ultra")
+            matches!(detect("/flare-code default ultra"), Some(SwitchAction::SetDefault(m)) if m == "ultra")
         );
     }
 
     #[test]
     fn ignores_false_positives() {
-        assert!(detect("let's talk about ponytail").is_none());
+        assert!(detect("let's talk about flare-code").is_none());
         assert!(detect("").is_none());
     }
 
     #[test]
     fn detects_sub_skill_review() {
         assert!(
-            matches!(detect("/ponytail-review"), Some(SwitchAction::SetMode(m)) if m == "review")
+            matches!(detect("/flare-code-review"), Some(SwitchAction::SetMode(m)) if m == "review")
         );
     }
 
     #[test]
     fn detects_sub_skill_audit() {
         assert!(
-            matches!(detect("/ponytail-audit"), Some(SwitchAction::SetMode(m)) if m == "audit")
+            matches!(detect("/flare-code-audit"), Some(SwitchAction::SetMode(m)) if m == "audit")
         );
     }
 
     #[test]
     fn detects_sub_skill_inline() {
         assert!(
-            matches!(detect("/ponytail review"), Some(SwitchAction::SetMode(m)) if m == "review")
+            matches!(detect("/flare-code review"), Some(SwitchAction::SetMode(m)) if m == "review")
         );
     }
 
     #[test]
     fn detects_sub_skill_playbook() {
         assert!(
-            matches!(detect("/ponytail-playbook"), Some(SwitchAction::SetMode(m)) if m == "playbook")
+            matches!(detect("/flare-code-playbook"), Some(SwitchAction::SetMode(m)) if m == "playbook")
         );
     }
 
     #[test]
     fn detects_sub_skill_no_hallucination() {
         assert!(
-            matches!(detect("/ponytail-no-hallucination"), Some(SwitchAction::SetMode(m)) if m == "no-hallucination")
+            matches!(detect("/flare-code-no-hallucination"), Some(SwitchAction::SetMode(m)) if m == "no-hallucination")
         );
     }
 
     #[test]
     fn detects_session_mode() {
         assert!(
-            matches!(detect("/ponytail session ultra"), Some(SwitchAction::SetSession(m)) if m == "ultra")
+            matches!(detect("/flare-code session ultra"), Some(SwitchAction::SetSession(m)) if m == "ultra")
         );
-        assert!(detect("/ponytail session").is_none());
+        assert!(detect("/flare-code session").is_none());
     }
 
     #[test]
     fn detects_status() {
         assert!(matches!(
-            detect("/ponytail status"),
+            detect("/flare-code status"),
             Some(SwitchAction::Report)
         ));
     }
 
     #[test]
     fn detects_bare_as_report() {
-        assert!(matches!(detect("/ponytail"), Some(SwitchAction::Report)));
+        assert!(matches!(detect("/flare-code"), Some(SwitchAction::Report)));
     }
 
     #[test]
     fn detects_mode_shortcut() {
         assert!(
-            matches!(detect("/ponytail-ultra"), Some(SwitchAction::SetMode(m)) if m == "ultra")
+            matches!(detect("/flare-code-ultra"), Some(SwitchAction::SetMode(m)) if m == "ultra")
         );
-        assert!(matches!(detect("/ponytail-lite"), Some(SwitchAction::SetMode(m)) if m == "lite"));
+        assert!(
+            matches!(detect("/flare-code-lite"), Some(SwitchAction::SetMode(m)) if m == "lite")
+        );
     }
 }

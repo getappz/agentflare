@@ -6,7 +6,7 @@ pub fn flag_path() -> PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")))
         .join("agentflare")
-        .join("ponytail")
+        .join("flare-code")
         .join("active")
 }
 
@@ -15,7 +15,7 @@ pub fn session_path() -> PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")))
         .join("agentflare")
-        .join("ponytail")
+        .join("flare-code")
         .join("session-mode")
 }
 

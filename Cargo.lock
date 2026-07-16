@@ -70,8 +70,9 @@ dependencies = [
  "agentflare-agent-registry",
  "agentflare-artifacts",
  "agentflare-backend",
- "agentflare-caveman",
  "agentflare-db-kit",
+ "agentflare-flare-code",
+ "agentflare-flare-output",
  "agentflare-gateway-registry",
  "agentflare-skill-registry",
  "base64",
@@ -87,7 +88,6 @@ dependencies = [
  "insta",
  "libc",
  "pbkdf2",
- "ponytail",
  "pretty_assertions",
  "rand 0.8.6",
  "regex",
@@ -147,19 +147,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentflare-caveman"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "regex",
- "serde_json",
- "tempfile",
- "thiserror",
- "ureq",
- "which",
-]
-
-[[package]]
 name = "agentflare-db-kit"
 version = "0.1.0"
 dependencies = [
@@ -169,6 +156,29 @@ dependencies = [
  "tempfile",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "agentflare-flare-code"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "serde",
+ "serde_json",
+ "sysinfo 0.34.2",
+]
+
+[[package]]
+name = "agentflare-flare-output"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "regex",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "ureq",
+ "which",
 ]
 
 [[package]]
@@ -1546,16 +1556,6 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
-]
-
-[[package]]
-name = "ponytail"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "serde",
- "serde_json",
- "sysinfo 0.34.2",
 ]
 
 [[package]]

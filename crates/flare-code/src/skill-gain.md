@@ -1,14 +1,14 @@
 ---
-name: ponytail-gain
+name: flare-code-gain
 description: >
-  Show ponytail's measured impact as a compact scoreboard: less code, less
+  Show flare-code's measured impact as a compact scoreboard: less code, less
   cost, more speed, from the benchmark medians. One-shot display, not a
-  persistent mode, and not a per-repo number. Trigger: /ponytail-gain,
-  "ponytail gain", "what does ponytail save", "show ponytail impact",
-  "ponytail scoreboard".
+  persistent mode, and not a per-repo number. Trigger: /flare-code-gain,
+  "flare-code gain", "what does flare-code save", "show flare-code impact",
+  "flare-code scoreboard".
 ---
 
-# Ponytail Gain
+# Flare Code Gain
 
 Display this scoreboard when invoked. One-shot: do NOT change mode, write flag
 files, or persist anything.
@@ -24,16 +24,16 @@ Render plain ASCII bars. The bar length shows the measured range; the label
 carries the exact figure:
 
 ```
-  ponytail gain                     benchmark median · 5 tasks · 3 models
+  flare-code gain                     benchmark median · 5 tasks · 3 models
 
   Lines of code   no-skill  ████████████████████  100%
-                  ponytail  ██▌·················    6–20%   ▼ 80–94%
+                  flare-code  ██▌·················    6–20%   ▼ 80–94%
   Cost            no-skill  ████████████████████  100%
-                  ponytail  █████▌··············   23–53%  ▼ 47–77%
-  Speed           ponytail  ▸ 3–6× faster
+                  flare-code  █████▌··············   23–53%  ▼ 47–77%
+  Speed           flare-code  ▸ 3–6× faster
 
-  This repo:  /ponytail-debt  (shortcuts you deferred)
-              /ponytail-audit (what's still cuttable)
+  This repo:  /flare-code-debt  (shortcuts you deferred)
+              /flare-code-audit (what's still cuttable)
 ```
 
 ## Honesty boundary
@@ -41,10 +41,10 @@ carries the exact figure:
 These are benchmark medians, not this repo. NEVER print a per-repo savings
 number ("you saved X lines/tokens here"): the unbuilt version was never
 written, so there is no real baseline to subtract from in a live repo. The
-only real per-repo figures come from `/ponytail-debt` (a counted ledger), and
+only real per-repo figures come from `/flare-code-debt` (a counted ledger), and
 this card points there instead of inventing one.
 
 ## Boundaries
 
 One-shot display. Edits nothing, changes no mode.
-"stop ponytail" or "normal mode": revert.
+"stop flare code" or "normal mode": revert.

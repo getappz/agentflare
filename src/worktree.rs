@@ -272,6 +272,16 @@ pub fn push_and_open_pr(
         Ok(count) if count != "0" => {}
         _ => return None,
     }
+    // Content-diff guard: even when the branch has new commits, its
+    // *content* may already be on the target (squash-merge). Compares
+    // target→branch tree (two-dot, not three-dot: we want whether the
+    // two tips are identical, not whether branch differs from merge-base).
+    if run_git_in_ok(
+        repo_root,
+        &["diff", "--quiet", &format!("{target_branch}..{branch}")],
+    ) {
+        return None;
+    }
     if let Some(p) = progress {
         p.send(0.0, Some(1.0), Some(format!("Pushing branch {branch}...")));
     }
@@ -529,6 +539,25 @@ mod tests {
         // No commits were made in the worktree — nothing to push, so this
         // must return early without attempting a real `git push`/`gh pr
         // create` (which would fail anyway: no remote configured here).
+        assert!(push_and_open_pr(&item, &repo.path, &target, None).is_none());
+    }
+
+    #[test]
+    fn push_and_open_pr_returns_none_when_branch_content_already_merged() {
+        let repo = init_repo();
+        let item = test_item(1);
+        let target = resolve_default_branch(&repo.path);
+        let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+        let test_file = worktree_path.join("test.txt");
+        std::fs::write(&test_file, b"hello").unwrap();
+        run_git_in(&worktree_path, &["add", "test.txt"]).unwrap();
+        run_git_in(&worktree_path, &["commit", "-m", "worktree change"]).unwrap();
+        // task/1 now has a commit master doesn't. Squash-merge: cherry-pick
+        // the *diff* onto master so content matches but ancestry doesn't.
+        run_git_in(&repo.path, &["cherry-pick", "-n", "task/1"]).unwrap();
+        run_git_in(&repo.path, &["commit", "-m", "squash-merge"]).unwrap();
+        // Content-diff guard should catch this even though commit-count
+        // guard passes.
         assert!(push_and_open_pr(&item, &repo.path, &target, None).is_none());
     }
 

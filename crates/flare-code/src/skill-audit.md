@@ -1,20 +1,20 @@
 ---
-name: ponytail-audit
+name: flare-code-audit
 description: >
-  Whole-repo audit for over-engineering. Like ponytail-review, but scans the
+  Whole-repo audit for over-engineering. Like flare-code-review, but scans the
   entire codebase instead of a diff: a ranked list of what to delete, simplify,
   or replace with stdlib/native equivalents. Use when the user says "audit this
   codebase", "audit for over-engineering", "what can I delete from this repo",
-  "find bloat", "ponytail-audit", or "/ponytail-audit". One-shot report, does
+  "find bloat", "flare-code-audit", or "/flare-code-audit". One-shot report, does
   not apply fixes.
 ---
 
-ponytail-review, repo-wide. Scan the whole tree instead of a diff. Rank
+flare-code-review, repo-wide. Scan the whole tree instead of a diff. Rank
 findings biggest cut first.
 
 ## Tags
 
-Same as ponytail-review:
+Same as flare-code-review:
 
 - `delete:` dead code, unused flexibility, speculative feature. Replacement: nothing.
 - `stdlib:` hand-rolled thing the standard library ships. Name the function.
@@ -38,4 +38,4 @@ End with `net: -<N> lines, -<M> deps possible.` Nothing to cut: `Lean already. S
 Scope: over-engineering and complexity only. Correctness bugs, security holes,
 and performance are explicitly out of scope. Route them to a normal review
 pass. Lists findings, applies nothing. One-shot.
-"stop ponytail-audit" or "normal mode" to revert.
+"stop flare-code-audit" or "normal mode" to revert.

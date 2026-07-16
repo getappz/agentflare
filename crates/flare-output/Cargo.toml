@@ -1,9 +1,9 @@
 [package]
-name = "agentflare-caveman"
+name = "agentflare-flare-output"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
-description = "Caveman markdown compressor — LLM-based prose compression with structural validation"
+description = "Flare output compressor — LLM-based prose compression with structural validation"
 license = "MIT"
 publish = false
 

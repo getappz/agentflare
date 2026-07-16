@@ -24,6 +24,7 @@ pub enum BackupMode {
 pub struct Report {
     pub original_bytes: usize,
     pub compressed_bytes: usize,
+    pub original_path: std::path::PathBuf,
 }
 
 pub fn compress(
@@ -118,9 +119,15 @@ pub fn compress(
         std::fs::write(target, &compressed)?;
     }
 
+    let original_path = if in_place {
+        backup_path
+    } else {
+        source.to_path_buf()
+    };
     Ok(Report {
         original_bytes: original_text.len(),
         compressed_bytes: std::fs::metadata(target)?.len() as usize,
+        original_path,
     })
 }
 
@@ -332,5 +339,33 @@ mod tests {
             "plugin content here",
             "source untouched"
         );
+    }
+
+    #[test]
+    fn report_points_original_path_at_backup_for_in_place() {
+        let dir = tempdir().unwrap();
+        let src = write(
+            dir.path(),
+            "doc.md",
+            "# Title\n\nlong original body worth compressing.\n",
+        );
+        let llm = FakeLlm::queue(&["# Title\n\nshort body"]);
+        let report = compress(&llm, &src, &src, Prompt::Generic, BackupMode::Sibling).unwrap();
+        assert_eq!(report.original_path, src.with_file_name("doc.md.orig"));
+        assert!(report.original_path.is_file());
+    }
+
+    #[test]
+    fn report_points_original_path_at_source_for_out_of_place() {
+        let dir = tempdir().unwrap();
+        let src = write(
+            dir.path(),
+            "doc.md",
+            "# Title\n\nlong original body worth compressing.\n",
+        );
+        let tgt = dir.path().join("out.md");
+        let llm = FakeLlm::queue(&["# Title\n\nshort body"]);
+        let report = compress(&llm, &src, &tgt, Prompt::Generic, BackupMode::Sibling).unwrap();
+        assert_eq!(report.original_path, src);
     }
 }

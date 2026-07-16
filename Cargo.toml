@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ponytail", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/caveman", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit"]
+members = ["crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit"]
 resolver = "2"
 
 [package]
@@ -59,11 +59,11 @@ rpassword = "7"
 thiserror = "2"
 eyre = "0.6"
 color-eyre = "0.6"
-ponytail = { path = "crates/ponytail" }
+flare-code = { package = "agentflare-flare-code", path = "crates/flare-code" }
 agent-registry = { package = "agentflare-agent-registry", path = "crates/agent-registry" }
 skill-registry = { package = "agentflare-skill-registry", path = "crates/skill-registry" }
 gateway-registry = { package = "agentflare-gateway-registry", path = "crates/gateway-registry" }
-caveman = { package = "agentflare-caveman", path = "crates/caveman" }
+flare-output = { package = "agentflare-flare-output", path = "crates/flare-output" }
 regex = "1"
 sysinfo = { version = "0.34", optional = true, default-features = false, features = ["system"] }
 agentflare-artifacts = { path = "crates/agentflare-artifacts" }

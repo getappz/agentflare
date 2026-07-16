@@ -44,14 +44,15 @@ pub fn normalize_extended_mode(mode: &str) -> Option<String> {
 }
 
 /// Serializes tests (in this module and `instructions.rs`) that mutate
-/// process-global env vars (`CLAUDE_CONFIG_DIR`, `PONYTAIL_DEFAULT_MODE`) —
+/// process-global env vars (`CLAUDE_CONFIG_DIR`, `FLARE_CODE_DEFAULT_MODE`
+/// and legacy `PONYTAIL_DEFAULT_MODE`) —
 /// `cargo test` runs unit tests in parallel by default, so unguarded
 /// `set_var`/`remove_var` calls can leak across assertions.
 pub static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Compression/persona plugins known to conflict with ponytail's own style
+/// Compression/persona plugins known to conflict with flare-code's own style
 /// guidance if both are active — e.g. caveman's terse-prose rules vs
-/// ponytail's own output-shape rules.
+/// flare-code's own output-shape rules.
 const KNOWN_COMPRESSION_PLUGINS: &[&str] = &["caveman"];
 
 fn claude_dir() -> PathBuf {
@@ -66,7 +67,7 @@ fn claude_dir() -> PathBuf {
 }
 
 /// Scans `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`)
-/// for known compression/persona plugins so ponytail can add a
+/// for known compression/persona plugins so flare-code can add a
 /// deconfliction note instead of silently contradicting them.
 #[must_use]
 pub fn detect_compression_plugins() -> Vec<&'static str> {
@@ -85,22 +86,25 @@ pub fn detect_compression_plugins() -> Vec<&'static str> {
 pub fn is_deactivation(text: &str) -> bool {
     let t = text.trim().to_lowercase();
     let t = t.trim_end_matches(|c: char| c == '.' || c == '!' || c == '?' || c.is_whitespace());
-    t == "stop ponytail" || t == "normal mode"
+    t == "stop flare-code" || t == "stop ponytail" || t == "normal mode"
 }
 
 /// `dirs::config_dir()` resolves via the OS directly and ignores env-var
 /// overrides — same footgun `paths::home()` documents in the root crate
 /// (a "sandboxed" test run silently writing to the real ~/.config).
-/// `PONYTAIL_CONFIG_DIR_OVERRIDE` is this crate's own escape hatch for tests.
+/// `FLARE_CODE_CONFIG_DIR_OVERRIDE` (and legacy `PONYTAIL_CONFIG_DIR_OVERRIDE`)
+/// is this crate's own escape hatch for tests.
 #[must_use]
 pub fn config_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("PONYTAIL_CONFIG_DIR_OVERRIDE") {
+    if let Ok(p) = std::env::var("FLARE_CODE_CONFIG_DIR_OVERRIDE")
+        .or_else(|_| std::env::var("PONYTAIL_CONFIG_DIR_OVERRIDE"))
+    {
         return PathBuf::from(p);
     }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("agentflare")
-        .join("ponytail")
+        .join("flare-code")
 }
 
 /// Test-only isolation for `config_dir()` — without this, tests that read
@@ -115,6 +119,7 @@ struct ConfigDirOverrideGuard;
 #[allow(unsafe_code)]
 impl Drop for ConfigDirOverrideGuard {
     fn drop(&mut self) {
+        unsafe { std::env::remove_var("FLARE_CODE_CONFIG_DIR_OVERRIDE") };
         unsafe { std::env::remove_var("PONYTAIL_CONFIG_DIR_OVERRIDE") };
     }
 }
@@ -125,10 +130,10 @@ fn with_temp_config_dir<T>(f: impl FnOnce() -> T) -> T {
     let _guard = ENV_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = std::env::temp_dir().join("ponytail-test-config-dir");
+    let dir = std::env::temp_dir().join("flare-code-test-config-dir");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    unsafe { std::env::set_var("PONYTAIL_CONFIG_DIR_OVERRIDE", &dir) };
+    unsafe { std::env::set_var("FLARE_CODE_CONFIG_DIR_OVERRIDE", &dir) };
     // Dropped (restoring the env var) even if `f()` panics — a bare
     // remove_var() call after f() would be skipped on panic, leaking the
     // override process-wide for the rest of the test binary.
@@ -148,7 +153,8 @@ struct ConfigFile {
 
 #[must_use]
 pub fn default_mode() -> String {
-    if let Ok(val) = std::env::var("PONYTAIL_DEFAULT_MODE")
+    if let Ok(val) =
+        std::env::var("FLARE_CODE_DEFAULT_MODE").or_else(|_| std::env::var("PONYTAIL_DEFAULT_MODE"))
         && let Some(m) = normalize_extended_mode(&val)
     {
         return m;
@@ -203,7 +209,7 @@ mod tests {
         let _guard = ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", "/nonexistent/ponytail-test-dir") };
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", "/nonexistent/flare-code-test-dir") };
         assert!(detect_compression_plugins().is_empty());
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
     }
@@ -213,7 +219,7 @@ mod tests {
         let _guard = ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = std::env::temp_dir().join("ponytail_test_compression_conflict");
+        let dir = std::env::temp_dir().join("flare-code_test_compression_conflict");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("settings.json"), r#"{"plugins": ["caveman"]}"#).unwrap();
         unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &dir) };
@@ -233,6 +239,7 @@ mod tests {
     #[test]
     fn defaults_to_full() {
         with_temp_config_dir(|| {
+            unsafe { std::env::remove_var("FLARE_CODE_DEFAULT_MODE") };
             unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
             assert_eq!(default_mode(), "full");
         });
@@ -241,9 +248,9 @@ mod tests {
     #[test]
     fn reads_env_var() {
         with_temp_config_dir(|| {
-            unsafe { std::env::set_var("PONYTAIL_DEFAULT_MODE", "lite") };
+            unsafe { std::env::set_var("FLARE_CODE_DEFAULT_MODE", "lite") };
             assert_eq!(default_mode(), "lite");
-            unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
+            unsafe { std::env::remove_var("FLARE_CODE_DEFAULT_MODE") };
         });
     }
 }
@@ -252,6 +259,7 @@ mod tests {
 #[allow(unsafe_code)]
 fn roundtrip_default_mode() {
     with_temp_config_dir(|| {
+        unsafe { std::env::remove_var("FLARE_CODE_DEFAULT_MODE") };
         unsafe { std::env::remove_var("PONYTAIL_DEFAULT_MODE") };
         let prev = default_mode();
         set_default_mode("ultra").unwrap();

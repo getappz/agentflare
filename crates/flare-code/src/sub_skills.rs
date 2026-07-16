@@ -28,7 +28,7 @@ pub fn skills_dir() -> std::path::PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("agentflare")
-        .join("ponytail")
+        .join("flare-code")
         .join("skills")
 }
 

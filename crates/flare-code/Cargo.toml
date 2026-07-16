@@ -1,9 +1,9 @@
 [package]
-name = "ponytail"
+name = "agentflare-flare-code"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
-description = "Ponytail — lazy senior dev mode for AI agents"
+description = "Flare code minimalism — lazy senior dev mode for AI agents"
 license = "MIT"
 publish = false
 

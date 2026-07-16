@@ -240,11 +240,6 @@ struct ArtifactRequest {
     #[serde(default)]
     base_version: Option<u32>,
     #[schemars(
-        description = "Handoff envelope: which agent/runtime is publishing (e.g. claude-code, codex) (publish)"
-    )]
-    #[serde(default)]
-    sender: Option<String>,
-    #[schemars(
         description = "Handoff envelope: agent/runtime this artifact is addressed to — for WORK PRODUCTS only; facts and decisions belong in memory (memory_remember), not artifacts (publish)"
     )]
     #[serde(default)]
@@ -276,6 +271,15 @@ struct ArtifactRequest {
     )]
     #[serde(default)]
     inbox_recipient: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct OptimizeRequest {
+    #[schemars(description = "Action: retrieve | list")]
+    action: String,
+    #[serde(default)]
+    #[schemars(description = "Registered compression id (required for retrieve)")]
+    id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -517,7 +521,8 @@ fn map_backend_err(e: agentflare_backend::Error) -> ErrorData {
     match e {
         agentflare_backend::Error::NotFound(msg)
         | agentflare_backend::Error::Duplicate(msg)
-        | agentflare_backend::Error::InvalidTransition(msg) => ErrorData::invalid_params(msg, None),
+        | agentflare_backend::Error::InvalidTransition(msg)
+        | agentflare_backend::Error::Validation(msg) => ErrorData::invalid_params(msg, None),
         agentflare_backend::Error::Database(e) => ErrorData::internal_error(e.to_string(), None),
     }
 }
@@ -644,14 +649,23 @@ struct CommentRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct LabelRequest {
-    #[schemars(description = "Action: create")]
+    #[schemars(description = "Action: create|list|update|delete")]
     action: String,
-    #[schemars(description = "Label name (required for create)")]
+    #[schemars(description = "Label ID (required for update, delete)")]
+    #[serde(default)]
+    id: Option<String>,
+    #[schemars(description = "Label name (required for create; optional for update)")]
     #[serde(default)]
     name: Option<String>,
-    #[schemars(description = "Hex color, e.g. #F59E0B (create)")]
+    #[schemars(description = "Hex color, e.g. #F59E0B (create, update)")]
     #[serde(default)]
     color: Option<String>,
+    #[schemars(description = "Parent label ID for nesting/grouping (create)")]
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[schemars(description = "Sort order for manual ordering (create, update)")]
+    #[serde(default)]
+    sort_order: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -900,6 +914,28 @@ impl AgentflareMcp {
         }
     }
 
+    /// Whether an asset's MIME type denotes text, so its content can be
+    /// returned as readable UTF-8 rather than Base64. Binary types are
+    /// excluded even when their bytes happen to be valid UTF-8.
+    fn mime_is_textual(mime: Option<&str>) -> bool {
+        let Some(m) = mime else { return false };
+        let m = m.split(';').next().unwrap_or(m).trim();
+        m.starts_with("text/")
+            || m.ends_with("+json")
+            || m.ends_with("+xml")
+            || matches!(
+                m,
+                "application/json"
+                    | "application/xml"
+                    | "application/javascript"
+                    | "application/ecmascript"
+                    | "application/typescript"
+                    | "application/toml"
+                    | "application/x-yaml"
+                    | "application/yaml"
+            )
+    }
+
     fn asset_max_attach_bytes() -> u64 {
         std::env::var("AGENTFLARE_BACKEND_ASSET_MAX_ATTACH_BYTES")
             .ok()
@@ -1026,7 +1062,7 @@ impl AgentflareMcp {
                     description: req.description,
                     favicon: req.favicon,
                     base_version: req.base_version,
-                    sender: req.sender.or_else(|| self.agent.clone()),
+                    sender: self.agent.clone(),
                     recipient: req.recipient,
                     thread_id: req.thread_id,
                     reply_to: req.reply_to,
@@ -1751,6 +1787,14 @@ impl AgentflareMcp {
                 let conn = Self::claim_db()?;
                 let repo = Self::resolve_repo_or_err(req.repo)?;
                 let pr = Self::resolve_round(req.pr)?;
+                // SECURITY / step-3 classification (#75): the finder `agent`
+                // stays caller-settable BY DESIGN. Unlike artifact authorship,
+                // review findings live in a local, per-repo, single-user DB, and
+                // a `/code-review` orchestrator legitimately submits on behalf
+                // of many finder sub-agents — consensus counts DISTINCT finder
+                // names, so collapsing them to one server identity would break
+                // it. No cross-principal trust boundary exists here; the
+                // server-derived `submitter_name` is the fallback when unset.
                 let agent = req
                     .agent
                     .filter(|s| !s.is_empty())
@@ -2171,6 +2215,44 @@ impl AgentflareMcp {
             )),
         }
     }
+    #[tool(
+        description = "Optimize layer — reversible-compression retrieval (CCR). action=retrieve returns the original for a registered id; action=list enumerates live entries."
+    )]
+    fn optimize(&self, Parameters(req): Parameters<OptimizeRequest>) -> Result<String, ErrorData> {
+        match req.action.as_str() {
+            "retrieve" => {
+                let id = req.id.ok_or_else(|| {
+                    ErrorData::invalid_params("id is required for retrieve", None)
+                })?;
+                crate::optimize::retrieve::retrieve(&id)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            }
+            "list" => {
+                let state =
+                    crate::optimize::retrieve::active_state(crate::optimize::retrieve::now_unix());
+                let mut entries: Vec<_> = state.entries.values().collect();
+                entries.sort_by_key(|e| std::cmp::Reverse(e.created_ts));
+                let summary: Vec<_> = entries
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "id": e.id,
+                            "kind": crate::optimize::retrieve::kind_label(&e.kind),
+                            "size_before": e.size_before,
+                            "size_after": e.size_after,
+                            "created_ts": e.created_ts,
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&summary)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            }
+            other => Err(ErrorData::invalid_params(
+                format!("unknown action: {other}"),
+                None,
+            )),
+        }
+    }
     fn item_inner(&self, req: ItemRequest) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "create" => self.item_create(req),
@@ -2365,6 +2447,25 @@ impl AgentflareMcp {
         }
     }
 
+    /// Verify a label belongs to the repo's resolved project before mutating it by
+    /// ID, so `update`/`delete` can't reach across projects by guessing an ID.
+    /// Returns `invalid_params` on mismatch (same shape as not-found).
+    fn ensure_label_in_project(
+        &self,
+        conn: &rusqlite::Connection,
+        label_id: &str,
+    ) -> Result<(), ErrorData> {
+        let project = self.resolve_project(conn)?;
+        let label = agentflare_backend::label::get(conn, label_id).map_err(map_backend_err)?;
+        if label.project_id.as_deref() != Some(project.id.as_str()) {
+            return Err(ErrorData::invalid_params(
+                format!("label {label_id} is not in this project"),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
     fn label_inner(&self, req: LabelRequest) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "create" => {
@@ -2381,8 +2482,8 @@ impl AgentflareMcp {
                         workspace_id: project.workspace_id,
                         name,
                         color: req.color,
-                        parent_id: None,
-                        sort_order: None,
+                        parent_id: req.parent_id,
+                        sort_order: req.sort_order,
                         external_source: None,
                         external_id: None,
                     };
@@ -2391,15 +2492,47 @@ impl AgentflareMcp {
                     Ok(serde_json::to_string_pretty(&label).unwrap_or_default())
                 })?
             }
+            "list" => self.with_backend_db(|conn| {
+                let project = self.resolve_project(conn)?;
+                let labels = agentflare_backend::label::list_by_project(conn, &project.id)
+                    .map_err(map_backend_err)?;
+                Ok(serde_json::to_string_pretty(&labels).unwrap_or_default())
+            })?,
+            "update" => {
+                let id = req
+                    .id
+                    .ok_or_else(|| ErrorData::invalid_params("id is required for update", None))?;
+                let input = agentflare_backend::label::UpdateLabel {
+                    name: req.name,
+                    color: req.color,
+                    sort_order: req.sort_order,
+                };
+                self.with_backend_db(|conn| {
+                    self.ensure_label_in_project(conn, &id)?;
+                    let label = agentflare_backend::label::update(conn, &id, input)
+                        .map_err(map_backend_err)?;
+                    Ok(serde_json::to_string_pretty(&label).unwrap_or_default())
+                })?
+            }
+            "delete" => {
+                let id = req
+                    .id
+                    .ok_or_else(|| ErrorData::invalid_params("id is required for delete", None))?;
+                self.with_backend_db(|conn| {
+                    self.ensure_label_in_project(conn, &id)?;
+                    agentflare_backend::label::delete(conn, &id).map_err(map_backend_err)?;
+                    Ok(serde_json::json!({"deleted": true, "id": id}).to_string())
+                })?
+            }
             other => Err(ErrorData::invalid_params(
-                format!("unknown label action: '{other}' — expected create"),
+                format!("unknown label action: '{other}' — expected create|list|update|delete"),
                 None,
             )),
         }
     }
 
     #[tool(
-        description = "Create a label in the repo's linked project. The `action` field selects the operation (only `create` for now)."
+        description = "Manage labels in the repo's linked project. The `action` field selects the operation (create|list|update|delete)."
     )]
     fn label(&self, Parameters(req): Parameters<LabelRequest>) -> Result<String, ErrorData> {
         self.label_inner(req)
@@ -2632,10 +2765,17 @@ impl AgentflareMcp {
                     if size <= max_inline {
                         match agentflare_backend::asset::read_file(&base_path, &asset.storage_path) {
                             Ok(bytes) => {
-                                let b64 = base64_encode(&bytes);
+                                // Textual MIME + valid UTF-8 => return readable text so
+                                // callers don't decode every text asset; everything else
+                                // (binary MIME, or invalid UTF-8) => Base64.
+                                let (content, encoding) = match std::str::from_utf8(&bytes) {
+                                    Ok(text) if Self::mime_is_textual(asset.mime_type.as_deref()) => (text.to_string(), "utf8"),
+                                    _ => (base64_encode(&bytes), "base64"),
+                                };
                                 let result = serde_json::json!({
                                     "asset": meta,
-                                    "content": b64,
+                                    "content": content,
+                                    "encoding": encoding,
                                 });
                                 Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
                             }
@@ -3013,6 +3153,32 @@ mod tests {
             }))
             .unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn optimize_tool_retrieve_returns_registered_original() {
+        crate::paths::test_support::with_temp_home(|| {
+            let backup = crate::state::state_dir().join("o.md");
+            std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+            std::fs::write(&backup, "ORIG").unwrap();
+            let e = crate::optimize::retrieve::register(
+                crate::optimize::retrieve::EntryKind::FileBackup {
+                    backup_path: backup,
+                },
+                4,
+                1,
+                1,
+            );
+
+            let s = AgentflareMcp::default();
+            let out = s
+                .optimize(Parameters(OptimizeRequest {
+                    action: "retrieve".into(),
+                    id: Some(e.id),
+                }))
+                .unwrap();
+            assert_eq!(out, "ORIG");
+        });
     }
 
     // NOTE: `list_resources`/`read_resource` on `ServerHandler` take a
@@ -3434,7 +3600,6 @@ mod tests {
                         action: "publish".into(),
                         name: Some(name.into()),
                         content: Some(format!("content {name}")),
-                        sender: Some("claude-code".into()),
                         recipient: recipient.map(Into::into),
                         thread_id: thread.map(Into::into),
                         ..Default::default()
@@ -3796,15 +3961,10 @@ mod tests {
         });
         assert_eq!(defaulted, "opencode");
 
-        // An explicit sender always wins over the identity default.
-        let explicit = sender_of(ArtifactRequest {
-            action: "publish".into(),
-            name: Some("explicit".into()),
-            content: Some("x".into()),
-            sender: Some("codex".into()),
-            ..Default::default()
-        });
-        assert_eq!(explicit, "codex");
+        // ArtifactRequest has no `sender` field (removed in #75): authorship is
+        // always the server-derived identity, so a caller cannot attribute a
+        // published artifact to another agent. The spoof is unrepresentable at
+        // the type level — stronger than a runtime "override ignored" check.
     }
 
     #[test]
@@ -4124,6 +4284,82 @@ mod tests {
             .map(|i| i["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, vec!["Mine open", "Unassigned", "Mine done"]);
+    }
+
+    #[test]
+    fn item_list_defaults_assignee_filter_to_server_identity() {
+        // #75: a bare `item(list)` (no assignee_agent) must default to the
+        // server-derived identity — mine + unassigned — not dump every item.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            backend_db_override: Some(tmp.path().join("backend.db")),
+            backend_project_link_override: Some(tmp.path().join("project.json")),
+            agent: Some("me".into()),
+            ..Default::default()
+        };
+
+        let mine: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("Mine"))).unwrap()).unwrap();
+        s.item(Parameters(ItemRequest {
+            action: "update".into(),
+            id: Some(mine["id"].as_str().unwrap().to_string()),
+            assignee_agent: Some("me".into()),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        serde_json::from_str::<serde_json::Value>(
+            &s.item(Parameters(empty_item_create("Unassigned"))).unwrap(),
+        )
+        .unwrap();
+
+        let others: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("Others"))).unwrap())
+                .unwrap();
+        s.item(Parameters(ItemRequest {
+            action: "update".into(),
+            id: Some(others["id"].as_str().unwrap().to_string()),
+            assignee_agent: Some("someone-else".into()),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        // Bare list: no assignee_agent → defaults to "me" (mine + unassigned).
+        let defaulted: serde_json::Value = serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                action: "list".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut names: Vec<&str> = defaulted
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Mine", "Unassigned"]);
+
+        // An explicit assignee_agent is still honored (view a teammate's queue).
+        let explicit: serde_json::Value = serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                action: "list".into(),
+                assignee_agent: Some("someone-else".into()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut names2: Vec<&str> = explicit
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        names2.sort_unstable();
+        assert_eq!(names2, vec!["Others", "Unassigned"]);
     }
 
     #[test]
@@ -4886,6 +5122,113 @@ mod tests {
     }
 
     #[test]
+    fn asset_get_returns_text_content_as_utf8_not_base64() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = harness();
+            let home = crate::paths::home();
+            let staging = home.join(".agentflare").join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+
+            let item: serde_json::Value = serde_json::from_str(
+                &s.item(Parameters(empty_item_create("utf8-content-test")))
+                    .unwrap(),
+            )
+            .unwrap();
+            let item_id = item["id"].as_str().unwrap().to_string();
+
+            let body = "# Handoff\n\nImplement the fix \u{2192} land a PR. \u{2713}";
+            std::fs::write(staging.join("note.md"), body.as_bytes()).unwrap();
+            let attached: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: Some(item_id.clone()),
+                    project_id: None,
+                    filename: Some("note.md".into()),
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let asset_id = attached["id"].as_str().unwrap().to_string();
+
+            let got: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "get".into(),
+                    id: Some(asset_id),
+                    item_id: None,
+                    project_id: None,
+                    filename: None,
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            // Text assets must come back as readable UTF-8, not base64.
+            assert_eq!(got["encoding"].as_str(), Some("utf8"));
+            assert_eq!(got["content"].as_str(), Some(body));
+        });
+    }
+
+    #[test]
+    fn asset_get_returns_base64_for_binary_with_valid_utf8_bytes() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = harness();
+            let home = crate::paths::home();
+            let staging = home.join(".agentflare").join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+
+            let item: serde_json::Value = serde_json::from_str(
+                &s.item(Parameters(empty_item_create("binary-utf8-test")))
+                    .unwrap(),
+            )
+            .unwrap();
+            let item_id = item["id"].as_str().unwrap().to_string();
+
+            // Bytes 0x00,0x01,0x02,0x03 are valid UTF-8, but this is an
+            // octet-stream (.bin) asset: it must come back Base64, not "utf8".
+            let raw = [0u8, 1, 2, 3];
+            assert!(
+                std::str::from_utf8(&raw).is_ok(),
+                "precondition: valid UTF-8"
+            );
+            std::fs::write(staging.join("blob.bin"), raw).unwrap();
+            let attached: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: Some(item_id.clone()),
+                    project_id: None,
+                    filename: Some("blob.bin".into()),
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let asset_id = attached["id"].as_str().unwrap().to_string();
+
+            let got: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "get".into(),
+                    id: Some(asset_id),
+                    item_id: None,
+                    project_id: None,
+                    filename: None,
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            // Binary MIME => Base64 regardless of UTF-8 validity.
+            assert_eq!(got["encoding"].as_str(), Some("base64"));
+            // Content must be the Base64 of the raw bytes, not merely labeled so.
+            assert_eq!(got["content"].as_str(), Some("AAECAw=="));
+        });
+    }
+
+    #[test]
     fn item_comment_create_and_list_roundtrip() {
         let (_tmp, s) = harness();
         let created: serde_json::Value =
@@ -5264,6 +5607,218 @@ mod tests {
             }))
             .unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn label_create_list_update_delete_via_mcp() {
+        let (_tmp, s) = harness();
+        // create
+        let created: serde_json::Value = serde_json::from_str(
+            &s.label(Parameters(LabelRequest {
+                action: "create".into(),
+                name: Some("bug".into()),
+                color: Some("#EF4444".into()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["name"], "bug");
+        assert_eq!(created["color"], "#EF4444");
+
+        // list shows it
+        let listed: serde_json::Value = serde_json::from_str(
+            &s.label(Parameters(LabelRequest {
+                action: "list".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["id"], id);
+
+        // update renames + recolors
+        let updated: serde_json::Value = serde_json::from_str(
+            &s.label(Parameters(LabelRequest {
+                action: "update".into(),
+                id: Some(id.clone()),
+                name: Some("defect".into()),
+                color: Some("#F59E0B".into()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(updated["name"], "defect");
+        assert_eq!(updated["color"], "#F59E0B");
+
+        // delete
+        let deleted: serde_json::Value = serde_json::from_str(
+            &s.label(Parameters(LabelRequest {
+                action: "delete".into(),
+                id: Some(id.clone()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deleted["deleted"], true);
+
+        // list is now empty
+        let after: serde_json::Value = serde_json::from_str(
+            &s.label(Parameters(LabelRequest {
+                action: "list".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(after.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn label_update_requires_id() {
+        let (_tmp, s) = harness();
+        let err = s
+            .label(Parameters(LabelRequest {
+                action: "update".into(),
+                name: Some("x".into()),
+                ..Default::default()
+            }))
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn item_add_label_rejects_foreign_project_label_via_mcp() {
+        let (tmp, s) = harness();
+        // Auto-provisions this repo's workspace + project.
+        let item: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+        let item_id = item["id"].as_str().unwrap().to_string();
+
+        // A label belonging to a completely separate workspace/project.
+        let foreign_label_id = {
+            let conn = backend_conn(&tmp);
+            let ws = agentflare_backend::workspace::create(
+                &conn,
+                agentflare_backend::workspace::CreateWorkspace {
+                    name: "Other".into(),
+                    slug: "other".into(),
+                    owner_agent: None,
+                    item_label: None,
+                },
+            )
+            .unwrap();
+            let proj = agentflare_backend::project::create(
+                &conn,
+                agentflare_backend::project::CreateProject {
+                    workspace_id: ws.id.clone(),
+                    name: "Other".into(),
+                    identifier: "OTH".into(),
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap();
+            agentflare_backend::label::create(
+                &conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(proj.id),
+                    workspace_id: ws.id,
+                    name: "bug".into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap()
+            .id
+        };
+
+        let err = s
+            .item(Parameters(ItemRequest {
+                action: "add_label".into(),
+                id: Some(item_id),
+                label_id: Some(foreign_label_id),
+                ..Default::default()
+            }))
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn label_update_and_delete_reject_foreign_project_label() {
+        let (tmp, s) = harness();
+
+        // A label in a separate workspace/project, not the repo's resolved project.
+        let foreign_label_id = {
+            let conn = backend_conn(&tmp);
+            let ws = agentflare_backend::workspace::create(
+                &conn,
+                agentflare_backend::workspace::CreateWorkspace {
+                    name: "Other".into(),
+                    slug: "other".into(),
+                    owner_agent: None,
+                    item_label: None,
+                },
+            )
+            .unwrap();
+            let proj = agentflare_backend::project::create(
+                &conn,
+                agentflare_backend::project::CreateProject {
+                    workspace_id: ws.id.clone(),
+                    name: "Other".into(),
+                    identifier: "OTH".into(),
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap();
+            agentflare_backend::label::create(
+                &conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(proj.id),
+                    workspace_id: ws.id,
+                    name: "bug".into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap()
+            .id
+        };
+
+        let upd = s
+            .label(Parameters(LabelRequest {
+                action: "update".into(),
+                id: Some(foreign_label_id.clone()),
+                name: Some("hijacked".into()),
+                ..Default::default()
+            }))
+            .unwrap_err();
+        assert_eq!(upd.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        let del = s
+            .label(Parameters(LabelRequest {
+                action: "delete".into(),
+                id: Some(foreign_label_id.clone()),
+                ..Default::default()
+            }))
+            .unwrap_err();
+        assert_eq!(del.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        // The foreign label must survive both rejected attempts unchanged.
+        let conn = backend_conn(&tmp);
+        let survivor = agentflare_backend::label::get(&conn, &foreign_label_id).unwrap();
+        assert_eq!(survivor.name, "bug");
     }
 
     #[test]

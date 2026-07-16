@@ -17,6 +17,7 @@ mod compact;
 mod components;
 mod cost;
 mod db;
+mod dev_install;
 mod dev_vars;
 mod errors;
 mod gateway_integrations;
