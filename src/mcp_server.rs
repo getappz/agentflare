@@ -2193,8 +2193,10 @@ impl AgentflareMcp {
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             }
             "list" => {
-                let state = crate::optimize::retrieve::load_state();
-                let entries: Vec<_> = state.entries.values().collect();
+                let state =
+                    crate::optimize::retrieve::active_state(crate::optimize::retrieve::now_unix());
+                let mut entries: Vec<_> = state.entries.values().collect();
+                entries.sort_by_key(|e| std::cmp::Reverse(e.created_ts));
                 serde_json::to_string(&entries)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             }

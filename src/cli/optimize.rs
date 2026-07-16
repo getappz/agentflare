@@ -467,7 +467,7 @@ impl OptimizeArgs {
     fn run_retrieve(&self, id: Option<&str>, list: bool) {
         use crate::optimize::retrieve;
         if list {
-            let state = retrieve::load_state();
+            let state = retrieve::active_state(retrieve::now_unix());
             let mut entries: Vec<_> = state.entries.values().collect();
             entries.sort_by_key(|e| std::cmp::Reverse(e.created_ts));
             for e in entries {
