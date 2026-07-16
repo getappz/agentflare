@@ -11,6 +11,49 @@ fn rules_dir() -> PathBuf {
     crate::state::state_dir().join("rules")
 }
 
+/// A simple cross-process advisory lock over the rules directory: create_new
+/// on a sentinel file fails if another process already holds it, so at most
+/// one process can be inside apply_rule/remove_rule's read-check-write
+/// sequence at a time. Removed on drop. A holder that crashed without
+/// cleaning up must never wedge the directory shut, so a lock held for more
+/// than about two seconds is treated as stale and broken rather than waited
+/// on forever.
+struct RulesLock {
+    path: PathBuf,
+}
+
+impl RulesLock {
+    fn acquire(dir: &std::path::Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(".rules.lock");
+        for _ in 0..200 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for RulesLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// List all coaching rules from the rules directory, sorted by id. Returns
 /// an empty vec if the directory doesn't exist or can't be read.
 pub(super) fn list_rules() -> Vec<CoachingRule> {
@@ -34,9 +77,10 @@ pub(super) fn list_rules() -> Vec<CoachingRule> {
     rules
 }
 
-/// Create or overwrite a coaching rule file. Enforces `MAX_RULES` only when
-/// `id` is new — updating an existing rule's content never counts against
-/// the cap.
+/// Create or overwrite a coaching rule file. Enforces MAX_RULES only when
+/// id is new, updating an existing rule's content never counts against
+/// the cap. Serialized across processes by RulesLock so two concurrent
+/// callers can never both observe room under MAX_RULES and both write.
 pub fn apply_rule(
     id: &str,
     title: &str,
@@ -48,12 +92,16 @@ pub fn apply_rule(
             "invalid rule id '{id}': must be 1-10 chars, start with a letter, and contain only letters, digits, or hyphens"
         ));
     }
+    rule::validate_rule_fields(title, trigger.as_ref())?;
+
+    let _lock = RulesLock::acquire(&rules_dir())
+        .map_err(|e| format!("failed to acquire rules lock: {e}"))?;
 
     let existing = list_rules();
     let is_overwrite = existing.iter().any(|r| r.id == id);
     if !is_overwrite && existing.len() >= MAX_RULES {
         return Err(format!(
-            "maximum {MAX_RULES} coaching rules reached — remove one first"
+            "maximum {MAX_RULES} coaching rules reached, remove one first"
         ));
     }
 
@@ -71,6 +119,8 @@ pub(super) fn remove_rule(id: &str) -> Result<(), String> {
     if !rule::is_valid_rule_id(id) {
         return Err(format!("invalid rule id '{id}'"));
     }
+    let _lock = RulesLock::acquire(&rules_dir())
+        .map_err(|e| format!("failed to acquire rules lock: {e}"))?;
     let path = rules_dir().join(format!("coaching-{id}.md"));
     if !path.exists() {
         return Err(format!("rule not found: {id}"));
@@ -78,8 +128,8 @@ pub(super) fn remove_rule(id: &str) -> Result<(), String> {
     std::fs::remove_file(&path).map_err(|e| format!("failed to remove rule file: {e}"))
 }
 
-/// Bodies of rules with no `# Trigger:` declared, in id order — what
-/// `hook session-start` surfaces unconditionally.
+/// Bodies of rules with no Trigger declared, in id order, what
+/// hook session-start surfaces unconditionally.
 pub fn untriggered_rule_bodies() -> Vec<String> {
     list_rules()
         .into_iter()
@@ -101,10 +151,10 @@ pub fn rule_bodies_for_tool(tool_name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Bodies of rules with `auto_match: true` whose title+body BM25-matches
-/// `prompt`, via the same ephemeral FTS5 scorer `crate::compact` already
+/// Bodies of rules with auto_match true whose title+body BM25-matches
+/// prompt, via the same ephemeral FTS5 scorer crate::compact already
 /// built for the PreCompact hook. No numeric threshold: appearing in
-/// `score_lines`'s result set is itself the fire/no-fire decision.
+/// score_lines's result set is itself the fire or no-fire decision.
 pub fn rule_bodies_for_prompt(prompt: &str) -> Vec<String> {
     let candidates: Vec<CoachingRule> = list_rules()
         .into_iter()
@@ -169,6 +219,28 @@ mod tests {
         with_temp_home(|| {
             let err = apply_rule("1bad", "Title", "Body", None).unwrap_err();
             assert!(err.contains("invalid rule id"));
+            assert!(list_rules().is_empty());
+        });
+    }
+
+    #[test]
+    fn apply_rule_rejects_newline_in_title() {
+        with_temp_home(|| {
+            let err = apply_rule("hygiene", "bad\ntitle", "Body", None).unwrap_err();
+            assert!(err.contains("newline"));
+            assert!(list_rules().is_empty());
+        });
+    }
+
+    #[test]
+    fn apply_rule_rejects_empty_trigger() {
+        with_temp_home(|| {
+            let empty = rule::RuleTrigger {
+                tools: vec![],
+                auto_match: false,
+            };
+            let err = apply_rule("hygiene", "Title", "Body", Some(empty)).unwrap_err();
+            assert!(err.contains("empty trigger"));
             assert!(list_rules().is_empty());
         });
     }
@@ -379,7 +451,7 @@ mod tests {
             )
             .unwrap();
 
-            assert!(rule_bodies_for_prompt("what's the weather like today").is_empty());
+            assert!(rule_bodies_for_prompt("sunny weather forecast tomorrow morning").is_empty());
         });
     }
 

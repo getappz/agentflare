@@ -7,11 +7,9 @@
 //! with a small header and a body, capped at MAX_RULES.
 //!
 //! Split into three submodules by concern:
-//! - `rule`  — the `CoachingRule` type and the `coaching-<id>.md` file format
-//!             (parse/write), private to this module tree.
-//! - `store` — CRUD over the rules directory (list/apply/remove), private to
-//!             this module tree except where re-exported below.
-//! - `cli`   — presentation glue for `agentflare coaching {list,apply,remove}`.
+//! - `rule` — the `CoachingRule` type and the `coaching-<id>.md` file format (parse/write), private to this module tree.
+//! - `store` — CRUD over the rules directory (list/apply/remove), private to this module tree except where re-exported below.
+//! - `cli` — presentation glue for `agentflare coaching {list,apply,remove}`.
 
 mod cli;
 pub(crate) mod rule;

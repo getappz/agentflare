@@ -18,14 +18,14 @@ pub struct CoachingRule {
 pub struct RuleTrigger {
     pub tools: Vec<String>,
     /// When true, this rule's title+body is scored via BM25 against the
-    /// current prompt (see `store::rule_bodies_for_prompt`) instead of
+    /// current prompt (see store::rule_bodies_for_prompt) instead of
     /// requiring a hand-authored keyword list.
     pub auto_match: bool,
 }
 
 /// Validate a rule id: non-empty, max 10 chars, starts with an ASCII
 /// letter, remaining chars ASCII alphanumeric or `-`. Ported from
-/// claude-view's `is_valid_pattern_id`.
+/// claude-view's is_valid_pattern_id.
 pub(super) fn is_valid_rule_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 10
@@ -33,14 +33,46 @@ pub(super) fn is_valid_rule_id(id: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// Parse a `# Trigger: tool:a,b; auto` line body (the text after
-/// `# Trigger:`). Segments are semicolon-separated; a segment of exactly
-/// `auto` (case-insensitive) enables BM25 auto-relevance matching, a
-/// `tool:<csv>` segment declares exact tool names. Unknown segment kinds
-/// are ignored rather than invalidating the whole line. Returns `None` if
-/// nothing recognizable was found — callers should treat that as
-/// "malformed, log a warning, fall back to untriggered" rather than
-/// erroring.
+/// Validates fields that will be serialized into a rule file's header.
+/// A title containing a newline would break the one-line-per-header-field
+/// format; commas/semicolons or newlines in a tool name would corrupt the
+/// tool:a,b; auto trigger grammar. A Some(RuleTrigger) with no tools and
+/// auto_match: false is rejected too, it round-trips back to None on
+/// reparse, so writing it would silently discard the caller's intent
+/// instead of persisting it.
+pub(super) fn validate_rule_fields(
+    title: &str,
+    trigger: Option<&RuleTrigger>,
+) -> Result<(), String> {
+    if title.contains('\n') {
+        return Err("rule title must not contain newlines".to_string());
+    }
+    let Some(trigger) = trigger else {
+        return Ok(());
+    };
+    if trigger.tools.is_empty() && !trigger.auto_match {
+        return Err(
+            "trigger has no tools and auto_match=false, pass None instead of an empty trigger"
+                .to_string(),
+        );
+    }
+    for tool in &trigger.tools {
+        if tool.is_empty() || tool.contains(['\n', ',', ';']) {
+            return Err(format!(
+                "invalid tool name in trigger {tool:?}: must be non-empty and must not contain newlines, commas, or semicolons"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a Trigger line body (the text after "# Trigger:"). Segments are
+/// semicolon-separated; a segment of exactly auto (case-insensitive)
+/// enables BM25 auto-relevance matching, a tool:<csv> segment declares
+/// exact tool names. Unknown segment kinds are ignored rather than
+/// invalidating the whole line. Returns None if nothing recognizable was
+/// found, callers should treat that as malformed and fall back to
+/// untriggered rather than erroring.
 fn parse_trigger_line(rest: &str) -> Option<RuleTrigger> {
     let mut tools = Vec::new();
     let mut auto_match = false;
@@ -72,8 +104,8 @@ fn parse_trigger_line(rest: &str) -> Option<RuleTrigger> {
     }
 }
 
-/// Inverse of `parse_trigger_line` — renders a `RuleTrigger` back into
-/// the `tool:a,b; auto` text that goes after `# Trigger:`.
+/// Inverse of parse_trigger_line, renders a RuleTrigger back into the
+/// tool:a,b; auto text that goes after "# Trigger:".
 fn format_trigger_line(trigger: &RuleTrigger) -> String {
     let mut parts = Vec::new();
     if !trigger.tools.is_empty() {
@@ -85,15 +117,18 @@ fn format_trigger_line(trigger: &RuleTrigger) -> String {
     parts.join("; ")
 }
 
-/// Parse a single `coaching-<id>.md` file into a `CoachingRule`. Returns
-/// `None` if the filename doesn't match the expected pattern, or if a
-/// matching file has no valid `# Applied:` header — such files are skipped
-/// entirely (not included with blank fields) so one bad file can never take
-/// down the whole listing.
+/// Parse a single coaching-<id>.md file into a CoachingRule. Returns None
+/// if the filename doesn't match the expected pattern, its id isn't a
+/// valid rule id, or if a matching file has no valid "# Applied:" header,
+/// such files are skipped entirely (not included with blank fields) so one
+/// bad file can never take down the whole listing.
 pub(super) fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
     let content = std::fs::read_to_string(path).ok()?;
     let filename = path.file_stem()?.to_str()?;
     let id = filename.strip_prefix("coaching-")?.to_string();
+    if !is_valid_rule_id(&id) {
+        return None;
+    }
 
     let mut title = String::new();
     let mut applied_at = String::new();
@@ -130,8 +165,6 @@ pub(super) fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
         }
     }
 
-    // Only return a rule if it has a valid # Applied: header (i.e., was
-    // written by write_rule_file). Malformed/empty files are skipped.
     if applied_at.is_empty() {
         return None;
     }
@@ -161,7 +194,10 @@ pub(super) fn write_rule_file(
     let content = format!(
         "---\n# Pattern: {id} \u{2014} {title}\n# Applied: {date}{trigger_line}\n---\n\n{body}\n"
     );
-    std::fs::write(dir.join(format!("coaching-{id}.md")), content)
+    let final_path = dir.join(format!("coaching-{id}.md"));
+    let tmp_path = dir.join(format!("coaching-{id}.md.tmp"));
+    std::fs::write(&tmp_path, content)?;
+    std::fs::rename(&tmp_path, &final_path)
 }
 
 #[cfg(test)]
@@ -182,6 +218,36 @@ mod tests {
         assert!(!is_valid_rule_id("1abc"));
         assert!(!is_valid_rule_id("has space"));
         assert!(!is_valid_rule_id("has_underscore"));
+    }
+
+    #[test]
+    fn validate_rule_fields_rejects_newline_in_title() {
+        assert!(validate_rule_fields("bad\ntitle", None).is_err());
+        assert!(validate_rule_fields("fine title", None).is_ok());
+    }
+
+    #[test]
+    fn validate_rule_fields_rejects_empty_trigger() {
+        let empty = RuleTrigger {
+            tools: vec![],
+            auto_match: false,
+        };
+        assert!(validate_rule_fields("Title", Some(&empty)).is_err());
+    }
+
+    #[test]
+    fn validate_rule_fields_rejects_delimiter_in_tool_name() {
+        let bad = RuleTrigger {
+            tools: vec!["a,b".to_string()],
+            auto_match: false,
+        };
+        assert!(validate_rule_fields("Title", Some(&bad)).is_err());
+
+        let ok = RuleTrigger {
+            tools: vec!["mcp__flare__review".to_string()],
+            auto_match: false,
+        };
+        assert!(validate_rule_fields("Title", Some(&ok)).is_ok());
     }
 
     #[test]
@@ -287,6 +353,23 @@ mod tests {
 
         let rule = parse_rule_file(&dir.join("coaching-hygiene.md")).unwrap();
         assert_eq!(rule.trigger, None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_rule_file_skips_file_with_invalid_id_in_filename() {
+        let dir = temp_dir_for_test();
+        write_rule_file(&dir, "hygiene", "Title", "Body", None).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("coaching-not a valid id.md"),
+            "---\n# Pattern: x \u{2014} y\n# Applied: 2026-01-01\n---\n\nBody\n",
+        )
+        .unwrap();
+
+        assert!(parse_rule_file(&dir.join("coaching-not a valid id.md")).is_none());
+        assert!(parse_rule_file(&dir.join("coaching-hygiene.md")).is_some());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
