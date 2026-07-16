@@ -22,8 +22,10 @@ pub enum HookEvent {
         #[arg(long, value_enum)]
         agent: Option<agent_registry::Agent>,
     },
-    /// Fires before context compaction (Claude Code). Hook can read the
-    /// transcript and persist state before the conversation is compacted.
+    /// DEPRECATED / unsupported no-op (see `hook::pre_compact` doc comment).
+    /// Claude Code's PreCompact hook never consumed this hook's output;
+    /// compaction-survival now lives in the lean-ctx sidecar. Kept only so
+    /// existing settings.json wiring doesn't error after an upgrade.
     PreCompact {
         #[arg(long, value_enum)]
         agent: Option<agent_registry::Agent>,
