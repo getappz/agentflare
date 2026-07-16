@@ -21,6 +21,24 @@ Print each score as: `RICE 9.6 — R4 I5 C3 / E? (UNESTIMATED)` with one-line wh
 When items lack any effort/size signal, use ICE = Impact × Confidence × Ease
 (1–5 each) and label the table "ICE (no effort estimates present)".
 
+## Sizing an unestimated item (mutating — outside the read-only workflows)
+
+`groom`/`plan` never call `item(update)` — sizing is a deliberate exception,
+done only when a human directly asks you to size specific items, not as an
+automatic step in any workflow.
+
+When asked, don't guess uniformly:
+- **Self-contained description** (states its own size, or is a trivially
+  small single fix) — size directly from the text.
+- **Judgment call** (the estimate depends on how much of this already exists,
+  how tangled the current code is, or how much is genuinely new) — verify
+  against the actual codebase first (`ctx_compose`/`ctx_search`/`ctx_read`)
+  before committing a size via `item(update) metadata={"size":...}`. Trusting
+  an item's own scope claims without checking is how a real L gets shipped as
+  M — found live in this project (#100 claimed reusable ledgers that don't
+  exist anywhere in the codebase; verifying caught it, the description alone
+  would not have).
+
 ## Unestimated handling
 
 Never fail. Score what you can, mark the missing factor `?`, and list all
