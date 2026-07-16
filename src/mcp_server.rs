@@ -2740,10 +2740,16 @@ impl AgentflareMcp {
                     if size <= max_inline {
                         match agentflare_backend::asset::read_file(&base_path, &asset.storage_path) {
                             Ok(bytes) => {
-                                let b64 = base64_encode(&bytes);
+                                // Return text as-is (readable UTF-8); only base64-encode
+                                // true binary so callers don't decode every text asset.
+                                let (content, encoding) = match std::str::from_utf8(&bytes) {
+                                    Ok(text) => (text.to_string(), "utf8"),
+                                    Err(_) => (base64_encode(&bytes), "base64"),
+                                };
                                 let result = serde_json::json!({
                                     "asset": meta,
-                                    "content": b64,
+                                    "content": content,
+                                    "encoding": encoding,
                                 });
                                 Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
                             }
@@ -5016,6 +5022,56 @@ mod tests {
                     std::env::remove_var("AGENTFLARE_BACKEND_ASSET_MAX_INLINE_BYTES")
                 },
             }
+        });
+    }
+
+    #[test]
+    fn asset_get_returns_text_content_as_utf8_not_base64() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_tmp, s) = harness();
+            let home = crate::paths::home();
+            let staging = home.join(".agentflare").join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+
+            let item: serde_json::Value = serde_json::from_str(
+                &s.item(Parameters(empty_item_create("utf8-content-test")))
+                    .unwrap(),
+            )
+            .unwrap();
+            let item_id = item["id"].as_str().unwrap().to_string();
+
+            let body = "# Handoff\n\nImplement the fix \u{2192} land a PR. \u{2713}";
+            std::fs::write(staging.join("note.md"), body.as_bytes()).unwrap();
+            let attached: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "attach".into(),
+                    id: None,
+                    item_id: Some(item_id.clone()),
+                    project_id: None,
+                    filename: Some("note.md".into()),
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let asset_id = attached["id"].as_str().unwrap().to_string();
+
+            let got: serde_json::Value = serde_json::from_str(
+                &s.asset(Parameters(AssetRequest {
+                    action: "get".into(),
+                    id: Some(asset_id),
+                    item_id: None,
+                    project_id: None,
+                    filename: None,
+                    metadata: None,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            // Text assets must come back as readable UTF-8, not base64.
+            assert_eq!(got["encoding"].as_str(), Some("utf8"));
+            assert_eq!(got["content"].as_str(), Some(body));
         });
     }
 
