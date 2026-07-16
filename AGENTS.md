@@ -76,6 +76,19 @@ tool has MCP support, prefer it there. Recall-only via the CLI otherwise.
 
 Use Exa for internet search when available — free-tier, no API key required.
 
+## Cargo target-dir isolation (item #133/#139)
+
+Each claimed worktree gets its own `.cargo/config.toml` (relative
+`target-dir = "target"`) so its build artifacts don't leak into a sibling
+worktree. An ambient `CARGO_TARGET_DIR` env var always outranks that config
+file, so `agentflare run` / `agentflare agents launch` (src/agent_launch.rs)
+strip `CARGO_TARGET_DIR` from the launched agent's child env before it can
+shadow the isolation, and CI's `target-dir-guard` job
+(.github/workflows/ci.yml) fails the build outright if the var is set
+project-wide. The residual gap is a bare shell opened inside a worktree
+without going through `agentflare run` — `cargo` there will still honor an
+ambient `CARGO_TARGET_DIR`.
+
 ## Git
 
 Never add "Generated with Claude Code" or "Co-Authored-By: Claude" signatures.

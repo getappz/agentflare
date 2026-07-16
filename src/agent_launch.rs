@@ -78,6 +78,13 @@ pub fn run_launch_env(
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
     cmd.stdin(Stdio::inherit());
+    // Item #139: strip an ambient CARGO_TARGET_DIR before it reaches the
+    // launched agent (and everything the agent spawns, including `cargo`).
+    // Cargo's env var always outranks the worktree's `.cargo/config.toml`
+    // (see `isolate_worktree_target_dir` in worktree.rs), so without this the
+    // per-worktree isolation is silently shadowed for every build the agent
+    // runs. An explicit override in `env` below can still re-set it.
+    cmd.env_remove("CARGO_TARGET_DIR");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -260,6 +267,9 @@ pub fn run_headless(
     };
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
+    // See the matching strip in `run_launch_env` above (item #139) — same
+    // rationale applies to headless child processes.
+    cmd.env_remove("CARGO_TARGET_DIR");
     match run_captured(cmd, timeout) {
         Ok(c) if c.success => HeadlessOutcome::Ok(c.stdout),
         Ok(c) if c.timed_out => {
@@ -373,6 +383,50 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
             "did not kill the whole tree promptly — a descendant likely kept the stdout pipe open"
+        );
+    }
+
+    // Item #139: an ambient CARGO_TARGET_DIR must never reach the launched
+    // agent — Cargo's env var always outranks the worktree's isolated
+    // `.cargo/config.toml` (see `isolate_worktree_target_dir` in
+    // worktree.rs), so leaking it here would silently defeat that isolation
+    // for every build the agent runs. `env_remove` clones the current env
+    // and drops the key at that point, so this holds regardless of what any
+    // other test concurrently does to the ambient var.
+    #[cfg(unix)]
+    #[test]
+    fn run_launch_env_strips_ambient_cargo_target_dir() {
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_path_buf();
+        unsafe {
+            std::env::set_var("CARGO_TARGET_DIR", "/tmp/shared-target");
+        }
+        let reg = vec![AgentSpec {
+            id: Agent::Aider,
+            display_name: "aider",
+            tier: Tier::Cli,
+            binary_names: &["sh"],
+            version_args: &[],
+            package_manager: None,
+            package_name: None,
+        }];
+        let script = format!("echo -n \"$CARGO_TARGET_DIR\" > {}", marker_path.display());
+        run_launch_env(
+            &reg,
+            "aider",
+            None,
+            None,
+            &["-c".to_string(), script],
+            &[],
+            false,
+        );
+        unsafe {
+            std::env::remove_var("CARGO_TARGET_DIR");
+        }
+        let content = std::fs::read_to_string(&marker_path).unwrap();
+        assert_eq!(
+            content, "",
+            "child must not inherit ambient CARGO_TARGET_DIR"
         );
     }
 

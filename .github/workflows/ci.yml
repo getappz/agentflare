@@ -130,6 +130,27 @@ jobs:
         with:
           manifest-path: Cargo.toml
 
+  target-dir-guard:
+    # Fails fast if CARGO_TARGET_DIR is set project-wide (e.g. a repo/org
+    # Actions variable) instead of being left to Cargo's per-checkout
+    # default. Ambient CARGO_TARGET_DIR always outranks a worktree's local
+    # .cargo/config.toml (see src/worktree.rs's isolate_worktree_target_dir),
+    # so if it ever leaked in here it would silently share build artifacts
+    # across the `build` matrix jobs. No paths filter, same rationale as
+    # `deny`: a path-filtered required check never reports on PRs that skip
+    # it. See item #133/#139.
+    name: Ambient CARGO_TARGET_DIR guard
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Fail if CARGO_TARGET_DIR is set
+        shell: bash
+        run: |
+          if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+            echo "::error::CARGO_TARGET_DIR is set ($CARGO_TARGET_DIR) — a project-wide target dir leaks build artifacts across worktrees/CI jobs. Unset it (see item #133/#139)." >&2
+            exit 1
+          fi
+
   # Single aggregating gate. Point branch protection at THIS job instead of
   # every leg above — stays correct when jobs are added/removed and can't be
   # bypassed by a silently-missing required check.
@@ -141,6 +162,7 @@ jobs:
       - clippy
       - fmt
       - deny
+      - target-dir-guard
     runs-on: ubuntu-latest
     permissions: {}
     steps:

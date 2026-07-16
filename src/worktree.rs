@@ -93,14 +93,19 @@ pub fn ensure_worktrees_ignored(repo_root: &Path) {
 /// path, so two worktrees of the same repo reuse each other's stale local
 /// crate artifacts (cargo #12516/#14053/#7740; OpenBlob #522).
 ///
-/// NOTE: this is a mitigation, NOT a fix for the ambient-env case of #133.
-/// Per Cargo's precedence (CLI flag > env var > config file), an ambient
-/// `CARGO_TARGET_DIR` *always* wins over the `.cargo/config.toml` that
-/// `isolate_worktree_target_dir` writes — so when the env var is set, the
-/// worktree's isolated `target/` is silently shadowed and the bug persists.
-/// Nothing in code can force Cargo to prefer the config file over the env var;
-/// the only safe remedies are unsetting the var or trusting CI. #133 therefore
-/// remains OPEN for the ambient-env case.
+/// This function is the last-resort warning, not the fix — it only covers a
+/// developer who opens a bare shell inside a worktree and runs `cargo`
+/// directly, bypassing `agentflare run`. Per Cargo's precedence (CLI flag >
+/// env var > config file), an ambient `CARGO_TARGET_DIR` *always* wins over
+/// the `.cargo/config.toml` that `isolate_worktree_target_dir` writes, so in
+/// that bypass case the isolated `target/` is silently shadowed and the bug
+/// can still occur.
+///
+/// Item #139 closed the two paths that matter for agents: `run_launch_env`/
+/// `run_headless` (src/agent_launch.rs) strip `CARGO_TARGET_DIR` from every
+/// launched agent's child env — the only mechanism that actually outranks
+/// the var — and CI (`.github/workflows/ci.yml`'s `target-dir-guard` job)
+/// fails the build outright if the var is set project-wide.
 fn warn_if_ambient_target_dir() {
     if std::env::var_os("CARGO_TARGET_DIR").is_some() {
         eprintln!(
@@ -115,11 +120,13 @@ fn warn_if_ambient_target_dir() {
 /// resolves locally instead of inheriting a shared `CARGO_TARGET_DIR`.
 ///
 /// Caveat: this only takes effect when `CARGO_TARGET_DIR` is *unset* in the
-/// ambient environment. Per Cargo's precedence (CLI flag > env var > config
-/// file), an ambient `CARGO_TARGET_DIR` still overrides this file — so this
-/// isolates ONLY the default-target case, not the ambient-env case that #133
-/// originally described. `warn_if_ambient_target_dir` is the only mitigation
-/// for that case. No config-file change can outrank the env var.
+/// ambient environment — no config file can outrank the env var (Cargo's
+/// precedence is CLI flag > env var > config file). A bare shell that
+/// bypasses `agentflare run` still needs `warn_if_ambient_target_dir`'s
+/// warning; every agent-launched build IS covered, since item #139 made
+/// `run_launch_env`/`run_headless` (src/agent_launch.rs) strip the var from
+/// the child env before it ever reaches Cargo, and CI enforces the same
+/// invariant via the `target-dir-guard` job in ci.yml.
 ///
 /// Local workspace crates must NOT be shared across worktrees (silent
 /// contamination); registry deps are safe but are better served by a shared
