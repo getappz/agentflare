@@ -1,15 +1,15 @@
 ---
-name: ponytail-no-hallucination
+name: flare-no-hallucination
 description: >
-  Reality-check companion to ponytail. Blocks invented APIs, deprecated
+  Reality-check companion to flare-code. Blocks invented APIs, deprecated
   methods, framework confusion, and undeclared variables — a minimal-looking
   line that calls a function which doesn't exist is not lazy, it's a bug with
-  extra confidence. Use whenever the user says "ponytail-no-hallucination",
-  "/ponytail-no-hallucination", "no hallucinations", "verify APIs", or "don't
-  invent functions".
+  extra confidence. Use whenever the user says "flare-no-hallucination",
+  "/flare-no-hallucination", "no hallucinations", "verify APIs", or "don't
+  invent functions" (legacy: "ponytail-no-hallucination" also works).
 ---
 
-# Ponytail — No Hallucination Layer
+# Flare — No Hallucination Layer
 
 The true lazy path is to use only what is provably there. A one-liner that
 calls a function which doesn't exist isn't minimal, it's a confident bug.
@@ -32,4 +32,4 @@ version before using it.
 Trust but verify: read the file or docs first, prefer searching the
 codebase over assuming the API surface.
 
-"stop ponytail-no-hallucination" or "normal mode" to revert.
+"stop flare-no-hallucination" / "stop ponytail-no-hallucination" or "normal mode" to revert.

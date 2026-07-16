@@ -26,7 +26,9 @@ impl Llm for RealLlm {
 }
 
 fn call_via_api(api_key: &str, prompt: &str) -> Result<String, CavemanError> {
-    let model = std::env::var("CAVEMAN_MODEL").unwrap_or_else(|_| "claude-sonnet-4-5".to_string());
+    let model = std::env::var("FLARE_OUTPUT_MODEL")
+        .or_else(|_| std::env::var("CAVEMAN_MODEL"))
+        .unwrap_or_else(|_| "claude-sonnet-4-5".to_string());
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 8192,
