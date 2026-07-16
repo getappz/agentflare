@@ -1,7 +1,7 @@
-//! MCP "Prompts" for ponytail — surfaces `/ponytail*` as native Claude Code
+//! MCP "Prompts" for flare code — surfaces `/optimize*` as native Claude Code
 //! slash commands via the MCP protocol (same mechanism lean-ctx uses for its
 //! own `/lean-ctx*` commands), routed entirely through agentflare's own
-//! ponytail port. No dependency on the DietrichGebert/ponytail marketplace
+//! optimize port. No dependency on the DietrichGebert/ponytail marketplace
 //! plugin.
 
 use rmcp::model::{
@@ -20,7 +20,7 @@ const SUB_SKILLS: &[(&str, &str)] = &[
     ),
     (
         "debt",
-        "Harvest `ponytail:` shortcut comments into a tracked ledger",
+        "Harvest `flare-code:` shortcut comments into a tracked ledger",
     ),
     (
         "gain",
@@ -28,7 +28,7 @@ const SUB_SKILLS: &[(&str, &str)] = &[
     ),
     (
         "help",
-        "Quick-reference card for all ponytail modes, skills, and commands",
+        "Quick-reference card for all flare code modes, skills, and commands",
     ),
     (
         "playbook",
@@ -43,8 +43,8 @@ const SUB_SKILLS: &[(&str, &str)] = &[
 pub fn list_prompts() -> Vec<Prompt> {
     let mut prompts = vec![
         Prompt::new(
-            "ponytail",
-            Some("Switch or report Ponytail lazy-dev mode"),
+            "optimize",
+            Some("Switch or report flare code lazy-dev mode"),
             Some(vec![PromptArgument::new("mode")
                 .with_description("lite|full|ultra|off|status (omit to report current mode)")]),
         ),
@@ -66,7 +66,7 @@ pub fn list_prompts() -> Vec<Prompt> {
     prompts.extend(
         SUB_SKILLS
             .iter()
-            .map(|(name, desc)| Prompt::new(format!("ponytail-{name}"), Some(*desc), None)),
+            .map(|(name, desc)| Prompt::new(format!("optimize-{name}"), Some(*desc), None)),
     );
     prompts
 }
@@ -81,14 +81,14 @@ pub fn get_prompt(
     if request.name == "handoff" {
         return Some(get_handoff_command(request, agent));
     }
-    if request.name == "ponytail" {
-        return Some(get_ponytail_mode(request));
+    if request.name == "optimize" {
+        return Some(get_optimize_mode(request));
     }
-    let skill = request.name.strip_prefix("ponytail-")?;
+    let skill = request.name.strip_prefix("optimize-")?;
     SUB_SKILLS
         .iter()
         .any(|(name, _)| *name == skill)
-        .then(|| get_ponytail_skill(skill))
+        .then(|| get_optimize_skill(skill))
 }
 
 fn assistant_text(msg: impl Into<String>) -> GetPromptResult {
@@ -98,7 +98,7 @@ fn assistant_text(msg: impl Into<String>) -> GetPromptResult {
     )])
 }
 
-fn get_ponytail_mode(request: &GetPromptRequestParams) -> GetPromptResult {
+fn get_optimize_mode(request: &GetPromptRequestParams) -> GetPromptResult {
     let mode_arg = request
         .arguments
         .as_ref()
@@ -112,24 +112,24 @@ fn get_ponytail_mode(request: &GetPromptRequestParams) -> GetPromptResult {
         let mode = crate::optimize::code::active_mode()
             .unwrap_or_else(crate::optimize::code::default_mode);
         return assistant_text(if mode == "off" {
-            "ponytail is off. Use /ponytail mode=lite|full|ultra to activate.".to_string()
+            "flare code is off. Use /optimize mode=lite|full|ultra to activate.".to_string()
         } else {
-            format!("PONYTAIL MODE ACTIVE — level: {mode}")
+            format!("FLARE CODE MODE ACTIVE — level: {mode}")
         });
     }
     if mode_arg == "off" {
         crate::optimize::code::clear_active();
-        return assistant_text("ponytail is now off.");
+        return assistant_text("flare code is now off.");
     }
     match crate::optimize::code::normalize_config_mode(&mode_arg) {
         Some(normalized) => match crate::optimize::code::set_active(normalized) {
             Ok(()) => {
                 assistant_text(crate::optimize::code::build_instructions(normalized, None).body)
             }
-            Err(e) => assistant_text(format!("Failed to persist ponytail mode: {e}")),
+            Err(e) => assistant_text(format!("Failed to persist flare code mode: {e}")),
         },
         None => assistant_text(format!(
-            "Unknown ponytail mode '{mode_arg}'. Use lite|full|ultra|off|status."
+            "Unknown flare code mode '{mode_arg}'. Use lite|full|ultra|off|status."
         )),
     }
 }
@@ -228,9 +228,9 @@ fn get_handoff_command(request: &GetPromptRequestParams, agent: Option<&str>) ->
     ))
 }
 
-fn get_ponytail_skill(skill: &str) -> GetPromptResult {
+fn get_optimize_skill(skill: &str) -> GetPromptResult {
     if let Err(e) = crate::optimize::code::set_active(skill) {
-        return assistant_text(format!("Failed to persist ponytail mode: {e}"));
+        return assistant_text(format!("Failed to persist flare code mode: {e}"));
     }
     let body = crate::optimize::code::sub_skills::get(skill).unwrap_or_default();
     assistant_text(body)
@@ -241,13 +241,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lists_ponytail_and_all_sub_skills() {
+    fn lists_optimize_and_all_sub_skills() {
         let prompts = list_prompts();
         let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
-        assert!(names.contains(&"ponytail"));
-        assert!(names.contains(&"ponytail-review"));
-        assert!(names.contains(&"ponytail-no-hallucination"));
-        // ponytail + artifact + handoff + one per sub-skill
+        assert!(names.contains(&"optimize"));
+        assert!(names.contains(&"optimize-review"));
+        assert!(names.contains(&"optimize-no-hallucination"));
+        // optimize + artifact + handoff + one per sub-skill
         assert_eq!(names.len(), 3 + SUB_SKILLS.len());
     }
 
@@ -379,28 +379,28 @@ mod tests {
     }
 
     #[test]
-    fn ponytail_review_returns_full_skill_body() {
-        let result = get_prompt(&GetPromptRequestParams::new("ponytail-review"), None).unwrap();
+    fn optimize_review_returns_full_skill_body() {
+        let result = get_prompt(&GetPromptRequestParams::new("optimize-review"), None).unwrap();
         let PromptMessage { content, .. } = &result.messages[0];
         let text = format!("{content:?}");
-        assert!(text.contains("ponytail-review"));
+        assert!(text.contains("review"));
     }
 
     #[test]
-    fn bare_ponytail_without_mode_reports_without_crashing() {
-        let result = get_prompt(&GetPromptRequestParams::new("ponytail"), None).unwrap();
+    fn bare_optimize_without_mode_reports_without_crashing() {
+        let result = get_prompt(&GetPromptRequestParams::new("optimize"), None).unwrap();
         assert_eq!(result.messages.len(), 1);
     }
 
     #[test]
-    fn ponytail_with_unknown_mode_reports_error_text() {
+    fn optimize_with_unknown_mode_reports_error_text() {
         use rmcp::model::JsonObject;
         let mut args = JsonObject::new();
         args.insert("mode".to_string(), serde_json::json!("bogus-mode"));
-        let params = GetPromptRequestParams::new("ponytail").with_arguments(args);
+        let params = GetPromptRequestParams::new("optimize").with_arguments(args);
         let result = get_prompt(&params, None).unwrap();
         let PromptMessage { content, .. } = &result.messages[0];
         let text = format!("{content:?}");
-        assert!(text.contains("Unknown ponytail mode"));
+        assert!(text.contains("Unknown flare code mode"));
     }
 }

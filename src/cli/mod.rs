@@ -2,7 +2,6 @@ mod agents;
 mod alias;
 mod artifacts;
 mod auth;
-mod caveman;
 mod channel;
 mod claim;
 mod coaching;
@@ -15,7 +14,6 @@ mod init;
 mod mcp;
 mod memory;
 mod optimize;
-mod ponytail;
 mod review;
 mod run;
 mod uninstall;
@@ -59,8 +57,6 @@ pub enum Commands {
     Handoff(handoff::HandoffArgs),
     #[command(alias = "flare", visible_alias = "opt")]
     Optimize(optimize::OptimizeArgs),
-    Ponytail(ponytail::PonytailArgs),
-    Caveman(caveman::CavemanArgs),
     Channel(channel::ChannelArgs),
     Claim(claim::ClaimArgs),
     Review(review::ReviewArgs),
@@ -86,8 +82,6 @@ impl Commands {
             Self::Artifacts(cmd) => cmd.run(),
             Self::Handoff(cmd) => cmd.run(),
             Self::Optimize(cmd) => cmd.run(),
-            Self::Ponytail(cmd) => cmd.run(),
-            Self::Caveman(cmd) => cmd.run(),
             Self::Channel(cmd) => cmd.run(),
             Self::Claim(cmd) => cmd.run(),
             Self::Review(cmd) => cmd.run(),
