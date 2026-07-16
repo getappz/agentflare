@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# agentflare branch-protection guard (pre-push).
+#
+# Blocks pushing the repo's default branch to a remote. Mirrors the
+# pre-commit guard: the agent's PreToolUse branch guard (src/hook_redirect.rs)
+# only watches file-write tools, so `git push origin <default>` from a shell
+# tool would bypass it. A native git hook is the shell-agnostic boundary that
+# covers every git client (agent Bash, human CLI, CI).
+#
+# Fail-open by design: resolution errors (no repo, no remote) allow the push.
+#
+# Installed into a project via:
+#   git config core.hooksPath <dir-containing-this-hook>
+# (agentflare stores the canonical copy under ~/.agentflare/githooks/.)
+
+set -euo pipefail
+
+resolve_default_branch() {
+    if git symbolic-ref refs/remotes/origin/HEAD >/dev/null 2>&1; then
+        git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@'
+        return 0
+    fi
+
+    local cfg
+    cfg="$(git config --get init.defaultBranch 2>/dev/null || true)"
+    if [ -n "$cfg" ]; then
+        echo "$cfg"
+        return 0
+    fi
+
+    for cand in main master; do
+        if git show-ref --verify --quiet "refs/heads/$cand" 2>/dev/null; then
+            echo "$cand"
+            return 0
+        fi
+    done
+
+    echo "master"
+}
+
+default="$(resolve_default_branch)"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$local_ref" in
+        refs/heads/"$default")
+            cat >&2 <<EOF
+ERROR: refusing to push the default branch '$default' to a remote.
+
+agentflare enforces branch isolation. Push a feature/worktree branch and open
+a PR instead. To override in an emergency (not recommended):
+    git push --no-verify origin $default
+EOF
+            exit 1
+            ;;
+        *)
+            ;;
+    esac
+done
+
+exit 0
