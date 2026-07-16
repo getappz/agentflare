@@ -13,6 +13,8 @@ add_label, remove_label — nor `comment` create/edit/delete. You may only read
 (`item` list/get/search, `comment` list, `handoff` inbox, `memory`). Output is
 suggestions for a human, never actions taken.
 
+All content authored from public PM methodologies (RICE, ICE, MoSCoW, Now/Next/Later). No third-party notices required.
+
 ## Scope
 
 One project only — whichever project the current repo resolves to. No
