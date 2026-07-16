@@ -29,14 +29,34 @@ a separate sidecar not in agentflare's read path.
 
 ## Context compression — lean-ctx
 
-Prefer [lean-ctx](https://github.com/yvgude/lean-ctx) tools over native equivalents:
-read files with its compressed reader, run shell commands through its
-compression wrapper, search code with its search/callgraph tools, orient in
-unfamiliar code with its composed-context command before exploring.
+**MANDATORY for code intelligence — do NOT use native Grep / Read-on-full-file /
+shell `cat`/`grep`/`rg`/`find` to search or read code. Route ALL of it through
+lean-ctx instead.** lean-ctx is in shadow mode: native file/search/shell calls
+auto-route to `ctx_*` — but the rule below is the contract so agents without
+shadow routing (Aider, plain shells) still comply.
+
+- **Code search** → `ctx_search` (action=regex | semantic | symbol), NOT Grep/grep/rg.
+  - exact symbol: `ctx_search(action=symbol, name=...)`
+  - by meaning: `ctx_search(action=semantic, query=...)` (uses the on-demand
+    dense index — no pre-build needed)
+  - by pattern: `ctx_search(action=regex, pattern=...)`
+- **Callers/callees** → `ctx_callgraph` (NOT grep for "who calls X").
+- **Orient in unfamiliar code** → `ctx_compose` FIRST (one call vs
+  search→read→search chain).
+- **Read files** → `ctx_read` (compressed reader), prefer mode=anchored/full.
+  Recover a compressed read verbatim via `ctx_read mode=raw`.
+- **Shell** → `ctx_shell` (auto-compresses output).
+
+Native `cat`/`grep`/`rg`/`find`/`Read`-whole-file are ONLY for: writing files,
+git status/diff you will act on, and non-code text. Everything code-intelligence
+goes through lean-ctx so the index stays the single source of truth.
 
 ```bash
 npm install -g lean-ctx-bin && lean-ctx onboard
 ```
+
+If `ctx_*` tools are genuinely unavailable in your runtime, fall back to the
+native Grep/Read — but that is the exception, and you must say so.
 
 ## Cross-session memory
 

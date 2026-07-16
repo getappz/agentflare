@@ -33,7 +33,7 @@ fn agentflare_bin() -> PathBuf {
 }
 
 #[test]
-fn caveman_compress_generic_uses_the_stubbed_claude_cli() {
+fn optimize_output_compress_generic_uses_the_stubbed_claude_cli() {
     let dir = tempfile::tempdir().unwrap();
     let stub_dir = dir.path().join("bin");
     std::fs::create_dir_all(&stub_dir).unwrap();
@@ -50,8 +50,10 @@ fn caveman_compress_generic_uses_the_stubbed_claude_cli() {
         existing_path
     );
 
+    // `caveman compress` was renamed to `optimize output compress`
+    // (FlareAction::Output { action: OutputAction::Compress }, src/cli/optimize.rs).
     let output = Command::new(agentflare_bin())
-        .args(["caveman", "compress"])
+        .args(["optimize", "output", "compress"])
         .arg(&source)
         .env("PATH", new_path)
         .env_remove("ANTHROPIC_API_KEY")

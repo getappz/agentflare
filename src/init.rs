@@ -206,13 +206,13 @@ pub fn run(agent: &str, yes: bool) {
         "claude-code" => {
             wire_claude_code();
             if confirm_ponytail_migration(agent, yes) {
-                wire_ponytail_hooks(agent);
+                wire_optimize_hooks(agent);
             }
         }
         "cursor" => {
             wire_cursor();
             if confirm_ponytail_migration(agent, yes) {
-                wire_ponytail_hooks(agent);
+                wire_optimize_hooks(agent);
             }
         }
         "codex" => {
@@ -227,7 +227,7 @@ pub fn run(agent: &str, yes: bool) {
                 println!("        work together (plugin handles hooks, agentflare provides");
                 println!("        skill engine).");
             }
-            wire_ponytail_opencode();
+            wire_optimize_opencode();
         }
         _ => {}
     }
@@ -286,8 +286,8 @@ fn confirm_gateway_integrations(agent: &str, yes: bool) {
 /// all-or-nothing "SessionStart present? skip everything" gate.
 /// `marker` is a plain substring of `"hook <event>"`, matching both current
 /// flagless commands and older installs that still carry `--agent <host>`
-/// (upgrades stay idempotent either way). It must not match ponytail's own
-/// hook commands (`"<bin>" ponytail hook X"`), so both can coexist per event.
+/// (upgrades stay idempotent either way). It must not match optimize code's own
+/// hook commands (`"<bin>" optimize code hook X"`), so both can coexist per event.
 fn add_hook_entry(
     hooks_obj: &mut Map<String, Value>,
     event: &str,
@@ -578,16 +578,16 @@ fn wire_opencode() {
     }
 }
 
-pub fn wire_ponytail_hooks(agent: &str) {
+pub fn wire_optimize_hooks(agent: &str) {
     match agent {
-        "claude-code" | "cowork" => wire_ponytail_claude_code(),
-        "cursor" | "cursor-cli" => wire_ponytail_cursor(),
-        "opencode" => wire_ponytail_opencode(),
+        "claude-code" | "cowork" => wire_optimize_claude_code(),
+        "cursor" | "cursor-cli" => wire_optimize_cursor(),
+        "opencode" => wire_optimize_opencode(),
         _ => println!("  info  auto-wiring not supported for {agent}. Manual config required."),
     }
 }
 
-fn wire_ponytail_claude_code() {
+fn wire_optimize_claude_code() {
     let path = home().join(".claude").join("settings.json");
     let mut settings: Value = fs::read_to_string(&path)
         .ok()
@@ -601,10 +601,10 @@ fn wire_ponytail_claude_code() {
     let already_wired = settings
         .get("hooks")
         .and_then(|h| h.get("SessionStart"))
-        .map(|v| v.to_string().contains("ponytail"))
+        .map(|v| v.to_string().contains("optimize"))
         .unwrap_or(false);
     if already_wired {
-        println!("  skip  ponytail hooks already wired in ~/.claude/settings.json");
+        println!("  skip  optimize code hooks already wired in ~/.claude/settings.json");
         return;
     }
 
@@ -613,20 +613,20 @@ fn wire_ponytail_claude_code() {
     let hooks_obj = hooks.as_object_mut().unwrap();
 
     hooks_obj.entry("SessionStart").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
-        "hooks": [{ "type": "command", "command": format!("\"{bin}\" ponytail hook session-start"), "timeout": 10 }]
+        "hooks": [{ "type": "command", "command": format!("\"{bin}\" optimize code hook session-start"), "timeout": 10 }]
     }));
     hooks_obj.entry("SubagentStart").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
-        "hooks": [{ "type": "command", "command": format!("\"{bin}\" ponytail hook subagent-start"), "timeout": 5 }]
+        "hooks": [{ "type": "command", "command": format!("\"{bin}\" optimize code hook subagent-start"), "timeout": 5 }]
     }));
     hooks_obj.entry("UserPromptSubmit").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
-        "hooks": [{ "type": "command", "command": format!("\"{bin}\" ponytail hook prompt-submit"), "timeout": 5 }]
+        "hooks": [{ "type": "command", "command": format!("\"{bin}\" optimize code hook prompt-submit"), "timeout": 5 }]
     }));
 
     obj.insert(
         "statusLine".to_string(),
         json!({
             "type": "command",
-            "command": format!("\"{bin}\" ponytail hook statusline")
+            "command": format!("\"{bin}\" optimize code hook statusline")
         }),
     );
 
@@ -637,19 +637,19 @@ fn wire_ponytail_claude_code() {
         &path,
         serde_json::to_string_pretty(&settings).unwrap() + "\n",
     ) {
-        Ok(_) => println!("  ok    ponytail hooks wired in ~/.claude/settings.json"),
+        Ok(_) => println!("  ok    optimize code hooks wired in ~/.claude/settings.json"),
         Err(e) => println!("  fail  writing ~/.claude/settings.json: {e}"),
     }
 }
 
-fn wire_ponytail_cursor() {
+fn wire_optimize_cursor() {
     let path = cwd().join(".cursor").join("hooks.json");
     let bin = agentflare_binary();
 
     if path.exists() {
         let existing = fs::read_to_string(&path).unwrap_or_default();
-        if existing.contains("ponytail") {
-            println!("  skip  ponytail hooks already wired in .cursor/hooks.json");
+        if existing.contains("optimize") {
+            println!("  skip  optimize code hooks already wired in .cursor/hooks.json");
             return;
         }
     }
@@ -675,7 +675,7 @@ fn wire_ponytail_cursor() {
         .as_array_mut()
         .unwrap()
         .push(json!({
-            "command": format!("\"{bin}\" ponytail hook session-start"),
+            "command": format!("\"{bin}\" optimize code hook session-start"),
             "type": "command",
             "timeout": 30
         }));
@@ -685,7 +685,7 @@ fn wire_ponytail_cursor() {
         .as_array_mut()
         .unwrap()
         .push(json!({
-            "command": format!("\"{bin}\" ponytail hook prompt-submit"),
+            "command": format!("\"{bin}\" optimize code hook prompt-submit"),
             "type": "command",
             "timeout": 10
         }));
@@ -697,12 +697,12 @@ fn wire_ponytail_cursor() {
         &path,
         serde_json::to_string_pretty(&content).unwrap() + "\n",
     ) {
-        Ok(_) => println!("  ok    ponytail hooks wired in .cursor/hooks.json"),
+        Ok(_) => println!("  ok    optimize code hooks wired in .cursor/hooks.json"),
         Err(e) => println!("  fail  writing .cursor/hooks.json: {e}"),
     }
 }
 
-fn wire_ponytail_opencode() {
+fn wire_optimize_opencode() {
     println!("  info  OpenCode uses plugin system for hooks, not config.");
     println!("        Keep @dietrichgebert/ponytail in plugin list.");
     println!("        The plugin's built-in hooks work alongside agentflare.");

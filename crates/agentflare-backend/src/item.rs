@@ -53,6 +53,7 @@ pub struct UpdateItem {
     pub state_id: Option<String>,
     pub assignee_agent: Option<String>,
     pub sort_order: Option<f64>,
+    pub metadata: Option<String>,
 }
 
 fn now() -> i64 {
@@ -247,6 +248,10 @@ pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
     }
     if input.sort_order.is_some() {
         sets.push(format!("sort_order = ?{param_idx}"));
+        param_idx += 1;
+    }
+    if input.metadata.is_some() {
+        sets.push(format!("metadata = ?{param_idx}"));
     }
     let sql = format!(
         "UPDATE items SET {} WHERE id = ?1 AND deleted_at IS NULL",
@@ -273,6 +278,9 @@ pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
     }
     if let Some(so) = input.sort_order {
         param_values.push(Box::new(so));
+    }
+    if let Some(ref metadata) = input.metadata {
+        param_values.push(Box::new(metadata.clone()));
     }
     let changed = stmt.execute(rusqlite::params_from_iter(param_values.iter()))?;
     if changed == 0 {
@@ -437,6 +445,63 @@ pub fn list_dependencies(conn: &Connection, item_id: &str) -> Result<Vec<String>
     let mut stmt =
         conn.prepare("SELECT depends_on_item_id FROM item_dependencies WHERE item_id = ?1")?;
     let rows = stmt.query_map(rusqlite::params![item_id], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Dependency edges for a set of items, with each edge's target state_group
+/// already joined in — so a caller's blocking status is correct even when
+/// the dependency target isn't itself in the same shortlist/limit window
+/// (e.g. a completed dependency that fell outside `groom`'s cap must not
+/// read back as an open blocker just because its state wasn't looked up).
+/// `(item_id, depends_on_item_id, depends_on_state_group)`.
+pub fn dependency_edges_for_items(
+    conn: &Connection,
+    item_ids: &[String],
+) -> Result<Vec<(String, String, String)>> {
+    if item_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT d.item_id, d.depends_on_item_id, s.group_name
+         FROM item_dependencies d
+         JOIN items i ON i.id = d.depends_on_item_id AND i.deleted_at IS NULL
+         JOIN states s ON s.id = i.state_id
+         WHERE d.item_id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(item_ids.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Fan-in counts: for each of `item_ids`, how many other (non-deleted) items
+/// declare a dependency on it — project-wide, not limited to the same
+/// shortlist/limit window a caller happens to be looking at.
+pub fn dependency_fanin_for_items(
+    conn: &Connection,
+    item_ids: &[String],
+) -> Result<std::collections::HashMap<String, i64>> {
+    if item_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT d.depends_on_item_id, COUNT(*)
+         FROM item_dependencies d
+         JOIN items i ON i.id = d.item_id AND i.deleted_at IS NULL
+         WHERE d.depends_on_item_id IN ({placeholders})
+         GROUP BY d.depends_on_item_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(item_ids.iter()), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 

@@ -288,8 +288,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
     let claude_code_only = host == "claude-code";
     let host_owned = host.to_string();
     let leanctx_log = crate::state::state_dir().join("leanctx-install.log");
-    let ponytail_config = home().join(".config").join("ponytail").join("config.json");
-    let caveman_config = home().join(".config").join("caveman").join("config.json");
+    let optimize_code_config = crate::optimize::code::config_path();
 
     #[cfg_attr(not(feature = "skill-overrides-sync"), allow(unused_mut))]
     let mut components = vec![
@@ -540,11 +539,11 @@ pub fn get_components(host: &str) -> Vec<Component> {
             }),
         },
         Component {
-            id: "ponytail-mode",
+            id: "optimize-code-mode",
             needs_consent: false,
-            describe: "pin Ponytail to ultra mode".to_string(),
+            describe: "pin flare code to ultra mode".to_string(),
             check: {
-                let path = ponytail_config.clone();
+                let path = optimize_code_config.clone();
                 Box::new(move || {
                     if !claude_code_only {
                         return true;
@@ -557,43 +556,12 @@ pub fn get_components(host: &str) -> Vec<Component> {
                 })
             },
             apply: {
-                let path = ponytail_config.clone();
+                let path = optimize_code_config.clone();
                 Box::new(move || {
                     if write_pinned_mode(&path) {
-                        "Ponytail pinned to ultra".to_string()
+                        "flare code pinned to ultra".to_string()
                     } else {
-                        "Ponytail mode already set".to_string()
-                    }
-                })
-            },
-        },
-        Component {
-            id: "caveman-mode",
-            needs_consent: false,
-            describe: "pin Caveman to ultra mode".to_string(),
-            check: {
-                let path = caveman_config.clone();
-                Box::new(move || {
-                    if !claude_code_only {
-                        return true;
-                    }
-                    if !plugin_enabled(&claude_settings(), "caveman@caveman") {
-                        return true; // nothing to pin yet
-                    }
-                    fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                        .and_then(|v| v.get("defaultMode").and_then(|m| m.as_str()).map(String::from))
-                        == Some("ultra".to_string())
-                })
-            },
-            apply: {
-                let path = caveman_config.clone();
-                Box::new(move || {
-                    if write_pinned_mode(&path) {
-                        "Caveman pinned to ultra".to_string()
-                    } else {
-                        "Caveman mode already set".to_string()
+                        "flare code mode already set".to_string()
                     }
                 })
             },
@@ -610,7 +578,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
     // (registered above) become the on-demand detail source.
     // Claude-Code-only: other hosts have no equivalent per-skill override
     // mechanism. Not consent-gated (a local config tweak, same trust
-    // level as ponytail-mode/caveman-mode above) so it also re-syncs on
+    // level as optimize-code-mode above) so it also re-syncs on
     // every session-start as new skills appear, not just during `init`.
     #[cfg(feature = "skill-overrides-sync")]
     {
@@ -666,8 +634,7 @@ mod tests {
             "leanctx",
             "agentflare-mcp",
             "ponytail-plugin",
-            "ponytail-mode",
-            "caveman-mode",
+            "optimize-code-mode",
         ];
         #[cfg(feature = "skill-overrides-sync")]
         let expected: Vec<&str> = vec![
@@ -676,8 +643,7 @@ mod tests {
             "leanctx",
             "agentflare-mcp",
             "ponytail-plugin",
-            "ponytail-mode",
-            "caveman-mode",
+            "optimize-code-mode",
             "skill-overrides-sync",
         ];
 
@@ -737,11 +703,11 @@ mod tests {
     }
 
     #[test]
-    fn non_claude_code_hosts_never_need_the_claude_cli_for_ponytail_or_caveman() {
+    fn non_claude_code_hosts_never_need_the_claude_cli_for_ponytail_plugin() {
         // Regression check for the host-gating bug caught during manual
-        // testing: these two components must report "satisfied" (no
+        // testing: the ponytail plugin component must report "satisfied" (no
         // pending nag, no attempted install) on every host except
-        // claude-code, since Ponytail/Caveman have no equivalent elsewhere.
+        // claude-code, since the plugin has no equivalent elsewhere.
         for host in [
             "codex",
             "cursor",
@@ -756,14 +722,9 @@ mod tests {
                 .iter()
                 .find(|c| c.id == "ponytail-plugin")
                 .unwrap();
-            let caveman_mode = components.iter().find(|c| c.id == "caveman-mode").unwrap();
             assert!(
                 (ponytail_plugin.check)(),
                 "ponytail-plugin should be satisfied on '{host}'"
-            );
-            assert!(
-                (caveman_mode.check)(),
-                "caveman-mode should be satisfied on '{host}'"
             );
         }
     }

@@ -41,7 +41,7 @@ pub fn run(agent: &str, args: &[String], json: bool) {
                 if !json {
                     eprintln!("retrying with new profile ({remaining} retries left)...");
                 }
-                // ponytail: short backoff, linear increase if rate limits persist
+                // flare-code: short backoff, linear increase if rate limits persist
                 thread::sleep(Duration::from_secs(1 + (MAX_RETRIES - remaining) as u64));
             }
             ExitKind::Failure(code) => {
