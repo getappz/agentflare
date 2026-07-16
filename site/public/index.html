@@ -1,0 +1,632 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>agentflare — run AI coding agents lean, and coordinate a crew of them</title>
+<meta name="description" content="One Rust binary that cuts the token bill of a single AI coding agent and coordinates more than one of them. No Node, no runtime deps. Works across Claude Code, Codex, Cursor, Windsurf, VS Code, Cline, and Continue." />
+<meta name="theme-color" content="#0B0D12" />
+<link rel="canonical" href="https://agentflare.dev/" />
+
+<!-- Open Graph / Twitter -->
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://agentflare.dev/" />
+<meta property="og:title" content="agentflare — run AI coding agents lean, coordinate a crew of them" />
+<meta property="og:description" content="One Rust binary. Cut the token bill of one agent; coordinate more than one. No Node, no runtime deps." />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="agentflare" />
+<meta name="twitter:description" content="Run AI coding agents efficiently, and coordinate more than one of them." />
+<meta property="og:image" content="https://agentflare.dev/og.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="agentflare — run coding agents lean, coordinate a crew of them" />
+<meta name="twitter:image" content="https://agentflare.dev/og.png" />
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3CradialGradient id='g' cx='50%25' cy='42%25' r='60%25'%3E%3Cstop offset='0' stop-color='%23FFD37A'/%3E%3Cstop offset='0.5' stop-color='%23FFB020'/%3E%3Cstop offset='1' stop-color='%23FF5E3A'/%3E%3C/radialGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='%230B0D12'/%3E%3Cpath d='M16 5 L18.4 13.6 L27 16 L18.4 18.4 L16 27 L13.6 18.4 L5 16 L13.6 13.6 Z' fill='url(%23g)'/%3E%3C/svg%3E" />
+
+<link rel="preload" href="/fonts/commit-mono-400.woff2" as="font" type="font/woff2" crossorigin />
+<link rel="preload" href="/fonts/commit-mono-700.woff2" as="font" type="font/woff2" crossorigin />
+
+<style>
+  /* Commit Mono (OFL) — self-hosted, same-origin, served from /fonts by the Worker */
+  @font-face{
+    font-family:"Commit Mono"; font-style:normal; font-weight:400; font-display:swap;
+    src:url("/fonts/commit-mono-400.woff2") format("woff2");
+  }
+  @font-face{
+    font-family:"Commit Mono"; font-style:normal; font-weight:700; font-display:swap;
+    src:url("/fonts/commit-mono-700.woff2") format("woff2");
+  }
+  :root{
+    color-scheme: light dark;
+    --bg:#0B0D12; --bg-2:#0E1119; --surface:#14171F; --surface-2:#1A1E29;
+    --line:#232838; --line-soft:#1C202C;
+    --ink:#EDEEF2; --ink-dim:#C3C8D4; --muted:#8A90A0; --faint:#5A6072;
+    --flare-warm:#FFB020; --flare-hot:#FF5E3A; --flare-soft:#FFD37A;
+    --good:#4ADE80; --code-bg:#0A0C11;
+    --shadow: 0 24px 60px -20px rgba(0,0,0,.6);
+    --glow: 0 0 0 1px rgba(255,176,32,.14), 0 30px 90px -30px rgba(255,94,58,.35);
+    --maxw: 1120px;
+    --mono: "Commit Mono",ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans: system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --r: 14px; --r-sm:10px;
+  }
+  @media (prefers-color-scheme: light){
+    :root{
+      --bg:#F4F5F8; --bg-2:#EEF0F4; --surface:#FFFFFF; --surface-2:#F7F8FB;
+      --line:#E1E4EC; --line-soft:#EAECF2;
+      --ink:#141720; --ink-dim:#333A49; --muted:#5C6478; --faint:#8A91A2;
+      --flare-warm:#C2760A; --flare-hot:#E14A22; --flare-soft:#B96A0A;
+      --code-bg:#0B0D12;
+      --shadow: 0 20px 50px -24px rgba(20,23,32,.30);
+      --glow: 0 0 0 1px rgba(194,118,10,.16), 0 28px 70px -34px rgba(225,74,34,.28);
+    }
+  }
+  :root[data-theme="dark"]{
+    color-scheme: dark;
+    --bg:#0B0D12; --bg-2:#0E1119; --surface:#14171F; --surface-2:#1A1E29;
+    --line:#232838; --line-soft:#1C202C;
+    --ink:#EDEEF2; --ink-dim:#C3C8D4; --muted:#8A90A0; --faint:#5A6072;
+    --flare-warm:#FFB020; --flare-hot:#FF5E3A; --flare-soft:#FFD37A;
+    --code-bg:#0A0C11;
+    --shadow: 0 24px 60px -20px rgba(0,0,0,.6);
+    --glow: 0 0 0 1px rgba(255,176,32,.14), 0 30px 90px -30px rgba(255,94,58,.35);
+  }
+  :root[data-theme="light"]{
+    color-scheme: light;
+    --bg:#F4F5F8; --bg-2:#EEF0F4; --surface:#FFFFFF; --surface-2:#F7F8FB;
+    --line:#E1E4EC; --line-soft:#EAECF2;
+    --ink:#141720; --ink-dim:#333A49; --muted:#5C6478; --faint:#8A91A2;
+    --flare-warm:#C2760A; --flare-hot:#E14A22; --flare-soft:#B96A0A;
+    --code-bg:#0B0D12;
+    --shadow: 0 20px 50px -24px rgba(20,23,32,.30);
+    --glow: 0 0 0 1px rgba(194,118,10,.16), 0 28px 70px -34px rgba(225,74,34,.28);
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion: reduce){ html{scroll-behavior:auto} *{animation-duration:.001ms !important; animation-iteration-count:1 !important; transition-duration:.001ms !important} }
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:var(--sans); font-size:16px; line-height:1.6;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+    overflow-x:hidden;
+  }
+  a{color:inherit; text-decoration:none}
+  .wrap{max-width:var(--maxw); margin-inline:auto; padding-inline:24px}
+  .mono{font-family:var(--mono)}
+  .eyebrow{
+    font-family:var(--mono); font-size:12px; letter-spacing:.18em; text-transform:uppercase;
+    color:var(--muted); display:inline-flex; gap:10px; align-items:center;
+  }
+  .eyebrow::before{content:""; width:22px; height:1px; background:linear-gradient(90deg,var(--flare-hot),var(--flare-warm))}
+  h1,h2,h3{font-family:var(--mono); font-weight:650; letter-spacing:-.02em; text-wrap:balance; margin:0}
+  section{position:relative}
+  .flare-text{
+    background:linear-gradient(100deg,var(--flare-warm),var(--flare-hot));
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+  }
+
+  /* ---------- Nav ---------- */
+  header.nav{position:sticky; top:0; z-index:50; backdrop-filter:blur(12px);
+    background:color-mix(in srgb, var(--bg) 78%, transparent); border-bottom:1px solid var(--line-soft)}
+  .nav-in{display:flex; align-items:center; gap:20px; height:60px}
+  .brand{display:flex; align-items:center; gap:10px; font-family:var(--mono); font-weight:650; letter-spacing:-.01em; font-size:16px}
+  .mark{width:22px; height:22px; flex:none}
+  .nav-links{display:flex; gap:22px; margin-left:12px}
+  .nav-links a{color:var(--muted); font-size:14px; transition:color .16s}
+  .nav-links a:hover{color:var(--ink)}
+  .nav-right{margin-left:auto; display:flex; align-items:center; gap:10px}
+  .icon-btn{display:inline-grid; place-items:center; width:36px; height:36px; border-radius:9px;
+    border:1px solid var(--line); background:var(--surface); color:var(--ink-dim); cursor:pointer; transition:.16s}
+  .icon-btn:hover{border-color:var(--flare-warm); color:var(--ink)}
+  .btn{display:inline-flex; align-items:center; gap:8px; font-family:var(--mono); font-size:14px; font-weight:600;
+    padding:9px 15px; border-radius:10px; cursor:pointer; border:1px solid transparent; transition:.16s; white-space:nowrap}
+  .btn-ghost{border-color:var(--line); background:var(--surface); color:var(--ink)}
+  .btn-ghost:hover{border-color:var(--flare-warm)}
+  .btn-flare{color:#160A02; background:linear-gradient(100deg,var(--flare-soft),var(--flare-warm)); font-weight:700}
+  .btn-flare:hover{filter:brightness(1.06); transform:translateY(-1px)}
+  @media (max-width:720px){ .nav-links{display:none} }
+
+  /* ---------- Hero ---------- */
+  .hero{padding:74px 0 30px; position:relative; overflow:hidden}
+  .hero::before{content:""; position:absolute; inset:-30% -10% auto 30%; height:620px;
+    background:radial-gradient(closest-side, rgba(255,94,58,.20), rgba(255,176,32,.10) 45%, transparent 72%);
+    filter:blur(6px); pointer-events:none; animation:breathe 9s ease-in-out infinite}
+  @keyframes breathe{0%,100%{opacity:.7; transform:translateY(0) scale(1)} 50%{opacity:1; transform:translateY(-14px) scale(1.05)}}
+  .hero-grid{display:grid; grid-template-columns:1.05fr .95fr; gap:52px; align-items:center; position:relative}
+  @media (max-width:900px){ .hero-grid{grid-template-columns:1fr; gap:34px} .hero{padding-top:48px} }
+  h1.title{font-size:clamp(34px,5.4vw,60px); line-height:1.02; margin-top:20px}
+  .lede{color:var(--ink-dim); font-size:clamp(16px,1.9vw,19px); max-width:44ch; margin:22px 0 0}
+  .lede b{color:var(--ink); font-weight:600}
+  .cta-row{display:flex; flex-wrap:wrap; gap:12px; margin-top:26px}
+
+  .cmd{display:flex; align-items:center; gap:12px; background:var(--code-bg); border:1px solid var(--line);
+    border-radius:12px; padding:12px 12px 12px 16px; max-width:520px; box-shadow:var(--shadow)}
+  .cmd code{font-family:var(--mono); font-size:13.5px; color:#E6E8EF; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .cmd .dollar{color:var(--flare-warm); user-select:none}
+  .copy{margin-left:auto; flex:none; display:inline-grid; place-items:center; width:34px; height:34px; border-radius:8px;
+    border:1px solid var(--line); background:var(--surface); color:var(--muted); cursor:pointer; transition:.15s}
+  .copy:hover{color:var(--ink); border-color:var(--flare-warm)}
+  .copy.copied{color:var(--good); border-color:var(--good)}
+  .sub-cmd{margin-top:12px; font-family:var(--mono); font-size:13px; color:var(--muted)}
+  .sub-cmd b{color:var(--flare-warm); font-weight:600}
+
+  /* terminal */
+  .term{border-radius:14px; border:1px solid var(--line); background:var(--code-bg); box-shadow:var(--glow); overflow:hidden}
+  .term-bar{display:flex; align-items:center; gap:8px; padding:11px 14px; border-bottom:1px solid var(--line-soft);
+    background:color-mix(in srgb, var(--surface) 50%, transparent)}
+  .dot{width:11px; height:11px; border-radius:50%}
+  .term-title{margin-left:8px; font-family:var(--mono); font-size:12px; color:var(--muted)}
+  .term-body{padding:16px 18px; font-family:var(--mono); font-size:13px; line-height:1.75; min-height:250px}
+  .term-body .l{display:block; white-space:pre-wrap; opacity:0; transform:translateY(3px)}
+  .term-body .l.show{opacity:1; transform:none; transition:opacity .18s ease, transform .18s ease}
+  .t-prompt{color:var(--flare-warm)}
+  .t-cmd{color:#EDEEF2}
+  .t-dim{color:var(--muted)}
+  .t-ok{color:var(--good)}
+  .t-flare{color:var(--flare-hot)}
+  .t-num{color:var(--flare-soft)}
+  .caret{display:inline-block; width:8px; height:15px; background:var(--flare-warm); vertical-align:-2px; animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+
+  /* works-with */
+  .worksrow{margin-top:46px; display:flex; flex-wrap:wrap; align-items:center; gap:10px 12px}
+  .worksrow .label{font-family:var(--mono); font-size:12px; letter-spacing:.12em; text-transform:uppercase; color:var(--faint); margin-right:6px}
+  .chip{font-family:var(--mono); font-size:13px; color:var(--ink-dim); border:1px solid var(--line);
+    background:var(--surface); padding:6px 11px; border-radius:999px}
+  .chip.dim{color:var(--muted)}
+
+  /* ---------- Stats band ---------- */
+  .stats{border-block:1px solid var(--line-soft); background:var(--bg-2); margin-top:60px}
+  .stats-in{display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line-soft)}
+  .stat{background:var(--bg-2); padding:30px 22px; text-align:left}
+  .stat .n{font-family:var(--mono); font-size:clamp(26px,3.4vw,38px); font-weight:650; letter-spacing:-.02em;
+    font-variant-numeric:tabular-nums}
+  .stat .n .flare-text{font-weight:700}
+  .stat .k{color:var(--muted); font-size:13.5px; margin-top:6px}
+  @media (max-width:760px){ .stats-in{grid-template-columns:repeat(2,1fr)} }
+
+  /* ---------- Sections ---------- */
+  .band{padding:84px 0}
+  .band-head{max-width:60ch}
+  .band-head h2{font-size:clamp(26px,3.6vw,38px); line-height:1.08}
+  .band-head p{color:var(--muted); font-size:17px; margin-top:14px}
+
+  .pillars{display:grid; grid-template-columns:1fr 1fr; gap:22px; margin-top:40px}
+  @media (max-width:860px){ .pillars{grid-template-columns:1fr} }
+  .pillar{background:var(--surface); border:1px solid var(--line); border-radius:var(--r); padding:28px; position:relative; overflow:hidden}
+  .pillar::after{content:""; position:absolute; inset:0 0 auto 0; height:2px;
+    background:linear-gradient(90deg,var(--flare-hot),var(--flare-warm),transparent)}
+  .pillar h3{font-size:21px; display:flex; align-items:center; gap:10px}
+  .pillar .tag{font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--flare-warm)}
+  .pillar > p{color:var(--ink-dim); margin:14px 0 6px}
+  .feat{display:flex; flex-direction:column; gap:2px; border-top:1px solid var(--line-soft); padding:16px 0 4px; margin-top:16px}
+  .feat-row{display:flex; gap:12px; padding:9px 0; align-items:baseline}
+  .feat-row .fk{font-family:var(--mono); font-size:13.5px; color:var(--ink); flex:none; min-width:118px}
+  .feat-row .fv{color:var(--muted); font-size:14px}
+  .feat-row .fk b, .feat-row .fv b{color:var(--flare-warm); font-weight:600}
+
+  /* metrics table */
+  .metrics{margin-top:38px; border:1px solid var(--line); border-radius:var(--r); overflow:hidden; background:var(--surface)}
+  .tscroll{overflow-x:auto}
+  table{border-collapse:collapse; width:100%; min-width:620px}
+  th,td{text-align:left; padding:16px 18px; border-bottom:1px solid var(--line-soft); vertical-align:top}
+  thead th{font-family:var(--mono); font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); background:var(--surface-2)}
+  tbody tr:last-child td{border-bottom:none}
+  td .tool{font-family:var(--mono); font-weight:650; color:var(--ink)}
+  td .claim{color:var(--ink-dim); font-size:14.5px}
+  td .method{color:var(--muted); font-size:13px; line-height:1.5}
+  .conf{font-family:var(--mono); font-size:12px; font-weight:600; color:var(--good);
+    border:1px solid color-mix(in srgb,var(--good) 40%, transparent); padding:3px 9px; border-radius:999px; white-space:nowrap}
+  .note{color:var(--faint); font-size:13px; margin-top:14px; font-family:var(--mono)}
+
+  /* install */
+  .install{background:var(--bg-2); border-block:1px solid var(--line-soft)}
+  .tabs{display:flex; gap:6px; flex-wrap:wrap; margin-top:26px}
+  .tab{font-family:var(--mono); font-size:13px; padding:8px 14px; border-radius:9px; border:1px solid var(--line);
+    background:var(--surface); color:var(--muted); cursor:pointer; transition:.15s}
+  .tab[aria-selected="true"]{color:#160A02; background:linear-gradient(100deg,var(--flare-soft),var(--flare-warm)); border-color:transparent; font-weight:700}
+  .panel{display:none; margin-top:16px}
+  .panel[data-active="true"]{display:block}
+  .codeblock{background:var(--code-bg); border:1px solid var(--line); border-radius:12px; overflow:hidden; box-shadow:var(--shadow)}
+  .codeblock .cb-head{display:flex; align-items:center; padding:10px 14px; border-bottom:1px solid var(--line-soft)}
+  .codeblock .cb-head span{font-family:var(--mono); font-size:12px; color:var(--muted)}
+  .codeblock .cb-head .copy{margin-left:auto}
+  .codeblock pre{margin:0; padding:16px 18px; overflow-x:auto}
+  .codeblock code{font-family:var(--mono); font-size:13.5px; color:#E6E8EF; line-height:1.7}
+  .cb-c1{color:var(--flare-warm)} .cb-c2{color:var(--muted)} .cb-c3{color:var(--good)}
+
+  /* callout */
+  .callout{display:grid; grid-template-columns:auto 1fr; gap:16px; align-items:center; background:var(--surface);
+    border:1px solid var(--line); border-radius:var(--r); padding:22px 24px; margin-top:26px}
+  .callout .em{font-family:var(--mono); color:var(--flare-warm); font-size:22px}
+  .callout p{margin:0; color:var(--ink-dim); font-size:15px}
+  .callout b{color:var(--ink)}
+
+  /* footer */
+  footer{border-top:1px solid var(--line-soft); padding:52px 0 40px; margin-top:20px}
+  .foot-grid{display:flex; flex-wrap:wrap; gap:28px; align-items:flex-start; justify-content:space-between}
+  .foot-brand{max-width:34ch}
+  .foot-brand p{color:var(--muted); font-size:14px; margin:12px 0 0}
+  .foot-links{display:flex; gap:56px; flex-wrap:wrap}
+  .foot-col h4{font-family:var(--mono); font-size:12px; letter-spacing:.1em; text-transform:uppercase; color:var(--faint); margin:0 0 12px}
+  .foot-col a{display:block; color:var(--muted); font-size:14px; padding:4px 0; transition:color .15s}
+  .foot-col a:hover{color:var(--flare-warm)}
+  .foot-base{display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between;
+    margin-top:40px; padding-top:22px; border-top:1px solid var(--line-soft); color:var(--faint); font-size:13px; font-family:var(--mono)}
+  .badge{display:inline-flex; align-items:center; gap:7px; font-family:var(--mono); font-size:12px; color:var(--muted);
+    border:1px solid var(--line); border-radius:999px; padding:4px 11px}
+  .badge .g{width:7px; height:7px; border-radius:50%; background:var(--flare-warm); box-shadow:0 0 8px var(--flare-warm)}
+
+  .reveal{opacity:0; transform:translateY(14px)}
+  .reveal.in{opacity:1; transform:none; transition:opacity .6s ease, transform .6s ease}
+
+  :focus-visible{outline:2px solid var(--flare-warm); outline-offset:3px; border-radius:6px}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-in">
+    <a class="brand" href="/" aria-label="agentflare home">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><defs><radialGradient id="m" cx="50%" cy="42%" r="60%"><stop offset="0" stop-color="#FFD37A"/><stop offset=".5" stop-color="#FFB020"/><stop offset="1" stop-color="#FF5E3A"/></radialGradient></defs><path d="M16 3 L18.8 13.2 L29 16 L18.8 18.8 L16 29 L13.2 18.8 L3 16 L13.2 13.2 Z" fill="url(#m)"/></svg>
+      agentflare
+    </a>
+    <nav class="nav-links" aria-label="Primary">
+      <a href="#optimize">Optimize</a>
+      <a href="#coordinate">Coordinate</a>
+      <a href="#numbers">Numbers</a>
+      <a href="#install">Install</a>
+    </nav>
+    <div class="nav-right">
+      <button class="icon-btn" id="theme" aria-label="Toggle color theme" title="Toggle theme">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+      </button>
+      <a class="btn btn-ghost" href="https://github.com/getappz/agentflare" target="_blank" rel="noopener">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.34-1.3-1.7-1.3-1.7-1.06-.72.08-.71.08-.71 1.17.09 1.79 1.2 1.79 1.2 1.04 1.78 2.73 1.27 3.4.97.1-.75.4-1.27.73-1.56-2.56-.29-5.26-1.28-5.26-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.7 5.4-5.28 5.69.41.36.78 1.05.78 2.12v3.14c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5Z"/></svg>
+        GitHub
+      </a>
+      <a class="btn btn-flare" href="#install">Install</a>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- HERO -->
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <span class="eyebrow">Open source · Rust · MIT · Beta</span>
+        <h1 class="title">Run coding agents<br><span class="flare-text">lean.</span> Coordinate a<br>whole crew of them.</h1>
+        <p class="lede">One Rust binary. It <b>cuts the token bill</b> of a single AI coding agent — and gives <b>more than one</b> of them a shared backlog, reviews, and clean handoffs. No Node, no runtime deps.</p>
+
+        <div class="cta-row">
+          <div class="cmd" role="group" aria-label="Install command">
+            <span class="dollar">$</span>
+            <code id="install-cmd">curl -fsSL https://agentflare.dev/install.sh | sh</code>
+            <button class="copy" data-copy="curl -fsSL https://agentflare.dev/install.sh | sh" aria-label="Copy install command">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+            </button>
+          </div>
+        </div>
+        <p class="sub-cmd">then wire up your agent — <b>agentflare init --agent claude-code</b></p>
+
+        <div class="worksrow">
+          <span class="label">Works with</span>
+          <span class="chip">Claude Code</span>
+          <span class="chip">Codex</span>
+          <span class="chip">Cursor</span>
+          <span class="chip">Windsurf</span>
+          <span class="chip">VS Code</span>
+          <span class="chip dim">Cline</span>
+          <span class="chip dim">Continue</span>
+        </div>
+      </div>
+
+      <div class="hero-term">
+        <div class="term" aria-hidden="true">
+          <div class="term-bar">
+            <span class="dot" style="background:#FF5E5A"></span>
+            <span class="dot" style="background:#FFB020"></span>
+            <span class="dot" style="background:#4ADE80"></span>
+            <span class="term-title">agentflare — session</span>
+          </div>
+          <div class="term-body" id="term"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- STATS -->
+  <section class="stats" aria-label="Headline numbers">
+    <div class="wrap"><div class="stats-in">
+      <div class="stat"><div class="n"><span class="flare-text">98.1%</span></div><div class="k">context compressed (lean-ctx, <span class="mono">map</span> mode)</div></div>
+      <div class="stat"><div class="n"><span class="flare-text">65%</span></div><div class="k">fewer output tokens (Caveman, avg)</div></div>
+      <div class="stat"><div class="n"><span class="flare-text">54%</span></div><div class="k">less code written (Ponytail)</div></div>
+      <div class="stat"><div class="n"><span class="flare-text">34.2M</span></div><div class="k">tokens saved in one live project</div></div>
+    </div></div>
+  </section>
+
+  <!-- WHAT IT IS / PILLARS -->
+  <section class="band" id="optimize">
+    <div class="wrap">
+      <div class="band-head reveal">
+        <span class="eyebrow">Two jobs, one binary</span>
+        <h2>Spend fewer tokens. Then get your agents out of each other's way.</h2>
+        <p>agentflare is an optimization layer bolted to a coordination layer. The first makes one agent cheaper to run. The second lets several of them — or several sessions over time — work the same repo without colliding.</p>
+      </div>
+
+      <div class="pillars">
+        <div class="pillar reveal">
+          <span class="tag">Layer 01</span>
+          <h3>Optimize</h3>
+          <p>Cut the token and cost overhead of a single agent session — inside the session and across sessions.</p>
+          <div class="feat">
+            <div class="feat-row"><span class="fk">lean-ctx</span><span class="fv">Compresses tool I/O — reads, shell output, search — <b>up to 99%</b>, in-session.</span></div>
+            <div class="feat-row"><span class="fk">memory</span><span class="fv">Decisions, facts, and preferences that survive a session ending. SQLite + FTS5, ships in the binary.</span></div>
+            <div class="feat-row"><span class="fk">Caveman</span><span class="fv">Trims conversation verbosity <b>~65%</b> (Claude Code).</span></div>
+            <div class="feat-row"><span class="fk">Ponytail</span><span class="fv">Stops agents over-engineering the code they write (Claude Code).</span></div>
+          </div>
+        </div>
+
+        <div class="pillar reveal" id="coordinate">
+          <span class="tag">Layer 02</span>
+          <h3>Coordinate</h3>
+          <p>A local-first, no-daemon backend for running more than one agent — exposed as MCP tools any MCP-capable agent can call.</p>
+          <div class="feat">
+            <div class="feat-row"><span class="fk">work items</span><span class="fv">A shared backlog. Claim one before working it so two agents don't collide.</span></div>
+            <div class="feat-row"><span class="fk">review</span><span class="fv">Findings against a diff, consensus across reviewers, scores over time.</span></div>
+            <div class="feat-row"><span class="fk">artifacts</span><span class="fv">Versioned specs, plans, and docs — a durable handoff surface, not scratch files.</span></div>
+            <div class="feat-row"><span class="fk">handoff</span><span class="fv">Pass addressed, threaded context when work moves between agents.</span></div>
+            <div class="feat-row"><span class="fk">coaching</span><span class="fv">Small persistent nudges surfaced to an agent, only when relevant.</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout reveal">
+        <span class="em">&#8596;</span>
+        <p><b>They're different axes, not substitutes.</b> lean-ctx saves tokens <i>inside</i> a session; memory saves the re-explaining tax <i>across</i> sessions; coordination keeps <i>multiple</i> agents out of each other's way. Everything is local-first, SQLite-backed, no daemon — over the same stdio MCP transport.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- NUMBERS -->
+  <section class="band" id="numbers" style="padding-top:20px">
+    <div class="wrap">
+      <div class="band-head reveal">
+        <span class="eyebrow">No blended totals</span>
+        <h2>Numbers we can actually back up.</h2>
+        <p>Each figure is the project's own published, reproducible benchmark — attributed, not merged into a fake combined total, and not taken on faith. Re-run them yourself.</p>
+      </div>
+
+      <div class="metrics reveal">
+        <div class="tscroll"><table>
+          <thead><tr><th>Tool</th><th>Published claim</th><th>Methodology</th><th>Confidence</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><span class="tool">lean-ctx</span></td>
+              <td><span class="claim">98.1% compression (<span class="mono">map</span>), 96.7% (<span class="mono">signatures</span>), ~99.99% cached re-read</span></td>
+              <td><span class="method">CI-gated, reproducible via <span class="mono">lean-ctx benchmark report .</span> — 50-file repo, GPT-4o tokenizer</span></td>
+              <td><span class="conf">High</span></td>
+            </tr>
+            <tr>
+              <td><span class="tool">Caveman</span></td>
+              <td><span class="claim">65% avg output-token reduction (22&ndash;87%, 10 prompts)</span></td>
+              <td><span class="method">Committed evals; docs flag the failure mode — ~1&ndash;1.5k input-token overhead per turn can go net-negative on already-terse work</span></td>
+              <td><span class="conf">High</span></td>
+            </tr>
+            <tr>
+              <td><span class="tool">Ponytail</span></td>
+              <td><span class="claim">~54% less code (94% ceiling), ~20% cheaper, ~27% faster, 100% safe</span></td>
+              <td><span class="method">12 real feature tasks, FastAPI + React repo, Haiku 4.5, n=4 — self-corrected an earlier overgeneralized figure</span></td>
+              <td><span class="conf">High</span></td>
+            </tr>
+          </tbody>
+        </table></div>
+      </div>
+      <p class="note">$ lean-ctx gain · /caveman-stats · ponytail-debt · agentflare memory context — check your own.</p>
+    </div>
+  </section>
+
+  <!-- INSTALL -->
+  <section class="band install" id="install">
+    <div class="wrap">
+      <div class="band-head reveal">
+        <span class="eyebrow">One command, run once</span>
+        <h2>Install the binary. Wire your agent. Done.</h2>
+        <p>A single static binary — the only runtime dependency is agentflare itself. Detection-first: already-satisfied pieces are skipped, nothing gets clobbered.</p>
+      </div>
+
+      <div class="reveal">
+        <div class="tabs" role="tablist" aria-label="Install method">
+          <button class="tab" role="tab" aria-selected="true" data-tab="curl">curl</button>
+          <button class="tab" role="tab" aria-selected="false" data-tab="brew">Homebrew</button>
+          <button class="tab" role="tab" aria-selected="false" data-tab="scoop">Scoop</button>
+          <button class="tab" role="tab" aria-selected="false" data-tab="cargo">Cargo</button>
+        </div>
+
+        <div class="panel" data-panel="curl" data-active="true">
+          <div class="codeblock">
+            <div class="cb-head"><span>Linux / macOS — prebuilt, checksum-verified</span>
+              <button class="copy" data-copy="curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/master/install.sh | sh" aria-label="Copy"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>
+            </div>
+            <pre><code><span class="cb-c1">curl</span> -fsSL https://raw.githubusercontent.com/getappz/agentflare/master/install.sh | <span class="cb-c1">sh</span></code></pre>
+          </div>
+        </div>
+
+        <div class="panel" data-panel="brew" data-active="false">
+          <div class="codeblock">
+            <div class="cb-head"><span>Homebrew — macOS / Linux</span>
+              <button class="copy" data-copy="brew tap getappz/agentflare && brew install agentflare" aria-label="Copy"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>
+            </div>
+            <pre><code><span class="cb-c1">brew</span> tap getappz/agentflare
+<span class="cb-c1">brew</span> install agentflare</code></pre>
+          </div>
+        </div>
+
+        <div class="panel" data-panel="scoop" data-active="false">
+          <div class="codeblock">
+            <div class="cb-head"><span>Scoop — Windows</span>
+              <button class="copy" data-copy="scoop bucket add agentflare https://github.com/getappz/agentflare && scoop install agentflare" aria-label="Copy"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>
+            </div>
+            <pre><code><span class="cb-c1">scoop</span> bucket add agentflare https://github.com/getappz/agentflare
+<span class="cb-c1">scoop</span> install agentflare</code></pre>
+          </div>
+        </div>
+
+        <div class="panel" data-panel="cargo" data-active="false">
+          <div class="codeblock">
+            <div class="cb-head"><span>Cargo — any platform with Rust</span>
+              <button class="copy" data-copy="cargo install --git https://github.com/getappz/agentflare" aria-label="Copy"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>
+            </div>
+            <pre><code><span class="cb-c1">cargo</span> install --git https://github.com/getappz/agentflare</code></pre>
+          </div>
+        </div>
+
+        <div class="codeblock" style="margin-top:16px">
+          <div class="cb-head"><span>Then set up your agent — the run is the consent</span>
+            <button class="copy" data-copy="agentflare init --agent claude-code" aria-label="Copy"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>
+          </div>
+          <pre><code><span class="cb-c2"># writes hooks straight into the host's own settings — no marketplace</span>
+<span class="cb-c1">agentflare</span> init --agent claude-code   <span class="cb-c2"># or: cursor &middot; windsurf &middot; vscode-copilot &middot; cline &middot; continue</span>
+<span class="cb-c3">&#10003;</span> rules written &middot; lean-ctx installed &middot; hooks + MCP wired &middot; memory ready</code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="/" aria-label="agentflare">
+          <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><defs><radialGradient id="mf" cx="50%" cy="42%" r="60%"><stop offset="0" stop-color="#FFD37A"/><stop offset=".5" stop-color="#FFB020"/><stop offset="1" stop-color="#FF5E3A"/></radialGradient></defs><path d="M16 3 L18.8 13.2 L29 16 L18.8 18.8 L16 29 L13.2 18.8 L3 16 L13.2 13.2 Z" fill="url(#mf)"/></svg>
+          agentflare
+        </a>
+        <p>Run AI coding agents efficiently, and coordinate more than one of them. A single Rust binary — no Node, no runtime dependencies.</p>
+      </div>
+      <div class="foot-links">
+        <div class="foot-col">
+          <h4>Project</h4>
+          <a href="https://github.com/getappz/agentflare" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://github.com/getappz/agentflare/blob/master/STATUS.md" target="_blank" rel="noopener">Status: what's stable</a>
+          <a href="https://github.com/getappz/agentflare/releases" target="_blank" rel="noopener">Releases</a>
+          <a href="https://github.com/getappz/agentflare/blob/master/LICENSE" target="_blank" rel="noopener">MIT License</a>
+        </div>
+        <div class="foot-col">
+          <h4>Layers</h4>
+          <a href="https://github.com/yvgude/lean-ctx" target="_blank" rel="noopener">lean-ctx</a>
+          <a href="#optimize">Memory</a>
+          <a href="#optimize">Caveman &amp; Ponytail</a>
+          <a href="#coordinate">Coordination (MCP)</a>
+        </div>
+      </div>
+    </div>
+    <div class="foot-base">
+      <span>&copy; 2026 agentflare &middot; MIT</span>
+      <span class="badge"><span class="g"></span> v1.3.1 &middot; beta &middot; local-first &middot; no daemon</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function(){
+  "use strict";
+  var root = document.documentElement;
+
+  // ----- theme -----
+  var saved = null;
+  try{ saved = localStorage.getItem("af-theme"); }catch(e){}
+  if(saved){ root.setAttribute("data-theme", saved); }
+  document.getElementById("theme").addEventListener("click", function(){
+    var cur = root.getAttribute("data-theme");
+    if(!cur){ cur = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"; }
+    var next = cur === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try{ localStorage.setItem("af-theme", next); }catch(e){}
+  });
+
+  // ----- copy buttons -----
+  document.querySelectorAll(".copy").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      var text = btn.getAttribute("data-copy") || "";
+      var done = function(){
+        btn.classList.add("copied");
+        var svg = btn.innerHTML;
+        btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+        setTimeout(function(){ btn.classList.remove("copied"); btn.innerHTML = svg; }, 1400);
+      };
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text).then(done).catch(done);
+      } else {
+        var ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta); ta.select();
+        try{ document.execCommand("copy"); }catch(e){} document.body.removeChild(ta); done();
+      }
+    });
+  });
+
+  // ----- install tabs -----
+  var tabs = document.querySelectorAll(".tab");
+  tabs.forEach(function(tab){
+    tab.addEventListener("click", function(){
+      tabs.forEach(function(t){ t.setAttribute("aria-selected", "false"); });
+      tab.setAttribute("aria-selected", "true");
+      var name = tab.getAttribute("data-tab");
+      document.querySelectorAll(".panel").forEach(function(p){
+        p.setAttribute("data-active", p.getAttribute("data-panel") === name ? "true" : "false");
+      });
+    });
+  });
+
+  // ----- scroll reveal -----
+  var reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var reveals = document.querySelectorAll(".reveal");
+  if(reduce || !("IntersectionObserver" in window)){
+    reveals.forEach(function(r){ r.classList.add("in"); });
+  } else {
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(en){ if(en.isIntersecting){ en.target.classList.add("in"); io.unobserve(en.target); } });
+    }, {threshold:.14});
+    reveals.forEach(function(r){ io.observe(r); });
+  }
+
+  // ----- hero terminal -----
+  var term = document.getElementById("term");
+  var lines = [
+    {c:'<span class="t-prompt">$</span> <span class="t-cmd">agentflare init --agent claude-code</span>', d:70},
+    {c:'<span class="t-ok">&#10003;</span> <span class="t-dim">rules written &middot; lean-ctx installed &middot; hooks + MCP wired</span>', d:520},
+    {c:'<span class="t-ok">&#10003;</span> <span class="t-dim">persistent memory ready — ships in the binary</span>', d:340},
+    {c:'', d:200},
+    {c:'<span class="t-prompt">$</span> <span class="t-cmd">agentflare memory context</span>', d:520},
+    {c:'<span class="t-flare">lean-ctx</span>   <span class="t-num">34.2M</span> tokens saved   <span class="t-dim">92% compression</span>   <span class="t-num">$88.45</span> saved', d:360},
+    {c:'<span class="t-flare">caveman</span>   <span class="t-num">1.16M</span> tokens saved <span class="t-dim">(~65%, one session)</span>', d:300},
+    {c:'<span class="t-flare">memory</span>    <span class="t-num">11</span> observations &middot; <span class="t-num">2</span> projects tracked', d:300},
+    {c:'', d:180},
+    {c:'<span class="t-dim"># not a demo — pulled live from a real project.</span>', d:200},
+    {c:'<span class="t-prompt">$</span> <span class="caret"></span>', d:0}
+  ];
+  function typeLines(i){
+    if(i >= lines.length) return;
+    var el = document.createElement("span");
+    el.className = "l"; el.innerHTML = lines[i].c || "&nbsp;";
+    term.appendChild(el);
+    requestAnimationFrame(function(){ el.classList.add("show"); });
+    term.scrollTop = term.scrollHeight;
+    setTimeout(function(){ typeLines(i+1); }, reduce ? 0 : lines[i].d);
+  }
+  if(reduce){
+    lines.forEach(function(ln){ var el=document.createElement("span"); el.className="l show"; el.innerHTML=ln.c||"&nbsp;"; term.appendChild(el); });
+  } else {
+    var started = false;
+    var startTerm = function(){ if(started) return; started = true; setTimeout(function(){ typeLines(0); }, 400); };
+    if("IntersectionObserver" in window){
+      var tio = new IntersectionObserver(function(es){ es.forEach(function(e){ if(e.isIntersecting){ startTerm(); tio.disconnect(); } }); }, {threshold:.3});
+      tio.observe(term);
+    } else { startTerm(); }
+  }
+})();
+</script>
+</body>
+</html>

@@ -7,12 +7,14 @@ mod channel;
 mod claim;
 mod coaching;
 mod cost;
+mod dev_install;
 mod gateway;
 mod handoff;
 mod hook;
 mod init;
 mod mcp;
 mod memory;
+mod optimize;
 mod ponytail;
 mod review;
 mod run;
@@ -43,6 +45,7 @@ pub enum Commands {
     Init(init::InitArgs),
     Hook(hook::HookArgs),
     Cost(cost::CostArgs),
+    DevInstall(dev_install::DevInstallArgs),
     Coaching(coaching::CoachingArgs),
     Gateway(gateway::GatewayArgs),
     Mcp(mcp::McpArgs),
@@ -54,6 +57,8 @@ pub enum Commands {
     Auth(auth::AuthArgs),
     Artifacts(artifacts::ArtifactsArgs),
     Handoff(handoff::HandoffArgs),
+    #[command(alias = "flare", visible_alias = "opt")]
+    Optimize(optimize::OptimizeArgs),
     Ponytail(ponytail::PonytailArgs),
     Caveman(caveman::CavemanArgs),
     Channel(channel::ChannelArgs),
@@ -68,6 +73,7 @@ impl Commands {
             Self::Init(cmd) => cmd.run(),
             Self::Hook(cmd) => cmd.run(),
             Self::Cost(cmd) => cmd.run(),
+            Self::DevInstall(cmd) => cmd.run(),
             Self::Coaching(cmd) => cmd.run(),
             Self::Gateway(cmd) => cmd.run(),
             Self::Mcp(cmd) => cmd.run(),
@@ -79,6 +85,7 @@ impl Commands {
             Self::Auth(cmd) => cmd.run(),
             Self::Artifacts(cmd) => cmd.run(),
             Self::Handoff(cmd) => cmd.run(),
+            Self::Optimize(cmd) => cmd.run(),
             Self::Ponytail(cmd) => cmd.run(),
             Self::Caveman(cmd) => cmd.run(),
             Self::Channel(cmd) => cmd.run(),

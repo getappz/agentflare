@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>404 — agentflare</title>
+<meta name="robots" content="noindex" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3CradialGradient id='g' cx='50%25' cy='42%25' r='60%25'%3E%3Cstop offset='0' stop-color='%23FFD37A'/%3E%3Cstop offset='0.5' stop-color='%23FFB020'/%3E%3Cstop offset='1' stop-color='%23FF5E3A'/%3E%3C/radialGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='%230B0D12'/%3E%3Cpath d='M16 5 L18.4 13.6 L27 16 L18.4 18.4 L16 27 L13.6 18.4 L5 16 L13.6 13.6 Z' fill='url(%23g)'/%3E%3C/svg%3E" />
+<style>
+  :root{
+    --bg:#0B0D12; --ink:#EDEEF2; --muted:#8A90A0; --flare-warm:#FFB020; --flare-hot:#FF5E3A; --line:#232838; --surface:#14171F;
+    --mono: ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --sans: system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#F4F5F8; --ink:#141720; --muted:#5C6478; --flare-warm:#C2760A; --flare-hot:#E14A22; --line:#E1E4EC; --surface:#FFFFFF; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--ink);
+    font-family:var(--sans); text-align:center; padding:24px}
+  .code{font-family:var(--mono); font-size:clamp(64px,16vw,120px); font-weight:650; letter-spacing:-.03em;
+    background:linear-gradient(100deg,var(--flare-warm),var(--flare-hot)); -webkit-background-clip:text; background-clip:text; color:transparent; line-height:1}
+  h1{font-family:var(--mono); font-weight:600; font-size:20px; margin:18px 0 8px; letter-spacing:-.01em}
+  p{color:var(--muted); margin:0 0 26px; max-width:42ch}
+  a{display:inline-flex; align-items:center; gap:8px; font-family:var(--mono); font-size:14px; font-weight:700; color:#160A02;
+    background:linear-gradient(100deg,#FFD37A,var(--flare-warm)); padding:11px 18px; border-radius:10px; text-decoration:none; transition:filter .15s}
+  a:hover{filter:brightness(1.06)}
+</style>
+</head>
+<body>
+  <main>
+    <div class="code">404</div>
+    <h1>No flare out here.</h1>
+    <p>That page drifted off into the dark. Head back to the launch pad.</p>
+    <a href="/">← agentflare.dev</a>
+  </main>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "name": "agentflare-web",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Landing site for agentflare — agentflare.dev (Cloudflare Workers + static assets)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

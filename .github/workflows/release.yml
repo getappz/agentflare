@@ -109,6 +109,8 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
       - name: Download checksums and extract platform hashes
         id: checksums
         run: |
@@ -137,6 +139,7 @@ jobs:
           X86_64_DARWIN_SHA="${{ steps.checksums.outputs.x86_64_darwin_sha }}"
           AARCH64_LINUX_SHA="${{ steps.checksums.outputs.aarch64_linux_sha }}"
           X86_64_LINUX_SHA="${{ steps.checksums.outputs.x86_64_linux_sha }}"
+          DESC=$(grep -m1 '^description = ' Cargo.toml | cut -d'"' -f2)
 
           git clone "https://x-access-token:${HOMEBREW_TOKEN}@github.com/getappz/homebrew-agentflare.git"
           cd homebrew-agentflare
@@ -144,7 +147,7 @@ jobs:
 
           cat > Formula/agentflare.rb <<EOF
           class Agentflare < Formula
-            desc "Optimize AI CLI agents for cost and performance"
+            desc "${DESC}"
             homepage "https://github.com/getappz/agentflare"
             version "${VERSION}"
             license "MIT"
@@ -220,13 +223,14 @@ jobs:
         run: |
           VERSION="${{ steps.checksums.outputs.version }}"
           WINDOWS_SHA="${{ steps.checksums.outputs.windows_sha }}"
+          DESC=$(grep -m1 '^description = ' Cargo.toml | cut -d'"' -f2)
 
           mkdir -p bucket
 
           cat > bucket/agentflare.json <<EOF
           {
             "version": "${VERSION}",
-            "description": "Optimize AI CLI agents for cost and performance",
+            "description": "${DESC}",
             "homepage": "https://github.com/getappz/agentflare",
             "license": "MIT",
             "url": "https://github.com/getappz/agentflare/releases/download/v${VERSION}/agentflare-x86_64-pc-windows-msvc.zip",
@@ -268,9 +272,10 @@ jobs:
       actions: write # gh workflow run
     steps:
       - name: Dispatch ppa-publish workflow
-        if: secrets.PPA_GPG_KEY != ''
+        if: env.PPA_GPG_KEY != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          PPA_GPG_KEY: ${{ secrets.PPA_GPG_KEY }}
         run: |
           gh workflow run ppa-publish.yml \
             --repo getappz/agentflare \

@@ -1,0 +1,41 @@
+<svg width="1200" height="630" viewBox="0 0 1200 630" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="glow" cx="80%" cy="18%" r="62%">
+      <stop offset="0" stop-color="#FF5E3A" stop-opacity="0.30"/>
+      <stop offset="0.42" stop-color="#FFB020" stop-opacity="0.13"/>
+      <stop offset="0.75" stop-color="#0B0D12" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="flare" cx="50%" cy="42%" r="60%">
+      <stop offset="0" stop-color="#FFD37A"/>
+      <stop offset="0.5" stop-color="#FFB020"/>
+      <stop offset="1" stop-color="#FF5E3A"/>
+    </radialGradient>
+    <linearGradient id="ftext" x1="0" y1="0" x2="1" y2="0.3">
+      <stop offset="0" stop-color="#FFB020"/>
+      <stop offset="1" stop-color="#FF5E3A"/>
+    </linearGradient>
+  </defs>
+
+  <!-- ground -->
+  <rect width="1200" height="630" fill="#0B0D12"/>
+  <rect width="1200" height="630" fill="url(#glow)"/>
+  <!-- top flare rule -->
+  <rect x="0" y="0" width="1200" height="6" fill="url(#ftext)"/>
+
+  <!-- wordmark row: flare mark + name -->
+  <g transform="translate(84,74) scale(2.55)">
+    <path d="M16 3 L18.8 13.2 L29 16 L18.8 18.8 L16 29 L13.2 18.8 L3 16 L13.2 13.2 Z" fill="url(#flare)"/>
+  </g>
+  <text x="176" y="144" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="50" font-weight="700" letter-spacing="-1" fill="#EDEEF2">agentflare</text>
+
+  <!-- thesis -->
+  <text x="84" y="322" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="74" font-weight="700" letter-spacing="-2" fill="#EDEEF2">Run coding agents <tspan fill="url(#ftext)">lean.</tspan></text>
+  <text x="84" y="410" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="74" font-weight="700" letter-spacing="-2" fill="#EDEEF2">Coordinate a crew of them.</text>
+
+  <!-- supporting line -->
+  <text x="86" y="486" font-family="'Segoe UI', 'DejaVu Sans', sans-serif" font-size="27" fill="#C3C8D4">One Rust binary. Cut one agent's token bill; coordinate more than one.</text>
+
+  <!-- footer chips row -->
+  <text x="84" y="566" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="24" fill="#8A90A0">no Node&#160;&#160;·&#160;&#160;no runtime deps&#160;&#160;·&#160;&#160;MIT</text>
+  <text x="1116" y="566" text-anchor="end" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="26" font-weight="700" fill="url(#ftext)">agentflare.dev</text>
+</svg>
