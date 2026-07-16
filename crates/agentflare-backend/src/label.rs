@@ -62,11 +62,33 @@ fn row_to_label(row: &rusqlite::Row) -> rusqlite::Result<Label> {
     })
 }
 
+/// Next sort_order for a new label: `max(sort_order) + 10000` within the same
+/// scope (project for project-scoped labels, workspace for workspace-level ones),
+/// or 65535 when the scope has no labels yet. Mirrors Plane's append-on-create.
+fn next_sort_order(conn: &Connection, project_id: Option<&str>, workspace_id: &str) -> Result<f64> {
+    let max: Option<f64> = match project_id {
+        Some(pid) => conn.query_row(
+            "SELECT MAX(sort_order) FROM labels WHERE project_id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![pid],
+            |row| row.get(0),
+        )?,
+        None => conn.query_row(
+            "SELECT MAX(sort_order) FROM labels WHERE workspace_id = ?1 AND project_id IS NULL AND deleted_at IS NULL",
+            rusqlite::params![workspace_id],
+            |row| row.get(0),
+        )?,
+    };
+    Ok(max.map_or(65535.0, |m| m + 10000.0))
+}
+
 pub fn create(conn: &Connection, input: CreateLabel) -> Result<Label> {
     let id = uuid::Uuid::now_v7().to_string();
     let ts = now();
     let color = input.color.unwrap_or_else(|| "#60646C".to_string());
-    let sort_order = input.sort_order.unwrap_or(65535.0);
+    let sort_order = match input.sort_order {
+        Some(v) => v,
+        None => next_sort_order(conn, input.project_id.as_deref(), &input.workspace_id)?,
+    };
     conn.execute(
         "INSERT INTO labels (id, project_id, workspace_id, name, color, parent_id, sort_order, external_source, external_id, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -210,6 +232,34 @@ mod tests {
         assert_eq!(label.name, "bug");
         let got = get(&conn, &label.id).unwrap();
         assert_eq!(got.id, label.id);
+    }
+
+    #[test]
+    fn create_auto_appends_sort_order() {
+        let conn = db::open_in_memory().unwrap();
+        let wid = seed_workspace(&conn);
+        let mk = |name: &str, sort_order: Option<f64>| {
+            create(
+                &conn,
+                CreateLabel {
+                    project_id: None,
+                    workspace_id: wid.clone(),
+                    name: name.into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap()
+        };
+        // First label in the scope seeds at 65535, each next appends +10000.
+        assert_eq!(mk("a", None).sort_order, 65535.0);
+        assert_eq!(mk("b", None).sort_order, 75535.0);
+        // An explicit sort_order is respected verbatim and doesn't shift the max.
+        assert_eq!(mk("c", Some(5.0)).sort_order, 5.0);
+        assert_eq!(mk("d", None).sort_order, 85535.0);
     }
 
     #[test]

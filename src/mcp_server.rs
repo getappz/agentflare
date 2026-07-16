@@ -526,7 +526,8 @@ fn map_backend_err(e: agentflare_backend::Error) -> ErrorData {
     match e {
         agentflare_backend::Error::NotFound(msg)
         | agentflare_backend::Error::Duplicate(msg)
-        | agentflare_backend::Error::InvalidTransition(msg) => ErrorData::invalid_params(msg, None),
+        | agentflare_backend::Error::InvalidTransition(msg)
+        | agentflare_backend::Error::Validation(msg) => ErrorData::invalid_params(msg, None),
         agentflare_backend::Error::Database(e) => ErrorData::internal_error(e.to_string(), None),
     }
 }
@@ -653,14 +654,23 @@ struct CommentRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct LabelRequest {
-    #[schemars(description = "Action: create")]
+    #[schemars(description = "Action: create|list|update|delete")]
     action: String,
-    #[schemars(description = "Label name (required for create)")]
+    #[schemars(description = "Label ID (required for update, delete)")]
+    #[serde(default)]
+    id: Option<String>,
+    #[schemars(description = "Label name (required for create; optional for update)")]
     #[serde(default)]
     name: Option<String>,
-    #[schemars(description = "Hex color, e.g. #F59E0B (create)")]
+    #[schemars(description = "Hex color, e.g. #F59E0B (create, update)")]
     #[serde(default)]
     color: Option<String>,
+    #[schemars(description = "Parent label ID for nesting/grouping (create)")]
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[schemars(description = "Sort order for manual ordering (create, update)")]
+    #[serde(default)]
+    sort_order: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -2428,8 +2438,8 @@ impl AgentflareMcp {
                         workspace_id: project.workspace_id,
                         name,
                         color: req.color,
-                        parent_id: None,
-                        sort_order: None,
+                        parent_id: req.parent_id,
+                        sort_order: req.sort_order,
                         external_source: None,
                         external_id: None,
                     };
@@ -2438,15 +2448,45 @@ impl AgentflareMcp {
                     Ok(serde_json::to_string_pretty(&label).unwrap_or_default())
                 })?
             }
+            "list" => self.with_backend_db(|conn| {
+                let project = self.resolve_project(conn)?;
+                let labels = agentflare_backend::label::list_by_project(conn, &project.id)
+                    .map_err(map_backend_err)?;
+                Ok(serde_json::to_string_pretty(&labels).unwrap_or_default())
+            })?,
+            "update" => {
+                let id = req
+                    .id
+                    .ok_or_else(|| ErrorData::invalid_params("id is required for update", None))?;
+                let input = agentflare_backend::label::UpdateLabel {
+                    name: req.name,
+                    color: req.color,
+                    sort_order: req.sort_order,
+                };
+                self.with_backend_db(|conn| {
+                    let label = agentflare_backend::label::update(conn, &id, input)
+                        .map_err(map_backend_err)?;
+                    Ok(serde_json::to_string_pretty(&label).unwrap_or_default())
+                })?
+            }
+            "delete" => {
+                let id = req
+                    .id
+                    .ok_or_else(|| ErrorData::invalid_params("id is required for delete", None))?;
+                self.with_backend_db(|conn| {
+                    agentflare_backend::label::delete(conn, &id).map_err(map_backend_err)?;
+                    Ok(serde_json::json!({"deleted": true, "id": id}).to_string())
+                })?
+            }
             other => Err(ErrorData::invalid_params(
-                format!("unknown label action: '{other}' — expected create"),
+                format!("unknown label action: '{other}' — expected create|list|update|delete"),
                 None,
             )),
         }
     }
 
     #[tool(
-        description = "Create a label in the repo's linked project. The `action` field selects the operation (only `create` for now)."
+        description = "Manage labels in the repo's linked project. The `action` field selects the operation (create|list|update|delete)."
     )]
     fn label(&self, Parameters(req): Parameters<LabelRequest>) -> Result<String, ErrorData> {
         self.label_inner(req)
@@ -5333,6 +5373,148 @@ mod tests {
         let err = s
             .label(Parameters(LabelRequest {
                 action: "nonexistent".into(),
+                ..Default::default()
+            }))
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn label_create_list_update_delete_via_mcp() {
+        let (_tmp, s) = harness();
+        // create
+        let created: serde_json::Value = serde_json::from_str(
+            &s.label(Parameters(LabelRequest {
+                action: "create".into(),
+                name: Some("bug".into()),
+                color: Some("#EF4444".into()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["name"], "bug");
+        assert_eq!(created["color"], "#EF4444");
+
+        // list shows it
+        let listed: serde_json::Value = serde_json::from_str(
+            &s.label(Parameters(LabelRequest {
+                action: "list".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["id"], id);
+
+        // update renames + recolors
+        let updated: serde_json::Value = serde_json::from_str(
+            &s.label(Parameters(LabelRequest {
+                action: "update".into(),
+                id: Some(id.clone()),
+                name: Some("defect".into()),
+                color: Some("#F59E0B".into()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(updated["name"], "defect");
+        assert_eq!(updated["color"], "#F59E0B");
+
+        // delete
+        let deleted: serde_json::Value = serde_json::from_str(
+            &s.label(Parameters(LabelRequest {
+                action: "delete".into(),
+                id: Some(id.clone()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deleted["deleted"], true);
+
+        // list is now empty
+        let after: serde_json::Value = serde_json::from_str(
+            &s.label(Parameters(LabelRequest {
+                action: "list".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(after.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn label_update_requires_id() {
+        let (_tmp, s) = harness();
+        let err = s
+            .label(Parameters(LabelRequest {
+                action: "update".into(),
+                name: Some("x".into()),
+                ..Default::default()
+            }))
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn item_add_label_rejects_foreign_project_label_via_mcp() {
+        let (tmp, s) = harness();
+        // Auto-provisions this repo's workspace + project.
+        let item: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+        let item_id = item["id"].as_str().unwrap().to_string();
+
+        // A label belonging to a completely separate workspace/project.
+        let foreign_label_id = {
+            let conn = backend_conn(&tmp);
+            let ws = agentflare_backend::workspace::create(
+                &conn,
+                agentflare_backend::workspace::CreateWorkspace {
+                    name: "Other".into(),
+                    slug: "other".into(),
+                    owner_agent: None,
+                    item_label: None,
+                },
+            )
+            .unwrap();
+            let proj = agentflare_backend::project::create(
+                &conn,
+                agentflare_backend::project::CreateProject {
+                    workspace_id: ws.id.clone(),
+                    name: "Other".into(),
+                    identifier: "OTH".into(),
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap();
+            agentflare_backend::label::create(
+                &conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(proj.id),
+                    workspace_id: ws.id,
+                    name: "bug".into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap()
+            .id
+        };
+
+        let err = s
+            .item(Parameters(ItemRequest {
+                action: "add_label".into(),
+                id: Some(item_id),
+                label_id: Some(foreign_label_id),
                 ..Default::default()
             }))
             .unwrap_err();

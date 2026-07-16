@@ -359,6 +359,21 @@ pub fn delete(conn: &Connection, id: &str) -> Result<()> {
 }
 
 pub fn add_label(conn: &Connection, item_id: &str, label_id: &str) -> Result<()> {
+    // A label may only be attached to an item in the same scope: a project-scoped
+    // label must share the item's project; a workspace-level label (project_id NULL)
+    // must share the item's workspace. This mirrors Plane's project-membership check
+    // and, because item::create routes through here, guards that path too.
+    let item = get(conn, item_id)?;
+    let label = crate::label::get(conn, label_id)?;
+    let in_scope = match &label.project_id {
+        Some(project_id) => project_id == &item.project_id,
+        None => label.workspace_id == workspace_id_for_project(conn, &item.project_id)?,
+    };
+    if !in_scope {
+        return Err(crate::error::Error::Validation(format!(
+            "label {label_id} is not in item {item_id}'s project"
+        )));
+    }
     conn.execute(
         "INSERT OR IGNORE INTO item_labels (item_id, label_id) VALUES (?1, ?2)",
         rusqlite::params![item_id, label_id],
@@ -717,6 +732,102 @@ mod tests {
         assert_eq!(labels[0], label.id);
         remove_label(&conn, &item.id, &label.id).unwrap();
         assert!(list_labels(&conn, &item.id).unwrap().is_empty());
+    }
+
+    fn workspace_by_slug(conn: &Connection, slug: &str) -> String {
+        workspace::list(conn)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.slug == slug)
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn add_label_rejects_label_from_another_project() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid1, sid1) = seed_project(&conn, "1");
+        let (pid2, _sid2) = seed_project(&conn, "2");
+        let item = create(
+            &conn,
+            CreateItem {
+                project_id: pid1,
+                state_id: sid1,
+                name: "Test".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        let foreign = crate::label::create(
+            &conn,
+            crate::label::CreateLabel {
+                project_id: Some(pid2),
+                workspace_id: workspace_by_slug(&conn, "test2"),
+                name: "bug".into(),
+                color: None,
+                parent_id: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+        let err = add_label(&conn, &item.id, &foreign.id).unwrap_err();
+        assert!(matches!(err, crate::error::Error::Validation(_)));
+        assert!(list_labels(&conn, &item.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_label_accepts_workspace_level_label_in_same_workspace() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid1, sid1) = seed_project(&conn, "1");
+        let item = create(
+            &conn,
+            CreateItem {
+                project_id: pid1,
+                state_id: sid1,
+                name: "Test".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        // Workspace-level label (project_id = None) in the item's workspace.
+        let global = crate::label::create(
+            &conn,
+            crate::label::CreateLabel {
+                project_id: None,
+                workspace_id: workspace_by_slug(&conn, "test1"),
+                name: "global".into(),
+                color: None,
+                parent_id: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+        add_label(&conn, &item.id, &global.id).unwrap();
+        assert_eq!(list_labels(&conn, &item.id).unwrap().len(), 1);
     }
 
     #[test]
