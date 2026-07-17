@@ -73,4 +73,57 @@ mod tests {
         assert!(bare.get("name").is_none());
         assert!(bare.get("body").is_none());
     }
+
+    use crate::github::test_support::{MockResponse, MockServer};
+
+    fn repo() -> RepoId {
+        RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        }
+    }
+
+    const REL: &str = r#"{"id":1,"tag_name":"v1.0.0","html_url":"u"}"#;
+
+    #[test]
+    fn list_gets_releases() {
+        let server = MockServer::start(vec![MockResponse::json(200, "[]")]);
+        let client = server.client(None);
+        assert!(list(&client, &repo()).unwrap().is_empty());
+        assert_eq!(
+            server.requests()[0].path,
+            "/repos/o/r/releases?per_page=100&page=1"
+        );
+    }
+
+    #[test]
+    fn get_fetches_by_id() {
+        let server = MockServer::start(vec![MockResponse::json(200, REL)]);
+        let client = server.client(None);
+        let rel = get(&client, &repo(), 1).unwrap();
+        assert_eq!(rel.tag_name, "v1.0.0");
+        assert_eq!(server.requests()[0].path, "/repos/o/r/releases/1");
+    }
+
+    #[test]
+    fn latest_hits_the_latest_endpoint() {
+        let server = MockServer::start(vec![MockResponse::json(200, REL)]);
+        let client = server.client(None);
+        latest(&client, &repo()).unwrap();
+        assert_eq!(server.requests()[0].path, "/repos/o/r/releases/latest");
+    }
+
+    #[test]
+    fn create_posts_release_body() {
+        let server = MockServer::start(vec![MockResponse::json(201, REL)]);
+        let client = server.client(Some("tok"));
+        create(&client, &repo(), "v1.0.0", Some("First"), None, true, false).unwrap();
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/repos/o/r/releases");
+        let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        assert_eq!(sent["tag_name"], "v1.0.0");
+        assert_eq!(sent["draft"], true);
+        assert_eq!(sent["name"], "First");
+    }
 }

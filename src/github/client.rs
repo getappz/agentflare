@@ -57,6 +57,18 @@ impl Client {
         }
     }
 
+    /// Construct a client aimed at an arbitrary base URL (e.g. a local mock
+    /// server) with an explicit token. Test-only: production code goes through
+    /// [`Client::new`] / [`Client::anonymous`], which always target GitHub.
+    #[cfg(test)]
+    pub(crate) fn for_test(base_url: String, token: Option<String>) -> Client {
+        Client {
+            agent: Self::agent(),
+            token,
+            base_url,
+        }
+    }
+
     pub fn request(
         &self,
         method: &str,
@@ -167,5 +179,82 @@ mod tests {
         assert_eq!(as_array(&serde_json::json!([1, 2, 3])).len(), 3);
         assert!(as_array(&serde_json::json!({})).is_empty());
         assert!(as_array(&serde_json::Value::Null).is_empty());
+    }
+
+    #[test]
+    fn map_status_429_is_rate_limited() {
+        assert!(matches!(
+            map_status(429, None, String::new()),
+            GitHubError::RateLimited(_)
+        ));
+    }
+
+    use crate::github::test_support::{MockResponse, MockServer};
+
+    #[test]
+    fn request_refuses_writes_without_a_token_before_any_network_call() {
+        // No server needed: the guard short-circuits before a request is made.
+        let client = Client::for_test("http://127.0.0.1:1".to_string(), None);
+        let err = client.request("POST", "/x", None).unwrap_err();
+        assert!(matches!(err, GitHubError::NoAuth(_)));
+    }
+
+    #[test]
+    fn request_get_parses_json_and_sends_expected_headers() {
+        let server = MockServer::start(vec![MockResponse::json(200, r#"{"ok":true}"#)]);
+        let client = server.client(None);
+        let value = client.request("GET", "/probe", None).unwrap();
+        assert_eq!(value["ok"], true);
+
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].path, "/probe");
+    }
+
+    #[test]
+    fn request_sends_json_body_on_writes() {
+        let server = MockServer::start(vec![MockResponse::json(201, r#"{"created":1}"#)]);
+        let client = server.client(Some("tok"));
+        let body = serde_json::json!({ "name": "value" });
+        let value = client.request("POST", "/thing", Some(body)).unwrap();
+        assert_eq!(value["created"], 1);
+
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "POST");
+        let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        assert_eq!(sent["name"], "value");
+    }
+
+    #[test]
+    fn request_empty_body_becomes_json_null() {
+        let server = MockServer::start(vec![MockResponse::json(204, "")]);
+        let client = server.client(Some("tok"));
+        let value = client
+            .request("POST", "/empty", Some(serde_json::json!({})))
+            .unwrap();
+        assert_eq!(value, serde_json::Value::Null);
+        let _ = server.requests();
+    }
+
+    #[test]
+    fn request_maps_error_status_from_the_wire() {
+        let server = MockServer::start(vec![
+            MockResponse::json(403, r#"{"message":"limited"}"#)
+                .with_header("x-ratelimit-remaining", "0"),
+        ]);
+        let client = server.client(Some("tok"));
+        let err = client.request("GET", "/limited", None).unwrap_err();
+        assert!(matches!(err, GitHubError::RateLimited(_)));
+        let _ = server.requests();
+    }
+
+    #[test]
+    fn request_reports_parse_error_on_malformed_json() {
+        let server = MockServer::start(vec![MockResponse::json(200, "not json")]);
+        let client = server.client(None);
+        let err = client.request("GET", "/bad", None).unwrap_err();
+        assert!(matches!(err, GitHubError::Parse(_)));
+        let _ = server.requests();
     }
 }
