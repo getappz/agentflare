@@ -196,29 +196,7 @@ pub fn now() -> i64 {
 /// forms of the same repo map to one claim namespace.
 /// `https://github.com/getappz/agentflare.git` and
 /// `git@github-alias:getappz/agentflare.git` both → `getappz/agentflare`.
-pub fn normalize_repo(remote_url: &str) -> String {
-    let s = remote_url.trim().trim_end_matches('/');
-    // Take everything after the last ':' or '/' boundary that separates host
-    // from path: strip scheme, then split host from path on ':' (scp form) or
-    // the first '/' after the host.
-    let after_scheme = s.split("://").last().unwrap_or(s);
-    let path = match after_scheme.split_once(':') {
-        // scp-like: host:owner/name
-        Some((_host, path)) if !path.starts_with('/') => path,
-        // https-like: host/owner/name  (or host:port/owner/name)
-        _ => after_scheme
-            .split_once('/')
-            .map(|x| x.1)
-            .unwrap_or(after_scheme),
-    };
-    let path = path.trim_start_matches('/').trim_end_matches(".git");
-    // Keep the last two segments (owner/name); fall back to whatever's there.
-    let segs: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-    match segs.as_slice() {
-        [.., owner, name] => format!("{owner}/{name}"),
-        _ => path.to_string(),
-    }
-}
+pub use crate::github::identity::normalize_repo;
 
 /// Resolves the repo key: explicit `--repo` wins, else normalize the origin
 /// remote from git provenance.

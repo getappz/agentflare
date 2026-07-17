@@ -22,6 +22,7 @@ mod dev_vars;
 mod errors;
 mod gateway_integrations;
 mod gateway_secrets;
+mod github;
 mod git;
 mod hook;
 mod hook_redirect;
