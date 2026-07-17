@@ -79,4 +79,32 @@ mod tests {
     fn repo_id_parse_is_none_for_single_segment() {
         assert!(RepoId::parse("not-a-url").is_none());
     }
+
+    #[test]
+    fn normalize_repo_handles_ports_and_extra_path_segments() {
+        // ssh:// with an explicit port, and a deeper path than owner/repo.
+        assert_eq!(
+            normalize_repo("ssh://git@github.com:22/getappz/agentflare.git"),
+            "getappz/agentflare"
+        );
+        assert_eq!(
+            normalize_repo("https://gitlab.com/group/subgroup/proj.git"),
+            "subgroup/proj"
+        );
+    }
+
+    #[test]
+    fn normalize_repo_trims_trailing_slash_and_git_suffix() {
+        assert_eq!(normalize_repo("https://github.com/o/r.git/"), "o/r");
+    }
+
+    #[test]
+    fn normalize_repo_passes_through_a_bare_single_segment() {
+        assert_eq!(normalize_repo("justname"), "justname");
+    }
+
+    #[test]
+    fn repo_id_parse_is_none_for_empty_input() {
+        assert!(RepoId::parse("").is_none());
+    }
 }

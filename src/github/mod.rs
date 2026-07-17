@@ -14,6 +14,9 @@ pub mod models;
 pub mod pulls;
 pub mod releases;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use client::Client;
 pub use identity::RepoId;
 
@@ -75,5 +78,44 @@ mod encode_tests {
         );
         assert_eq!(encode_query("open"), "open");
         assert_eq!(encode_query("a b"), "a%20b");
+    }
+
+    #[test]
+    fn encode_query_encodes_multibyte_utf8() {
+        // Each byte of a non-ASCII char is percent-encoded individually.
+        assert_eq!(encode_query("café"), "caf%C3%A9");
+    }
+
+    #[test]
+    fn github_error_display_matches_each_variant() {
+        assert_eq!(
+            GitHubError::NoAuth("no creds".into()).to_string(),
+            "no creds"
+        );
+        assert_eq!(
+            GitHubError::Forbidden("forbidden".into()).to_string(),
+            "forbidden"
+        );
+        assert_eq!(
+            GitHubError::RateLimited("slow down".into()).to_string(),
+            "slow down"
+        );
+        assert_eq!(GitHubError::NotFound.to_string(), "not found");
+        assert_eq!(
+            GitHubError::Http {
+                status: 500,
+                body: "boom".into()
+            }
+            .to_string(),
+            "GitHub HTTP 500: boom"
+        );
+        assert_eq!(
+            GitHubError::Transport("reset".into()).to_string(),
+            "transport error: reset"
+        );
+        assert_eq!(
+            GitHubError::Parse("bad json".into()).to_string(),
+            "response parse error: bad json"
+        );
     }
 }

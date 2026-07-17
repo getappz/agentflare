@@ -87,4 +87,72 @@ mod tests {
         assert_eq!(with["inputs"]["env"], "prod");
         assert!(dispatch_body("main", None).get("inputs").is_none());
     }
+
+    use crate::github::test_support::{MockResponse, MockServer};
+
+    fn repo() -> RepoId {
+        RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        }
+    }
+
+    #[test]
+    fn list_runs_unwraps_envelope_without_branch() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"workflow_runs":[{"id":1,"status":"completed","conclusion":"success","html_url":"u"}]}"#,
+        )]);
+        let client = server.client(None);
+        let runs = list_runs(&client, &repo(), None).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(server.requests()[0].path, "/repos/o/r/actions/runs");
+    }
+
+    #[test]
+    fn list_runs_appends_branch_query() {
+        let server = MockServer::start(vec![MockResponse::json(200, r#"{"workflow_runs":[]}"#)]);
+        let client = server.client(None);
+        list_runs(&client, &repo(), Some("feat/x")).unwrap();
+        assert_eq!(
+            server.requests()[0].path,
+            "/repos/o/r/actions/runs?branch=feat/x"
+        );
+    }
+
+    #[test]
+    fn get_run_fetches_single_run() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"id":7,"status":"completed","conclusion":"failure","html_url":"u"}"#,
+        )]);
+        let client = server.client(None);
+        let run = get_run(&client, &repo(), 7).unwrap();
+        assert_eq!(run.conclusion.as_deref(), Some("failure"));
+        assert_eq!(server.requests()[0].path, "/repos/o/r/actions/runs/7");
+    }
+
+    #[test]
+    fn rerun_posts_to_the_rerun_endpoint() {
+        let server = MockServer::start(vec![MockResponse::json(201, "")]);
+        let client = server.client(Some("tok"));
+        rerun(&client, &repo(), 9).unwrap();
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/repos/o/r/actions/runs/9/rerun");
+    }
+
+    #[test]
+    fn dispatch_posts_ref_to_workflow_dispatches() {
+        let server = MockServer::start(vec![MockResponse::json(204, "")]);
+        let client = server.client(Some("tok"));
+        dispatch(&client, &repo(), "ci.yml", "main", None).unwrap();
+        let reqs = server.requests();
+        assert_eq!(
+            reqs[0].path,
+            "/repos/o/r/actions/workflows/ci.yml/dispatches"
+        );
+        let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        assert_eq!(sent["ref"], "main");
+    }
 }
