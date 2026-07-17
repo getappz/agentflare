@@ -13,8 +13,9 @@ pub struct KvEntry {
 
 impl Store {
     pub fn kv_set(&self, key: &str, value: &[u8]) -> rusqlite::Result<()> {
+        let conn = self.conn();
         let now = db_kit::ids::now();
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO store_kv (key, value, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?3)
              ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
@@ -24,8 +25,8 @@ impl Store {
     }
 
     pub fn kv_get(&self, key: &str) -> rusqlite::Result<Option<KvEntry>> {
-        self.conn
-            .query_row(
+        let conn = self.conn();
+        conn.query_row(
                 "SELECT key, value, created_at, updated_at FROM store_kv WHERE key = ?1",
                 params![key],
                 |row| {
@@ -41,8 +42,8 @@ impl Store {
     }
 
     pub fn kv_exists(&self, key: &str) -> rusqlite::Result<bool> {
-        self.conn
-            .query_row(
+        let conn = self.conn();
+        conn.query_row(
                 "SELECT 1 FROM store_kv WHERE key = ?1",
                 params![key],
                 |_| Ok(()),
@@ -52,16 +53,14 @@ impl Store {
     }
 
     pub fn kv_delete(&self, key: &str) -> rusqlite::Result<bool> {
-        let n = self
-            .conn
-            .execute("DELETE FROM store_kv WHERE key = ?1", params![key])?;
+        let conn = self.conn();
+        let n = conn.execute("DELETE FROM store_kv WHERE key = ?1", params![key])?;
         Ok(n > 0)
     }
 
     pub fn kv_scan(&self, prefix: &str) -> rusqlite::Result<Vec<KvEntry>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT key, value, created_at, updated_at FROM store_kv WHERE key >= ?1 AND key < ?2 ORDER BY key")?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT key, value, created_at, updated_at FROM store_kv WHERE key >= ?1 AND key < ?2 ORDER BY key")?;
         let end = {
             let mut s = prefix.to_string();
             s.push('\u{10FFFF}');

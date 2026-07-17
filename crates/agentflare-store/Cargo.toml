@@ -17,8 +17,18 @@ blake3 = "1.5"
 thiserror = "2"
 parking_lot = "0.12"
 bytemuck = { version = "1", features = ["derive"] }
+anyhow = { version = "1", optional = true }
+dirs = { version = "6", optional = true }
+tracing = { version = "0.1", optional = true }
+ureq = { version = "2", features = ["json"], optional = true }
+sha2 = { version = "0.10", optional = true }
+ndarray = { version = "0.17", optional = true }
+rayon = { version = "1", optional = true }
+ort = { version = "=2.0.0-rc.12", optional = true, default-features = true, features = ["ndarray"] }
+
 [features]
 default = []
+embeddings = ["dep:anyhow", "dep:dirs", "dep:tracing", "dep:ureq", "dep:sha2", "dep:ndarray", "dep:rayon", "dep:ort"]
 
 [dev-dependencies]
 tempfile = "3"

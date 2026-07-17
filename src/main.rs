@@ -41,6 +41,7 @@ mod rollup;
 mod rule_text;
 mod shell;
 mod state;
+mod store;
 mod tool_install;
 mod ui;
 mod uninstall;

@@ -6,6 +6,9 @@ pub mod leases;
 pub mod migrate;
 pub mod migrations;
 
+#[cfg(feature = "embeddings")]
+pub mod embedding_pipeline;
+
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
@@ -26,7 +29,7 @@ pub enum Error {
 }
 
 pub struct Store {
-    conn: Connection,
+    conn: parking_lot::Mutex<Connection>,
     root: PathBuf,
 }
 
@@ -34,19 +37,22 @@ impl Store {
     pub fn open_file(path: &Path) -> Result<Self, Error> {
         let conn = db_kit::open_file(path, &migrations::migrations())?;
         let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        Ok(Self { conn, root })
+        Ok(Self {
+            conn: parking_lot::Mutex::new(conn),
+            root,
+        })
     }
 
     pub fn open_memory() -> Result<Self, Error> {
         let conn = db_kit::open_memory(&migrations::migrations())?;
         Ok(Self {
-            conn,
+            conn: parking_lot::Mutex::new(conn),
             root: PathBuf::from(":memory:"),
         })
     }
 
-    pub fn conn(&self) -> &Connection {
-        &self.conn
+    pub fn conn(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.conn.lock()
     }
 
     pub fn root(&self) -> &Path {

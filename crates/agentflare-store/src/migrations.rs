@@ -57,5 +57,28 @@ pub fn migrations() -> Migrations<'static> {
             heartbeat_at INTEGER NOT NULL
         );",
         ),
+        M::up(
+            "ALTER TABLE store_documents ADD COLUMN title TEXT NOT NULL DEFAULT '';
+             ALTER TABLE store_documents ADD COLUMN doc_type TEXT NOT NULL DEFAULT 'file';
+             ALTER TABLE store_documents ADD COLUMN blob_hash TEXT;
+             ALTER TABLE store_documents ADD COLUMN mime TEXT NOT NULL DEFAULT '';
+             ALTER TABLE store_documents ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
+             ALTER TABLE store_documents ADD COLUMN session_id TEXT;
+             ALTER TABLE store_documents ADD COLUMN source TEXT NOT NULL DEFAULT '';
+             ALTER TABLE store_documents ADD COLUMN version INTEGER NOT NULL DEFAULT 1;",
+        ),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS store_doc_history (
+            id         TEXT PRIMARY KEY NOT NULL,
+            doc_id     TEXT NOT NULL REFERENCES store_documents(id),
+            version    INTEGER NOT NULL,
+            content    TEXT NOT NULL DEFAULT '',
+            blob_hash  TEXT,
+            mime       TEXT NOT NULL DEFAULT '',
+            title      TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_doc_history_doc ON store_doc_history(doc_id);",
+        ),
     ])
 }

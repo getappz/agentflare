@@ -1,16 +1,36 @@
 use crate::Store;
 use rusqlite::{OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub id: String,
     pub project_id: String,
     pub path: String,
     pub content: String,
+    pub title: String,
+    pub doc_type: String,
+    pub blob_hash: Option<String>,
+    pub mime: String,
+    pub tags: Vec<String>,
+    pub session_id: Option<String>,
+    pub source: String,
+    pub version: i32,
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DocVersion {
+    pub id: String,
+    pub doc_id: String,
+    pub version: i32,
+    pub content: String,
+    pub blob_hash: Option<String>,
+    pub mime: String,
+    pub title: String,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -22,58 +42,187 @@ pub struct DocMatch {
     pub score: f64,
 }
 
+#[derive(Debug, Default)]
+pub struct DocUpsertOpts {
+    pub title: Option<String>,
+    pub doc_type: Option<String>,
+    pub blob_hash: Option<String>,
+    pub mime: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub session_id: Option<String>,
+    pub source: Option<String>,
+}
+
 impl Store {
-    fn doc_sync_fts(&self, row_id: i64, content: &str) -> rusqlite::Result<()> {
-        // FTS5 has no REPLACE/UPSERT — delete any existing rowid first (no-op if fresh)
-        self.conn.execute(
+    fn doc_sync_fts(conn: &rusqlite::Connection, row_id: i64, content: &str) -> rusqlite::Result<()> {
+        conn.execute(
             "DELETE FROM store_docs_fts WHERE rowid = ?1",
             params![row_id],
         )?;
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO store_docs_fts(rowid, content) VALUES (?1, ?2)",
             params![row_id, content],
         )?;
         Ok(())
     }
+
+    fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
+        let tags_str: String = row.get(8)?;
+        let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
+        Ok(Document {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            path: row.get(2)?,
+            content: row.get(3)?,
+            title: row.get(4)?,
+            doc_type: row.get(5)?,
+            blob_hash: row.get(6)?,
+            mime: row.get(7)?,
+            tags,
+            session_id: row.get(9)?,
+            source: row.get(10)?,
+            version: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
+            deleted_at: row.get(14)?,
+        })
+    }
+
     pub fn doc_upsert(
         &self,
         project_id: &str,
         path: &str,
         content: &str,
     ) -> rusqlite::Result<Document> {
-        let now = db_kit::ids::now();
-        let id = db_kit::ids::new_id();
+        self.doc_upsert_with_opts(project_id, path, content, DocUpsertOpts::default())
+    }
 
-        // Try to find existing by (project_id, path), else insert fresh
-        let existing = self
-            .conn
+    pub fn doc_upsert_with_opts(
+        &self,
+        project_id: &str,
+        path: &str,
+        content: &str,
+        opts: DocUpsertOpts,
+    ) -> rusqlite::Result<Document> {
+        let conn = self.conn();
+        let now = db_kit::ids::now();
+
+        let existing = conn
             .query_row(
-                "SELECT id, rowid FROM store_documents WHERE project_id = ?1 AND path = ?2",
+                "SELECT id, rowid, content, version FROM store_documents
+                 WHERE project_id = ?1 AND path = ?2",
                 params![project_id, path],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i32>(3)?,
+                    ))
+                },
             )
             .optional()?;
 
-        if let Some((existing_id, rowid)) = existing {
-            self.conn.execute(
-                "UPDATE store_documents SET content = ?1, updated_at = ?2, deleted_at = NULL WHERE id = ?3",
-                params![content, now, existing_id],
+        if let Some((existing_id, rowid, old_content, old_version)) = existing {
+            let new_version = old_version + 1;
+            let history_id = db_kit::ids::new_id();
+
+            // Snapshot current version to history
+            conn.execute(
+                "INSERT INTO store_doc_history (id, doc_id, version, content, title, created_at)
+                 VALUES (?1, ?2, ?3, ?4, (SELECT title FROM store_documents WHERE id = ?2), ?5)",
+                params![history_id, existing_id, old_version, old_content, now],
             )?;
-            self.doc_sync_fts(rowid, content)?;
+
+            conn.execute(
+                "UPDATE store_documents SET
+                 content = ?1, updated_at = ?2, deleted_at = NULL,
+                 version = ?3
+                 WHERE id = ?4",
+                params![content, now, new_version, existing_id],
+            )?;
+
+            // Apply optional updates (need separate UPDATE to avoid long SQL)
+            if let Some(title) = &opts.title {
+                conn.execute(
+                    "UPDATE store_documents SET title = ?1 WHERE id = ?2",
+                    params![title, existing_id],
+                )?;
+            }
+            if let Some(doc_type) = &opts.doc_type {
+                conn.execute(
+                    "UPDATE store_documents SET doc_type = ?1 WHERE id = ?2",
+                    params![doc_type, existing_id],
+                )?;
+            }
+            if opts.blob_hash.is_some() {
+                conn.execute(
+                    "UPDATE store_documents SET blob_hash = ?1 WHERE id = ?2",
+                    params![opts.blob_hash, existing_id],
+                )?;
+            }
+            if let Some(mime) = &opts.mime {
+                conn.execute(
+                    "UPDATE store_documents SET mime = ?1 WHERE id = ?2",
+                    params![mime, existing_id],
+                )?;
+            }
+            if let Some(tags) = &opts.tags {
+                let json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
+                conn.execute(
+                    "UPDATE store_documents SET tags = ?1 WHERE id = ?2",
+                    params![json, existing_id],
+                )?;
+            }
+            if opts.session_id.is_some() {
+                conn.execute(
+                    "UPDATE store_documents SET session_id = ?1 WHERE id = ?2",
+                    params![opts.session_id, existing_id],
+                )?;
+            }
+            if let Some(source) = &opts.source {
+                conn.execute(
+                    "UPDATE store_documents SET source = ?1 WHERE id = ?2",
+                    params![source, existing_id],
+                )?;
+            }
+
+            Self::doc_sync_fts(&conn, rowid, content)?;
+            drop(conn);
             self.doc_get(&existing_id).map(|o| o.unwrap())
         } else {
-            self.conn.execute(
-                "INSERT INTO store_documents (id, project_id, path, content, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                params![id, project_id, path, content, now],
+            let id = db_kit::ids::new_id();
+            let title = opts.title.unwrap_or_default();
+            let doc_type = opts.doc_type.unwrap_or_else(|| "file".to_string());
+            let mime = opts.mime.unwrap_or_default();
+            let tags_val = opts.tags.unwrap_or_default();
+            let tags_json = serde_json::to_string(&tags_val).unwrap_or_else(|_| "[]".to_string());
+            let source = opts.source.unwrap_or_default();
+
+            conn.execute(
+                "INSERT INTO store_documents
+                 (id, project_id, path, content, title, doc_type, blob_hash, mime, tags, session_id, source, version, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?12)",
+                params![
+                    id, project_id, path, content, title, doc_type, opts.blob_hash,
+                    mime, tags_json, opts.session_id, source, now
+                ],
             )?;
-            let rowid = self.conn.last_insert_rowid();
-            self.doc_sync_fts(rowid, content)?;
+            let rowid = conn.last_insert_rowid();
+            Self::doc_sync_fts(&conn, rowid, content)?;
             Ok(Document {
                 id,
                 project_id: project_id.to_string(),
                 path: path.to_string(),
                 content: content.to_string(),
+                title,
+                doc_type,
+                blob_hash: opts.blob_hash,
+                mime,
+                tags: tags_val,
+                session_id: opts.session_id,
+                source,
+                version: 1,
                 created_at: now,
                 updated_at: now,
                 deleted_at: None,
@@ -82,30 +231,21 @@ impl Store {
     }
 
     pub fn doc_get(&self, id: &str) -> rusqlite::Result<Option<Document>> {
-        self.conn
-            .query_row(
-                "SELECT id, project_id, path, content, created_at, updated_at, deleted_at
+        let conn = self.conn();
+        conn.query_row(
+                "SELECT id, project_id, path, content, title, doc_type, blob_hash, mime, tags,
+                        session_id, source, version, created_at, updated_at, deleted_at
                  FROM store_documents WHERE id = ?1",
                 params![id],
-                |row| {
-                    Ok(Document {
-                        id: row.get(0)?,
-                        project_id: row.get(1)?,
-                        path: row.get(2)?,
-                        content: row.get(3)?,
-                        created_at: row.get(4)?,
-                        updated_at: row.get(5)?,
-                        deleted_at: row.get(6)?,
-                    })
-                },
+                Self::row_to_document,
             )
             .optional()
     }
 
     pub fn doc_delete(&self, id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn();
         let now = db_kit::ids::now();
-        if let Some(rowid) = self
-            .conn
+        if let Some(rowid) = conn
             .query_row(
                 "SELECT rowid FROM store_documents WHERE id = ?1",
                 params![id],
@@ -113,11 +253,11 @@ impl Store {
             )
             .optional()?
         {
-            self.conn.execute(
+            conn.execute(
                 "UPDATE store_documents SET deleted_at = ?1 WHERE id = ?2",
                 params![now, id],
             )?;
-            self.conn.execute(
+            conn.execute(
                 "DELETE FROM store_docs_fts WHERE rowid = ?1",
                 params![rowid],
             )?;
@@ -128,8 +268,8 @@ impl Store {
     }
 
     pub fn doc_hard_delete(&self, id: &str) -> rusqlite::Result<bool> {
-        if let Some(rowid) = self
-            .conn
+        let conn = self.conn();
+        if let Some(rowid) = conn
             .query_row(
                 "SELECT rowid FROM store_documents WHERE id = ?1",
                 params![id],
@@ -137,9 +277,8 @@ impl Store {
             )
             .optional()?
         {
-            self.conn
-                .execute("DELETE FROM store_documents WHERE id = ?1", params![id])?;
-            self.conn.execute(
+            conn.execute("DELETE FROM store_documents WHERE id = ?1", params![id])?;
+            conn.execute(
                 "DELETE FROM store_docs_fts WHERE rowid = ?1",
                 params![rowid],
             )?;
@@ -149,13 +288,59 @@ impl Store {
         }
     }
 
+    pub fn doc_history(&self, doc_id: &str) -> rusqlite::Result<Vec<DocVersion>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, doc_id, version, content, blob_hash, mime, title, created_at
+             FROM store_doc_history
+             WHERE doc_id = ?1
+             ORDER BY version DESC",
+        )?;
+        let rows = stmt.query_map(params![doc_id], |row| {
+            Ok(DocVersion {
+                id: row.get(0)?,
+                doc_id: row.get(1)?,
+                version: row.get(2)?,
+                content: row.get(3)?,
+                blob_hash: row.get(4)?,
+                mime: row.get(5)?,
+                title: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn doc_get_version(&self, doc_id: &str, version: i32) -> rusqlite::Result<Option<DocVersion>> {
+        let conn = self.conn();
+        conn.query_row(
+                "SELECT id, doc_id, version, content, blob_hash, mime, title, created_at
+                 FROM store_doc_history WHERE doc_id = ?1 AND version = ?2",
+                params![doc_id, version],
+                |row| {
+                    Ok(DocVersion {
+                        id: row.get(0)?,
+                        doc_id: row.get(1)?,
+                        version: row.get(2)?,
+                        content: row.get(3)?,
+                        blob_hash: row.get(4)?,
+                        mime: row.get(5)?,
+                        title: row.get(6)?,
+                        created_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
     pub fn doc_search(
         &self,
         project_id: &str,
         query: &str,
         limit: usize,
     ) -> rusqlite::Result<Vec<DocMatch>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             "SELECT d.id, d.project_id, d.path,
                     snippet(store_docs_fts, 0, '<b>', '</b>', '...', 48) AS snip,
                     rank
@@ -180,9 +365,10 @@ impl Store {
     }
 
     pub fn doc_set_embedding(&self, doc_id: &str, embedding: &[f32]) -> rusqlite::Result<bool> {
+        let conn = self.conn();
         let now = db_kit::ids::now();
         let bytes: &[u8] = bytemuck::cast_slice(embedding);
-        let n = self.conn.execute(
+        let n = conn.execute(
             "INSERT INTO store_docs_vec (doc_id, embedding, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(doc_id) DO UPDATE SET embedding = ?2, updated_at = ?3",
             params![doc_id, bytes, now],
@@ -191,8 +377,8 @@ impl Store {
     }
 
     pub fn doc_get_embedding(&self, doc_id: &str) -> rusqlite::Result<Option<Vec<f32>>> {
-        self.conn
-            .query_row(
+        let conn = self.conn();
+        conn.query_row(
                 "SELECT embedding FROM store_docs_vec WHERE doc_id = ?1",
                 params![doc_id],
                 |row| {
@@ -213,7 +399,8 @@ impl Store {
         query_vec: &[f32],
         limit: usize,
     ) -> rusqlite::Result<Vec<DocMatch>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             "SELECT d.id, d.project_id, d.path, v.embedding
              FROM store_docs_vec v
              JOIN store_documents d ON d.id = v.doc_id
@@ -267,19 +454,11 @@ impl Store {
 
         let mut max_fts = fts.first().map(|m| m.score).unwrap_or(1.0);
         let mut max_vec = vec.first().map(|m| m.score).unwrap_or(1.0);
-        if max_fts < 1e-12 {
-            max_fts = 1.0;
-        }
-        if max_vec < 1e-12 {
-            max_vec = 1.0;
-        }
+        if max_fts < 1e-12 { max_fts = 1.0; }
+        if max_vec < 1e-12 { max_vec = 1.0; }
 
-        for m in &mut fts {
-            m.score = alpha * (m.score / max_fts);
-        }
-        for m in &mut vec {
-            m.score = (1.0 - alpha) * (m.score / max_vec);
-        }
+        for m in &mut fts { m.score = alpha * (m.score / max_fts); }
+        for m in &mut vec { m.score = (1.0 - alpha) * (m.score / max_vec); }
 
         let mut combined: Vec<DocMatch> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -302,23 +481,15 @@ impl Store {
     }
 
     pub fn doc_list(&self, project_id: &str) -> rusqlite::Result<Vec<Document>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, path, content, created_at, updated_at, deleted_at
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, path, content, title, doc_type, blob_hash, mime, tags,
+                    session_id, source, version, created_at, updated_at, deleted_at
              FROM store_documents
              WHERE project_id = ?1 AND deleted_at IS NULL
              ORDER BY path",
         )?;
-        let rows = stmt.query_map(params![project_id], |row| {
-            Ok(Document {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                path: row.get(2)?,
-                content: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                deleted_at: row.get(6)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![project_id], Self::row_to_document)?;
         rows.collect()
     }
 }
@@ -454,5 +625,39 @@ mod tests {
             .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].id, d1.id);
+    }
+
+    #[test]
+    fn upsert_with_metadata() {
+        let s = store();
+        let doc = s.doc_upsert_with_opts("p", "/meta.md", "content", DocUpsertOpts {
+            title: Some("My Doc".into()),
+            doc_type: Some("note".into()),
+            mime: Some("text/markdown".into()),
+            tags: Some(vec!["rust".into(), "db".into()]),
+            source: Some("agent".into()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(doc.title, "My Doc");
+        assert_eq!(doc.doc_type, "note");
+        assert_eq!(doc.mime, "text/markdown");
+        assert_eq!(doc.tags, vec!["rust", "db"]);
+        assert_eq!(doc.source, "agent");
+        assert_eq!(doc.version, 1);
+    }
+
+    #[test]
+    fn versioning_increments_on_upsert() {
+        let s = store();
+        let doc = s.doc_upsert("p", "/v.md", "v1").unwrap();
+        assert_eq!(doc.version, 1);
+
+        let updated = s.doc_upsert("p", "/v.md", "v2").unwrap();
+        assert_eq!(updated.version, 2);
+
+        let history = s.doc_history(&updated.id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].version, 1);
+        assert_eq!(history[0].content, "v1");
     }
 }
