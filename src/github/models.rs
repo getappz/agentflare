@@ -17,14 +17,16 @@ pub struct Issue {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct Release {
+    #[allow(dead_code)]
     pub id: u64,
     pub tag_name: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub name: Option<String>,
     pub html_url: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub draft: bool,
     #[serde(default)]
     pub prerelease: bool,
