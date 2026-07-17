@@ -195,14 +195,18 @@ jobs:
     name: Update Scoop
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: master
-          # Owner PAT (user-approved 2026-07-06): master's required-checks
-          # protection rejects pushes from the default GITHUB_TOKEN (GH006);
-          # enforce_admins is off, so a push authenticated as the admin owner
-          # goes through for this generated one-file manifest commit.
+          # Owner PAT: master requires an approved PR + passing required
+          # checks (enforce_admins is on, so no push — including an admin's
+          # — bypasses that). GITHUB_TOKEN-authored branch pushes/PRs don't
+          # trigger required CI checks, so this job needs a real user PAT to
+          # open a mergeable PR below rather than pushing directly.
           token: ${{ secrets.CLA_SIGNATURES_TOKEN }}
 
       - name: Download checksums and extract windows hash
@@ -219,7 +223,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Generate manifest and push to master
+      - name: Generate manifest and open PR
         run: |
           VERSION="${{ steps.checksums.outputs.version }}"
           WINDOWS_SHA="${{ steps.checksums.outputs.windows_sha }}"
@@ -246,8 +250,22 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add bucket/agentflare.json
-          git diff --cached --quiet || git commit -m "scoop manifest: agentflare ${VERSION}"
-          git push origin HEAD:master
+          if git diff --cached --quiet; then
+            echo "no manifest changes, skipping PR"
+            exit 0
+          fi
+
+          BRANCH="scoop-manifest-${VERSION}"
+          git checkout -b "$BRANCH"
+          git commit -m "scoop manifest: agentflare ${VERSION}"
+          git push origin "$BRANCH"
+
+          gh pr create --base master --head "$BRANCH" \
+            --title "scoop manifest: agentflare ${VERSION}" \
+            --body "Automated Scoop manifest update for release ${GITHUB_REF_NAME}."
+          gh pr merge "$BRANCH" --auto --squash --delete-branch
+        env:
+          GH_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
 
   trigger-npm-publish:
     name: Trigger npm publish
