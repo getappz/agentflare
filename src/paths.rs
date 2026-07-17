@@ -25,6 +25,45 @@ pub fn agentflare_binary() -> String {
         .unwrap_or_else(|| "agentflare".to_string())
 }
 
+/// `~/.claude` — the Claude Code config directory. Single definition so the
+/// many call sites that build paths under it (settings, rules, credentials)
+/// can't drift apart.
+pub fn claude_dir() -> PathBuf {
+    home().join(".claude")
+}
+
+/// `~/.claude/settings.json` — Claude Code's user-scope settings/hooks file.
+pub fn claude_settings_path() -> PathBuf {
+    claude_dir().join("settings.json")
+}
+
+/// `~/.claude/rules` — where agentflare drops its rule markdown for Claude Code.
+pub fn claude_rules_dir() -> PathBuf {
+    claude_dir().join("rules")
+}
+
+/// `~/.claude.json` — user-scope `claude mcp add` registrations live here, a
+/// separate file from `~/.claude/settings.json`.
+pub fn claude_json_path() -> PathBuf {
+    home().join(".claude.json")
+}
+
+/// `~/.config/opencode` — the OpenCode config directory.
+pub fn opencode_dir() -> PathBuf {
+    home().join(".config").join("opencode")
+}
+
+/// `~/.config/opencode/opencode.jsonc` — OpenCode's config file (JSONC).
+pub fn opencode_config_path() -> PathBuf {
+    opencode_dir().join("opencode.jsonc")
+}
+
+/// `~/.config/opencode/rules` — where agentflare drops its rule markdown for
+/// OpenCode.
+pub fn opencode_rules_dir() -> PathBuf {
+    opencode_dir().join("rules")
+}
+
 /// Shared by mcp_server.rs (serving skill_search/skill_load) and
 /// components.rs (syncing skillOverrides) — same on-disk cache, single path
 /// definition so the two can never drift apart.

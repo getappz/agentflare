@@ -1,4 +1,7 @@
-use crate::paths::home;
+use crate::jsonc::write_json_pretty;
+use crate::paths::{
+    claude_rules_dir, claude_settings_path, home, opencode_config_path, opencode_rules_dir,
+};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -50,12 +53,12 @@ fn remove_dir(path: &PathBuf, dry_run: bool) {
 }
 
 fn clean_claude_code(dry_run: bool) {
-    let rules = home().join(".claude").join("rules");
+    let rules = claude_rules_dir();
     for f in &["exa.md", "git.md", "lean-ctx.md"] {
         remove_file(&rules.join(f), dry_run);
     }
 
-    let settings_path = home().join(".claude").join("settings.json");
+    let settings_path = claude_settings_path();
     if settings_path.exists() {
         let content = fs::read_to_string(&settings_path).unwrap_or_default();
         if content.contains("agentflare")
@@ -93,25 +96,19 @@ fn clean_claude_code(dry_run: bool) {
             if dry_run {
                 println!("  clean ~/.claude/settings.json (remove agentflare hooks)");
             } else {
-                let _ = fs::write(
-                    &settings_path,
-                    serde_json::to_string_pretty(&settings).unwrap() + "\n",
-                );
+                let _ = write_json_pretty(&settings_path, &settings);
             }
         }
     }
 }
 
 fn clean_opencode(dry_run: bool) {
-    let rules_dir = home().join(".config").join("opencode").join("rules");
+    let rules_dir = opencode_rules_dir();
     for f in &["exa.md", "git.md", "lean-ctx.md"] {
         remove_file(&rules_dir.join(f), dry_run);
     }
 
-    let config_path = home()
-        .join(".config")
-        .join("opencode")
-        .join("opencode.jsonc");
+    let config_path = opencode_config_path();
     if config_path.exists() {
         let content = fs::read_to_string(&config_path).unwrap_or_default();
         if (content.contains("agentflare")
@@ -139,10 +136,7 @@ fn clean_opencode(dry_run: bool) {
                     "  clean ~/.config/opencode/opencode.jsonc (remove agentflare instructions)"
                 );
             } else {
-                let _ = fs::write(
-                    &config_path,
-                    serde_json::to_string_pretty(&config).unwrap() + "\n",
-                );
+                let _ = write_json_pretty(&config_path, &config);
             }
         }
     }
@@ -213,7 +207,7 @@ fn clean_mcp_entry(path: &PathBuf, dry_run: bool) {
         if dry_run {
             println!("  clean {} (remove agentflare MCP entries)", path.display());
         } else {
-            let _ = fs::write(path, serde_json::to_string_pretty(&config).unwrap() + "\n");
+            let _ = write_json_pretty(path, &config);
         }
     }
 }

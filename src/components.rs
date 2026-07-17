@@ -2,11 +2,15 @@
 // fix itself. `init` runs every entry; `hook session-start` only runs the
 // non-consent ones (rules/mode-pinning) since installing packages happens
 // only via the explicit `init` command, never from an auto-firing hook.
-use crate::paths::home;
+use crate::jsonc::{read_json_object, write_json_pretty};
+use crate::paths::{
+    claude_json_path, claude_rules_dir, claude_settings_path, home, opencode_config_path,
+    opencode_rules_dir,
+};
 use crate::rule_text;
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub struct Component {
@@ -32,19 +36,13 @@ fn run_ok(cmd: &str, args: &[&str]) -> bool {
 }
 
 fn claude_settings() -> Value {
-    fs::read_to_string(home().join(".claude").join("settings.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(Value::Null)
+    json_at(&claude_settings_path())
 }
 
 /// User-scope `claude mcp add` registrations live in `~/.claude.json`, a
 /// separate file from `~/.claude/settings.json`.
 fn claude_json() -> Value {
-    fs::read_to_string(home().join(".claude.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(Value::Null)
+    json_at(&claude_json_path())
 }
 
 /// Removes a server entry from `~/.claude.json`'s `mcpServers` map, if
@@ -53,7 +51,7 @@ fn claude_json() -> Value {
 /// re-registered behind the agentflare gateway instead. Returns true only if
 /// an entry was actually found and removed.
 fn remove_claude_mcp_server(name: &str) -> bool {
-    let path = home().join(".claude.json");
+    let path = claude_json_path();
     let mut root = claude_json();
     let Some(servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut()) else {
         return false;
@@ -61,11 +59,7 @@ fn remove_claude_mcp_server(name: &str) -> bool {
     if servers.remove(name).is_none() {
         return false;
     }
-    fs::write(
-        &path,
-        serde_json::to_string_pretty(&root).unwrap_or_default() + "\n",
-    )
-    .is_ok()
+    write_json_pretty(&path, &root).is_ok()
 }
 
 fn json_at(path: &std::path::Path) -> Value {
@@ -81,14 +75,10 @@ fn plugin_enabled(settings: &Value, key: &str) -> bool {
 }
 
 fn write_pinned_mode(path: &PathBuf) -> bool {
-    let current: Option<String> = fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| {
-            v.get("defaultMode")
-                .and_then(|m| m.as_str())
-                .map(String::from)
-        });
+    let current: Option<String> = json_at(path)
+        .get("defaultMode")
+        .and_then(|m| m.as_str())
+        .map(String::from);
     if current.is_some() {
         return false;
     }
@@ -98,11 +88,8 @@ fn write_pinned_mode(path: &PathBuf) -> bool {
     fs::write(path, "{\"defaultMode\": \"ultra\"}\n").is_ok()
 }
 
-fn merge_json(path: &PathBuf, root_key: &str, key: &str, value: Value) -> bool {
-    let mut existing: Value = crate::jsonc::read_jsonc(path, || serde_json::json!({}));
-    if !existing.is_object() {
-        existing = serde_json::json!({});
-    }
+fn merge_json(path: &Path, root_key: &str, key: &str, value: Value) -> bool {
+    let mut existing = read_json_object(path, || serde_json::json!({}));
     let obj = existing.as_object_mut().unwrap();
     let servers = obj.entry(root_key).or_insert_with(|| serde_json::json!({}));
     if let Some(m) = servers.as_object_mut() {
@@ -111,18 +98,11 @@ fn merge_json(path: &PathBuf, root_key: &str, key: &str, value: Value) -> bool {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    fs::write(
-        path,
-        serde_json::to_string_pretty(&existing).unwrap_or_default() + "\n",
-    )
-    .is_ok()
+    write_json_pretty(path, &existing).is_ok()
 }
 
-fn merge_opencode_mcp(path: &PathBuf, key: &str, entry: Value) -> bool {
-    let mut existing: Value = crate::jsonc::read_jsonc(path, || serde_json::json!({}));
-    if !existing.is_object() {
-        existing = serde_json::json!({});
-    }
+fn merge_opencode_mcp(path: &Path, key: &str, entry: Value) -> bool {
+    let mut existing = read_json_object(path, || serde_json::json!({}));
     let obj = existing.as_object_mut().unwrap();
     let mcp = obj.entry("mcp").or_insert_with(|| serde_json::json!({}));
     if let Some(m) = mcp.as_object_mut()
@@ -155,11 +135,7 @@ fn merge_opencode_mcp(path: &PathBuf, key: &str, entry: Value) -> bool {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    fs::write(
-        path,
-        serde_json::to_string_pretty(&existing).unwrap_or_default() + "\n",
-    )
-    .is_ok()
+    write_json_pretty(path, &existing).is_ok()
 }
 
 fn write_if_absent(path: &PathBuf, content: &str) -> bool {
@@ -181,7 +157,7 @@ pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
     let joined = || rule_text::all().join("\n\n");
     match host {
         "claude-code" => {
-            let dir = home().join(".claude").join("rules");
+            let dir = claude_rules_dir();
             vec![
                 (dir.join("exa.md"), rule_text::EXA.to_string()),
                 (dir.join("git.md"), rule_text::GIT.to_string()),
@@ -218,7 +194,7 @@ pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
             )]
         }
         "opencode" => {
-            let dir = home().join(".config").join("opencode").join("rules");
+            let dir = opencode_rules_dir();
             vec![
                 (dir.join("exa.md"), rule_text::EXA.to_string()),
                 (dir.join("git.md"), rule_text::GIT.to_string()),
@@ -271,15 +247,11 @@ fn apply_skill_overrides(names: &[String], settings: &mut Value) -> Result<usize
 #[cfg(feature = "skill-overrides-sync")]
 fn sync_skill_overrides() -> Result<usize, String> {
     let names = discover_skill_names()?;
-    let path = home().join(".claude").join("settings.json");
+    let path = claude_settings_path();
     let mut settings = claude_settings();
     let added = apply_skill_overrides(&names, &mut settings)?;
     if added > 0 {
-        fs::write(
-            &path,
-            serde_json::to_string_pretty(&settings).unwrap_or_default() + "\n",
-        )
-        .map_err(|e| e.to_string())?;
+        write_json_pretty(&path, &settings).map_err(|e| e.to_string())?;
     }
     Ok(added)
 }
@@ -425,7 +397,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
                         .and_then(|m| m.get("flare"))
                         .is_some(),
                     "continue" => cwd().join(".continue").join("mcpServers").join("flare.json").exists(),
-                    "opencode" => json_at(&home().join(".config").join("opencode").join("opencode.jsonc"))
+                    "opencode" => json_at(&opencode_config_path())
                         .get("mcp")
                         .and_then(|m| m.get("flare"))
                         .is_some(),
@@ -507,7 +479,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
                             }
                         }
                         "opencode" => {
-                            let path = home().join(".config").join("opencode").join("opencode.jsonc");
+                            let path = opencode_config_path();
                             if merge_opencode_mcp(&path, "flare", entry) {
                                 format!("{} (flare registered)", path.display())
                             } else {
@@ -548,11 +520,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
                     if !claude_code_only {
                         return true;
                     }
-                    fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                        .and_then(|v| v.get("defaultMode").cloned())
-                        .is_some()
+                    json_at(&path).get("defaultMode").is_some()
                 })
             },
             apply: {
