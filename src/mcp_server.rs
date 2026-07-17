@@ -369,7 +369,7 @@ struct MemoryRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct GitHubRequest {
-    #[schemars(description = "Action: pr_create|pr_list|pr_get|pr_merge|pr_comment|pr_request_review")]
+    #[schemars(description = "Action: pr_create|pr_list|pr_get|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|release_list|release_get|release_latest|release_create|run_list|run_get|run_rerun|workflow_dispatch")]
     action: String,
     #[schemars(description = "owner/repo (default: resolved from the current repo's origin)")]
     #[serde(default)]
@@ -2546,9 +2546,19 @@ impl AgentflareMcp {
             }
             "workflow_dispatch" => {
                 let wf = req.workflow.as_deref().ok_or_else(|| ErrorData::invalid_params("workflow is required", None))?;
+                if let Some(inputs) = req.inputs.as_ref() {
+                    if !inputs.is_object() {
+                        return Err(ErrorData::invalid_params("inputs must be a JSON object", None));
+                    }
+                }
                 let git_ref = match req.git_ref.as_deref() {
                     Some(r) => r.to_string(),
-                    None => crate::git::resolve_default_branch(&std::env::current_dir().unwrap_or_default()),
+                    None => {
+                        if req.repo.is_some() {
+                            return Err(ErrorData::invalid_params("git_ref is required when repo is overridden (cannot infer the target repo default branch)", None));
+                        }
+                        crate::git::resolve_default_branch(&std::env::current_dir().unwrap_or_default())
+                    }
                 };
                 actions::dispatch(&client, &repo, wf, &git_ref, req.inputs.as_ref()).map_err(to_mcp_error)?;
                 format!("Dispatched {wf} on {git_ref}")
