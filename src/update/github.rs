@@ -7,8 +7,6 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 pub(crate) const REPO: &str = "getappz/agentflare";
-pub(crate) const API_LATEST: &str =
-    "https://api.github.com/repos/getappz/agentflare/releases/latest";
 
 pub(crate) fn target_triple() -> &'static str {
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) {

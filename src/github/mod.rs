@@ -11,7 +11,7 @@ pub mod models;
 pub mod pulls;
 
 pub use client::Client;
-pub use identity::{RepoId, normalize_repo};
+pub use identity::RepoId;
 
 /// All failure modes of the GitHub module. `Display` never contains the token.
 #[derive(Debug)]

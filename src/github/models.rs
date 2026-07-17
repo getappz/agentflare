@@ -6,8 +6,6 @@ pub struct PullRequest {
     pub html_url: String,
     pub state: String,
     pub title: String,
-    #[serde(default)]
-    pub merged: Option<bool>,
 }
 
 #[cfg(test)]
@@ -24,6 +22,5 @@ mod tests {
         assert_eq!(pr.number, 7);
         assert_eq!(pr.html_url, "https://github.com/o/r/pull/7");
         assert_eq!(pr.state, "open");
-        assert_eq!(pr.merged, None);
     }
 }

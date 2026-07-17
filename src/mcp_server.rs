@@ -2416,7 +2416,7 @@ impl AgentflareMcp {
             "pr_get" => {
                 let n = req.number.ok_or_else(|| ErrorData::invalid_params("number is required", None))?;
                 let pr = pulls::get(&client, &repo, n).map_err(to_mcp_error)?;
-                format!("PR #{} [{}]: {}", pr.number, pr.state, pr.html_url)
+                format!("PR #{} [{}] {}: {}", pr.number, pr.state, pr.title, pr.html_url)
             }
             "pr_merge" => {
                 let n = req.number.ok_or_else(|| ErrorData::invalid_params("number is required", None))?;
