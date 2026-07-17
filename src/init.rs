@@ -6,7 +6,10 @@
 // flag (`[features] codex_hooks = true` in config.toml) that Codex itself
 // requires — wire_codex_hooks() upserts it alongside hooks.json.
 use crate::components::{get_components, rule_targets};
-use crate::paths::{agentflare_binary, home};
+use crate::jsonc::{read_json_object, write_json_pretty};
+use crate::paths::{
+    agentflare_binary, claude_settings_path, home, opencode_config_path, opencode_rules_dir,
+};
 use crate::rule_text;
 use crate::ui;
 use serde_json::{Map, Value, json};
@@ -66,7 +69,7 @@ fn confirm_ponytail_migration(agent: &str, yes: bool) -> bool {
 }
 
 fn has_existing_ponytail_claude() -> bool {
-    let path = home().join(".claude").join("settings.json");
+    let path = claude_settings_path();
     if let Ok(content) = fs::read_to_string(&path)
         && let Ok(settings) = serde_json::from_str::<Value>(&content)
     {
@@ -94,10 +97,7 @@ fn has_existing_ponytail_cursor() -> bool {
 }
 
 fn has_existing_ponytail_opencode() -> bool {
-    let path = home()
-        .join(".config")
-        .join("opencode")
-        .join("opencode.jsonc");
+    let path = opencode_config_path();
     if let Ok(content) = fs::read_to_string(&path) {
         has_ponytail_ref(&content) && !content.contains("agentflare")
     } else {
@@ -298,14 +298,8 @@ fn add_hook_entry(
 }
 
 fn wire_claude_code() {
-    let path = home().join(".claude").join("settings.json");
-    let mut settings: Value = fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    if !settings.is_object() {
-        settings = json!({});
-    }
+    let path = claude_settings_path();
+    let mut settings = read_json_object(&path, || json!({}));
     let bin = agentflare_binary();
 
     let obj = settings.as_object_mut().unwrap();
@@ -350,10 +344,7 @@ fn wire_claude_code() {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match fs::write(
-        &path,
-        serde_json::to_string_pretty(&settings).unwrap() + "\n",
-    ) {
+    match write_json_pretty(&path, &settings) {
         Ok(_) => ui::success("~/.claude/settings.json hooks wired"),
         Err(e) => ui::error(&format!("writing ~/.claude/settings.json: {e}")),
     }
@@ -427,10 +418,7 @@ fn wire_cursor() {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match fs::write(
-        &path,
-        serde_json::to_string_pretty(&content).unwrap() + "\n",
-    ) {
+    match write_json_pretty(&path, &content) {
         Ok(_) => ui::success(".cursor/hooks.json wired"),
         Err(e) => ui::error(&format!("writing .cursor/hooks.json: {e}")),
     }
@@ -443,13 +431,7 @@ fn wire_cursor() {
 fn wire_codex_hooks() {
     let codex_dir = home().join(".codex");
     let hooks_path = codex_dir.join("hooks.json");
-    let mut settings: Value = fs::read_to_string(&hooks_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    if !settings.is_object() {
-        settings = json!({});
-    }
+    let mut settings = read_json_object(&hooks_path, || json!({}));
     let bin = agentflare_binary();
 
     let obj = settings.as_object_mut().unwrap();
@@ -469,10 +451,7 @@ fn wire_codex_hooks() {
         let _ = fs::create_dir_all(parent);
     }
     if added {
-        match fs::write(
-            &hooks_path,
-            serde_json::to_string_pretty(&settings).unwrap() + "\n",
-        ) {
+        match write_json_pretty(&hooks_path, &settings) {
             Ok(_) => ui::success("~/.codex/hooks.json wired"),
             Err(e) => ui::error(&format!("writing ~/.codex/hooks.json: {e}")),
         }
@@ -498,17 +477,11 @@ fn wire_codex_hooks() {
 }
 
 fn wire_opencode() {
-    let path = home()
-        .join(".config")
-        .join("opencode")
-        .join("opencode.jsonc");
-    let rules_dir = home().join(".config").join("opencode").join("rules");
+    let path = opencode_config_path();
+    let rules_dir = opencode_rules_dir();
     let rule_files: &[&str] = &["exa.md", "git.md", "lean-ctx.md"];
 
-    let mut config: Value = crate::jsonc::read_jsonc(&path, || json!({}));
-    if !config.is_object() {
-        config = json!({});
-    }
+    let mut config = read_json_object(&path, || json!({}));
 
     let instructions = config
         .as_object_mut()
@@ -552,7 +525,7 @@ fn wire_opencode() {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        match fs::write(&path, serde_json::to_string_pretty(&config).unwrap() + "\n") {
+        match write_json_pretty(&path, &config) {
             Ok(_) if removed_legacy => ui::success(&format!(
                 "opencode.jsonc instructions wired ({added} rule(s), removed stale engram.md)"
             )),
@@ -580,14 +553,8 @@ pub fn wire_optimize_hooks(agent: &str) {
 }
 
 fn wire_optimize_claude_code() {
-    let path = home().join(".claude").join("settings.json");
-    let mut settings: Value = fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    if !settings.is_object() {
-        settings = json!({});
-    }
+    let path = claude_settings_path();
+    let mut settings = read_json_object(&path, || json!({}));
     let bin = agentflare_binary();
 
     let already_wired = settings
@@ -625,10 +592,7 @@ fn wire_optimize_claude_code() {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match fs::write(
-        &path,
-        serde_json::to_string_pretty(&settings).unwrap() + "\n",
-    ) {
+    match write_json_pretty(&path, &settings) {
         Ok(_) => ui::success("optimize code hooks wired in ~/.claude/settings.json"),
         Err(e) => ui::error(&format!("writing ~/.claude/settings.json: {e}")),
     }
@@ -646,13 +610,7 @@ fn wire_optimize_cursor() {
         }
     }
 
-    let mut content: Value = fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({ "version": 1, "hooks": {} }));
-    if !content.is_object() {
-        content = json!({ "version": 1, "hooks": {} });
-    }
+    let mut content = read_json_object(&path, || json!({ "version": 1, "hooks": {} }));
 
     let hooks = content
         .as_object_mut()
@@ -685,10 +643,7 @@ fn wire_optimize_cursor() {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match fs::write(
-        &path,
-        serde_json::to_string_pretty(&content).unwrap() + "\n",
-    ) {
+    match write_json_pretty(&path, &content) {
         Ok(_) => ui::success("optimize code hooks wired in .cursor/hooks.json"),
         Err(e) => ui::error(&format!("writing .cursor/hooks.json: {e}")),
     }

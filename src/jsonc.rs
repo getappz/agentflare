@@ -23,6 +23,26 @@ pub fn read_jsonc(path: &std::path::Path, default: impl FnOnce() -> Value) -> Va
         .and_then(|s| parse_jsonc(&s).ok())
         .unwrap_or_else(default)
 }
+
+/// Reads `path` as JSONC and guarantees the result is a JSON object: if the
+/// file is missing/unreadable/invalid, or parses to a non-object value,
+/// `default()` is returned instead. `default` must itself produce an object.
+///
+/// Consolidates the "read a config file, fall back to an empty object, and
+/// ensure it's an object before mutating" dance that every agent-config
+/// writer (`init.rs`, `components.rs`) repeated inline.
+pub fn read_json_object(path: &std::path::Path, default: impl Fn() -> Value) -> Value {
+    let value = read_jsonc(path, &default);
+    if value.is_object() { value } else { default() }
+}
+
+/// Serializes `value` as pretty JSON with a trailing newline and writes it to
+/// `path`. Mirrors what every agent-config writer in agentflare emits, so the
+/// exact byte format (2-space indent + final `\n`) stays in one place.
+pub fn write_json_pretty(path: &std::path::Path, value: &Value) -> std::io::Result<()> {
+    let body = serde_json::to_string_pretty(value).unwrap_or_default() + "\n";
+    std::fs::write(path, body)
+}
 /// Advances past a `"..."` string starting at `bytes[i] == b'"'`, honoring
 /// backslash escapes. Returns the index just past the closing quote (or
 /// `bytes.len()` if unterminated).
@@ -130,6 +150,44 @@ fn strip_trailing_commas(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_json_object_returns_default_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.json");
+        let v = read_json_object(&path, || serde_json::json!({ "a": 1 }));
+        assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn read_json_object_returns_default_when_not_an_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("arr.json");
+        std::fs::write(&path, "[1, 2, 3]").unwrap();
+        let v = read_json_object(&path, || serde_json::json!({}));
+        assert!(v.is_object());
+        assert_eq!(v.as_object().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn read_json_object_parses_jsonc_with_comments_and_trailing_commas() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.jsonc");
+        std::fs::write(&path, "{\n  // hi\n  \"k\": 1,\n}").unwrap();
+        let v = read_json_object(&path, || serde_json::json!({}));
+        assert_eq!(v["k"], 1);
+    }
+
+    #[test]
+    fn write_json_pretty_roundtrips_with_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.json");
+        write_json_pretty(&path, &serde_json::json!({ "k": "v" })).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.ends_with("\n"));
+        let v = read_json_object(&path, || serde_json::json!({}));
+        assert_eq!(v["k"], "v");
+    }
 
     #[test]
     fn strips_line_comments() {
