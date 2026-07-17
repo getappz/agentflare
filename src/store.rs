@@ -1,10 +1,14 @@
 use agentflare_store::{Error, Store};
 use std::path::PathBuf;
 
+/// Deliberately NOT `agentflare.db` -- that file is `src/db.rs`'s "single
+/// source-of-truth" relational store (claims, handoffs, review_findings,
+/// gateway_secrets, ...), with its own separate migration list. This store
+/// is a different kind of thing (blobs, FTS+vector documents, kv) with its
+/// own migrations; sharing a file would let two independent migration
+/// systems fight over the same schema/version state.
 pub fn store_path() -> PathBuf {
-    crate::paths::home()
-        .join(".agentflare")
-        .join("agentflare.db")
+    crate::paths::home().join(".agentflare").join("store.db")
 }
 
 /// Opens a fresh connection to the local store on every call -- deliberately
