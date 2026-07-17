@@ -419,6 +419,21 @@ struct GitHubRequest {
     #[schemars(description = "Mark release as prerelease (release_create, default false)")]
     #[serde(default)]
     prerelease: Option<bool>,
+    #[schemars(description = "Workflow run id (run_get, run_rerun)")]
+    #[serde(default)]
+    run_id: Option<u64>,
+    #[schemars(description = "Branch filter for run_list")]
+    #[serde(default)]
+    branch: Option<String>,
+    #[schemars(description = "Workflow file name or id (workflow_dispatch)")]
+    #[serde(default)]
+    workflow: Option<String>,
+    #[schemars(description = "Git ref to dispatch against (workflow_dispatch, default: repo default branch)")]
+    #[serde(default)]
+    git_ref: Option<String>,
+    #[schemars(description = "JSON inputs object for workflow_dispatch")]
+    #[serde(default)]
+    inputs: Option<serde_json::Value>,
 }
 
 #[derive(Default)]
@@ -2409,10 +2424,10 @@ impl AgentflareMcp {
         }
     }
     #[tool(
-        description = "GitHub repo management via the flare_git module. Single action-dispatch tool: action=pr_create|pr_list|pr_get|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|release_list|release_get|release_latest|release_create. Uses gh/GITHUB_TOKEN credentials; repo defaults to the current repo's origin."
+        description = "GitHub repo management via the flare_git module. Single action-dispatch tool: action=pr_create|pr_list|pr_get|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|release_list|release_get|release_latest|release_create|run_list|run_get|run_rerun|workflow_dispatch. Uses gh/GITHUB_TOKEN credentials; repo defaults to the current repo's origin."
     )]
     fn flare_git(&self, Parameters(req): Parameters<GitHubRequest>) -> Result<String, ErrorData> {
-        use crate::github::{Client, RepoId, issues, pulls, releases};
+        use crate::github::{Client, RepoId, actions, issues, pulls, releases};
 
         let repo = match &req.repo {
             Some(r) => RepoId::parse(r).ok_or_else(|| ErrorData::invalid_params(format!("bad repo: {r}"), None))?,
@@ -2511,6 +2526,32 @@ impl AgentflareMcp {
                     req.draft.unwrap_or(false), req.prerelease.unwrap_or(false),
                 ).map_err(to_mcp_error)?;
                 format!("Created release {}: {}", rel.tag_name, rel.html_url)
+            }
+            "run_list" => {
+                let runs = actions::list_runs(&client, &repo, req.branch.as_deref()).map_err(to_mcp_error)?;
+                let summary: Vec<String> = runs.iter()
+                    .map(|r| format!("{} {} {}", r.id, r.status, r.conclusion.as_deref().unwrap_or("-")))
+                    .collect();
+                serde_json::to_string(&summary).unwrap_or_default()
+            }
+            "run_get" => {
+                let id = req.run_id.ok_or_else(|| ErrorData::invalid_params("run_id is required", None))?;
+                let run = actions::get_run(&client, &repo, id).map_err(to_mcp_error)?;
+                format!("Run {} [{}/{}]: {}", run.id, run.status, run.conclusion.as_deref().unwrap_or("-"), run.html_url)
+            }
+            "run_rerun" => {
+                let id = req.run_id.ok_or_else(|| ErrorData::invalid_params("run_id is required", None))?;
+                actions::rerun(&client, &repo, id).map_err(to_mcp_error)?;
+                format!("Re-queued run {id}")
+            }
+            "workflow_dispatch" => {
+                let wf = req.workflow.as_deref().ok_or_else(|| ErrorData::invalid_params("workflow is required", None))?;
+                let git_ref = match req.git_ref.as_deref() {
+                    Some(r) => r.to_string(),
+                    None => crate::git::resolve_default_branch(&std::env::current_dir().unwrap_or_default()),
+                };
+                actions::dispatch(&client, &repo, wf, &git_ref, req.inputs.as_ref()).map_err(to_mcp_error)?;
+                format!("Dispatched {wf} on {git_ref}")
             }
             other => return Err(ErrorData::invalid_params(format!("unknown action: {other}"), None)),
         };
