@@ -13,6 +13,9 @@ pub struct Client {
 
 const BASE_URL: &str = "https://api.github.com";
 
+/// Max items per page GitHub allows for the list endpoints used here.
+const PER_PAGE: usize = 100;
+
 fn map_status(status: u16, ratelimit_remaining: Option<&str>, body: String) -> GitHubError {
     match status {
         401 => GitHubError::NoAuth(
@@ -97,6 +100,38 @@ impl Client {
             Err(e) => Err(GitHubError::Transport(e.to_string())),
         }
     }
+
+    /// GET every page of a list endpoint, walking `?page=N&per_page=100` until a
+    /// page comes back shorter than a full page. `extract` pulls the item array
+    /// out of each response — identity for bare-array endpoints, or the envelope
+    /// key (e.g. `workflow_runs`) for wrapped ones. Returns the concatenated
+    /// items as a JSON array so callers deserialize once.
+    pub fn get_paginated(
+        &self,
+        base_path: &str,
+        extract: impl Fn(&serde_json::Value) -> Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, GitHubError> {
+        let sep = if base_path.contains('?') { '&' } else { '?' };
+        let mut all: Vec<serde_json::Value> = Vec::new();
+        let mut page = 1usize;
+        loop {
+            let path = format!("{base_path}{sep}per_page={PER_PAGE}&page={page}");
+            let resp = self.request("GET", &path, None)?;
+            let items = extract(&resp);
+            let full = items.len() == PER_PAGE;
+            all.extend(items);
+            if !full {
+                break;
+            }
+            page += 1;
+        }
+        Ok(serde_json::Value::Array(all))
+    }
+}
+
+/// Extractor for bare-array list endpoints (pulls, issues, releases).
+pub fn as_array(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    v.as_array().cloned().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -125,5 +160,12 @@ mod tests {
             map_status(500, None, "boom".into()),
             GitHubError::Http { status: 500, .. }
         ));
+    }
+
+    #[test]
+    fn as_array_unwraps_or_defaults_empty() {
+        assert_eq!(as_array(&serde_json::json!([1, 2, 3])).len(), 3);
+        assert!(as_array(&serde_json::json!({})).is_empty());
+        assert!(as_array(&serde_json::Value::Null).is_empty());
     }
 }

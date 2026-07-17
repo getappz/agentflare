@@ -4,12 +4,12 @@
 use crate::github::models::WorkflowRun;
 use crate::github::{Client, GitHubError, RepoId};
 
-fn parse_runs(envelope: serde_json::Value) -> Result<Vec<WorkflowRun>, GitHubError> {
-    let arr = envelope
-        .get("workflow_runs")
+/// Extractor for the `{ workflow_runs: [...] }` envelope each page returns.
+fn workflow_runs(page: &serde_json::Value) -> Vec<serde_json::Value> {
+    page.get("workflow_runs")
+        .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or(serde_json::Value::Array(vec![]));
-    serde_json::from_value(arr).map_err(|e| GitHubError::Parse(e.to_string()))
+        .unwrap_or_default()
 }
 
 fn dispatch_body(git_ref: &str, inputs: Option<&serde_json::Value>) -> serde_json::Value {
@@ -29,8 +29,8 @@ pub fn list_runs(
     if let Some(b) = branch {
         path.push_str(&format!("?branch={}", crate::github::encode_query(b)));
     }
-    let envelope = client.request("GET", &path, None)?;
-    parse_runs(envelope)
+    let arr = client.get_paginated(&path, workflow_runs)?;
+    serde_json::from_value(arr).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
 pub fn get_run(client: &Client, repo: &RepoId, run_id: u64) -> Result<WorkflowRun, GitHubError> {
@@ -68,17 +68,17 @@ pub fn dispatch(
 mod tests {
     use super::*;
     #[test]
-    fn parse_runs_extracts_the_array() {
+    fn workflow_runs_extracts_the_array() {
         let env = serde_json::json!({ "total_count": 1, "workflow_runs": [{
             "id": 1, "status": "completed", "conclusion": "success",
             "html_url": "https://github.com/o/r/actions/runs/1" }] });
-        let runs = parse_runs(env).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].conclusion.as_deref(), Some("success"));
+        let items = workflow_runs(&env);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["conclusion"], "success");
     }
     #[test]
-    fn parse_runs_defaults_to_empty_when_key_absent() {
-        assert!(parse_runs(serde_json::json!({})).unwrap().is_empty());
+    fn workflow_runs_defaults_to_empty_when_key_absent() {
+        assert!(workflow_runs(&serde_json::json!({})).is_empty());
     }
     #[test]
     fn dispatch_body_includes_inputs_only_when_present() {

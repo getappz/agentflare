@@ -29,7 +29,7 @@ pub fn list(client: &Client, repo: &RepoId, state: &str) -> Result<Vec<PullReque
         repo.repo,
         crate::github::encode_query(state)
     );
-    let json = client.request("GET", &path, None)?;
+    let json = client.get_paginated(&path, crate::github::client::as_array)?;
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 

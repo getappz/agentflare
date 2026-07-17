@@ -22,7 +22,7 @@ fn create_body(
 
 pub fn list(client: &Client, repo: &RepoId) -> Result<Vec<Release>, GitHubError> {
     let path = format!("/repos/{}/{}/releases", repo.owner, repo.repo);
-    let json = client.request("GET", &path, None)?;
+    let json = client.get_paginated(&path, crate::github::client::as_array)?;
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
