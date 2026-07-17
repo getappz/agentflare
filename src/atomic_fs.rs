@@ -87,31 +87,38 @@ pub fn try_atomic_write(
         .map_or(0, |d| d.as_nanos());
     let tmp = parent.join(format!(".{filename}.agentflare.tmp.{pid}.{nanos}"));
 
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        let _ = f.flush();
-        let _ = f.sync_all();
-    }
+    // Everything after the temp file is created must clean it up on failure so
+    // a half-written temp isn't left behind before the caller decides whether
+    // to fall back. Errors from flush/sync_all/set_permissions are propagated
+    // rather than swallowed: a silently-dropped sync_all defeats the whole
+    // durability guarantee, and a silently-dropped set_permissions would leave
+    // e.g. a credential file at the process default mode instead of 0600.
+    let result = (|| -> std::io::Result<()> {
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            f.write_all(bytes)?;
+            f.flush()?;
+            f.sync_all()?;
+        }
 
-    if let Some(perms) = permissions {
-        let _ = std::fs::set_permissions(&tmp, perms.clone());
-    }
+        if let Some(perms) = permissions {
+            std::fs::set_permissions(&tmp, perms.clone())?;
+        }
 
-    // std::fs::rename already replaces an existing destination on every
-    // platform we build for (including Windows, via MoveFileExW's
-    // MOVEFILE_REPLACE_EXISTING) — no separate pre-removal needed, and one
-    // would only open a window where neither the old nor new file exists.
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        // Don't leave a half-written temp behind before the caller decides
-        // whether to fall back.
+        // std::fs::rename already replaces an existing destination on every
+        // platform we build for (including Windows, via MoveFileExW's
+        // MOVEFILE_REPLACE_EXISTING) — no separate pre-removal needed, and one
+        // would only open a window where neither the old nor new file exists.
+        std::fs::rename(&tmp, path)
+    })();
+
+    if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e);
     }
-    Ok(())
+    result
 }
 
 /// In-place overwrite of an existing file inode (`O_WRONLY|O_TRUNC`, plus
@@ -137,11 +144,11 @@ pub fn in_place_overwrite(
 
     let mut f = opts.open(path)?;
     f.write_all(bytes)?;
-    let _ = f.flush();
-    let _ = f.sync_all();
+    f.flush()?;
+    f.sync_all()?;
 
     if let Some(perms) = permissions {
-        let _ = std::fs::set_permissions(path, perms.clone());
+        std::fs::set_permissions(path, perms.clone())?;
     }
     Ok(())
 }
