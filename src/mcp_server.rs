@@ -398,6 +398,12 @@ struct GitHubRequest {
     #[schemars(description = "Reviewer logins (pr_request_review)")]
     #[serde(default)]
     reviewers: Option<Vec<String>>,
+    #[schemars(description = "Labels (issue_create, issue_label)")]
+    #[serde(default)]
+    labels: Option<Vec<String>>,
+    #[schemars(description = "Assignee logins (issue_create)")]
+    #[serde(default)]
+    assignees: Option<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -2388,10 +2394,10 @@ impl AgentflareMcp {
         }
     }
     #[tool(
-        description = "GitHub repo management via the flare_git module. Single action-dispatch tool: action=pr_create|pr_list|pr_get|pr_merge|pr_comment|pr_request_review. Uses gh/GITHUB_TOKEN credentials; repo defaults to the current repo's origin."
+        description = "GitHub repo management via the flare_git module. Single action-dispatch tool: action=pr_create|pr_list|pr_get|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label. Uses gh/GITHUB_TOKEN credentials; repo defaults to the current repo's origin."
     )]
     fn flare_git(&self, Parameters(req): Parameters<GitHubRequest>) -> Result<String, ErrorData> {
-        use crate::github::{Client, RepoId, pulls};
+        use crate::github::{Client, RepoId, issues, pulls};
 
         let repo = match &req.repo {
             Some(r) => RepoId::parse(r).ok_or_else(|| ErrorData::invalid_params(format!("bad repo: {r}"), None))?,
@@ -2435,6 +2441,40 @@ impl AgentflareMcp {
                 let reviewers = req.reviewers.clone().unwrap_or_default();
                 pulls::request_review(&client, &repo, n, &reviewers).map_err(to_mcp_error)?;
                 format!("Requested review on PR #{n}")
+            }
+            "issue_create" => {
+                let title = req.title.as_deref().ok_or_else(|| ErrorData::invalid_params("title is required", None))?;
+                let labels = req.labels.clone().unwrap_or_default();
+                let assignees = req.assignees.clone().unwrap_or_default();
+                let issue = issues::create(&client, &repo, title, req.body.as_deref(), &labels, &assignees).map_err(to_mcp_error)?;
+                format!("Opened issue #{}: {}", issue.number, issue.html_url)
+            }
+            "issue_list" => {
+                let state = req.state.as_deref().unwrap_or("open");
+                let items = issues::list(&client, &repo, state).map_err(to_mcp_error)?;
+                serde_json::to_string(&items.iter().map(|i| &i.html_url).collect::<Vec<_>>()).unwrap_or_default()
+            }
+            "issue_get" => {
+                let n = req.number.ok_or_else(|| ErrorData::invalid_params("number is required", None))?;
+                let issue = issues::get(&client, &repo, n).map_err(to_mcp_error)?;
+                format!("Issue #{} [{}] {}: {}", issue.number, issue.state, issue.title, issue.html_url)
+            }
+            "issue_comment" => {
+                let n = req.number.ok_or_else(|| ErrorData::invalid_params("number is required", None))?;
+                let body = req.body.as_deref().ok_or_else(|| ErrorData::invalid_params("body is required", None))?;
+                issues::comment(&client, &repo, n, body).map_err(to_mcp_error)?;
+                format!("Commented on issue #{n}")
+            }
+            "issue_close" => {
+                let n = req.number.ok_or_else(|| ErrorData::invalid_params("number is required", None))?;
+                let issue = issues::close(&client, &repo, n).map_err(to_mcp_error)?;
+                format!("Closed issue #{} [{}]", issue.number, issue.state)
+            }
+            "issue_label" => {
+                let n = req.number.ok_or_else(|| ErrorData::invalid_params("number is required", None))?;
+                let labels = req.labels.clone().unwrap_or_default();
+                issues::add_labels(&client, &repo, n, &labels).map_err(to_mcp_error)?;
+                format!("Added {} label(s) to issue #{n}", labels.len())
             }
             other => return Err(ErrorData::invalid_params(format!("unknown action: {other}"), None)),
         };
