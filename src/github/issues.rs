@@ -35,12 +35,21 @@ pub fn create(
     assignees: &[String],
 ) -> Result<Issue, GitHubError> {
     let path = format!("/repos/{}/{}/issues", repo.owner, repo.repo);
-    let json = client.request("POST", &path, Some(create_body(title, body, labels, assignees)))?;
+    let json = client.request(
+        "POST",
+        &path,
+        Some(create_body(title, body, labels, assignees)),
+    )?;
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
 pub fn list(client: &Client, repo: &RepoId, state: &str) -> Result<Vec<Issue>, GitHubError> {
-    let path = format!("/repos/{}/{}/issues?state={}", repo.owner, repo.repo, crate::github::encode_query(state));
+    let path = format!(
+        "/repos/{}/{}/issues?state={}",
+        repo.owner,
+        repo.repo,
+        crate::github::encode_query(state)
+    );
     let json = client.request("GET", &path, None)?;
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
@@ -52,14 +61,21 @@ pub fn get(client: &Client, repo: &RepoId, number: u64) -> Result<Issue, GitHubE
 }
 
 pub fn comment(client: &Client, repo: &RepoId, number: u64, body: &str) -> Result<(), GitHubError> {
-    let path = format!("/repos/{}/{}/issues/{number}/comments", repo.owner, repo.repo);
+    let path = format!(
+        "/repos/{}/{}/issues/{number}/comments",
+        repo.owner, repo.repo
+    );
     client.request("POST", &path, Some(serde_json::json!({ "body": body })))?;
     Ok(())
 }
 
 pub fn close(client: &Client, repo: &RepoId, number: u64) -> Result<Issue, GitHubError> {
     let path = format!("/repos/{}/{}/issues/{number}", repo.owner, repo.repo);
-    let json = client.request("PATCH", &path, Some(serde_json::json!({ "state": "closed" })))?;
+    let json = client.request(
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "state": "closed" })),
+    )?;
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
@@ -80,7 +96,12 @@ mod tests {
 
     #[test]
     fn create_body_includes_optional_fields_only_when_present() {
-        let full = create_body("t", Some("desc"), &["bug".to_string()], &["alice".to_string()]);
+        let full = create_body(
+            "t",
+            Some("desc"),
+            &["bug".to_string()],
+            &["alice".to_string()],
+        );
         assert_eq!(full["title"], "t");
         assert_eq!(full["body"], "desc");
         assert_eq!(full["labels"][0], "bug");

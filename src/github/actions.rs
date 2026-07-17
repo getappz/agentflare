@@ -5,7 +5,10 @@ use crate::github::models::WorkflowRun;
 use crate::github::{Client, GitHubError, RepoId};
 
 fn parse_runs(envelope: serde_json::Value) -> Result<Vec<WorkflowRun>, GitHubError> {
-    let arr = envelope.get("workflow_runs").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+    let arr = envelope
+        .get("workflow_runs")
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(vec![]));
     serde_json::from_value(arr).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
@@ -17,7 +20,11 @@ fn dispatch_body(git_ref: &str, inputs: Option<&serde_json::Value>) -> serde_jso
     v
 }
 
-pub fn list_runs(client: &Client, repo: &RepoId, branch: Option<&str>) -> Result<Vec<WorkflowRun>, GitHubError> {
+pub fn list_runs(
+    client: &Client,
+    repo: &RepoId,
+    branch: Option<&str>,
+) -> Result<Vec<WorkflowRun>, GitHubError> {
     let mut path = format!("/repos/{}/{}/actions/runs", repo.owner, repo.repo);
     if let Some(b) = branch {
         path.push_str(&format!("?branch={}", crate::github::encode_query(b)));
@@ -33,14 +40,26 @@ pub fn get_run(client: &Client, repo: &RepoId, run_id: u64) -> Result<WorkflowRu
 }
 
 pub fn rerun(client: &Client, repo: &RepoId, run_id: u64) -> Result<(), GitHubError> {
-    let path = format!("/repos/{}/{}/actions/runs/{run_id}/rerun", repo.owner, repo.repo);
+    let path = format!(
+        "/repos/{}/{}/actions/runs/{run_id}/rerun",
+        repo.owner, repo.repo
+    );
     client.request("POST", &path, Some(serde_json::json!({})))?;
     Ok(())
 }
 
 /// `workflow` is a workflow file name (e.g. "ci.yml") or numeric id.
-pub fn dispatch(client: &Client, repo: &RepoId, workflow: &str, git_ref: &str, inputs: Option<&serde_json::Value>) -> Result<(), GitHubError> {
-    let path = format!("/repos/{}/{}/actions/workflows/{workflow}/dispatches", repo.owner, repo.repo);
+pub fn dispatch(
+    client: &Client,
+    repo: &RepoId,
+    workflow: &str,
+    git_ref: &str,
+    inputs: Option<&serde_json::Value>,
+) -> Result<(), GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/actions/workflows/{workflow}/dispatches",
+        repo.owner, repo.repo
+    );
     client.request("POST", &path, Some(dispatch_body(git_ref, inputs)))?;
     Ok(())
 }

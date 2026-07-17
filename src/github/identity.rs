@@ -23,7 +23,10 @@ impl RepoId {
         if owner.is_empty() || repo.is_empty() {
             return None;
         }
-        Some(RepoId { owner: owner.to_string(), repo: repo.to_string() })
+        Some(RepoId {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        })
     }
 
     pub fn resolve_from_remote(repo_root: &Path) -> Option<RepoId> {
@@ -39,7 +42,10 @@ pub fn normalize_repo(remote_url: &str) -> String {
     let after_scheme = s.split("://").last().unwrap_or(s);
     let path = match after_scheme.split_once(':') {
         Some((_host, path)) if !path.starts_with('/') => path,
-        _ => after_scheme.split_once('/').map(|x| x.1).unwrap_or(after_scheme),
+        _ => after_scheme
+            .split_once('/')
+            .map(|x| x.1)
+            .unwrap_or(after_scheme),
     };
     let path = path.trim_start_matches('/').trim_end_matches(".git");
     let segs: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();

@@ -19,25 +19,37 @@ pub fn classify(env_present: bool, secret_present: bool, gh_present: bool) -> Cr
 }
 
 fn env_present() -> bool {
-    ["GITHUB_TOKEN", "GH_TOKEN"].iter().any(|v| std::env::var(v).map(|s| !s.trim().is_empty()).unwrap_or(false))
+    ["GITHUB_TOKEN", "GH_TOKEN"].iter().any(|v| {
+        std::env::var(v)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    })
 }
 
 fn gh_present() -> bool {
-    std::process::Command::new("gh").args(["auth", "token"]).output()
-        .map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false)
+    std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 fn secret_present() -> bool {
     crate::db::open()
         .ok()
-        .and_then(|conn| crate::gateway_secrets::get_secret(&conn, "github_token").ok().flatten())
+        .and_then(|conn| {
+            crate::gateway_secrets::get_secret(&conn, "github_token")
+                .ok()
+                .flatten()
+        })
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false)
 }
 
 pub fn is_github_repo(repo_root: &std::path::Path) -> bool {
     crate::git::run_in_opt(repo_root, &["remote", "get-url", "origin"])
-        .map(|u| u.contains("github")).unwrap_or(false)
+        .map(|u| u.contains("github"))
+        .unwrap_or(false)
 }
 
 fn store_token(token: &str) -> Result<(), String> {
@@ -57,13 +69,21 @@ pub fn ensure(agent: &str, yes: bool) {
             println!("  skip  GitHub credential present (via {src})");
         }
         CredState::Missing => {
-            println!("  info  No GitHub credential found — flare_git writes (PRs, issues, releases) need one.");
+            println!(
+                "  info  No GitHub credential found — flare_git writes (PRs, issues, releases) need one."
+            );
             use std::io::IsTerminal;
             if yes || !std::io::stdin().is_terminal() {
-                println!("  skip  non-interactive: run gh auth login or set GITHUB_TOKEN to enable flare_git writes");
+                println!(
+                    "  skip  non-interactive: run gh auth login or set GITHUB_TOKEN to enable flare_git writes"
+                );
                 return;
             }
-            if !crate::init::prompt_yes("  Store a GitHub token now? (or run 'gh auth login' later) [Y/n] ", agent, yes) {
+            if !crate::init::prompt_yes(
+                "  Store a GitHub token now? (or run 'gh auth login' later) [Y/n] ",
+                agent,
+                yes,
+            ) {
                 return;
             }
             print!("  Paste a GitHub PAT (input hidden): ");
@@ -88,8 +108,14 @@ mod tests {
     use super::*;
     #[test]
     fn classify_prefers_env_then_secret_then_gh_then_missing() {
-        assert_eq!(classify(true, true, true), CredState::Present("GITHUB_TOKEN"));
-        assert_eq!(classify(false, true, true), CredState::Present("stored secret"));
+        assert_eq!(
+            classify(true, true, true),
+            CredState::Present("GITHUB_TOKEN")
+        );
+        assert_eq!(
+            classify(false, true, true),
+            CredState::Present("stored secret")
+        );
         assert_eq!(classify(false, false, true), CredState::Present("gh"));
         assert_eq!(classify(false, false, false), CredState::Missing);
     }

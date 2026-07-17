@@ -9,7 +9,11 @@ pub(crate) const NO_AUTH_MSG: &str = "No GitHub credentials. Set GITHUB_TOKEN, r
 
 fn nonempty(s: String) -> Option<String> {
     let t = s.trim();
-    if t.is_empty() { None } else { Some(t.to_string()) }
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }
 
 fn env_token() -> Option<String> {
@@ -28,8 +32,13 @@ fn secret_token() -> Option<String> {
 }
 
 fn gh_auth_token() -> Option<String> {
-    let out = std::process::Command::new("gh").args(["auth", "token"]).output().ok()?;
-    if !out.status.success() { return None; }
+    let out = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     nonempty(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
@@ -54,13 +63,22 @@ mod tests {
 
     #[test]
     fn pick_prefers_env_then_secret_then_gh() {
-        assert_eq!(pick_token(Some("e".into()), Some("s".into()), Some("g".into())).unwrap(), "e");
-        assert_eq!(pick_token(None, Some("s".into()), Some("g".into())).unwrap(), "s");
+        assert_eq!(
+            pick_token(Some("e".into()), Some("s".into()), Some("g".into())).unwrap(),
+            "e"
+        );
+        assert_eq!(
+            pick_token(None, Some("s".into()), Some("g".into())).unwrap(),
+            "s"
+        );
         assert_eq!(pick_token(None, None, Some("g".into())).unwrap(), "g");
     }
 
     #[test]
     fn pick_none_is_noauth() {
-        assert!(matches!(pick_token(None, None, None).unwrap_err(), GitHubError::NoAuth(_)));
+        assert!(matches!(
+            pick_token(None, None, None).unwrap_err(),
+            GitHubError::NoAuth(_)
+        ));
     }
 }

@@ -39,11 +39,19 @@ impl Client {
     }
 
     pub fn new() -> Result<Client, GitHubError> {
-        Ok(Client { agent: Self::agent(), token: Some(auth::resolve_token()?), base_url: BASE_URL.to_string() })
+        Ok(Client {
+            agent: Self::agent(),
+            token: Some(auth::resolve_token()?),
+            base_url: BASE_URL.to_string(),
+        })
     }
 
     pub fn anonymous() -> Client {
-        Client { agent: Self::agent(), token: None, base_url: BASE_URL.to_string() }
+        Client {
+            agent: Self::agent(),
+            token: None,
+            base_url: BASE_URL.to_string(),
+        }
     }
 
     pub fn request(
@@ -53,7 +61,9 @@ impl Client {
         body: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, GitHubError> {
         if method != "GET" && self.token.is_none() {
-            return Err(GitHubError::NoAuth(crate::github::auth::NO_AUTH_MSG.to_string()));
+            return Err(GitHubError::NoAuth(
+                crate::github::auth::NO_AUTH_MSG.to_string(),
+            ));
         }
         let url = format!("{}{}", self.base_url, path);
         let mut req = self
@@ -71,7 +81,9 @@ impl Client {
         };
         match result {
             Ok(resp) => {
-                let text = resp.into_string().map_err(|e| GitHubError::Transport(e.to_string()))?;
+                let text = resp
+                    .into_string()
+                    .map_err(|e| GitHubError::Transport(e.to_string()))?;
                 if text.trim().is_empty() {
                     return Ok(serde_json::Value::Null);
                 }
@@ -93,10 +105,25 @@ mod tests {
 
     #[test]
     fn map_status_covers_the_table() {
-        assert!(matches!(map_status(401, None, String::new()), GitHubError::NoAuth(_)));
-        assert!(matches!(map_status(403, Some("0"), String::new()), GitHubError::RateLimited(_)));
-        assert!(matches!(map_status(403, Some("42"), String::new()), GitHubError::Forbidden(_)));
-        assert!(matches!(map_status(404, None, String::new()), GitHubError::NotFound));
-        assert!(matches!(map_status(500, None, "boom".into()), GitHubError::Http { status: 500, .. }));
+        assert!(matches!(
+            map_status(401, None, String::new()),
+            GitHubError::NoAuth(_)
+        ));
+        assert!(matches!(
+            map_status(403, Some("0"), String::new()),
+            GitHubError::RateLimited(_)
+        ));
+        assert!(matches!(
+            map_status(403, Some("42"), String::new()),
+            GitHubError::Forbidden(_)
+        ));
+        assert!(matches!(
+            map_status(404, None, String::new()),
+            GitHubError::NotFound
+        ));
+        assert!(matches!(
+            map_status(500, None, "boom".into()),
+            GitHubError::Http { status: 500, .. }
+        ));
     }
 }

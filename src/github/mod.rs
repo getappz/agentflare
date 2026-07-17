@@ -3,16 +3,16 @@
 //! releases, actions). Built on the already-present `ureq` + `serde_json`; no
 //! new dependency, and sync throughout so the MCP tool stays a plain `fn`.
 
+pub mod actions;
 pub mod auth;
 pub mod client;
 pub mod identity;
+pub mod init_auth;
 pub mod issues;
 pub mod mcp;
 pub mod models;
 pub mod pulls;
 pub mod releases;
-pub mod actions;
-pub mod init_auth;
 
 pub use client::Client;
 pub use identity::RepoId;
@@ -50,7 +50,9 @@ pub enum GitHubError {
 impl std::fmt::Display for GitHubError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GitHubError::NoAuth(m) | GitHubError::Forbidden(m) | GitHubError::RateLimited(m) => write!(f, "{m}"),
+            GitHubError::NoAuth(m) | GitHubError::Forbidden(m) | GitHubError::RateLimited(m) => {
+                write!(f, "{m}")
+            }
             GitHubError::NotFound => write!(f, "not found"),
             GitHubError::Http { status, body } => write!(f, "GitHub HTTP {status}: {body}"),
             GitHubError::Transport(m) => write!(f, "transport error: {m}"),
@@ -67,7 +69,10 @@ mod encode_tests {
 
     #[test]
     fn encode_query_neutralizes_injection_and_passes_unreserved() {
-        assert_eq!(encode_query("feature/a&per_page=1"), "feature/a%26per_page%3D1");
+        assert_eq!(
+            encode_query("feature/a&per_page=1"),
+            "feature/a%26per_page%3D1"
+        );
         assert_eq!(encode_query("open"), "open");
         assert_eq!(encode_query("a b"), "a%20b");
     }

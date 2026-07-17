@@ -386,18 +386,31 @@ pub fn push_and_open_pr(
     let repo = match RepoId::resolve_from_remote(repo_root) {
         Some(r) => r,
         None => {
-            eprintln!("worktree: cannot resolve origin remote, skipping PR for item {}", item.id);
+            eprintln!(
+                "worktree: cannot resolve origin remote, skipping PR for item {}",
+                item.id
+            );
             return None;
         }
     };
     let client = match crate::github::Client::new() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("worktree: no GitHub credentials, skipping PR for item {}: {e}", item.id);
+            eprintln!(
+                "worktree: no GitHub credentials, skipping PR for item {}: {e}",
+                item.id
+            );
             return None;
         }
     };
-    match crate::github::pulls::create(&client, &repo, &item.name, &branch, target_branch, Some(&body)) {
+    match crate::github::pulls::create(
+        &client,
+        &repo,
+        &item.name,
+        &branch,
+        target_branch,
+        Some(&body),
+    ) {
         Ok(pr) => {
             if let Some(p) = progress {
                 p.send(1.0, Some(1.0), Some("PR created".into()));

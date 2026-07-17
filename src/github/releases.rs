@@ -3,7 +3,13 @@
 use crate::github::models::Release;
 use crate::github::{Client, GitHubError, RepoId};
 
-fn create_body(tag: &str, name: Option<&str>, body: Option<&str>, draft: bool, prerelease: bool) -> serde_json::Value {
+fn create_body(
+    tag: &str,
+    name: Option<&str>,
+    body: Option<&str>,
+    draft: bool,
+    prerelease: bool,
+) -> serde_json::Value {
     let mut v = serde_json::json!({ "tag_name": tag, "draft": draft, "prerelease": prerelease });
     if let Some(n) = name {
         v["name"] = serde_json::Value::String(n.to_string());
@@ -33,10 +39,20 @@ pub fn latest(client: &Client, repo: &RepoId) -> Result<Release, GitHubError> {
 }
 
 pub fn create(
-    client: &Client, repo: &RepoId, tag: &str, name: Option<&str>, body: Option<&str>, draft: bool, prerelease: bool,
+    client: &Client,
+    repo: &RepoId,
+    tag: &str,
+    name: Option<&str>,
+    body: Option<&str>,
+    draft: bool,
+    prerelease: bool,
 ) -> Result<Release, GitHubError> {
     let path = format!("/repos/{}/{}/releases", repo.owner, repo.repo);
-    let json = client.request("POST", &path, Some(create_body(tag, name, body, draft, prerelease)))?;
+    let json = client.request(
+        "POST",
+        &path,
+        Some(create_body(tag, name, body, draft, prerelease)),
+    )?;
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
