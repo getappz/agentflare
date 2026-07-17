@@ -10,6 +10,7 @@ pub mod issues;
 pub mod mcp;
 pub mod models;
 pub mod pulls;
+pub mod releases;
 
 pub use client::Client;
 pub use identity::RepoId;
