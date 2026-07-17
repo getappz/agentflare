@@ -94,14 +94,21 @@ fn git_remote_is_github() -> bool {
 }
 
 /// True if a server named `name` is already configured in gateway.toml — the
-/// idempotency gate. Uses the same parser the gateway itself uses, so a
-/// present-but-differently-formatted entry still counts as registered.
+/// idempotency gate. Tries the real parser first, so a present-but
+/// differently-formatted entry still counts as registered; but a single
+/// malformed/legacy entry anywhere in the file (e.g. a pre-`kind`-tag
+/// server block) fails parsing for the *whole* file, which used to make
+/// every other server look unregistered forever and re-append on every
+/// `init` run. Falls back to a literal `[servers.<name>]` header search so
+/// that one bad sibling entry can't defeat the idempotency check.
 pub fn already_registered(name: &str) -> bool {
-    fs::read_to_string(gateway_toml_path())
-        .ok()
-        .and_then(|s| gateway_registry::parse_config(&s).ok())
-        .map(|cfg| cfg.servers.contains_key(name))
-        .unwrap_or(false)
+    let Ok(content) = fs::read_to_string(gateway_toml_path()) else {
+        return false;
+    };
+    match gateway_registry::parse_config(&content) {
+        Ok(cfg) => cfg.servers.contains_key(name),
+        Err(_) => content.contains(&format!("[servers.{name}]")),
+    }
 }
 
 /// Appends the integration's block to gateway.toml (creating the file if
@@ -244,6 +251,39 @@ mod tests {
             let msg2 = register(&LEANCTX);
             assert!(msg2.starts_with("skip"), "second: {msg2}");
             let content = fs::read_to_string(gateway_toml_path()).unwrap();
+            assert_eq!(content.matches("[servers.leanctx]").count(), 1);
+        });
+    }
+
+    #[test]
+    fn already_registered_survives_a_malformed_sibling_entry() {
+        with_temp_home(|| {
+            let path = gateway_toml_path();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // A legacy/malformed entry (missing the now-required `kind` tag)
+            // makes the whole file fail to parse, but leanctx's own table is
+            // still present verbatim in the text.
+            fs::write(
+                &path,
+                "[servers.legacy]
+cmd = \"legacy-mcp\"
+
+[servers.leanctx]
+kind = \"mcp_stdio\"
+command = \"lean-ctx\"
+args = []
+",
+            )
+            .unwrap();
+
+            let content = fs::read_to_string(&path).unwrap();
+            assert!(gateway_registry::parse_config(&content).is_err());
+            assert!(already_registered("leanctx"));
+            assert!(!already_registered("nonexistent"));
+
+            let msg = register(&LEANCTX);
+            assert!(msg.starts_with("skip"), "unexpected: {msg}");
+            let content = fs::read_to_string(&path).unwrap();
             assert_eq!(content.matches("[servers.leanctx]").count(), 1);
         });
     }
