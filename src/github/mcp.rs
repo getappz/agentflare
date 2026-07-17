@@ -9,7 +9,7 @@ use crate::github::GitHubError;
 pub fn is_client_error(err: &GitHubError) -> bool {
     matches!(
         err,
-        GitHubError::NoAuth(_) | GitHubError::Forbidden(_) | GitHubError::NotFound | GitHubError::RateLimited(_)
+        GitHubError::NoAuth(_) | GitHubError::Forbidden(_) | GitHubError::NotFound
     )
 }
 
@@ -21,6 +21,7 @@ mod tests {
     fn auth_and_notfound_are_client_errors_transport_is_not() {
         assert!(is_client_error(&GitHubError::NoAuth("x".into())));
         assert!(is_client_error(&GitHubError::NotFound));
+        assert!(!is_client_error(&GitHubError::RateLimited("x".into())));
         assert!(!is_client_error(&GitHubError::Transport("x".into())));
         assert!(!is_client_error(&GitHubError::Parse("x".into())));
     }

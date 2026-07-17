@@ -18,7 +18,7 @@ pub fn create(
 }
 
 pub fn list(client: &Client, repo: &RepoId, state: &str) -> Result<Vec<PullRequest>, GitHubError> {
-    let path = format!("/repos/{}/{}/pulls?state={state}", repo.owner, repo.repo);
+    let path = format!("/repos/{}/{}/pulls?state={}", repo.owner, repo.repo, crate::github::encode_query(state));
     let json = client.request("GET", &path, None)?;
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }

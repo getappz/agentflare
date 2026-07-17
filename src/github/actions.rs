@@ -20,7 +20,7 @@ fn dispatch_body(git_ref: &str, inputs: Option<&serde_json::Value>) -> serde_jso
 pub fn list_runs(client: &Client, repo: &RepoId, branch: Option<&str>) -> Result<Vec<WorkflowRun>, GitHubError> {
     let mut path = format!("/repos/{}/{}/actions/runs", repo.owner, repo.repo);
     if let Some(b) = branch {
-        path.push_str(&format!("?branch={b}"));
+        path.push_str(&format!("?branch={}", crate::github::encode_query(b)));
     }
     let envelope = client.request("GET", &path, None)?;
     parse_runs(envelope)

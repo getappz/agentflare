@@ -17,6 +17,24 @@ pub mod init_auth;
 pub use client::Client;
 pub use identity::RepoId;
 
+/// Percent-encode a dynamic value for a URL query string so reserved
+/// characters cannot alter query semantics. Unreserved chars and slash
+/// (common in branch names, valid in the query component) pass through.
+pub(crate) fn encode_query(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || "-._~/".contains(ch) {
+            out.push(ch);
+        } else {
+            let mut buf = [0u8; 4];
+            for b in ch.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
 /// All failure modes of the GitHub module. `Display` never contains the token.
 #[derive(Debug)]
 pub enum GitHubError {
@@ -42,3 +60,15 @@ impl std::fmt::Display for GitHubError {
 }
 
 impl std::error::Error for GitHubError {}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    #[test]
+    fn encode_query_neutralizes_injection_and_passes_unreserved() {
+        assert_eq!(encode_query("feature/a&per_page=1"), "feature/a%26per_page%3D1");
+        assert_eq!(encode_query("open"), "open");
+        assert_eq!(encode_query("a b"), "a%20b");
+    }
+}
