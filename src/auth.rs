@@ -825,13 +825,18 @@ pub fn isolate_add_with(agent: &str, profile: &str, shallow: bool, json: bool) {
     // Copy auth files from vault profile
     activate_into(agent, profile, &dir);
 
-    // Store metadata
+    // Store metadata. Without it, read_isolate_mode() later can't tell whether
+    // this isolate is shallow or deep, so a failed write must not pass silently.
     let meta = serde_json::json!({"mode": if shallow { "shallow" } else { "deep" }, "agent": agent, "profile": profile});
-    fs::write(
+    if let Err(e) = fs::write(
         dir.join("isolate.json"),
         serde_json::to_string_pretty(&meta).unwrap() + "\n",
-    )
-    .ok();
+    ) {
+        eprintln!(
+            "warning: failed to write isolate metadata to {}: {e}",
+            dir.display()
+        );
+    }
 
     if json {
         println!(
@@ -1072,12 +1077,27 @@ fn activate_into(agent: &str, profile: &str, target_dir: &std::path::Path) {
 
 #[cfg(not(windows))]
 fn symlink_or_copy(src: &std::path::Path, dest: &std::path::Path) {
-    std::os::unix::fs::symlink(src, dest).ok();
+    warn_on_link_failure(src, dest, std::os::unix::fs::symlink(src, dest));
 }
 
 #[cfg(windows)]
 fn symlink_or_copy(src: &std::path::Path, dest: &std::path::Path) {
-    fs::copy(src, dest).ok();
+    warn_on_link_failure(src, dest, fs::copy(src, dest).map(|_| ()));
+}
+
+/// An already-present destination is fine (the isolate was set up before); any
+/// other failure means the isolate is missing host state (ssh keys, git config)
+/// it needs, so surface it instead of silently continuing.
+fn warn_on_link_failure(src: &std::path::Path, dest: &std::path::Path, res: std::io::Result<()>) {
+    if let Err(e) = res
+        && e.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        eprintln!(
+            "warning: failed to link {} into isolate at {}: {e}",
+            src.display(),
+            dest.display()
+        );
+    }
 }
 
 #[cfg(test)]

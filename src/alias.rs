@@ -92,7 +92,30 @@ pub fn run(
         }
     };
 
-    let existing_content = std::fs::read_to_string(&profile).ok();
+    // Distinguish "file doesn't exist yet" (fine — we'll create it) from a real
+    // read failure. Collapsing both to None via .ok() would treat an unreadable
+    // existing profile as empty and then overwrite the user's real shell profile
+    // with just the managed block, destroying its contents.
+    let existing_content = match std::fs::read_to_string(&profile) {
+        Ok(content) => Some(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            let err = format!("cannot read profile {}: {e}", profile.display());
+            if !json {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+            emit_json(JsonOutput {
+                requested: preferred.to_string(),
+                installed: String::new(),
+                status: Status::WriteError.as_str(),
+                profile: profile.to_string_lossy().into_owned(),
+                snippet: None,
+                error: Some(err),
+            });
+            return;
+        }
+    };
 
     if !force
         && let Some(ref content) = existing_content
