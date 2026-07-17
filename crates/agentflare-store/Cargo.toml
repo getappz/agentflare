@@ -1,0 +1,24 @@
+[package]
+name = "agentflare-store"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+description = "Local-first document, artifact, blob, and memory storage for AI agent CLIs. SQLite index + content-addressed files. Zero external infra."
+publish = false
+
+[dependencies]
+db_kit = { package = "agentflare-db-kit", path = "../agentflare-db-kit" }
+rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite_migration = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1.5"
+thiserror = "2"
+parking_lot = "0.12"
+bytemuck = { version = "1", features = ["derive"] }
+[features]
+default = []
+
+[dev-dependencies]
+tempfile = "3"

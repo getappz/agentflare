@@ -1,0 +1,50 @@
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum();
+    let nb: f32 = b.iter().map(|x| x * x).sum();
+    let denom = na.sqrt() * nb.sqrt();
+    if denom < 1e-12 { 0.0 } else { dot / denom }
+}
+
+pub fn normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-12 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cosine_similarity_identical() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_orthogonal() {
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        assert!((cosine_similarity(&a, &b) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_zero_denom() {
+        let a = vec![0.0, 0.0];
+        let b = vec![1.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_unit_vector() {
+        let mut v = vec![3.0, 4.0];
+        normalize(&mut v);
+        let len: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((len - 1.0).abs() < 1e-6);
+    }
+}
