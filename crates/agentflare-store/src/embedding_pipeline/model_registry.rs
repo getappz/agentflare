@@ -82,6 +82,7 @@ impl EmbeddingModel {
                 query_prefix: None,
                 document_prefix: None,
                 needs_token_type_ids: true,
+                base_url_override: None,
             },
             Self::NomicEmbedV1_5 => ModelConfig {
                 model: self.clone(),
@@ -97,6 +98,7 @@ impl EmbeddingModel {
                 query_prefix: Some("search_query: ".into()),
                 document_prefix: Some("search_document: ".into()),
                 needs_token_type_ids: false,
+                base_url_override: None,
             },
             Self::Custom(spec) => ModelConfig {
                 model: self.clone(),
@@ -115,6 +117,7 @@ impl EmbeddingModel {
                 query_prefix: None,
                 document_prefix: None,
                 needs_token_type_ids: false,
+                base_url_override: None,
             },
         }
     }
@@ -172,6 +175,9 @@ pub struct ModelConfig {
     pub revision: Option<String>,
     pub onnx_path: String,
     pub vocab_file: VocabSource,
+    /// When set, overrides the HuggingFace base URL used to resolve downloads.
+    /// Primarily for tests that serve model files from a local HTTP server.
+    pub base_url_override: Option<String>,
     pub dimensions: usize,
     pub max_seq_len: usize,
     pub model_min_bytes: u64,
@@ -183,6 +189,9 @@ pub struct ModelConfig {
 
 impl ModelConfig {
     fn resolve_base(&self) -> String {
+        if let Some(base) = &self.base_url_override {
+            return base.clone();
+        }
         format!(
             "https://huggingface.co/{}/resolve/{}",
             self.hf_repo,
