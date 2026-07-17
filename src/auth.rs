@@ -601,22 +601,11 @@ pub fn pick(agent: &str) {
         println!("no profiles for {agent}");
         return;
     }
-    for (i, p) in profiles.iter().enumerate() {
-        println!("  [{}] {p}", i + 1);
+    let items: Vec<(String, String)> = profiles.iter().map(|p| (p.clone(), p.clone())).collect();
+    match crate::ui::select(&format!("choose profile for {agent}"), &items) {
+        Some(profile) => activate(agent, &profile, false),
+        None => crate::ui::skip("no profile selected"),
     }
-    print!("choose profile: ");
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).ok();
-    if let Ok(idx) = input.trim().parse::<usize>()
-        && idx > 0
-        && idx <= profiles.len()
-    {
-        activate(agent, &profiles[idx - 1], false);
-        return;
-    }
-    eprintln!("invalid selection");
 }
 
 pub fn cooldown_set(target: &str, minutes: Option<u32>, json: bool) {

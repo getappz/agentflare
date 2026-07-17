@@ -146,17 +146,13 @@ pub fn run(
     if !json && !yes {
         let msg = if name != preferred {
             format!(
-                "'{preferred}' is occupied — will use '{name}' instead.\nAdd alias to {}? [Y/n] ",
+                "'{preferred}' is occupied — will use '{name}' instead. Add alias to {}?",
                 profile.display()
             )
         } else {
-            format!("Add alias '{name}' to {}? [Y/n] ", profile.display())
+            format!("Add alias '{name}' to {}?", profile.display())
         };
-        print!("{msg}");
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        let mut response = String::new();
-        if std::io::stdin().read_line(&mut response).is_err() || is_no(response.trim()) {
+        if !crate::ui::confirm(&msg, true) {
             return;
         }
     }
@@ -225,6 +221,7 @@ fn resolve_profile(profile_path: Option<&str>, shell: Shell) -> Result<PathBuf, 
     }
 }
 
+#[cfg(test)]
 fn is_no(response: &str) -> bool {
     let r = response.to_lowercase();
     r == "n" || r == "no"

@@ -8,6 +8,7 @@
 use crate::components::{get_components, rule_targets};
 use crate::paths::{agentflare_binary, home};
 use crate::rule_text;
+use crate::ui;
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::PathBuf;
@@ -28,48 +29,36 @@ fn confirm_ponytail_migration(agent: &str, yes: bool) -> bool {
         return true;
     }
 
-    println!();
-    println!("⚠ Existing ponytail plugin detected for {agent}.");
-    println!("  agentflare has ponytail built-in — the npm plugin would conflict.");
+    ui::warning(&format!(
+        "Existing ponytail plugin detected for {agent}. agentflare has ponytail \
+         built-in — the npm plugin would conflict."
+    ));
 
-    if !yes {
-        print!("  Uninstall ponytail plugin? [Y/n] ");
-        let mut input = String::new();
-        let bytes_read = std::io::stdin().read_line(&mut input).ok();
-        if bytes_read == Some(0) {
-            println!("  Skipped. Re-run: agentflare init --agent {agent}");
-            return false;
-        }
-        match input.trim().to_lowercase().as_str() {
-            "y" | "yes" | "" => {}
-            _ => {
-                println!("  Skipped. Re-run: agentflare init --agent {agent}");
-                return false;
-            }
-        }
+    if !yes && !ui::confirm("Uninstall ponytail plugin?", true) {
+        ui::skip(&format!("Skipped. Re-run: agentflare init --agent {agent}"));
+        return false;
     }
 
     match agent {
         "opencode" => {
-            println!("  Running: opencode plugin uninstall ponytail@ponytail");
-            match std::process::Command::new("opencode")
-                .args(["plugin", "uninstall", "ponytail@ponytail"])
-                .output()
-            {
-                Ok(out) => {
-                    if out.status.success() {
-                        println!("  ok    ponytail plugin uninstalled");
-                    } else {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        println!("  fail  {stderr}");
-                    }
-                }
-                Err(e) => println!("  fail  could not run opencode: {e}"),
+            let out = ui::with_spinner(
+                "Uninstalling ponytail plugin…",
+                "ponytail plugin uninstall finished",
+                || {
+                    std::process::Command::new("opencode")
+                        .args(["plugin", "uninstall", "ponytail@ponytail"])
+                        .output()
+                },
+            );
+            match out {
+                Ok(o) if o.status.success() => ui::success("ponytail plugin uninstalled"),
+                Ok(o) => ui::error(String::from_utf8_lossy(&o.stderr).trim()),
+                Err(e) => ui::error(&format!("could not run opencode: {e}")),
             }
             true
         }
         "claude-code" | "cowork" => {
-            println!("  Run '/plugin uninstall ponytail@ponytail' in a Claude Code session");
+            ui::info("Run '/plugin uninstall ponytail@ponytail' in a Claude Code session");
             true
         }
         _ => true,
@@ -145,20 +134,11 @@ fn prompt_yes(message: &str, agent: &str, yes: bool) -> bool {
     if yes {
         return true;
     }
-    print!("{message}");
-    let mut input = String::new();
-    let bytes_read = std::io::stdin().read_line(&mut input).ok();
-    if bytes_read == Some(0) {
-        println!("  Skipped. Re-run: agentflare init --agent {agent}");
-        return false;
+    if ui::confirm(message, true) {
+        return true;
     }
-    match input.trim().to_lowercase().as_str() {
-        "y" | "yes" | "" => true,
-        _ => {
-            println!("  Skipped. Re-run: agentflare init --agent {agent}");
-            false
-        }
-    }
+    ui::skip(&format!("Skipped. Re-run: agentflare init --agent {agent}"));
+    false
 }
 
 /// Rule files under `rule_targets` are only ever written when absent (see
@@ -172,33 +152,38 @@ fn confirm_rule_refresh(agent: &str, yes: bool) {
             continue;
         }
 
-        println!();
-        println!(
-            "⚠ {} has outdated guidance (from an earlier agentflare version).",
+        ui::warning(&format!(
+            "{} has outdated guidance (from an earlier agentflare version).",
             path.display()
-        );
-        if !prompt_yes("  Refresh to the current version? [Y/n] ", agent, yes) {
+        ));
+        if !prompt_yes("Refresh to the current version?", agent, yes) {
             continue;
         }
 
         match fs::write(&path, format!("{current}\n")) {
-            Ok(_) => println!("  ok    {} refreshed", path.display()),
-            Err(e) => println!("  fail  writing {}: {e}", path.display()),
+            Ok(_) => ui::success(&format!("{} refreshed", path.display())),
+            Err(e) => ui::error(&format!("writing {}: {e}", path.display())),
         }
     }
 }
 
 pub fn run(agent: &str, yes: bool) {
-    println!("agentflare init --agent {agent}\n");
+    ui::intro(&format!("agentflare init · {agent}"));
 
     check_competing_plugins(agent);
     confirm_rule_refresh(agent, yes);
 
     for c in get_components(agent) {
         if (c.check)() {
-            println!("  skip  {} (already satisfied)", c.id);
+            ui::skip(&format!("{} already satisfied", c.id));
         } else {
-            println!("  {:<5} {}", (c.apply)(), c.id);
+            let msg = (c.apply)();
+            let line = format!("{}: {msg}", c.id);
+            if msg.to_lowercase().contains("fail") {
+                ui::error(&line);
+            } else {
+                ui::step(&line);
+            }
         }
     }
 
@@ -221,11 +206,11 @@ pub fn run(agent: &str, yes: bool) {
         "opencode" => {
             wire_opencode();
             if has_existing_ponytail_opencode() {
-                println!();
-                println!("  info  Ponytail plugin detected. Keep it — OpenCode uses");
-                println!("        plugins for hooks, not config. Plugin + agentflare");
-                println!("        work together (plugin handles hooks, agentflare provides");
-                println!("        skill engine).");
+                ui::info(
+                    "Ponytail plugin detected. Keep it — OpenCode uses plugins for hooks, \
+                     not config. Plugin + agentflare work together (plugin handles hooks, \
+                     agentflare provides the skill engine).",
+                );
             }
             wire_optimize_opencode();
         }
@@ -234,7 +219,7 @@ pub fn run(agent: &str, yes: bool) {
 
     confirm_gateway_integrations(agent, yes);
 
-    println!("\nDone. Restart {agent} if it was already running.");
+    ui::outro(&format!("Done. Restart {agent} if it was already running."));
 }
 
 /// Detects project context (e.g. a GitHub remote) and offers to register the
@@ -249,31 +234,34 @@ fn confirm_gateway_integrations(agent: &str, yes: bool) {
             continue;
         }
         if already_registered(intg.name) {
-            println!(
-                "  skip  {} MCP already registered behind the gateway",
+            ui::skip(&format!(
+                "{} MCP already registered behind the gateway",
                 intg.name
-            );
+            ));
             continue;
         }
 
-        println!();
-        println!("{}", intg.prompt);
-        if !prompt_yes(
-            "  Register it behind the agentflare gateway? [Y/n] ",
-            agent,
-            yes,
-        ) {
+        ui::info(intg.prompt);
+        if !prompt_yes("Register it behind the agentflare gateway?", agent, yes) {
             continue;
         }
 
-        let status = register(intg);
+        let status = ui::with_spinner(
+            &format!("Registering {} behind the gateway…", intg.name),
+            &format!("{} registration finished", intg.name),
+            || register(intg),
+        );
         let registered = status.starts_with("ok");
-        println!("  {status}");
-        // Only print the follow-up (e.g. how to store the token) when the
+        if registered {
+            ui::success(&status);
+        } else {
+            ui::error(&status);
+        }
+        // Only surface the follow-up (e.g. how to store the token) when the
         // server was actually written — not when register failed or skipped.
         if registered {
             for line in (intg.post_note)() {
-                println!("{line}");
+                ui::info(&line);
             }
         }
     }
@@ -353,7 +341,7 @@ fn wire_claude_code() {
     );
 
     if !added {
-        println!("  skip  ~/.claude/settings.json hooks (already wired)");
+        ui::skip("~/.claude/settings.json hooks (already wired)");
         return;
     }
 
@@ -364,8 +352,8 @@ fn wire_claude_code() {
         &path,
         serde_json::to_string_pretty(&settings).unwrap() + "\n",
     ) {
-        Ok(_) => println!("  ok    ~/.claude/settings.json hooks wired"),
-        Err(e) => println!("  fail  writing ~/.claude/settings.json: {e}"),
+        Ok(_) => ui::success("~/.claude/settings.json hooks wired"),
+        Err(e) => ui::error(&format!("writing ~/.claude/settings.json: {e}")),
     }
 }
 
@@ -373,7 +361,7 @@ fn wire_cursor() {
     let path = cwd().join(".cursor").join("hooks.json");
     let existing = fs::read_to_string(&path).unwrap_or_default();
     if !existing.is_empty() && !existing.contains("agentflare") {
-        println!("  skip  .cursor/hooks.json (exists, not agentflare's — not overwriting)");
+        ui::skip(".cursor/hooks.json (exists, not agentflare's — not overwriting)");
         return;
     }
 
@@ -430,7 +418,7 @@ fn wire_cursor() {
     }
 
     if !added {
-        println!("  skip  .cursor/hooks.json (already wired)");
+        ui::skip(".cursor/hooks.json (already wired)");
         return;
     }
 
@@ -441,8 +429,8 @@ fn wire_cursor() {
         &path,
         serde_json::to_string_pretty(&content).unwrap() + "\n",
     ) {
-        Ok(_) => println!("  ok    .cursor/hooks.json wired"),
-        Err(e) => println!("  fail  writing .cursor/hooks.json: {e}"),
+        Ok(_) => ui::success(".cursor/hooks.json wired"),
+        Err(e) => ui::error(&format!("writing .cursor/hooks.json: {e}")),
     }
 }
 
@@ -483,17 +471,17 @@ fn wire_codex_hooks() {
             &hooks_path,
             serde_json::to_string_pretty(&settings).unwrap() + "\n",
         ) {
-            Ok(_) => println!("  ok    ~/.codex/hooks.json wired"),
-            Err(e) => println!("  fail  writing ~/.codex/hooks.json: {e}"),
+            Ok(_) => ui::success("~/.codex/hooks.json wired"),
+            Err(e) => ui::error(&format!("writing ~/.codex/hooks.json: {e}")),
         }
     } else {
-        println!("  skip  ~/.codex/hooks.json (already wired)");
+        ui::skip("~/.codex/hooks.json (already wired)");
     }
 
     let config_path = codex_dir.join("config.toml");
     let config_content = fs::read_to_string(&config_path).unwrap_or_default();
     if config_content.contains("codex_hooks") {
-        println!("  skip  ~/.codex/config.toml (codex_hooks flag already present)");
+        ui::skip("~/.codex/config.toml (codex_hooks flag already present)");
         return;
     }
     let mut updated = config_content.clone();
@@ -502,8 +490,8 @@ fn wire_codex_hooks() {
     }
     updated.push_str("[features]\ncodex_hooks = true\n");
     match fs::write(&config_path, updated) {
-        Ok(_) => println!("  ok    ~/.codex/config.toml: codex_hooks feature flag enabled"),
-        Err(e) => println!("  fail  writing ~/.codex/config.toml: {e}"),
+        Ok(_) => ui::success("~/.codex/config.toml: codex_hooks feature flag enabled"),
+        Err(e) => ui::error(&format!("writing ~/.codex/config.toml: {e}")),
     }
 }
 
@@ -563,18 +551,18 @@ fn wire_opencode() {
             let _ = fs::create_dir_all(parent);
         }
         match fs::write(&path, serde_json::to_string_pretty(&config).unwrap() + "\n") {
-            Ok(_) if removed_legacy => {
-                println!(
-                    "  ok    opencode.jsonc instructions wired ({added} rule(s), removed stale engram.md)"
-                )
-            }
-            Ok(_) => println!("  ok    opencode.jsonc instructions wired ({added} rule(s))"),
-            Err(e) => println!("  fail  writing opencode.jsonc: {e}"),
+            Ok(_) if removed_legacy => ui::success(&format!(
+                "opencode.jsonc instructions wired ({added} rule(s), removed stale engram.md)"
+            )),
+            Ok(_) => ui::success(&format!(
+                "opencode.jsonc instructions wired ({added} rule(s))"
+            )),
+            Err(e) => ui::error(&format!("writing opencode.jsonc: {e}")),
         }
     } else if arr.is_empty() {
-        println!("  info  opencode.jsonc — no rules to wire yet (run with rules present)");
+        ui::info("opencode.jsonc — no rules to wire yet (run with rules present)");
     } else {
-        println!("  skip  opencode.jsonc (already wired)");
+        ui::skip("opencode.jsonc (already wired)");
     }
 }
 
@@ -583,7 +571,9 @@ pub fn wire_optimize_hooks(agent: &str) {
         "claude-code" | "cowork" => wire_optimize_claude_code(),
         "cursor" | "cursor-cli" => wire_optimize_cursor(),
         "opencode" => wire_optimize_opencode(),
-        _ => println!("  info  auto-wiring not supported for {agent}. Manual config required."),
+        _ => ui::info(&format!(
+            "auto-wiring not supported for {agent}. Manual config required."
+        )),
     }
 }
 
@@ -604,7 +594,7 @@ fn wire_optimize_claude_code() {
         .map(|v| v.to_string().contains("optimize"))
         .unwrap_or(false);
     if already_wired {
-        println!("  skip  optimize code hooks already wired in ~/.claude/settings.json");
+        ui::skip("optimize code hooks already wired in ~/.claude/settings.json");
         return;
     }
 
@@ -637,8 +627,8 @@ fn wire_optimize_claude_code() {
         &path,
         serde_json::to_string_pretty(&settings).unwrap() + "\n",
     ) {
-        Ok(_) => println!("  ok    optimize code hooks wired in ~/.claude/settings.json"),
-        Err(e) => println!("  fail  writing ~/.claude/settings.json: {e}"),
+        Ok(_) => ui::success("optimize code hooks wired in ~/.claude/settings.json"),
+        Err(e) => ui::error(&format!("writing ~/.claude/settings.json: {e}")),
     }
 }
 
@@ -649,7 +639,7 @@ fn wire_optimize_cursor() {
     if path.exists() {
         let existing = fs::read_to_string(&path).unwrap_or_default();
         if existing.contains("optimize") {
-            println!("  skip  optimize code hooks already wired in .cursor/hooks.json");
+            ui::skip("optimize code hooks already wired in .cursor/hooks.json");
             return;
         }
     }
@@ -697,15 +687,17 @@ fn wire_optimize_cursor() {
         &path,
         serde_json::to_string_pretty(&content).unwrap() + "\n",
     ) {
-        Ok(_) => println!("  ok    optimize code hooks wired in .cursor/hooks.json"),
-        Err(e) => println!("  fail  writing .cursor/hooks.json: {e}"),
+        Ok(_) => ui::success("optimize code hooks wired in .cursor/hooks.json"),
+        Err(e) => ui::error(&format!("writing .cursor/hooks.json: {e}")),
     }
 }
 
 fn wire_optimize_opencode() {
-    println!("  info  OpenCode uses plugin system for hooks, not config.");
-    println!("        Keep @dietrichgebert/ponytail in plugin list.");
-    println!("        The plugin's built-in hooks work alongside agentflare.");
+    ui::info(
+        "OpenCode uses the plugin system for hooks, not config. Keep \
+         @dietrichgebert/ponytail in the plugin list — the plugin's built-in \
+         hooks work alongside agentflare.",
+    );
 }
 
 fn check_competing_plugins(agent: &str) {
@@ -716,10 +708,10 @@ fn check_competing_plugins(agent: &str) {
 
     for (name, markers) in competitors {
         if let Some(where_found) = scan_agent_configs(agent, markers) {
-            eprintln!(
-                "[agentflare] warning: detected {name} in {where_found} — \
-                 may conflict with agentflare. Set AGENTFLARE_IGNORE_CONFLICTS=true to suppress."
-            );
+            ui::warning(&format!(
+                "detected {name} in {where_found} — may conflict with agentflare. \
+                 Set AGENTFLARE_IGNORE_CONFLICTS=true to suppress."
+            ));
         }
     }
 }
