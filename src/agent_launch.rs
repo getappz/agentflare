@@ -83,9 +83,13 @@ pub fn run_launch_env(
     // Cargo's env var always outranks the worktree's `.cargo/config.toml`
     // (see `isolate_worktree_target_dir` in worktree.rs), so without this the
     // per-worktree isolation is silently shadowed for every build the agent
-    // runs. An explicit override in `env` below can still re-set it.
+    // runs. `env` overrides (e.g. from a project's `.dev.vars`) are filtered
+    // so they can't reintroduce the var we just stripped.
     cmd.env_remove("CARGO_TARGET_DIR");
     for (k, v) in env {
+        if k == "CARGO_TARGET_DIR" {
+            continue;
+        }
         cmd.env(k, v);
     }
 
@@ -283,6 +287,7 @@ pub fn run_headless(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_registry::detect::PATH_LOCK as GLOBAL_STATE_LOCK;
     use agent_registry::{Agent, Tier};
 
     fn test_registry() -> Vec<AgentSpec> {
@@ -396,6 +401,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_launch_env_strips_ambient_cargo_target_dir() {
+        // SAFETY: GLOBAL_STATE_LOCK serializes this process-wide env
+        // mutation against every other test touching CARGO_TARGET_DIR/PATH.
+        let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let marker = tempfile::NamedTempFile::new().unwrap();
         let marker_path = marker.path().to_path_buf();
         unsafe {
@@ -433,6 +441,51 @@ mod tests {
         assert_eq!(
             content, "",
             "child must not inherit ambient CARGO_TARGET_DIR"
+        );
+    }
+
+    // An explicit CARGO_TARGET_DIR passed in `env` (e.g. sourced from a
+    // project's `.dev.vars`) must not reintroduce the var `env_remove`
+    // above just stripped, or a dev-vars file that happens to set it would
+    // silently defeat the ambient-isolation guarantee this launch path
+    // exists for.
+    #[cfg(unix)]
+    #[test]
+    fn run_launch_env_override_cannot_reintroduce_cargo_target_dir() {
+        // SAFETY: GLOBAL_STATE_LOCK serializes against other tests that
+        // mutate CARGO_TARGET_DIR in the ambient process env.
+        let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_path_buf();
+        let reg = vec![AgentSpec {
+            id: Agent::Aider,
+            display_name: "aider",
+            tier: Tier::Cli,
+            binary_names: &["sh"],
+            version_args: &[],
+            package_manager: None,
+            package_name: None,
+        }];
+        let script = format!(
+            "printf '%s' \"$CARGO_TARGET_DIR\" > {}",
+            marker_path.display()
+        );
+        run_launch_env(
+            &reg,
+            "aider",
+            None,
+            None,
+            &["-c".to_string(), script],
+            &[(
+                "CARGO_TARGET_DIR".to_string(),
+                "/should/not/leak".to_string(),
+            )],
+            false,
+        );
+        let content = std::fs::read_to_string(&marker_path).unwrap();
+        assert_eq!(
+            content, "",
+            "explicit env override must not reintroduce CARGO_TARGET_DIR"
         );
     }
 

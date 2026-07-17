@@ -145,9 +145,15 @@ jobs:
     steps:
       - name: Fail if CARGO_TARGET_DIR is set
         shell: bash
+        env:
+          # A repo/org/environment Actions *variable* doesn't reach the shell
+          # unless mapped into `env` explicitly — map it so this guard also
+          # catches CARGO_TARGET_DIR configured that way, not just an
+          # ambient runner-environment value.
+          CARGO_TARGET_DIR_VAR: ${{ vars.CARGO_TARGET_DIR }}
         run: |
-          if [ -n "${CARGO_TARGET_DIR:-}" ]; then
-            echo "::error::CARGO_TARGET_DIR is set ($CARGO_TARGET_DIR) — a project-wide target dir leaks build artifacts across worktrees/CI jobs. Unset it (see item #133/#139)." >&2
+          if [ -n "${CARGO_TARGET_DIR:-}" ] || [ -n "${CARGO_TARGET_DIR_VAR:-}" ]; then
+            echo "::error::CARGO_TARGET_DIR is set (env=${CARGO_TARGET_DIR:-<unset>}, vars.CARGO_TARGET_DIR=${CARGO_TARGET_DIR_VAR:-<unset>}) — a project-wide target dir leaks build artifacts across worktrees/CI jobs. Unset it (see item #133/#139)." >&2
             exit 1
           fi
 
