@@ -137,6 +137,21 @@ fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// A domain can resolve to a private/link-local address even when its literal
+/// spelling looks external (DNS rebinding, or a hostname the operator points
+/// at `169.254.169.254`), which the IP-literal checks above can't catch.
+/// Resolve the host and reject if *any* returned address is blocked. A
+/// resolution failure is treated as "not provably internal" and allowed
+/// through — a delivery to an unresolvable host fails on its own without
+/// blocking legitimate hooks on transient DNS errors.
+fn domain_resolves_to_blocked_ip(domain: &str, port: u16) -> bool {
+    use std::net::ToSocketAddrs;
+    match (domain, port).to_socket_addrs() {
+        Ok(addrs) => addrs.into_iter().any(|sa| is_blocked_ip(sa.ip())),
+        Err(_) => false,
+    }
+}
+
 fn validate_webhook_url(raw: &str) -> Result<()> {
     let parsed =
         url::Url::parse(raw).map_err(|_| Error::InvalidTransition("invalid webhook URL".into()))?;
@@ -145,10 +160,14 @@ fn validate_webhook_url(raw: &str) -> Result<()> {
             "webhook URL must use http or https scheme".into(),
         ));
     }
+    let default_port = if parsed.scheme() == "https" { 443 } else { 80 };
+    let port = parsed.port().unwrap_or(default_port);
     let blocked = match parsed.host() {
         Some(url::Host::Ipv4(v4)) => is_blocked_ip(std::net::IpAddr::V4(v4)),
         Some(url::Host::Ipv6(v6)) => is_blocked_ip(std::net::IpAddr::V6(v6)),
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Domain(d)) => {
+            d.eq_ignore_ascii_case("localhost") || domain_resolves_to_blocked_ip(d, port)
+        }
         None => true,
     };
     if blocked {
@@ -334,6 +353,21 @@ pub fn deliver(
     action: &str,
     data: serde_json::Value,
 ) -> Result<()> {
+    // Re-validate the stored URL against the SSRF ranges on every send: a
+    // hostname that passed validation at create time can later be repointed
+    // at an internal address (DNS rebinding), and delivery — not just
+    // registration — is the moment that actually reaches the network.
+    if let Err(e) = validate_webhook_url(&webhook.url) {
+        return log_delivery(
+            conn,
+            webhook,
+            event_type,
+            b"",
+            "blocked_ssrf",
+            &e.to_string(),
+        );
+    }
+
     let payload = serde_json::json!({
         "event": event_type,
         "action": action,
@@ -403,6 +437,15 @@ mod tests {
         assert!(validate_webhook_url("http://0.0.0.0/hook").is_err());
         assert!(validate_webhook_url("http://[::1]/hook").is_err());
         assert!(validate_webhook_url("not-a-url").is_err());
+    }
+
+    #[test]
+    fn domain_resolution_flags_names_pointing_at_loopback() {
+        // "localhost" is in every /etc/hosts and resolves to a loopback
+        // address offline — a stand-in for any external-looking hostname an
+        // attacker points at an internal IP, which the IP-literal checks
+        // above can't see. Resolution is the layer that catches it.
+        assert!(domain_resolves_to_blocked_ip("localhost", 80));
     }
 
     #[test]
