@@ -48,6 +48,10 @@ pub fn ensure(agent: &str, yes: bool) {
         }
         CredState::Missing => {
             println!("  info  No GitHub credential found — flare_git writes (PRs, issues, releases) need one.");
+            if yes {
+                println!("  skip  non-interactive (-y): run gh auth login or set GITHUB_TOKEN to enable flare_git writes");
+                return;
+            }
             if !crate::init::prompt_yes("  Store a GitHub token now? (or run 'gh auth login' later) [Y/n] ", agent, yes) {
                 return;
             }
