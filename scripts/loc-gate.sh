@@ -21,9 +21,19 @@ is_allowed() {
 }
 
 fail=0
-while IFS= read -r file; do
+
+file_list=$(mktemp)
+trap 'rm -f "$file_list"' EXIT
+
+if ! find . -path ./target -prune -o -name '*.rs' -type f -print0 >"$file_list"; then
+  echo "FAIL: find traversal failed — refusing to report a clean LOC gate" >&2
+  exit 1
+fi
+
+while IFS= read -r -d '' file; do
   lines=$(wc -l <"$file" | tr -d ' ')
-  if is_allowed "$file"; then
+  relative_file=${file#./}
+  if is_allowed "$relative_file"; then
     if ((lines > FROZEN_LIMIT)); then
       echo "FAIL: $file has $lines lines (> frozen limit $FROZEN_LIMIT — split it, do not grow it)"
       fail=1
@@ -32,7 +42,7 @@ while IFS= read -r file; do
     echo "FAIL: $file has $lines lines (> $LIMIT — split into submodules or allowlist in scripts/loc-gate.sh)"
     fail=1
   fi
-done < <(find . -path ./target -prune -o -name '*.rs' -type f -print)
+done <"$file_list"
 
 for a in "${ALLOWLIST[@]}"; do
   if [[ -f "$a" ]]; then
