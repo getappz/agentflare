@@ -18,6 +18,11 @@ impl std::fmt::Display for RepoId {
 
 impl RepoId {
     pub fn parse(remote_url: &str) -> Option<RepoId> {
+        // An already-resolved `owner/repo` identifier (e.g. an explicit
+        // `--repo` flag) has no host to validate — accept it directly.
+        if let Some((owner, repo)) = bare_owner_repo(remote_url) {
+            return Some(RepoId { owner, repo });
+        }
         // Issue #224: reject non-GitHub origins. A GitLab/Bitbucket
         // remote would otherwise resolve to a same-named GitHub repo and
         // write ops would target GitHub with a GitHub token.
@@ -57,6 +62,22 @@ pub fn normalize_repo(remote_url: &str) -> String {
         [.., owner, name] => format!("{owner}/{name}"),
         _ => path.to_string(),
     }
+}
+
+/// Recognizes an already-resolved `owner/repo` identifier — no scheme, no
+/// `@`/`:` (which would indicate a URL or scp-like SSH remote), exactly two
+/// non-empty segments. Callers pass this form explicitly (e.g. `--repo`),
+/// so it has no host to validate against the issue #224 gate.
+fn bare_owner_repo(s: &str) -> Option<(String, String)> {
+    let s = s.trim();
+    if s.contains("://") || s.contains('@') || s.contains(':') {
+        return None;
+    }
+    let (owner, repo) = s.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
 }
 
 /// Allowed GitHub host suffixes. A remote whose resolved host equals one
@@ -128,6 +149,25 @@ fn resolve_ssh_alias(host: &str) -> Option<String> {
     None
 }
 
+/// True for SSH-transported remotes: scp-like `[user@]host:path` or an
+/// explicit `ssh://` scheme. False for `https://`/`http://` — those hosts
+/// are literal DNS names, never SSH config aliases, so they don't need (and
+/// must not trigger) `ssh -G` resolution.
+fn is_ssh_remote(remote_url: &str) -> bool {
+    let s = remote_url.trim();
+    if s.starts_with("ssh://") {
+        return true;
+    }
+    if s.starts_with("http://") || s.starts_with("https://") {
+        return false;
+    }
+    match (s.find(':'), s.find('/')) {
+        (Some(colon), Some(slash)) => colon < slash,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 /// Resolve + validate: returns the real (alias-resolved) host iff it is an
 /// allowed GitHub host, else None. This is the gate for issue #224.
 fn confirmed_github_host(remote_url: &str) -> Option<String> {
@@ -144,6 +184,12 @@ fn confirmed_github_host(remote_url: &str) -> Option<String> {
     let host_lc = host.to_lowercase();
     if matches(&host_lc) {
         return Some(host);
+    }
+    // Only SSH-shaped remotes can be host aliases needing `ssh -G`
+    // resolution — an HTTPS (or otherwise unrecognized) host is literal, so
+    // no match here means "not GitHub": reject without spawning ssh.
+    if !is_ssh_remote(remote_url) {
+        return None;
     }
     // A host starting with `-` would be parsed by `ssh` as an option rather
     // than a hostname (argument injection) — never pass it through.
@@ -299,15 +345,48 @@ mod tests {
     }
 
     #[test]
+    fn repo_id_parse_accepts_bare_owner_repo_without_host_check() {
+        // Explicit `--repo owner/name` (flare_git's documented format) has
+        // no host to validate — it must bypass the issue #224 gate entirely,
+        // even though "owner" alone isn't a github.com host.
+        let id = RepoId::parse("getappz/agentflare").unwrap();
+        assert_eq!(
+            (id.owner.as_str(), id.repo.as_str()),
+            ("getappz", "agentflare")
+        );
+        assert!(RepoId::parse("owner/repo/extra").is_none());
+        assert!(RepoId::parse("owner/").is_none());
+    }
+
+    #[test]
+    fn confirmed_github_host_rejects_non_ssh_host_without_invoking_ssh() {
+        // An HTTPS remote's host is a literal DNS name, never an SSH config
+        // alias — a non-allowlisted HTTPS host must be rejected without
+        // spawning `ssh -G`.
+        assert!(RepoId::parse("https://gitlab.com/o/r").is_none());
+        assert!(!is_ssh_remote("https://gitlab.com/o/r"));
+        assert!(is_ssh_remote("git@gitlab.com:o/r.git"));
+    }
+
+    #[test]
     fn allowed_github_hosts_honors_env() {
+        // AGENTFLARE_GITHUB_HOSTS mutation is process-global — serialize
+        // against every other env mutation in this test binary and restore
+        // the original value rather than unconditionally removing it.
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let original = std::env::var_os("AGENTFLARE_GITHUB_HOSTS");
         unsafe {
+            // SAFETY: PATH_LOCK serializes all env mutations in this binary.
             std::env::set_var("AGENTFLARE_GITHUB_HOSTS", "github.com,git.example.com");
         }
         let hosts = allowed_github_hosts();
         assert!(hosts.contains(&"github.com".to_string()));
         assert!(hosts.contains(&"git.example.com".to_string()));
-        unsafe {
-            std::env::remove_var("AGENTFLARE_GITHUB_HOSTS");
+        match original {
+            Some(v) => unsafe { std::env::set_var("AGENTFLARE_GITHUB_HOSTS", v) },
+            None => unsafe { std::env::remove_var("AGENTFLARE_GITHUB_HOSTS") },
         }
     }
 }
