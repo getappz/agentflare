@@ -5,6 +5,7 @@ pub mod kv;
 pub mod leases;
 pub mod migrate;
 pub mod migrations;
+pub mod retrieval;
 
 #[cfg(feature = "embeddings")]
 pub mod embedding_pipeline;
