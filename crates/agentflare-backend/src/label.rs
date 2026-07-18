@@ -82,7 +82,7 @@ fn next_sort_order(conn: &Connection, project_id: Option<&str>, workspace_id: &s
 }
 
 pub fn create(conn: &Connection, input: CreateLabel) -> Result<Label> {
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = db_kit::ids::new_id();
     let ts = now();
     let color = input.color.unwrap_or_else(|| "#60646C".to_string());
     // Compute the auto-append sort_order and insert inside one transaction so two

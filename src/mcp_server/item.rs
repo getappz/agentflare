@@ -5,6 +5,7 @@
 //! verbatim; `item_inner` itself is now just the `match` dispatch.
 
 use super::*;
+use rusqlite::Connection;
 
 /// Bounds `groom`'s shortlist size — caps the O(n^2) duplicate-detection
 /// pass and the SQLite `IN (...)` parameter list built from it.
@@ -141,6 +142,18 @@ fn capacity_buckets(
 }
 
 impl AgentflareMcp {
+    /// Resolve a user-supplied id to an item UUID.
+    /// Accepts a UUID (pass-through) or a numeric `sequence_id`.
+    pub(crate) fn resolve_item_id(
+        &self,
+        conn: &Connection,
+        id_or_seq: &str,
+    ) -> Result<String, ErrorData> {
+        let project = self.resolve_project(conn)?;
+        agentflare_backend::item::resolve_id(conn, Some(&project.id), id_or_seq)
+            .map_err(map_backend_err)
+    }
+
     pub(super) fn item_create(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let name = req
             .name
@@ -185,13 +198,14 @@ impl AgentflareMcp {
     }
 
     pub(super) fn item_get(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let id = req
+        let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for get", None))?;
-        if id.trim().is_empty() {
+        if raw.trim().is_empty() {
             return Err(ErrorData::invalid_params("id is required", None));
         }
         self.with_backend_db(|conn| {
+            let id = self.resolve_item_id(conn, &raw)?;
             let item = agentflare_backend::item::get(conn, &id).map_err(map_backend_err)?;
             Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
         })?
@@ -273,13 +287,14 @@ impl AgentflareMcp {
     }
 
     pub(super) fn item_update(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let id = req
+        let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for update", None))?;
-        if id.trim().is_empty() {
+        if raw.trim().is_empty() {
             return Err(ErrorData::invalid_params("id is required", None));
         }
         self.with_backend_db(|conn| {
+            let id = self.resolve_item_id(conn, &raw)?;
             let input = agentflare_backend::item::UpdateItem {
                 name: req.name,
                 description: req.description,
@@ -296,19 +311,20 @@ impl AgentflareMcp {
     }
 
     pub(super) fn item_update_state(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let id = req
+        let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for update_state", None))?;
         let state_id = req.state_id.ok_or_else(|| {
             ErrorData::invalid_params("state_id is required for update_state", None)
         })?;
-        if id.trim().is_empty() || state_id.trim().is_empty() {
+        if raw.trim().is_empty() || state_id.trim().is_empty() {
             return Err(ErrorData::invalid_params(
                 "id and state_id are required",
                 None,
             ));
         }
         self.with_backend_db(|conn| {
+            let id = self.resolve_item_id(conn, &raw)?;
             let item = agentflare_backend::item::update_state(conn, &id, &state_id)
                 .map_err(map_backend_err)?;
             Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
@@ -316,23 +332,24 @@ impl AgentflareMcp {
     }
 
     pub(super) fn item_delete(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let id = req
+        let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for delete", None))?;
-        if id.trim().is_empty() {
+        if raw.trim().is_empty() {
             return Err(ErrorData::invalid_params("id is required", None));
         }
         self.with_backend_db(|conn| {
+            let id = self.resolve_item_id(conn, &raw)?;
             agentflare_backend::item::delete(conn, &id).map_err(map_backend_err)?;
             Ok(serde_json::json!({"deleted": true, "id": id}).to_string())
         })?
     }
 
     pub(super) fn item_claim(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let item_id = req
+        let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for claim", None))?;
-        if item_id.trim().is_empty() {
+        if raw.trim().is_empty() {
             return Err(ErrorData::invalid_params("id is required", None));
         }
         let owner = crate::claims::owner_id();
@@ -343,7 +360,8 @@ impl AgentflareMcp {
         // backend lock; `git worktree add` below is a blocking
         // filesystem+subprocess operation that has no business
         // running while the shared DB mutex is held.
-        let (outcome, item, target_branch) = self.with_backend_db(|conn| {
+        let (outcome, item_id, item, target_branch) = self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
             let outcome = agentflare_backend::item::claim(conn, &item_id, &owner, now, ttl)
                 .map_err(map_backend_err)?;
             let (item, target_branch) = if outcome == agentflare_backend::claim::Acquire::Acquired {
@@ -355,7 +373,7 @@ impl AgentflareMcp {
             } else {
                 (None, None)
             };
-            Ok::<_, ErrorData>((outcome, item, target_branch))
+            Ok::<_, ErrorData>((outcome, item_id, item, target_branch))
         })??;
         let worktree_path = match (&item, &target_branch) {
             (Some(item), Some(target)) => PROGRESS_SENDER
@@ -388,15 +406,16 @@ impl AgentflareMcp {
     }
 
     pub(super) fn item_heartbeat(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let item_id = req
+        let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for heartbeat", None))?;
-        if item_id.trim().is_empty() {
+        if raw.trim().is_empty() {
             return Err(ErrorData::invalid_params("id is required", None));
         }
         let owner = crate::claims::owner_id();
         let now = crate::claims::now();
         self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
             let ok = agentflare_backend::claim::heartbeat(conn, &item_id, &owner, now)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
             Ok(serde_json::json!({"heartbeat": ok, "item_id": item_id}).to_string())
@@ -404,14 +423,15 @@ impl AgentflareMcp {
     }
 
     pub(super) fn item_release(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let item_id = req
+        let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for release", None))?;
-        if item_id.trim().is_empty() {
+        if raw.trim().is_empty() {
             return Err(ErrorData::invalid_params("id is required", None));
         }
         let owner = crate::claims::owner_id();
         self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
             let ok = agentflare_backend::claim::release(conn, &item_id, &owner)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
             Ok(serde_json::json!({"released": ok, "item_id": item_id}).to_string())
@@ -419,10 +439,10 @@ impl AgentflareMcp {
     }
 
     pub(super) fn item_done(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let item_id = req
+        let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for done", None))?;
-        if item_id.trim().is_empty() {
+        if raw.trim().is_empty() {
             return Err(ErrorData::invalid_params("id is required", None));
         }
         let owner = crate::claims::owner_id();
@@ -432,7 +452,8 @@ impl AgentflareMcp {
         // backend lock, then run the blocking git/gh push+PR outside
         // it — `git push`/`gh pr create` have no business running
         // while the shared DB mutex is held.
-        let (done, item, target_branch) = self.with_backend_db(|conn| {
+        let (done, item_id, item, target_branch) = self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
             let done = agentflare_backend::item::mark_completed(conn, &item_id, &owner)
                 .map_err(map_backend_err)?;
             let (item, target_branch) = if done {
@@ -450,7 +471,7 @@ impl AgentflareMcp {
             } else {
                 (None, None)
             };
-            Ok::<_, ErrorData>((done, item, target_branch))
+            Ok::<_, ErrorData>((done, item_id, item, target_branch))
         })??;
         let pr_url = match (&item, &target_branch) {
             (Some(item), Some(target)) => PROGRESS_SENDER
@@ -491,14 +512,15 @@ impl AgentflareMcp {
     }
 
     pub(super) fn item_cancel(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let item_id = req
+        let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for cancel", None))?;
-        if item_id.trim().is_empty() {
+        if raw.trim().is_empty() {
             return Err(ErrorData::invalid_params("id is required", None));
         }
         let owner = crate::claims::owner_id();
         self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
             let project = self.resolve_project(conn)?;
             let cancelled =
                 agentflare_backend::state::first_in_group(conn, &project.id, "cancelled")
@@ -536,19 +558,20 @@ impl AgentflareMcp {
     }
 
     pub(super) fn item_add_label(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let item_id = req
+        let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for add_label", None))?;
         let label_id = req
             .label_id
             .ok_or_else(|| ErrorData::invalid_params("label_id is required for add_label", None))?;
-        if item_id.trim().is_empty() || label_id.trim().is_empty() {
+        if raw.trim().is_empty() || label_id.trim().is_empty() {
             return Err(ErrorData::invalid_params(
                 "id and label_id are required",
                 None,
             ));
         }
         self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
             agentflare_backend::item::add_label(conn, &item_id, &label_id)
                 .map_err(map_backend_err)?;
             Ok(
@@ -559,19 +582,20 @@ impl AgentflareMcp {
     }
 
     pub(super) fn item_remove_label(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let item_id = req
+        let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for remove_label", None))?;
         let label_id = req.label_id.ok_or_else(|| {
             ErrorData::invalid_params("label_id is required for remove_label", None)
         })?;
-        if item_id.trim().is_empty() || label_id.trim().is_empty() {
+        if raw.trim().is_empty() || label_id.trim().is_empty() {
             return Err(ErrorData::invalid_params(
                 "id and label_id are required",
                 None,
             ));
         }
         self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
             agentflare_backend::item::remove_label(conn, &item_id, &label_id)
                 .map_err(map_backend_err)?;
             Ok(

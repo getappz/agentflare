@@ -1310,3 +1310,57 @@ fn find_root_from_never_resolves_to_home_itself() {
 // depend on what markers happen to exist above the OS temp directory on
 // whatever machine runs this — not a property this test can control. The
 // fallback itself is a single trivial `None => return start`.
+#[test]
+fn item_get_resolves_bare_and_hash_prefixed_sequence_id() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let uuid = created["id"].as_str().unwrap().to_string();
+    let seq = created["sequence_id"].as_i64().unwrap();
+
+    let by_bare_seq: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "get".into(),
+            id: Some(seq.to_string()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(by_bare_seq["id"], uuid);
+
+    let by_hash_seq: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "get".into(),
+            id: Some(format!("#{seq}")),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(by_hash_seq["id"], uuid);
+
+    let by_uuid: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "get".into(),
+            id: Some(uuid.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(by_uuid["id"], uuid);
+}
+
+#[test]
+fn item_get_unknown_sequence_id_returns_not_found() {
+    let (_tmp, s) = harness();
+    let err = s
+        .item(Parameters(ItemRequest {
+            action: "get".into(),
+            id: Some("999999".into()),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}

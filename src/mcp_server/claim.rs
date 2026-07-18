@@ -3,12 +3,23 @@
 use super::*;
 
 impl AgentflareMcp {
+    /// Resolve a claim target that may be `item#<seq_id>` → `item#<uuid>`.
+    fn resolve_claim_target(&self, target: &str) -> Result<String, ErrorData> {
+        if let Some(rest) = target.strip_prefix("item#") {
+            let uuid = self.with_backend_db(|conn| self.resolve_item_id(conn, rest))??;
+            Ok(format!("item#{uuid}"))
+        } else {
+            Ok(target.to_string())
+        }
+    }
+
     pub fn claim_impl(&self, req: ClaimRequest) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "acquire" => {
                 let target = req
                     .target
                     .ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
+                let target = self.resolve_claim_target(&target)?;
                 let repo_opt = req.repo;
                 let repo_overridden = repo_opt.as_ref().is_some_and(|r| !r.is_empty());
                 let (conn, repo) = Self::claim_ctx(&target, repo_opt)?;
@@ -37,6 +48,7 @@ impl AgentflareMcp {
                 let target = req
                     .target
                     .ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
+                let target = self.resolve_claim_target(&target)?;
                 let (conn, repo) = Self::claim_ctx(&target, req.repo)?;
                 let owner = crate::claims::owner_id();
                 let ok =
@@ -51,6 +63,7 @@ impl AgentflareMcp {
                 let target = req
                     .target
                     .ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
+                let target = self.resolve_claim_target(&target)?;
                 let (conn, repo) = Self::claim_ctx(&target, req.repo)?;
                 let owner = crate::claims::owner_id();
                 let ok = crate::claims::release(&conn, &repo, &target, &owner)
@@ -64,6 +77,7 @@ impl AgentflareMcp {
                 let target = req
                     .target
                     .ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
+                let target = self.resolve_claim_target(&target)?;
                 let (conn, repo) = Self::claim_ctx(&target, req.repo)?;
                 let owner = crate::claims::owner_id();
                 let ok = crate::claims::done(&conn, &repo, &target, &owner, crate::claims::now())

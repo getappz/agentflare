@@ -73,7 +73,9 @@ pub(crate) struct ToolRequest {
 pub(crate) struct ClaimRequest {
     #[schemars(description = "Action: acquire|done|heartbeat|list|release")]
     pub(crate) action: String,
-    #[schemars(description = "Target to claim, e.g. \"issue#42\" or \"pr#7\"")]
+    #[schemars(
+        description = "Target to claim, e.g. \"issue#42\", \"pr#7\", \"item#<uuid>\", or \"item#<seq_id>\""
+    )]
     #[serde(default)]
     pub(crate) target: Option<String>,
     #[schemars(description = "Repo key owner/name (default: normalized origin remote)")]
@@ -566,7 +568,7 @@ pub(crate) struct ItemRequest {
     )]
     pub(crate) action: String,
     #[schemars(
-        description = "Item ID (required for get, update, update_state, delete, claim, heartbeat, release, done, add_label, remove_label)"
+        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, add_label, remove_label"
     )]
     #[serde(default)]
     pub(crate) id: Option<String>,

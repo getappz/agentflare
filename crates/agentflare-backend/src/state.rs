@@ -83,7 +83,7 @@ fn row_to_state(row: &rusqlite::Row) -> rusqlite::Result<State> {
 pub fn seed_defaults(conn: &Connection, project_id: &str) -> Result<()> {
     let ts = now();
     for (i, (name, group, seq, color)) in DEFAULT_STATES.iter().enumerate() {
-        let id = uuid::Uuid::now_v7().to_string();
+        let id = db_kit::ids::new_id();
         let is_default = if i == 0 { 1 } else { 0 };
         conn.execute(
             "INSERT INTO states (id, project_id, name, group_name, sequence, is_default, color, created_at, updated_at)
@@ -95,7 +95,7 @@ pub fn seed_defaults(conn: &Connection, project_id: &str) -> Result<()> {
 }
 
 pub fn create(conn: &Connection, input: CreateState) -> Result<State> {
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = db_kit::ids::new_id();
     let ts = now();
     let is_default = if input.is_default.unwrap_or(false) {
         1

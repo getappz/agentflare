@@ -56,7 +56,7 @@ fn row_to_project(row: &rusqlite::Row) -> rusqlite::Result<Project> {
 }
 
 pub fn create(conn: &Connection, input: CreateProject) -> Result<Project> {
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = db_kit::ids::new_id();
     let ts = now();
     // One transaction: a project must never exist with fewer than its 6
     // seeded default states. Without this, a crash between the INSERT and

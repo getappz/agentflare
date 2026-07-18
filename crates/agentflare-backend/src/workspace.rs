@@ -50,7 +50,7 @@ fn row_to_workspace(row: &rusqlite::Row) -> rusqlite::Result<Workspace> {
 }
 
 pub fn create(conn: &Connection, input: CreateWorkspace) -> Result<Workspace> {
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = db_kit::ids::new_id();
     let ts = now();
     let item_label = input.item_label.unwrap_or_else(|| "Item".to_string());
     conn.execute(
