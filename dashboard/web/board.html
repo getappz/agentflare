@@ -12,7 +12,7 @@
 <body>
   <div class="af-app">
     <aside class="af-sidebar" x-data="shellNav()" x-init="init()">
-      <div class="af-sidebar-header">agentflare</div>
+      <div class="af-sidebar-header"><span class="af-logo-mark"></span>agentflare</div>
 
       <div class="af-nav-section">
         <label class="af-nav-section-label" for="af-workspace-select">Workspace</label>
@@ -74,27 +74,29 @@
           <template x-for="state in states" :key="state.id">
             <div class="af-board-col">
               <div class="af-board-col-header">
-                <span class="af-state-dot" :style="{ background: state.color }"></span>
+                <span class="af-state-dot" :style="{ background: state.color, color: state.color }"></span>
                 <span x-text="state.name"></span>
-                <span class="af-board-col-count" x-text="'(' + itemsForState(state.id).length + ')'"></span>
+                <span class="af-board-col-count" x-text="itemsForState(state.id).length"></span>
               </div>
-              <template x-if="itemsForState(state.id).length === 0">
-                <p class="af-empty" style="padding: var(--af-space-3)">No items</p>
-              </template>
-              <template x-for="item in itemsForState(state.id)" :key="item.id">
-                <a
-                  class="af-card"
-                  :href="itemHref(item)"
-                >
-                  <div class="af-card-title" x-text="item.name"></div>
-                  <div class="af-card-meta">
-                    <span class="af-badge" x-text="item.priority"></span>
-                    <template x-if="item.assignee_agent">
-                      <span class="af-badge" x-text="item.assignee_agent"></span>
-                    </template>
-                  </div>
-                </a>
-              </template>
+              <div class="af-board-col-body">
+                <template x-if="itemsForState(state.id).length === 0">
+                  <p class="af-empty-col">No items</p>
+                </template>
+                <template x-for="item in itemsForState(state.id)" :key="item.id">
+                  <a
+                    class="af-card"
+                    :href="itemHref(item)"
+                  >
+                    <div class="af-card-title" x-text="item.name"></div>
+                    <div class="af-card-meta">
+                      <span class="af-badge af-prio" :class="'af-prio-' + (item.priority || 'none').toLowerCase()" x-text="item.priority"></span>
+                      <template x-if="item.assignee_agent">
+                        <span class="af-badge af-badge-assignee" x-text="item.assignee_agent"></span>
+                      </template>
+                    </div>
+                  </a>
+                </template>
+              </div>
             </div>
           </template>
         </div>
