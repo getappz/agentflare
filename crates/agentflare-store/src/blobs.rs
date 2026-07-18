@@ -17,9 +17,15 @@ fn blob_disk_path(root: &Path, hash: &str) -> PathBuf {
     root.join("blobs").join(&hash[..2]).join(hash)
 }
 
-fn read_disk_blob(root: &Path, hash: &str) -> Option<Vec<u8>> {
+/// `Ok(None)` means the file genuinely isn't there; other I/O errors (permissions,
+/// disk failures) are propagated instead of being folded into "not found".
+fn read_disk_blob(root: &Path, hash: &str) -> std::io::Result<Option<Vec<u8>>> {
     let path = blob_disk_path(root, hash);
-    std::fs::read(&path).ok()
+    match std::fs::read(&path) {
+        Ok(data) => Ok(Some(data)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 fn write_disk_blob(root: &Path, hash: &str, data: &[u8]) -> Result<(), std::io::Error> {
@@ -47,8 +53,16 @@ impl Store {
         let conn = self.conn();
         let hash = blake3::hash(data).to_hex().to_string();
         let now = db_kit::ids::now();
+        let is_memory = self.is_memory();
 
-        let exists = conn
+        // Immediate takes the write lock up front, so the exists-check and
+        // the insert-or-bump below are atomic across connections — without
+        // this, two concurrent stores of the same new content can both see
+        // "not found" and then race on the INSERT.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+
+        let exists = tx
             .query_row(
                 "SELECT 1 FROM store_blobs WHERE hash = ?1",
                 params![hash],
@@ -58,31 +72,40 @@ impl Store {
             .is_some();
 
         if exists {
-            conn.execute(
+            tx.execute(
                 "UPDATE store_blobs SET ref_count = ref_count + 1 WHERE hash = ?1",
                 params![hash],
             )?;
+            tx.commit()?;
             return Ok(hash);
         }
 
-        let is_memory = self.is_memory();
         if !is_memory {
+            // Written outside the SQL transaction (files aren't part of it);
+            // if the metadata insert below fails, remove it again so a
+            // failed store doesn't leak an orphaned file with no DB row.
             if let Err(e) = write_disk_blob(&self.root, &hash, data) {
                 return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)));
             }
         } else {
             for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
-                conn.execute(
+                tx.execute(
                     "INSERT INTO store_blob_chunks (hash, chunk_index, data) VALUES (?1, ?2, ?3)",
                     params![hash, i as i64, chunk],
                 )?;
             }
         }
 
-        conn.execute(
+        if let Err(e) = tx.execute(
             "INSERT INTO store_blobs (hash, size, ref_count, created_at) VALUES (?1, ?2, 1, ?3)",
             params![hash, data.len() as i64, now],
-        )?;
+        ) {
+            if !is_memory {
+                delete_disk_blob(&self.root, &hash);
+            }
+            return Err(e);
+        }
+        tx.commit()?;
         Ok(hash)
     }
 
@@ -109,7 +132,8 @@ impl Store {
         };
 
         if !self.is_memory() {
-            return Ok(read_disk_blob(&self.root, hash));
+            return read_disk_blob(&self.root, hash)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)));
         }
 
         let conn = self.conn();
@@ -136,12 +160,22 @@ impl Store {
 
     pub fn blob_unref(&self, hash: &str) -> rusqlite::Result<bool> {
         let conn = self.conn();
-        let n = conn.execute(
+        let is_memory = self.is_memory();
+
+        // Immediate takes the write lock up front, so the decrement and the
+        // ref_count<=0 cascade-delete below are atomic across connections —
+        // without this, two concurrent unrefs can both observe ref_count<=0
+        // and both attempt the cascade.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+
+        let n = tx.execute(
             "UPDATE store_blobs SET ref_count = ref_count - 1 WHERE hash = ?1 AND ref_count > 0",
             params![hash],
         )?;
+        let mut removed = false;
         if n > 0 {
-            let removed = conn
+            removed = tx
                 .query_row(
                     "SELECT ref_count <= 0 FROM store_blobs WHERE hash = ?1",
                     params![hash],
@@ -150,16 +184,22 @@ impl Store {
                 .optional()?
                 .unwrap_or(false);
             if removed {
-                conn.execute("DELETE FROM store_blobs WHERE hash = ?1", params![hash])?;
-                if !self.is_memory() {
-                    delete_disk_blob(&self.root, hash);
-                } else {
-                    conn.execute(
+                if is_memory {
+                    tx.execute(
                         "DELETE FROM store_blob_chunks WHERE hash = ?1",
                         params![hash],
                     )?;
                 }
+                tx.execute("DELETE FROM store_blobs WHERE hash = ?1", params![hash])?;
             }
+        }
+        tx.commit()?;
+
+        // Disk cleanup runs after the metadata commit: the row is the
+        // source of truth and is already gone, so a crash here just leaks
+        // a file instead of leaving a dangling row with no data.
+        if removed && !is_memory {
+            delete_disk_blob(&self.root, hash);
         }
         Ok(n > 0)
     }

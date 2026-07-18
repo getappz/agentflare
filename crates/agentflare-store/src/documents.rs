@@ -111,7 +111,14 @@ impl Store {
         let conn = self.conn();
         let now = db_kit::ids::now();
 
-        let existing = conn
+        // BEGIN IMMEDIATE takes SQLite's write lock up front, so the version
+        // read below is serialized against other connections instead of
+        // racing them (two connections could otherwise both read version N
+        // and both compute N+1).
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+
+        let existing = tx
             .query_row(
                 "SELECT id, rowid, content, version, blob_hash, mime FROM store_documents
                  WHERE project_id = ?1 AND path = ?2",
@@ -134,8 +141,6 @@ impl Store {
         {
             let new_version = old_version + 1;
             let history_id = db_kit::ids::new_id();
-
-            let tx = conn.unchecked_transaction()?;
 
             // Snapshot current version to history
             tx.execute(
@@ -210,7 +215,9 @@ impl Store {
             let tags_json = serde_json::to_string(&tags_val).unwrap_or_else(|_| "[]".to_string());
             let source = opts.source.unwrap_or_default();
 
-            conn.execute(
+            // Insert + FTS sync share this transaction so a failure between
+            // the two can't leave a document without its search index row.
+            tx.execute(
                 "INSERT INTO store_documents
                  (id, project_id, path, content, title, doc_type, blob_hash, mime, tags, session_id, source, version, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?12)",
@@ -219,8 +226,9 @@ impl Store {
                     mime, tags_json, opts.session_id, source, now
                 ],
             )?;
-            let rowid = conn.last_insert_rowid();
-            Self::doc_sync_fts(&conn, rowid, content)?;
+            let rowid = tx.last_insert_rowid();
+            Self::doc_sync_fts(&tx, rowid, content)?;
+            tx.commit()?;
             Ok(Document {
                 id,
                 project_id: project_id.to_string(),
@@ -280,23 +288,32 @@ impl Store {
 
     pub fn doc_hard_delete(&self, id: &str) -> rusqlite::Result<bool> {
         let conn = self.conn();
-        if let Some(rowid) = conn
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let Some(rowid) = tx
             .query_row(
                 "SELECT rowid FROM store_documents WHERE id = ?1",
                 params![id],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?
-        {
-            conn.execute("DELETE FROM store_documents WHERE id = ?1", params![id])?;
-            conn.execute(
-                "DELETE FROM store_docs_fts WHERE rowid = ?1",
-                params![rowid],
-            )?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        else {
+            return Ok(false);
+        };
+
+        // Delete dependents before the parent row, all in one transaction.
+        tx.execute(
+            "DELETE FROM store_doc_history WHERE doc_id = ?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM store_docs_vec WHERE doc_id = ?1", params![id])?;
+        tx.execute(
+            "DELETE FROM store_docs_fts WHERE rowid = ?1",
+            params![rowid],
+        )?;
+        tx.execute("DELETE FROM store_documents WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn doc_history(&self, doc_id: &str) -> rusqlite::Result<Vec<DocVersion>> {
@@ -440,7 +457,7 @@ impl Store {
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
-                let sim = crate::embed::cosine_similarity(query_vec, &doc_vec) as f64;
+                let sim = crate::embed::cosine_similarity(query_vec, &doc_vec)? as f64;
                 Some((
                     sim,
                     DocMatch {
@@ -622,15 +639,19 @@ mod tests {
         let d2 = s.doc_upsert("p", "/dog.md", "about dogs").unwrap();
         let d3 = s.doc_upsert("p", "/car.md", "about cars").unwrap();
 
-        test_embed(&s, &d1.id, 4, 1.0);
-        test_embed(&s, &d2.id, 4, 0.8);
-        test_embed(&s, &d3.id, 4, 0.0);
+        // Directionally distinct so cosine similarity actually differs —
+        // uniform-value vectors like [1,1,1,1] vs [0.8,0.8,0.8,0.8] are
+        // collinear and score identically regardless of magnitude.
+        s.doc_set_embedding(&d1.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        s.doc_set_embedding(&d2.id, &[1.0, 1.0, 0.0, 0.0]).unwrap();
+        s.doc_set_embedding(&d3.id, &[0.0, 1.0, 0.0, 0.0]).unwrap();
 
-        let query = vec![1.0; 4];
+        let query = vec![1.0, 0.0, 0.0, 0.0];
         let results = s.doc_vec_search("p", &query, 10).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].id, d1.id);
         assert_eq!(results[1].id, d2.id);
+        assert_eq!(results[2].id, d3.id);
     }
 
     #[test]

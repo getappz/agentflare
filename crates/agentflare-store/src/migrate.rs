@@ -24,15 +24,28 @@ pub fn migrate_state_json(store: &Store, path: &Path) -> Result<usize, MigrateEr
     let content = std::fs::read_to_string(path)?;
     let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&content)?;
 
-    for (key, value) in &map {
-        let serialized = serde_json::to_vec(value)?;
-        store.kv_set(key, &serialized)?;
-    }
-
+    // One transaction for every key plus the completion marker: a partial
+    // failure rolls back entirely instead of leaving the marker set (or
+    // absent) out of sync with which keys actually landed.
+    let conn = store.conn();
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
     let now = db_kit::ids::now();
-    let marker = serde_json::to_vec(&now)?;
-    store.kv_set(MIGRATION_MARKER, &marker)?;
+    let upsert = |key: &str, value: &[u8]| -> Result<(), MigrateError> {
+        tx.execute(
+            "INSERT INTO store_kv (key, value, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+            rusqlite::params![key, value, now],
+        )?;
+        Ok(())
+    };
 
+    for (key, value) in &map {
+        upsert(key, &serde_json::to_vec(value)?)?;
+    }
+    upsert(MIGRATION_MARKER, &serde_json::to_vec(&now)?)?;
+
+    tx.commit()?;
     Ok(map.len())
 }
 
