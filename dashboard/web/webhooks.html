@@ -1,0 +1,169 @@
+<!-- @dsCard group="Ops" -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>agentflare dashboard — webhooks</title>
+  <link rel="stylesheet" href="/tokens.css" />
+  <script defer src="/shell.js"></script>
+  <script defer src="/vendor/alpine.js"></script>
+</head>
+<body>
+  <div class="af-app">
+    <aside class="af-sidebar" x-data="shellNav()" x-init="init()">
+      <div class="af-sidebar-header">agentflare</div>
+
+      <div class="af-nav-section">
+        <label class="af-nav-section-label" for="af-workspace-select">Workspace</label>
+        <select
+          id="af-workspace-select"
+          class="af-select"
+          x-model="workspaceId"
+          @change="onWorkspaceChange()"
+        >
+          <template x-if="!loading && workspaces.length === 0">
+            <option value="">No workspaces</option>
+          </template>
+          <template x-for="w in workspaces" :key="w.id">
+            <option :value="w.id" x-text="w.name"></option>
+          </template>
+        </select>
+      </div>
+
+      <div class="af-nav-section">
+        <label class="af-nav-section-label" for="af-project-select">Project</label>
+        <select
+          id="af-project-select"
+          class="af-select"
+          x-model="projectId"
+          @change="onProjectChange()"
+        >
+          <template x-if="!loading && projects.length === 0">
+            <option value="">No projects</option>
+          </template>
+          <template x-for="p in projects" :key="p.id">
+            <option :value="p.id" x-text="p.identifier + ' — ' + p.name"></option>
+          </template>
+        </select>
+      </div>
+
+      <nav class="af-nav-links">
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/board.html') }" :href="navHref('/board.html')">Board</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/list.html') }" :href="navHref('/list.html')">List</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/webhooks.html') }" :href="navHref('/webhooks.html')">Webhooks</a>
+      </nav>
+    </aside>
+
+    <div class="af-main-col">
+      <header class="af-topbar">
+        <h1>Webhooks</h1>
+      </header>
+      <main
+        class="af-content"
+        x-data="webhooksView()"
+        x-init="init()"
+      >
+        <template x-if="!loading && !workspaceId">
+          <p class="af-empty">No workspace selected — create a workspace first.</p>
+        </template>
+        <template x-if="!loading && workspaceId && logs.length === 0">
+          <p class="af-empty">No webhook deliveries logged.</p>
+        </template>
+        <div class="af-table-wrap" x-show="!loading && logs.length > 0">
+          <table class="af-table">
+            <thead>
+              <tr>
+                <th @click="sortBy('created_at')">Delivered</th>
+                <th @click="sortBy('event_type')">Event</th>
+                <th @click="sortBy('request_method')">Method</th>
+                <th @click="sortBy('response_status')">Status</th>
+                <th @click="sortBy('retry_count')">Retries</th>
+                <th>Webhook</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="log in sortedLogs()" :key="log.id">
+                <tr class="is-clickable" @click="toggleExpanded(log.id)">
+                  <td x-text="afFormatTime(log.created_at)"></td>
+                  <td x-text="log.event_type || '—'"></td>
+                  <td x-text="log.request_method || '—'"></td>
+                  <td x-text="log.response_status || '—'"></td>
+                  <td x-text="log.retry_count"></td>
+                  <td class="af-mono af-truncate" x-text="log.webhook_id"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+
+        <template x-if="expandedLog">
+          <div class="af-item-description" style="margin-top: var(--af-space-4)">
+            <div class="af-section-title">Delivery detail</div>
+            <div><strong>Request body</strong></div>
+            <pre class="af-mono" x-text="expandedLog.request_body || '(empty)'"></pre>
+            <div><strong>Response body</strong></div>
+            <pre class="af-mono" x-text="expandedLog.response_body || '(empty)'"></pre>
+          </div>
+        </template>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    function webhooksView() {
+      return {
+        workspaceId: '',
+        logs: [],
+        loading: true,
+        sortField: 'created_at',
+        sortDir: 'desc',
+        expandedLogId: null,
+
+        async init() {
+          const params = afParams();
+          const scope = await afResolveScope(params.get('workspace_id'), null);
+          this.workspaceId = scope.workspaceId;
+          if (!this.workspaceId) {
+            this.loading = false;
+            return;
+          }
+          this.logs = await afGetJson(
+            `/api/webhooks?workspace_id=${encodeURIComponent(this.workspaceId)}`,
+            [],
+          );
+          this.loading = false;
+        },
+
+        sortBy(field) {
+          if (this.sortField === field) {
+            this.sortDir = this.sortDir === 'asc' ? 'desc' : 'asc';
+          } else {
+            this.sortField = field;
+            this.sortDir = 'asc';
+          }
+        },
+
+        sortedLogs() {
+          const field = this.sortField;
+          const dir = this.sortDir === 'asc' ? 1 : -1;
+          return this.logs.slice().sort((a, b) => {
+            const av = a[field];
+            const bv = b[field];
+            if (av === bv) return 0;
+            return av > bv ? dir : -dir;
+          });
+        },
+
+        toggleExpanded(id) {
+          this.expandedLogId = this.expandedLogId === id ? null : id;
+        },
+
+        get expandedLog() {
+          return this.logs.find((l) => l.id === this.expandedLogId) || null;
+        },
+      };
+    }
+  </script>
+</body>
+</html>
