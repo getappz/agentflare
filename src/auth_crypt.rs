@@ -19,17 +19,7 @@ pub fn get_passphrase() -> Option<String> {
 }
 
 fn prompt_passphrase() -> Option<String> {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
-        return None;
-    }
-    let pw = rpassword::prompt_password("vault passphrase: ").unwrap_or_default();
-    let trimmed = pw.trim().to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
+    crate::ui::password("vault passphrase")
 }
 
 fn derive_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {

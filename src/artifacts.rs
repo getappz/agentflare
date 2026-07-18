@@ -7,10 +7,12 @@ pub fn serve(host: &str, port: u16, dir: Option<std::path::PathBuf>) {
     let server =
         ArtifactServer::start_on(store, host, port).expect("failed to start artifact server");
     let url = server.base_url();
-    eprintln!("agentflare artifacts server listening on {url}");
-    eprintln!("  store: {}", dir.display());
+    crate::ui::info(&format!("agentflare artifacts server listening on {url}"));
+    crate::ui::info(&format!("  store: {}", dir.display()));
     if host != "127.0.0.1" && host != "localhost" {
-        eprintln!("  warning: bound to {host} — anyone on your network can view these artifacts");
+        crate::ui::warning(&format!(
+            "bound to {host} — anyone on your network can view these artifacts"
+        ));
     }
     loop {
         std::thread::park();

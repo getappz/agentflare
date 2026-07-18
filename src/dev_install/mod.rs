@@ -19,21 +19,21 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Build (release unless `!release`), verify, and replace the running binary.
 pub fn run(release: bool, dry_run: bool) {
-    println!(
+    crate::ui::step(&format!(
         "building agentflare ({})...",
         if release { "release" } else { "debug" }
-    );
+    ));
     let built = match cargo::build_and_locate(release) {
         Ok(p) if p.exists() => p,
         Ok(p) => {
-            eprintln!(
+            crate::ui::error(&format!(
                 "error: cargo reported {} but it does not exist",
                 p.display()
-            );
+            ));
             std::process::exit(1);
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            crate::ui::error(&e.to_string());
             std::process::exit(1);
         }
     };
@@ -41,43 +41,46 @@ pub fn run(release: bool, dry_run: bool) {
     // Verify the fresh build runs *before* replacing anything, so a broken
     // build never overwrites a working install.
     if let Err(e) = verify_runs(&built) {
-        eprintln!("error: built binary failed verification: {e}");
+        crate::ui::error(&format!("built binary failed verification: {e}"));
         std::process::exit(1);
     }
 
     let target = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("error: cannot determine current binary path: {e}");
+            crate::ui::error(&format!("cannot determine current binary path: {e}"));
             std::process::exit(1);
         }
     };
 
     if same_file(&built, &target) {
-        eprintln!(
-            "refusing to install over the build output itself ({}).\n\
-             Run `dev-install` from your *installed* agentflare, not the freshly built binary.",
+        crate::ui::error(&format!(
+            "refusing to install over the build output itself ({}).\nRun `dev-install` from your *installed* agentflare, not the freshly built binary.",
             target.display()
-        );
+        ));
         std::process::exit(1);
     }
 
     if dry_run {
-        println!(
+        crate::ui::info(&format!(
             "dry-run: would install {} -> {}",
             built.display(),
             target.display()
-        );
+        ));
         return;
     }
 
-    println!("installing {} -> {}", built.display(), target.display());
+    crate::ui::step(&format!(
+        "installing {} -> {}",
+        built.display(),
+        target.display()
+    ));
     if let Err(e) = crate::update::swap::replace_binary(&built, &target) {
-        eprintln!("error installing binary: {e}");
+        crate::ui::error(&format!("error installing binary: {e}"));
         std::process::exit(1);
     }
-    println!("installed to {}", target.display());
-    println!("run `agentflare --version` to confirm");
+    crate::ui::success(&format!("installed to {}", target.display()));
+    crate::ui::info("run `agentflare --version` to confirm");
 }
 
 /// Run `<binary> --version` and confirm it exits successfully within

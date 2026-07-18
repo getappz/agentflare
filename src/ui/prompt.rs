@@ -30,3 +30,18 @@ pub fn select(prompt: &str, items: &[(String, String)]) -> Option<String> {
     }
     menu.interact().ok()
 }
+
+/// Masked password / secret input. Returns `None` when non-interactive, on
+/// cancel, or on I/O error — the caller falls back to an env var or aborts.
+/// `cliclack` renders a masked field, so this replaces raw `rpassword` calls
+/// and stays consistent with the rest of the UI.
+pub fn password(prompt: &str) -> Option<String> {
+    if !interactive() {
+        return None;
+    }
+    cliclack::password(prompt)
+        .interact()
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}

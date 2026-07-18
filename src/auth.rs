@@ -169,7 +169,7 @@ pub fn activate_with(agent: &str, profile: &str, reload_daemon: bool, json: bool
                 serde_json::json!({"error": "profile not found", "profile": profile})
             );
         } else {
-            eprintln!("error: profile '{profile}' not found for {agent}");
+            crate::ui::error(&format!("profile '{profile}' not found for {agent}"));
         }
         return;
     }
@@ -190,17 +190,17 @@ pub fn activate_with(agent: &str, profile: &str, reload_daemon: bool, json: bool
                         crate::atomic_fs::write_bytes_with_fallback(&dest, &decrypted, None)
                             .expect("write");
                     } else {
-                        eprintln!(
-                            "warning: cannot decrypt {} — wrong passphrase",
+                        crate::ui::warning(&format!(
+                            "cannot decrypt {} — wrong passphrase",
                             src.display()
-                        );
+                        ));
                         continue;
                     }
                 } else {
-                    eprintln!(
-                        "warning: {} is encrypted but no passphrase set — set AGENTFLARE_VAULT_PASSPHRASE",
+                    crate::ui::warning(&format!(
+                        "{} is encrypted but no passphrase set — set AGENTFLARE_VAULT_PASSPHRASE",
                         src.display()
-                    );
+                    ));
                     continue;
                 }
             } else {
@@ -230,14 +230,14 @@ pub fn activate_with(agent: &str, profile: &str, reload_daemon: bool, json: bool
     if crate::auth_runner::daemon_running(agent) {
         if reload_daemon {
             if let Err(e) = crate::auth_runner::reload_daemon(agent) {
-                eprintln!("warning: failed to reload daemon: {e}");
+                crate::ui::warning(&format!("failed to reload daemon: {e}"));
             } else if !json {
                 println!("daemon restarted — auth changes now active");
             }
         } else if !json {
-            eprintln!(
-                "warning: {agent} daemon is running — auth changes won't take effect until restart. Use --reload-daemon to auto-restart."
-            );
+            crate::ui::warning(&format!(
+                "{agent} daemon is running — auth changes won't take effect until restart. Use --reload-daemon to auto-restart."
+            ));
         }
     }
 }
@@ -316,7 +316,7 @@ pub fn delete(agent: &str, profile: &str, json: bool) {
         if json {
             println!("{}", serde_json::json!({"error": "not found"}));
         } else {
-            eprintln!("profile '{profile}' not found for {agent}");
+            crate::ui::error(&format!("profile '{profile}' not found for {agent}"));
         }
         return;
     }
@@ -363,7 +363,7 @@ pub fn rename(agent: &str, old: &str, new: &str, json: bool) {
         if json {
             println!("{}", serde_json::json!({"error": "not found"}));
         } else {
-            eprintln!("profile '{old}' not found for {agent}");
+            crate::ui::error(&format!("profile '{old}' not found for {agent}"));
         }
         return;
     }
@@ -372,7 +372,7 @@ pub fn rename(agent: &str, old: &str, new: &str, json: bool) {
         if json {
             println!("{}", serde_json::json!({"error": "destination exists"}));
         } else {
-            eprintln!("profile '{new}' already exists for {agent}");
+            crate::ui::error(&format!("profile '{new}' already exists for {agent}"));
         }
         return;
     }
@@ -462,7 +462,7 @@ fn fail(msg: &(impl std::fmt::Display + ?Sized), detail: &str, json: bool) {
             serde_json::json!({"error": msg.to_string(), "detail": detail})
         );
     } else {
-        eprintln!("error: {msg}: {detail}");
+        crate::ui::error(&format!("{msg}: {detail}"));
     }
 }
 
@@ -494,7 +494,7 @@ pub fn rotate(agent: &str, algorithm: &str, json: bool) {
                 serde_json::json!({"error": "no non-cooldown profiles available"})
             );
         } else {
-            eprintln!("error: all profiles are in cooldown");
+            crate::ui::error("all profiles are in cooldown");
         }
         return;
     }
@@ -618,7 +618,7 @@ pub fn cooldown_set(target: &str, minutes: Option<u32>, json: bool) {
                     serde_json::json!({"error": "expected <agent>/<profile>"})
                 );
             } else {
-                eprintln!("error: expected <agent>/<profile>");
+                crate::ui::error("expected <agent>/<profile>");
             }
             return;
         }
@@ -680,7 +680,7 @@ pub fn cooldown_clear(target: &str, json: bool) {
                     serde_json::json!({"error": "expected <agent>/<profile>"})
                 );
             } else {
-                eprintln!("error: expected <agent>/<profile>");
+                crate::ui::error("expected <agent>/<profile>");
             }
             return;
         }
@@ -730,7 +730,7 @@ pub fn project_set(agent: &str, profile: &str, json: bool) {
             if json {
                 println!("{}", serde_json::json!({"error": msg}));
             } else {
-                eprintln!("error: {msg}");
+                crate::ui::error(&msg);
             }
             return;
         }
@@ -756,7 +756,7 @@ pub fn project_unset(agent: &str, json: bool) {
             if json {
                 println!("{}", serde_json::json!({"error": msg}));
             } else {
-                eprintln!("error: {msg}");
+                crate::ui::error(&msg);
             }
             return;
         }
@@ -797,7 +797,9 @@ pub fn isolate_add_with(agent: &str, profile: &str, shallow: bool, json: bool) {
                 serde_json::json!({"error": "isolated profile already exists"})
             );
         } else {
-            eprintln!("isolated profile '{agent}/{profile}' already exists");
+            crate::ui::error(&format!(
+                "isolated profile '{agent}/{profile}' already exists"
+            ));
         }
         return;
     }
@@ -832,10 +834,10 @@ pub fn isolate_add_with(agent: &str, profile: &str, shallow: bool, json: bool) {
         dir.join("isolate.json"),
         serde_json::to_string_pretty(&meta).unwrap() + "\n",
     ) {
-        eprintln!(
-            "warning: failed to write isolate metadata to {}: {e}",
+        crate::ui::warning(&format!(
+            "failed to write isolate metadata to {}: {e}",
             dir.display()
-        );
+        ));
     }
 
     if json {
@@ -906,7 +908,7 @@ pub fn isolate_delete(agent: &str, profile: &str, json: bool) {
         if json {
             println!("{}", serde_json::json!({"error": "not found"}));
         } else {
-            eprintln!("isolated profile '{agent}/{profile}' not found");
+            crate::ui::error(&format!("isolated profile '{agent}/{profile}' not found"));
         }
         return;
     }
@@ -930,15 +932,15 @@ pub fn auth_exec(agent: &str, profile: &str, args: &[String], json: bool) {
                 serde_json::json!({"error": "isolated profile not found"})
             );
         } else {
-            eprintln!(
-                "error: isolated profile '{agent}/{profile}' not found — run 'auth isolate add' first"
-            );
+            crate::ui::error(&format!(
+                "isolated profile '{agent}/{profile}' not found — run 'auth isolate add' first"
+            ));
         }
         return;
     }
 
     if args.is_empty() {
-        eprintln!("error: no command specified after --");
+        crate::ui::error("no command specified after --");
         return;
     }
 
@@ -955,7 +957,7 @@ pub fn auth_exec(agent: &str, profile: &str, args: &[String], json: bool) {
         cmd.env("HOMEPATH", &dir);
     }
     let status = cmd.spawn().and_then(|mut c| c.wait()).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
+        crate::ui::error(&format!("{e}"));
         std::process::exit(1);
     });
 
@@ -972,7 +974,7 @@ pub fn auth_login(agent: &str, profile: &str, args: &[String], json: bool) {
     }
 
     if args.is_empty() {
-        eprintln!("error: no login command specified after --");
+        crate::ui::error("no login command specified after --");
         return;
     }
 
@@ -989,7 +991,7 @@ pub fn auth_login(agent: &str, profile: &str, args: &[String], json: bool) {
         cmd.env("HOMEPATH", &dir);
     }
     let status = cmd.spawn().and_then(|mut c| c.wait()).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
+        crate::ui::error(&format!("{e}"));
         std::process::exit(1);
     });
 
@@ -1055,17 +1057,17 @@ fn activate_into(agent: &str, profile: &str, target_dir: &std::path::Path) {
                         crate::atomic_fs::write_bytes_with_fallback(&dest, &decrypted, None)
                             .expect("write");
                     } else {
-                        eprintln!(
-                            "warning: cannot decrypt {} — wrong passphrase",
+                        crate::ui::warning(&format!(
+                            "cannot decrypt {} — wrong passphrase",
                             src.display()
-                        );
+                        ));
                         continue;
                     }
                 } else {
-                    eprintln!(
-                        "warning: {} is encrypted but no passphrase set",
+                    crate::ui::warning(&format!(
+                        "{} is encrypted but no passphrase set",
                         src.display()
-                    );
+                    ));
                     continue;
                 }
             } else {
@@ -1092,11 +1094,11 @@ fn warn_on_link_failure(src: &std::path::Path, dest: &std::path::Path, res: std:
     if let Err(e) = res
         && e.kind() != std::io::ErrorKind::AlreadyExists
     {
-        eprintln!(
-            "warning: failed to link {} into isolate at {}: {e}",
+        crate::ui::warning(&format!(
+            "failed to link {} into isolate at {}: {e}",
             src.display(),
             dest.display()
-        );
+        ));
     }
 }
 

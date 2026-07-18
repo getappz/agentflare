@@ -153,7 +153,7 @@ pub fn cli_install(agent: &str, dry_run: bool) {
     match agent_install::run_install(agent_registry::REGISTRY, agent, None, dry_run) {
         Outcome::Ok(msg) => println!("{msg}"),
         Outcome::Skipped(msg) => println!("skip: {msg}"),
-        Outcome::Err(msg) => eprintln!("error: {msg}"),
+        Outcome::Err(msg) => crate::ui::error(&msg),
     }
 }
 
@@ -161,7 +161,7 @@ pub fn cli_update(agent: &str, dry_run: bool) {
     match agent_install::run_update(agent_registry::REGISTRY, agent, dry_run) {
         Outcome::Ok(msg) => println!("{msg}"),
         Outcome::Skipped(msg) => println!("skip: {msg}"),
-        Outcome::Err(msg) => eprintln!("error: {msg}"),
+        Outcome::Err(msg) => crate::ui::error(&msg),
     }
 }
 
@@ -169,16 +169,16 @@ pub fn cli_uninstall(agent: &str, dry_run: bool) {
     match agent_install::run_uninstall(agent_registry::REGISTRY, agent, dry_run) {
         Outcome::Ok(msg) => println!("{msg}"),
         Outcome::Skipped(msg) => println!("skip: {msg}"),
-        Outcome::Err(msg) => eprintln!("error: {msg}"),
+        Outcome::Err(msg) => crate::ui::error(&msg),
     }
 }
 
 pub fn cli_launch(agent: &str, model: Option<&str>, mode: Option<&str>, args: &[String]) {
     match agent_launch::run_launch(agent_registry::REGISTRY, agent, model, mode, args) {
         LaunchOutcome::Launched => {}
-        LaunchOutcome::NotFound(msg) => eprintln!("error: {msg}"),
-        LaunchOutcome::UnknownAgent(msg) => eprintln!("error: unknown agent: {msg}"),
-        LaunchOutcome::Extension(msg) => eprintln!("error: {msg}"),
+        LaunchOutcome::NotFound(msg) => crate::ui::error(&msg),
+        LaunchOutcome::UnknownAgent(msg) => crate::ui::error(&format!("unknown agent: {msg}")),
+        LaunchOutcome::Extension(msg) => crate::ui::error(&msg),
     }
 }
 
@@ -204,7 +204,9 @@ pub fn cli_run(
         }
         None => {
             if let Some(s) = stage {
-                eprintln!("agentflare run: no .dev.vars.{s} or .dev.vars found");
+                crate::ui::warning(&format!(
+                    "agentflare run: no .dev.vars.{s} or .dev.vars found"
+                ));
             }
             Vec::new()
         }
@@ -219,9 +221,9 @@ pub fn cli_run(
         true,
     ) {
         LaunchOutcome::Launched => {}
-        LaunchOutcome::NotFound(msg) => eprintln!("error: {msg}"),
-        LaunchOutcome::UnknownAgent(msg) => eprintln!("error: unknown agent: {msg}"),
-        LaunchOutcome::Extension(msg) => eprintln!("error: {msg}"),
+        LaunchOutcome::NotFound(msg) => crate::ui::error(&msg),
+        LaunchOutcome::UnknownAgent(msg) => crate::ui::error(&format!("unknown agent: {msg}")),
+        LaunchOutcome::Extension(msg) => crate::ui::error(&msg),
     }
 }
 
@@ -238,7 +240,7 @@ pub fn cli_run_headless(agent: &str, prompt: &str, timeout: std::time::Duration)
         | agent_launch::HeadlessOutcome::NotHeadless(msg)
         | agent_launch::HeadlessOutcome::NotFound(msg)
         | agent_launch::HeadlessOutcome::Failed(msg) => {
-            eprintln!("error: {msg}");
+            crate::ui::error(&msg);
             1
         }
     }

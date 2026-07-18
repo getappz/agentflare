@@ -52,7 +52,7 @@ impl HandoffArgs {
                 println!("  hint: {recipient} reads it via /flare:handoff inbox (or artifact_get)");
             }
             Err(e) => {
-                eprintln!("Error: {e}");
+                crate::ui::error(&e.to_string());
                 std::process::exit(1);
             }
         }

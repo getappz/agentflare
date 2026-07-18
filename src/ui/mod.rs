@@ -20,7 +20,7 @@ mod prompt;
 mod spinner;
 
 pub use log::{error, info, intro, outro, skip, step, success, warning};
-pub use prompt::{confirm, select};
+pub use prompt::{confirm, password, select};
 pub use spinner::with_spinner;
 
 use std::io::IsTerminal;

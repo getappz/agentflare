@@ -25,12 +25,12 @@ pub fn run(agent: &str, args: &[String], json: bool) {
             ExitKind::Success => return,
             ExitKind::RateLimited => {
                 if remaining == 0 {
-                    eprintln!("error: all retries exhausted");
+                    crate::ui::error("all retries exhausted");
                     std::process::exit(1);
                 }
                 remaining -= 1;
                 if !json {
-                    eprintln!("rate limited — rotating profile...");
+                    crate::ui::warning("rate limited — rotating profile...");
                 }
                 let conn = auth_db::open_or_rebuild();
                 if let Some((profile, _)) = auth_db::get_rotation_last(&conn, agent) {
@@ -39,7 +39,9 @@ pub fn run(agent: &str, args: &[String], json: bool) {
                 }
                 crate::auth::rotate(agent, "smart", json);
                 if !json {
-                    eprintln!("retrying with new profile ({remaining} retries left)...");
+                    crate::ui::info(&format!(
+                        "retrying with new profile ({remaining} retries left)..."
+                    ));
                 }
                 // flare-code: short backoff, linear increase if rate limits persist
                 thread::sleep(Duration::from_secs(1 + (MAX_RETRIES - remaining) as u64));
@@ -84,7 +86,7 @@ fn spawn_and_capture(agent: &str, args: &[String]) -> (i32, String) {
     {
         Ok(child) => child,
         Err(e) => {
-            eprintln!("error: cannot run {binary}: {e}");
+            crate::ui::error(&format!("cannot run {binary}: {e}"));
             std::process::exit(1);
         }
     };

@@ -248,6 +248,6 @@ fn read_stdin() -> String {
 }
 
 fn fail(msg: String) -> ! {
-    eprintln!("review: {msg}");
+    crate::ui::error(&format!("review: {msg}"));
     std::process::exit(1);
 }

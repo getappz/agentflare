@@ -53,7 +53,7 @@ pub fn cli_apply(
     match store::apply_rule(id, title, body, trigger) {
         Ok(rule) => println!("Applied coaching rule '{}': {}", rule.id, rule.title),
         Err(e) => {
-            eprintln!("agentflare coaching apply: {e}");
+            crate::ui::error(&format!("agentflare coaching apply: {e}"));
             std::process::exit(1);
         }
     }
@@ -61,9 +61,9 @@ pub fn cli_apply(
 
 pub fn cli_remove(id: &str) {
     match store::remove_rule(id) {
-        Ok(()) => println!("Removed coaching rule '{id}'."),
+        Ok(()) => crate::ui::success(&format!("Removed coaching rule '{id}'.")),
         Err(e) => {
-            eprintln!("agentflare coaching remove: {e}");
+            crate::ui::error(&format!("agentflare coaching remove: {e}"));
             std::process::exit(1);
         }
     }

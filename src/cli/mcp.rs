@@ -10,7 +10,7 @@ impl McpArgs {
             .build()
             .expect("failed to build tokio runtime for mcp server");
         if let Err(e) = runtime.block_on(crate::mcp_server::run()) {
-            eprintln!("agentflare mcp: {e}");
+            crate::ui::error(&format!("agentflare mcp: {e}"));
             std::process::exit(1);
         }
     }

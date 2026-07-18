@@ -57,7 +57,7 @@ pub fn run(
         Err(name) => {
             let err = format!("unknown shell: {name}");
             if !json {
-                eprintln!("error: {err}");
+                crate::ui::error(&err);
                 std::process::exit(1);
             }
             emit_json(JsonOutput {
@@ -77,7 +77,7 @@ pub fn run(
         Err(()) => {
             let err = format!("cannot determine profile path for {}", shell.name());
             if !json {
-                eprintln!("error: {err}");
+                crate::ui::error(&err);
                 std::process::exit(1);
             }
             emit_json(JsonOutput {
@@ -102,7 +102,7 @@ pub fn run(
         Err(e) => {
             let err = format!("cannot read profile {}: {e}", profile.display());
             if !json {
-                eprintln!("error: {err}");
+                crate::ui::error(&err);
                 std::process::exit(1);
             }
             emit_json(JsonOutput {

@@ -73,7 +73,9 @@ fn install_hooks(opts: InstallHooksArgs) {
     let repo_root = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("agentflare git install-hooks: cannot resolve cwd: {e}");
+            crate::ui::error(&format!(
+                "agentflare git install-hooks: cannot resolve cwd: {e}"
+            ));
             return;
         }
     };
@@ -82,18 +84,24 @@ fn install_hooks(opts: InstallHooksArgs) {
     if !repo_root.join(".git").exists()
         && run_git(&repo_root, &["rev-parse", "--git-dir"]).is_none()
     {
-        eprintln!("agentflare git install-hooks: not a git repository (run inside a repo root)");
+        crate::ui::error(
+            "agentflare git install-hooks: not a git repository (run inside a repo root)",
+        );
         return;
     }
 
     if let Err(e) = ensure_shared_templates() {
-        eprintln!("agentflare git install-hooks: cannot write shared templates: {e}");
+        crate::ui::error(&format!(
+            "agentflare git install-hooks: cannot write shared templates: {e}"
+        ));
         return;
     }
 
     let local_dir = repo_root.join(".githooks");
     if let Err(e) = fs::create_dir_all(&local_dir) {
-        eprintln!("agentflare git install-hooks: cannot create {local_dir:?}: {e}");
+        crate::ui::error(&format!(
+            "agentflare git install-hooks: cannot create {local_dir:?}: {e}"
+        ));
         return;
     }
 
@@ -113,11 +121,11 @@ fn install_hooks(opts: InstallHooksArgs) {
                     use std::os::unix::fs::PermissionsExt;
                     let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o755));
                 }
-                println!("  ok    .githooks/{name}");
+                crate::ui::success(&format!(".githooks/{name}"));
                 changed = true;
             }
             Err(e) => {
-                eprintln!("  fail  copying {name}: {e}");
+                crate::ui::error(&format!("copying {name}: {e}"));
                 return;
             }
         }
@@ -126,7 +134,7 @@ fn install_hooks(opts: InstallHooksArgs) {
     // Point the repo at the local .githooks dir (relative, so it survives
     // clone/move). `git config` is run via the shell-free helper below.
     set_hooks_path(&repo_root, ".githooks");
-    println!("  ok    core.hooksPath = .githooks");
+    crate::ui::success("core.hooksPath = .githooks");
 
     if changed {
         println!(

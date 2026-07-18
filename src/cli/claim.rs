@@ -55,7 +55,7 @@ impl ClaimArgs {
         let conn = match crate::db::open() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("claim: cannot open ledger: {e}");
+                crate::ui::error(&format!("claim: cannot open ledger: {e}"));
                 std::process::exit(1);
             }
         };
@@ -86,9 +86,9 @@ impl ClaimArgs {
                         owner: holder,
                         age_secs,
                     }) => {
-                        eprintln!(
+                        crate::ui::error(&format!(
                             "{repo} {target} already held by {holder} ({age_secs}s since heartbeat)"
-                        );
+                        ));
                         std::process::exit(1);
                     }
                     Err(e) => fail(e),
@@ -160,7 +160,9 @@ fn report(res: rusqlite::Result<bool>, verb: &str, repo: &str, target: &str, own
     match res {
         Ok(true) => println!("{verb} {repo} {target}"),
         Ok(false) => {
-            eprintln!("{repo} {target} not held by {owner} — nothing changed");
+            crate::ui::error(&format!(
+                "{repo} {target} not held by {owner} — nothing changed"
+            ));
             std::process::exit(1);
         }
         Err(e) => fail(e),
@@ -169,8 +171,8 @@ fn report(res: rusqlite::Result<bool>, verb: &str, repo: &str, target: &str, own
 
 fn require_repo(explicit: Option<String>) -> String {
     crate::claims::resolve_repo(explicit).unwrap_or_else(|| {
-        eprintln!(
-            "claim: could not determine repo — run inside a git repo or pass --repo owner/name"
+        crate::ui::error(
+            "claim: could not determine repo — run inside a git repo or pass --repo owner/name",
         );
         std::process::exit(1);
     })
@@ -181,6 +183,6 @@ fn git_commit() -> Option<String> {
 }
 
 fn fail(e: rusqlite::Error) -> ! {
-    eprintln!("claim: ledger error: {e}");
+    crate::ui::error(&format!("claim: ledger error: {e}"));
     std::process::exit(1);
 }

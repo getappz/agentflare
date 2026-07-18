@@ -66,38 +66,32 @@ pub fn ensure(agent: &str, yes: bool) {
     }
     match classify(env_present(), secret_present(), gh_present()) {
         CredState::Present(src) => {
-            println!("  skip  GitHub credential present (via {src})");
+            crate::ui::skip(&format!("GitHub credential present (via {src})"));
         }
         CredState::Missing => {
-            println!(
-                "  info  No GitHub credential found — flare_git writes (PRs, issues, releases) need one."
+            crate::ui::info(
+                "No GitHub credential found — flare_git writes (PRs, issues, releases) need one.",
             );
-            use std::io::IsTerminal;
-            if yes || !std::io::stdin().is_terminal() {
-                println!(
-                    "  skip  non-interactive: run gh auth login or set GITHUB_TOKEN to enable flare_git writes"
+            if yes || !crate::ui::interactive() {
+                crate::ui::skip(
+                    "non-interactive: run gh auth login or set GITHUB_TOKEN to enable flare_git writes",
                 );
                 return;
             }
             if !crate::init::prompt_yes(
-                "  Store a GitHub token now? (or run 'gh auth login' later) [Y/n] ",
+                "Store a GitHub token now? (or run 'gh auth login' later)",
                 agent,
                 yes,
             ) {
                 return;
             }
-            print!("  Paste a GitHub PAT (input hidden): ");
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-            let token = rpassword::read_password().unwrap_or_default();
-            let token = token.trim();
-            if token.is_empty() {
-                println!("  skip  no token entered");
+            let Some(token) = crate::ui::password("GitHub PAT") else {
+                crate::ui::skip("no token entered");
                 return;
-            }
-            match store_token(token) {
-                Ok(()) => println!("  ok    stored github_token secret (encrypted)"),
-                Err(e) => println!("  fail  storing github_token: {e}"),
+            };
+            match store_token(&token) {
+                Ok(()) => crate::ui::success("stored github_token secret (encrypted)"),
+                Err(e) => crate::ui::error(&format!("storing github_token: {e}")),
             }
         }
     }

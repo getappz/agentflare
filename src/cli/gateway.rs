@@ -37,7 +37,7 @@ fn run_secret(action: GatewaySecretAction) {
     let conn = match crate::db::open() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("failed to open agentflare.db: {e}");
+            crate::ui::error(&format!("failed to open agentflare.db: {e}"));
             std::process::exit(1);
         }
     };
@@ -46,18 +46,18 @@ fn run_secret(action: GatewaySecretAction) {
             use std::io::Read;
             let mut value = String::new();
             if std::io::stdin().read_to_string(&mut value).is_err() {
-                eprintln!("failed to read secret value from stdin");
+                crate::ui::error("failed to read secret value from stdin");
                 std::process::exit(1);
             }
             let value = value.trim();
             if value.is_empty() {
-                eprintln!("secret value must not be empty");
+                crate::ui::error("secret value must not be empty");
                 std::process::exit(1);
             }
             match crate::gateway_secrets::set_secret(&conn, &name, value) {
                 Ok(()) => println!("stored secret '{name}'"),
                 Err(e) => {
-                    eprintln!("failed to store secret: {e}");
+                    crate::ui::error(&format!("failed to store secret: {e}"));
                     std::process::exit(1);
                 }
             }
@@ -70,7 +70,7 @@ fn run_secret(action: GatewaySecretAction) {
                 }
             }
             Err(e) => {
-                eprintln!("failed to list secrets: {e}");
+                crate::ui::error(&format!("failed to list secrets: {e}"));
                 std::process::exit(1);
             }
         },
@@ -78,11 +78,11 @@ fn run_secret(action: GatewaySecretAction) {
             match crate::gateway_secrets::remove_secret(&conn, &name) {
                 Ok(true) => println!("removed secret '{name}'"),
                 Ok(false) => {
-                    eprintln!("no secret named '{name}'");
+                    crate::ui::error(&format!("no secret named '{name}'"));
                     std::process::exit(1);
                 }
                 Err(e) => {
-                    eprintln!("failed to remove secret: {e}");
+                    crate::ui::error(&format!("failed to remove secret: {e}"));
                     std::process::exit(1);
                 }
             }
