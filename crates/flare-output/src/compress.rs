@@ -357,11 +357,9 @@ mod tests {
 
         // Simulate a backup left behind by a pre-rename version of this
         // tool, at the equivalent path under the old "caveman" namespace.
-        let legacy = PathBuf::from(
-            resolved
-                .to_string_lossy()
-                .replace("flare-output", "caveman"),
-        );
+        let current_root = out_of_tree_backup_dir("flare-output");
+        let relative = resolved.strip_prefix(&current_root).unwrap();
+        let legacy = out_of_tree_backup_dir("caveman").join(relative);
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, "pre-rename backup").unwrap();
 
