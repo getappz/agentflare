@@ -1,0 +1,29 @@
+name: auto-merge
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+
+jobs:
+  enable-auto-merge:
+    name: Enable auto-merge
+    # Toggle repo-wide without touching this file:
+    #   gh variable set AUTO_MERGE_ENABLED --body false   (disable)
+    #   gh variable set AUTO_MERGE_ENABLED --body true    (re-enable, or just delete the variable — unset defaults to enabled)
+    if: vars.AUTO_MERGE_ENABLED != 'false' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      # Doesn't merge anything itself — just flips the PR into GitHub's
+      # native auto-merge state. Branch protection's required status checks
+      # (build/clippy/fmt/etc., all "strict") still gate the actual merge,
+      # and GitHub re-syncs a BEHIND branch on its own before merging, so
+      # this replaces the manual "remember to pass --auto" step entirely.
+      - name: gh pr merge --auto
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --squash --delete-branch "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}"
