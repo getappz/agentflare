@@ -26,3 +26,11 @@
 /install_onpush.ps1
 /run_onpush.bat
 /serve_docs.py
+
+# Claude Code local runtime artifacts (machine-local, not shared)
+# NOTE: do NOT ignore .claude/ wholesale — .claude/skills/pm/ is tracked/shared.
+.claude/worktrees/
+.claude/projects/
+.claude/history/
+.claude/todos/
+.claude/stats.json
