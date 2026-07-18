@@ -1,0 +1,162 @@
+<!-- @dsCard group="PM" -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>agentflare dashboard — item</title>
+  <link rel="stylesheet" href="/tokens.css" />
+  <script defer src="/shell.js"></script>
+  <script defer src="/vendor/alpine.js"></script>
+</head>
+<body>
+  <div class="af-app">
+    <aside class="af-sidebar" x-data="shellNav()" x-init="init()">
+      <div class="af-sidebar-header">agentflare</div>
+
+      <div class="af-nav-section">
+        <label class="af-nav-section-label" for="af-workspace-select">Workspace</label>
+        <select
+          id="af-workspace-select"
+          class="af-select"
+          x-model="workspaceId"
+          @change="onWorkspaceChange()"
+        >
+          <template x-if="!loading && workspaces.length === 0">
+            <option value="">No workspaces</option>
+          </template>
+          <template x-for="w in workspaces" :key="w.id">
+            <option :value="w.id" x-text="w.name"></option>
+          </template>
+        </select>
+      </div>
+
+      <div class="af-nav-section">
+        <label class="af-nav-section-label" for="af-project-select">Project</label>
+        <select
+          id="af-project-select"
+          class="af-select"
+          x-model="projectId"
+          @change="onProjectChange()"
+        >
+          <template x-if="!loading && projects.length === 0">
+            <option value="">No projects</option>
+          </template>
+          <template x-for="p in projects" :key="p.id">
+            <option :value="p.id" x-text="p.identifier + ' — ' + p.name"></option>
+          </template>
+        </select>
+      </div>
+
+      <nav class="af-nav-links">
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/board.html') }" :href="navHref('/board.html')">Board</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/list.html') }" :href="navHref('/list.html')">List</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/webhooks.html') }" :href="navHref('/webhooks.html')">Webhooks</a>
+      </nav>
+    </aside>
+
+    <div class="af-main-col">
+      <header class="af-topbar">
+        <h1>Item</h1>
+      </header>
+      <main
+        class="af-content"
+        x-data="itemView()"
+        x-init="init()"
+      >
+        <template x-if="!loading && !requestedId">
+          <p class="af-empty">No item id given — open an item from the Board or List view.</p>
+        </template>
+        <template x-if="!loading && requestedId && !item">
+          <p class="af-empty">
+            Item <span class="af-mono" x-text="requestedId"></span> was not found in the
+            selected project. Check the <code>?project_id=</code> and <code>?id=</code>
+            query params.
+          </p>
+        </template>
+
+        <template x-if="!loading && item">
+          <div>
+            <div class="af-item-header">
+              <h1 x-text="item.name"></h1>
+              <div class="af-item-meta">
+                <span>State: <strong x-text="stateName(item.state_id)"></strong></span>
+                <span>Priority: <strong x-text="item.priority"></strong></span>
+                <span>Assignee: <strong x-text="item.assignee_agent || '—'"></strong></span>
+                <span>Created: <strong x-text="afFormatTime(item.created_at)"></strong></span>
+                <span>Updated: <strong x-text="afFormatTime(item.updated_at)"></strong></span>
+                <template x-if="item.completed_at">
+                  <span>Completed: <strong x-text="afFormatTime(item.completed_at)"></strong></span>
+                </template>
+              </div>
+            </div>
+
+            <div class="af-item-description" x-show="item.description" x-text="item.description"></div>
+            <p class="af-empty" x-show="!item.description">No description.</p>
+
+            <div class="af-section-title" style="margin-top: var(--af-space-5)">Comments</div>
+            <template x-if="comments.length === 0">
+              <p class="af-empty">No comments.</p>
+            </template>
+            <template x-for="comment in comments" :key="comment.id">
+              <div class="af-comment">
+                <div class="af-comment-meta">
+                  <span x-text="comment.author_agent"></span>
+                  <span x-text="afFormatTime(comment.created_at)"></span>
+                </div>
+                <div x-text="comment.body"></div>
+              </div>
+            </template>
+          </div>
+        </template>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    function itemView() {
+      return {
+        requestedId: '',
+        projectId: '',
+        states: [],
+        item: null,
+        comments: [],
+        loading: true,
+
+        async init() {
+          const params = afParams();
+          this.requestedId = params.get('id') || '';
+          if (!this.requestedId) {
+            this.loading = false;
+            return;
+          }
+          const scope = await afResolveScope(params.get('workspace_id'), params.get('project_id'));
+          this.projectId = scope.projectId;
+          if (!this.projectId) {
+            this.loading = false;
+            return;
+          }
+          const [states, items] = await Promise.all([
+            afGetJson(`/api/pm/states?project_id=${encodeURIComponent(this.projectId)}`, []),
+            afGetJson(`/api/pm/items?project_id=${encodeURIComponent(this.projectId)}`, []),
+          ]);
+          this.states = states;
+          this.item = items.find((i) => i.id === this.requestedId) || null;
+          if (this.item) {
+            this.comments = await afGetJson(
+              `/api/pm/comments?item_id=${encodeURIComponent(this.item.id)}`,
+              [],
+            );
+          }
+          this.loading = false;
+        },
+
+        stateName(stateId) {
+          const state = this.states.find((s) => s.id === stateId);
+          return state ? state.name : stateId;
+        },
+      };
+    }
+  </script>
+</body>
+</html>
