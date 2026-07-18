@@ -390,8 +390,8 @@ mod tests {
     use rusqlite::Connection;
 
     fn new_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        super::super::schema::migrate(&conn).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        super::super::schema::migrate(&mut conn).unwrap();
         conn
     }
 

@@ -52,6 +52,7 @@ flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite_migration = "2"
 rand = "0.8"
 aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", features = ["simple"] }

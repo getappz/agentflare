@@ -1,8 +1,9 @@
 use rusqlite::Connection;
+use rusqlite_migration::{M, Migrations};
 
-pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "
+/// Frozen v1 DDL — the exact pre-migration brain schema. Never edit this
+/// string; schema changes are new `M::up` entries in `migrations()`.
+pub const V1_DDL: &str = "
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
             project TEXT, directory TEXT,
@@ -112,7 +113,15 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_summaries_project ON session_summaries(project);
         CREATE INDEX IF NOT EXISTS idx_summaries_session ON session_summaries(session_id);
-        ",
-    )?;
-    Ok(())
+        ";
+
+pub fn migrations() -> Migrations<'static> {
+    Migrations::new(vec![M::up(V1_DDL)])
+}
+
+/// Bring a connection (usually in-memory, in tests) to the latest schema.
+pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+    migrations()
+        .to_latest(conn)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
 }

@@ -98,6 +98,7 @@ dependencies = [
  "rmcp",
  "rpassword",
  "rusqlite",
+ "rusqlite_migration",
  "rust-embed",
  "serde",
  "serde_json",
