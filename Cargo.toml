@@ -95,6 +95,7 @@ built = { version = "0.8", features = ["chrono"] }
 insta = { version = "1", features = ["json"] }
 tempfile = "3"
 pretty_assertions = "1"
+reqwest = { version = "0.12", default-features = false }
 
 [lints.rust]
 unsafe_code = "warn"
