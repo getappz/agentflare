@@ -108,11 +108,19 @@ async fn cost_handler(Query(q): Query<CostQuery>) -> Response {
         .into_response()
 }
 
-/// Single shared broadcast of the live `{ claims, cost_today }` snapshot. All
-/// `/events` clients read from this one channel, so the expensive open + sync +
-/// `~/.claude/projects` walk in `live_snapshot_json` happens at most once per
-/// interval no matter how many browser tabs are connected — and not at all
-/// while nobody is watching.
+/// `/events` cadence. Claims are a cheap indexed SQLite read, so they refresh
+/// every `TICK`. The cost summary is the expensive surface — `cost::summarize`
+/// walks the whole `~/.claude/projects` tree and rewrites the analytics cache —
+/// so it is recomputed only every `COST_REFRESH` and cached between. With the
+/// "skip while nobody's watching" guard, an idle or single-tab dashboard costs
+/// almost nothing, and N tabs still cost just one refresh cycle.
+const TICK: std::time::Duration = std::time::Duration::from_secs(3);
+const COST_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Single shared broadcast of the live `{ claims, cost_today }` snapshot. Every
+/// `/events` client subscribes to this one channel, so there is no per-client
+/// work — the producer below runs at most one refresh cycle per `TICK`,
+/// regardless of how many browser tabs are connected.
 fn snapshot_broadcaster() -> tokio::sync::broadcast::Sender<String> {
     use std::sync::OnceLock;
     static TX: OnceLock<tokio::sync::broadcast::Sender<String>> = OnceLock::new();
@@ -120,22 +128,37 @@ fn snapshot_broadcaster() -> tokio::sync::broadcast::Sender<String> {
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(4);
         let producer = tx.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+            let mut ticker = tokio::time::interval(TICK);
+            // The expensive cost summary is refreshed on its own slower
+            // schedule and cached here between refreshes.
+            let mut cost_today = String::from("{}");
+            let mut cost_age = COST_REFRESH; // force a refresh on the first tick
             loop {
                 ticker.tick().await;
-                // Nobody's listening → skip the whole sync; no idle disk churn.
+                // Nobody's listening → do no work at all; no idle disk churn.
                 if producer.receiver_count() == 0 {
                     continue;
                 }
-                // live_snapshot_json is blocking (SQLite + fs walk + cache
-                // write), so keep it off the async worker threads.
-                let snapshot =
-                    tokio::task::spawn_blocking(crate::dashboard::data::live_snapshot_json)
-                        .await
-                        .unwrap_or_else(|_| "{}".to_string());
-                // Err only means every receiver dropped between the count check
-                // and here; the next tick no-ops via receiver_count.
-                let _ = producer.send(snapshot);
+                // Recompute the cost summary only once its cache has aged past
+                // COST_REFRESH; the walk+cache-write is kept off the async
+                // worker threads via spawn_blocking.
+                if cost_age >= COST_REFRESH {
+                    cost_today = tokio::task::spawn_blocking(|| {
+                        crate::dashboard::data::cost_json(1, "model")
+                    })
+                    .await
+                    .unwrap_or_else(|_| "{}".to_string());
+                    cost_age = std::time::Duration::ZERO;
+                }
+                cost_age += TICK;
+                // Claims are cheap (one indexed read) — refresh every tick,
+                // still off the worker threads.
+                let claims = tokio::task::spawn_blocking(crate::dashboard::data::claims_json)
+                    .await
+                    .unwrap_or_else(|_| "[]".to_string());
+                // Err only means every receiver dropped mid-cycle; the next
+                // tick no-ops via receiver_count.
+                let _ = producer.send(crate::dashboard::data::snapshot_json(&claims, &cost_today));
             }
         });
         tx
@@ -144,13 +167,13 @@ fn snapshot_broadcaster() -> tokio::sync::broadcast::Sender<String> {
 }
 
 /// Server-Sent Events stream of the volatile surfaces (claims + today's cost).
-/// Subscribes to the shared broadcast, so N connected tabs cost one snapshot
-/// per interval rather than N. A newly connected client waits up to one
-/// interval (~2s) for its first frame; the view shows "connecting…" until then.
+/// Subscribes to the shared broadcast, so N connected tabs cost one refresh
+/// cycle rather than N. A newly connected client waits up to one `TICK` (~3s)
+/// for its first frame; the view shows "connecting…" until then.
 async fn events_handler()
 -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = snapshot_broadcaster().subscribe();
-    // Drop lagged/errored frames — the next snapshot (<=2s away) supersedes them.
+    // Drop lagged/errored frames — the next snapshot supersedes them.
     let stream = tokio_stream::StreamExt::filter_map(
         tokio_stream::wrappers::BroadcastStream::new(rx),
         |msg| match msg {

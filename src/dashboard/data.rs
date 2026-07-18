@@ -165,15 +165,23 @@ pub fn cost_json(days: u32, by: &str) -> String {
 }
 
 /// A full snapshot of the volatile surfaces the `/events` SSE stream pushes:
-/// `{ claims, cost_today }`. Reuses `claims_json` and today's `cost_json`
-/// (grouped by model), re-parsing each so they nest as JSON values rather
-/// than embedded strings. On any error the reused fns already yield `[]`/an
-/// empty summary, so this never fails.
+/// `{ claims, cost_today }`. Convenience wrapper that computes both pieces and
+/// combines them via `snapshot_json`. The SSE producer instead calls
+/// `snapshot_json` directly so it can refresh the cheap claims read every tick
+/// while recomputing the expensive cost summary far less often.
 pub fn live_snapshot_json() -> String {
+    snapshot_json(&claims_json(), &cost_json(1, "model"))
+}
+
+/// Combine an already-computed `claims` (JSON array string) and `cost_today`
+/// (JSON object string) into the `/events` snapshot `{ claims, cost_today }`.
+/// Re-parses each so they nest as JSON values rather than embedded strings;
+/// malformed or empty input degrades to `[]` / `{}`, so this never fails.
+pub fn snapshot_json(claims_json_str: &str, cost_today_json_str: &str) -> String {
     let claims: serde_json::Value =
-        serde_json::from_str(&claims_json()).unwrap_or_else(|_| serde_json::json!([]));
+        serde_json::from_str(claims_json_str).unwrap_or_else(|_| serde_json::json!([]));
     let cost_today: serde_json::Value =
-        serde_json::from_str(&cost_json(1, "model")).unwrap_or_else(|_| serde_json::json!({}));
+        serde_json::from_str(cost_today_json_str).unwrap_or_else(|_| serde_json::json!({}));
     serde_json::json!({ "claims": claims, "cost_today": cost_today }).to_string()
 }
 
