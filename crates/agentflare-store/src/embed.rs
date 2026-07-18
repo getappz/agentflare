@@ -12,6 +12,25 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
     Some(if denom < 1e-12 { 0.0 } else { dot / denom })
 }
 
+/// f32 slice → explicit little-endian byte blob. Must stay symmetric with
+/// `bytes_to_vec` and with documents.rs's storage convention (see the
+/// endianness fix in #256 — never use platform-native byte casts here).
+pub fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// Little-endian byte blob → f32 vec. None if length isn't a multiple of 4.
+pub fn bytes_to_vec(b: &[u8]) -> Option<Vec<f32>> {
+    if b.len() % 4 != 0 {
+        return None;
+    }
+    Some(
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
 pub fn normalize(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-12 {

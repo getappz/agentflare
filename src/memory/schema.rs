@@ -116,7 +116,18 @@ pub const V1_DDL: &str = "
         ";
 
 pub fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1_DDL)])
+    Migrations::new(vec![
+        M::up(V1_DDL),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS observations_vec (
+                obs_id INTEGER PRIMARY KEY REFERENCES observations(id),
+                embedding BLOB NOT NULL,
+                dim INTEGER NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            );",
+        ),
+    ])
 }
 
 /// Bring a connection (usually in-memory, in tests) to the latest schema.
