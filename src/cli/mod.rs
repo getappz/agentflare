@@ -36,7 +36,7 @@ pub static AGENTFLARE_VERSION: LazyLock<String> = LazyLock::new(|| {
 #[command(name = "agentflare", version = AGENTFLARE_VERSION.as_str(), about = "Optimize AI CLI agents for cost and performance")]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -59,6 +59,8 @@ pub enum Commands {
     Handoff(handoff::HandoffArgs),
     #[command(alias = "flare", visible_alias = "opt")]
     Optimize(optimize::OptimizeArgs),
+    #[command(visible_alias = "logo")]
+    About(crate::about::AboutArgs),
     Channel(channel::ChannelArgs),
     Claim(claim::ClaimArgs),
     Review(review::ReviewArgs),
@@ -85,6 +87,7 @@ impl Commands {
             Self::Artifacts(cmd) => cmd.run(),
             Self::Handoff(cmd) => cmd.run(),
             Self::Optimize(cmd) => cmd.run(),
+            Self::About(cmd) => crate::about::run(cmd),
             Self::Channel(cmd) => cmd.run(),
             Self::Claim(cmd) => cmd.run(),
             Self::Review(cmd) => cmd.run(),

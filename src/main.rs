@@ -1,3 +1,4 @@
+mod about;
 mod agent_install;
 mod agent_launch;
 mod agents;
@@ -8,6 +9,7 @@ mod auth;
 mod auth_crypt;
 mod auth_db;
 mod auth_runner;
+mod banner;
 mod build_time;
 mod channels;
 mod claims;
@@ -53,5 +55,8 @@ use clap::Parser;
 fn main() {
     color_eyre::install().expect("color_eyre::install failed");
     let cli = cli::Cli::parse();
-    cli.command.run();
+    match cli.command {
+        Some(command) => command.run(),
+        None => crate::about::run(crate::about::AboutArgs {}),
+    }
 }
