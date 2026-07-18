@@ -1,0 +1,5 @@
+# Single-maintainer repo today — this exists so GitHub auto-requests review
+# on every PR. Split into path-scoped rules once there's more than one
+# regular contributor; a per-directory split with a single owner behind
+# every path is ceremony, not protection.
+* @getappz
