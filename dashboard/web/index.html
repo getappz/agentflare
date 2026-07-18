@@ -1,28 +1,20 @@
-<!-- @dsCard group="Shell" -->
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="refresh" content="0; url=/board.html" />
   <title>agentflare dashboard</title>
-  <script defer src="/vendor/alpine.js"></script>
+  <link rel="stylesheet" href="/tokens.css" />
+  <script>
+    // The dashboard has no standalone home; land on the Board so the URL
+    // becomes /board.html and its sidebar entry highlights. location.replace
+    // avoids trapping the back button on this redirect stub.
+    location.replace('/board.html');
+  </script>
 </head>
 <body>
-  <main x-data="claims()" x-init="load()">
-    <h1>Claims</h1>
-    <p x-show="rows.length === 0">No active claims.</p>
-    <ul>
-      <template x-for="c in rows" :key="c.repo + c.target">
-        <li><span x-text="c.repo"></span> / <span x-text="c.target"></span>
-          — <span x-text="c.owner"></span> <em x-show="c.stale">(stale)</em></li>
-      </template>
-    </ul>
-  </main>
-  <script>
-    function claims() {
-      return { rows: [],
-        async load() { this.rows = await (await fetch('/api/claims')).json(); } };
-    }
-  </script>
+  <p class="af-empty" style="margin: var(--af-space-6)">
+    Redirecting to the <a href="/board.html">agentflare dashboard</a>…
+  </p>
 </body>
 </html>
