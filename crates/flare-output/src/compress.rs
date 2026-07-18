@@ -131,6 +131,14 @@ pub fn compress(
     })
 }
 
+fn out_of_tree_backup_dir(namespace: &str) -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("agentflare")
+        .join(namespace)
+        .join("backups")
+}
+
 fn backup_path_for(target: &Path, mode: BackupMode) -> PathBuf {
     match mode {
         BackupMode::Sibling => {
@@ -141,11 +149,6 @@ fn backup_path_for(target: &Path, mode: BackupMode) -> PathBuf {
             target.with_file_name(format!("{file_name}.orig"))
         }
         BackupMode::OutOfTree => {
-            let base = dirs::cache_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("agentflare")
-                .join("caveman")
-                .join("backups");
             // Hash the full parent path, not just its last component — two
             // files with the same name under differently-located but
             // identically-named parent dirs (e.g. "project-a/docs/README.md"
@@ -163,8 +166,23 @@ fn backup_path_for(target: &Path, mode: BackupMode) -> PathBuf {
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
-            base.join(format!("{dir_hash:016x}"))
-                .join(format!("{stem}.original.md"))
+            let sub = format!("{dir_hash:016x}");
+            let file = format!("{stem}.original.md");
+
+            let current = out_of_tree_backup_dir("flare-output")
+                .join(&sub)
+                .join(&file);
+            // The backup namespace was renamed from "caveman" to
+            // "flare-output". If a pre-rename backup already sits at the
+            // old path, keep resolving to it — otherwise it (and the
+            // "backup already exists" guard above, which checks this same
+            // path) would silently stop seeing it.
+            let legacy = out_of_tree_backup_dir("caveman").join(&sub).join(&file);
+            if !current.exists() && legacy.exists() {
+                legacy
+            } else {
+                current
+            }
         }
     }
 }
@@ -324,6 +342,34 @@ mod tests {
             backup_a, backup_b,
             "same-named parent dirs must not collide"
         );
+    }
+
+    #[test]
+    fn out_of_tree_backup_falls_back_to_pre_rename_caveman_path() {
+        let dir = tempdir().unwrap();
+        let target = write(dir.path(), "legacy-fallback-test.md", "content");
+
+        // Nothing backed up anywhere yet: resolves under the current
+        // "flare-output" namespace.
+        let resolved = backup_path_for(&target, BackupMode::OutOfTree);
+        assert!(resolved.to_string_lossy().contains("flare-output"));
+        assert!(!resolved.exists());
+
+        // Simulate a backup left behind by a pre-rename version of this
+        // tool, at the equivalent path under the old "caveman" namespace.
+        let current_root = out_of_tree_backup_dir("flare-output");
+        let relative = resolved.strip_prefix(&current_root).unwrap();
+        let legacy = out_of_tree_backup_dir("caveman").join(relative);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "pre-rename backup").unwrap();
+
+        let resolved_again = backup_path_for(&target, BackupMode::OutOfTree);
+        assert_eq!(
+            resolved_again, legacy,
+            "must resolve to the existing legacy backup instead of orphaning it"
+        );
+
+        std::fs::remove_file(&legacy).unwrap();
     }
 
     #[test]

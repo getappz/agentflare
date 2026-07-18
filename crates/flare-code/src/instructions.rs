@@ -65,10 +65,9 @@ pub fn build(mode: &str, skill_path: Option<&Path>) -> Instructions {
     }
 }
 
-/// If a known compression/persona plugin (e.g. caveman) is also wired into
-/// the agent's settings, add a short note so the two don't read as
-/// contradictory: flare-code governs code structure, the peer plugin governs
-/// output style.
+/// If a known compression/persona plugin is also wired into the agent's
+/// settings, add a short note so the two don't read as contradictory:
+/// flare-code governs code structure, the peer plugin governs output style.
 fn compression_deconfliction() -> String {
     let peers = config::detect_compression_plugins();
     if peers.is_empty() {
@@ -124,22 +123,9 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)]
-    fn build_appends_deconfliction_when_compression_plugin_present() {
-        let _guard = config::ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = std::env::temp_dir().join("flare-code_test_instructions_compression");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("settings.json"), r#"{"plugins": ["caveman"]}"#).unwrap();
-        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &dir) };
-
+    fn build_has_no_deconfliction_when_known_plugins_empty() {
         let ins = build("full", None);
-        assert!(ins.body.contains("Compression plugin coexistence"));
-        assert!(ins.body.contains("caveman"));
-
-        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(!ins.body.contains("Compression plugin coexistence"));
     }
 
     #[test]

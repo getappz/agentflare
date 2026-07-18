@@ -51,9 +51,9 @@ pub fn normalize_extended_mode(mode: &str) -> Option<String> {
 pub static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Compression/persona plugins known to conflict with flare-code's own style
-/// guidance if both are active — e.g. caveman's terse-prose rules vs
+/// guidance if both are active — e.g. another tool's terse-prose rules vs
 /// flare-code's own output-shape rules.
-const KNOWN_COMPRESSION_PLUGINS: &[&str] = &["caveman"];
+const KNOWN_COMPRESSION_PLUGINS: &[&str] = &[];
 
 fn claude_dir() -> PathBuf {
     std::env::var("CLAUDE_CONFIG_DIR").map_or_else(
@@ -215,17 +215,8 @@ mod tests {
     }
 
     #[test]
-    fn detects_caveman_in_settings_json() {
-        let _guard = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = std::env::temp_dir().join("flare-code_test_compression_conflict");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("settings.json"), r#"{"plugins": ["caveman"]}"#).unwrap();
-        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &dir) };
-        assert_eq!(detect_compression_plugins(), vec!["caveman"]);
-        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
-        std::fs::remove_dir_all(&dir).ok();
+    fn detects_no_plugins_when_list_empty() {
+        assert!(detect_compression_plugins().is_empty());
     }
 
     #[test]

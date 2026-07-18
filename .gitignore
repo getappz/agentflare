@@ -1,10 +1,14 @@
 /target
 /.docs/
 /domain-research/
+/skills/
 /.worktrees/
 
 # Machine-local docs output / notes, not part of the project
 /docs/
+
+# Competitive audit clones and reports — large, transient, per-machine
+/.competitive-audit/
 
 # Local opencode config — carries per-machine MCP server paths, not shared
 /opencode.json

@@ -1,4 +1,4 @@
-//! Compression prompt profiles. `Generic` is caveman's own embedded prompt
+//! Compression prompt profiles. `Generic` is flare-output's embedded prompt
 //! — a short string literal that has never had an external doc, so there's
 //! no reason to invent a download mechanism for it (unlike ponytail's
 //! SKILL.md, which lives in its own separately-maintained upstream repo).
@@ -28,7 +28,7 @@ impl Prompt {
         match self {
             Prompt::Generic => {
                 format!(
-                    "Compress this markdown into caveman format.\n\n{GENERIC_RULES}\n\nTEXT:\n{body}"
+                    "Compress this markdown into flare format.\n\n{GENERIC_RULES}\n\nTEXT:\n{body}"
                 )
             }
             Prompt::Custom(spec) => format!(

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit"]
+members = ["crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store"]
 resolver = "2"
 
 [package]
@@ -72,6 +72,7 @@ agentflare-backend = { package = "agentflare-backend", path = "crates/agentflare
 db_kit = { package = "agentflare-db-kit", path = "crates/agentflare-db-kit" }
 agent-detector = "0.2.1"
 flare-search-kit = { path = "crates/flare-search-kit" }
+agentflare-store = { path = "crates/agentflare-store" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

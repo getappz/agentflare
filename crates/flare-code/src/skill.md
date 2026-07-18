@@ -27,7 +27,7 @@ code is the code never written.
 
 ACTIVE EVERY RESPONSE. No drift back to over-building. Still active if
 unsure. Off only: "stop flare code" / "normal mode". Default: **full**.
-Switch: \`/flare code lite|full|ultra\`.
+Switch: \`/flare-code lite|full|ultra\`.
 
 ## The ladder
 
@@ -134,7 +134,7 @@ test, YAGNI applies to tests too.
 
 ## Boundaries
 
-Flare Code governs what you build, not how you talk (pair with Caveman for
+Flare Code governs what you build, not how you talk (pair with flare-output for
 terse prose). "stop flare code" / "normal mode": revert. Level persists until
 changed or session end.
 

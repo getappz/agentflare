@@ -25,8 +25,17 @@ impl Llm for RealLlm {
     }
 }
 
+fn env_model(key: &str) -> Option<String> {
+    // A blank value (e.g. `FLARE_OUTPUT_MODEL=""` from an unset shell var
+    // interpolated into an env file) must not win over the next fallback —
+    // treat it the same as unset.
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
 fn call_via_api(api_key: &str, prompt: &str) -> Result<String, CavemanError> {
-    let model = std::env::var("CAVEMAN_MODEL").unwrap_or_else(|_| "claude-sonnet-4-5".to_string());
+    let model = env_model("FLARE_OUTPUT_MODEL")
+        .or_else(|| env_model("CAVEMAN_MODEL"))
+        .unwrap_or_else(|| "claude-sonnet-4-5".to_string());
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 8192,
