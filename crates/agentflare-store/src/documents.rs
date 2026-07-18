@@ -399,7 +399,7 @@ impl Store {
     pub fn doc_set_embedding(&self, doc_id: &str, embedding: &[f32]) -> rusqlite::Result<bool> {
         let conn = self.conn();
         let now = db_kit::ids::now();
-        let bytes: &[u8] = bytemuck::cast_slice(embedding);
+        let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let n = conn.execute(
             "INSERT INTO store_docs_vec (doc_id, embedding, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(doc_id) DO UPDATE SET embedding = ?2, updated_at = ?3",
@@ -630,6 +630,29 @@ mod tests {
         let got = s.doc_get_embedding(&doc.id).unwrap().unwrap();
         assert_eq!(got.len(), 3);
         assert!((got[0] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn embedding_bytes_are_stored_little_endian() {
+        // Regression test for a bug flagged in item #148's review: the
+        // write side used bytemuck::cast_slice (native-endian) while the
+        // read side hardcoded f32::from_le_bytes — matched by accident on
+        // little-endian hosts, but not guaranteed by the code. Assert the
+        // on-disk byte layout directly, not just the round trip.
+        let s = store();
+        let doc = s.doc_upsert("p", "/endian.md", "content").unwrap();
+        let value: f32 = 1.5;
+        s.doc_set_embedding(&doc.id, &[value]).unwrap();
+
+        let raw: Vec<u8> = s
+            .conn()
+            .query_row(
+                "SELECT embedding FROM store_docs_vec WHERE doc_id = ?1",
+                params![doc.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, value.to_le_bytes().to_vec());
     }
 
     #[test]
