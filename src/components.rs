@@ -66,14 +66,6 @@ fn json_at(path: &std::path::Path) -> Value {
     crate::jsonc::read_jsonc(path, || Value::Null)
 }
 
-fn plugin_enabled(settings: &Value, key: &str) -> bool {
-    settings
-        .get("enabledPlugins")
-        .and_then(|p| p.get(key))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
 fn write_pinned_mode(path: &PathBuf) -> bool {
     let current: Option<String> = json_at(path)
         .get("defaultMode")
@@ -491,25 +483,6 @@ pub fn get_components(host: &str) -> Vec<Component> {
                 })
             },
         },
-        // Ponytail/Caveman are Claude Code plugins installed via the `claude
-        // plugin` CLI — no equivalent exists on any other host, so these
-        // report "satisfied" everywhere else rather than nagging about
-        // something that can't be installed there.
-        Component {
-            id: "ponytail-plugin",
-            needs_consent: true,
-            describe: "Ponytail plugin — claude plugin marketplace add DietrichGebert/ponytail && claude plugin install ponytail@ponytail".to_string(),
-            check: Box::new(move || !claude_code_only || plugin_enabled(&claude_settings(), "ponytail@ponytail")),
-            apply: Box::new(|| {
-                let ok = run_ok("claude", &["plugin", "marketplace", "add", "DietrichGebert/ponytail"])
-                    && run_ok("claude", &["plugin", "install", "ponytail@ponytail"]);
-                if ok {
-                    "Ponytail plugin installed — restart to activate".to_string()
-                } else {
-                    "Ponytail plugin install failed — run manually".to_string()
-                }
-            }),
-        },
         Component {
             id: "optimize-code-mode",
             needs_consent: false,
@@ -601,7 +574,6 @@ mod tests {
             "mise",
             "leanctx",
             "agentflare-mcp",
-            "ponytail-plugin",
             "optimize-code-mode",
         ];
         #[cfg(feature = "skill-overrides-sync")]
@@ -610,7 +582,6 @@ mod tests {
             "mise",
             "leanctx",
             "agentflare-mcp",
-            "ponytail-plugin",
             "optimize-code-mode",
             "skill-overrides-sync",
         ];
@@ -668,33 +639,6 @@ mod tests {
 
         // "continue" has no dedicated rules convention — empty on purpose.
         assert!(rule_targets("continue").is_empty());
-    }
-
-    #[test]
-    fn non_claude_code_hosts_never_need_the_claude_cli_for_ponytail_plugin() {
-        // Regression check for the host-gating bug caught during manual
-        // testing: the ponytail plugin component must report "satisfied" (no
-        // pending nag, no attempted install) on every host except
-        // claude-code, since the plugin has no equivalent elsewhere.
-        for host in [
-            "codex",
-            "cursor",
-            "windsurf",
-            "vscode-copilot",
-            "cline",
-            "continue",
-            "opencode",
-        ] {
-            let components = get_components(host);
-            let ponytail_plugin = components
-                .iter()
-                .find(|c| c.id == "ponytail-plugin")
-                .unwrap();
-            assert!(
-                (ponytail_plugin.check)(),
-                "ponytail-plugin should be satisfied on '{host}'"
-            );
-        }
     }
 
     #[test]

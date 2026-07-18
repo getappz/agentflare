@@ -20,95 +20,6 @@ fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_default()
 }
 
-fn confirm_ponytail_migration(agent: &str, yes: bool) -> bool {
-    let detected = match agent {
-        "claude-code" | "cowork" => has_existing_ponytail_claude(),
-        "cursor" | "cursor-cli" => has_existing_ponytail_cursor(),
-        "opencode" => has_existing_ponytail_opencode(),
-        _ => false,
-    };
-
-    if !detected {
-        return true;
-    }
-
-    ui::warning(&format!(
-        "Existing ponytail plugin detected for {agent}. agentflare has ponytail \
-         built-in — the npm plugin would conflict."
-    ));
-
-    if !yes && !ui::confirm("Uninstall ponytail plugin?", true) {
-        ui::skip(&format!("Skipped. Re-run: agentflare init --agent {agent}"));
-        return false;
-    }
-
-    match agent {
-        "opencode" => {
-            let out = ui::with_spinner(
-                "Uninstalling ponytail plugin…",
-                "ponytail plugin uninstall finished",
-                || {
-                    std::process::Command::new("opencode")
-                        .args(["plugin", "uninstall", "ponytail@ponytail"])
-                        .output()
-                },
-            );
-            match out {
-                Ok(o) if o.status.success() => ui::success("ponytail plugin uninstalled"),
-                Ok(o) => ui::error(String::from_utf8_lossy(&o.stderr).trim()),
-                Err(e) => ui::error(&format!("could not run opencode: {e}")),
-            }
-            true
-        }
-        "claude-code" | "cowork" => {
-            ui::info("Run '/plugin uninstall ponytail@ponytail' in a Claude Code session");
-            true
-        }
-        _ => true,
-    }
-}
-
-fn has_existing_ponytail_claude() -> bool {
-    let path = claude_settings_path();
-    if let Ok(content) = fs::read_to_string(&path)
-        && let Ok(settings) = serde_json::from_str::<Value>(&content)
-    {
-        let hooks = settings.get("hooks");
-        let has_ponytail = hooks
-            .and_then(|h| h.get("SessionStart"))
-            .map(|v| v.to_string().contains("ponytail"))
-            .unwrap_or(false);
-        let not_agentflare = hooks
-            .and_then(|h| h.get("SessionStart"))
-            .map(|v| !v.to_string().contains("agentflare"))
-            .unwrap_or(true);
-        return has_ponytail && not_agentflare;
-    }
-    false
-}
-
-fn has_existing_ponytail_cursor() -> bool {
-    let path = cwd().join(".cursor").join("hooks.json");
-    if let Ok(content) = fs::read_to_string(&path) {
-        has_ponytail_ref(&content) && !content.contains("agentflare")
-    } else {
-        false
-    }
-}
-
-fn has_existing_ponytail_opencode() -> bool {
-    let path = opencode_config_path();
-    if let Ok(content) = fs::read_to_string(&path) {
-        has_ponytail_ref(&content) && !content.contains("agentflare")
-    } else {
-        false
-    }
-}
-
-fn has_ponytail_ref(content: &str) -> bool {
-    content.to_lowercase().contains("ponytail")
-}
-
 /// A rule file is stale (safe to offer a refresh) only if its on-disk
 /// content matches a KNOWN old version verbatim — anything else (already
 /// current, or diverging for some other reason) is left untouched, since
@@ -144,8 +55,8 @@ pub(crate) fn prompt_yes(message: &str, agent: &str, yes: bool) -> bool {
 /// Rule files under `rule_targets` are only ever written when absent (see
 /// components.rs's "rules" component) — safe by default, but it means a rule
 /// whose wording we later fix stays stale forever on machines that already
-/// have the old file. Offer to refresh it, same consent pattern as ponytail
-/// migration.
+/// have the old file. Offer to refresh it, same consent pattern as the
+/// plugin-rule refresh.
 fn confirm_rule_refresh(agent: &str, yes: bool) {
     for (path, current) in rule_targets(agent) {
         if !is_stale_rule(&path, &current) {
@@ -190,28 +101,17 @@ pub fn run(agent: &str, yes: bool) {
     match agent {
         "claude-code" => {
             wire_claude_code();
-            if confirm_ponytail_migration(agent, yes) {
-                wire_optimize_hooks(agent);
-            }
+            wire_optimize_hooks(agent);
         }
         "cursor" => {
             wire_cursor();
-            if confirm_ponytail_migration(agent, yes) {
-                wire_optimize_hooks(agent);
-            }
+            wire_optimize_hooks(agent);
         }
         "codex" => {
             wire_codex_hooks();
         }
         "opencode" => {
             wire_opencode();
-            if has_existing_ponytail_opencode() {
-                ui::info(
-                    "Ponytail plugin detected. Keep it — OpenCode uses plugins for hooks, \
-                     not config. Plugin + agentflare work together (plugin handles hooks, \
-                     agentflare provides the skill engine).",
-                );
-            }
             wire_optimize_opencode();
         }
         _ => {}
@@ -651,9 +551,8 @@ fn wire_optimize_cursor() {
 
 fn wire_optimize_opencode() {
     ui::info(
-        "OpenCode uses the plugin system for hooks, not config. Keep \
-         @dietrichgebert/ponytail in the plugin list — the plugin's built-in \
-         hooks work alongside agentflare.",
+        "OpenCode uses the plugin system for hooks, not config. agentflare \
+         provides the optimize engine directly — no third-party plugin required.",
     );
 }
 
