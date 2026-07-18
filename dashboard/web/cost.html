@@ -1,0 +1,215 @@
+<!-- @dsCard group="Runtime" -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>agentflare dashboard — cost</title>
+  <link rel="stylesheet" href="/tokens.css" />
+  <script defer src="/shell.js"></script>
+  <script defer src="/vendor/alpine.js"></script>
+</head>
+<body>
+  <div class="af-app">
+    <aside class="af-sidebar" x-data="shellNav()" x-init="init()">
+      <div class="af-sidebar-header"><span class="af-logo-mark"></span>agentflare</div>
+
+      <div class="af-nav-section">
+        <label class="af-nav-section-label" for="af-workspace-select">Workspace</label>
+        <select
+          id="af-workspace-select"
+          class="af-select"
+          x-model="workspaceId"
+          @change="onWorkspaceChange()"
+        >
+          <template x-if="!loading && workspaces.length === 0">
+            <option value="">No workspaces</option>
+          </template>
+          <template x-for="w in workspaces" :key="w.id">
+            <option :value="w.id" x-text="w.name"></option>
+          </template>
+        </select>
+      </div>
+
+      <div class="af-nav-section">
+        <label class="af-nav-section-label" for="af-project-select">Project</label>
+        <select
+          id="af-project-select"
+          class="af-select"
+          x-model="projectId"
+          @change="onProjectChange()"
+        >
+          <template x-if="!loading && projects.length === 0">
+            <option value="">No projects</option>
+          </template>
+          <template x-for="p in projects" :key="p.id">
+            <option :value="p.id" x-text="p.identifier + ' — ' + p.name"></option>
+          </template>
+        </select>
+      </div>
+
+      <nav class="af-nav-links">
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/board.html') }" :href="navHref('/board.html')">Board</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/list.html') }" :href="navHref('/list.html')">List</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/webhooks.html') }" :href="navHref('/webhooks.html')">Webhooks</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/claims.html') }" :href="navHref('/claims.html')">Claims</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/cost.html') }" :href="navHref('/cost.html')">Cost</a>
+      </nav>
+    </aside>
+
+    <div class="af-main-col" x-data="costView()" x-init="init()">
+      <header class="af-topbar">
+        <h1>Cost</h1>
+        <span class="af-topbar-meta" x-show="isLiveView()">
+          <span class="af-live" :class="{ 'is-on': connected }"></span>
+          <span x-text="connected ? 'live' : 'connecting…'"></span>
+        </span>
+      </header>
+      <main class="af-content">
+        <div class="af-toolbar">
+          <div>
+            <label class="af-nav-section-label" for="af-cost-range">Range</label>
+            <select
+              id="af-cost-range"
+              class="af-select af-select-inline"
+              x-model.number="days"
+              @change="refresh()"
+            >
+              <option :value="1">Today</option>
+              <option :value="7">Last 7 days</option>
+              <option :value="30">Last 30 days</option>
+            </select>
+          </div>
+          <div>
+            <label class="af-nav-section-label" for="af-cost-group">Group by</label>
+            <select
+              id="af-cost-group"
+              class="af-select af-select-inline"
+              x-model="by"
+              @change="refresh()"
+            >
+              <option value="model">Model</option>
+              <option value="project">Project</option>
+            </select>
+          </div>
+          <div class="af-cost-total">
+            <div class="af-section-title" style="margin-bottom: var(--af-space-1)">Total</div>
+            <div class="af-cost-total-value" x-text="formatUsd(total)"></div>
+          </div>
+        </div>
+
+        <template x-if="groups.length === 0">
+          <p class="af-empty">No usage recorded for this range.</p>
+        </template>
+
+        <div class="af-table-wrap" x-show="groups.length > 0">
+          <table class="af-table">
+            <thead>
+              <tr>
+                <th x-text="by === 'project' ? 'Project' : 'Model'"></th>
+                <th>Input</th>
+                <th>Output</th>
+                <th>Cache read</th>
+                <th>Cache write</th>
+                <th>Cost</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="g in groups" :key="g.key">
+                <tr>
+                  <td class="af-mono" x-text="g.key"></td>
+                  <td x-text="fmt(g.input_tokens)"></td>
+                  <td x-text="fmt(g.output_tokens)"></td>
+                  <td x-text="fmt(g.cache_read_tokens)"></td>
+                  <td x-text="fmt(g.cache_creation_tokens)"></td>
+                  <td x-text="formatUsd(g.cost_usd)"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="af-empty-col" x-show="anyUnpriced" style="margin-top: var(--af-space-3)">
+          Usage from unrecognized models is excluded from the cost total.
+        </p>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    function costView() {
+      return {
+        days: 1,
+        by: 'model',
+        groups: [],
+        total: 0,
+        anyUnpriced: false,
+        connected: false,
+        source: null,
+
+        init() {
+          this.refresh();
+        },
+
+        // The SSE snapshot only carries today's by-model cost, so it can drive
+        // a live view for exactly that selection; every other range/grouping
+        // is a one-shot /api/cost fetch.
+        isLiveView() {
+          return Number(this.days) === 1 && this.by === 'model';
+        },
+
+        async refresh() {
+          this.closeStream();
+          if (this.isLiveView()) {
+            this.subscribeLive();
+          } else {
+            const data = await afGetJson(
+              `/api/cost?days=${this.days}&by=${encodeURIComponent(this.by)}`,
+              { groups: [], total_cost_usd: 0, any_unpriced: false },
+            );
+            this.apply(data);
+          }
+        },
+
+        subscribeLive() {
+          this.source = new EventSource('/events');
+          this.source.onmessage = (e) => {
+            try {
+              const snap = JSON.parse(e.data);
+              this.apply(snap.cost_today || {});
+              this.connected = true;
+            } catch (_e) {
+              /* ignore a malformed frame */
+            }
+          };
+          this.source.onerror = () => {
+            this.connected = false;
+          };
+        },
+
+        closeStream() {
+          if (this.source) {
+            this.source.close();
+            this.source = null;
+          }
+          this.connected = false;
+        },
+
+        apply(data) {
+          this.groups = Array.isArray(data.groups) ? data.groups : [];
+          this.total = data.total_cost_usd || 0;
+          this.anyUnpriced = !!data.any_unpriced;
+        },
+
+        fmt(n) {
+          return (n || 0).toLocaleString();
+        },
+
+        formatUsd(n) {
+          return '$' + (n || 0).toFixed(4);
+        },
+      };
+    }
+  </script>
+</body>
+</html>

@@ -612,3 +612,43 @@ a:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* -------------------------------------------------- Live / runtime views */
+.af-live {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--af-color-text-faint);
+  margin-right: 5px;
+}
+
+.af-live.is-on {
+  background: var(--af-color-success);
+  box-shadow: 0 0 0 3px var(--af-color-success-soft);
+}
+
+.af-toolbar {
+  display: flex;
+  gap: var(--af-space-4);
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin-bottom: var(--af-space-5);
+}
+
+.af-select-inline {
+  width: auto;
+  min-width: 150px;
+}
+
+.af-cost-total {
+  margin-left: auto;
+  text-align: right;
+}
+
+.af-cost-total-value {
+  font-size: var(--af-font-size-xl);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
