@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# agentflare branch-protection guard (pre-commit).
+#
+# Blocks direct commits while on the repo's default branch. The PreToolUse
+# branch guard in src/hook_redirect.rs only watches file-write tools, so a
+# `git commit` issued through a Bash/shell tool slips past it (see item #132
+# follow-up). A native git hook is the shell-agnostic enforcement boundary:
+# it fires for ANY git client — agent Bash, human CLI, CI — not just tool
+# calls that route through the agent's PreToolUse hook.
+#
+# Fail-open by design: if git/branch resolution errors (no repo, no remote,
+# detached HEAD), the commit is allowed rather than blocked.
+#
+# Installed into a project via:
+#   git config core.hooksPath <dir-containing-this-hook>
+# (agentflare stores the canonical copy under ~/.agentflare/githooks/).
+
+set -euo pipefail
+
+resolve_default_branch() {
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if git symbolic-ref refs/remotes/origin/HEAD >/dev/null 2>&1; then
+        git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@'
+        return 0
+    fi
+
+    local cfg
+    cfg="$(git config --get init.defaultBranch 2>/dev/null || true)"
+    if [ -n "$cfg" ]; then
+        echo "$cfg"
+        return 0
+    fi
+
+    for cand in main master; do
+        if git show-ref --verify --quiet "refs/heads/$cand" 2>/dev/null; then
+            echo "$cand"
+            return 0
+        fi
+    done
+
+    echo "master"
+}
+
+current="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+if [ -z "$current" ] || [ "$current" = "HEAD" ]; then
+    exit 0
+fi
+
+default="$(resolve_default_branch)"
+
+if [ "$current" = "$default" ]; then
+    cat >&2 <<EOF
+ERROR: refusing to commit directly to the default branch '$default'.
+
+agentflare enforces branch isolation: create an isolated worktree or feature
+branch first, e.g.
+    git worktree add ../<repo>-<topic> -b <topic>
+    # or, in-session:
+    git checkout -b <topic>
+
+Then commit there and open a PR. To override in an emergency (not recommended):
+    git commit --no-verify
+EOF
+    exit 1
+fi
+
+# LOC gate, staged files only (the full-repo scan runs in CI — see
+# scripts/loc-gate.sh; passing it explicit paths runs a fast partial scan
+# instead). Fail-open if the repo root or script can't be resolved, matching
+# this hook's existing fail-open design.
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -n "$repo_root" ] && [ -f "$repo_root/scripts/loc-gate.sh" ]; then
+    staged_rs=()
+    while IFS= read -r f; do
+        [ -n "$f" ] && staged_rs+=("$f")
+    done < <(git diff --cached --name-only --diff-filter=ACMR -- '*.rs' 2>/dev/null || true)
+    if [ "${#staged_rs[@]}" -gt 0 ]; then
+        if ! bash "$repo_root/scripts/loc-gate.sh" "${staged_rs[@]}"; then
+            echo "ERROR: LOC gate failed on staged file(s) above." >&2
+            echo "Split the file, or override in an emergency (not recommended):" >&2
+            echo "    git commit --no-verify" >&2
+            exit 1
+        fi
+    fi
+fi
+
+exit 0

@@ -8,6 +8,7 @@ mod coaching;
 mod cost;
 mod dev_install;
 mod gateway;
+mod git;
 mod handoff;
 mod hook;
 mod init;
@@ -46,6 +47,7 @@ pub enum Commands {
     DevInstall(dev_install::DevInstallArgs),
     Coaching(coaching::CoachingArgs),
     Gateway(gateway::GatewayArgs),
+    Git(git::GitArgs),
     Mcp(mcp::McpArgs),
     Agents(agents::AgentsArgs),
     Run(run::RunArgs),
@@ -72,6 +74,7 @@ impl Commands {
             Self::DevInstall(cmd) => cmd.run(),
             Self::Coaching(cmd) => cmd.run(),
             Self::Gateway(cmd) => cmd.run(),
+            Self::Git(cmd) => git::run(cmd),
             Self::Mcp(cmd) => cmd.run(),
             Self::Agents(cmd) => cmd.run(),
             Self::Run(cmd) => cmd.run(),

@@ -25,14 +25,23 @@ fail=0
 file_list=$(mktemp)
 trap 'rm -f "$file_list"' EXIT
 
-# git ls-files only lists tracked files, so it naturally skips build output,
-# vendored/scratch clones, and other worktrees without needing to know their
-# paths in advance (all of those are either .gitignored or simply never
-# added). The hidden-folder skip below is defense in depth on top of that,
-# not the primary exclusion.
-if ! git ls-files -z -- '*.rs' >"$file_list"; then
-  echo "FAIL: git ls-files failed — refusing to report a clean LOC gate" >&2
-  exit 1
+# With args: partial scan (e.g. the pre-commit hook checking only staged
+# files) — fast, and skips the allowlist-ratchet check below, which is a
+# whole-repo invariant that doesn't apply to a subset. With no args: full
+# scan via git ls-files, which only lists tracked files, so it naturally
+# skips build output, vendored/scratch clones, and other worktrees without
+# needing to know their paths in advance (all of those are either
+# .gitignored or simply never added). The hidden-folder skip below is
+# defense in depth on top of that, not the primary exclusion.
+if (($# > 0)); then
+  partial_scan=1
+  printf '%s\0' "$@" >"$file_list"
+else
+  partial_scan=0
+  if ! git ls-files -z -- '*.rs' >"$file_list"; then
+    echo "FAIL: git ls-files failed — refusing to report a clean LOC gate" >&2
+    exit 1
+  fi
 fi
 
 while IFS= read -r -d '' file; do
@@ -41,6 +50,7 @@ while IFS= read -r -d '' file; do
   case "$file" in
     .*/*|*/.*) continue ;;
   esac
+  [[ -f "$file" ]] || continue
   lines=$(wc -l <"$file" | tr -d ' ')
   if is_allowed "$file"; then
     if ((lines > FROZEN_LIMIT)); then
@@ -53,20 +63,26 @@ while IFS= read -r -d '' file; do
   fi
 done <"$file_list"
 
-for a in "${ALLOWLIST[@]}"; do
-  if [[ -f "$a" ]]; then
-    lines=$(wc -l <"$a" | tr -d ' ')
-    if ((lines <= LIMIT)); then
-      echo "FAIL: $a is now $lines lines (<= $LIMIT) — remove it from allowlist in scripts/loc-gate.sh"
+if ((partial_scan == 0)); then
+  for a in "${ALLOWLIST[@]}"; do
+    if [[ -f "$a" ]]; then
+      lines=$(wc -l <"$a" | tr -d ' ')
+      if ((lines <= LIMIT)); then
+        echo "FAIL: $a is now $lines lines (<= $LIMIT) — remove it from allowlist in scripts/loc-gate.sh"
+        fail=1
+      fi
+    else
+      echo "FAIL: allowlisted file $a no longer exists — remove it from scripts/loc-gate.sh"
       fail=1
     fi
-  else
-    echo "FAIL: allowlisted file $a no longer exists — remove it from scripts/loc-gate.sh"
-    fail=1
-  fi
-done
+  done
+fi
 
 if ((fail == 0)); then
-  echo "LOC gate OK: all non-allowlisted Rust files <= $LIMIT lines (${#ALLOWLIST[@]} legacy files frozen <= $FROZEN_LIMIT)"
+  if ((partial_scan == 1)); then
+    echo "LOC gate OK: staged Rust file(s) within limits"
+  else
+    echo "LOC gate OK: all non-allowlisted Rust files <= $LIMIT lines (${#ALLOWLIST[@]} legacy files frozen <= $FROZEN_LIMIT)"
+  fi
 fi
 exit "$fail"
