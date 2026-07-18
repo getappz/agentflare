@@ -1,0 +1,80 @@
+<!-- @dsCard group="Shell" -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>agentflare dashboard — shell</title>
+  <link rel="stylesheet" href="/tokens.css" />
+  <script defer src="/shell.js"></script>
+  <script defer src="/vendor/alpine.js"></script>
+</head>
+<body>
+  <!--
+    Reference copy of the shared shell chrome (sidebar + topbar + content
+    slot). board.html / list.html / item.html / webhooks.html each copy this
+    same markup with a different topbar title and content slot — there's no
+    include mechanism without a build step, so the behavior lives in
+    shell.js (Alpine.data('shellNav', ...)) and only this structure is
+    duplicated per page.
+  -->
+  <div class="af-app">
+    <aside class="af-sidebar" x-data="shellNav()" x-init="init()">
+      <div class="af-sidebar-header">agentflare</div>
+
+      <div class="af-nav-section">
+        <label class="af-nav-section-label" for="af-workspace-select">Workspace</label>
+        <select
+          id="af-workspace-select"
+          class="af-select"
+          x-model="workspaceId"
+          @change="onWorkspaceChange()"
+        >
+          <template x-if="!loading && workspaces.length === 0">
+            <option value="">No workspaces</option>
+          </template>
+          <template x-for="w in workspaces" :key="w.id">
+            <option :value="w.id" x-text="w.name"></option>
+          </template>
+        </select>
+      </div>
+
+      <div class="af-nav-section">
+        <label class="af-nav-section-label" for="af-project-select">Project</label>
+        <select
+          id="af-project-select"
+          class="af-select"
+          x-model="projectId"
+          @change="onProjectChange()"
+        >
+          <template x-if="!loading && projects.length === 0">
+            <option value="">No projects</option>
+          </template>
+          <template x-for="p in projects" :key="p.id">
+            <option :value="p.id" x-text="p.identifier + ' — ' + p.name"></option>
+          </template>
+        </select>
+      </div>
+
+      <nav class="af-nav-links">
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/board.html') }" :href="navHref('/board.html')">Board</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/list.html') }" :href="navHref('/list.html')">List</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/webhooks.html') }" :href="navHref('/webhooks.html')">Webhooks</a>
+      </nav>
+    </aside>
+
+    <div class="af-main-col">
+      <header class="af-topbar">
+        <h1>Shell</h1>
+      </header>
+      <main class="af-content">
+        <p class="af-empty">
+          This is the layout skeleton only — pick Board, List, or Webhooks from the
+          sidebar to see live data. Design tokens live in <code>tokens.css</code>,
+          shared nav behavior lives in <code>shell.js</code>.
+        </p>
+      </main>
+    </div>
+  </div>
+</body>
+</html>
