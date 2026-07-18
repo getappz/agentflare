@@ -16,7 +16,13 @@ pub fn pm_db_readonly() -> rusqlite::Result<Connection> {
 pub fn claims_json() -> String {
     let path = crate::db::agentflare_db_path();
     let result = open_readonly(&path).and_then(|conn| {
-        crate::claims::list(&conn, None, true, crate::claims::now(), crate::claims::ttl_secs())
+        crate::claims::list(
+            &conn,
+            None,
+            true,
+            crate::claims::now(),
+            crate::claims::ttl_secs(),
+        )
     });
     match result {
         Ok(claims) => serde_json::to_string(&claims).unwrap_or_else(|_| "[]".into()),
@@ -164,15 +170,6 @@ pub fn cost_json(days: u32, by: &str) -> String {
     cost_totals_to_json(&crate::cost::summarize((start, today), group_by))
 }
 
-/// A full snapshot of the volatile surfaces the `/events` SSE stream pushes:
-/// `{ claims, cost_today }`. Convenience wrapper that computes both pieces and
-/// combines them via `snapshot_json`. The SSE producer instead calls
-/// `snapshot_json` directly so it can refresh the cheap claims read every tick
-/// while recomputing the expensive cost summary far less often.
-pub fn live_snapshot_json() -> String {
-    snapshot_json(&claims_json(), &cost_json(1, "model"))
-}
-
 /// Combine an already-computed `claims` (JSON array string) and `cost_today`
 /// (JSON object string) into the `/events` snapshot `{ claims, cost_today }`.
 /// Re-parses each so they nest as JSON values rather than embedded strings;
@@ -268,24 +265,10 @@ mod tests {
         assert_eq!(groups[1]["key"], "some-unpriced-model");
 
         assert_eq!(v["total_cost_usd"], 1.25, "total is the sum of group costs");
-        assert_eq!(v["any_unpriced"], true, "flagged when any group is unpriced");
-    }
-
-    #[test]
-    fn live_snapshot_json_bundles_claims_and_cost_today() {
-        crate::paths::test_support::with_temp_home(|| {
-            let json = live_snapshot_json();
-            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-            assert!(v["claims"].is_array(), "claims must be a JSON array: {json}");
-            assert!(
-                v["cost_today"].is_object(),
-                "cost_today must be the cost summary object: {json}"
-            );
-            assert!(
-                v["cost_today"]["groups"].is_array(),
-                "cost_today carries the grouped rows: {json}"
-            );
-        });
+        assert_eq!(
+            v["any_unpriced"], true,
+            "flagged when any group is unpriced"
+        );
     }
 
     #[test]
@@ -300,7 +283,10 @@ mod tests {
         }
         let ro = open_readonly(&path).unwrap();
         let err = ro.execute("INSERT INTO t (x) VALUES (1)", []).unwrap_err();
-        assert!(format!("{err}").contains("read"), "must reject writes: {err}");
+        assert!(
+            format!("{err}").contains("read"),
+            "must reject writes: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -316,7 +302,10 @@ mod tests {
             }
             let ro = pm_db_readonly().unwrap();
             let err = ro.execute("INSERT INTO t (x) VALUES (1)", []).unwrap_err();
-            assert!(format!("{err}").contains("read"), "must reject writes: {err}");
+            assert!(
+                format!("{err}").contains("read"),
+                "must reject writes: {err}"
+            );
         });
     }
 
@@ -334,7 +323,10 @@ mod tests {
         )
         .unwrap();
         let json = workspaces_json_from(&conn);
-        assert!(json.contains("\"slug\":\"acme\""), "expected acme workspace in {json}");
+        assert!(
+            json.contains("\"slug\":\"acme\""),
+            "expected acme workspace in {json}"
+        );
     }
 
     #[test]
@@ -362,7 +354,10 @@ mod tests {
         )
         .unwrap();
         let json = projects_json_from(&conn, &ws.id);
-        assert!(json.contains("\"identifier\":\"ROCK\""), "expected ROCK project in {json}");
+        assert!(
+            json.contains("\"identifier\":\"ROCK\""),
+            "expected ROCK project in {json}"
+        );
         let empty = projects_json_from(&conn, "nonexistent-workspace");
         assert_eq!(empty, "[]");
     }
@@ -392,7 +387,10 @@ mod tests {
         )
         .unwrap();
         let json = states_json_from(&conn, &proj.id);
-        assert!(json.contains("\"group_name\":\"backlog\""), "expected default states in {json}");
+        assert!(
+            json.contains("\"group_name\":\"backlog\""),
+            "expected default states in {json}"
+        );
         let empty = states_json_from(&conn, "nonexistent-project");
         assert_eq!(empty, "[]");
     }
@@ -444,7 +442,10 @@ mod tests {
         )
         .unwrap();
         let json = items_json_from(&conn, &proj.id);
-        assert!(json.contains("\"name\":\"Fix bug\""), "expected item in {json}");
+        assert!(
+            json.contains("\"name\":\"Fix bug\""),
+            "expected item in {json}"
+        );
         let empty = items_json_from(&conn, "nonexistent-project");
         assert_eq!(empty, "[]");
     }
@@ -497,7 +498,10 @@ mod tests {
         .unwrap();
         agentflare_backend::comment::create(&conn, &item.id, "agent-1", "Looks good").unwrap();
         let json = comments_json_from(&conn, &item.id);
-        assert!(json.contains("\"body\":\"Looks good\""), "expected comment in {json}");
+        assert!(
+            json.contains("\"body\":\"Looks good\""),
+            "expected comment in {json}"
+        );
         let empty = comments_json_from(&conn, "nonexistent-item");
         assert_eq!(empty, "[]");
     }
@@ -541,9 +545,15 @@ mod tests {
         )
         .unwrap();
         let by_project = labels_json_from(&conn, None, Some(&proj.id));
-        assert!(by_project.contains("\"name\":\"bug\""), "expected label in {by_project}");
+        assert!(
+            by_project.contains("\"name\":\"bug\""),
+            "expected label in {by_project}"
+        );
         let by_workspace = labels_json_from(&conn, Some(&ws.id), None);
-        assert!(by_workspace.contains("\"name\":\"bug\""), "expected label in {by_workspace}");
+        assert!(
+            by_workspace.contains("\"name\":\"bug\""),
+            "expected label in {by_workspace}"
+        );
         let neither = labels_json_from(&conn, None, None);
         assert_eq!(neither, "[]");
     }
@@ -582,7 +592,10 @@ mod tests {
         )
         .unwrap();
         let json = webhooks_json_from(&conn, &ws.id);
-        assert!(json.contains("\"event_type\":\"item\""), "expected event log in {json}");
+        assert!(
+            json.contains("\"event_type\":\"item\""),
+            "expected event log in {json}"
+        );
         let empty = webhooks_json_from(&conn, "nonexistent-workspace");
         assert_eq!(empty, "[]");
     }

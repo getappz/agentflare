@@ -1,3 +1,4 @@
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::{
     Router,
     extract::Query,
@@ -7,14 +8,16 @@ use axum::{
 };
 use rust_embed::RustEmbed;
 use serde::Deserialize;
-use axum::response::sse::{Event, KeepAlive, Sse};
 
 #[derive(RustEmbed)]
 #[folder = "dashboard/web/"]
 struct WebAssets;
 
 async fn claims_handler() -> Response {
-    ([(header::CONTENT_TYPE, "application/json")], crate::dashboard::data::claims_json())
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        crate::dashboard::data::claims_json(),
+    )
         .into_response()
 }
 
@@ -24,7 +27,10 @@ struct WorkspaceScope {
 }
 
 async fn pm_workspaces_handler() -> Response {
-    ([(header::CONTENT_TYPE, "application/json")], crate::dashboard::data::workspaces_json())
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        crate::dashboard::data::workspaces_json(),
+    )
         .into_response()
 }
 
@@ -188,7 +194,11 @@ async fn static_handler(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
     match WebAssets::get(path) {
-        Some(c) => ([(header::CONTENT_TYPE, mime_for(path))], c.data.into_owned()).into_response(),
+        Some(c) => (
+            [(header::CONTENT_TYPE, mime_for(path))],
+            c.data.into_owned(),
+        )
+            .into_response(),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
@@ -233,7 +243,9 @@ pub async fn run(host: &str, port: u16, open: bool) {
     if open {
         crate::dashboard::open_browser(&url);
     }
-    axum::serve(listener, router()).await.expect("dashboard server error");
+    axum::serve(listener, router())
+        .await
+        .expect("dashboard server error");
 }
 
 #[cfg(test)]
@@ -242,11 +254,19 @@ mod tests {
 
     #[tokio::test]
     async fn claims_endpoint_returns_json_array() {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router()).await.unwrap(); });
+        tokio::spawn(async move {
+            axum::serve(listener, router()).await.unwrap();
+        });
         let body = reqwest::get(format!("http://{addr}/api/claims"))
-            .await.unwrap().text().await.unwrap();
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
         assert!(body.starts_with('['), "expected JSON array, got: {body}");
     }
 }

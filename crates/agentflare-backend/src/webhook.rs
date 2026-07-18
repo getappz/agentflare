@@ -650,7 +650,14 @@ mod tests {
             },
         )
         .unwrap();
-        deliver(&conn, &wh, "item", "create", serde_json::json!({"id": "123"})).unwrap();
+        deliver(
+            &conn,
+            &wh,
+            "item",
+            "create",
+            serde_json::json!({"id": "123"}),
+        )
+        .unwrap();
         let logs = list_logs_by_workspace(&conn, &wid).unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].webhook_id, wh.id);
