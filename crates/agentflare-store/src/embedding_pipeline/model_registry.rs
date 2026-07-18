@@ -49,16 +49,15 @@ impl CustomModelSpec {
                 _ => '-',
             });
         }
-        if let Some(rev) = &self.revision {
-            slug.push('-');
-            for c in rev.chars().take(16) {
-                slug.push(match c {
-                    'a'..='z' | '0'..='9' | '-' => c,
-                    'A'..='Z' => c.to_ascii_lowercase(),
-                    _ => '-',
-                });
-            }
-        }
+        // Hash repo+revision instead of truncating the revision to 16 chars:
+        // two different (repo, revision) pairs that happen to share a
+        // 16-char revision prefix would otherwise collide on the same cache
+        // directory.
+        let digest = blake3::hash(
+            format!("{}@{}", self.repo, self.revision.as_deref().unwrap_or("")).as_bytes(),
+        );
+        slug.push('-');
+        slug.push_str(&digest.to_hex()[..16]);
         slug
     }
 }
@@ -208,8 +207,10 @@ impl ModelConfig {
     }
 }
 
-pub fn resolve_model() -> EmbeddingModel {
-    let env_val = std::env::var("AGENTFLARE_EMBEDDING_MODEL").ok();
-    let name = env_val.as_deref().unwrap_or("default");
-    EmbeddingModel::from_str_name(name).unwrap_or(EmbeddingModel::DEFAULT)
+pub fn resolve_model() -> anyhow::Result<EmbeddingModel> {
+    match std::env::var("AGENTFLARE_EMBEDDING_MODEL") {
+        Ok(name) => EmbeddingModel::from_str_name(&name)
+            .ok_or_else(|| anyhow::anyhow!("invalid AGENTFLARE_EMBEDDING_MODEL: {name:?}")),
+        Err(_) => Ok(EmbeddingModel::DEFAULT),
+    }
 }

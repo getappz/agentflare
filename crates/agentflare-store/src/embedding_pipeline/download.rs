@@ -21,7 +21,7 @@ pub fn ensure_model(model_dir: &Path, config: &ModelConfig) -> anyhow::Result<Pa
     // model.lock.json) before trusting them. A present-but-corrupt file (partial
     // write, disk corruption, tampering) must not silently bypass the checksum,
     // so a size/hash mismatch is treated as missing and re-downloaded below.
-    let lock = read_lockfile(model_dir);
+    let lock = read_lockfile(model_dir)?;
     let mut any_corrupt = false;
     for file in &files {
         let local_path = model_dir.join(&file.local_name);
@@ -33,7 +33,13 @@ pub fn ensure_model(model_dir: &Path, config: &ModelConfig) -> anyhow::Result<Pa
                 "Embedding model file {} present but failed size/SHA-256 verification; re-downloading",
                 file.local_name
             );
-            let _ = std::fs::remove_file(&local_path);
+            std::fs::remove_file(&local_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to remove corrupt model file {}: {e}. Refusing to \
+                     continue with unverified data left on disk.",
+                    local_path.display()
+                )
+            })?;
             any_corrupt = true;
         }
     }
@@ -50,7 +56,7 @@ pub fn ensure_model(model_dir: &Path, config: &ModelConfig) -> anyhow::Result<Pa
     );
     std::fs::create_dir_all(model_dir)?;
 
-    let mut lock = read_lockfile(model_dir);
+    let mut lock = read_lockfile(model_dir)?;
 
     for file in &files {
         let local_path = model_dir.join(&file.local_name);
@@ -193,11 +199,20 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
     Ok(format!("{result:x}"))
 }
 
-fn read_lockfile(model_dir: &Path) -> BTreeMap<String, String> {
-    std::fs::read_to_string(model_dir.join(LOCKFILE))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+/// A missing lockfile is expected on first run (`Ok(empty)`); an existing but
+/// unreadable or malformed one is not — silently treating it as empty would
+/// make every present file look unpinned and skip verification entirely.
+fn read_lockfile(model_dir: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+    let path = model_dir.join(LOCKFILE);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s)
+            .map_err(|e| anyhow::anyhow!("Malformed lockfile {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(anyhow::anyhow!(
+            "Cannot read lockfile {}: {e}",
+            path.display()
+        )),
+    }
 }
 
 fn write_lockfile(model_dir: &Path, lock: &BTreeMap<String, String>) -> anyhow::Result<()> {
