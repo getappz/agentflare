@@ -56,6 +56,38 @@ fn projects_json_from(conn: &Connection, workspace_id: &str) -> String {
     }
 }
 
+/// Items in a project as a JSON array string; reuses
+/// `agentflare_backend::item::list_by_project`. "[]" on error.
+pub fn items_json(project_id: &str) -> String {
+    match pm_db_readonly() {
+        Ok(conn) => items_json_from(&conn, project_id),
+        Err(_) => "[]".into(),
+    }
+}
+
+fn items_json_from(conn: &Connection, project_id: &str) -> String {
+    match agentflare_backend::item::list_by_project(conn, project_id) {
+        Ok(rows) => serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()),
+        Err(_) => "[]".into(),
+    }
+}
+
+/// States in a project as a JSON array string; reuses
+/// `agentflare_backend::state::list_by_project`. "[]" on error.
+pub fn states_json(project_id: &str) -> String {
+    match pm_db_readonly() {
+        Ok(conn) => states_json_from(&conn, project_id),
+        Err(_) => "[]".into(),
+    }
+}
+
+fn states_json_from(conn: &Connection, project_id: &str) -> String {
+    match agentflare_backend::state::list_by_project(conn, project_id) {
+        Ok(rows) => serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()),
+        Err(_) => "[]".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +169,88 @@ mod tests {
         let json = projects_json_from(&conn, &ws.id);
         assert!(json.contains("\"identifier\":\"ROCK\""), "expected ROCK project in {json}");
         let empty = projects_json_from(&conn, "nonexistent-workspace");
+        assert_eq!(empty, "[]");
+    }
+
+    #[test]
+    fn states_json_from_scopes_to_project() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let ws = agentflare_backend::workspace::create(
+            &conn,
+            agentflare_backend::workspace::CreateWorkspace {
+                name: "Acme".into(),
+                slug: "acme".into(),
+                owner_agent: None,
+                item_label: None,
+            },
+        )
+        .unwrap();
+        let proj = agentflare_backend::project::create(
+            &conn,
+            agentflare_backend::project::CreateProject {
+                workspace_id: ws.id.clone(),
+                name: "Rocket".into(),
+                identifier: "ROCK".into(),
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+        let json = states_json_from(&conn, &proj.id);
+        assert!(json.contains("\"group_name\":\"backlog\""), "expected default states in {json}");
+        let empty = states_json_from(&conn, "nonexistent-project");
+        assert_eq!(empty, "[]");
+    }
+
+    #[test]
+    fn items_json_from_scopes_to_project() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let ws = agentflare_backend::workspace::create(
+            &conn,
+            agentflare_backend::workspace::CreateWorkspace {
+                name: "Acme".into(),
+                slug: "acme".into(),
+                owner_agent: None,
+                item_label: None,
+            },
+        )
+        .unwrap();
+        let proj = agentflare_backend::project::create(
+            &conn,
+            agentflare_backend::project::CreateProject {
+                workspace_id: ws.id.clone(),
+                name: "Rocket".into(),
+                identifier: "ROCK".into(),
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+        let states = agentflare_backend::state::list_by_project(&conn, &proj.id).unwrap();
+        let state_id = states.iter().find(|s| s.is_default).unwrap().id.clone();
+        agentflare_backend::item::create(
+            &conn,
+            agentflare_backend::item::CreateItem {
+                project_id: proj.id.clone(),
+                state_id,
+                name: "Fix bug".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        let json = items_json_from(&conn, &proj.id);
+        assert!(json.contains("\"name\":\"Fix bug\""), "expected item in {json}");
+        let empty = items_json_from(&conn, "nonexistent-project");
         assert_eq!(empty, "[]");
     }
 }
