@@ -25,15 +25,24 @@ fail=0
 file_list=$(mktemp)
 trap 'rm -f "$file_list"' EXIT
 
-if ! find . -path ./target -prune -o -name '*.rs' -type f -print0 >"$file_list"; then
-  echo "FAIL: find traversal failed — refusing to report a clean LOC gate" >&2
+# git ls-files only lists tracked files, so it naturally skips build output,
+# vendored/scratch clones, and other worktrees without needing to know their
+# paths in advance (all of those are either .gitignored or simply never
+# added). The hidden-folder skip below is defense in depth on top of that,
+# not the primary exclusion.
+if ! git ls-files -z -- '*.rs' >"$file_list"; then
+  echo "FAIL: git ls-files failed — refusing to report a clean LOC gate" >&2
   exit 1
 fi
 
 while IFS= read -r -d '' file; do
+  # Skip anything under a hidden folder (.worktrees, .claude, .github, …) —
+  # never project source, regardless of tracking state.
+  case "$file" in
+    .*/*|*/.*) continue ;;
+  esac
   lines=$(wc -l <"$file" | tr -d ' ')
-  relative_file=${file#./}
-  if is_allowed "$relative_file"; then
+  if is_allowed "$file"; then
     if ((lines > FROZEN_LIMIT)); then
       echo "FAIL: $file has $lines lines (> frozen limit $FROZEN_LIMIT — split it, do not grow it)"
       fail=1
