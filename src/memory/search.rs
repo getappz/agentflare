@@ -15,27 +15,10 @@ pub fn search(
     let limit = limit.min(50) as i64;
     let like_pat = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
 
-    // Filters are always present as `(?N IS NULL OR ...)` clauses with their
-    // own distinct placeholder index, rather than conditionally spliced-in
-    // SQL fragments sharing an index with LIMIT — the latter is what caused
-    // the ?2 collision bug (project filter and LIMIT both bound to ?2).
-    let sql = "SELECT o.id, o.session_id, o.type, o.title, o.content, o.tool_name,
-                o.project, o.scope, o.topic_key, o.normalized_hash,
-                o.revision_count, o.duplicate_count, o.last_seen_at,
-                o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at
-         FROM observations_fts f
-         JOIN observations o ON o.id = f.rowid
-         WHERE observations_fts MATCH ?1
-           AND o.deleted_at IS NULL
-           AND (?3 IS NULL OR o.project = ?3)
-           AND (?4 IS NULL OR o.type = ?4)
-         ORDER BY bm25(observations_fts, 3.0, 1.0, 1.0, 1.0, 1.0)
-         LIMIT ?2";
-
-    let mut stmt = conn.prepare(sql)?;
-    let fts_query = build_fts_query(query);
-    let rows = stmt.query_map(params![fts_query, limit, project, r#type], map_search_row)?;
-    let results: Vec<Observation> = rows.collect::<Result<_, _>>()?;
+    let results: Vec<Observation> = fts_ranked(conn, query, project, r#type, limit as usize)?
+        .into_iter()
+        .map(|(o, _)| o)
+        .collect();
     if !results.is_empty() {
         return Ok(results);
     }
@@ -82,6 +65,107 @@ fn build_fts_query(raw: &str) -> String {
     tokens.join(" ")
 }
 
+/// FTS hits with HIGHER-IS-BETTER scores (negated SQLite bm25 rank).
+///
+/// Filters are always present as `(?N IS NULL OR ...)` clauses with their
+/// own distinct placeholder index, rather than conditionally spliced-in
+/// SQL fragments sharing an index with LIMIT — the latter is what caused
+/// the ?2 collision bug (project filter and LIMIT both bound to ?2).
+fn fts_ranked(
+    conn: &Connection,
+    query: &str,
+    project: Option<&str>,
+    r#type: Option<&str>,
+    k: usize,
+) -> rusqlite::Result<Vec<(Observation, f64)>> {
+    let sql = "SELECT o.id, o.session_id, o.type, o.title, o.content, o.tool_name,
+                o.project, o.scope, o.topic_key, o.normalized_hash,
+                o.revision_count, o.duplicate_count, o.last_seen_at,
+                o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
+                -bm25(observations_fts, 3.0, 1.0, 1.0, 1.0, 1.0) AS score
+         FROM observations_fts f
+         JOIN observations o ON o.id = f.rowid
+         WHERE observations_fts MATCH ?1
+           AND o.deleted_at IS NULL
+           AND (?3 IS NULL OR o.project = ?3)
+           AND (?4 IS NULL OR o.type = ?4)
+         ORDER BY bm25(observations_fts, 3.0, 1.0, 1.0, 1.0, 1.0)
+         LIMIT ?2";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(
+        params![build_fts_query(query), k as i64, project, r#type],
+        |r| Ok((map_search_row(r)?, r.get::<_, f64>(18)?)),
+    )?;
+    rows.collect()
+}
+
+/// Hybrid recall: weighted BM25+vector merge (0.4/0.6), 30-day temporal
+/// decay, MMR re-rank (λ=0.7). `embed` returning `None` (no `semantic`
+/// feature, no model) makes this EXACTLY equivalent to `search()` — the
+/// equality test below enforces that contract.
+pub fn search_hybrid(
+    conn: &Connection,
+    query: &str,
+    project: Option<&str>,
+    r#type: Option<&str>,
+    limit: usize,
+    embed: impl Fn(&str) -> Option<Vec<f32>>,
+) -> rusqlite::Result<Vec<Observation>> {
+    use agentflare_store::retrieval;
+
+    let Some(qvec) = embed(query) else {
+        return search(conn, query, project, r#type, limit);
+    };
+    let pool = limit.min(50) * 2;
+
+    let fts = fts_ranked(conn, query, project, r#type, pool)?;
+    let vec_hits = super::embeddings::candidates(conn, &qvec, project, r#type, pool)?;
+    if fts.is_empty() && vec_hits.is_empty() {
+        // Preserve the LIKE/recent fallback behavior for no-hit queries.
+        return search(conn, query, project, r#type, limit);
+    }
+
+    let bm25_pairs: Vec<(i64, f64)> = fts.iter().map(|(o, s)| (o.id, *s)).collect();
+    let mut merged = retrieval::merge_ranked(&bm25_pairs, &vec_hits, 0.4, 0.6);
+
+    // Materialize observations for ids that only came from the vector side.
+    let mut by_id: std::collections::HashMap<i64, Observation> =
+        fts.into_iter().map(|(o, _)| (o.id, o)).collect();
+    for (id, _) in &merged {
+        if !by_id.contains_key(id) {
+            if let Some(o) = super::observations::get(conn, *id)? {
+                by_id.insert(*id, o);
+            }
+        }
+    }
+    merged.retain(|(id, _)| by_id.contains_key(id));
+
+    // Temporal decay: 30-day half-life on RFC3339 created_at.
+    let now = chrono::Utc::now();
+    for (id, score) in merged.iter_mut() {
+        if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&by_id[id].created_at) {
+            let age_days = (now - created.with_timezone(&chrono::Utc)).num_hours() as f64 / 24.0;
+            *score *= retrieval::decay_factor(age_days.max(0.0), 30.0);
+        }
+    }
+
+    // MMR: λ=0.7, jaccard similarity over title+content.
+    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let texts: Vec<String> = merged
+        .iter()
+        .map(|(id, _)| format!("{}\n{}", by_id[id].title, by_id[id].content))
+        .collect();
+    let scores: Vec<f64> = merged.iter().map(|(_, s)| *s).collect();
+    let picked = retrieval::mmr_select(&scores, limit, 0.7, |i, j| {
+        retrieval::jaccard_overlap(&texts[i], &texts[j])
+    });
+
+    Ok(picked
+        .into_iter()
+        .map(|i| by_id[&merged[i].0].clone())
+        .collect())
+}
+
 fn map_search_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Observation> {
     Ok(Observation {
         id: r.get(0)?,
@@ -115,6 +199,97 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         schema::migrate(&mut conn).unwrap();
         conn
+    }
+
+    // Deterministic fake embedder: axis per keyword, no ONNX involved.
+    fn fake_embed(text: &str) -> Option<Vec<f32>> {
+        let t = text.to_lowercase();
+        Some(vec![
+            if t.contains("rocket") { 1.0 } else { 0.0 },
+            if t.contains("garden") { 1.0 } else { 0.0 },
+        ])
+    }
+
+    // The no-embedder contract: search_hybrid with a None embedder must be
+    // EXACTLY today's FTS search — same rows, same order.
+    #[test]
+    fn hybrid_none_embedder_matches_plain_search_exactly() {
+        let conn = new_db();
+        for (title, content) in [("widget rollout", "shipping"), ("widget outage", "boom")] {
+            observations::save(
+                &conn, None, "note", title, content, None, Some("p"), None, None,
+            )
+            .unwrap();
+        }
+        let plain = search(&conn, "widget", Some("p"), None, 10).unwrap();
+        let hybrid = search_hybrid(&conn, "widget", Some("p"), None, 10, |_| None).unwrap();
+        assert_eq!(
+            plain.iter().map(|o| o.id).collect::<Vec<_>>(),
+            hybrid.iter().map(|o| o.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn hybrid_surfaces_semantic_match_without_keyword() {
+        let conn = new_db();
+        // Content shares NO keyword with the query "rocket".
+        let id = match observations::save(
+            &conn,
+            None,
+            "note",
+            "launch vehicle notes",
+            "propulsion staging details",
+            None,
+            Some("p"),
+            None,
+            None,
+        )
+        .unwrap()
+        {
+            observations::SaveOutcome::Created(id) => id,
+            other => panic!("{other:?}"),
+        };
+        crate::memory::embeddings::upsert(&conn, id, &[1.0, 0.0], "fake").unwrap();
+        let hits = search_hybrid(&conn, "rocket", Some("p"), None, 10, fake_embed).unwrap();
+        assert!(
+            hits.iter().any(|o| o.id == id),
+            "vector-only match must surface"
+        );
+    }
+
+    #[test]
+    fn hybrid_decay_downranks_old_equal_match() {
+        let conn = new_db();
+        let mut ids = Vec::new();
+        for title in ["garden plan a", "garden plan b"] {
+            if let observations::SaveOutcome::Created(id) = observations::save(
+                &conn,
+                None,
+                "note",
+                title,
+                &format!("unique-filler-{title}"),
+                None,
+                Some("p"),
+                None,
+                None,
+            )
+            .unwrap()
+            {
+                crate::memory::embeddings::upsert(&conn, id, &[0.0, 1.0], "fake").unwrap();
+                ids.push(id);
+            }
+        }
+        // Age the first one by a year.
+        conn.execute(
+            "UPDATE observations SET created_at = '2025-07-19T00:00:00+00:00' WHERE id = ?1",
+            rusqlite::params![ids[0]],
+        )
+        .unwrap();
+        let hits = search_hybrid(&conn, "garden", Some("p"), None, 2, fake_embed).unwrap();
+        assert_eq!(
+            hits[0].id, ids[1],
+            "fresh observation must outrank year-old twin"
+        );
     }
 
     // Regression test for the ?2/LIMIT collision: project-scoped search used

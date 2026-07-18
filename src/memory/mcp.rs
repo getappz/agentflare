@@ -79,12 +79,13 @@ fn recall_with_conn(conn: &rusqlite::Connection, input: RecallInput) -> Result<S
     }
     let limit = input.limit.unwrap_or(10).min(50);
     let results = if let Some(ref q) = input.query.filter(|q| !q.trim().is_empty()) {
-        search::search(
+        search::search_hybrid(
             conn,
             q,
             input.project.as_deref(),
             input.r#type.as_deref(),
             limit,
+            super::engine::embed_query,
         )
         .map_err(|e| format!("search failed: {e}"))?
     } else {
