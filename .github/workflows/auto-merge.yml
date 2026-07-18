@@ -23,7 +23,14 @@ jobs:
       # (build/clippy/fmt/etc., all "strict") still gate the actual merge,
       # and GitHub re-syncs a BEHIND branch on its own before merging, so
       # this replaces the manual "remember to pass --auto" step entirely.
+      #
+      # Needs a real PAT, not the default token: GitHub's Actions-issued
+      # GITHUB_TOKEN is rejected by the enablePullRequestAutoMerge mutation
+      # ("Resource not accessible by integration") regardless of declared
+      # permissions — confirmed 2026-07-18. Create a fine-grained PAT scoped
+      # to this repo with Pull requests: read/write, then:
+      #   gh secret set AUTOMERGE_TOKEN --body <token>
       - name: gh pr merge --auto
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.AUTOMERGE_TOKEN }}
         run: gh pr merge --auto --squash --delete-branch "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}"
