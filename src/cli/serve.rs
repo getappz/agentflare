@@ -3,8 +3,8 @@ use clap::Args;
 /// Serve the read-only agentflare dashboard.
 #[derive(Args)]
 pub struct ServeArgs {
-    /// TCP port (0 = auto).
-    #[arg(long, default_value = "0")]
+    /// TCP port. Default 35273 ("FLARE" on a phone keypad); 0 = auto-assign.
+    #[arg(long, default_value = "35273")]
     pub port: u16,
     /// Interface to bind ("0.0.0.0" shares with your LAN).
     #[arg(long, default_value = "127.0.0.1")]
