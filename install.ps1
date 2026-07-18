@@ -17,6 +17,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# --- branding banner (mirror of assets/banner.txt; keep in sync) ---
+function Write-Banner {
+    if ($env:AGENTFLARE_QUIET_INSTALL -eq '1') { return }
+    $useColor = (-not [Console]::IsOutputRedirected) -and (-not $env:NO_COLOR)
+    $line = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+    $text = '  agentflare  ·  Optimize AI CLI agents for cost & performance'
+    if ($useColor) {
+        $e = [char]27
+        Write-Host "$e[2;36m$line$e[0m"
+        Write-Host "$e[1;35m$text$e[0m"
+        Write-Host "$e[2;36m$line$e[0m"
+    } else {
+        Write-Host $line
+        Write-Host $text
+        Write-Host $line
+    }
+}
+
 if ($Help) {
     Write-Host 'Usage: .\install.ps1 [-BuildOnly] [-Help]'
     Write-Host ''
@@ -47,7 +65,7 @@ $cargoBinDir = Get-CargoBinDir
 $builtBinary = Join-Path $scriptDir 'target\release\agentflare.exe'
 $installedBinary = Join-Path $cargoBinDir 'agentflare.exe'
 
-Write-Host 'agentflare Windows installer'
+Write-Banner
 Write-Host 'Mode: build from source'
 Write-Host ''
 Write-Host 'Building agentflare (release)...'

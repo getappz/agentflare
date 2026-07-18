@@ -1,5 +1,11 @@
 <div align="center">
 
+<pre>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  agentflare  ·  Optimize AI CLI agents for cost & performance
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+</pre>
+
 # agentflare
 
 **Run AI coding agents efficiently, and coordinate more than one of them.**

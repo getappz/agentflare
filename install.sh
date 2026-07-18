@@ -16,6 +16,20 @@
 
 set -eu
 
+# --- branding banner (mirror of assets/banner.txt; keep in sync) ---
+print_banner() {
+  # Suppress for non-interactive, NO_COLOR, or quiet install.
+  case "${AGENTFLARE_QUIET_INSTALL:-}" in 1|true) return 0 ;; esac
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    CY=$'\033[2;36m'; MG=$'\033[1;35m'; RS=$'\033[0m'
+  else
+    CY=""; MG=""; RS=""
+  fi
+  printf '%s\n' "${CY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RS}"
+  printf '%s\n' "${MG}  agentflare  ·  Optimize AI CLI agents for cost & performance${RS}"
+  printf '%s\n' "${CY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RS}"
+}
+
 REPO="getappz/agentflare"
 INSTALL_DIR="${AGENTFLARE_INSTALL_DIR:-$HOME/.local/bin}"
 # Resolve the script's directory when invoked as a file. When piped via
@@ -34,7 +48,7 @@ SCRIPT_DIR="$(
   fi
 )"
 
-echo "agentflare installer"
+print_banner
 
 finish() {
   case ":$PATH:" in

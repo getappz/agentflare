@@ -3,6 +3,8 @@ mod agent_launch;
 mod agents;
 mod alias;
 mod artifacts;
+mod about;
+mod banner;
 mod atomic_fs;
 mod auth;
 mod auth_crypt;
@@ -53,5 +55,8 @@ use clap::Parser;
 fn main() {
     color_eyre::install().expect("color_eyre::install failed");
     let cli = cli::Cli::parse();
-    cli.command.run();
+    match cli.command {
+        Some(command) => command.run(),
+        None => crate::about::run(crate::about::AboutArgs {}),
+    }
 }
