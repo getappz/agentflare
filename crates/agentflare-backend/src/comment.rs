@@ -38,7 +38,7 @@ pub fn create(
     author_agent: &str,
     body: &str,
 ) -> Result<ItemComment> {
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = db_kit::ids::new_id();
     let ts = now();
     conn.execute(
         "INSERT INTO item_comments (id, item_id, author_agent, body, created_at, updated_at)

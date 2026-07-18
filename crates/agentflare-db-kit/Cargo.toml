@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2"
-uuid = { version = "1", features = ["v7"] }
+nanoid = "0.5"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 

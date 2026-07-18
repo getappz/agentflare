@@ -339,7 +339,10 @@ fn handoff_tool_requires_recipient_and_assigns_item() {
 
         let assets = item_assets(&s, &item_id);
         assert_eq!(assets.as_array().unwrap().len(), 1);
-        assert_eq!(assets[0]["filename"], format!("{item_id}.md"));
+        assert_eq!(
+            assets[0]["filename"],
+            format!("{}.md", item_id.to_lowercase())
+        );
     });
 }
 

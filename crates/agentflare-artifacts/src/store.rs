@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use uuid::Uuid;
 
 const ARTIFACTS_DIR: &str = "artifacts";
 const META_FILE: &str = "meta.json";
@@ -64,7 +63,7 @@ impl ArtifactStore {
             .update_id
             .clone()
             .filter(|uid| self.artifact_dir(uid).exists())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+            .unwrap_or_else(|| nanoid::nanoid!());
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -45,7 +45,7 @@ pub struct UpdateAsset {
 }
 
 pub fn storage_path(workspace_id: &str, filename: &str) -> String {
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = db_kit::ids::new_id();
     format!("{}/assets/{}-{}", workspace_id, id, filename)
 }
 
@@ -117,14 +117,14 @@ fn row_to_asset(row: &rusqlite::Row) -> rusqlite::Result<Asset> {
 }
 
 pub fn create(conn: &Connection, input: CreateAsset) -> Result<Asset> {
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = db_kit::ids::new_id();
     let ts = now();
     let sp = match input.storage_path {
         Some(ref path) => path.clone(),
         None => match &input.workspace_id {
             Some(wid) => storage_path(wid, &input.filename),
             None => {
-                let id = uuid::Uuid::now_v7().to_string();
+                let id = db_kit::ids::new_id();
                 format!("assets/{}-{}", id, input.filename)
             }
         },

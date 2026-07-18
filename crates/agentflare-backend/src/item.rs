@@ -115,7 +115,7 @@ fn workspace_id_for_project(conn: &Connection, project_id: &str) -> Result<Strin
 }
 
 pub fn create(conn: &Connection, input: CreateItem) -> Result<Item> {
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = db_kit::ids::new_id();
     let ts = now();
     let sort_order = input.sort_order.unwrap_or(65535.0);
     let description = input.description.unwrap_or_default();
@@ -187,6 +187,36 @@ pub fn get(conn: &Connection, id: &str) -> Result<Item> {
         rusqlite::Error::QueryReturnedNoRows => crate::error::Error::NotFound(id.to_string()),
         other => other.into(),
     })
+}
+
+/// Resolve a user-supplied identifier to an item UUID.
+/// Accepts a UUID (pass-through) or a numeric `sequence_id`.
+/// When `project_id` is `Some`, scopes the sequence_id lookup to that project;
+/// when `None`, searches across all projects (returns the first match).
+pub fn resolve_id(conn: &Connection, project_id: Option<&str>, id_or_seq: &str) -> Result<String> {
+    if let Ok(seq) = id_or_seq.parse::<i64>() {
+        let sql = match project_id {
+            Some(_) => {
+                "SELECT id FROM items WHERE project_id = ?1 AND sequence_id = ?2 AND deleted_at IS NULL"
+            }
+            None => "SELECT id FROM items WHERE sequence_id = ?1 AND deleted_at IS NULL LIMIT 1",
+        };
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = match project_id {
+            Some(pid) => vec![Box::new(pid.to_string()), Box::new(seq)],
+            None => vec![Box::new(seq)],
+        };
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        conn.query_row(sql, params_ref.as_slice(), |row| row.get(0))
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    crate::error::Error::NotFound(format!("sequence_id #{seq}"))
+                }
+                other => other.into(),
+            })
+    } else {
+        Ok(id_or_seq.to_string())
+    }
 }
 
 pub fn list_by_project(conn: &Connection, project_id: &str) -> Result<Vec<Item>> {

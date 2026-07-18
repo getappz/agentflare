@@ -197,7 +197,7 @@ fn validate_webhook_url(raw: &str) -> Result<()> {
 
 pub fn create(conn: &Connection, input: CreateWebhook) -> Result<Webhook> {
     validate_webhook_url(&input.url)?;
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = db_kit::ids::new_id();
     let ts = now();
     conn.execute(
         "INSERT INTO webhooks (id, workspace_id, url, is_active, secret_key, on_item, on_state, on_project, created_at, updated_at)
@@ -355,7 +355,7 @@ fn log_delivery(
     status: &str,
     resp_body: &str,
 ) -> Result<()> {
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = db_kit::ids::new_id();
     let ts = now();
     conn.execute(
         "INSERT INTO webhook_logs (id, workspace_id, webhook_id, event_type, request_method, request_body, response_status, response_body, retry_count, created_at)
@@ -406,7 +406,7 @@ pub fn deliver(
     let body = serde_json::to_vec(&payload)
         .map_err(|e| Error::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
     let signature = sign(&webhook.secret_key, &body);
-    let delivery_id = uuid::Uuid::new_v4().to_string();
+    let delivery_id = db_kit::ids::new_id();
 
     let request = http_agent()
         .post(&webhook.url)
