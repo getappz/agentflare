@@ -198,13 +198,24 @@ pub fn now() -> i64 {
 /// `git@github-alias:getappz/agentflare.git` both → `getappz/agentflare`.
 pub use crate::github::identity::normalize_repo;
 
-/// Resolves the repo key: explicit `--repo` wins, else normalize the origin
-/// remote from git provenance.
+/// Maps a git remote URL to its `owner/name` claim key, enforcing the issue
+/// #224 gate: only a confirmed GitHub origin resolves (see `RepoId::parse`).
+/// A GitLab/Bitbucket origin returns `None`, so callers must require an
+/// explicit `--repo`.
+fn repo_key_from_url(url: &str) -> Option<String> {
+    crate::github::identity::RepoId::parse(url).map(|r| r.to_string())
+}
+
+/// Resolves the repo key: explicit `--repo` wins, else resolve the origin
+/// remote from git provenance. Routing through `RepoId::parse` enforces the
+/// issue #224 gate — a non-GitHub origin (GitLab/Bitbucket) returns `None`
+/// here, forcing the caller to pass an explicit `--repo`.
 pub fn resolve_repo(explicit: Option<String>) -> Option<String> {
     explicit.filter(|s| !s.is_empty()).or_else(|| {
         crate::mcp_server::AgentflareMcp::git_provenance()
             .and_then(|g| g.repo)
-            .map(|url| normalize_repo(&url))
+            .as_deref()
+            .and_then(repo_key_from_url)
     })
 }
 
@@ -338,5 +349,23 @@ mod tests {
             normalize_repo("ssh://git@github.com/getappz/agentflare.git"),
             "getappz/agentflare"
         );
+    }
+
+    #[test]
+    fn repo_key_from_url_accepts_github_and_rejects_non_github() {
+        // Issue #224: the claim-namespace resolution must reject non-GitHub
+        // origins (which would otherwise collide with a same-named GitHub repo
+        // and target GitHub write ops with a GitHub token).
+        assert_eq!(
+            repo_key_from_url("https://github.com/getappz/agentflare.git"),
+            Some("getappz/agentflare".to_string())
+        );
+        assert_eq!(
+            repo_key_from_url("git@github.com:getappz/agentflare.git"),
+            Some("getappz/agentflare".to_string())
+        );
+        assert!(repo_key_from_url("https://bitbucket.org/o/r").is_none());
+        assert!(repo_key_from_url("git@gitlab.com:o/r.git").is_none());
+        assert!(repo_key_from_url("ssh://git@gitlab.com/o/r.git").is_none());
     }
 }
