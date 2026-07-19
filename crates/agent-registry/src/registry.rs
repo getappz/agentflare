@@ -277,6 +277,11 @@ pub static REGISTRY: &[AgentSpec] = &[
 
 /// Not yet consumed outside tests — wired up by the upcoming agent detection
 /// engine and CLI commands.
+///
+/// # Panics
+///
+/// Panics if `agent` has no `REGISTRY` entry — every `Agent` variant is
+/// guaranteed exactly one by the `registry_has_exactly_twenty_entries` test.
 #[allow(dead_code)]
 #[must_use]
 pub fn spec(agent: Agent) -> &'static AgentSpec {
@@ -294,9 +299,8 @@ pub fn spec(agent: Agent) -> &'static AgentSpec {
 #[must_use]
 pub fn headless_args(agent: Agent) -> Option<&'static [&'static str]> {
     match agent {
-        Agent::ClaudeCode => Some(&["-p"]),
+        Agent::ClaudeCode | Agent::GeminiCli => Some(&["-p"]),
         Agent::Codex => Some(&["exec"]),
-        Agent::GeminiCli => Some(&["-p"]),
         Agent::Opencode => Some(&["run"]),
         _ => None,
     }
@@ -317,7 +321,9 @@ pub fn autonomous_args(agent: Agent) -> Option<&'static [&'static str]> {
         Agent::ClaudeCode => Some(&["--dangerously-skip-permissions"]),
         Agent::Codex => Some(&["--full-auto"]),
         Agent::GeminiCli => Some(&["--yolo"]),
-        Agent::Opencode => None,
+        // Opencode falls through to the `_` wildcard, same as every other
+        // agent with no known bypass flag — listing it separately was
+        // clippy::match_same_arms.
         _ => None,
     }
 }

@@ -395,7 +395,9 @@ fn find_in_parent_tree() -> Option<String> {
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
 
     let current_pid = Pid::from_u32(std::process::id());
-    let mut pid = system.process(current_pid).and_then(|p| p.parent());
+    let mut pid = system
+        .process(current_pid)
+        .and_then(sysinfo::Process::parent);
 
     while let Some(p) = pid {
         let proc = system.process(p)?;

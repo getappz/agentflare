@@ -169,6 +169,10 @@ pub fn default_mode() -> String {
     DEFAULT_MODE.to_string()
 }
 
+/// # Errors
+///
+/// Returns `Err` if `mode` is invalid, or the config dir/file can't be
+/// created/written.
 pub fn set_default_mode(mode: &str) -> Result<(), String> {
     let normalized =
         normalize_extended_mode(mode).ok_or_else(|| format!("invalid mode: {mode}"))?;
