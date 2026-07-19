@@ -79,7 +79,10 @@ pub fn list_check_runs(
     repo: &RepoId,
     sha: &str,
 ) -> Result<Vec<CheckRun>, GitHubError> {
-    let path = format!("/repos/{}/{}/commits/{sha}/check-runs", repo.owner, repo.repo);
+    let path = format!(
+        "/repos/{}/{}/commits/{sha}/check-runs",
+        repo.owner, repo.repo
+    );
     let arr = client.get_paginated(&path, check_runs)?;
     serde_json::from_value(arr).map_err(|e| GitHubError::Parse(e.to_string()))
 }

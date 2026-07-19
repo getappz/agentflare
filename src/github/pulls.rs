@@ -78,7 +78,11 @@ pub fn request_review(
 
 /// Review verdicts (approve/request-changes/comment) — includes bot reviewers
 /// like CodeRabbit, which submit as ordinary PR reviews.
-pub fn list_reviews(client: &Client, repo: &RepoId, number: u64) -> Result<Vec<Review>, GitHubError> {
+pub fn list_reviews(
+    client: &Client,
+    repo: &RepoId,
+    number: u64,
+) -> Result<Vec<Review>, GitHubError> {
     let path = format!("/repos/{}/{}/pulls/{number}/reviews", repo.owner, repo.repo);
     let json = client.get_paginated(&path, crate::github::client::as_array)?;
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
@@ -95,7 +99,10 @@ pub fn list_review_comments(
     number: u64,
     since: Option<&str>,
 ) -> Result<Vec<ReviewComment>, GitHubError> {
-    let mut path = format!("/repos/{}/{}/pulls/{number}/comments", repo.owner, repo.repo);
+    let mut path = format!(
+        "/repos/{}/{}/pulls/{number}/comments",
+        repo.owner, repo.repo
+    );
     if let Some(s) = since {
         path.push_str(&format!("?since={}", crate::github::encode_query(s)));
     }

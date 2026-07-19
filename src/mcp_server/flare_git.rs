@@ -70,7 +70,14 @@ impl AgentflareMcp {
                     pulls::resolved_review_comment_ids(&client, &repo, n).map_err(to_mcp_error)?;
                 let comments =
                     issues::list_comments(&client, &repo, n, since).map_err(to_mcp_error)?;
-                mcp::pr_status_json(&pr, &checks, &reviews, &review_comments, &resolved_ids, &comments)
+                mcp::pr_status_json(
+                    &pr,
+                    &checks,
+                    &reviews,
+                    &review_comments,
+                    &resolved_ids,
+                    &comments,
+                )
             }
             "pr_merge" => {
                 let n = req

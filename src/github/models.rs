@@ -203,7 +203,8 @@ mod pr_status_model_tests {
 
     #[test]
     fn check_run_deserializes_with_null_conclusion() {
-        let json = serde_json::json!({ "name": "build", "status": "in_progress", "conclusion": null });
+        let json =
+            serde_json::json!({ "name": "build", "status": "in_progress", "conclusion": null });
         let run: CheckRun = serde_json::from_value(json).unwrap();
         assert_eq!(run.name, "build");
         assert_eq!(run.conclusion, None);

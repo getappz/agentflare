@@ -364,7 +364,9 @@ pub(crate) struct GitHubRequest {
     #[schemars(description = "owner/repo (default: resolved from the current repo's origin)")]
     #[serde(default)]
     pub(crate) repo: Option<String>,
-    #[schemars(description = "PR number (pr_get, pr_status, pr_merge, pr_comment, pr_request_review)")]
+    #[schemars(
+        description = "PR number (pr_get, pr_status, pr_merge, pr_comment, pr_request_review)"
+    )]
     #[serde(default)]
     pub(crate) number: Option<u64>,
     #[schemars(description = "PR title (pr_create)")]
