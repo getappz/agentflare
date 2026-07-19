@@ -214,6 +214,13 @@ fn get_handoff_command(request: &GetPromptRequestParams, agent: Option<&str>) ->
          item_id=<that item's id> (so the reply becomes the next asset version instead of a new \
          item) and reply_to=<id of the specific message you're answering>, reusing its \
          thread_id.\n\
+         If the work already lives on some other existing item (not just your \
+         own inbox reply), pass that item's id as item_id too — omitting it \
+         always creates a new item, even when one covering this work already \
+         exists. And if this is just a plain-text status update with no \
+         versioned artifact to attach, skip `handoff` entirely: call `comment` \
+         (action=create, item_id=<id>) plus `item` (action=update, id=<id>, \
+         assignee_agent=<recipient>) instead — lighter, no new item, no asset.\n\
          - `inbox [me]` → call the `item` tool (action=list, state_group=\"backlog,unstarted,started\" \
          by default to hide completed/cancelled items — omit state_group only if the command \
          explicitly says `all`) — already scoped to this repo's linked project — and filter to \
