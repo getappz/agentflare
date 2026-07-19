@@ -54,6 +54,15 @@ mod tests {
 
     #[test]
     fn log_and_cursor_are_siblings_under_state_dir() {
+        // repo_key() reads cwd (via repo_root()) and AGENTFLARE_HOME_OVERRIDE,
+        // both process-global and mutated by with_temp_cwd/with_temp_home
+        // elsewhere in this binary -- without this lock, a concurrent test can
+        // change either between the two repo_key() calls below (log_path()
+        // then cursor_path()), producing mismatched slugs. Flaked on Linux CI
+        // under higher default test parallelism; not reliably reproduced locally.
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let log = log_path();
         let cur = cursor_path();
         assert!(log.to_string_lossy().contains("vents"));
