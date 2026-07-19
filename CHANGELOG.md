@@ -7,13 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0](https://github.com/getappz/agentflare/compare/v1.4.0...v1.5.0) - 2026-07-20
+
 ### Added
 
+- `agentflare daemon {start,stop,restart,status,enable,disable}`: background daemon lifecycle (PID file, flock-based start lock, Unix socket / Windows named pipe IPC), autostart registration via launchd (macOS) / systemd --user (Linux), and a 24h-cached update check. HTTP-over-IPC client and macOS ad-hoc codesign scaffolding land ahead of the follow-up that wires the daemon's own HTTP handler and MCP tool-call dispatch.
+- `flare-proxy` crate: Anthropic-to-OpenAI free-provider proxy, with env-var model routing (`MODEL`/`MODEL_OPUS`/`MODEL_SONNET`/`MODEL_HAIKU`).
+- `@mention` feature: inline `@I`/`@A`/`@search` references resolved across items, agents, and search.
+- `agentflare work`: autonomous claim → worktree → headless agent → report-back command.
 - `vent` MCP tool + `agentflare vent` CLI: agents log tooling friction to an append-only per-repo JSONL; a deterministic classifier consolidates them once per turn (via the PromptSubmit hook) and auto-files actionable vents as backlog items. No new dependencies; fully auditable (raw `vents.jsonl` + `vent list`).
+- Read-only dashboard (`agentflare serve`), Phases 0-2.
+- `flare_git`: paginated list actions (no more silent 30-item truncation) and a `pr_status` action bundling PR detail + CI checks + reviews + comments into one call.
+- `flare_handoff`: knowledge fact import + session snapshot on handoff.
+- `agentflare-store` crate: initial KV/document (CRUD+FTS+vector+hybrid)/blob/lease engine.
+- CLI branding banner (logo asset, installers, `about` command).
 
 ### Changed
 
 - *(memory)* brain.db now opens through the shared db-kit engine (versioned migrations, WAL, FK enforcement); recall gains optional hybrid semantic search (BM25+vector merge, 30-day temporal decay, MMR) behind `--features semantic`, with `agentflare memory backfill-embeddings` to index existing observations. FTS-only behavior is byte-identical without an embedding model.
+- `item`/`claim` tools accept a numeric `sequence_id` directly; new item IDs switch to nanoid.
+- CI: LOC-gate wired into the pre-commit hook (staged files only).
 
 ## [1.4.0](https://github.com/getappz/agentflare/compare/v1.3.1...v1.4.0) - 2026-07-17
 
