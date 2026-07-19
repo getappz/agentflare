@@ -382,13 +382,15 @@ pub(crate) struct MemoryRequest {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GitHubRequest {
     #[schemars(
-        description = "Action: pr_create|pr_list|pr_get|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|release_list|release_get|release_latest|release_create|run_list|run_get|run_rerun|workflow_dispatch"
+        description = "Action: pr_create|pr_list|pr_get|pr_status|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|release_list|release_get|release_latest|release_create|run_list|run_get|run_rerun|workflow_dispatch"
     )]
     pub(crate) action: String,
     #[schemars(description = "owner/repo (default: resolved from the current repo's origin)")]
     #[serde(default)]
     pub(crate) repo: Option<String>,
-    #[schemars(description = "PR number (pr_get, pr_merge, pr_comment, pr_request_review)")]
+    #[schemars(
+        description = "PR number (pr_get, pr_status, pr_merge, pr_comment, pr_request_review)"
+    )]
     #[serde(default)]
     pub(crate) number: Option<u64>,
     #[schemars(description = "PR title (pr_create)")]
@@ -450,6 +452,11 @@ pub(crate) struct GitHubRequest {
     #[schemars(description = "JSON inputs object for workflow_dispatch")]
     #[serde(default)]
     pub(crate) inputs: Option<serde_json::Value>,
+    #[schemars(
+        description = "ISO8601 timestamp — pr_status only returns comments newer than this (GitHub filters server-side); omit for full history"
+    )]
+    #[serde(default)]
+    pub(crate) since: Option<String>,
 }
 
 /// All local artifact backends (flared, another session, or our own

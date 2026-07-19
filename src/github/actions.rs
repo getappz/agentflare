@@ -1,7 +1,7 @@
 //! GitHub Actions operations. `list_runs` unwraps the `{workflow_runs: [...]}`
 //! envelope; `rerun`/`dispatch` ignore their empty response bodies.
 
-use crate::github::models::WorkflowRun;
+use crate::github::models::{CheckRun, WorkflowRun};
 use crate::github::{Client, GitHubError, RepoId};
 
 /// Extractor for the `{ workflow_runs: [...] }` envelope each page returns.
@@ -62,6 +62,29 @@ pub fn dispatch(
     );
     client.request("POST", &path, Some(dispatch_body(git_ref, inputs)))?;
     Ok(())
+}
+
+/// Extractor for the `{ check_runs: [...] }` envelope each page returns.
+fn check_runs(page: &serde_json::Value) -> Vec<serde_json::Value> {
+    page.get("check_runs")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// CI check runs (status checks) for a commit SHA — used by `pr_status` to
+/// report build/lint/test state without a separate `gh pr checks` round trip.
+pub fn list_check_runs(
+    client: &Client,
+    repo: &RepoId,
+    sha: &str,
+) -> Result<Vec<CheckRun>, GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/commits/{sha}/check-runs",
+        repo.owner, repo.repo
+    );
+    let arr = client.get_paginated(&path, check_runs)?;
+    serde_json::from_value(arr).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
 #[cfg(test)]
@@ -157,5 +180,29 @@ mod tests {
         );
         let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
         assert_eq!(sent["ref"], "main");
+    }
+
+    #[test]
+    fn check_runs_extracts_the_array() {
+        let env = serde_json::json!({ "total_count": 1, "check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}] });
+        let items = check_runs(&env);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["name"], "build");
+    }
+
+    #[test]
+    fn list_check_runs_fetches_and_unwraps_envelope() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"check_runs":[{"name":"build","status":"completed","conclusion":"success"}]}"#,
+        )]);
+        let client = server.client(None);
+        let runs = list_check_runs(&client, &repo(), "abc123").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].name, "build");
+        assert_eq!(
+            server.requests()[0].path,
+            "/repos/o/r/commits/abc123/check-runs?per_page=100&page=1"
+        );
     }
 }

@@ -1,11 +1,41 @@
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct User {
+    pub login: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RefInfo {
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    #[serde(default)]
+    pub sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct PullRequest {
     pub number: u64,
     pub html_url: String,
     pub state: String,
     pub title: String,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub mergeable: Option<bool>,
+    #[serde(default)]
+    pub mergeable_state: Option<String>,
+    #[serde(default)]
+    pub additions: Option<u64>,
+    #[serde(default)]
+    pub deletions: Option<u64>,
+    #[serde(default)]
+    pub changed_files: Option<u64>,
+    #[serde(default)]
+    pub head: Option<RefInfo>,
+    #[serde(default)]
+    pub base: Option<RefInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +75,44 @@ pub struct WorkflowRun {
     #[serde(default)]
     #[allow(dead_code)]
     pub head_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckRun {
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Review {
+    pub user: User,
+    pub state: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub submitted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewComment {
+    pub id: u64,
+    pub user: User,
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<u64>,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Comment {
+    pub user: User,
+    pub body: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub created_at: Option<String>,
 }
 
 #[cfg(test)]
@@ -108,5 +176,58 @@ mod workflow_run_tests {
         assert_eq!(run.status, "in_progress");
         assert_eq!(run.conclusion, None);
         assert_eq!(run.head_branch.as_deref(), Some("feat/x"));
+    }
+}
+
+#[cfg(test)]
+mod pr_status_model_tests {
+    use super::*;
+
+    #[test]
+    fn pull_request_deserializes_review_fields() {
+        let json = serde_json::json!({
+            "number": 5, "html_url": "u", "state": "open", "title": "t",
+            "draft": true, "mergeable": false, "mergeable_state": "dirty",
+            "additions": 10, "deletions": 2, "changed_files": 3,
+            "head": {"ref": "feat/x", "sha": "abc123"},
+            "base": {"ref": "main", "sha": "def456"}
+        });
+        let pr: PullRequest = serde_json::from_value(json).unwrap();
+        assert!(pr.draft);
+        assert_eq!(pr.mergeable, Some(false));
+        assert_eq!(pr.mergeable_state.as_deref(), Some("dirty"));
+        assert_eq!(pr.additions, Some(10));
+        assert_eq!(pr.head.unwrap().sha, "abc123");
+        assert_eq!(pr.base.unwrap().git_ref, "main");
+    }
+
+    #[test]
+    fn check_run_deserializes_with_null_conclusion() {
+        let json =
+            serde_json::json!({ "name": "build", "status": "in_progress", "conclusion": null });
+        let run: CheckRun = serde_json::from_value(json).unwrap();
+        assert_eq!(run.name, "build");
+        assert_eq!(run.conclusion, None);
+    }
+
+    #[test]
+    fn review_deserializes_author_and_state() {
+        let json = serde_json::json!({
+            "user": {"login": "coderabbitai[bot]"}, "state": "CHANGES_REQUESTED",
+            "body": "fix this", "submitted_at": "2026-07-19T00:00:00Z"
+        });
+        let review: Review = serde_json::from_value(json).unwrap();
+        assert_eq!(review.user.login, "coderabbitai[bot]");
+        assert_eq!(review.state, "CHANGES_REQUESTED");
+    }
+
+    #[test]
+    fn review_comment_line_is_optional() {
+        let json = serde_json::json!({
+            "id": 900, "user": {"login": "alice"}, "path": "src/x.rs", "line": null, "body": "nit"
+        });
+        let c: ReviewComment = serde_json::from_value(json).unwrap();
+        assert_eq!(c.line, None);
+        assert_eq!(c.path, "src/x.rs");
     }
 }
