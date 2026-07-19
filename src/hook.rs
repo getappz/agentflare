@@ -373,6 +373,9 @@ pub fn prompt_submit(agent: &str) {
         "Exa is the only web search tool.".to_string(),
         "Clean git commits, no AI signature.".to_string(),
     ];
+    if let Some(block) = crate::mentions::expand(prompt) {
+        bits.push(block);
+    }
     let pending = get_components(agent)
         .iter()
         .any(|c| c.needs_consent && !(c.check)());
@@ -730,6 +733,52 @@ second line
                 !msg.contains("Secret task"),
                 "other agent's item should not appear"
             );
+        });
+    }
+
+    #[test]
+    fn prompt_submit_expands_mentions_for_the_resolved_project() {
+        use crate::paths::test_support::with_temp_home;
+        use agentflare_backend::item;
+
+        with_temp_home(|| {
+            let home = crate::paths::home();
+            std::fs::create_dir_all(home.join(".agentflare")).unwrap();
+            let db_path = home.join(".agentflare").join("backend.db");
+            let conn = agentflare_backend::db::open_db(&db_path).unwrap();
+
+            let proj = crate::mcp_server::AgentflareMcp::default()
+                .resolve_project(&conn)
+                .unwrap();
+            let sid = {
+                let states = agentflare_backend::state::list_by_project(&conn, &proj.id).unwrap();
+                states.iter().find(|s| s.is_default).unwrap().id.clone()
+            };
+            let created = item::create(
+                &conn,
+                item::CreateItem {
+                    project_id: proj.id,
+                    state_id: sid,
+                    name: "Fix login timeout".into(),
+                    description: None,
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: None,
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                },
+            )
+            .unwrap();
+
+            let block = crate::mentions::expand(&format!("check @I:{}", created.id)).unwrap();
+            assert!(block.contains("Fix login timeout"));
+
+            assert!(crate::mentions::expand("no mentions here").is_none());
         });
     }
 }

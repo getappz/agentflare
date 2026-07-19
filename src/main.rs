@@ -34,6 +34,7 @@ mod jsonc;
 mod mcp_prompts;
 mod mcp_server;
 mod memory;
+mod mentions;
 mod mise_install;
 mod optimize;
 mod paths;
