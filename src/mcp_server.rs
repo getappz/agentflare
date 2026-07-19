@@ -8,10 +8,10 @@ mod claim;
 mod comment;
 mod flare_git;
 mod handoff;
-mod item;
+pub(crate) mod item;
 mod memory_tool;
 mod review;
-mod types;
+pub(crate) mod types;
 
 use crate::optimize;
 use crate::progress::{PROGRESS_SENDER, ProgressSender};
@@ -484,7 +484,7 @@ impl AgentflareMcp {
     /// `repo_root()`, but honoring `worktree_repo_root_override` — used only
     /// by the worktree-on-claim feature so tests never run real `git
     /// worktree`/branch operations against this actual repository.
-    fn worktree_repo_root(&self) -> std::path::PathBuf {
+    pub(crate) fn worktree_repo_root(&self) -> std::path::PathBuf {
         self.worktree_repo_root_override
             .clone()
             .unwrap_or_else(Self::repo_root)
@@ -570,7 +570,7 @@ impl AgentflareMcp {
     /// migrations) on first use, then run `f` against it. The backend DB is
     /// its own source of truth — no filesystem-derived refresh needed,
     /// unlike `with_fresh_registry` above.
-    fn with_backend_db<T>(
+    pub(crate) fn with_backend_db<T>(
         &self,
         f: impl FnOnce(&rusqlite::Connection) -> T,
     ) -> Result<T, ErrorData> {

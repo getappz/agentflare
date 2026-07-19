@@ -302,6 +302,26 @@ pub fn headless_args(agent: Agent) -> Option<&'static [&'static str]> {
     }
 }
 
+/// Permission-bypass / autonomy flags for agents in headless mode, appended
+/// after the print-mode flags and before the prompt (e.g., `claude -p
+/// --dangerously-skip-permissions "<prompt>"`). These let the agent proceed
+/// without interactive approval gates — intended exclusively for `agentflare
+/// work`'s autonomous code path, never for `agentflare run --print`.
+/// `None` (or empty) means the agent has no known bypass flag (the user
+/// must acknowledge via `--timeout` that any hang on missing permission is
+/// acceptable, or the run will stall).
+#[allow(dead_code)]
+#[must_use]
+pub fn autonomous_args(agent: Agent) -> Option<&'static [&'static str]> {
+    match agent {
+        Agent::ClaudeCode => Some(&["--dangerously-skip-permissions"]),
+        Agent::Codex => Some(&["--full-auto"]),
+        Agent::GeminiCli => Some(&["--yolo"]),
+        Agent::Opencode => None,
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
