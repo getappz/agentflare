@@ -174,6 +174,30 @@ pub(crate) struct HandoffRequest {
     )]
     #[serde(default)]
     pub(crate) description: Option<String>,
+    #[schemars(
+        description = "Knowledge facts to import into the recipient's memory on receive. Each item: {title, content, type, topic_key?}."
+    )]
+    #[serde(default)]
+    pub(crate) facts: Option<Vec<serde_json::Value>>,
+    #[schemars(
+        description = "Sender's session summary — embedded in the handoff so the recipient sees context without extra round-trips."
+    )]
+    #[serde(default)]
+    pub(crate) summary: Option<String>,
+    #[schemars(description = "Findings array [{file, line?, summary}] — session snapshot.")]
+    #[serde(default)]
+    pub(crate) findings: Option<Vec<serde_json::Value>>,
+    #[schemars(description = "Decisions array [{summary, rationale?}] — session snapshot.")]
+    #[serde(default)]
+    pub(crate) decisions: Option<Vec<serde_json::Value>>,
+    #[schemars(
+        description = "Files touched array [{path, modified?, tokens}] — session snapshot."
+    )]
+    #[serde(default)]
+    pub(crate) files_touched: Option<Vec<serde_json::Value>>,
+    #[schemars(description = "Evidence array [{kind, action, detail}] — session snapshot.")]
+    #[serde(default)]
+    pub(crate) evidence: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
