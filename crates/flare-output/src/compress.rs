@@ -27,11 +27,15 @@ pub struct Report {
     pub original_path: std::path::PathBuf,
 }
 
+/// # Errors
+///
+/// Returns `Err` on a missing/oversized/sensitive source file, LLM failure,
+/// or a compressed result that fails validation after all retries.
 pub fn compress(
     llm: &dyn Llm,
     source: &Path,
     target: &Path,
-    prompt: Prompt,
+    prompt: &Prompt,
     backup: BackupMode,
 ) -> Result<Report, CavemanError> {
     if !source.is_file() {
@@ -126,7 +130,7 @@ pub fn compress(
     };
     Ok(Report {
         original_bytes: original_text.len(),
-        compressed_bytes: std::fs::metadata(target)?.len() as usize,
+        compressed_bytes: usize::try_from(std::fs::metadata(target)?.len()).unwrap_or(usize::MAX),
         original_path,
     })
 }
@@ -204,8 +208,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let source = write(dir.path(), "doc.md", "# Title\n\nverbose text here");
         let llm = FakeLlm::queue(&["# Title\n\nterse"]);
-        let report =
-            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap();
+        let report = compress(
+            &llm,
+            &source,
+            &source,
+            &Prompt::Generic,
+            BackupMode::Sibling,
+        )
+        .unwrap();
         assert_eq!(report.original_bytes, "# Title\n\nverbose text here".len());
         assert_eq!(
             std::fs::read_to_string(&source).unwrap(),
@@ -224,8 +234,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let source = write(dir.path(), "credentials.md", "some content");
         let llm = FakeLlm::queue(&["irrelevant"]);
-        let err =
-            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        let err = compress(
+            &llm,
+            &source,
+            &source,
+            &Prompt::Generic,
+            BackupMode::Sibling,
+        )
+        .unwrap_err();
         assert!(matches!(err, CavemanError::Sensitive(_)), "{err:?}");
     }
 
@@ -234,8 +250,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let source = write(dir.path(), "doc.md", "   \n  ");
         let llm = FakeLlm::queue(&["irrelevant"]);
-        let err =
-            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        let err = compress(
+            &llm,
+            &source,
+            &source,
+            &Prompt::Generic,
+            BackupMode::Sibling,
+        )
+        .unwrap_err();
         assert!(matches!(err, CavemanError::Empty(_)), "{err:?}");
     }
 
@@ -245,8 +267,14 @@ mod tests {
         let big = "x".repeat(600_000);
         let source = write(dir.path(), "doc.md", &big);
         let llm = FakeLlm::queue(&["irrelevant"]);
-        let err =
-            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        let err = compress(
+            &llm,
+            &source,
+            &source,
+            &Prompt::Generic,
+            BackupMode::Sibling,
+        )
+        .unwrap_err();
         assert!(matches!(err, CavemanError::TooLarge(_)), "{err:?}");
     }
 
@@ -256,8 +284,14 @@ mod tests {
         let source = write(dir.path(), "doc.md", "some real content");
         write(dir.path(), "doc.md.orig", "pre-existing backup");
         let llm = FakeLlm::queue(&["irrelevant"]);
-        let err =
-            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        let err = compress(
+            &llm,
+            &source,
+            &source,
+            &Prompt::Generic,
+            BackupMode::Sibling,
+        )
+        .unwrap_err();
         assert!(matches!(err, CavemanError::BackupExists(_)), "{err:?}");
     }
 
@@ -266,8 +300,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let source = write(dir.path(), "doc.md", "real content here");
         let llm = FakeLlm::queue(&[""]);
-        let err =
-            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        let err = compress(
+            &llm,
+            &source,
+            &source,
+            &Prompt::Generic,
+            BackupMode::Sibling,
+        )
+        .unwrap_err();
         assert!(matches!(err, CavemanError::EmptyResponse), "{err:?}");
     }
 
@@ -276,8 +316,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let source = write(dir.path(), "doc.md", "unchanged text");
         let llm = FakeLlm::queue(&["unchanged text"]);
-        let err =
-            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        let err = compress(
+            &llm,
+            &source,
+            &source,
+            &Prompt::Generic,
+            BackupMode::Sibling,
+        )
+        .unwrap_err();
         assert!(matches!(err, CavemanError::IdenticalOutput), "{err:?}");
     }
 
@@ -292,8 +338,14 @@ mod tests {
             "# T\n\nterse, no code block",
             "# T\n\n```py\nprint(1)\n```\nterse",
         ]);
-        let report =
-            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap();
+        let report = compress(
+            &llm,
+            &source,
+            &source,
+            &Prompt::Generic,
+            BackupMode::Sibling,
+        )
+        .unwrap();
         assert!(
             std::fs::read_to_string(&source)
                 .unwrap()
@@ -309,8 +361,14 @@ mod tests {
         let source = write(dir.path(), "doc.md", original);
         // Every response drops the code block — validation never passes.
         let llm = FakeLlm::queue(&["missing code", "still missing code"]);
-        let err =
-            compress(&llm, &source, &source, Prompt::Generic, BackupMode::Sibling).unwrap_err();
+        let err = compress(
+            &llm,
+            &source,
+            &source,
+            &Prompt::Generic,
+            BackupMode::Sibling,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, CavemanError::ValidationFailed(2, _)),
             "{err:?}"
@@ -378,7 +436,14 @@ mod tests {
         let source = write(dir.path(), "source.md", "plugin content here");
         let target = dir.path().join("shadow.md");
         let llm = FakeLlm::queue(&["compressed content"]);
-        compress(&llm, &source, &target, Prompt::Generic, BackupMode::Sibling).unwrap();
+        compress(
+            &llm,
+            &source,
+            &target,
+            &Prompt::Generic,
+            BackupMode::Sibling,
+        )
+        .unwrap();
         assert!(!dir.path().join("shadow.md.orig").exists());
         assert_eq!(
             std::fs::read_to_string(&source).unwrap(),
@@ -396,7 +461,7 @@ mod tests {
             "# Title\n\nlong original body worth compressing.\n",
         );
         let llm = FakeLlm::queue(&["# Title\n\nshort body"]);
-        let report = compress(&llm, &src, &src, Prompt::Generic, BackupMode::Sibling).unwrap();
+        let report = compress(&llm, &src, &src, &Prompt::Generic, BackupMode::Sibling).unwrap();
         assert_eq!(report.original_path, src.with_file_name("doc.md.orig"));
         assert!(report.original_path.is_file());
     }
@@ -411,7 +476,7 @@ mod tests {
         );
         let tgt = dir.path().join("out.md");
         let llm = FakeLlm::queue(&["# Title\n\nshort body"]);
-        let report = compress(&llm, &src, &tgt, Prompt::Generic, BackupMode::Sibling).unwrap();
+        let report = compress(&llm, &src, &tgt, &Prompt::Generic, BackupMode::Sibling).unwrap();
         assert_eq!(report.original_path, src);
     }
 }

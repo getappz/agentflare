@@ -36,6 +36,10 @@ pub fn active_mode() -> Option<String> {
     })
 }
 
+/// # Errors
+///
+/// Returns `Err` if the flag directory can't be created or the flag file
+/// can't be written.
 pub fn set_active(mode: &str) -> io::Result<()> {
     let path = flag_path();
     if let Some(parent) = path.parent() {
@@ -44,6 +48,10 @@ pub fn set_active(mode: &str) -> io::Result<()> {
     std::fs::write(path, mode)
 }
 
+/// # Errors
+///
+/// Returns `Err` if the session directory can't be created or the session
+/// file can't be written.
 pub fn set_session(mode: &str) -> io::Result<()> {
     let path = session_path();
     if let Some(parent) = path.parent() {

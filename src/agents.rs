@@ -231,7 +231,7 @@ pub fn cli_run(
 /// print its captured reply to stdout, and return a process exit code (0 on
 /// success, 1 on any failure). The caller decides whether to `exit`.
 pub fn cli_run_headless(agent: &str, prompt: &str, timeout: std::time::Duration) -> i32 {
-    match agent_launch::run_headless(agent_registry::REGISTRY, agent, prompt, timeout) {
+    match agent_launch::run_headless(agent_registry::REGISTRY, agent, prompt, timeout, &[]) {
         agent_launch::HeadlessOutcome::Ok(reply) => {
             print!("{reply}");
             0

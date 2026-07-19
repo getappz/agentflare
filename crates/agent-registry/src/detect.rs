@@ -187,6 +187,9 @@ mod extract_version_tests {
 /// `.cmd` stub scripts aren't reliably spawnable via `std::process::Command`
 /// on Windows).
 pub trait VersionRunner {
+    /// # Errors
+    ///
+    /// Returns `Err` if the binary can't be spawned or produces no output.
     fn run(&self, binary: &Path, args: &[&str]) -> Result<String, String>;
 }
 
@@ -242,6 +245,11 @@ fn run_version_command(binary: &Path, args: &[&str]) -> Result<String, String> {
 /// both match a prior resolution, otherwise invoking `runner`. A failed or
 /// unparseable resolution is never written to `cache` — a transient
 /// `--version` failure must not stick forever.
+/// # Errors
+///
+/// Returns `Err` if `binary_path` can't be stat'd, `runner` fails, or the
+/// output doesn't contain a parseable version string.
+#[allow(clippy::implicit_hasher)] // internal cache, never called with a custom hasher
 pub fn resolve_version_with(
     runner: &dyn VersionRunner,
     agent_key: &str,
@@ -278,7 +286,11 @@ pub fn resolve_version_with(
     Ok(version)
 }
 
+/// # Errors
+///
+/// See [`resolve_version_with`].
 #[allow(dead_code)]
+#[allow(clippy::implicit_hasher)] // internal cache, never called with a custom hasher
 pub fn resolve_version(
     agent_key: &str,
     binary_path: &Path,
@@ -453,6 +465,7 @@ pub struct DetectedAgent {
 /// resolving its version via `runner`. `Tier::Extension` entries are always
 /// skipped — they have no `binary_names` to search for. Agents not found on
 /// PATH are omitted entirely (installed-only, per the design doc).
+#[allow(clippy::implicit_hasher)] // internal cache, never called with a custom hasher
 pub fn detect_all_with(
     registry: &[AgentSpec],
     cache: &mut HashMap<String, VersionCacheEntry>,
@@ -491,6 +504,7 @@ pub fn detect_all_with(
 }
 
 #[allow(dead_code)]
+#[allow(clippy::implicit_hasher)] // internal cache, never called with a custom hasher
 pub fn detect_all(
     registry: &[AgentSpec],
     cache: &mut HashMap<String, VersionCacheEntry>,

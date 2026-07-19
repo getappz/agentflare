@@ -10,6 +10,10 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 pub trait Llm {
+    /// # Errors
+    ///
+    /// Returns `Err` if the underlying HTTP request or `claude --print`
+    /// subprocess fails.
     fn call(&self, prompt: &str) -> Result<String, CavemanError>;
 }
 

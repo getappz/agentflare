@@ -69,7 +69,7 @@ impl OutputAction {
                     &crate::optimize::output::RealLlm,
                     &source,
                     &target,
-                    prompt,
+                    &prompt,
                     backup_mode,
                 );
                 match result {
