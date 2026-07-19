@@ -490,6 +490,25 @@ impl AgentflareMcp {
             .unwrap_or_else(Self::repo_root)
     }
 
+    /// Test-only constructor: an isolated instance backed entirely by the
+    /// given paths, so tests outside this module (e.g. `cli::work`'s
+    /// integration tests) never touch the shared `backend.db`,
+    /// `project.json`, or run real `git worktree` operations against the
+    /// actual repo `cargo test` is running in.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        backend_db: std::path::PathBuf,
+        worktree_repo_root: std::path::PathBuf,
+        project_link: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            backend_db_override: Some(backend_db),
+            backend_project_link_override: Some(project_link),
+            worktree_repo_root_override: Some(worktree_repo_root),
+            ..Default::default()
+        }
+    }
+
     /// Pure walk-up so the non-git fallback path is unit-testable without
     /// touching process-global state: neither this process's real cwd nor
     /// `crate::paths::home()` (which itself reads the `AGENTFLARE_HOME_OVERRIDE`
