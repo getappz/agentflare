@@ -90,11 +90,7 @@ impl ProviderConfig {
                     Some("OPENROUTER_API_KEY"),
                     ProviderKind::OpenRouter,
                 ),
-                "lmstudio" => (
-                    "http://localhost:1234/v1",
-                    None,
-                    ProviderKind::LmStudio,
-                ),
+                "lmstudio" => ("http://localhost:1234/v1", None, ProviderKind::LmStudio),
                 _ => continue,
             };
 
@@ -118,7 +114,11 @@ impl ProviderConfig {
             requires_think_parsing: false,
         });
 
-        for (keyword, opt) in [("opus", &model_opus), ("sonnet", &model_sonnet), ("haiku", &model_haiku)] {
+        for (keyword, opt) in [
+            ("opus", &model_opus),
+            ("sonnet", &model_sonnet),
+            ("haiku", &model_haiku),
+        ] {
             if let Some(m) = opt {
                 let (pid, um) = parse_model_string(m);
                 routing.push(ModelRoute {
@@ -233,13 +233,72 @@ impl ProviderConfig {
         }
     }
 
-    pub fn route_for(&self, anthropic_model: &str) -> Option<&ModelRoute> {
-        self.routing
-            .iter()
-            .find(|r| r.anthropic_model == anthropic_model)
-    }
-
     pub fn provider(&self, id: &str) -> Option<&ProviderEntry> {
         self.providers.iter().find(|p| p.id == id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_model_string_splits_on_first_slash() {
+        assert_eq!(
+            parse_model_string("nvidia_nim/meta/llama-3.1-405b-instruct"),
+            (
+                "nvidia_nim".to_string(),
+                "meta/llama-3.1-405b-instruct".to_string()
+            )
+        );
+        assert_eq!(
+            parse_model_string("bare-model"),
+            ("nvidia_nim".to_string(), "bare-model".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_model_falls_back_to_default_free() {
+        let config = ProviderConfig::default_free();
+        let route = config.resolve_model("claude-sonnet-4-20250514").unwrap();
+        assert_eq!(route.provider_id, "nvidia-nim");
+    }
+
+    #[test]
+    fn resolve_model_prefers_keyword_route_when_present() {
+        let mut config = ProviderConfig::default_free();
+        config.routing.push(ModelRoute {
+            anthropic_model: "opus".into(),
+            provider_id: "openrouter".into(),
+            upstream_model: "openrouter/opus-override".into(),
+            requires_heuristic_tools: false,
+            requires_think_parsing: false,
+        });
+
+        let route = config.resolve_model("claude-opus-4-20250514").unwrap();
+        assert_eq!(route.upstream_model, "openrouter/opus-override");
+    }
+
+    #[test]
+    fn resolve_model_falls_back_to_empty_default_when_keyword_route_missing() {
+        let config = ProviderConfig {
+            providers: vec![],
+            routing: vec![ModelRoute {
+                anthropic_model: String::new(),
+                provider_id: "nvidia_nim".into(),
+                upstream_model: "meta/llama-3.1-405b-instruct".into(),
+                requires_heuristic_tools: true,
+                requires_think_parsing: false,
+            }],
+            model: Some("nvidia_nim/meta/llama-3.1-405b-instruct".into()),
+            model_opus: None,
+            model_sonnet: None,
+            model_haiku: None,
+        };
+
+        // No MODEL_OPUS route configured — substring match on "opus" must not
+        // return None, it should fall through to the empty-keyed default route.
+        let route = config.resolve_model("claude-opus-4-20250514").unwrap();
+        assert_eq!(route.upstream_model, "meta/llama-3.1-405b-instruct");
     }
 }
