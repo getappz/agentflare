@@ -21,10 +21,11 @@ fn extract_headings(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Line-based fenced code block extractor. Handles ``` and ~~~ fences with
-/// variable length (CommonMark: closing fence must use the same character
-/// and be at least as long as the opening one) — including nested fences,
-/// e.g. an outer 4-backtick block wrapping inner 3-backtick content.
+/// Line-based fenced code block extractor. Handles backtick-fenced and
+/// tilde-fenced blocks with variable length (`CommonMark`: closing fence must
+/// use the same character and be at least as long as the opening one) —
+/// including nested fences, e.g. an outer 4-backtick block wrapping inner
+/// 3-backtick content.
 fn extract_code_blocks(text: &str) -> Vec<String> {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut blocks = Vec::new();

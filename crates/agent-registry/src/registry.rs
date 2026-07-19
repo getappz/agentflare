@@ -277,6 +277,11 @@ pub static REGISTRY: &[AgentSpec] = &[
 
 /// Not yet consumed outside tests — wired up by the upcoming agent detection
 /// engine and CLI commands.
+///
+/// # Panics
+///
+/// Panics if `agent` has no `REGISTRY` entry — every `Agent` variant is
+/// guaranteed exactly one by the `registry_has_exactly_twenty_entries` test.
 #[allow(dead_code)]
 #[must_use]
 pub fn spec(agent: Agent) -> &'static AgentSpec {
@@ -294,10 +299,31 @@ pub fn spec(agent: Agent) -> &'static AgentSpec {
 #[must_use]
 pub fn headless_args(agent: Agent) -> Option<&'static [&'static str]> {
     match agent {
-        Agent::ClaudeCode => Some(&["-p"]),
+        Agent::ClaudeCode | Agent::GeminiCli => Some(&["-p"]),
         Agent::Codex => Some(&["exec"]),
-        Agent::GeminiCli => Some(&["-p"]),
         Agent::Opencode => Some(&["run"]),
+        _ => None,
+    }
+}
+
+/// Permission-bypass / autonomy flags for agents in headless mode, appended
+/// after the print-mode flags and before the prompt (e.g., `claude -p
+/// --dangerously-skip-permissions "<prompt>"`). These let the agent proceed
+/// without interactive approval gates — intended exclusively for `agentflare
+/// work`'s autonomous code path, never for `agentflare run --print`.
+/// `None` (or empty) means the agent has no known bypass flag (the user
+/// must acknowledge via `--timeout` that any hang on missing permission is
+/// acceptable, or the run will stall).
+#[allow(dead_code)]
+#[must_use]
+pub fn autonomous_args(agent: Agent) -> Option<&'static [&'static str]> {
+    match agent {
+        Agent::ClaudeCode => Some(&["--dangerously-skip-permissions"]),
+        Agent::Codex => Some(&["--full-auto"]),
+        Agent::GeminiCli => Some(&["--yolo"]),
+        // Opencode falls through to the `_` wildcard, same as every other
+        // agent with no known bypass flag — listing it separately was
+        // clippy::match_same_arms.
         _ => None,
     }
 }

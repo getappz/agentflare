@@ -21,6 +21,7 @@ mod serve;
 mod uninstall;
 mod update;
 mod vent;
+mod work;
 
 use clap::{Parser, Subcommand};
 use std::sync::LazyLock;
@@ -69,6 +70,7 @@ pub enum Commands {
     Memory(memory::MemoryArgs),
     Serve(serve::ServeArgs),
     Vent(vent::VentArgs),
+    Work(work::WorkArgs),
 }
 
 impl Commands {
@@ -98,6 +100,7 @@ impl Commands {
             Self::Memory(cmd) => cmd.run(),
             Self::Serve(cmd) => cmd.run(),
             Self::Vent(cmd) => vent::run(cmd),
+            Self::Work(cmd) => cmd.run(),
         }
     }
 }
