@@ -1,0 +1,21 @@
+[package]
+name = "flare-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "Anthropic→OpenAI proxy for free providers (NVIDIA NIM, OpenRouter, LM Studio)"
+license = "Apache-2.0"
+repository = "https://github.com/getappz/agentflare"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "sync", "net", "time"] }
+axum = "0.8"
+tower-http = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+futures = "0.3"
+base64 = "0.22"
+regex = "1"
+thiserror = "2"
+nanoid = "0.5"

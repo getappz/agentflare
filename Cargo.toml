@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store"]
+members = ["crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy"]
 resolver = "2"
 
 [package]
@@ -78,6 +78,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 rust-embed = "8"
 tokio-stream = { version = "0.1", features = ["sync"] }
 agentflare-store = { path = "crates/agentflare-store" }
+flare-proxy = { path = "crates/flare-proxy" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
