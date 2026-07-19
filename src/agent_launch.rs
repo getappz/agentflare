@@ -120,6 +120,8 @@ pub struct Captured {
     pub success: bool,
     /// Everything the child wrote to stdout.
     pub stdout: String,
+    /// Everything the child wrote to stderr.
+    pub stderr: String,
     /// True iff the child was killed for outliving the timeout.
     pub timed_out: bool,
 }
@@ -167,7 +169,7 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
 #[allow(dead_code)]
 pub fn run_captured(mut cmd: Command, timeout: Duration) -> std::io::Result<Captured> {
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
+    cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
     // Make the child the leader of a new process group so any descendants it
     // spawns (which inherit the group by default) can be killed together via
@@ -183,6 +185,12 @@ pub fn run_captured(mut cmd: Command, timeout: Duration) -> std::io::Result<Capt
     let reader = std::thread::spawn(move || {
         let mut buf = String::new();
         let _ = pipe.read_to_string(&mut buf);
+        buf
+    });
+    let mut err_pipe = child.stderr.take().expect("stderr piped above");
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = err_pipe.read_to_string(&mut buf);
         buf
     });
 
@@ -202,9 +210,11 @@ pub fn run_captured(mut cmd: Command, timeout: Duration) -> std::io::Result<Capt
     };
 
     let stdout = reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
     Ok(Captured {
         success: status.success() && !timed_out,
         stdout,
+        stderr,
         timed_out,
     })
 }
@@ -212,11 +222,17 @@ pub fn run_captured(mut cmd: Command, timeout: Duration) -> std::io::Result<Capt
 /// Build the full argv for a headless run: `[binary, <print-mode flags…>, prompt]`.
 /// `None` if the agent has no headless print mode.
 #[allow(dead_code)]
-pub fn headless_argv(agent: Agent, binary: &Path, prompt: &str) -> Option<Vec<String>> {
+pub fn headless_argv(
+    agent: Agent,
+    binary: &Path,
+    prompt: &str,
+    extra_args: &[String],
+) -> Option<Vec<String>> {
     let flags = headless_args(agent)?;
-    let mut argv = Vec::with_capacity(flags.len() + 2);
+    let mut argv = Vec::with_capacity(flags.len() + extra_args.len() + 2);
     argv.push(binary.to_string_lossy().into_owned());
     argv.extend(flags.iter().map(|s| (*s).to_string()));
+    argv.extend(extra_args.iter().cloned());
     argv.push(prompt.to_string());
     Some(argv)
 }
@@ -245,6 +261,7 @@ pub fn run_headless(
     agent: &str,
     prompt: &str,
     timeout: Duration,
+    extra_args: &[String],
 ) -> HeadlessOutcome {
     let Some(spec) = registry.iter().find(|s| s.id.as_str() == agent) else {
         return HeadlessOutcome::UnknownAgent(format!("unknown agent: {agent}"));
@@ -263,7 +280,7 @@ pub fn run_headless(
             spec.binary_names.join(" / ")
         ));
     };
-    let Some(argv) = headless_argv(spec.id, &binary, prompt) else {
+    let Some(argv) = headless_argv(spec.id, &binary, prompt, extra_args) else {
         return HeadlessOutcome::NotHeadless(format!(
             "{} has no headless print mode",
             spec.display_name
@@ -517,7 +534,7 @@ mod tests {
     fn headless_argv_puts_flags_before_prompt() {
         let binary = std::path::Path::new("/usr/bin/claude");
         assert_eq!(
-            headless_argv(Agent::ClaudeCode, binary, "hi there"),
+            headless_argv(Agent::ClaudeCode, binary, "hi there", &[]),
             Some(vec![
                 "/usr/bin/claude".to_string(),
                 "-p".to_string(),
@@ -525,7 +542,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            headless_argv(Agent::Codex, std::path::Path::new("/x/codex"), "do it"),
+            headless_argv(Agent::Codex, std::path::Path::new("/x/codex"), "do it", &[]),
             Some(vec![
                 "/x/codex".to_string(),
                 "exec".to_string(),
@@ -537,7 +554,7 @@ mod tests {
     #[test]
     fn headless_argv_none_without_print_mode() {
         assert_eq!(
-            headless_argv(Agent::Aider, std::path::Path::new("/x/aider"), "p"),
+            headless_argv(Agent::Aider, std::path::Path::new("/x/aider"), "p", &[]),
             None
         );
     }
@@ -545,7 +562,7 @@ mod tests {
     #[test]
     fn run_headless_unknown_agent() {
         let reg = headless_registry();
-        match run_headless(&reg, "nope", "hi", Duration::from_secs(1)) {
+        match run_headless(&reg, "nope", "hi", Duration::from_secs(1), &[]) {
             HeadlessOutcome::UnknownAgent(m) => assert!(m.contains("nope")),
             other => panic!("expected UnknownAgent, got {other:?}"),
         }
@@ -554,7 +571,7 @@ mod tests {
     #[test]
     fn run_headless_agent_without_print_mode() {
         let reg = headless_registry();
-        match run_headless(&reg, "aider", "hi", Duration::from_secs(1)) {
+        match run_headless(&reg, "aider", "hi", Duration::from_secs(1), &[]) {
             HeadlessOutcome::NotHeadless(m) => assert!(m.contains("aider")),
             other => panic!("expected NotHeadless, got {other:?}"),
         }
@@ -563,7 +580,7 @@ mod tests {
     #[test]
     fn run_headless_binary_not_found() {
         let reg = headless_registry();
-        match run_headless(&reg, "codex", "hi", Duration::from_secs(1)) {
+        match run_headless(&reg, "codex", "hi", Duration::from_secs(1), &[]) {
             HeadlessOutcome::NotFound(m) => assert!(m.contains("not found")),
             other => panic!("expected NotFound, got {other:?}"),
         }

@@ -345,7 +345,7 @@ impl AgentflareMcp {
         })?
     }
 
-    pub(super) fn item_claim(&self, req: ItemRequest) -> Result<String, ErrorData> {
+    pub(crate) fn item_claim(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for claim", None))?;
@@ -422,7 +422,7 @@ impl AgentflareMcp {
         })?
     }
 
-    pub(super) fn item_release(&self, req: ItemRequest) -> Result<String, ErrorData> {
+    pub(crate) fn item_release(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for release", None))?;
@@ -438,7 +438,7 @@ impl AgentflareMcp {
         })?
     }
 
-    pub(super) fn item_done(&self, req: ItemRequest) -> Result<String, ErrorData> {
+    pub(crate) fn item_done(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for done", None))?;

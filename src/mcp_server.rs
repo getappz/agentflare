@@ -8,10 +8,10 @@ mod claim;
 mod comment;
 mod flare_git;
 mod handoff;
-mod item;
+pub(crate) mod item;
 mod memory_tool;
 mod review;
-mod types;
+pub(crate) mod types;
 
 use crate::optimize;
 use crate::progress::{PROGRESS_SENDER, ProgressSender};
@@ -484,10 +484,29 @@ impl AgentflareMcp {
     /// `repo_root()`, but honoring `worktree_repo_root_override` — used only
     /// by the worktree-on-claim feature so tests never run real `git
     /// worktree`/branch operations against this actual repository.
-    fn worktree_repo_root(&self) -> std::path::PathBuf {
+    pub(crate) fn worktree_repo_root(&self) -> std::path::PathBuf {
         self.worktree_repo_root_override
             .clone()
             .unwrap_or_else(Self::repo_root)
+    }
+
+    /// Test-only constructor: an isolated instance backed entirely by the
+    /// given paths, so tests outside this module (e.g. `cli::work`'s
+    /// integration tests) never touch the shared `backend.db`,
+    /// `project.json`, or run real `git worktree` operations against the
+    /// actual repo `cargo test` is running in.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        backend_db: std::path::PathBuf,
+        worktree_repo_root: std::path::PathBuf,
+        project_link: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            backend_db_override: Some(backend_db),
+            backend_project_link_override: Some(project_link),
+            worktree_repo_root_override: Some(worktree_repo_root),
+            ..Default::default()
+        }
     }
 
     /// Pure walk-up so the non-git fallback path is unit-testable without
@@ -570,7 +589,7 @@ impl AgentflareMcp {
     /// migrations) on first use, then run `f` against it. The backend DB is
     /// its own source of truth — no filesystem-derived refresh needed,
     /// unlike `with_fresh_registry` above.
-    fn with_backend_db<T>(
+    pub(crate) fn with_backend_db<T>(
         &self,
         f: impl FnOnce(&rusqlite::Connection) -> T,
     ) -> Result<T, ErrorData> {

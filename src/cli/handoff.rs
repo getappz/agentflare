@@ -58,7 +58,7 @@ impl HandoffArgs {
         }
     }
 
-    fn publish(self) -> Result<HandoffOutcome, String> {
+    pub(crate) fn publish(self) -> Result<HandoffOutcome, String> {
         let (content, stem, ext) = match (&self.file, self.content) {
             (Some(path), None) => {
                 let content = std::fs::read_to_string(path)
