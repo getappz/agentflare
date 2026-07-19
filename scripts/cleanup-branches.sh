@@ -111,7 +111,12 @@ for b in "${!candidates[@]}"; do
   fi
 done
 
-git worktree prune
+# `git worktree remove` above already drops the admin entry for anything it
+# actually removes. `prune` is a real mutation (not a preview), and on at
+# least one Windows/Git-Bash setup it has misjudged untouched, still-present
+# worktrees as stale and wiped their registration — so it must never run
+# under --dry-run, which promises to "change nothing".
+((DRY_RUN)) || git worktree prune
 
 if ((DO_REMOTE)); then
   echo "== remote branches merged into origin/$DEFAULT_BRANCH =="
