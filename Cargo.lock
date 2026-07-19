@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "agentflare"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "aes-gcm",
  "agent-detector",
