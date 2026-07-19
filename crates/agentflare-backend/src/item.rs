@@ -121,7 +121,10 @@ pub fn create(conn: &Connection, input: CreateItem) -> Result<Item> {
     let description = input.description.unwrap_or_default();
     let priority = input.priority.unwrap_or_else(|| "none".to_string());
     let metadata = input.metadata.unwrap_or_else(|| "{}".to_string());
-    let assignee_agent = input.assignee_agent.as_deref().map(agent_registry::canonicalize);
+    let assignee_agent = input
+        .assignee_agent
+        .as_deref()
+        .map(agent_registry::canonicalize);
 
     let state = crate::state::get(conn, &input.state_id)?;
     if state.project_id != input.project_id {
@@ -256,7 +259,10 @@ pub fn list_by_assignee_agent(
 
 pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
     let ts = now();
-    let assignee_agent = input.assignee_agent.as_deref().map(agent_registry::canonicalize);
+    let assignee_agent = input
+        .assignee_agent
+        .as_deref()
+        .map(agent_registry::canonicalize);
     let mut sets = vec!["updated_at = ?2".to_string()];
     let mut param_idx = 3;
     if input.name.is_some() {
