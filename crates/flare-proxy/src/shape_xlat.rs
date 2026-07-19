@@ -280,13 +280,10 @@ pub fn openai_chunk_to_anthropic_sse(chunk: &Value, buffer: &mut AnthropicStream
         None => return out,
     };
 
-    let finish = choices
-        .first()
-        .and_then(|c| c.get("finish_reason"))
-        .and_then(|v| v.as_str());
-
     if !buffer.started {
         buffer.started = true;
+        buffer.open_indices.insert(0);
+        buffer.next_index = 1;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -350,33 +347,41 @@ pub fn openai_chunk_to_anthropic_sse(chunk: &Value, buffer: &mut AnthropicStream
 
     if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
         for tc in tool_calls {
-            let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            if let Some(name) = tc.pointer("/function/name").and_then(|v| v.as_str()) {
-                let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                emit_event(
-                    &mut out,
-                    "content_block_start",
-                    &json!({
-                        "type": "content_block_start",
-                        "index": idx,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tc_id,
-                            "name": name,
-                            "input": {}
-                        }
-                    }),
-                );
+            let openai_idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+            let anth_idx = *buffer.tool_index_map.entry(openai_idx).or_insert_with(|| {
+                let i = buffer.next_index;
+                buffer.next_index += 1;
+                i
+            });
+            let newly_opened = buffer.open_indices.insert(anth_idx);
+
+            if newly_opened {
+                if let Some(name) = tc.pointer("/function/name").and_then(|v| v.as_str()) {
+                    let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    emit_event(
+                        &mut out,
+                        "content_block_start",
+                        &json!({
+                            "type": "content_block_start",
+                            "index": anth_idx,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": tc_id,
+                                "name": name,
+                                "input": {}
+                            }
+                        }),
+                    );
+                }
             }
             if let Some(args) = tc.pointer("/function/arguments").and_then(|v| v.as_str()) {
                 if !args.is_empty() {
-                    let _parsed: Value = serde_json::from_str(args).unwrap_or_default();
                     emit_event(
                         &mut out,
                         "content_block_delta",
                         &json!({
                             "type": "content_block_delta",
-                            "index": idx,
+                            "index": anth_idx,
                             "delta": {
                                 "type": "input_json_delta",
                                 "partial_json": args
@@ -388,43 +393,59 @@ pub fn openai_chunk_to_anthropic_sse(chunk: &Value, buffer: &mut AnthropicStream
         }
     }
 
-    if let Some(reason) = finish {
-        let sr = match reason {
-            "stop" => "end_turn",
-            "length" => "max_tokens",
-            "tool_calls" => "tool_use",
-            _ => "end_turn",
-        };
+    out
+}
+
+/// Close every open content block and emit message_delta/message_stop.
+/// Callers doing extra out-of-band block injection (e.g. heuristic tool-call
+/// extraction) must do so — and register/close their own indices — before
+/// calling this, since it ends the message.
+pub fn finish_stream(chunk: &Value, buffer: &mut AnthropicStreamBuffer) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    let finish_reason = chunk
+        .pointer("/choices/0/finish_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("stop");
+
+    for idx in std::mem::take(&mut buffer.open_indices) {
         emit_event(
             &mut out,
             "content_block_stop",
             &json!({
                 "type": "content_block_stop",
-                "index": 0
-            }),
-        );
-        emit_event(
-            &mut out,
-            "message_delta",
-            &json!({
-                "type": "message_delta",
-                "delta": {
-                    "stop_reason": sr,
-                    "stop_sequence": null
-                },
-                "usage": {
-                    "output_tokens": chunk.pointer("/usage/completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
-                }
-            }),
-        );
-        emit_event(
-            &mut out,
-            "message_stop",
-            &json!({
-                "type": "message_stop"
+                "index": idx
             }),
         );
     }
+
+    let sr = match finish_reason {
+        "stop" => "end_turn",
+        "length" => "max_tokens",
+        "tool_calls" => "tool_use",
+        _ => "end_turn",
+    };
+    emit_event(
+        &mut out,
+        "message_delta",
+        &json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": sr,
+                "stop_sequence": null
+            },
+            "usage": {
+                "output_tokens": chunk.pointer("/usage/completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+            }
+        }),
+    );
+    emit_event(
+        &mut out,
+        "message_stop",
+        &json!({
+            "type": "message_stop"
+        }),
+    );
 
     out
 }
@@ -434,6 +455,9 @@ pub struct AnthropicStreamBuffer {
     pub started: bool,
     pub message_id: Option<String>,
     pub block_id: Option<String>,
+    pub next_index: usize,
+    pub open_indices: std::collections::BTreeSet<usize>,
+    pub tool_index_map: std::collections::HashMap<u64, usize>,
 }
 
 fn emit_event(out: &mut Vec<u8>, event: &str, data: &Value) {
@@ -543,5 +567,45 @@ mod tests {
         let openai = messages_to_chat(&anthropic).unwrap();
         assert_eq!(openai["tools"][0]["function"]["name"], "get_weather");
         assert_eq!(openai["tool_choice"]["type"], "auto");
+    }
+
+    #[test]
+    fn test_stream_native_tool_call_does_not_collide_with_text_index() {
+        let mut buffer = AnthropicStreamBuffer::default();
+
+        let start = json!({"choices": [{"delta": {}, "index": 0}]});
+        openai_chunk_to_anthropic_sse(&start, &mut buffer);
+
+        // Native tool_calls whose own `index` is 0 (as most providers emit
+        // for the first tool call) must not reuse content-block index 0,
+        // which the eagerly-opened text block already claims.
+        let tool_delta = json!({
+            "choices": [{
+                "delta": { "tool_calls": [{ "index": 0, "id": "call_1", "function": { "name": "get_weather" } }] }
+            }]
+        });
+        let bytes = openai_chunk_to_anthropic_sse(&tool_delta, &mut buffer);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("\"index\":1"),
+            "tool block should get a fresh index, got: {text}"
+        );
+        assert!(buffer.open_indices.contains(&0));
+        assert!(buffer.open_indices.contains(&1));
+
+        let finish = json!({"choices": [{"finish_reason": "tool_calls"}]});
+        let out = String::from_utf8(finish_stream(&finish, &mut buffer)).unwrap();
+        assert_eq!(
+            out.matches("event: content_block_stop").count(),
+            2,
+            "expected both blocks closed, got: {out}"
+        );
+        assert!(buffer.open_indices.is_empty());
+        let stop_pos = out.find("message_stop").unwrap();
+        let last_block_stop_pos = out.rfind("content_block_stop").unwrap();
+        assert!(
+            last_block_stop_pos < stop_pos,
+            "content_block_stop must precede message_stop"
+        );
     }
 }

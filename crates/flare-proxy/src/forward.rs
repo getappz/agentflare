@@ -103,7 +103,7 @@ pub async fn proxy_request(anthropic_body: Value, config: &ProviderConfig) -> Re
     let stream = resp.bytes_stream();
     let mut buffer = AnthropicStreamBuffer::default();
     let mut accumulated_text = String::new();
-    let mut accumulated_tool_calls: Vec<Value> = Vec::new();
+    let mut line_buf = String::new();
 
     let sse_stream = stream.filter_map(move |chunk_result| {
         let chunk = match chunk_result {
@@ -111,10 +111,16 @@ pub async fn proxy_request(anthropic_body: Value, config: &ProviderConfig) -> Re
             Err(_) => return futures::future::ready(None),
         };
 
-        let chunk_str = String::from_utf8_lossy(&chunk);
+        // SSE lines don't align with raw TCP/HTTP chunk boundaries — buffer
+        // any trailing partial line across chunks instead of silently
+        // dropping the truncated JSON it would otherwise produce.
+        line_buf.push_str(&String::from_utf8_lossy(&chunk));
+        let split_at = line_buf.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let complete: String = line_buf.drain(..split_at).collect();
+
         let mut out = Vec::new();
 
-        for line in chunk_str.lines() {
+        for line in complete.lines() {
             if !line.starts_with("data: ") {
                 continue;
             }
@@ -133,13 +139,6 @@ pub async fn proxy_request(anthropic_body: Value, config: &ProviderConfig) -> Re
                 accumulated_text.push_str(delta);
             }
 
-            // Accumulate tool call deltas
-            if let Some(tcs) = val.pointer("/choices/0/delta/tool_calls").and_then(|v| v.as_array()) {
-                for tc in tcs.clone() {
-                    accumulated_tool_calls.push(tc);
-                }
-            }
-
             let is_finish = val
                 .pointer("/choices/0/finish_reason")
                 .and_then(|v| v.as_str())
@@ -149,31 +148,31 @@ pub async fn proxy_request(anthropic_body: Value, config: &ProviderConfig) -> Re
             out.extend_from_slice(&anthropic_sse);
 
             if is_finish {
-                // Heuristic tool extraction on accumulated text
+                // Heuristic tool extraction on accumulated text. This must
+                // open+close its own content block (using a fresh index)
+                // before finish_stream runs below, since finish_stream ends
+                // the message with message_stop.
                 if needs_heuristic && !accumulated_text.is_empty() {
                     if let Some(tc) = crate::heuristic::try_extract_tool_call(&accumulated_text) {
-                        // If the model output text AND a tool call, keep the text before the tool call
-                        let (clean_text, _) = crate::think::strip_think_tags(&accumulated_text);
-                        if !clean_text.is_empty() && clean_text != accumulated_text {
-                            // Replace the last text delta with cleaned version
-                            // TODO: proper text delta replacement
-                        }
-                        // Emit a tool_use content block
+                        let idx = buffer.next_index;
+                        buffer.next_index += 1;
                         let tool_block = json!({
                             "type": "tool_use",
                             "id": tc.id,
                             "name": tc.name,
                             "input": tc.args
                         });
-                        // Need to emit content_block_start for tool
-                        // This is a simplified version - in production we'd inject SSE events
                         let tool_json = serde_json::to_string(&tool_block).unwrap_or_default();
                         let inject = format!(
-                            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{tool_json}}}\n\n"
+                            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{idx},\"content_block\":{tool_json}}}\n\n"
                         );
                         out.extend_from_slice(inject.as_bytes());
-                        // Emit stop for the tool block
-                        out.extend_from_slice(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n");
+                        out.extend_from_slice(
+                            format!(
+                                "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{idx}}}\n\n"
+                            )
+                            .as_bytes(),
+                        );
                     }
                 }
 
@@ -187,6 +186,9 @@ pub async fn proxy_request(anthropic_body: Value, config: &ProviderConfig) -> Re
                         // The SSE events already went out; this is best-effort cleanup.
                     }
                 }
+
+                let finish_bytes = shape_xlat::finish_stream(&val, &mut buffer);
+                out.extend_from_slice(&finish_bytes);
             }
         }
 
