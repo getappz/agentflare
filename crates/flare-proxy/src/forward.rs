@@ -58,6 +58,10 @@ pub async fn proxy_request(
                 .into_response()
         }
     };
+    // `messages_to_chat` copies the incoming Anthropic model string as-is;
+    // swap in the provider-native model the route resolved to, or upstream
+    // APIs reject/ignore an unrecognized Anthropic model id.
+    openai_req["model"] = json!(route.upstream_model);
 
     let upstream_model = &route.upstream_model;
     openai_req["model"] = json!(upstream_model);
