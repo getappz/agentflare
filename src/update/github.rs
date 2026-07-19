@@ -4,6 +4,7 @@
 //! stays separate from the binary-swap logic in [`super::swap`].
 
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use std::time::Duration;
 
 pub(crate) const REPO: &str = "getappz/agentflare";
@@ -66,6 +67,63 @@ fn gh_get(url: &str) -> Result<ureq::Response, String> {
         .map_err(|e| format!("HTTP error: {e}"))
 }
 
+fn cache_path() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("agentflare")
+        .join("update-check")
+}
+
+/// Fresh-cache decision. `None` = cache too old (or missing), caller must hit
+/// the network. `Some(None)` = fresh cache confirms `current` is up to date.
+/// `Some(Some(v))` = fresh cache says version `v` is available. Split out
+/// pure so the branching logic is unit-testable without touching disk.
+fn cache_decision(cached_version: &str, current: &str, age_hours: i64) -> Option<Option<String>> {
+    if age_hours >= 24 {
+        return None;
+    }
+    if cached_version == current {
+        Some(None)
+    } else {
+        Some(Some(cached_version.to_string()))
+    }
+}
+
+fn read_cache() -> Result<Option<Option<String>>, String> {
+    let path = cache_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    let mut lines = content.lines();
+    let timestamp = match lines.next() {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let cached_version = match lines.next() {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let cached_time = match chrono::DateTime::parse_from_rfc3339(timestamp) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    let age_hours = chrono::Utc::now()
+        .signed_duration_since(cached_time)
+        .num_hours();
+    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+    Ok(cache_decision(cached_version, &current, age_hours))
+}
+
+fn write_cache(version: &str) {
+    let path = cache_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let content = format!("{}\n{}\n", chrono::Utc::now().to_rfc3339(), version);
+    let _ = std::fs::write(&path, content);
+}
+
 pub(crate) fn latest_version() -> Result<String, String> {
     let client = crate::github::Client::anonymous();
     let json = client
@@ -78,13 +136,47 @@ pub(crate) fn latest_version() -> Result<String, String> {
 }
 
 pub(crate) fn check_for_update() -> Result<Option<String>, String> {
-    let latest = latest_version()?;
+    // Check the 24h cache first.
+    if let Some(cached) = read_cache()? {
+        return Ok(cached);
+    }
+
+    let latest = match latest_version() {
+        Ok(v) => v,
+        Err(e) => {
+            // Network error: fall back to stale cache, if any.
+            if let Ok(Some(cached)) = read_stale_cache() {
+                return Ok(Some(cached));
+            }
+            return Err(e);
+        }
+    };
+
     let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+
+    // Cache the result regardless of whether there's an update.
+    write_cache(&latest);
+
     if latest != current {
         Ok(Some(latest))
     } else {
         Ok(None)
     }
+}
+
+/// Read the cache file even when it's stale — used as a network-failure
+/// fallback.
+fn read_stale_cache() -> Result<Option<String>, String> {
+    let path = cache_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    let version = content.lines().nth(1).unwrap_or("");
+    if version.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(version.to_string()))
 }
 
 /// Download the release asset for `version` and return its bytes.
@@ -171,5 +263,26 @@ mod tests {
         let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         assert!(verify_checksum(b"", empty).is_ok());
         assert!(verify_checksum(b"tampered", empty).is_err());
+    }
+
+    #[test]
+    fn cache_decision_caches_up_to_date_result() {
+        // Regression: previously the "you're already on latest" case was
+        // indistinguishable from "no cache", so it was never cached and hit
+        // the network on every invocation.
+        assert_eq!(cache_decision("v1.0.0", "v1.0.0", 1), Some(None));
+    }
+
+    #[test]
+    fn cache_decision_returns_cached_update() {
+        assert_eq!(
+            cache_decision("v1.2.0", "v1.0.0", 1),
+            Some(Some("v1.2.0".to_string()))
+        );
+    }
+
+    #[test]
+    fn cache_decision_expires_after_24h() {
+        assert_eq!(cache_decision("v1.0.0", "v1.0.0", 24), None);
     }
 }
