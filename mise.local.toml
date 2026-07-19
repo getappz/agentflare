@@ -1,3 +1,0 @@
-[tasks.refresh-install]
-description = "Build current worktree and reinstall as system agentflare binary"
-run = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/refresh-install.ps1"

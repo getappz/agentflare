@@ -34,3 +34,7 @@
 .claude/history/
 .claude/todos/
 .claude/stats.json
+
+# mise tasks are personal dev-workflow shortcuts, not shared project config
+/.mise.toml
+/.mise/
