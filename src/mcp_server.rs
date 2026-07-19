@@ -473,7 +473,7 @@ impl AgentflareMcp {
     /// across multiple linked projects depending on which subdirectory a
     /// tool was invoked from. Falls back to raw cwd only when nothing is
     /// found anywhere above it.
-    fn repo_root() -> std::path::PathBuf {
+    pub(crate) fn repo_root() -> std::path::PathBuf {
         let cwd = std::env::current_dir().unwrap_or_default();
         if let Some(root) = crate::git::repo_toplevel(&cwd) {
             return root;

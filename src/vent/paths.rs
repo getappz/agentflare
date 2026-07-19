@@ -17,19 +17,12 @@ pub fn repo_key() -> String {
     format!("path:{}", canonical.to_string_lossy())
 }
 
+/// Same resolution `AgentflareMcp` uses for `.agentflare/project.json` —
+/// git toplevel, else a marker-based walk-up for non-git projects. Vent must
+/// resolve to the identical root or `consolidate()` looks for the project
+/// link in the wrong directory.
 pub fn repo_root() -> PathBuf {
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        && out.status.success()
-    {
-        let s = String::from_utf8_lossy(&out.stdout);
-        let s = s.trim();
-        if !s.is_empty() {
-            return PathBuf::from(s);
-        }
-    }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    crate::mcp_server::AgentflareMcp::repo_root()
 }
 
 fn repo_slug() -> String {
