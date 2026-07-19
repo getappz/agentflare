@@ -59,5 +59,4 @@ mod tests {
         assert_eq!(first.message, "boom");
         assert_eq!(first.tags, vec!["dx".to_string()]);
     }
-
 }

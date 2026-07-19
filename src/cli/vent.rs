@@ -32,8 +32,9 @@ pub fn run(args: VentArgs) {
             severity,
             tags,
         } => {
+            let severity = crate::vent::classify::normalize_severity(Some(&severity));
             let log = crate::vent::paths::log_path();
-            match crate::vent::capture::append(&log, None, &severity, &tags, message.trim()) {
+            match crate::vent::capture::append(&log, None, severity, &tags, message.trim()) {
                 Ok(id) => println!("vented {id}"),
                 Err(e) => eprintln!("vent failed: {e}"),
             }
@@ -58,14 +59,14 @@ pub fn run(args: VentArgs) {
             }
         }
         VentCmd::List { actionable } => {
-            let conn =
-                match agentflare_backend::db::open_db(&crate::vent::paths::backend_db_path()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("cannot open backend: {e}");
-                        return;
-                    }
-                };
+            let conn = match agentflare_backend::db::open_db(&crate::vent::paths::backend_db_path())
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("cannot open backend: {e}");
+                    return;
+                }
+            };
             let link = crate::vent::paths::repo_root()
                 .join(".agentflare")
                 .join("project.json");

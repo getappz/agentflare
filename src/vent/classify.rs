@@ -32,10 +32,20 @@ pub fn severity_rank(severity: &str) -> u8 {
     }
 }
 
+/// Normalize user-supplied severity to exactly "low" | "medium" | "high"
+/// (case-insensitive), defaulting to "medium" for anything else. Shared by
+/// the MCP `vent` tool and the `agentflare vent say` CLI so both entry
+/// points classify identically.
+pub fn normalize_severity(input: Option<&str>) -> &'static str {
+    match input.map(str::to_lowercase).as_deref() {
+        Some("low") => "low",
+        Some("high") => "high",
+        _ => "medium",
+    }
+}
+
 pub fn classify(severity: &str, seen_count: i64, message: &str) -> bool {
-    severity == "high"
-        || seen_count >= ACTIONABLE_SEEN_THRESHOLD
-        || MARKER_RE.is_match(message)
+    severity == "high" || seen_count >= ACTIONABLE_SEEN_THRESHOLD || MARKER_RE.is_match(message)
 }
 
 #[cfg(test)]
@@ -64,5 +74,13 @@ mod tests {
         assert!(severity_rank("high") > severity_rank("medium"));
         assert!(severity_rank("medium") > severity_rank("low"));
         assert_eq!(severity_rank("garbage"), severity_rank("low"));
+    }
+
+    #[test]
+    fn normalize_severity_is_case_insensitive_and_defaults_to_medium() {
+        assert_eq!(normalize_severity(Some("High")), "high");
+        assert_eq!(normalize_severity(Some("LOW")), "low");
+        assert_eq!(normalize_severity(Some("garbage")), "medium");
+        assert_eq!(normalize_severity(None), "medium");
     }
 }

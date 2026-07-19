@@ -97,7 +97,15 @@ pub fn consolidate_core(
         report.consolidated += g.count as usize;
         let tags_json = "[]";
         let out = match agentflare_backend::vent::upsert(
-            conn, project_id, &g.message, &g.severity, tags_json, &key, &g.first_event, g.count, now(),
+            conn,
+            project_id,
+            &g.message,
+            &g.severity,
+            tags_json,
+            &key,
+            &g.first_event,
+            g.count,
+            now(),
         ) {
             Ok(o) => o,
             Err(e) => {
@@ -283,7 +291,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (log, cur) = (dir.path().join("v.jsonl"), dir.path().join("v.cursor"));
         let spiral: Vec<(&str, &str)> =
-            std::iter::repeat(("high", "the same broken thing")).take(43).collect();
+            std::iter::repeat_n(("high", "the same broken thing"), 43).collect();
         write_lines(&log, &spiral);
         let rep = consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
         assert_eq!(rep.items_created.len(), 1, "43 identical vents → one item");
