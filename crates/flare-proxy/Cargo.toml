@@ -3,6 +3,9 @@ name = "flare-proxy"
 version = "0.1.0"
 edition = "2021"
 description = "Anthropic→OpenAI proxy for free providers (NVIDIA NIM, OpenRouter, LM Studio)"
+license = "Apache-2.0"
+repository = "https://github.com/getappz/agentflare"
+publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
