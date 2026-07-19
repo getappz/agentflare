@@ -1,15 +1,12 @@
 use crate::providers::{ProviderConfig, ProviderKind};
 use crate::shape_xlat::{self, AnthropicStreamBuffer};
 use axum::body::Body;
-use axum::response::{IntoResponse, Response};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use futures::stream::StreamExt;
 use serde_json::{json, Value};
 
-pub async fn proxy_request(
-    anthropic_body: Value,
-    config: &ProviderConfig,
-) -> Response {
+pub async fn proxy_request(anthropic_body: Value, config: &ProviderConfig) -> Response {
     let model = anthropic_body
         .get("model")
         .and_then(|v| v.as_str())
@@ -18,7 +15,11 @@ pub async fn proxy_request(
     let route = match config.route_for(model) {
         Some(r) => r,
         None => {
-            return (StatusCode::BAD_REQUEST, format!("no route for model: {model}").to_string()).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("no route for model: {model}"),
+            )
+                .into_response()
         }
     };
 
@@ -37,11 +38,7 @@ pub async fn proxy_request(
         Some(env_var) => match std::env::var(env_var) {
             Ok(k) => k,
             Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("{} not set", env_var),
-                )
-                    .into_response()
+                return (StatusCode::BAD_REQUEST, format!("{} not set", env_var)).into_response()
             }
         },
         None => String::new(),
@@ -50,7 +47,11 @@ pub async fn proxy_request(
     let openai_req = match shape_xlat::messages_to_chat(&anthropic_body) {
         Some(r) => r,
         None => {
-            return (StatusCode::BAD_REQUEST, String::from("failed to translate request")).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                String::from("failed to translate request"),
+            )
+                .into_response()
         }
     };
 
@@ -65,7 +66,7 @@ pub async fn proxy_request(
     match provider.kind {
         ProviderKind::NvidiaNim => {
             req_builder = req_builder
-                .header("Authorization", format!("nvapi-{api_key}"))
+                .header("Authorization", format!("Bearer {api_key}"))
                 .header("Content-Type", "application/json");
         }
         ProviderKind::OpenRouter => {
@@ -76,26 +77,23 @@ pub async fn proxy_request(
                 .header("X-Title", "agentflare");
         }
         ProviderKind::LmStudio => {
-            req_builder = req_builder
-                .header("Content-Type", "application/json");
+            req_builder = req_builder.header("Content-Type", "application/json");
         }
     }
 
     let resp = match req_builder.send().await {
         Ok(r) => r,
-        Err(e) => {
-            return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response()
-        }
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response(),
     };
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        let err_val: Value = serde_json::from_str(&body).unwrap_or(json!({"error": {"message": body}}));
+        let err_val: Value =
+            serde_json::from_str(&body).unwrap_or(json!({"error": {"message": body}}));
         return (
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            serde_json::to_string(&shape_xlat::error_to_anthropic(&err_val))
-                .unwrap_or_default(),
+            serde_json::to_string(&shape_xlat::error_to_anthropic(&err_val)).unwrap_or_default(),
         )
             .into_response();
     }
