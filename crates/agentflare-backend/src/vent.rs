@@ -67,7 +67,7 @@ pub fn upsert(
         });
     }
 
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = db_kit::ids::new_id();
     conn.execute(
         "INSERT INTO vents (id, project_id, message, severity, tags, topic_key,
              seen_count, actionable, item_id, first_event_id, created_at, updated_at)
