@@ -22,7 +22,7 @@ pub fn router() -> Router {
     Router::new()
         .route("/proxy/v1/messages", post(v1_messages_handler))
         .with_state(AppState {
-            config: ProviderConfig::default_free(),
+            config: ProviderConfig::from_env(),
             client,
         })
 }

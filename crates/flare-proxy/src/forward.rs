@@ -16,7 +16,7 @@ pub async fn proxy_request(
         .and_then(|v| v.as_str())
         .unwrap_or("claude-sonnet-4-20250514");
 
-    let route = match config.route_for(model) {
+    let route = match config.resolve_model(model) {
         Some(r) => r,
         None => {
             return (
@@ -48,7 +48,7 @@ pub async fn proxy_request(
         None => String::new(),
     };
 
-    let openai_req = match shape_xlat::messages_to_chat(&anthropic_body) {
+    let mut openai_req = match shape_xlat::messages_to_chat(&anthropic_body) {
         Some(r) => r,
         None => {
             return (
@@ -58,6 +58,9 @@ pub async fn proxy_request(
                 .into_response()
         }
     };
+
+    let upstream_model = &route.upstream_model;
+    openai_req["model"] = json!(upstream_model);
 
     let needs_heuristic = route.requires_heuristic_tools;
     let needs_think = route.requires_think_parsing;

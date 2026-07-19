@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 pub struct ProviderConfig {
     pub providers: Vec<ProviderEntry>,
     pub routing: Vec<ModelRoute>,
+    pub model: Option<String>,
+    pub model_opus: Option<String>,
+    pub model_sonnet: Option<String>,
+    pub model_haiku: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,9 +43,125 @@ pub struct ModelRoute {
     pub requires_think_parsing: bool,
 }
 
+fn parse_model_string(s: &str) -> (String, String) {
+    match s.split_once('/') {
+        Some((provider, model)) => (provider.to_string(), model.to_string()),
+        None => ("nvidia_nim".into(), s.into()),
+    }
+}
+
 impl ProviderConfig {
+    pub fn from_env() -> Self {
+        let default_model = std::env::var("MODEL").ok().filter(|s| !s.is_empty());
+
+        let default_model = match default_model {
+            Some(m) => m,
+            None => return Self::default_free(),
+        };
+
+        let model_opus = std::env::var("MODEL_OPUS").ok().filter(|s| !s.is_empty());
+        let model_sonnet = std::env::var("MODEL_SONNET").ok().filter(|s| !s.is_empty());
+        let model_haiku = std::env::var("MODEL_HAIKU").ok().filter(|s| !s.is_empty());
+
+        let all_model_strs: Vec<String> = std::iter::once(default_model.clone())
+            .chain(model_opus.clone())
+            .chain(model_sonnet.clone())
+            .chain(model_haiku.clone())
+            .collect();
+
+        let mut provider_types: Vec<String> = Vec::new();
+        for ms in &all_model_strs {
+            let pt = ms.split('/').next().unwrap_or("").to_string();
+            if !pt.is_empty() && !provider_types.contains(&pt) {
+                provider_types.push(pt);
+            }
+        }
+
+        let mut providers = Vec::new();
+        for pt in &provider_types {
+            let (base_url, api_key_env, kind) = match pt.as_str() {
+                "nvidia_nim" => (
+                    "https://integrate.api.nvidia.com/v1",
+                    Some("NVIDIA_NIM_API_KEY"),
+                    ProviderKind::NvidiaNim,
+                ),
+                "open_router" => (
+                    "https://openrouter.ai/api/v1",
+                    Some("OPENROUTER_API_KEY"),
+                    ProviderKind::OpenRouter,
+                ),
+                "lmstudio" => (
+                    "http://localhost:1234/v1",
+                    None,
+                    ProviderKind::LmStudio,
+                ),
+                _ => continue,
+            };
+
+            providers.push(ProviderEntry {
+                id: pt.clone(),
+                kind,
+                base_url: base_url.into(),
+                api_key_env: api_key_env.map(String::from),
+                default_model: None,
+                models: vec![],
+            });
+        }
+
+        let mut routing = Vec::new();
+        let (def_provider, def_model) = parse_model_string(&default_model);
+        routing.push(ModelRoute {
+            anthropic_model: String::new(),
+            provider_id: def_provider,
+            upstream_model: def_model,
+            requires_heuristic_tools: true,
+            requires_think_parsing: false,
+        });
+
+        for (keyword, opt) in [("opus", &model_opus), ("sonnet", &model_sonnet), ("haiku", &model_haiku)] {
+            if let Some(m) = opt {
+                let (pid, um) = parse_model_string(m);
+                routing.push(ModelRoute {
+                    anthropic_model: keyword.into(),
+                    provider_id: pid,
+                    upstream_model: um,
+                    requires_heuristic_tools: true,
+                    requires_think_parsing: false,
+                });
+            }
+        }
+
+        Self {
+            providers,
+            routing,
+            model: Some(default_model),
+            model_opus,
+            model_sonnet,
+            model_haiku,
+        }
+    }
+
+    pub fn resolve_model(&self, anthropic_model: &str) -> Option<&ModelRoute> {
+        let name_lower = anthropic_model.to_lowercase();
+        for keyword in ["opus", "haiku", "sonnet"] {
+            if name_lower.contains(keyword) {
+                if let Some(route) = self.routing.iter().find(|r| r.anthropic_model == keyword) {
+                    return Some(route);
+                }
+                break;
+            }
+        }
+        self.routing
+            .iter()
+            .find(|r| r.anthropic_model == anthropic_model || r.anthropic_model.is_empty())
+    }
+
     pub fn default_free() -> Self {
         Self {
+            model: None,
+            model_opus: None,
+            model_sonnet: None,
+            model_haiku: None,
             providers: vec![
                 ProviderEntry {
                     id: "nvidia-nim".into(),
