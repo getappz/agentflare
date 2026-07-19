@@ -263,6 +263,13 @@ pub(crate) struct OptimizeRequest {
     pub(crate) id: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct VentRequest {
+    pub(crate) message: String,
+    pub(crate) severity: Option<String>,
+    pub(crate) tags: Option<Vec<String>>,
+}
+
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct MemoryRequest {
     #[schemars(description = "Action: compact|context|curate|handoff|recall|relate|remember")]

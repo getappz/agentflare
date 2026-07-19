@@ -17,9 +17,9 @@ mod memory;
 mod optimize;
 mod review;
 mod run;
-mod serve;
 mod uninstall;
 mod update;
+mod vent;
 
 use clap::{Parser, Subcommand};
 use std::sync::LazyLock;
@@ -66,7 +66,7 @@ pub enum Commands {
     Claim(claim::ClaimArgs),
     Review(review::ReviewArgs),
     Memory(memory::MemoryArgs),
-    Serve(serve::ServeArgs),
+    Vent(vent::VentArgs),
 }
 
 impl Commands {
@@ -94,7 +94,7 @@ impl Commands {
             Self::Claim(cmd) => cmd.run(),
             Self::Review(cmd) => cmd.run(),
             Self::Memory(cmd) => cmd.run(),
-            Self::Serve(cmd) => cmd.run(),
+            Self::Vent(cmd) => vent::run(cmd),
         }
     }
 }
