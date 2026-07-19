@@ -77,6 +77,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # creates the GitHub release and uploads assets
+      id-token: write # required for cosign keyless signing via GitHub OIDC
+    outputs:
+      hashes: ${{ steps.checksums.outputs.hashes }} # base64 SHA256SUMS, consumed by the provenance job below
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -98,11 +101,49 @@ jobs:
           sha256sum * > SHA256SUMS
           cd -
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign binaries with cosign (keyless)
+        # OIDC-based keyless signing: the certificate is issued by Fulcio and
+        # bound to this workflow's identity (no long-lived key to manage or
+        # leak), and the signing event is recorded in the Rekor transparency
+        # log. The .cosign.bundle carries cert + signature + Rekor entry, so
+        # verifiers only need one extra download. See README "Verifying
+        # release binaries" for consumer-side verification.
+        run: |
+          cd dist
+          for file in *.tar.gz *.zip; do
+            [ -e "$file" ] || continue
+            echo "Signing $file..."
+            cosign sign-blob --yes --bundle "${file}.cosign.bundle" "$file"
+          done
+          cd -
+
+      - name: Compute hashes for SLSA provenance
+        id: checksums
+        run: |
+          cd dist
+          echo "hashes=$(base64 -w0 < SHA256SUMS)" >> "$GITHUB_OUTPUT"
+          cd -
+
       - name: Create release
         uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d # v3
         with:
           files: dist/*
           generate_release_notes: true
+
+  provenance:
+    name: SLSA provenance
+    needs: release
+    permissions:
+      actions: read   # generator reads the workflow run for provenance
+      id-token: write # OIDC keyless signing (same trust model as cosign)
+      contents: write # attach the attestation to the release
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.release.outputs.hashes }}
+      upload-assets: true
 
   update-homebrew:
     name: Update Homebrew
