@@ -4,7 +4,7 @@ use super::*;
 
 impl AgentflareMcp {
     pub fn flare_git_impl(&self, req: GitHubRequest) -> Result<String, ErrorData> {
-        use crate::github::{Client, RepoId, actions, issues, pulls, releases};
+        use crate::github::{Client, RepoId, actions, issues, mcp, pulls, releases};
 
         let repo = match &req.repo {
             Some(r) => RepoId::parse(r)
@@ -53,6 +53,30 @@ impl AgentflareMcp {
                 format!(
                     "PR #{} [{}] {}: {}",
                     pr.number, pr.state, pr.title, pr.html_url
+                )
+            }
+            "pr_status" => {
+                let n = req
+                    .number
+                    .ok_or_else(|| ErrorData::invalid_params("number is required", None))?;
+                let pr = pulls::get(&client, &repo, n).map_err(to_mcp_error)?;
+                let sha = pr.head.as_ref().map(|h| h.sha.as_str()).unwrap_or_default();
+                let since = req.since.as_deref();
+                let checks = actions::list_check_runs(&client, &repo, sha).map_err(to_mcp_error)?;
+                let reviews = pulls::list_reviews(&client, &repo, n).map_err(to_mcp_error)?;
+                let review_comments =
+                    pulls::list_review_comments(&client, &repo, n, since).map_err(to_mcp_error)?;
+                let resolved_ids =
+                    pulls::resolved_review_comment_ids(&client, &repo, n).map_err(to_mcp_error)?;
+                let comments =
+                    issues::list_comments(&client, &repo, n, since).map_err(to_mcp_error)?;
+                mcp::pr_status_json(
+                    &pr,
+                    &checks,
+                    &reviews,
+                    &review_comments,
+                    &resolved_ids,
+                    &comments,
                 )
             }
             "pr_merge" => {

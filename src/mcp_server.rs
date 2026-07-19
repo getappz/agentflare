@@ -1062,7 +1062,7 @@ impl AgentflareMcp {
         }
     }
     #[tool(
-        description = "GitHub repo management via the flare_git module. Single action-dispatch tool: action=pr_create|pr_list|pr_get|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|release_list|release_get|release_latest|release_create|run_list|run_get|run_rerun|workflow_dispatch. Uses gh/GITHUB_TOKEN credentials; repo defaults to the current repo's origin."
+        description = "GitHub repo management via the flare_git module. Single action-dispatch tool: action=pr_create|pr_list|pr_get|pr_status|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|release_list|release_get|release_latest|release_create|run_list|run_get|run_rerun|workflow_dispatch. pr_status bundles PR detail + CI checks + reviews + comments into one call (vs. 4-5 separate ones), trimmed to only actionable data: passing checks are counted not listed, resolved review threads are dropped, only the latest verdict per reviewer is kept, and there are no timestamps. Pass `since` (ISO8601) to fetch only newer comments. Uses gh/GITHUB_TOKEN credentials; repo defaults to the current repo's origin."
     )]
     fn flare_git(&self, Parameters(req): Parameters<GitHubRequest>) -> Result<String, ErrorData> {
         self.flare_git_impl(req)
