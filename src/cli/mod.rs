@@ -6,6 +6,7 @@ mod channel;
 mod claim;
 mod coaching;
 mod cost;
+mod daemon;
 mod dev_install;
 mod gateway;
 mod git;
@@ -64,6 +65,7 @@ pub enum Commands {
     Optimize(optimize::OptimizeArgs),
     #[command(visible_alias = "logo")]
     About(crate::about::AboutArgs),
+    Daemon(daemon::DaemonArgs),
     Channel(channel::ChannelArgs),
     Claim(claim::ClaimArgs),
     Review(review::ReviewArgs),
@@ -99,6 +101,7 @@ impl Commands {
             Self::Review(cmd) => cmd.run(),
             Self::Memory(cmd) => cmd.run(),
             Self::Serve(cmd) => cmd.run(),
+            Self::Daemon(cmd) => cmd.run(),
             Self::Vent(cmd) => vent::run(cmd),
             Self::Work(cmd) => cmd.run(),
         }
