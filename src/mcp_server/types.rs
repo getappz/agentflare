@@ -155,7 +155,7 @@ pub(crate) struct HandoffRequest {
     #[serde(default)]
     pub(crate) r#type: Option<String>,
     #[schemars(
-        description = "Existing item ID to assign and attach to, instead of creating a new item"
+        description = "Existing item ID to assign and attach to, instead of creating a new one. If the work already has a home item, always pass its id here — omitting it unconditionally creates a new item, even when one covering this work already exists."
     )]
     #[serde(default)]
     pub(crate) item_id: Option<String>,
