@@ -9,6 +9,10 @@ pub enum DaemonAddr {
 }
 
 impl DaemonAddr {
+    // `pid` is only read on the #[cfg(windows)] branch below (it names the
+    // per-daemon named pipe); the unix branch derives its socket path from
+    // the runtime dir instead, so it's unused there.
+    #[allow(unused_variables)]
     pub fn default_for_pid(pid: u32) -> Self {
         #[cfg(unix)]
         {
