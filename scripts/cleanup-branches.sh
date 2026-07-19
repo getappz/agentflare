@@ -67,23 +67,16 @@ for b in "${!candidates[@]}"; do
   is_protected "$b" && continue
 
   wt="${worktree_of[$b]:-}"
-  if ((DRY_RUN)); then
-    if [[ -n "$wt" ]]; then
-      echo "would remove worktree $wt + branch $b"
-    else
-      echo "would delete branch $b"
-    fi
-    continue
-  fi
 
   # -D force-deletes without a merge check, so verify the branch's own
   # changes are actually present in origin/$DEFAULT_BRANCH BEFORE touching
-  # its worktree or ref. A plain ancestry check (`git branch --merged`)
-  # misses squash-merges (different tree shape), which is why "gone" is in
-  # the candidate set at all — but that same gap means a branch with
-  # unpushed commits beyond what was squash-merged would otherwise lose its
-  # worktree checkout and ref silently. Checking first (not just before the
-  # branch delete) means a "risky" branch keeps both intact.
+  # its worktree or ref (and before reporting it as removable in --dry-run,
+  # so the preview matches what a real run would actually do). A plain
+  # ancestry check (`git branch --merged`) misses squash-merges (different
+  # tree shape), which is why "gone" is in the candidate set at all — but
+  # that same gap means a branch with unpushed commits beyond what was
+  # squash-merged would otherwise lose its worktree checkout and ref
+  # silently.
   merge_base=$(git merge-base "origin/$DEFAULT_BRANCH" "$b" 2>/dev/null) || {
     echo "skip $b: no common history with origin/$DEFAULT_BRANCH" >&2
     continue
@@ -91,6 +84,15 @@ for b in "${!candidates[@]}"; do
   mapfile -t touched < <(git diff --name-only "$merge_base" "$b")
   if ((${#touched[@]})) && ! git diff --quiet "origin/$DEFAULT_BRANCH" "$b" -- "${touched[@]}"; then
     echo "skip $b: differs from origin/$DEFAULT_BRANCH in files it touched (possible unpushed work)" >&2
+    continue
+  fi
+
+  if ((DRY_RUN)); then
+    if [[ -n "$wt" ]]; then
+      echo "would remove worktree $wt + branch $b"
+    else
+      echo "would delete branch $b"
+    fi
     continue
   fi
 
