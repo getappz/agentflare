@@ -121,6 +121,10 @@ pub fn create(conn: &Connection, input: CreateItem) -> Result<Item> {
     let description = input.description.unwrap_or_default();
     let priority = input.priority.unwrap_or_else(|| "none".to_string());
     let metadata = input.metadata.unwrap_or_else(|| "{}".to_string());
+    let assignee_agent = input
+        .assignee_agent
+        .as_deref()
+        .map(agent_registry::canonicalize);
 
     let state = crate::state::get(conn, &input.state_id)?;
     if state.project_id != input.project_id {
@@ -143,7 +147,7 @@ pub fn create(conn: &Connection, input: CreateItem) -> Result<Item> {
             description,
             priority,
             input.parent_id,
-            input.assignee_agent,
+            assignee_agent,
             seq,
             sort_order,
             input.external_source,
@@ -255,6 +259,10 @@ pub fn list_by_assignee_agent(
 
 pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
     let ts = now();
+    let assignee_agent = input
+        .assignee_agent
+        .as_deref()
+        .map(agent_registry::canonicalize);
     let mut sets = vec!["updated_at = ?2".to_string()];
     let mut param_idx = 3;
     if input.name.is_some() {
@@ -273,7 +281,7 @@ pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
         sets.push(format!("state_id = ?{param_idx}"));
         param_idx += 1;
     }
-    if input.assignee_agent.is_some() {
+    if assignee_agent.is_some() {
         sets.push(format!("assignee_agent = ?{param_idx}"));
         param_idx += 1;
     }
@@ -304,7 +312,7 @@ pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
     if let Some(ref sid) = input.state_id {
         param_values.push(Box::new(sid.clone()));
     }
-    if let Some(ref agent) = input.assignee_agent {
+    if let Some(ref agent) = assignee_agent {
         param_values.push(Box::new(agent.clone()));
     }
     if let Some(so) = input.sort_order {
@@ -1717,5 +1725,44 @@ mod tests {
         // The item's sequence_id exists in project A but not project B.
         let err = resolve_id(&conn, Some(&pid_b), &item.sequence_id.to_string()).unwrap_err();
         assert!(matches!(err, crate::error::Error::NotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn create_and_update_canonicalize_known_assignee_aliases() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+
+        let item = create(
+            &conn,
+            CreateItem {
+                project_id: pid.clone(),
+                state_id: sid.clone(),
+                name: "Test".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: Some("claude".into()),
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(item.assignee_agent.as_deref(), Some("claude-code"));
+
+        let updated = update(
+            &conn,
+            &item.id,
+            UpdateItem {
+                assignee_agent: Some("Claude Code".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.assignee_agent.as_deref(), Some("claude-code"));
     }
 }

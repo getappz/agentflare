@@ -57,6 +57,21 @@ impl Agent {
     }
 }
 
+/// Maps common human-typed aliases to the canonical registry name (e.g.
+/// `"claude"` -> `"claude-code"`), so any consumer that stores or matches
+/// agent names by exact string — handoff recipients, item assignees —
+/// shares one alias table instead of each feature growing its own.
+/// Unrecognized input passes through unchanged: these fields accept
+/// arbitrary agent names, not just ones in `REGISTRY`. Add more arms as
+/// aliases show up.
+#[must_use]
+pub fn canonicalize(name: &str) -> String {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "claude" | "claude code" | "claude-code-cli" => Agent::ClaudeCode.as_str().to_string(),
+        _ => name.to_string(),
+    }
+}
+
 /// `Cli`-tier agents ship a standalone binary and are eligible for
 /// PATH-based detection (this ticket) and, later, install/launch.
 /// `Extension`-tier agents are editor-embedded (VS Code extensions) with no
@@ -397,5 +412,14 @@ mod tests {
         // Editor-embedded / unmapped agents have no headless invocation.
         assert_eq!(headless_args(Agent::Cursor), None);
         assert_eq!(headless_args(Agent::VscodeCopilot), None);
+    }
+
+    #[test]
+    fn canonicalize_maps_known_aliases_and_passes_through_unknown() {
+        assert_eq!(canonicalize("claude"), "claude-code");
+        assert_eq!(canonicalize("Claude Code"), "claude-code");
+        assert_eq!(canonicalize("  CLAUDE-CODE-CLI  "), "claude-code");
+        assert_eq!(canonicalize("codex"), "codex");
+        assert_eq!(canonicalize("some-unknown-agent"), "some-unknown-agent");
     }
 }

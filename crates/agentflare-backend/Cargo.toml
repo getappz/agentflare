@@ -8,6 +8,7 @@ description = "Universal agent backend: workspace/project/item schema + CRUD, po
 publish = false
 
 [dependencies]
+agent-registry = { package = "agentflare-agent-registry", path = "../agent-registry" }
 db_kit = { package = "agentflare-db-kit", path = "../agentflare-db-kit" }
 flare-search-kit = { path = "../flare-search-kit" }
 rusqlite = { version = "0.40", features = ["bundled"] }

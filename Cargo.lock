@@ -139,6 +139,7 @@ dependencies = [
 name = "agentflare-backend"
 version = "0.1.0"
 dependencies = [
+ "agentflare-agent-registry",
  "agentflare-db-kit",
  "flare-search-kit",
  "hex",
