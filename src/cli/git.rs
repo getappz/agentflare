@@ -161,7 +161,9 @@ fn shim_dest_name() -> &'static str {
 fn install_shim(opts: InstallShimArgs) {
     let dir = shims_dir();
     if let Err(e) = fs::create_dir_all(&dir) {
-        crate::ui::error(&format!("agentflare git install-shim: cannot create {dir:?}: {e}"));
+        crate::ui::error(&format!(
+            "agentflare git install-shim: cannot create {dir:?}: {e}"
+        ));
         return;
     }
     let dest = dir.join(shim_dest_name());
@@ -185,7 +187,9 @@ fn install_shim(opts: InstallShimArgs) {
             dir.display()
         )),
         Ok(false) => crate::ui::success(&format!("{} already on PATH", dir.display())),
-        Err(e) => crate::ui::error(&format!("agentflare git install-shim: could not update PATH: {e}")),
+        Err(e) => crate::ui::error(&format!(
+            "agentflare git install-shim: could not update PATH: {e}"
+        )),
     }
 
     println!(
@@ -202,7 +206,9 @@ fn uninstall_shim() {
     }
     match fs::remove_file(&dest) {
         Ok(()) => crate::ui::success(&format!("removed {}", dest.display())),
-        Err(e) => crate::ui::error(&format!("agentflare git uninstall-shim: cannot remove {dest:?}: {e}")),
+        Err(e) => crate::ui::error(&format!(
+            "agentflare git uninstall-shim: cannot remove {dest:?}: {e}"
+        )),
     }
     // Deliberately leaves the shims dir on PATH -- other shims (e.g. the
     // lean-ctx one) may still live there; removing just this binary is
@@ -226,9 +232,10 @@ fn ensure_on_path(dir: &Path) -> Result<bool, String> {
         .output()
         .map_err(|e| e.to_string())?;
     let current = String::from_utf8_lossy(&get.stdout).trim().to_string();
-    let already_present = current
-        .split(';')
-        .any(|p| p.trim_end_matches('\u{5c}').eq_ignore_ascii_case(dir_str.trim_end_matches('\u{5c}')));
+    let already_present = current.split(';').any(|p| {
+        p.trim_end_matches('\u{5c}')
+            .eq_ignore_ascii_case(dir_str.trim_end_matches('\u{5c}'))
+    });
     if already_present {
         return Ok(false);
     }
@@ -405,7 +412,8 @@ fn snapshot_prune(repo_root: &Path, opts: &SnapshotPruneArgs) {
 /// `prepare-commit-msg` hook. Fail-open: any error leaves the message file
 /// untouched rather than blocking the commit.
 fn trailer_inject(msg_file: &Path) {
-    let Some(repo_root) = branch::repo_toplevel(&std::env::current_dir().unwrap_or_default()) else {
+    let Some(repo_root) = branch::repo_toplevel(&std::env::current_dir().unwrap_or_default())
+    else {
         return;
     };
     let Ok(original) = fs::read_to_string(msg_file) else {
@@ -445,7 +453,10 @@ fn ref_transaction_log() {
     let agent = repo_root
         .as_deref()
         .and_then(|root| provenance::build_trailers(root).agent);
-    let event = audit::RefTransactionEvent { agent, transactions };
+    let event = audit::RefTransactionEvent {
+        agent,
+        transactions,
+    };
     if let Some(path) = audit::default_path("git-refs.jsonl") {
         let _ = audit::log_event(&path, &event);
     }

@@ -62,7 +62,14 @@ const ESCAPE_HATCH_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree"];
 
 /// Global flags that consume the following argument as their value, so
 /// subcommand detection can skip past both tokens.
-const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path"];
+const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
+    "-c",
+    "-C",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+];
 
 /// Finds the subcommand token's index, skipping global flags (and their
 /// values, for flags that take one). Also reports whether an escape-hatch
@@ -76,11 +83,17 @@ fn parse_global_flags(args: &[String]) -> (Option<usize>, bool) {
             return (Some(i), escape_hatch);
         }
         if ESCAPE_HATCH_FLAGS.contains(&a.as_str())
-            || ESCAPE_HATCH_FLAGS.iter().any(|f| a.starts_with(&format!("{f}=")))
+            || ESCAPE_HATCH_FLAGS
+                .iter()
+                .any(|f| a.starts_with(&format!("{f}=")))
         {
             escape_hatch = true;
         }
-        i += if GLOBAL_FLAGS_WITH_VALUE.contains(&a.as_str()) { 2 } else { 1 };
+        i += if GLOBAL_FLAGS_WITH_VALUE.contains(&a.as_str()) {
+            2
+        } else {
+            1
+        };
     }
     (None, escape_hatch)
 }
@@ -124,7 +137,11 @@ fn snapshots_enabled() -> bool {
 /// (non-worktree) checkout AND the command would actually detach HEAD.
 /// Interactive human use, and any use inside an isolated worktree, is
 /// completely unaffected.
-fn deny_canonical_detach_reason(repo_root: &Path, subcommand: &str, args: &[String]) -> Option<String> {
+fn deny_canonical_detach_reason(
+    repo_root: &Path,
+    subcommand: &str,
+    args: &[String],
+) -> Option<String> {
     if agentflare_shim::is_set(ALLOW_CANONICAL_MUTATE_ENV) {
         return None;
     }
@@ -191,7 +208,10 @@ fn main() {
         if let Some(audit_path) = audit::default_path("git.jsonl") {
             let bypass_event = classify::Event {
                 subcommand: "*".to_string(),
-                args: args.iter().map(|a| a.to_string_lossy().into_owned()).collect(),
+                args: args
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect(),
                 disposition: classify::Disposition::SilentExempt,
             };
             let _ = audit::log_event(&audit_path, &bypass_event);
@@ -199,7 +219,10 @@ fn main() {
         run_real(&tool, filtered_path.as_ref(), &args);
     }
 
-    let str_args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    let str_args: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     let (subcommand_idx, escape_hatch) = parse_global_flags(&str_args);
 
     if escape_hatch {
@@ -219,7 +242,9 @@ fn main() {
         let event = classify::Event {
             subcommand: subcommand.clone(),
             args: rest.clone(),
-            disposition: classify::Disposition::Deny { reason: reason.clone() },
+            disposition: classify::Disposition::Deny {
+                reason: reason.clone(),
+            },
         };
         if let Some(audit_path) = audit::default_path("git.jsonl") {
             let _ = audit::log_event(&audit_path, &event);

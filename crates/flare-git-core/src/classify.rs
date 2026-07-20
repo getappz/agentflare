@@ -98,7 +98,15 @@ pub fn would_detach_head(repo_root: &Path, subcommand: &str, args: &[String]) ->
             let Some(target) = args.iter().find(|a| !a.starts_with('-')) else {
                 return false; // e.g. bare `git checkout` -- doesn't move HEAD
             };
-            !crate::shell::run_in_ok(repo_root, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{target}")])
+            !crate::shell::run_in_ok(
+                repo_root,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{target}"),
+                ],
+            )
         }
         "switch" => args.iter().any(|a| a == "--detach" || a == "-d"),
         _ => false,
@@ -173,7 +181,9 @@ pub fn is_destructive(subcommand: &str, args: &[String]) -> bool {
         "clean" => args.iter().any(|a| {
             a == "--force" || (a.starts_with('-') && !a.starts_with("--") && a.contains('f'))
         }),
-        "checkout" | "switch" => args.iter().any(|a| a == "-f" || a == "--force" || a == "-B"),
+        "checkout" | "switch" => args
+            .iter()
+            .any(|a| a == "-f" || a == "--force" || a == "-B"),
         _ => false,
     }
 }
@@ -190,7 +200,9 @@ pub fn classify_pure(
     default_branch: &str,
     push_touches_trust_root: bool,
 ) -> Disposition {
-    if READ_ONLY_SUBCOMMANDS.contains(&subcommand) || ALLOWED_MUTATING_SUBCOMMANDS.contains(&subcommand) {
+    if READ_ONLY_SUBCOMMANDS.contains(&subcommand)
+        || ALLOWED_MUTATING_SUBCOMMANDS.contains(&subcommand)
+    {
         return Disposition::Passthrough;
     }
     if DENIED_PLUMBING_SUBCOMMANDS.contains(&subcommand) {
@@ -265,7 +277,8 @@ pub fn push_touches_trust_root(repo_root: &Path, branch: &str, target: &str) -> 
     let range = format!("{target}...{branch}");
     match crate::shell::run_in(repo_root, &["diff", "--name-only", &range]) {
         Ok(names) => names.lines().any(|f| {
-            TRUST_ROOT_PATHS.iter().any(|p| f.starts_with(p)) || extra.iter().any(|p| f.starts_with(p.as_str()))
+            TRUST_ROOT_PATHS.iter().any(|p| f.starts_with(p))
+                || extra.iter().any(|p| f.starts_with(p.as_str()))
         }),
         Err(_) => true,
     }
@@ -441,7 +454,12 @@ mod tests {
     #[test]
     fn branch_rename_of_protected_branch_is_denied() {
         assert!(matches!(
-            classify_pure("branch", &args(&["-M", "master", "renamed"]), "master", false),
+            classify_pure(
+                "branch",
+                &args(&["-M", "master", "renamed"]),
+                "master",
+                false
+            ),
             Disposition::Deny { .. }
         ));
     }
@@ -456,7 +474,10 @@ mod tests {
 
     #[test]
     fn branch_listing_and_creation_pass_through() {
-        assert_eq!(classify_pure("branch", &[], "master", false), Disposition::Passthrough);
+        assert_eq!(
+            classify_pure("branch", &[], "master", false),
+            Disposition::Passthrough
+        );
         assert_eq!(
             classify_pure("branch", &args(&["feature/new"]), "master", false),
             Disposition::Passthrough
@@ -476,7 +497,11 @@ mod tests {
     fn would_detach_head_false_for_an_existing_branch_checkout_target() {
         let repo = crate::shell::test_support::init_repo_with_branch("master");
         crate::shell::run_in(&repo.path, &["branch", "feature/x"]).unwrap();
-        assert!(!would_detach_head(&repo.path, "checkout", &args(&["feature/x"])));
+        assert!(!would_detach_head(
+            &repo.path,
+            "checkout",
+            &args(&["feature/x"])
+        ));
     }
 
     #[test]
@@ -493,8 +518,16 @@ mod tests {
     #[test]
     fn would_detach_head_true_for_explicit_detach_flag() {
         let repo = crate::shell::test_support::init_repo_with_branch("master");
-        assert!(would_detach_head(&repo.path, "checkout", &args(&["--detach", "master"])));
-        assert!(would_detach_head(&repo.path, "switch", &args(&["--detach", "master"])));
+        assert!(would_detach_head(
+            &repo.path,
+            "checkout",
+            &args(&["--detach", "master"])
+        ));
+        assert!(would_detach_head(
+            &repo.path,
+            "switch",
+            &args(&["--detach", "master"])
+        ));
     }
 
     #[test]

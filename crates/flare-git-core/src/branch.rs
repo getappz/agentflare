@@ -3,7 +3,7 @@
 //! git-shim's command classifier, so "is this branch protected" has exactly
 //! one definition.
 
-use crate::shell::{run_in_opt, run_in_ok};
+use crate::shell::{run_in_ok, run_in_opt};
 use std::path::{Path, PathBuf};
 
 /// Current branch name (`HEAD` in detached-HEAD state). `None` outside a git
@@ -35,7 +35,8 @@ pub fn resolve_default_branch(repo_root: &Path) -> String {
     if run_in_ok(repo_root, &["rev-parse", "--verify", "master"]) {
         return "master".to_string();
     }
-    run_in_opt(repo_root, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|| "master".to_string())
+    run_in_opt(repo_root, &["symbolic-ref", "--short", "HEAD"])
+        .unwrap_or_else(|| "master".to_string())
 }
 
 /// `git rev-parse --show-toplevel` from `start` — handles worktrees/submodules
@@ -172,9 +173,17 @@ mod tests {
     fn is_protected_branch_among_matches_extra_exact_and_glob_patterns() {
         let extra = vec!["staging".to_string(), "release/*".to_string()];
         assert!(is_protected_branch_among("staging", Some("main"), &extra));
-        assert!(is_protected_branch_among("release/1.0", Some("main"), &extra));
+        assert!(is_protected_branch_among(
+            "release/1.0",
+            Some("main"),
+            &extra
+        ));
         assert!(!is_protected_branch_among("release", Some("main"), &extra));
-        assert!(!is_protected_branch_among("feature/x", Some("main"), &extra));
+        assert!(!is_protected_branch_among(
+            "feature/x",
+            Some("main"),
+            &extra
+        ));
     }
 
     #[test]
@@ -205,7 +214,13 @@ mod tests {
         let wt_path = wt_parent.path().join("wt-check");
         crate::shell::run_in(
             &repo.path,
-            &["worktree", "add", wt_path.to_str().unwrap(), "-b", "wt-branch"],
+            &[
+                "worktree",
+                "add",
+                wt_path.to_str().unwrap(),
+                "-b",
+                "wt-branch",
+            ],
         )
         .unwrap();
         assert!(is_linked_worktree(&wt_path));

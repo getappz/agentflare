@@ -45,7 +45,12 @@ pub fn push_and_open_pr(
     target_branch: &str,
     progress: Option<&ProgressSender>,
 ) -> Option<String> {
-    let branch = flare_git_core::worktree::push_branch(item, repo_root, target_branch, as_progress(progress))?;
+    let branch = flare_git_core::worktree::push_branch(
+        item,
+        repo_root,
+        target_branch,
+        as_progress(progress),
+    )?;
     if let Some(p) = progress {
         p.send(0.5, Some(1.0), Some("Creating PR...".into()));
     }

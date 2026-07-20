@@ -27,7 +27,11 @@ pub struct SnapshotMeta {
 
 /// `git <args>` with a temporary `GIT_INDEX_FILE`, so staging for a
 /// snapshot never touches the caller's real index.
-fn run_git_with_index(repo_root: &Path, index_file: &Path, args: &[&str]) -> Result<String, String> {
+fn run_git_with_index(
+    repo_root: &Path,
+    index_file: &Path,
+    args: &[&str],
+) -> Result<String, String> {
     // A snapshot must capture exactly what's on disk right now -- `-c
     // core.autocrlf=false` stops git silently converting line endings
     // while staging, regardless of the caller's ambient/global git config
@@ -57,7 +61,12 @@ pub fn snapshot_before(repo_root: &Path, reason: &str) -> Result<SnapshotId, Str
         run_git_with_index(repo_root, &tmp_index, &["add", "-A"])?;
         let tree = run_git_with_index(repo_root, &tmp_index, &["write-tree"])?;
         let parent = run_in(repo_root, &["rev-parse", "HEAD"]).ok();
-        let mut commit_args = vec!["commit-tree".to_string(), tree, "-m".to_string(), reason.to_string()];
+        let mut commit_args = vec![
+            "commit-tree".to_string(),
+            tree,
+            "-m".to_string(),
+            reason.to_string(),
+        ];
         if let Some(p) = &parent {
             commit_args.push("-p".to_string());
             commit_args.push(p.clone());

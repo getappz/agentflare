@@ -150,6 +150,9 @@ mod tests {
             }],
         };
         log_event(&path, &event).unwrap();
-        assert_eq!(read_events::<RefTransactionEvent>(&path).unwrap(), vec![event]);
+        assert_eq!(
+            read_events::<RefTransactionEvent>(&path).unwrap(),
+            vec![event]
+        );
     }
 }

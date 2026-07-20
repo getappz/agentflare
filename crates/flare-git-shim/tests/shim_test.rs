@@ -125,7 +125,11 @@ fn denied_command_is_logged_to_the_audit_log() {
     let out = shim(repo.path(), home.path(), &["checkout", "master"]);
     assert!(!out.status.success());
 
-    let audit_log = home.path().join(".agentflare").join("audit").join("git.jsonl");
+    let audit_log = home
+        .path()
+        .join(".agentflare")
+        .join("audit")
+        .join("git.jsonl");
     let content = std::fs::read_to_string(&audit_log).expect("audit log must exist");
     assert!(content.contains("checkout"), "{content}");
     assert!(content.contains("Deny"), "{content}");

@@ -33,7 +33,8 @@ use std::sync::OnceLock;
 fn is_cargo_target_profile_dir(p: &Path) -> bool {
     let comps: Vec<_> = p.components().collect();
     comps.windows(2).any(|w| {
-        w[0].as_os_str() == "target" && (w[1].as_os_str() == "debug" || w[1].as_os_str() == "release")
+        w[0].as_os_str() == "target"
+            && (w[1].as_os_str() == "debug" || w[1].as_os_str() == "release")
     })
 }
 
@@ -51,7 +52,8 @@ pub(crate) fn git_binary() -> PathBuf {
                 .unwrap_or(path_var)
             });
             let cwd = std::env::current_dir().unwrap_or_default();
-            which::which_in("git", filtered_path.as_ref(), cwd).unwrap_or_else(|_| PathBuf::from("git"))
+            which::which_in("git", filtered_path.as_ref(), cwd)
+                .unwrap_or_else(|_| PathBuf::from("git"))
         })
         .clone()
 }
