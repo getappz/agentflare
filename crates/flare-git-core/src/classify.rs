@@ -8,9 +8,9 @@
 //! legitimate operation just because its allowlist hasn't caught up with
 //! git's full subcommand surface (submodule, bisect, notes, gc, lfs, ...).
 //! Only the specific, deliberately-chosen cases below (protected-branch
-//! checkout/switch, trust-root push, low-level plumbing, `worktree`) are
-//! ever denied -- those are known and intentional, not "doesn't recognize
-//! it". `RedirectToWorktree` exists in the `Disposition` enum for API
+//! checkout/switch/delete/rename, trust-root push, low-level plumbing,
+//! `worktree`) are ever denied -- those are known and intentional, not
+//! "doesn't recognize it". `RedirectToWorktree` exists in the `Disposition` enum for API
 //! completeness (mirroring the inspiration project's 4-way model) but v1's
 //! policy never produces it — agentflare has no per-agent worktree binding
 //! data available at classify time yet.
@@ -61,7 +61,6 @@ const READ_ONLY_SUBCOMMANDS: &[&str] = &[
     "config",
     "remote",
     "tag",
-    "branch",
     "fetch",
     "clone",
     "help",
@@ -135,6 +134,27 @@ pub fn classify_pure(
         };
     }
     match subcommand {
+        // Deletion/rename lumped with checkout/switch below: `git branch
+        // -D/-M <name>` is a second way to destroy or rename the protected
+        // branch's local ref, not covered by the checkout/switch guard.
+        // Every other `branch` usage (listing, creating a new branch,
+        // --set-upstream-to, ...) stays Passthrough.
+        "branch" => {
+            let deletes_or_renames = args
+                .iter()
+                .any(|a| matches!(a.as_str(), "-D" | "-d" | "--delete" | "-M" | "-m" | "--move"));
+            if !deletes_or_renames {
+                return Disposition::Passthrough;
+            }
+            let targets: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).map(String::as_str).collect();
+            if targets.iter().any(|t| is_protected_branch(t, Some(default_branch))) {
+                Disposition::Deny {
+                    reason: "this 'git branch' invocation would delete or rename the repo's default branch — blocked by the agentflare git shim.".to_string(),
+                }
+            } else {
+                Disposition::Passthrough
+            }
+        }
         "checkout" | "switch" => {
             let Some(target) = args.iter().find(|a| !a.starts_with('-')) else {
                 return Disposition::Passthrough; // no target arg (e.g. `git switch -`) — nothing to protect against
@@ -309,6 +329,43 @@ mod tests {
     fn push_not_touching_trust_root_passes_through() {
         assert_eq!(
             classify_pure("push", &args(&["origin", "feature/x"]), "master", false),
+            Disposition::Passthrough
+        );
+    }
+
+    #[test]
+    fn branch_delete_of_protected_branch_is_denied() {
+        assert!(matches!(
+            classify_pure("branch", &args(&["-D", "master"]), "master", false),
+            Disposition::Deny { .. }
+        ));
+        assert!(matches!(
+            classify_pure("branch", &args(&["--delete", "master"]), "master", false),
+            Disposition::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn branch_rename_of_protected_branch_is_denied() {
+        assert!(matches!(
+            classify_pure("branch", &args(&["-M", "master", "renamed"]), "master", false),
+            Disposition::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn branch_delete_of_feature_branch_passes_through() {
+        assert_eq!(
+            classify_pure("branch", &args(&["-D", "feature/x"]), "master", false),
+            Disposition::Passthrough
+        );
+    }
+
+    #[test]
+    fn branch_listing_and_creation_pass_through() {
+        assert_eq!(classify_pure("branch", &[], "master", false), Disposition::Passthrough);
+        assert_eq!(
+            classify_pure("branch", &args(&["feature/new"]), "master", false),
             Disposition::Passthrough
         );
     }
