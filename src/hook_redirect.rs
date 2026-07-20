@@ -17,6 +17,11 @@ const GATING_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Native/MCP tools that mutate files on disk — every one of these is gated
 /// by `branch_guard_reason` so a direct edit can never land on the repo's
 /// default branch, regardless of which of these the agent reaches for.
+/// Includes opencode's native tool names (`write`/`edit` lowercase already
+/// covered Claude Code's own lowercase variants; `patch`/`apply_patch`/
+/// `multiedit` are opencode-specific) — the opencode branch-guard plugin
+/// (`~/.config/opencode/plugin/branch-guard.js`) calls this same classifier
+/// via `agentflare hook pre-tool-use` instead of duplicating branch logic.
 const MUTATING_TOOLS: &[&str] = &[
     "Write",
     "write",
@@ -24,6 +29,10 @@ const MUTATING_TOOLS: &[&str] = &[
     "edit",
     "NotebookEdit",
     "notebookedit",
+    "MultiEdit",
+    "multiedit",
+    "patch",
+    "apply_patch",
     "mcp__lean-ctx__ctx_patch",
     "mcp__lean-ctx__ctx_edit",
 ];
@@ -219,6 +228,15 @@ mod tests {
         assert!(classify("edit", None, ctx).is_some());
         assert!(classify("write", None, ctx).is_some());
         assert!(classify("notebookedit", None, ctx).is_some());
+    }
+
+    #[test]
+    fn classify_blocks_opencode_native_tool_names_on_master() {
+        let ctx = (Some("master"), None);
+        assert!(classify("patch", None, ctx).is_some());
+        assert!(classify("apply_patch", None, ctx).is_some());
+        assert!(classify("multiedit", None, ctx).is_some());
+        assert!(classify("MultiEdit", None, ctx).is_some());
     }
 
     #[test]
