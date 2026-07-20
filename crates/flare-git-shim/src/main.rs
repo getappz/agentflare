@@ -27,6 +27,13 @@ use flare_git_core::{audit, branch, classify, snapshot};
 const RECURSION_ENV: &str = "FLARE_GIT_SHIM_DEPTH";
 const MAX_RECURSION_DEPTH: u32 = 3;
 
+/// Escape hatch for the dogfooding period (and beyond): set to skip
+/// classification entirely and exec the real binary unconditionally. A
+/// misclassification must never be able to block someone mid-work with no
+/// way out short of uninstalling the shim. Still audited (as a distinct
+/// disposition), so a bypass is visible after the fact, not silent.
+const BYPASS_ENV: &str = "AGENTFLARE_GIT_BYPASS";
+
 /// Global flags that redirect git to operate on a different repo than the
 /// one resolved via cwd (`-C`, `--git-dir`, `--work-tree`) -- denied
 /// outright rather than classified, since this shim's policy resolves the
@@ -103,6 +110,18 @@ fn main() {
         // init`, `git clone` into a fresh directory, `git --version`).
         run_real(&tool, filtered_path.as_ref(), &args);
     };
+
+    if agentflare_shim::is_set(BYPASS_ENV) {
+        if let Some(audit_path) = audit::default_path() {
+            let bypass_event = classify::Event {
+                subcommand: "*".to_string(),
+                args: args.iter().map(|a| a.to_string_lossy().into_owned()).collect(),
+                disposition: classify::Disposition::SilentExempt,
+            };
+            let _ = audit::log_event(&audit_path, &bypass_event);
+        }
+        run_real(&tool, filtered_path.as_ref(), &args);
+    }
 
     let str_args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
     let (subcommand_idx, escape_hatch) = parse_global_flags(&str_args);

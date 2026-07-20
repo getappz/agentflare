@@ -29,6 +29,21 @@ pub struct GitArgs {
 pub enum GitCommand {
     /// Install branch-protection pre-commit/pre-push hooks into this repo.
     InstallHooks(InstallHooksArgs),
+    /// Install the flare-git-shim binary (dogfooding/local use) as `git`
+    /// on PATH, so every git invocation on this machine gets classified.
+    InstallShim(InstallShimArgs),
+    /// Remove the git shim installed by `install-shim`.
+    UninstallShim,
+}
+
+#[derive(Args)]
+pub struct InstallShimArgs {
+    /// Path to a compiled flare-git-shim binary (its `[[bin]] name = "git"`
+    /// target) to install. No auto-discovery yet -- this is a dogfooding
+    /// aid, not the production release path (that will bundle the shim
+    /// alongside the main binary via install.sh/install.ps1).
+    #[arg(long)]
+    pub binary: PathBuf,
 }
 
 #[derive(Args)]
@@ -66,7 +81,121 @@ fn ensure_shared_templates() -> std::io::Result<()> {
 pub fn run(args: GitArgs) {
     match args.command {
         GitCommand::InstallHooks(opts) => install_hooks(opts),
+        GitCommand::InstallShim(opts) => install_shim(opts),
+        GitCommand::UninstallShim => uninstall_shim(),
     }
+}
+
+/// Canonical location: `~/.agentflare/shims/` -- same directory
+/// `agentflare-shim` (item #227's lean-ctx PATH shim) already uses, so
+/// there's one PATH entry to manage, not several.
+fn shims_dir() -> PathBuf {
+    home().join(".agentflare").join("shims")
+}
+
+fn shim_dest_name() -> &'static str {
+    if cfg!(windows) { "git.exe" } else { "git" }
+}
+
+fn install_shim(opts: InstallShimArgs) {
+    let dir = shims_dir();
+    if let Err(e) = fs::create_dir_all(&dir) {
+        crate::ui::error(&format!("agentflare git install-shim: cannot create {dir:?}: {e}"));
+        return;
+    }
+    let dest = dir.join(shim_dest_name());
+    if let Err(e) = fs::copy(&opts.binary, &dest) {
+        crate::ui::error(&format!(
+            "agentflare git install-shim: cannot copy {:?} to {dest:?}: {e}",
+            opts.binary
+        ));
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(0o755));
+    }
+    crate::ui::success(&format!("installed git shim -> {}", dest.display()));
+
+    match ensure_on_path(&dir) {
+        Ok(true) => crate::ui::success(&format!(
+            "added {} to your User PATH -- restart your terminal/IDE to pick it up",
+            dir.display()
+        )),
+        Ok(false) => crate::ui::success(&format!("{} already on PATH", dir.display())),
+        Err(e) => crate::ui::error(&format!("agentflare git install-shim: could not update PATH: {e}")),
+    }
+
+    println!(
+        "
+Once your PATH refreshes, every `git` command on this machine is classified by the agentflare git shim. Escape hatch: set AGENTFLARE_GIT_BYPASS=1 to skip classification for a command/session without uninstalling. Remove entirely with `agentflare git uninstall-shim`."
+    );
+}
+
+fn uninstall_shim() {
+    let dest = shims_dir().join(shim_dest_name());
+    if !dest.exists() {
+        crate::ui::success("git shim was not installed");
+        return;
+    }
+    match fs::remove_file(&dest) {
+        Ok(()) => crate::ui::success(&format!("removed {}", dest.display())),
+        Err(e) => crate::ui::error(&format!("agentflare git uninstall-shim: cannot remove {dest:?}: {e}")),
+    }
+    // Deliberately leaves the shims dir on PATH -- other shims (e.g. the
+    // lean-ctx one) may still live there; removing just this binary is
+    // enough to fully restore normal git behavior.
+}
+
+/// Prepends `dir` to the current user's persistent PATH (Windows: the
+/// `User` environment scope via PowerShell, since it needs to survive
+/// across terminal sessions and there's no portable non-shelling way to
+/// do this without an extra crate). Returns `Ok(true)` if PATH was
+/// changed, `Ok(false)` if `dir` was already present.
+#[cfg(windows)]
+fn ensure_on_path(dir: &std::path::Path) -> Result<bool, String> {
+    let dir_str = dir.to_string_lossy().to_string();
+    let get = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "[Environment]::GetEnvironmentVariable('PATH','User')",
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+    let current = String::from_utf8_lossy(&get.stdout).trim().to_string();
+    let already_present = current
+        .split(';')
+        .any(|p| p.trim_end_matches('\\').eq_ignore_ascii_case(dir_str.trim_end_matches('\\')));
+    if already_present {
+        return Ok(false);
+    }
+    let new_path = if current.is_empty() {
+        dir_str.clone()
+    } else {
+        format!("{dir_str};{current}")
+    };
+    let set_script = format!(
+        "[Environment]::SetEnvironmentVariable('PATH', '{}', 'User')",
+        new_path.replace('\'', "''")
+    );
+    let set = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &set_script])
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !set.success() {
+        return Err("powershell SetEnvironmentVariable failed".to_string());
+    }
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+fn ensure_on_path(_dir: &std::path::Path) -> Result<bool, String> {
+    // Not needed for this dogfooding session (Windows-only machine); the
+    // real install.sh wiring will handle shell-profile PATH export the
+    // same way it already does for the main binary's install dir.
+    Ok(false)
 }
 
 fn install_hooks(opts: InstallHooksArgs) {

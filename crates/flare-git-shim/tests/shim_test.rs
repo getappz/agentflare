@@ -88,6 +88,25 @@ fn outside_a_git_repo_passes_through() {
 }
 
 #[test]
+fn bypass_env_var_skips_classification_even_for_a_denied_command() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["some-made-up-subcommand"])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("AGENTFLARE_GIT_BYPASS", "1")
+        .output()
+        .unwrap();
+    // Real git also rejects the made-up subcommand, but for a DIFFERENT
+    // reason (unknown git command, not "denied by the shim") -- assert on
+    // stderr content, not just a nonzero exit, so this test would fail if
+    // bypass silently started denying again.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("denied"), "{stderr}");
+}
+
+#[test]
 fn denied_command_is_logged_to_the_audit_log() {
     let repo = init_repo();
     let home = tempfile::TempDir::new().unwrap();
