@@ -130,3 +130,158 @@ fn denied_command_is_logged_to_the_audit_log() {
     assert!(content.contains("checkout"), "{content}");
     assert!(content.contains("Deny"), "{content}");
 }
+
+#[test]
+fn bypass_agent_env_var_bypasses_only_for_the_matching_agent() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    assert!(flare_git_core::shell::run_in_ok(
+        repo.path(),
+        &["checkout", "-b", "feature/x"]
+    ));
+
+    // Matching agent -- bypasses.
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["checkout", "master"])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("AGENTFLARE_AGENT", "claude-code")
+        .env("AGENTFLARE_GIT_BYPASS_AGENT", "claude-code")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    // Back to feature/x, try again with a DIFFERENT agent -- must still deny.
+    flare_git_core::shell::run_in(repo.path(), &["checkout", "feature/x"]).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["checkout", "master"])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("AGENTFLARE_AGENT", "some-other-agent")
+        .env("AGENTFLARE_GIT_BYPASS_AGENT", "claude-code")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+}
+
+#[test]
+fn bypass_until_env_var_respects_the_deadline() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    assert!(flare_git_core::shell::run_in_ok(
+        repo.path(),
+        &["checkout", "-b", "feature/x"]
+    ));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Deadline in the past -- must still deny.
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["checkout", "master"])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("AGENTFLARE_GIT_BYPASS_UNTIL", (now - 60).to_string())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+
+    // Deadline in the future -- bypasses.
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["checkout", "master"])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("AGENTFLARE_GIT_BYPASS_UNTIL", (now + 3600).to_string())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+#[test]
+fn snapshots_disabled_env_var_skips_the_pre_destructive_snapshot() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    std::fs::write(repo.path().join("f.txt"), "dirty").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["reset", "--hard"])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("AGENTFLARE_GIT_SNAPSHOTS", "0")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        flare_git_core::snapshot::list(repo.path()).is_empty(),
+        "no snapshot should have been taken with AGENTFLARE_GIT_SNAPSHOTS=0"
+    );
+}
+
+#[test]
+fn snapshots_enabled_by_default_before_a_destructive_op() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    std::fs::write(repo.path().join("f.txt"), "dirty").unwrap();
+
+    let out = shim(repo.path(), home.path(), &["reset", "--hard"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        !flare_git_core::snapshot::list(repo.path()).is_empty(),
+        "a snapshot should have been taken by default"
+    );
+}
+
+#[test]
+fn canonical_repo_detach_is_denied_for_agent_invocation_but_not_human() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let sha = flare_git_core::shell::run_in(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+
+    // Agent-invoked (CLAUDECODE marker set) -- denied.
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["checkout", &sha])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("CLAUDECODE", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("canonical checkout"), "{stderr}");
+
+    // No agent marker -- ordinary human usage, passes through. This test
+    // process itself may be running under an agent-marked environment (it
+    // is, under Claude Code -- CLAUDECODE=1), so explicitly strip every
+    // agent marker rather than relying on ambient absence.
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["checkout", &sha])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env_remove("CLAUDECODE")
+        .env_remove("CURSOR_AGENT")
+        .env_remove("CODEX_CLI_SESSION")
+        .env_remove("GEMINI_SESSION")
+        .env_remove("CODEBUDDY")
+        .env_remove("AGENTFLARE_AGENT")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+#[test]
+fn canonical_repo_detach_allowed_with_escape_hatch() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let sha = flare_git_core::shell::run_in(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["checkout", &sha])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("CLAUDECODE", "1")
+        .env("AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}

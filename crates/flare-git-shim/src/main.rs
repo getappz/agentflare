@@ -13,6 +13,7 @@ use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentflare_shim::{path_without_shim_dir, run_real, tool_name_from_exe};
 use flare_git_core::{audit, branch, classify, snapshot};
@@ -27,12 +28,30 @@ use flare_git_core::{audit, branch, classify, snapshot};
 const RECURSION_ENV: &str = "FLARE_GIT_SHIM_DEPTH";
 const MAX_RECURSION_DEPTH: u32 = 3;
 
-/// Escape hatch for the dogfooding period (and beyond): set to skip
-/// classification entirely and exec the real binary unconditionally. A
-/// misclassification must never be able to block someone mid-work with no
-/// way out short of uninstalling the shim. Still audited (as a distinct
-/// disposition), so a bypass is visible after the fact, not silent.
-const BYPASS_ENV: &str = "AGENTFLARE_GIT_BYPASS";
+/// Tiered bypass, escape hatches for the dogfooding period (and beyond).
+/// All three skip classification entirely and exec the real binary
+/// unconditionally -- a misclassification must never be able to block
+/// someone mid-work with no way out short of uninstalling the shim. Still
+/// audited (as a distinct disposition), so a bypass is visible after the
+/// fact, not silent.
+const BYPASS_ENV: &str = "AGENTFLARE_GIT_BYPASS"; // one-shot: set at all -> bypass
+const BYPASS_AGENT_ENV: &str = "AGENTFLARE_GIT_BYPASS_AGENT"; // bypass iff it equals AGENTFLARE_AGENT
+const BYPASS_UNTIL_ENV: &str = "AGENTFLARE_GIT_BYPASS_UNTIL"; // bypass iff now < this unix epoch
+
+/// `AGENTFLARE_GIT_SNAPSHOTS=0`/`off` disables the automatic pre-destructive
+/// snapshot; any other value (or unset) leaves it enabled. Snapshotting is
+/// a pure safety net (never blocks the underlying op even on failure), so
+/// the default here is ON -- unlike the reference project, which defaults
+/// it off in raw shim mode and on only inside its own launched sessions;
+/// this shim has no separate "launched session" mode, so ON is the safer
+/// default for a shim installed directly on someone's daily-driver PATH.
+const SNAPSHOTS_ENV: &str = "AGENTFLARE_GIT_SNAPSHOTS";
+
+/// Escape hatch for the canonical-repo HEAD-detach guard (see
+/// `deny_canonical_detach_reason`) -- set to allow an agent-invoked
+/// checkout/switch that would detach HEAD in the canonical (non-worktree)
+/// checkout.
+const ALLOW_CANONICAL_MUTATE_ENV: &str = "AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE";
 
 /// Global flags that redirect git to operate on a different repo than the
 /// one resolved via cwd (`-C`, `--git-dir`, `--work-tree`) -- denied
@@ -64,6 +83,63 @@ fn parse_global_flags(args: &[String]) -> (Option<usize>, bool) {
         i += if GLOBAL_FLAGS_WITH_VALUE.contains(&a.as_str()) { 2 } else { 1 };
     }
     (None, escape_hatch)
+}
+
+/// `true` if any bypass condition is currently active.
+fn bypass_active() -> bool {
+    if agentflare_shim::is_set(BYPASS_ENV) {
+        return true;
+    }
+    if let Ok(target_agent) = env::var(BYPASS_AGENT_ENV)
+        && !target_agent.is_empty()
+        && env::var("AGENTFLARE_AGENT").ok().as_deref() == Some(target_agent.as_str())
+    {
+        return true;
+    }
+    if let Ok(until) = env::var(BYPASS_UNTIL_ENV)
+        && let Ok(until_epoch) = until.parse::<u64>()
+    {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now < until_epoch {
+            return true;
+        }
+    }
+    false
+}
+
+/// `false` only when explicitly disabled via `AGENTFLARE_GIT_SNAPSHOTS=0`/`off`.
+fn snapshots_enabled() -> bool {
+    match env::var(SNAPSHOTS_ENV) {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("off"),
+        Err(_) => true,
+    }
+}
+
+/// Deny reason for the canonical-repo HEAD-detach guard, or `None` to let
+/// the op through. Scoped tightly on purpose: agent-invoked (self-reported
+/// via env markers, same as `agentflare-shim`'s own gate) AND the canonical
+/// (non-worktree) checkout AND the command would actually detach HEAD.
+/// Interactive human use, and any use inside an isolated worktree, is
+/// completely unaffected.
+fn deny_canonical_detach_reason(repo_root: &Path, subcommand: &str, args: &[String]) -> Option<String> {
+    if agentflare_shim::is_set(ALLOW_CANONICAL_MUTATE_ENV) {
+        return None;
+    }
+    if !classify::agent_invocation_detected() {
+        return None;
+    }
+    if branch::is_linked_worktree(repo_root) {
+        return None; // agent worktrees are exactly where this is expected
+    }
+    if !classify::would_detach_head(repo_root, subcommand, args) {
+        return None;
+    }
+    Some(format!(
+        "this would detach HEAD in the canonical checkout (not an isolated worktree) while agent-invoked -- set {ALLOW_CANONICAL_MUTATE_ENV}=1 to override, or work in an isolated worktree instead."
+    ))
 }
 
 fn main() {
@@ -111,8 +187,8 @@ fn main() {
         run_real(&tool, filtered_path.as_ref(), &args);
     };
 
-    if agentflare_shim::is_set(BYPASS_ENV) {
-        if let Some(audit_path) = audit::default_path() {
+    if bypass_active() {
+        if let Some(audit_path) = audit::default_path("git.jsonl") {
             let bypass_event = classify::Event {
                 subcommand: "*".to_string(),
                 args: args.iter().map(|a| a.to_string_lossy().into_owned()).collect(),
@@ -139,9 +215,22 @@ fn main() {
     let subcommand = str_args[idx].clone();
     let rest: Vec<String> = str_args[idx + 1..].to_vec();
 
+    if let Some(reason) = deny_canonical_detach_reason(&repo_root, &subcommand, &rest) {
+        let event = classify::Event {
+            subcommand: subcommand.clone(),
+            args: rest.clone(),
+            disposition: classify::Disposition::Deny { reason: reason.clone() },
+        };
+        if let Some(audit_path) = audit::default_path("git.jsonl") {
+            let _ = audit::log_event(&audit_path, &event);
+        }
+        eprintln!("agentflare git shim: denied — {reason}");
+        exit(1);
+    }
+
     let event = classify::classify(&repo_root, &subcommand, &rest);
 
-    if let Some(audit_path) = audit::default_path() {
+    if let Some(audit_path) = audit::default_path("git.jsonl") {
         let _ = audit::log_event(&audit_path, &event);
     }
 
@@ -161,11 +250,11 @@ fn main() {
             exit(1);
         }
         classify::Disposition::Passthrough | classify::Disposition::SilentExempt => {
-            if classify::is_destructive(&subcommand, &rest) {
+            if snapshots_enabled() && classify::is_destructive(&subcommand, &rest) {
                 let reason = format!("pre-{subcommand} snapshot ({})", rest.join(" "));
                 match snapshot::snapshot_before(&repo_root, &reason) {
                     Ok(id) => eprintln!(
-                        "agentflare git shim: snapshotted before destructive '{subcommand}' (id {}) -- restorable if this goes wrong.",
+                        "agentflare git shim: snapshotted before destructive '{subcommand}' (id {}) -- restore with `agentflare git snapshot restore`.",
                         id.0
                     ),
                     Err(e) => eprintln!(

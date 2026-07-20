@@ -198,7 +198,11 @@ mod tests {
     #[test]
     fn is_linked_worktree_true_inside_an_actual_linked_worktree() {
         let repo = init_repo_with_branch("master");
-        let wt_path = repo.path.parent().unwrap().join("wt-check");
+        // A fresh TempDir of its own -- `repo.path.parent()` is the SHARED
+        // system temp root, which every parallel test also creates
+        // directories under, and can collide with a leftover path.
+        let wt_parent = tempfile::TempDir::new().unwrap();
+        let wt_path = wt_parent.path().join("wt-check");
         crate::shell::run_in(
             &repo.path,
             &["worktree", "add", wt_path.to_str().unwrap(), "-b", "wt-branch"],
