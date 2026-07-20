@@ -177,7 +177,7 @@ impl AgentflareMcp {
                 })?
             }
             "list" => {
-                let ws_id = match self.with_backend_db(|conn| Self::resolve_workspace_id(conn)) {
+                let ws_id = match self.with_backend_db(Self::resolve_workspace_id) {
                     Ok(Ok(id)) => id,
                     Ok(Err(e)) => return Err(ErrorData::internal_error(e.to_string(), None)),
                     Err(e) => return Err(e),

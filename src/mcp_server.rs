@@ -636,14 +636,14 @@ impl AgentflareMcp {
         // One-time backfill: try_lock to avoid deadlock when called from
         // within with_backend_db (attach handler nests store inside backend).
         // If backend isn't open yet, skip — with_backend_db will handle it.
-        if let Ok(bg) = self.backend_db.try_lock() {
-            if let Some(ref conn) = *bg {
-                let base_path = crate::paths::home().join(".agentflare");
-                if let Ok(s) = self.store.lock() {
-                    if let Some(ref store) = *s {
-                        let _ = crate::asset_store::backfill_legacy_assets(store, conn, &base_path);
-                    }
-                }
+        if let Ok(bg) = self.backend_db.try_lock()
+            && let Some(ref conn) = *bg
+        {
+            let base_path = crate::paths::home().join(".agentflare");
+            if let Ok(s) = self.store.lock()
+                && let Some(ref store) = *s
+            {
+                let _ = crate::asset_store::backfill_legacy_assets(store, conn, &base_path);
             }
         }
 
