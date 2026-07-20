@@ -11,6 +11,22 @@ use std::time::Duration;
 
 const STDIN_TIMEOUT_MS: u64 = 1000;
 
+// Brand palette — same codes as `banner::colorize` (magenta wordmark, cyan
+// dividers) so hook output matches the CLI. Gated on `NO_COLOR` only, not
+// `interactive()`: hook stdout is always a pipe back to the host agent, never
+// the real terminal, so a TTY check here would just disable color outright.
+const BRAND: &str = "\x1b[1;35m";
+const HEADING: &str = "\x1b[2;36m";
+const RESET: &str = "\x1b[0m";
+
+fn colorize(code: &str, s: &str) -> String {
+    if std::env::var_os("NO_COLOR").is_some() {
+        s.to_string()
+    } else {
+        format!("{code}{s}{RESET}")
+    }
+}
+
 fn read_stdin_timeout(ms: u64) -> Option<String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -62,6 +78,7 @@ pub fn session_start(agent: &str) {
 
 fn session_start_message(agent: &str) -> String {
     let components = get_components(agent);
+    let is_active = |id: &str| components.iter().any(|c| c.id == id && (c.check)());
     let mut lines = vec![];
     let mut pending = vec![];
 
@@ -78,8 +95,9 @@ fn session_start_message(agent: &str) -> String {
 
     if !pending.is_empty() {
         lines.push(String::new());
-        lines.push(format!(
-            "agentflare: the following aren't set up yet — run `agentflare init --agent {agent}` to install them:"
+        lines.push(colorize(
+            HEADING,
+            &format!("agentflare: setup needed — run `agentflare init --agent {agent}`:"),
         ));
         for d in pending {
             lines.push(format!("  - {d}"));
@@ -89,7 +107,7 @@ fn session_start_message(agent: &str) -> String {
     let rule_bodies = crate::coaching::untriggered_rule_bodies();
     if !rule_bodies.is_empty() {
         lines.push(String::new());
-        lines.push("Coaching rules:".to_string());
+        lines.push(colorize(HEADING, "Coaching rules:"));
         for body in rule_bodies {
             lines.push(format!("  - {body}"));
         }
@@ -112,9 +130,12 @@ fn session_start_message(agent: &str) -> String {
         && !items.is_empty()
     {
         lines.push(String::new());
-        lines.push(format!(
-            "Pending items assigned to you ({agent}, {} open):",
-            items.len()
+        lines.push(colorize(
+            HEADING,
+            &format!(
+                "Pending items assigned to you ({agent}, {} open):",
+                items.len()
+            ),
         ));
         const MAX_SHOWN: usize = 10;
         for item in items.iter().take(MAX_SHOWN) {
@@ -125,19 +146,34 @@ fn session_start_message(agent: &str) -> String {
         }
     }
 
+    // Closing status line: names only the tools this session can actually
+    // reach — each tag is gated on the matching component's own `check()` so
+    // it never claims a feature that isn't wired up. (Previously this was a
+    // static line claiming lean-ctx/Exa/MCP tools were active regardless of
+    // whether `agentflare init` had ever registered them.)
+    let mut tags = vec![];
+    if is_active("leanctx") {
+        tags.push("lean-ctx ctx_* tools");
+    }
+    if is_active("rules") {
+        tags.push("Exa search, clean commits");
+    }
+    if is_active("agentflare-mcp") {
+        tags.push("skill_search/skill_load + memory_* MCP tools");
+    }
     lines.push(String::new());
-    lines.push(
-        "AGENTFLARE ACTIVE — lean-ctx tools, Exa search, clean git commits. Off: /agentflare off."
-            .to_string(),
-    );
-    lines.push(
-        "Skills load on demand: before assuming a relevant skill doesn't exist, call skill_search(query) then skill_load(name) via the agentflare MCP tools."
-            .to_string(),
-    );
-    lines.push(
-        "Memory: agentflare's built-in memory_remember/memory_recall/memory_context/memory_handoff/memory_relate/memory_curate MCP tools (or `agentflare memory ...` CLI) — no install needed, call directly."
-            .to_string(),
-    );
+    lines.push(if tags.is_empty() {
+        format!(
+            "{} — nothing active yet, see setup above.",
+            colorize(BRAND, "agentflare")
+        )
+    } else {
+        format!(
+            "{} active — {}. /agentflare off to disable.",
+            colorize(BRAND, "agentflare"),
+            tags.join("; ")
+        )
+    });
 
     lines.join("\n")
 }
@@ -313,6 +349,22 @@ pub fn pre_compact(_agent: &str) {}
 /// end after an upgrade. New installs never wire this hook (see init.rs).
 pub fn session_end(_agent: &str) {}
 
+/// Static identity/rules reminder — sent once per session (first turn only,
+/// not every turn) and gated on which components are actually active, so it
+/// never claims a tool that isn't wired up. Uses the same terse `@tag:`
+/// syntax as the rule files in `rule_text.rs` instead of full sentences.
+fn identity_bits(components: &[crate::components::Component]) -> Vec<String> {
+    let is_active = |id: &str| components.iter().any(|c| c.id == id && (c.check)());
+    let mut bits = vec!["@agentflare: active — /agentflare off to disable".to_string()];
+    if is_active("leanctx") {
+        bits.push("@use: lean-ctx ctx_* over native Read/Grep/Bash/Glob".to_string());
+    }
+    if is_active("rules") {
+        bits.push("@use: Exa for web search; clean git commits, no AI signature".to_string());
+    }
+    bits
+}
+
 pub fn prompt_submit(agent: &str) {
     let Some(input) = read_stdin_or_skip("UserPromptSubmit") else {
         return;
@@ -367,27 +419,13 @@ pub fn prompt_submit(agent: &str) {
         }
     });
 
-    let mut bits = vec![
-        "AGENTFLARE ACTIVE.".to_string(),
-        "Prefer lean-ctx ctx_* tools over native Read/Grep/Bash/Glob.".to_string(),
-        "Exa is the only web search tool.".to_string(),
-        "Clean git commits, no AI signature.".to_string(),
-    ];
-    if let Some(block) = crate::mentions::expand(prompt) {
-        bits.push(block);
-    }
-    let pending = get_components(agent)
-        .iter()
-        .any(|c| c.needs_consent && !(c.check)());
-    if pending {
-        bits.push(format!(
-            "Reminder: `agentflare init --agent {agent}` to finish setup."
-        ));
-    }
-
     let router = crate::optimize::active_router();
+    let mut session_bits = vec![];
+    // No session_id to track turn count against (rare) — always remind, same
+    // as a first turn.
+    let mut first_turn = session_id.is_none();
 
-    if let Some(sid) = session_id {
+    if let Some(sid) = &session_id {
         let mut runtime = crate::optimize::load_runtime();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -403,21 +441,22 @@ pub fn prompt_submit(agent: &str) {
                     turn_count: 0,
                     recent_tool_calls: vec![],
                 });
+        first_turn = record.turn_count == 0;
         record.turn_count += 1;
 
         let ctx = crate::optimize::RouteContext {
             prompt: prompt.to_string(),
-            session_id: sid,
+            session_id: sid.clone(),
             turn_count: record.turn_count,
             recent_tool_calls: record.recent_tool_calls.clone(),
             current_model: None,
         };
         if let Some(nudge) = router.route(&ctx) {
-            bits.push(nudge);
+            session_bits.push(nudge);
         }
 
         if let Some(nudge) = crate::optimize::session_hygiene_nudge(record, now) {
-            bits.push(nudge);
+            session_bits.push(nudge);
         }
         crate::optimize::save_runtime(&runtime);
     } else {
@@ -429,10 +468,24 @@ pub fn prompt_submit(agent: &str) {
             current_model: None,
         };
         if let Some(nudge) = router.route(&ctx) {
-            bits.push(nudge);
+            session_bits.push(nudge);
         }
     }
 
+    let components = get_components(agent);
+    let mut bits = if first_turn {
+        identity_bits(&components)
+    } else {
+        vec![]
+    };
+    if let Some(block) = crate::mentions::expand(prompt) {
+        bits.push(block);
+    }
+    let pending = components.iter().any(|c| c.needs_consent && !(c.check)());
+    if pending {
+        bits.push(format!("@setup: agentflare init --agent {agent}"));
+    }
+    bits.extend(session_bits);
     bits.extend(crate::coaching::rule_bodies_for_prompt(prompt));
 
     let out = json!({
@@ -588,22 +641,35 @@ second line
     }
 
     #[test]
-    fn session_start_message_nudges_skill_search_before_load() {
+    fn session_start_message_names_skill_and_memory_tools_when_mcp_registered() {
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
+            std::fs::write(
+                crate::paths::claude_json_path(),
+                r#"{"mcpServers": {"flare": {"command": "agentflare", "args": ["mcp"]}}}"#,
+            )
+            .unwrap();
+
             let msg = session_start_message("claude-code");
-            assert!(msg.contains("skill_search(query)"));
-            assert!(msg.contains("skill_load(name)"));
+            assert!(msg.contains("skill_search/skill_load"));
+            assert!(msg.contains("memory_*"));
         });
     }
 
     #[test]
-    fn session_start_message_points_to_builtin_memory_tools() {
+    fn session_start_message_does_not_claim_unregistered_mcp_tools() {
+        // Regression test: the closing status line must never claim a
+        // feature is active when its component's own `check()` says
+        // otherwise — a fresh $HOME has no `flare` MCP server registered, so
+        // skill/memory tooling must not be mentioned as active. (The pending
+        // setup section legitimately mentions "skill_search/skill_load" in
+        // its describe text, so assert on the full active-tag phrase rather
+        // than that substring alone.)
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
             let msg = session_start_message("claude-code");
-            assert!(msg.contains("memory_remember"));
-            assert!(msg.contains("memory_recall"));
+            assert!(!msg.contains("skill_search/skill_load + memory_*"));
+            assert!(!msg.contains("memory_*"));
         });
     }
 

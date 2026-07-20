@@ -72,6 +72,7 @@ extract_asset() {
 }
 
 skipped_platforms=()
+published_platform_deps=() # "@scope/agentflare-os-arch" entries actually published, for the main package's optionalDependencies
 
 for entry in "${platforms[@]}"; do
 	IFS=":" read -r npm_plat rust_target ext <<<"$entry"
@@ -136,86 +137,92 @@ EOF
 		}
 	fi
 	popd
+
+	published_platform_deps+=("$pkg_name")
 done
 
-# Publish main wrapper package
+# Publish main wrapper package. It carries no compiled binary and no
+# install-time script -- the platform packages above are declared as
+# optionalDependencies (npm/yarn/pnpm resolve+fetch+verify only the one
+# matching this machine's os/cpu natively, the same way they already do for
+# every other dependency), and bin/agentflare.js is a small shim that, at
+# *invocation* time, resolves whichever platform package actually got
+# installed and execs it. No script runs at `npm install` time.
 rm -rf "$RELEASE_DIR/npm"
-mkdir -p "$RELEASE_DIR/npm"
+mkdir -p "$RELEASE_DIR/npm/bin"
 
 cp README.md "$RELEASE_DIR/npm/README.md" 2>/dev/null || true
 
-# installArchSpecificPackage.js — embedded to keep it versioned with the script
-cat <<'JSEOF' >"$RELEASE_DIR/npm/installArchSpecificPackage.js"
-var spawn = require('child_process').spawn;
-var path = require('path');
-var fs = require('fs');
+# bin/agentflare.js -- embedded to keep it versioned with the script
+cat <<'JSEOF' >"$RELEASE_DIR/npm/bin/agentflare.js"
+#!/usr/bin/env node
+"use strict";
 
-function installArchSpecificPackage(version) {
-    process.env.npm_config_global = 'false';
+var spawnSync = require("child_process").spawnSync;
+var path = require("path");
 
-    var platform = process.platform;
-    var arch = process.arch;
+// Keep in sync with the `platforms` array in scripts/release-npm.sh.
+var PLATFORM_PACKAGES = {
+    "linux-x64": "@getappz/agentflare-linux-x64",
+    "linux-arm64": "@getappz/agentflare-linux-arm64",
+    "darwin-x64": "@getappz/agentflare-darwin-x64",
+    "darwin-arm64": "@getappz/agentflare-darwin-arm64",
+    "win32-x64": "@getappz/agentflare-win32-x64"
+};
 
-    var pkg = ['@getappz', 'agentflare', platform, arch].join('-');
-    console.log('Installing platform-specific package:', pkg + '@' + version);
-
-    var cp = spawn(platform === 'win32' ? 'npm.cmd' : 'npm', ['install', '--no-save', pkg + '@' + version], {
-        stdio: 'inherit',
-        shell: true
-    });
-
-    cp.on('close', function(code) {
-        if (code !== 0) {
-            return process.exit(code);
-        }
-
-        var pkgJson;
-        try {
-            pkgJson = require.resolve(pkg + '/package.json');
-        } catch (e) {
-            console.error('Failed to resolve platform package:', pkg);
-            return process.exit(1);
-        }
-
-        var subpkg = JSON.parse(fs.readFileSync(pkgJson, 'utf8'));
-        var executable = subpkg.bin.agentflare;
-        var bin = path.resolve(path.dirname(pkgJson), executable);
-
-        try {
-            fs.mkdirSync(path.resolve(process.cwd(), 'bin'));
-        } catch (e) {
-            if (e.code !== 'EEXIST') {
-                throw e;
-            }
-        }
-
-        linkSync(bin, path.resolve(process.cwd(), executable));
-
-        if (platform === 'win32') {
-            var mainPkg = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'package.json'), 'utf8'));
-            fs.writeFileSync(path.resolve(process.cwd(), 'bin/agentflare'), 'placeholder');
-            mainPkg.bin.agentflare = 'bin/agentflare.exe';
-            fs.writeFileSync(path.resolve(process.cwd(), 'package.json'), JSON.stringify(mainPkg, null, 2));
-        }
-
-        return process.exit(0);
-    });
-}
-
-function linkSync(src, dest) {
-    try {
-        fs.unlinkSync(dest);
-    } catch (e) {
-        if (e.code !== 'ENOENT') {
-            throw e;
-        }
+function resolveBinary() {
+    var key = process.platform + "-" + process.arch;
+    var pkg = PLATFORM_PACKAGES[key];
+    if (!pkg) {
+        console.error("agentflare: unsupported platform " + key);
+        process.exit(1);
     }
-    return fs.linkSync(src, dest);
+
+    var pkgJsonPath;
+    try {
+        pkgJsonPath = require.resolve(pkg + "/package.json");
+    } catch (e) {
+        console.error(
+            "agentflare: platform package " + pkg + " is not installed.\n" +
+            "This usually means your package manager skipped optionalDependencies\n" +
+            "(e.g. --no-optional / --omit=optional), or " + key + " has no published build."
+        );
+        process.exit(1);
+    }
+
+    var pkgJson = require(pkgJsonPath);
+    var binRel = typeof pkgJson.bin === "string" ? pkgJson.bin : pkgJson.bin.agentflare;
+    return path.join(path.dirname(pkgJsonPath), binRel);
 }
 
-var pjson = require('./package.json');
-installArchSpecificPackage(pjson.version);
+var bin = resolveBinary();
+var result = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
+
+if (result.error) {
+    console.error("agentflare: failed to launch " + bin + ": " + result.error.message);
+    process.exit(1);
+}
+if (result.signal) {
+    process.kill(process.pid, result.signal);
+}
+process.exit(result.status === null ? 1 : result.status);
+
 JSEOF
+chmod +x "$RELEASE_DIR/npm/bin/agentflare.js"
+
+# Build the optionalDependencies object from whichever platform packages
+# actually published above (a platform whose release asset was missing gets
+# neither a package nor an entry here -- see the skipped_platforms check at
+# the end of this script).
+optional_deps_json="{}"
+if [ "${#published_platform_deps[@]}" -gt 0 ]; then
+	optional_deps_entries=""
+	for dep in "${published_platform_deps[@]}"; do
+		optional_deps_entries+="    \"$dep\": \"$AGENTFLARE_NPM_VERSION\",\n"
+	done
+	optional_deps_json="{\n${optional_deps_entries%',\n'}\n  }"
+fi
+optional_deps_json="$(printf '%b' "$optional_deps_json")"
 
 cat <<EOF >"$RELEASE_DIR/npm/package.json"
 {
@@ -227,19 +234,16 @@ cat <<EOF >"$RELEASE_DIR/npm/package.json"
     "url": "https://github.com/getappz/agentflare"
   },
   "files": [
-    "installArchSpecificPackage.js",
+    "bin",
     "README.md"
   ],
-  "scripts": {
-    "prepack": "rm -rf bin",
-    "preinstall": "node installArchSpecificPackage.js"
-  },
   "bin": {
-    "agentflare": "./bin/agentflare"
+    "agentflare": "bin/agentflare.js"
   },
+  "optionalDependencies": $optional_deps_json,
   "license": "MIT",
   "engines": {
-    "node": ">=5.0.0"
+    "node": ">=16"
   }
 }
 EOF
