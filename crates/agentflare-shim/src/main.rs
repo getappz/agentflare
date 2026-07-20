@@ -30,6 +30,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 
+use agentflare_shim::{is_set, path_without_shim_dir, run_real, tool_name_from_exe, trace};
+
 const KILL_SWITCHES: &[&str] = &["LEAN_CTX_DISABLED", "LEAN_CTX_NO_HOOK"];
 
 const AGENT_ENV_VARS: &[&str] = &[
@@ -42,10 +44,6 @@ const AGENT_ENV_VARS: &[&str] = &[
 ];
 
 const PROJECT_MARKER: &str = ".agentflare";
-
-fn is_set(name: &str) -> bool {
-    env::var_os(name).is_some_and(|v| !v.is_empty())
-}
 
 fn any_set(names: &[&str]) -> bool {
     names.iter().any(|n| is_set(n))
@@ -69,39 +67,6 @@ fn in_scoped_project(start: &Path, home: Option<&Path>) -> bool {
     false
 }
 
-/// PATH with `shim_dir` removed, so neither our own real-binary lookup nor a
-/// `lean-ctx -c` child process resolves back into this shim (self-recursion).
-fn path_without_shim_dir(shim_dir: &Path) -> Option<OsString> {
-    let path_var = env::var_os("PATH")?;
-    env::join_paths(env::split_paths(&path_var).filter(|p| p != shim_dir)).ok()
-}
-
-fn trace(msg: &str) {
-    if is_set("AGENTFLARE_SHIM_TRACE") {
-        eprintln!("[flare-trace] {msg}");
-    }
-}
-
-fn run_real(tool: &str, filtered_path: Option<&OsString>, args: &[OsString]) -> ! {
-    trace(&format!("real: {tool}"));
-    let cwd = env::current_dir().unwrap_or_default();
-    let resolved = match filtered_path {
-        Some(p) => which::which_in(tool, Some(p), cwd),
-        None => which::which(tool),
-    };
-    let Ok(real) = resolved else {
-        eprintln!("agentflare-shim: command not found: {tool}");
-        exit(127);
-    };
-    match Command::new(real).args(args).status() {
-        Ok(status) => exit(status.code().unwrap_or(1)),
-        Err(e) => {
-            eprintln!("agentflare-shim: failed to exec {tool}: {e}");
-            exit(127)
-        }
-    }
-}
-
 fn main() {
     let exe = match env::current_exe() {
         Ok(p) => p,
@@ -110,7 +75,7 @@ fn main() {
             exit(1);
         }
     };
-    let Some(tool) = exe.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+    let Some(tool) = tool_name_from_exe(&exe) else {
         eprintln!("agentflare-shim: failed to determine tool name from executable path");
         exit(1);
     };
