@@ -353,8 +353,7 @@ pub fn session_end(_agent: &str) {}
 /// not every turn) and gated on which components are actually active, so it
 /// never claims a tool that isn't wired up. Uses the same terse `@tag:`
 /// syntax as the rule files in `rule_text.rs` instead of full sentences.
-fn identity_bits(agent: &str) -> Vec<String> {
-    let components = get_components(agent);
+fn identity_bits(components: &[crate::components::Component]) -> Vec<String> {
     let is_active = |id: &str| components.iter().any(|c| c.id == id && (c.check)());
     let mut bits = vec!["@agentflare: active — /agentflare off to disable".to_string()];
     if is_active("leanctx") {
@@ -473,17 +472,16 @@ pub fn prompt_submit(agent: &str) {
         }
     }
 
+    let components = get_components(agent);
     let mut bits = if first_turn {
-        identity_bits(agent)
+        identity_bits(&components)
     } else {
         vec![]
     };
     if let Some(block) = crate::mentions::expand(prompt) {
         bits.push(block);
     }
-    let pending = get_components(agent)
-        .iter()
-        .any(|c| c.needs_consent && !(c.check)());
+    let pending = components.iter().any(|c| c.needs_consent && !(c.check)());
     if pending {
         bits.push(format!("@setup: agentflare init --agent {agent}"));
     }
