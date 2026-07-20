@@ -894,3 +894,16 @@ pub(crate) struct AssetRequest {
     #[serde(default)]
     pub(crate) metadata: Option<String>,
 }
+
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SearchRequest {
+    #[schemars(description = "Search query")]
+    pub(crate) query: String,
+    #[schemars(description = "Search type: 'store' (default, FTS search across indexed documents) or 'web' (internet search)")]
+    #[serde(default)]
+    pub(crate) r#type: Option<String>,
+    #[schemars(description = "Max results per group (default 20)")]
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+}

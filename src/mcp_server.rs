@@ -11,6 +11,7 @@ mod handoff;
 pub(crate) mod item;
 mod memory_tool;
 mod review;
+pub(crate) mod search;
 pub(crate) mod types;
 
 use crate::optimize;
@@ -1370,6 +1371,13 @@ impl AgentflareMcp {
     )]
     fn asset(&self, Parameters(req): Parameters<AssetRequest>) -> Result<String, ErrorData> {
         self.asset_impl(req)
+    }
+
+    #[tool(
+        description = "Global unified search across three sources. type='store' (default) — FTS search across indexed store documents (artifacts, memories, notes), grouped by doc_type. type='code' — code search via lean-ctx grep (FTS5/symbol/regex). type='web' — internet search via rivalsearch (invoke from agent level, not yet in Rust). Returns { query, source, total, groups|results }."
+    )]
+    fn search(&self, Parameters(req): Parameters<SearchRequest>) -> Result<String, ErrorData> {
+        self.search_impl(req)
     }
 }
 
