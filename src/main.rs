@@ -4,6 +4,7 @@ mod agent_launch;
 mod agents;
 mod alias;
 mod artifacts;
+mod asset_store;
 mod atomic_fs;
 mod auth;
 mod auth_crypt;

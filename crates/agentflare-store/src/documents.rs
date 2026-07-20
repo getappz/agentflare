@@ -18,6 +18,8 @@ pub struct Document {
     pub version: i32,
     pub created_at: i64,
     pub updated_at: i64,
+    pub metadata: String,
+    pub size: i64,
     pub deleted_at: Option<i64>,
 }
 
@@ -30,6 +32,8 @@ pub struct DocVersion {
     pub blob_hash: Option<String>,
     pub mime: String,
     pub title: String,
+    pub metadata: String,
+    pub size: i64,
     pub created_at: i64,
 }
 
@@ -51,6 +55,8 @@ pub struct DocUpsertOpts {
     pub tags: Option<Vec<String>>,
     pub session_id: Option<String>,
     pub source: Option<String>,
+    pub metadata: Option<String>,
+    pub size: Option<i64>,
 }
 
 impl Store {
@@ -86,9 +92,11 @@ impl Store {
             session_id: row.get(9)?,
             source: row.get(10)?,
             version: row.get(11)?,
-            created_at: row.get(12)?,
-            updated_at: row.get(13)?,
-            deleted_at: row.get(14)?,
+            metadata: row.get(12)?,
+            size: row.get(13)?,
+            created_at: row.get(14)?,
+            updated_at: row.get(15)?,
+            deleted_at: row.get(16)?,
         })
     }
 
@@ -120,7 +128,7 @@ impl Store {
 
         let existing = tx
             .query_row(
-                "SELECT id, rowid, content, version, blob_hash, mime FROM store_documents
+                "SELECT id, rowid, content, version, blob_hash, mime, metadata, size FROM store_documents
                  WHERE project_id = ?1 AND path = ?2",
                 params![project_id, path],
                 |row| {
@@ -131,22 +139,32 @@ impl Store {
                         row.get::<_, i32>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
                     ))
                 },
             )
             .optional()?;
 
-        if let Some((existing_id, rowid, old_content, old_version, old_blob_hash, old_mime)) =
-            existing
+        if let Some((
+            existing_id,
+            rowid,
+            old_content,
+            old_version,
+            old_blob_hash,
+            old_mime,
+            old_metadata,
+            old_size,
+        )) = existing
         {
             let new_version = old_version + 1;
             let history_id = db_kit::ids::new_id();
 
             // Snapshot current version to history
             tx.execute(
-                "INSERT INTO store_doc_history (id, doc_id, version, content, blob_hash, mime, title, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT title FROM store_documents WHERE id = ?2), ?7)",
-                params![history_id, existing_id, old_version, old_content, old_blob_hash, old_mime, now],
+                "INSERT INTO store_doc_history (id, doc_id, version, content, blob_hash, mime, title, metadata, size, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT title FROM store_documents WHERE id = ?2), ?7, ?8, ?9)",
+                params![history_id, existing_id, old_version, old_content, old_blob_hash, old_mime, old_metadata, old_size, now],
             )?;
 
             tx.execute(
@@ -201,6 +219,18 @@ impl Store {
                     params![source, existing_id],
                 )?;
             }
+            if let Some(metadata) = &opts.metadata {
+                tx.execute(
+                    "UPDATE store_documents SET metadata = ?1 WHERE id = ?2",
+                    params![metadata, existing_id],
+                )?;
+            }
+            if let Some(size) = opts.size {
+                tx.execute(
+                    "UPDATE store_documents SET size = ?1 WHERE id = ?2",
+                    params![size, existing_id],
+                )?;
+            }
 
             Self::doc_sync_fts(&tx, rowid, content)?;
             tx.commit()?;
@@ -214,16 +244,18 @@ impl Store {
             let tags_val = opts.tags.unwrap_or_default();
             let tags_json = serde_json::to_string(&tags_val).unwrap_or_else(|_| "[]".to_string());
             let source = opts.source.unwrap_or_default();
+            let metadata = opts.metadata.unwrap_or_else(|| "{}".to_string());
+            let size = opts.size.unwrap_or(0);
 
             // Insert + FTS sync share this transaction so a failure between
             // the two can't leave a document without its search index row.
             tx.execute(
                 "INSERT INTO store_documents
-                 (id, project_id, path, content, title, doc_type, blob_hash, mime, tags, session_id, source, version, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?12)",
+                 (id, project_id, path, content, title, doc_type, blob_hash, mime, tags, session_id, source, metadata, size, version, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14, ?14)",
                 params![
                     id, project_id, path, content, title, doc_type, opts.blob_hash,
-                    mime, tags_json, opts.session_id, source, now
+                    mime, tags_json, opts.session_id, source, metadata, size, now
                 ],
             )?;
             let rowid = tx.last_insert_rowid();
@@ -241,6 +273,8 @@ impl Store {
                 tags: tags_val,
                 session_id: opts.session_id,
                 source,
+                metadata,
+                size,
                 version: 1,
                 created_at: now,
                 updated_at: now,
@@ -253,8 +287,8 @@ impl Store {
         let conn = self.conn();
         conn.query_row(
             "SELECT id, project_id, path, content, title, doc_type, blob_hash, mime, tags,
-                        session_id, source, version, created_at, updated_at, deleted_at
-                 FROM store_documents WHERE id = ?1",
+                        session_id, source, version, metadata, size, created_at, updated_at, deleted_at
+                 FROM store_documents WHERE id = ?1 AND deleted_at IS NULL",
             params![id],
             Self::row_to_document,
         )
@@ -319,7 +353,7 @@ impl Store {
     pub fn doc_history(&self, doc_id: &str) -> rusqlite::Result<Vec<DocVersion>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, doc_id, version, content, blob_hash, mime, title, created_at
+            "SELECT id, doc_id, version, content, blob_hash, mime, title, metadata, size, created_at
              FROM store_doc_history
              WHERE doc_id = ?1
              ORDER BY version DESC",
@@ -333,7 +367,9 @@ impl Store {
                 blob_hash: row.get(4)?,
                 mime: row.get(5)?,
                 title: row.get(6)?,
-                created_at: row.get(7)?,
+                metadata: row.get(7)?,
+                size: row.get(8)?,
+                created_at: row.get(9)?,
             })
         })?;
         rows.collect()
@@ -346,7 +382,7 @@ impl Store {
     ) -> rusqlite::Result<Option<DocVersion>> {
         let conn = self.conn();
         conn.query_row(
-            "SELECT id, doc_id, version, content, blob_hash, mime, title, created_at
+            "SELECT id, doc_id, version, content, blob_hash, mime, title, metadata, size, created_at
                  FROM store_doc_history WHERE doc_id = ?1 AND version = ?2",
             params![doc_id, version],
             |row| {
@@ -358,7 +394,9 @@ impl Store {
                     blob_hash: row.get(4)?,
                     mime: row.get(5)?,
                     title: row.get(6)?,
-                    created_at: row.get(7)?,
+                    metadata: row.get(7)?,
+                    size: row.get(8)?,
+                    created_at: row.get(9)?,
                 })
             },
         )
@@ -526,7 +564,7 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, project_id, path, content, title, doc_type, blob_hash, mime, tags,
-                    session_id, source, version, created_at, updated_at, deleted_at
+                    session_id, source, version, metadata, size, created_at, updated_at, deleted_at
              FROM store_documents
              WHERE project_id = ?1 AND deleted_at IS NULL
              ORDER BY path",
@@ -576,6 +614,10 @@ mod tests {
         let list = s.doc_list("p").unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].path, "/a.md");
+
+        // doc_get must not resurrect a soft-deleted row -- callers (e.g. the
+        // asset MCP tool) rely on this to report "not found" post-delete.
+        assert!(s.doc_get(&b.id).unwrap().is_none());
     }
 
     #[test]

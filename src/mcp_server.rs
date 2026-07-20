@@ -90,6 +90,13 @@ pub struct AgentflareMcp {
     /// never runs real git worktree/branch operations against this actual
     /// repository (worktree add, force-remove, branch -D).
     worktree_repo_root_override: Option<std::path::PathBuf>,
+    /// Lazily-opened agentflare-store (documents + blobs), replacing the
+    /// hand-rolled `assets` table. Persisted across calls so migrations
+    /// and the one-time backfill run only once per process lifetime.
+    store: std::sync::Mutex<Option<agentflare_store::Store>>,
+    /// Tests inject either a temp path (file-based) or `":memory:"` so
+    /// they never touch ~/.agentflare/store.db.
+    store_override: Option<std::path::PathBuf>,
 }
 
 #[tool_router]
@@ -248,12 +255,6 @@ impl AgentflareMcp {
         }
     }
 
-    fn content_hash(bytes: &[u8]) -> String {
-        use sha2::Digest;
-        let digest = sha2::Sha256::digest(bytes);
-        hex::encode(&digest[..])
-    }
-
     fn infer_mime_type(ext: &str) -> String {
         match ext.to_lowercase().as_str() {
             "pdf" => "application/pdf".into(),
@@ -319,14 +320,6 @@ impl AgentflareMcp {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1024 * 1024)
-    }
-
-    fn strip_storage_path(asset: &agentflare_backend::asset::Asset) -> serde_json::Value {
-        let mut v = serde_json::to_value(asset).unwrap_or_default();
-        if let serde_json::Value::Object(ref mut map) = v {
-            map.remove("storage_path");
-        }
-        v
     }
 
     /// Lock the artifact store + backend pair, resolving the backend on
@@ -501,10 +494,13 @@ impl AgentflareMcp {
         worktree_repo_root: std::path::PathBuf,
         project_link: std::path::PathBuf,
     ) -> Self {
+        let store_dir = backend_db.parent().unwrap().join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
         Self {
             backend_db_override: Some(backend_db),
             backend_project_link_override: Some(project_link),
             worktree_repo_root_override: Some(worktree_repo_root),
+            store_override: Some(store_dir.join("store.db")),
             ..Default::default()
         }
     }
@@ -607,6 +603,52 @@ impl AgentflareMcp {
             *guard = Some(conn);
         }
         Ok(f(guard.as_ref().expect("just initialized above")))
+    }
+
+    /// Open the store (create + migrate) if not yet open.
+    fn ensure_store(&self) -> Result<(), ErrorData> {
+        let mut guard = self
+            .store
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if guard.is_some() {
+            return Ok(());
+        }
+        let path = self
+            .store_override
+            .clone()
+            .unwrap_or_else(crate::store::store_path);
+        let store = agentflare_store::Store::open_file(&path)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        *guard = Some(store);
+        Ok(())
+    }
+
+    /// Lock the agentflare-store, lazily opening it on first use.
+    /// After opening, runs the one-time asset backfill (best-effort,
+    /// skipped if backend_db is already locked by this thread).
+    fn with_store<T>(&self, f: impl FnOnce(&agentflare_store::Store) -> T) -> Result<T, ErrorData> {
+        self.ensure_store()?;
+
+        // One-time backfill: try_lock to avoid deadlock when called from
+        // within with_backend_db (attach handler nests store inside backend).
+        // If backend isn't open yet, skip — with_backend_db will handle it.
+        if let Ok(bg) = self.backend_db.try_lock()
+            && let Some(ref conn) = *bg
+        {
+            let base_path = crate::paths::home().join(".agentflare");
+            if let Ok(s) = self.store.lock()
+                && let Some(ref store) = *s
+            {
+                let _ = crate::asset_store::backfill_legacy_assets(store, conn, &base_path);
+            }
+        }
+
+        let guard = self
+            .store
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(f(guard.as_ref().expect("ensure_store just initialized it")))
     }
 
     /// The one and only workspace on this system: reused if it already

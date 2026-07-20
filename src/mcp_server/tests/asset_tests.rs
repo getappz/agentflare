@@ -162,6 +162,69 @@ fn asset_get_rejects_missing_id() {
 }
 
 #[test]
+fn asset_get_and_delete_after_delete_return_not_found() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let home = crate::paths::home();
+        let staging = home.join(".agentflare").join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        let item: serde_json::Value =
+            serde_json::from_str(&s.item(Parameters(empty_item_create("gone"))).unwrap()).unwrap();
+        let item_id = item["id"].as_str().unwrap().to_string();
+
+        std::fs::write(staging.join("gone.txt"), b"bye").unwrap();
+        let attached: serde_json::Value = serde_json::from_str(
+            &s.asset(Parameters(AssetRequest {
+                action: "attach".into(),
+                id: None,
+                item_id: Some(item_id),
+                project_id: None,
+                filename: Some("gone.txt".into()),
+                metadata: None,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let asset_id = attached["id"].as_str().unwrap().to_string();
+
+        s.asset(Parameters(AssetRequest {
+            action: "delete".into(),
+            id: Some(asset_id.clone()),
+            item_id: None,
+            project_id: None,
+            filename: None,
+            metadata: None,
+        }))
+        .unwrap();
+
+        // A deleted asset must not be gettable, matching the pre-#185
+        // agentflare_backend::asset::get contract (deleted_at IS NULL).
+        s.asset(Parameters(AssetRequest {
+            action: "get".into(),
+            id: Some(asset_id.clone()),
+            item_id: None,
+            project_id: None,
+            filename: None,
+            metadata: None,
+        }))
+        .unwrap_err();
+
+        // Deleting an already-deleted asset must also report not-found,
+        // not silently double-unref an already-purged blob.
+        s.asset(Parameters(AssetRequest {
+            action: "delete".into(),
+            id: Some(asset_id),
+            item_id: None,
+            project_id: None,
+            filename: None,
+            metadata: None,
+        }))
+        .unwrap_err();
+    });
+}
+
+#[test]
 fn asset_shared_storage_delete_safety() {
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();
@@ -258,67 +321,8 @@ fn asset_shared_storage_delete_safety() {
     });
 }
 
-#[test]
-fn asset_content_dedup() {
-    crate::paths::test_support::with_temp_home(|| {
-        let (tmp, s) = harness();
-        let home = crate::paths::home();
-        let staging = home.join(".agentflare").join("staging");
-        std::fs::create_dir_all(&staging).unwrap();
-
-        let item_a: serde_json::Value =
-            serde_json::from_str(&s.item(Parameters(empty_item_create("dedup-a"))).unwrap())
-                .unwrap();
-        let item_b: serde_json::Value =
-            serde_json::from_str(&s.item(Parameters(empty_item_create("dedup-b"))).unwrap())
-                .unwrap();
-        let id_a = item_a["id"].as_str().unwrap().to_string();
-        let id_b = item_b["id"].as_str().unwrap().to_string();
-
-        let content = b"dedup me please";
-        std::fs::write(staging.join("dedup.txt"), content).unwrap();
-        s.asset(Parameters(AssetRequest {
-            action: "attach".into(),
-            id: None,
-            item_id: Some(id_a.clone()),
-            project_id: None,
-            filename: Some("dedup.txt".into()),
-            metadata: None,
-        }))
-        .unwrap();
-
-        std::fs::write(staging.join("dedup.txt"), content).unwrap();
-        s.asset(Parameters(AssetRequest {
-            action: "attach".into(),
-            id: None,
-            item_id: Some(id_b.clone()),
-            project_id: None,
-            filename: Some("dedup.txt".into()),
-            metadata: None,
-        }))
-        .unwrap();
-
-        // two rows, one file on disk: count unique storage_path values
-        let conn = backend_conn(&tmp);
-        let unique_paths: i64 = conn
-            .query_row(
-                "SELECT count(DISTINCT storage_path) FROM assets WHERE deleted_at IS NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(unique_paths, 1, "same content must share one storage_path");
-
-        let total_rows: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM assets WHERE deleted_at IS NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(total_rows, 2, "two rows despite one file on disk");
-    });
-}
+// asset_content_dedup was removed in #185: content dedup via store_blobs
+// (blob_store/blob_unref) is tested by the agentflare-store crate itself.
 
 #[test]
 fn asset_attach_to_project() {
