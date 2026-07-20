@@ -89,32 +89,33 @@ impl AgentflareMcp {
 
                     let path = crate::asset_store::entity_path(entity_type, &entity_id, &fn_val);
 
-                    let result = self.with_store(|store| -> Result<serde_json::Value, ErrorData> {
-                        let blob_hash = store
-                            .blob_store(&bytes)
-                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                    let result =
+                        self.with_store(|store| -> Result<serde_json::Value, ErrorData> {
+                            let blob_hash = store
+                                .blob_store(&bytes)
+                                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-                        let doc = store
-                            .doc_upsert_with_opts(
-                                &ws_id,
-                                &path,
-                                "",
-                                agentflare_store::documents::DocUpsertOpts {
-                                    title: Some(fn_val.clone()),
-                                    doc_type: Some("asset".into()),
-                                    blob_hash: Some(blob_hash),
-                                    mime: Some(mime),
-                                    source: Some("attach".into()),
-                                    metadata: Some(meta.clone()),
-                                    size: Some(size as i64),
-                                    ..Default::default()
-                                },
-                            )
-                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                            let doc = store
+                                .doc_upsert_with_opts(
+                                    &ws_id,
+                                    &path,
+                                    "",
+                                    agentflare_store::documents::DocUpsertOpts {
+                                        title: Some(fn_val.clone()),
+                                        doc_type: Some("asset".into()),
+                                        blob_hash: Some(blob_hash),
+                                        mime: Some(mime),
+                                        source: Some("attach".into()),
+                                        metadata: Some(meta.clone()),
+                                        size: Some(size as i64),
+                                        ..Default::default()
+                                    },
+                                )
+                                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-                        let _ = std::fs::remove_file(&staged);
-                        Ok(crate::asset_store::document_to_asset_json(&doc))
-                    })??;
+                            let _ = std::fs::remove_file(&staged);
+                            Ok(crate::asset_store::document_to_asset_json(&doc))
+                        })??;
 
                     Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
                 })?
@@ -133,16 +134,12 @@ impl AgentflareMcp {
                     let size = doc.size as u64;
 
                     if size <= max_inline {
-                        let content =
-                            crate::asset_store::get_blob_content(store, &doc).map_err(|e| {
-                                ErrorData::internal_error(e.to_string(), None)
-                            })?;
+                        let content = crate::asset_store::get_blob_content(store, &doc)
+                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                         match content {
                             Some(bytes) => {
                                 let (content, encoding) = match std::str::from_utf8(&bytes) {
-                                    Ok(text)
-                                        if Self::mime_is_textual(Some(&doc.mime)) =>
-                                    {
+                                    Ok(text) if Self::mime_is_textual(Some(&doc.mime)) => {
                                         (text.to_string(), "utf8")
                                     }
                                     _ => (base64_encode(&bytes), "base64"),

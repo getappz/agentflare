@@ -15,13 +15,11 @@ pub fn parse_entity_path(path: &str) -> Option<(&str, &str, &str)> {
     Some((entity_type, entity_id, filename))
 }
 
-pub fn document_to_asset_json(
-    doc: &agentflare_store::documents::Document,
-) -> serde_json::Value {
-    let (entity_type, entity_id, filename) = parse_entity_path(&doc.path)
-        .unwrap_or(("unknown", "unknown", &doc.path));
-    let meta: serde_json::Value =
-        serde_json::from_str(&doc.metadata).unwrap_or(serde_json::Value::Object(Default::default()));
+pub fn document_to_asset_json(doc: &agentflare_store::documents::Document) -> serde_json::Value {
+    let (entity_type, entity_id, filename) =
+        parse_entity_path(&doc.path).unwrap_or(("unknown", "unknown", &doc.path));
+    let meta: serde_json::Value = serde_json::from_str(&doc.metadata)
+        .unwrap_or(serde_json::Value::Object(Default::default()));
     serde_json::json!({
         "id": doc.id,
         "workspace_id": doc.project_id,
@@ -51,10 +49,7 @@ pub fn backfill_legacy_assets(
     let assets = agentflare_backend::asset::list_all(backend_conn)?;
     if assets.is_empty() {
         let now = db_kit::ids::now();
-        store.kv_set(
-            "_asset_backfill_done",
-            &serde_json::to_vec(&now)?,
-        )?;
+        store.kv_set("_asset_backfill_done", &serde_json::to_vec(&now)?)?;
         return Ok(0);
     }
 
@@ -81,10 +76,7 @@ pub fn backfill_legacy_assets(
     }
 
     let now = db_kit::ids::now();
-    store.kv_set(
-        "_asset_backfill_done",
-        &serde_json::to_vec(&now)?,
-    )?;
+    store.kv_set("_asset_backfill_done", &serde_json::to_vec(&now)?)?;
 
     Ok(assets.len())
 }

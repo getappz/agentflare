@@ -89,7 +89,8 @@ impl AgentflareMcp {
             let safe_stem = Self::slugify(&item.id);
             let asset_id = db_kit::ids::new_id();
             let filename = format!("{safe_stem}-{asset_id}.{ext}");
-            let entity_path = crate::asset_store::entity_path("item_attachment", &item.id, &filename);
+            let entity_path =
+                crate::asset_store::entity_path("item_attachment", &item.id, &filename);
             let mut meta = serde_json::json!({ "sender": self.agent, "recipient": recipient });
             if let Some(t) = &thread_id {
                 meta["thread_id"] = serde_json::json!(t);
@@ -120,7 +121,11 @@ impl AgentflareMcp {
                 let existing = store
                     .doc_list(&ws_id)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                let version = existing.iter().filter(|d| d.path.starts_with(&prefix)).count() as i32 + 1;
+                let version = existing
+                    .iter()
+                    .filter(|d| d.path.starts_with(&prefix))
+                    .count() as i32
+                    + 1;
 
                 let blob_hash = store
                     .blob_store(bytes)
@@ -139,7 +144,7 @@ impl AgentflareMcp {
                             source: Some("handoff".into()),
                             metadata: Some(meta.to_string()),
                             size: Some(bytes.len() as i64),
-        
+
                             ..Default::default()
                         },
                     )

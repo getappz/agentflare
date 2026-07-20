@@ -146,8 +146,16 @@ impl Store {
             )
             .optional()?;
 
-        if let Some((existing_id, rowid, old_content, old_version, old_blob_hash, old_mime, old_metadata, old_size)) =
-            existing
+        if let Some((
+            existing_id,
+            rowid,
+            old_content,
+            old_version,
+            old_blob_hash,
+            old_mime,
+            old_metadata,
+            old_size,
+        )) = existing
         {
             let new_version = old_version + 1;
             let history_id = db_kit::ids::new_id();

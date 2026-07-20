@@ -627,10 +627,7 @@ impl AgentflareMcp {
     /// Lock the agentflare-store, lazily opening it on first use.
     /// After opening, runs the one-time asset backfill (best-effort,
     /// skipped if backend_db is already locked by this thread).
-    fn with_store<T>(
-        &self,
-        f: impl FnOnce(&agentflare_store::Store) -> T,
-    ) -> Result<T, ErrorData> {
+    fn with_store<T>(&self, f: impl FnOnce(&agentflare_store::Store) -> T) -> Result<T, ErrorData> {
         self.ensure_store()?;
 
         // One-time backfill: try_lock to avoid deadlock when called from
