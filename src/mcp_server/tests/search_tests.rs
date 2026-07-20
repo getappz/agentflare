@@ -78,6 +78,60 @@ fn search_store_returns_grouped_results() {
 }
 
 #[test]
+fn search_memory_requires_non_empty_query() {
+    let (_tmp, s) = harness();
+    let err = s
+        .search_impl(SearchRequest {
+            query: "".into(),
+            r#type: Some("memory".into()),
+            limit: None,
+        })
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[test]
+fn search_memory_returns_grouped_observations() {
+    crate::paths::test_support::with_temp_home(|| {
+        // Seed an observation into brain.db
+        let conn = crate::memory::store::open().unwrap();
+        crate::memory::observations::save(
+            &conn,
+            None,
+            "decision",
+            "memory search test",
+            "this is a test observation for memory search",
+            None,
+            Some("test-project"),
+            None,
+            None,
+        )
+        .unwrap();
+        drop(conn);
+
+        let (_tmp, s) = harness();
+        let result = s
+            .search_impl(SearchRequest {
+                query: "memory search".into(),
+                r#type: Some("memory".into()),
+                limit: Some(50),
+            })
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["source"], "memory");
+        assert!(
+            parsed["total"].as_u64().unwrap_or(0) >= 1,
+            "expected >=1 result, got {result}"
+        );
+        let groups = parsed["groups"].as_object().unwrap();
+        assert!(
+            groups.contains_key("decision"),
+            "expected decision group, got groups: {groups:?}"
+        );
+    });
+}
+
+#[test]
 fn search_code_requires_non_empty_query() {
     let (_tmp, s) = harness();
     let err = s

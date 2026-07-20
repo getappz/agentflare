@@ -5,6 +5,7 @@ impl AgentflareMcp {
         let search_type = req.r#type.as_deref().unwrap_or("store");
         match search_type {
             "code" => self.search_code(&req),
+            "memory" => self.search_memory(&req),
             "web" => self.search_web(&req),
             _ => self.search_store(&req),
         }
@@ -68,6 +69,55 @@ impl AgentflareMcp {
             });
             Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
         })?
+    }
+
+    fn search_memory(&self, req: &SearchRequest) -> Result<String, ErrorData> {
+        let q = req.query.trim();
+        if q.is_empty() {
+            return Err(ErrorData::invalid_params("query must not be empty", None));
+        }
+        let limit = req.limit.unwrap_or(20);
+
+        let brain = match crate::memory::store::open() {
+            Ok(conn) => conn,
+            Err(e) => return Err(ErrorData::internal_error(
+                format!("failed to open brain.db: {e}"), None
+            )),
+        };
+
+        let observations = match crate::memory::search::search(&brain, q, None, None, limit) {
+            Ok(obs) => obs,
+            Err(e) => return Err(ErrorData::internal_error(
+                format!("memory search failed: {e}"), None
+            )),
+        };
+
+        let mut grouped: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+            std::collections::BTreeMap::new();
+
+        for obs in observations {
+            let entry = serde_json::json!({
+                "id": obs.id,
+                "type": obs.r#type,
+                "title": obs.title,
+                "content": obs.content,
+                "project": obs.project,
+                "session_id": obs.session_id,
+                "created_at": obs.created_at,
+                "updated_at": obs.updated_at,
+                "pinned": obs.pinned,
+                "topic_key": obs.topic_key,
+            });
+            let key = if obs.r#type.is_empty() { "unknown".into() } else { obs.r#type.clone() };
+            grouped.entry(key).or_default().push(entry);
+        }
+
+        Ok(serde_json::json!({
+            "query": q,
+            "source": "memory",
+            "total": grouped.values().map(|v| v.len()).sum::<usize>(),
+            "groups": grouped,
+        }).to_string())
     }
 
     fn search_code(&self, req: &SearchRequest) -> Result<String, ErrorData> {
