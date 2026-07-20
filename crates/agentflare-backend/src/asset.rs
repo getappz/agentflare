@@ -170,6 +170,15 @@ pub fn get(conn: &Connection, id: &str) -> Result<Asset> {
     })
 }
 
+pub fn list_all(conn: &Connection) -> Result<Vec<Asset>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, workspace_id, entity_type, entity_id, filename, size, storage_path, mime_type, metadata, created_at, updated_at, deleted_at, version
+         FROM assets WHERE deleted_at IS NULL ORDER BY created_at",
+    )?;
+    let rows = stmt.query_map([], row_to_asset)?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 pub fn list_by_entity(conn: &Connection, entity_type: &str, entity_id: &str) -> Result<Vec<Asset>> {
     let mut stmt = conn.prepare(
         "SELECT id, workspace_id, entity_type, entity_id, filename, size, storage_path, mime_type, metadata, created_at, updated_at, deleted_at, version

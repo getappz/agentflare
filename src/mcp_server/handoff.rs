@@ -1,5 +1,3 @@
-//! `handoff` MCP tool handler body -- split out of mcp_server.rs (item #168).
-
 use super::*;
 
 impl AgentflareMcp {
@@ -88,21 +86,10 @@ impl AgentflareMcp {
             };
 
             let bytes = content.as_bytes();
-            let hash = Self::content_hash(bytes);
-            // Keyed on item.id, not name — name is the per-call brief and
-            // can legitimately differ between messages on the same item
-            // (e.g. a reply's brief vs. the original ask); keying on it
-            // would silently reset versioning to 1 instead of continuing
-            // the chain.
             let safe_stem = Self::slugify(&item.id);
-            let filename = format!("{safe_stem}.{ext}");
-            let full_storage = format!("{ws_id}/assets/{safe_stem}-{hash}.{ext}");
-            let base_path = crate::paths::home().join(".agentflare");
-            let target = base_path.join(&full_storage);
-            if !target.exists() {
-                agentflare_backend::asset::write_file(&base_path, &full_storage, bytes)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            }
+            let asset_id = db_kit::ids::new_id();
+            let filename = format!("{safe_stem}-{asset_id}.{ext}");
+            let entity_path = crate::asset_store::entity_path("item_attachment", &item.id, &filename);
             let mut meta = serde_json::json!({ "sender": self.agent, "recipient": recipient });
             if let Some(t) = &thread_id {
                 meta["thread_id"] = serde_json::json!(t);
@@ -110,7 +97,6 @@ impl AgentflareMcp {
             if let Some(r) = &reply_to {
                 meta["reply_to"] = serde_json::json!(r);
             }
-            // Session snapshot — lets the recipient see context without extra round-trips.
             if let Some(s) = summary {
                 meta["session_summary"] = serde_json::json!(s);
             }
@@ -126,24 +112,49 @@ impl AgentflareMcp {
             if let Some(e) = evidence {
                 meta["evidence"] = serde_json::json!(e);
             }
-            let asset = agentflare_backend::asset::create(
-                conn,
-                agentflare_backend::asset::CreateAsset {
-                    workspace_id: Some(ws_id),
-                    entity_type: "item_attachment".into(),
-                    entity_id: item.id.clone(),
-                    filename,
-                    size: bytes.len() as i64,
-                    mime_type: Some(Self::infer_mime_type(ext)),
-                    metadata: Some(meta.to_string()),
-                    storage_path: Some(full_storage),
-                },
-            )
-            .map_err(map_backend_err)?;
 
-            // Knowledge fact import: persist each fact into the recipient's memory,
-            // scoped to this handoff's project. Runs only after the item/asset are
-            // committed, so a failed handoff never leaves orphaned facts behind.
+            let mime_type = Self::infer_mime_type(ext);
+
+            let result = self.with_store(|store| -> Result<serde_json::Value, ErrorData> {
+                let prefix = format!("item_attachment/{}", item.id);
+                let existing = store
+                    .doc_list(&ws_id)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let version = existing.iter().filter(|d| d.path.starts_with(&prefix)).count() as i32 + 1;
+
+                let blob_hash = store
+                    .blob_store(bytes)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+                let doc = store
+                    .doc_upsert_with_opts(
+                        &ws_id,
+                        &entity_path,
+                        "",
+                        agentflare_store::documents::DocUpsertOpts {
+                            title: Some(filename.clone()),
+                            doc_type: Some("asset".into()),
+                            blob_hash: Some(blob_hash),
+                            mime: Some(mime_type.clone()),
+                            source: Some("handoff".into()),
+                            metadata: Some(meta.to_string()),
+                            size: Some(bytes.len() as i64),
+        
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+                Ok(serde_json::json!({
+                    "item_id": item.id,
+                    "item_sequence_id": item.sequence_id,
+                    "asset_id": doc.id,
+                    "asset_version": version,
+                    "recipient": recipient,
+                }))
+            })??;
+
+            // Knowledge fact import: persist each fact into the recipient's memory
             if let Some(ref facts) = facts {
                 let sender = self.agent.as_deref().unwrap_or("unknown");
                 for fact in facts {
@@ -172,19 +183,11 @@ impl AgentflareMcp {
                         scope: None,
                     };
                     if let Err(e) = crate::memory::mcp::handle_remember(input) {
-                        // Fact import is best-effort — never fail the handoff for a memory write
                         eprintln!("[handoff] fact import failed: {e}");
                     }
                 }
             }
 
-            let result = serde_json::json!({
-                "item_id": item.id,
-                "item_sequence_id": item.sequence_id,
-                "asset_id": asset.id,
-                "asset_version": asset.version,
-                "recipient": recipient,
-            });
             Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
         })?
     }

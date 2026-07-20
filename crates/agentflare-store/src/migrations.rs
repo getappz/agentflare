@@ -80,5 +80,11 @@ pub fn migrations() -> Migrations<'static> {
         );
         CREATE INDEX IF NOT EXISTS idx_doc_history_doc ON store_doc_history(doc_id);",
         ),
+        M::up(
+            "ALTER TABLE store_documents ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';
+             ALTER TABLE store_documents ADD COLUMN size INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE store_doc_history ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';
+             ALTER TABLE store_doc_history ADD COLUMN size INTEGER NOT NULL DEFAULT 0;",
+        ),
     ])
 }

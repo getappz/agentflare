@@ -3,6 +3,7 @@ mod agent_install;
 mod agent_launch;
 mod agents;
 mod alias;
+mod asset_store;
 mod artifacts;
 mod atomic_fs;
 mod auth;
