@@ -1,0 +1,23 @@
+[package]
+name = "agentflare-shim"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Compiled PATH shim routing AI-agent shell commands through lean-ctx -c, project-scoped via .agentflare"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "agentflare-shim"
+path = "src/main.rs"
+
+[dependencies]
+which = "6"
+dirs = "6"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

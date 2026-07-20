@@ -216,6 +216,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentflare-shim"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "which",
+]
+
+[[package]]
 name = "agentflare-skill-registry"
 version = "0.1.1"
 dependencies = [
