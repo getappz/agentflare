@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"   # frontmatter only; deprecated upstream but stable — replace if a maintained fork is adopted workspace-wide
+serde_yml = "0.0"  # frontmatter only; replaces deprecated serde_yaml
 regex = "1"
 thiserror = "2"
 dirs = "6"
