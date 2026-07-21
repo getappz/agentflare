@@ -104,16 +104,48 @@ fn bundled_git_shim() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-/// `true` once every generic tool name plus `git` has a shim on disk --
-/// presence only, not a content/hash check (matches this codebase's other
-/// `Component::check` implementations, e.g. `rules`). An upgrade that
-/// ships a newer shim binary needs a re-run with consent, same as `mise`.
+/// `true` if `path` is already hardlinked to `src` (same file on disk) --
+/// via the `same-file` crate, since Rust's std has no stable cross-platform
+/// "same file" check (the Windows one, `MetadataExt::number_of_links`, is
+/// still behind the unstable `windows_by_handle` feature).
+fn is_linked_to(path: &Path, src: &Path) -> bool {
+    same_file::is_same_file(path, src).unwrap_or(false)
+}
+
+/// `true` if hardlinking actually works between `dir` and `src`'s volume --
+/// probed via a throwaway link rather than assumed, since a cross-volume
+/// install or a restricted filesystem falls back to plain copies (see
+/// `link_or_copy`), where `nlink > 1` is an unreachable target forever.
+/// Without this probe, `all_shims_present` would treat a legitimately
+/// copy-only install as perpetually stale and re-prompt on every `init`.
+fn hardlinking_works(dir: &Path, src: &Path) -> bool {
+    let probe = dir.join(".shim-hardlink-probe");
+    let _ = fs::remove_file(&probe);
+    let ok = fs::hard_link(src, &probe).is_ok();
+    let _ = fs::remove_file(&probe);
+    ok
+}
+
+/// `true` once every generic tool name plus `git` has a shim on disk. For
+/// the generic-tool group, a plain copy left behind by an install predating
+/// hardlink support (or by the copy-fallback path) also counts as "not
+/// done" whenever hardlinking is actually achievable on this filesystem --
+/// so re-running `init` after upgrading to this version self-heals a
+/// machine's existing duplicated-bytes shims into hardlinks instead of
+/// leaving them as-is forever.
 pub fn all_shims_present() -> bool {
     let dir = shims_dir();
-    GENERIC_SHIM_TOOLS
-        .iter()
-        .all(|name| dir.join(exe_name(name)).exists())
-        && dir.join(shim_dest_name()).exists()
+    let generic_ok = GENERIC_SHIM_TOOLS.iter().all(|name| {
+        let path = dir.join(exe_name(name));
+        if !path.exists() {
+            return false;
+        }
+        match bundled_generic_shim() {
+            Some(src) => is_linked_to(&path, &src) || !hardlinking_works(&dir, &src),
+            None => true,
+        }
+    });
+    generic_ok && dir.join(shim_dest_name()).exists()
 }
 
 /// Hardlinks `src` to `dest` (same file on disk, no duplicated bytes),
@@ -229,5 +261,60 @@ mod tests {
         let name = generic_shim_binary_name();
         assert_eq!(cfg!(windows), name.ends_with(".exe"));
         assert!(name.starts_with("agentflare-shim"));
+    }
+
+    #[test]
+    fn is_linked_to_is_false_for_a_standalone_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        fs::write(&src, b"x").unwrap();
+        let copy = dir.path().join("standalone.bin");
+        fs::copy(&src, &copy).unwrap();
+        assert!(!is_linked_to(&copy, &src));
+    }
+
+    #[test]
+    fn is_linked_to_is_true_once_hardlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        fs::write(&src, b"x").unwrap();
+        let dest = dir.path().join("linked.bin");
+        fs::hard_link(&src, &dest).unwrap();
+        assert!(is_linked_to(&dest, &src));
+    }
+
+    #[test]
+    fn hardlinking_works_detects_same_volume_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        fs::write(&src, b"x").unwrap();
+        // Same-volume temp dir on every CI platform this crate targets --
+        // this is a capability probe, not a hardlink-vs-copy race, so a
+        // `true` result here is the expected common case.
+        assert!(hardlinking_works(dir.path(), &src));
+        // The probe file must be cleaned up, not left behind.
+        assert!(!dir.path().join(".shim-hardlink-probe").exists());
+    }
+
+    #[test]
+    fn all_shims_present_self_heals_a_stale_copy_into_a_hardlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join(generic_shim_binary_name());
+        fs::write(&src, b"shim payload").unwrap();
+
+        // A pre-existing plain copy (e.g. from before hardlinking landed)
+        // must NOT read as "linked to src" -- confirming the building block
+        // `all_shims_present` relies on actually distinguishes the two
+        // cases, without needing the real `~/.agentflare/shims` layout.
+        let copy_dest = dir.path().join("aws.bin");
+        fs::copy(&src, &copy_dest).unwrap();
+        assert!(!is_linked_to(&copy_dest, &src), "a plain copy isn't linked");
+
+        let link_dest = dir.path().join("cargo.bin");
+        link_or_copy(&src, &link_dest).unwrap();
+        assert!(
+            is_linked_to(&link_dest, &src) || !hardlinking_works(dir.path(), &src),
+            "link_or_copy's hardlink path must register as linked"
+        );
     }
 }
