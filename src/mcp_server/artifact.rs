@@ -102,49 +102,7 @@ impl AgentflareMcp {
                 if query.trim().is_empty() {
                     return Err(ErrorData::invalid_params("query is required", None));
                 }
-                let (store, base) = self.ensure_artifact_server()?;
-                let needle = query.to_lowercase();
-                let mut hits = Vec::new();
-                for summary in store
-                    .list(req.session_id.as_deref())
-                    .map_err(Self::artifact_error)?
-                {
-                    let name_hit = summary.name.to_lowercase().contains(&needle);
-                    let desc_hit = summary
-                        .description
-                        .as_deref()
-                        .is_some_and(|d| d.to_lowercase().contains(&needle));
-                    let content = store
-                        .get(&summary.id)
-                        .map(|a| a.content)
-                        .unwrap_or_default();
-                    let content_pos = content.to_lowercase().find(&needle);
-                    if !(name_hit || desc_hit || content_pos.is_some()) {
-                        continue;
-                    }
-                    let snippet = content_pos.map(|pos| {
-                        let mut start = pos.saturating_sub(40);
-                        while !content.is_char_boundary(start) {
-                            start -= 1;
-                        }
-                        let mut end = (pos + needle.len() + 40).min(content.len());
-                        while !content.is_char_boundary(end) {
-                            end += 1;
-                        }
-                        content[start..end].to_string()
-                    });
-                    let mut v = serde_json::to_value(&summary).unwrap_or_default();
-                    if let Some(obj) = v.as_object_mut() {
-                        obj.insert(
-                            "url".into(),
-                            serde_json::json!(format!("{base}/{}", summary.id)),
-                        );
-                        if let Some(snippet) = snippet {
-                            obj.insert("snippet".into(), serde_json::json!(snippet));
-                        }
-                    }
-                    hits.push(v);
-                }
+                let hits = self.artifact_search_hits(&query, req.session_id.as_deref())?;
                 Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
             }
             "delete" => {
@@ -160,5 +118,58 @@ impl AgentflareMcp {
                 None,
             )),
         }
+    }
+
+    /// Case-insensitive substring scan over artifact name/description/content,
+    /// returning summary JSON with `url` and (for content matches) `snippet`.
+    /// Shared by the artifact tool's `search` action and the global search
+    /// tool's store arm.
+    pub(crate) fn artifact_search_hits(
+        &self,
+        query: &str,
+        session_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, ErrorData> {
+        let (store, base) = self.ensure_artifact_server()?;
+        let needle = query.to_lowercase();
+        let mut hits = Vec::new();
+        for summary in store.list(session_id).map_err(Self::artifact_error)? {
+            let name_hit = summary.name.to_lowercase().contains(&needle);
+            let desc_hit = summary
+                .description
+                .as_deref()
+                .is_some_and(|d| d.to_lowercase().contains(&needle));
+            let content = store
+                .get(&summary.id)
+                .map(|a| a.content)
+                .unwrap_or_default();
+            let content_lower = content.to_lowercase();
+            let content_pos = content_lower.find(&needle);
+            if !(name_hit || desc_hit || content_pos.is_some()) {
+                continue;
+            }
+            let snippet = content_pos.map(|pos| {
+                let mut start = pos.saturating_sub(40);
+                while !content_lower.is_char_boundary(start) {
+                    start -= 1;
+                }
+                let mut end = (pos + needle.len() + 40).min(content_lower.len());
+                while !content_lower.is_char_boundary(end) {
+                    end += 1;
+                }
+                content_lower[start..end].to_string()
+            });
+            let mut v = serde_json::to_value(&summary).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "url".into(),
+                    serde_json::json!(format!("{base}/{}", summary.id)),
+                );
+                if let Some(snippet) = snippet {
+                    obj.insert("snippet".into(), serde_json::json!(snippet));
+                }
+            }
+            hits.push(v);
+        }
+        Ok(hits)
     }
 }

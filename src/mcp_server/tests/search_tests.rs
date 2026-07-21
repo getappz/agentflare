@@ -227,3 +227,40 @@ fn search_store_defaults_to_store_type() {
         assert!(parsed["total"].as_u64().unwrap_or(0) >= 1);
     });
 }
+
+#[test]
+fn search_store_includes_artifact_matches() {
+    crate::paths::test_support::with_temp_home(|| {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            backend_db_override: Some(tmp.path().join("backend.db")),
+            backend_project_link_override: Some(tmp.path().join("project.json")),
+            artifacts_dir_override: Some(tmp.path().join("artifacts")),
+            ..Default::default()
+        };
+
+        s.artifact(Parameters(ArtifactRequest {
+            action: "publish".into(),
+            name: Some("handoff-notes".into()),
+            content: Some("the search marker phrase lives here".into()),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        let result = search_sync(
+            &s,
+            SearchRequest {
+                query: "marker phrase".into(),
+                r#type: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let artifact_group = parsed["groups"]["artifact"].as_array();
+        assert!(
+            artifact_group.is_some_and(|a| !a.is_empty()),
+            "artifact matches must appear in the store arm: {result}"
+        );
+    });
+}
