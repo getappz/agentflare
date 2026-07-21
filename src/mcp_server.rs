@@ -1374,10 +1374,13 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Global unified search across four sources. type='store' (default) — FTS search across indexed store documents (artifacts, notes), grouped by doc_type. type='memory' — FTS search across brain.db observations (decisions, findings, patterns). type='code' — code search via lean-ctx grep (FTS5/symbol/regex). type='web' — internet search (agent-level, not Rust). Returns { query, source, total, groups|results }."
+        description = "Global unified search across four sources. type='store' (default) — FTS search across indexed store documents (artifacts, notes), grouped by doc_type. type='memory' — FTS search across brain.db observations (decisions, findings, patterns). type='code' — code search via lean-ctx grep (FTS5/symbol/regex). type='web' — internet search via rivalsearch web_search tool. Returns { query, source, total, groups|results }."
     )]
-    fn search(&self, Parameters(req): Parameters<SearchRequest>) -> Result<String, ErrorData> {
-        self.search_impl(req)
+    async fn search(
+        &self,
+        Parameters(req): Parameters<SearchRequest>,
+    ) -> Result<String, ErrorData> {
+        self.search_impl(req).await
     }
 }
 

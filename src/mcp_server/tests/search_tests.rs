@@ -20,6 +20,11 @@ fn seed_doc(s: &AgentflareMcp, ws_id: &str, path: &str, content: &str, doc_type:
     .unwrap();
 }
 
+fn search_sync(s: &AgentflareMcp, req: SearchRequest) -> Result<String, ErrorData> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(s.search_impl(req))
+}
+
 fn ws_id(s: &AgentflareMcp) -> String {
     match s.with_backend_db(AgentflareMcp::resolve_workspace_id) {
         Ok(Ok(id)) => id,
@@ -31,13 +36,15 @@ fn ws_id(s: &AgentflareMcp) -> String {
 #[test]
 fn search_store_requires_non_empty_query() {
     let (_tmp, s) = harness();
-    let err = s
-        .search_impl(SearchRequest {
+    let err = search_sync(
+        &s,
+        SearchRequest {
             query: "".into(),
             r#type: None,
             limit: None,
-        })
-        .unwrap_err();
+        },
+    )
+    .unwrap_err();
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
 }
 
@@ -47,7 +54,13 @@ fn search_store_returns_grouped_results() {
         let (_tmp, s) = harness();
         let wid = ws_id(&s);
 
-        seed_doc(&s, &wid, "docs/report.txt", "this is alpha content", "document");
+        seed_doc(
+            &s,
+            &wid,
+            "docs/report.txt",
+            "this is alpha content",
+            "document",
+        );
         seed_doc(
             &s,
             &wid,
@@ -56,13 +69,15 @@ fn search_store_returns_grouped_results() {
             "asset",
         );
 
-        let result = s
-            .search_impl(SearchRequest {
+        let result = search_sync(
+            &s,
+            SearchRequest {
                 query: "alpha".into(),
                 r#type: Some("store".into()),
                 limit: Some(50),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["source"], "store");
         assert!(
@@ -80,13 +95,15 @@ fn search_store_returns_grouped_results() {
 #[test]
 fn search_memory_requires_non_empty_query() {
     let (_tmp, s) = harness();
-    let err = s
-        .search_impl(SearchRequest {
+    let err = search_sync(
+        &s,
+        SearchRequest {
             query: "".into(),
             r#type: Some("memory".into()),
             limit: None,
-        })
-        .unwrap_err();
+        },
+    )
+    .unwrap_err();
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
 }
 
@@ -110,13 +127,15 @@ fn search_memory_returns_grouped_observations() {
         drop(conn);
 
         let (_tmp, s) = harness();
-        let result = s
-            .search_impl(SearchRequest {
+        let result = search_sync(
+            &s,
+            SearchRequest {
                 query: "memory search".into(),
                 r#type: Some("memory".into()),
                 limit: Some(50),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["source"], "memory");
         assert!(
@@ -134,13 +153,15 @@ fn search_memory_returns_grouped_observations() {
 #[test]
 fn search_code_requires_non_empty_query() {
     let (_tmp, s) = harness();
-    let err = s
-        .search_impl(SearchRequest {
+    let err = search_sync(
+        &s,
+        SearchRequest {
             query: "".into(),
             r#type: Some("code".into()),
             limit: None,
-        })
-        .unwrap_err();
+        },
+    )
+    .unwrap_err();
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
 }
 
@@ -150,19 +171,45 @@ fn search_code_returns_results_from_lean_ctx() {
     if !root.exists() {
         return; // skip outside a git repo
     }
+    if std::process::Command::new("lean-ctx")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return; // skip when lean-ctx isn't on PATH (CI)
+    }
     let s = AgentflareMcp::default();
     // Search for a pattern that definitely exists in this codebase
-    let result = s
-        .search_impl(SearchRequest {
+    let result = search_sync(
+        &s,
+        SearchRequest {
             query: "search_impl".into(),
             r#type: Some("code".into()),
             limit: Some(10),
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["source"], "code");
-    // May be 0 if lean-ctx index doesn't cover worktree, but should not error
-    assert!(parsed["total"].as_u64().is_some());
+    assert!(
+        parsed["total"].as_u64().unwrap_or(0) > 0,
+        "expected at least one code result for 'search_impl', got {parsed}"
+    );
+}
+
+#[test]
+fn search_rejects_unknown_type() {
+    let (_tmp, s) = harness();
+    let err = search_sync(
+        &s,
+        SearchRequest {
+            query: "x".into(),
+            r#type: Some("bogus".into()),
+            limit: None,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
 }
 
 #[test]
@@ -173,13 +220,15 @@ fn search_store_defaults_to_store_type() {
 
         seed_doc(&s, &wid, "test/findme.md", "this is findable data", "note");
 
-        let result = s
-            .search_impl(SearchRequest {
+        let result = search_sync(
+            &s,
+            SearchRequest {
                 query: "findable".into(),
                 r#type: None,
                 limit: None,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["source"], "store");
         assert!(parsed["total"].as_u64().unwrap_or(0) >= 1);

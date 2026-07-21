@@ -895,15 +895,16 @@ pub(crate) struct AssetRequest {
     pub(crate) metadata: Option<String>,
 }
 
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SearchRequest {
     #[schemars(description = "Search query")]
     pub(crate) query: String,
-    #[schemars(description = "Search type: 'store' (default, FTS search across indexed documents) or 'web' (internet search)")]
+    #[schemars(
+        description = "Search type: 'store' (default, FTS across store documents, grouped by doc_type), 'memory' (FTS across brain.db observations), 'code' (lean-ctx grep), or 'web' (rivalsearch internet search)"
+    )]
     #[serde(default)]
     pub(crate) r#type: Option<String>,
-    #[schemars(description = "Max results per group (default 20)")]
+    #[schemars(description = "Max results (default 20; code 50, web 10)")]
     #[serde(default)]
     pub(crate) limit: Option<usize>,
 }
