@@ -22,7 +22,7 @@ fn blob_disk_path(root: &Path, hash: &str) -> PathBuf {
 fn read_disk_blob(root: &Path, hash: &str) -> std::io::Result<Option<Vec<u8>>> {
     let path = blob_disk_path(root, hash);
     match std::fs::read(&path) {
-        Ok(data) => Ok(Some(data)),
+        Ok(data) => Ok(Some(decompress_if_gzip(data)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -33,8 +33,33 @@ fn write_disk_blob(root: &Path, hash: &str, data: &[u8]) -> Result<(), std::io::
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, data)?;
+    std::fs::write(&path, gzip(data)?)?;
     Ok(())
+}
+
+fn gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(data)?;
+    enc.finish()
+}
+
+/// Gzip streams always start with the 2-byte magic `1f 8b`; a blob written
+/// before compression landed has no such header, so it's returned
+/// byte-for-byte unchanged — self-describing on read, no version marker or
+/// migration step needed to keep serving blobs written by older builds.
+fn decompress_if_gzip(data: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut out = Vec::new();
+        GzDecoder::new(&data[..]).read_to_end(&mut out)?;
+        Ok(out)
+    } else {
+        Ok(data)
+    }
 }
 
 fn delete_disk_blob(root: &Path, hash: &str) {
@@ -261,5 +286,53 @@ mod tests {
 
         let retrieved = s.blob_get(&hash).unwrap().unwrap();
         assert_eq!(retrieved, data);
+    }
+
+    #[test]
+    fn disk_blobs_are_stored_gzip_compressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("store.db");
+        let s = Store::open_file(&db_path).unwrap();
+        // Long enough / repetitive enough that gzip overhead can't win.
+        let data = "compressible ".repeat(200);
+        let hash = s.blob_store(data.as_bytes()).unwrap();
+
+        let on_disk = std::fs::read(blob_disk_path(dir.path(), &hash)).unwrap();
+        assert!(
+            on_disk.len() < data.len(),
+            "on-disk blob ({} bytes) should be smaller than the source ({} bytes)",
+            on_disk.len(),
+            data.len()
+        );
+        assert_eq!(&on_disk[..2], &[0x1f, 0x8b], "gzip magic header");
+
+        let retrieved = s.blob_get(&hash).unwrap().unwrap();
+        assert_eq!(retrieved, data.as_bytes());
+    }
+
+    #[test]
+    fn a_legacy_uncompressed_blob_written_before_gzip_still_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("store.db");
+        let s = Store::open_file(&db_path).unwrap();
+        let data = b"plain bytes, no gzip header";
+        let hash = blake3::hash(data).to_hex().to_string();
+
+        // Simulate a blob written by a build predating compression: write
+        // the raw disk file directly (bypassing blob_store's gzip step) and
+        // register its DB row the same way blob_store would.
+        let disk_path = blob_disk_path(dir.path(), &hash);
+        std::fs::create_dir_all(disk_path.parent().unwrap()).unwrap();
+        std::fs::write(&disk_path, data).unwrap();
+        s.conn.lock().execute(
+            "INSERT INTO store_blobs (hash, size, ref_count, created_at) VALUES (?1, ?2, 1, ?3)",
+            params![hash, data.len() as i64, db_kit::ids::now()],
+        ).unwrap();
+
+        let retrieved = s.blob_get(&hash).unwrap().unwrap();
+        assert_eq!(
+            retrieved, data,
+            "a pre-compression blob has no gzip magic and must pass through unchanged"
+        );
     }
 }
