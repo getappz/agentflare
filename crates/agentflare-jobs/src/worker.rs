@@ -1,7 +1,7 @@
 use crate::queue::Queue;
 use crate::supervisor::Supervisor;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 

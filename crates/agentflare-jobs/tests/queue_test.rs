@@ -94,7 +94,8 @@ fn fail_retries_then_permanent() {
 #[test]
 fn cancel_queued_job() {
     let q = test_queue();
-    q.enqueue(&AgentJob::new("cmd").args(["/c", "timeout 100"])).unwrap();
+    q.enqueue(&AgentJob::new("cmd").args(["/c", "timeout 100"]))
+        .unwrap();
     let (id, _) = q.dequeue().unwrap().unwrap();
 
     // cancel only works on queued, not running

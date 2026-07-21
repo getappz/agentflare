@@ -221,6 +221,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentflare-jobs"
+version = "0.1.0"
+dependencies = [
+ "agentflare-db-kit",
+ "parking_lot",
+ "rusqlite",
+ "rusqlite_migration",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "agentflare-shim"
 version = "0.1.0"
 dependencies = [

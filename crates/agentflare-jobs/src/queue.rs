@@ -66,10 +66,7 @@ impl Queue {
         &self.log_dir
     }
 
-    pub fn enqueue(
-        &self,
-        job: &crate::types::AgentJob,
-    ) -> Result<JobInfo, Error> {
+    pub fn enqueue(&self, job: &crate::types::AgentJob) -> Result<JobInfo, Error> {
         let id = db_kit::ids::new_id();
         let now = db_kit::ids::now();
         let payload = serde_json::to_string(job)?;
@@ -119,12 +116,7 @@ impl Queue {
         Ok(Some((id, job)))
     }
 
-    pub fn complete(
-        &self,
-        id: &str,
-        output: &JobOutput,
-        success: bool,
-    ) -> Result<(), Error> {
+    pub fn complete(&self, id: &str, output: &JobOutput, success: bool) -> Result<(), Error> {
         let now = db_kit::ids::now();
         let state = if success { "exited" } else { "failed" };
         let conn = self.conn.lock();
@@ -192,10 +184,10 @@ impl Queue {
         let mut stmt = conn.prepare(&sql)?;
 
         let jobs: Vec<JobInfo> = if state_filter.is_some() {
-            stmt.query_map(params![state_val], |r| map_job_row(r))?
+            stmt.query_map(params![state_val], map_job_row)?
                 .collect::<Result<Vec<_>, _>>()?
         } else {
-            stmt.query_map([], |r| map_job_row(r))?
+            stmt.query_map([], map_job_row)?
                 .collect::<Result<Vec<_>, _>>()?
         };
         Ok(jobs)
@@ -208,7 +200,7 @@ impl Queue {
                     finished_at, exit_code, timed_out, stdout_log_path, stderr_log_path
              FROM agent_jobs WHERE id = ?1",
             params![id],
-            |r| map_job_row(r),
+            map_job_row,
         )?;
         Ok(row)
     }

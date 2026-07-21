@@ -160,9 +160,7 @@ fn kill_graceful(child: &mut std::process::Child, kill_after: Duration) {
     #[cfg(windows)]
     {
         let pid = child.id().to_string();
-        let _ = Command::new("taskkill")
-            .args(["/T", "/PID", &pid])
-            .status();
+        let _ = Command::new("taskkill").args(["/T", "/PID", &pid]).status();
         std::thread::sleep(kill_after);
         let _ = Command::new("taskkill")
             .args(["/T", "/F", "/PID", &pid])
