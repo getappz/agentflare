@@ -1,4 +1,5 @@
 use super::*;
+use flare_search_kit::fts_query;
 
 impl AgentflareMcp {
     pub async fn search_impl(&self, req: SearchRequest) -> Result<String, ErrorData> {
@@ -29,10 +30,10 @@ impl AgentflareMcp {
         };
 
         self.with_store(|store| -> Result<String, ErrorData> {
+            let fts_q = fts_query(q, Default::default()).unwrap_or_else(|| q.to_string());
             let matches = store
-                .doc_search(&ws_id, q, limit)
+                .doc_search(&ws_id, &fts_q, limit)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
             let mut grouped: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
                 std::collections::BTreeMap::new();
 
@@ -186,9 +187,8 @@ impl AgentflareMcp {
 
         let args = serde_json::json!({
             "query": q,
-            "max_results": limit,
+            "num_results": limit,
         });
-
         match reg.execute("rivalsearch", "web_search", args).await {
             Ok(val) => Ok(serde_json::json!({
                 "source": "web",
