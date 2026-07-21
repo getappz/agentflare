@@ -43,18 +43,75 @@ pub fn default_path(name: &str) -> Option<PathBuf> {
     Some(home.join(".agentflare").join("audit").join(name))
 }
 
+/// Byte size at which an audit log gets trimmed back down to
+/// `AUDIT_LOG_KEEP_LINES` — an append-only JSONL log otherwise grows forever
+/// (every git subcommand invocation fires one event). Checked via a single
+/// `metadata()` stat on every append, so the common under-budget case costs
+/// one cheap syscall, not a read of the whole file.
+const AUDIT_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const AUDIT_LOG_KEEP_LINES: usize = 5_000;
+
 /// Appends one JSONL line for `event`, creating the parent directory and
-/// file if needed.
+/// file if needed. Holds an exclusive lock on a sibling `.lock` file across
+/// the whole append + maybe-rotate cycle so concurrent git processes writing
+/// to the same audit log can't interleave: without it, a rotation's
+/// read-modify-write could silently drop another process's append (TOCTOU).
 pub fn log_event<T: Serialize>(audit_path: &Path, event: &T) -> std::io::Result<()> {
     if let Some(parent) = audit_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let _lock = lock_audit_path(audit_path)?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(audit_path)?;
     let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
-    writeln!(f, "{line}")
+    writeln!(f, "{line}")?;
+    drop(f);
+    maybe_rotate(audit_path, AUDIT_LOG_MAX_BYTES, AUDIT_LOG_KEEP_LINES)
+}
+
+/// Opens (creating if needed) and exclusively locks `path`'s sibling
+/// `.lock` file, blocking until acquired. Released when the returned file
+/// is dropped. Same pattern as `daemon::acquire_start_lock`.
+fn lock_audit_path(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(PathBuf::from(lock_path))?;
+    fs2::FileExt::lock_exclusive(&lock_file)?;
+    Ok(lock_file)
+}
+
+/// Trims `path` down to its last `keep_lines` lines, oldest dropped first,
+/// once it exceeds `max_bytes`. No-op (single stat, no read) while under
+/// budget. Writes the trimmed content to a temp file and renames it over
+/// `path` so a crash mid-rotation can't leave a truncated/corrupt log.
+///
+/// ponytail: `keep_lines` alone doesn't guarantee the result stays under
+/// `max_bytes` if lines run large (unlikely for these two compact event
+/// types); add a byte-budget trim pass too if that ever becomes real.
+fn maybe_rotate(path: &Path, max_bytes: u64, keep_lines: usize) -> std::io::Result<()> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if meta.len() <= max_bytes {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= keep_lines {
+        return Ok(());
+    }
+    let trimmed = lines[lines.len() - keep_lines..].join("\n") + "\n";
+    let mut tmp_path = path.as_os_str().to_owned();
+    tmp_path.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_path);
+    std::fs::write(&tmp_path, trimmed)?;
+    std::fs::rename(&tmp_path, path)
 }
 
 /// Reads back every event in the log, oldest first. A missing file reads
@@ -135,6 +192,38 @@ mod tests {
             read_events::<Event>(&path).is_err(),
             "a corrupt line must surface as an error, not be silently skipped"
         );
+    }
+
+    #[test]
+    fn maybe_rotate_is_a_noop_under_budget() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("git.jsonl");
+        for i in 0..10 {
+            log_event(&path, &sample_event(&format!("cmd{i}"))).unwrap();
+        }
+        assert_eq!(read_events::<Event>(&path).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn maybe_rotate_trims_oldest_lines_once_over_budget() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("git.jsonl");
+        for i in 0..20 {
+            log_event(&path, &sample_event(&format!("cmd{i}"))).unwrap();
+        }
+        // Tiny budget forces rotation on the very next append.
+        maybe_rotate(&path, 1, 5).unwrap();
+        let events = read_events::<Event>(&path).unwrap();
+        assert_eq!(events.len(), 5, "only the 5 most recent survive");
+        assert_eq!(events[0].subcommand, "cmd15", "oldest dropped first");
+        assert_eq!(events[4].subcommand, "cmd19", "newest kept");
+    }
+
+    #[test]
+    fn maybe_rotate_on_a_missing_file_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("does-not-exist.jsonl");
+        assert!(maybe_rotate(&path, 1, 5).is_ok());
     }
 
     #[test]

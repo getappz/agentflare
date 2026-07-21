@@ -50,6 +50,7 @@ hex = "0.4"
 base64 = "0.22"
 flate2 = "1"
 tar = "0.4"
+same-file = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2"
