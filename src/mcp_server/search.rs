@@ -30,7 +30,17 @@ impl AgentflareMcp {
         };
 
         self.with_store(|store| -> Result<String, ErrorData> {
-            let fts_q = fts_query(q, Default::default()).unwrap_or_else(|| q.to_string());
+            // ponytail: no valid FTS5 tokens (e.g. query is only quote chars) -- return
+            // no matches instead of falling back to the unsanitized raw query.
+            let Some(fts_q) = fts_query(q, Default::default()) else {
+                let result = serde_json::json!({
+                    "query": q,
+                    "source": "store",
+                    "total": 0,
+                    "groups": {},
+                });
+                return Ok(serde_json::to_string_pretty(&result).unwrap_or_default());
+            };
             let matches = store
                 .doc_search(&ws_id, &fts_q, limit)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
