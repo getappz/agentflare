@@ -158,10 +158,7 @@ pub fn redirect_decision(tool_name: &str, tool_input: Option<&Value>) -> Option<
                     .and_then(flare_git_core::branch::repo_toplevel)
             });
             match target_repo {
-                Some(repo) => (
-                    current_branch(Some(&repo)),
-                    default_branch(Some(&repo)),
-                ),
+                Some(repo) => (current_branch(Some(&repo)), default_branch(Some(&repo))),
                 // Target path not in any git repo → no branch guard.
                 None => (None, None),
             }
