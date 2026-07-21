@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0](https://github.com/getappz/agentflare/compare/v1.5.0...v1.6.0) - 2026-07-21
+
+### Added
+
+- global search MCP tool — store, memory, code, and web arms, with gateway delegation and local MCP auto-registration (#284)
+- migrate asset store to agentflare-store documents+blobs (#282)
+- git-aware PATH shim — classify, snapshot, canonical-repo detach guard (#279)
+- cover opencode's native tool names in the branch guard (#281)
+- release-bump.sh + release-tag.sh — manual release flow, no crates.io (#275)
+
+### Fixed
+
+- resolve PreToolUse branch guard against target file's repo, not host cwd (#283)
+- sync session hooks with actual feature state, cut per-turn bloat (#277)
+- don't run git worktree prune under --dry-run (#272)
+
 ## [1.5.0](https://github.com/getappz/agentflare/compare/v1.4.0...v1.5.0) - 2026-07-20
 
 ### Added
