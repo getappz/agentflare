@@ -177,6 +177,84 @@ impl AgentflareMcp {
         Ok(f(reg))
     }
     #[tool(
+        description = "Detect intent from user prompt and find relevant skills. Returns intent classification + ranked skill matches."
+    )]
+    async fn skill_detect(
+        &self,
+        Parameters(req): Parameters<SkillDetectRequest>,
+    ) -> Result<String, ErrorData> {
+        if req.prompt.trim().is_empty() {
+            return Err(ErrorData::invalid_params("prompt is required", None));
+        }
+        let intent = crate::skill_detect::classify(&req.prompt);
+        let limit = req.limit.unwrap_or(3).clamp(1, 10);
+        let skills = self
+            .with_fresh_registry(|reg| {
+                crate::skill_detect::find_skills(
+                    &intent,
+                    reg,
+                    limit,
+                    crate::memory::engine::embed_query,
+                    crate::memory::engine::embed_doc,
+                )
+            })
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let skills = match skills {
+            Ok(s) => s,
+            Err(e) => return Err(ErrorData::internal_error(e, None)),
+        };
+        let body_skills = if req.include_body {
+            let loaded: Vec<serde_json::Value> = self
+                .with_fresh_registry(|reg| {
+                    skills
+                        .iter()
+                        .map(|s| match reg.load(&s.name, false) {
+                            Ok(loaded) => serde_json::json!({
+                                "name": s.name,
+                                "source": s.source,
+                                "description": s.description,
+                                "score": s.score,
+                                "match_reason": s.match_reason,
+                                "body": loaded.body,
+                            }),
+                            Err(_) => serde_json::json!({
+                                "name": s.name,
+                                "source": s.source,
+                                "description": s.description,
+                                "score": s.score,
+                                "match_reason": s.match_reason,
+                            }),
+                        })
+                        .collect()
+                })
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            loaded
+        } else {
+            skills
+                .into_iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "name": s.name,
+                        "source": s.source,
+                        "description": s.description,
+                        "score": s.score,
+                        "match_reason": s.match_reason,
+                    })
+                })
+                .collect()
+        };
+        let result = serde_json::json!({
+            "intent": {
+                "type": intent.task_type.as_str(),
+                "confidence": intent.confidence,
+                "keywords": intent.keywords,
+                "targets": intent.targets,
+            },
+            "skills": body_skills,
+        });
+        Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+    }
+    #[tool(
         description = "Skill operations — search installed skills or load one by name. Single consolidated tool with `action` field (search|load)."
     )]
     async fn skill(&self, Parameters(req): Parameters<SkillRequest>) -> Result<String, ErrorData> {

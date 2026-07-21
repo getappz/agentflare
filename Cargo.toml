@@ -82,6 +82,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 agentflare-store = { path = "crates/agentflare-store" }
 flare-git-core = { path = "crates/flare-git-core" }
 flare-proxy = { path = "crates/flare-proxy" }
+skill = { version = "0.8", default-features = false, features = ["network"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

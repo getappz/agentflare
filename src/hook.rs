@@ -146,6 +146,25 @@ fn session_start_message(agent: &str) -> String {
         }
     }
 
+    // Skill preload: detect project context and surface relevant skills.
+    let project_queries = crate::skill_detect::session_context_queries();
+    if !project_queries.is_empty() {
+        let db_path = crate::paths::skills_db_path();
+        if db_path.exists()
+            && let Ok(mut registry) = skill_registry::Registry::open_default(&db_path)
+        {
+            let _ = registry.ensure_fresh();
+            for q in &project_queries {
+                if let Ok(hits) = registry.search(q, 2, skill_registry::MatchMode::Any)
+                    && !hits.is_empty()
+                {
+                    let names: Vec<_> = hits.iter().map(|h| h.name.as_str()).collect();
+                    lines.push(format!("  {} skills: {}", q, names.join(", ")));
+                }
+            }
+        }
+    }
+
     // Closing status line: names only the tools this session can actually
     // reach — each tag is gated on the matching component's own `check()` so
     // it never claims a feature that isn't wired up. (Previously this was a
@@ -487,6 +506,51 @@ pub fn prompt_submit(agent: &str) {
     }
     bits.extend(session_bits);
     bits.extend(crate::coaching::rule_bodies_for_prompt(prompt));
+
+    let intent = crate::skill_detect::classify(prompt);
+    bits.push(crate::skill_detect::format_briefing_header(&intent));
+
+    if intent.confidence >= 0.5 {
+        let db_path = crate::paths::skills_db_path();
+        if db_path.exists()
+            && let Ok(mut registry) = skill_registry::Registry::open_default(&db_path)
+        {
+            let _ = registry.ensure_fresh();
+            if let Ok(skills) = crate::skill_detect::find_skills(
+                &intent,
+                &registry,
+                3,
+                crate::memory::engine::embed_query,
+                crate::memory::engine::embed_doc,
+            ) && let Some(injection) = crate::skill_detect::build_injection(&skills)
+            {
+                bits.push(injection);
+            }
+        }
+    }
+
+    // Detect "install <something> skill" patterns → suggest CLI command.
+    let q = prompt.to_lowercase();
+    if q.contains("install") && (q.contains("skill") || q.contains("skills")) {
+        let name = q
+            .replace("install", "")
+            .replace("skill", "")
+            .replace("the", "")
+            .replace("a", "")
+            .replace("please", "")
+            .trim()
+            .to_string();
+        if !name.is_empty() {
+            bits.push(format!(
+                "@skill-install: agentflare skill install \"{name}\" to search and install"
+            ));
+        } else {
+            bits.push(
+                "@skill-install: agentflare skill search <query> to find and install skills"
+                    .to_string(),
+            );
+        }
+    }
 
     let out = json!({
         "hookSpecificOutput": {
