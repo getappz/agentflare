@@ -49,6 +49,7 @@ mod review;
 mod rollup;
 mod rule_text;
 mod shell;
+mod skill_detect;
 mod state;
 mod store;
 mod tool_install;
