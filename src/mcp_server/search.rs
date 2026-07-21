@@ -190,7 +190,9 @@ impl AgentflareMcp {
         if q.is_empty() {
             return Err(ErrorData::invalid_params("query must not be empty", None));
         }
-        let limit = req.limit.unwrap_or(10);
+        // rivalsearch web_search schema bounds num_results to 1..=20; clamp so an
+        // out-of-range limit gets truncated instead of failing the whole call.
+        let limit = req.limit.unwrap_or(10).clamp(1, 20);
 
         let guard = self.ensure_gateway_registry().await?;
         let reg = guard.as_ref().expect("ensured above");
