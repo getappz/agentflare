@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-serde_yml = "0.0"  # frontmatter only; replaces deprecated serde_yaml
+serde_yaml_ng = "0.10"  # frontmatter only; serde_yml has an unsound RUSTSEC advisory (RUSTSEC-2025-0068) and is archived
 regex = "1"
 thiserror = "2"
 dirs = "6"

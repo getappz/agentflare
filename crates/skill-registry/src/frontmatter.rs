@@ -25,7 +25,7 @@ pub fn parse_frontmatter(text: &str) -> Option<(Frontmatter, &str)> {
         if line.trim_end_matches(['\r', '\n']) == "---" && !line.starts_with("----") {
             let yaml = &rest[..offset];
             let body = &rest[offset + line.len()..];
-            let fm: Frontmatter = serde_yml::from_str(yaml).ok()?;
+            let fm: Frontmatter = serde_yaml_ng::from_str(yaml).ok()?;
             return Some((fm, body));
         }
         offset += line.len();

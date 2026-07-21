@@ -22,7 +22,9 @@ pub(crate) struct SkillDetectRequest {
     #[schemars(description = "Max skills to return (default 3)")]
     #[serde(default)]
     pub(crate) limit: Option<usize>,
-    #[schemars(description = "If true, return skill body content instead of just metadata (default false)")]
+    #[schemars(
+        description = "If true, return skill body content instead of just metadata (default false)"
+    )]
     #[serde(default)]
     pub(crate) include_body: bool,
 }
