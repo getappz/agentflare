@@ -13,10 +13,33 @@ pub struct SkillHit {
     pub est_tokens: i64,
     pub compressed: bool,
     pub score: f64,
+    pub last_used_at: i64,
     /// How to install this as an MCP server (only set for registry fallback hits).
     pub install_hint: Option<String>,
     /// Streamable HTTP URL (only set for registry hits with remotes).
     pub remote_url: Option<String>,
+}
+
+/// Exponential decay half-life in seconds (30 days).
+const DECAY_HALF_LIFE: f64 = 30.0 * 86400.0;
+
+/// Apply usage-decay penalty: skills used more recently rank slightly higher
+/// than equally-relevant stale ones. `now` is seconds since epoch.
+fn apply_usage_decay(hits: &mut [SkillHit], now: i64) {
+    for h in hits.iter_mut() {
+        if h.last_used_at == 0 {
+            continue;
+        }
+        let elapsed = (now - h.last_used_at) as f64;
+        if elapsed <= 0.0 {
+            continue;
+        }
+        // decay = 2^(-elapsed / half_life) → 1.0 when just used, → 0.0 when ancient
+        let decay = (-elapsed / DECAY_HALF_LIFE).exp2();
+        // Penalty: at most 30% of the raw score, scaled by decay.
+        // Newest: score * 1.0.   Oldest: score * (1.0 + 0.3).
+        h.score = h.score + h.score * 0.3 * (1.0 - decay);
+    }
 }
 
 pub fn search(
@@ -31,26 +54,35 @@ pub fn search(
     let mut stmt = conn.prepare(
         "SELECT s.name, s.source, s.description, s.est_tokens,
                 s.shadow_path IS NOT NULL,
-                bm25(skills_fts, 3.0, 1.0, 2.0) AS score
+                s.last_used_at,
+                bm25(skills_fts, 3.0, 1.0, 0.5, 2.0, 2.0) AS score
          FROM skills_fts
          JOIN skills s ON s.rowid = skills_fts.rowid
          WHERE skills_fts MATCH ?1
          ORDER BY score
          LIMIT ?2",
     )?;
-    let rows = stmt.query_map(rusqlite::params![fts, clamped_limit(limit)], |r| {
-        Ok(SkillHit {
-            name: r.get(0)?,
-            source: r.get(1)?,
-            description: r.get(2)?,
-            est_tokens: r.get(3)?,
-            compressed: r.get(4)?,
-            score: r.get(5)?,
-            install_hint: None,
-            remote_url: None,
-        })
-    })?;
-    rows.collect()
+    let mut rows: Vec<SkillHit> = stmt
+        .query_map(rusqlite::params![fts, clamped_limit(limit)], |r| {
+            Ok(SkillHit {
+                name: r.get(0)?,
+                source: r.get(1)?,
+                description: r.get(2)?,
+                est_tokens: r.get(3)?,
+                compressed: r.get(4)?,
+                last_used_at: r.get(5)?,
+                score: r.get(6)?,
+                install_hint: None,
+                remote_url: None,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    apply_usage_decay(&mut rows, now);
+    Ok(rows)
 }
 
 /// Fold registry-fallback hits into an already-fetched local result set, up
@@ -72,6 +104,7 @@ pub fn merge_registry_hits(
         est_tokens: 0,
         compressed: false,
         score: gateway_registry::REGISTRY_FALLBACK_SCORE,
+        last_used_at: 0,
         install_hint: hit.install_hint.map(|h| {
             if let Some(runtime) = h.runtime_hint {
                 format!("{} {}", runtime, h.identifier)
@@ -101,12 +134,15 @@ mod tests {
     use std::path::PathBuf;
 
     fn seed() -> Connection {
+
         let mut conn = open_in_memory().unwrap();
-        let mk = |name: &str, desc: &str, shadow: bool| SkillEntry {
+        let mk = |name: &str, desc: &str, body: &str, shadow: bool| SkillEntry {
             name: name.into(),
             source: "claude-user".into(),
             path: PathBuf::from(format!("/x/{name}/SKILL.md")),
             description: desc.into(),
+            body: body.into(),
+            neg_text: String::new(),
             tags: String::new(),
             est_tokens: 100,
             mtime: 1,
@@ -118,18 +154,46 @@ mod tests {
                 mk(
                     "live",
                     "Use when the user asks about running sessions, agent status",
+                    "",
                     true,
                 ),
                 mk(
                     "cv-usage",
                     "Use when the user asks about usage analytics, token usage, cost summary",
+                    "detailed usage tracking body",
                     false,
                 ),
                 mk(
                     "win-cleanup",
                     "Use when the user asks to free disk space on Windows",
+                    "",
                     false,
                 ),
+            ],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn seed_body_match() -> Connection {
+        let mut conn = open_in_memory().unwrap();
+        let mk = |name: &str, desc: &str, body_text: &str| SkillEntry {
+            name: name.into(),
+            source: "claude-user".into(),
+            path: PathBuf::from(format!("/x/{name}/SKILL.md")),
+            description: desc.into(),
+            body: body_text.into(),
+            neg_text: String::new(),
+            tags: String::new(),
+            est_tokens: 100,
+            mtime: 1,
+            shadow_path: None,
+        };
+        rebuild(
+            &mut conn,
+            &[
+                mk("skill-a", "Use for general automation", "handles file parsing and data extraction"),
+                mk("skill-b", "Use for general automation", "unrelated topic coverage"),
             ],
         )
         .unwrap();
@@ -166,6 +230,49 @@ mod tests {
         let conn = seed();
         let hits = search(&conn, "sessions", 5, MatchMode::Any).unwrap();
         assert!(hits.iter().find(|h| h.name == "live").unwrap().compressed);
+    }
+
+    #[test]
+    fn body_text_matches_outranks_identical_description_only() {
+        let conn = seed_body_match();
+        // "parsing" only in skill-a's body; both have same description.
+        let hits = search(&conn, "parsing", 5, MatchMode::Any).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].name, "skill-a");
+    }
+
+    #[test]
+    fn neg_text_match_penalizes_ranking_vs_pure_positive_hit() {
+        let mut conn = open_in_memory().unwrap();
+        let mk = |name: &str, desc: &str, neg: &str| SkillEntry {
+            name: name.into(),
+            source: "claude-user".into(),
+            path: PathBuf::from(format!("/x/{name}/SKILL.md")),
+            description: desc.into(),
+            body: String::new(),
+            neg_text: neg.into(),
+            tags: String::new(),
+            est_tokens: 100,
+            mtime: 1,
+            shadow_path: None,
+        };
+        rebuild(
+            &mut conn,
+            &[
+                mk(
+                    "claude-api",
+                    "Use for Claude API, Anthropic access",
+                    "Do not use for OpenAI GPT or other providers",
+                ),
+                mk("openai-tool", "Use for OpenAI GPT models", ""),
+            ],
+        )
+        .unwrap();
+        // "OpenAI" matches both: claude-api via neg_text (penalty), openai-tool via description (positive).
+        // openai-tool should rank higher.
+        let hits = search(&conn, "OpenAI", 5, MatchMode::Any).unwrap();
+        assert_eq!(hits[0].name, "openai-tool",
+            "neg_text match must penalize claude-api below the genuinely-positive hit");
     }
 
     #[test]
@@ -209,6 +316,38 @@ mod tests {
                 "win-cleanup".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn usage_decay_penalizes_stale_skills() {
+        let now = 1_000_000_000i64;
+        let recent = now - 3600;  // 1 hour ago
+        let stale = now - 90 * 86400; // 90 days ago
+        let mut hits = vec![
+            SkillHit { name: "recent".into(), source: "s".into(), description: "d".into(), est_tokens: 100, compressed: false, score: 1.0, last_used_at: recent, install_hint: None, remote_url: None },
+            SkillHit { name: "stale".into(), source: "s".into(), description: "d".into(), est_tokens: 100, compressed: false, score: 1.0, last_used_at: stale, install_hint: None, remote_url: None },
+        ];
+        apply_usage_decay(&mut hits, now);
+        let recent_hit = hits.iter().find(|h| h.name == "recent").unwrap();
+        let stale_hit = hits.iter().find(|h| h.name == "stale").unwrap();
+        assert!(
+            stale_hit.score > recent_hit.score,
+            "stale skill should have higher (worse) score after decay: recent={} stale={}",
+            recent_hit.score,
+            stale_hit.score
+        );
+    }
+
+    #[test]
+    fn usage_decay_noop_for_never_used() {
+        let mut hits = vec![SkillHit {
+            name: "n".into(), source: "s".into(), description: "d".into(),
+            est_tokens: 100, compressed: false, score: 0.5, last_used_at: 0,
+            install_hint: None, remote_url: None,
+        }];
+        let original = hits[0].score;
+        apply_usage_decay(&mut hits, 1_000_000);
+        assert_eq!(hits[0].score, original);
     }
 
     #[test]

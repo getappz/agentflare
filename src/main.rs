@@ -51,6 +51,7 @@ mod rule_text;
 mod shell;
 mod shim_install;
 mod skill_detect;
+mod skill_proactive;
 mod state;
 mod store;
 mod tool_install;

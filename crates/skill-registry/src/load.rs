@@ -64,6 +64,17 @@ pub fn load(conn: &Connection, name: &str, original: bool) -> Result<LoadedSkill
         0 => Err(LoadError::NotFound(name.to_string())),
         1 => {
             let (name, source, path, shadow) = candidates.remove(0);
+            let _ = conn.execute(
+                "UPDATE skills SET last_used_at = ?1 WHERE name = ?2 AND source = ?3",
+                rusqlite::params![
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                    name,
+                    source,
+                ],
+            );
             let use_shadow = !original && shadow.is_some();
             let body_path = if use_shadow {
                 PathBuf::from(shadow.clone().unwrap())
@@ -187,6 +198,8 @@ mod tests {
                 source: "claude-plugin:cv".into(),
                 path: orig_dir.join("SKILL.md"),
                 description: "d".into(),
+                body: String::new(),
+                neg_text: String::new(),
                 tags: String::new(),
                 est_tokens: 10,
                 mtime: 1,
@@ -197,6 +210,8 @@ mod tests {
                 source: "codex".into(),
                 path: tmp.path().join("codex-live-SKILL.md"),
                 description: "other agent's live".into(),
+                body: String::new(),
+                neg_text: String::new(),
                 tags: String::new(),
                 est_tokens: 10,
                 mtime: 1,

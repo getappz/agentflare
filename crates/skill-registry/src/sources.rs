@@ -9,6 +9,8 @@ pub struct SkillEntry {
     pub source: String,
     pub path: PathBuf,
     pub description: String,
+    pub body: String,
+    pub neg_text: String,
     pub tags: String, // space-joined, FTS column
     pub est_tokens: i64,
     pub mtime: i64,
@@ -59,9 +61,37 @@ fn version_key(dir_name: &str) -> Vec<u64> {
     parts
 }
 
+static NEGATION_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(do not use|skip|not for|never use)\b").unwrap()
+});
+
+/// Split text at the first negation marker. Everything before stays in the
+/// positive portion; everything from the marker onward goes to neg_text.
+/// Returns (positive, neg_text).
+fn split_negation(text: &str) -> (String, String) {
+    match NEGATION_RE.find(text) {
+        Some(m) => {
+            let pos = text[..m.start()].trim().to_string();
+            let neg = text[m.start()..].trim().to_string();
+            (pos, neg)
+        }
+        None => (text.to_string(), String::new()),
+    }
+}
+
+/// Directories/files to skip during source scanning.
+static IGNORE_DIRS: &[&str] = &["__pycache__", "node_modules", ".git", ".venv"];
+
+fn is_ignored(entry: &std::fs::DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .is_some_and(|n| IGNORE_DIRS.contains(&n))
+}
+
 fn read_entry(id: &str, path: &Path) -> Option<SkillEntry> {
     let text = std::fs::read_to_string(path).ok()?;
-    let (fm, _body) = parse_frontmatter(&text)?;
+    let (fm, body) = parse_frontmatter(&text)?;
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
@@ -70,11 +100,23 @@ fn read_entry(id: &str, path: &Path) -> Option<SkillEntry> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let dir_name = path.parent()?.file_name()?.to_string_lossy().to_string();
+    let desc = fm.description.unwrap_or_default();
+    let (description, desc_neg) = split_negation(&desc);
+    let body_text = body.trim();
+    let (body, body_neg) = split_negation(body_text);
+    let neg_text = match (desc_neg.is_empty(), body_neg.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => desc_neg,
+        (true, false) => body_neg,
+        (false, false) => format!("{desc_neg} {body_neg}"),
+    };
     Some(SkillEntry {
         name: fm.name.unwrap_or(dir_name),
         source: id.to_string(),
         path: path.to_path_buf(),
-        description: fm.description.unwrap_or_default(),
+        description,
+        body,
+        neg_text,
         tags: fm.tags.join(" "),
         est_tokens: est_tokens(meta.len()),
         mtime,
@@ -102,7 +144,7 @@ pub fn scan_sources(sources: &[Source]) -> ScanOutput {
                 let Ok(read) = std::fs::read_dir(root) else {
                     continue;
                 };
-                for dir in read.flatten() {
+                for dir in read.flatten().filter(|e| !is_ignored(e)) {
                     let skill_md = dir.path().join("SKILL.md");
                     if !skill_md.is_file() {
                         continue;
@@ -122,11 +164,13 @@ pub fn scan_sources(sources: &[Source]) -> ScanOutput {
                         .into_iter()
                         .flatten()
                         .flatten()
+                        .filter(|e| !is_ignored(e))
                     {
                         for ver in std::fs::read_dir(plugin.path())
                             .into_iter()
                             .flatten()
                             .flatten()
+                            .filter(|e| !is_ignored(e))
                         {
                             let skills = ver.path().join("skills");
                             for sk in std::fs::read_dir(&skills).into_iter().flatten().flatten() {
@@ -384,6 +428,86 @@ mod tests {
         assert_eq!(
             out.entries[0].shadow_path.as_deref(),
             Some(ud.join("SKILL.md").as_path())
+        );
+    }
+
+    #[test]
+    fn scan_sources_skips_ignored_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Valid skill
+        write_skill(tmp.path(), "real-skill", "A real skill", "body");
+        // Ignored dirs
+        for ignored in ["__pycache__", "node_modules", ".git", ".venv"] {
+            let d = tmp.path().join(ignored);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(
+                d.join("SKILL.md"),
+                "---\nname: ghost\ndescription: should not appear\n---\nbody",
+            )
+            .unwrap();
+        }
+        let out = scan_sources(&[Source {
+            id: "claude-user".into(),
+            kind: SourceKind::FlatDir(tmp.path().to_path_buf()),
+        }]);
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].name, "real-skill");
+    }
+
+    #[test]
+    fn split_negation_extracts_negation_marker() {
+        let (pos, neg) = split_negation("Use for Claude API. Do NOT use for OpenAI.");
+        assert_eq!(pos, "Use for Claude API.");
+        assert_eq!(neg, "Do NOT use for OpenAI.");
+    }
+
+    #[test]
+    fn split_negation_no_marker_returns_empty_neg() {
+        let (pos, neg) = split_negation("Use for general automation");
+        assert_eq!(pos, "Use for general automation");
+        assert!(neg.is_empty());
+    }
+
+    #[test]
+    fn split_negation_multiple_markers_splits_at_first() {
+        let (pos, neg) =
+            split_negation("General automation. Skip for file parsing. Not for data extraction.");
+        assert_eq!(pos, "General automation.");
+        assert!(
+            neg.starts_with("Skip"),
+            "neg should start at first marker: {neg}"
+        );
+    }
+
+    #[test]
+    fn split_negation_is_case_insensitive() {
+        let (pos, neg) = split_negation("Use for Claude. skip for OpenAI. NEVER USE for Gemini.");
+        assert_eq!(pos, "Use for Claude.");
+        assert!(neg.starts_with("skip"), "neg={neg}");
+    }
+
+    #[test]
+    fn read_entry_separates_negation_from_description_and_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("test-skill");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(
+            d.join("SKILL.md"),
+            "---\nname: test-skill\ndescription: Use for coding tasks. Not for debugging.\n---\nGeneral code assistance. Never use for SQL.\n",
+        )
+        .unwrap();
+        let e = read_entry("claude-user", &d.join("SKILL.md")).unwrap();
+        assert_eq!(e.description, "Use for coding tasks.");
+        assert_eq!(e.body, "General code assistance.");
+        assert!(
+            e.neg_text.contains("Not for debugging"),
+            "neg_text should contain description negation: {}",
+            e.neg_text
+        );
+        assert!(
+            e.neg_text.contains("Never use for SQL"),
+            "neg_text should contain body negation: {}",
+            e.neg_text
         );
     }
 

@@ -165,6 +165,15 @@ fn session_start_message(agent: &str) -> String {
         }
     }
 
+    // Proactive skill suggestions (active/quiet levels)
+    if let Some(advice) = crate::skill_proactive::proactive_suggestions() {
+        lines.push(String::new());
+        lines.push(colorize(HEADING, "Skill advisory:"));
+        for line in advice.lines() {
+            lines.push(line.to_string());
+        }
+    }
+
     // Closing status line: names only the tools this session can actually
     // reach — each tag is gated on the matching component's own `check()` so
     // it never claims a feature that isn't wired up. (Previously this was a

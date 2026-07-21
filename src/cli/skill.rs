@@ -25,6 +25,10 @@ pub enum SkillAction {
         #[command(subcommand)]
         action: RegistryAction,
     },
+    /// Run search-quality evaluation against the indexed skills and report
+    /// Hit@1/Hit@3/MRR/nDCG. Fails with a non-zero exit when any metric
+    /// drops below its configured floor.
+    Eval,
 }
 
 #[derive(Subcommand)]
@@ -245,6 +249,130 @@ fn run_registry(action: RegistryAction) {
     }
 }
 
+/// Labeled query for `skill eval`. `relevance` is on a 0-3 scale:
+/// 3 = perfect match (the skill is about exactly this), 2 = good match,
+/// 1 = marginal, 0 = irrelevant.
+struct EvalQuery {
+    query: &'static str,
+    expected: &'static str,
+    relevance: u32,
+}
+
+const EVAL_QUERIES: &[EvalQuery] = &[
+    EvalQuery { query: "what's running right now", expected: "live", relevance: 3 },
+    EvalQuery { query: "are my agents stuck", expected: "live", relevance: 3 },
+    EvalQuery { query: "check on background sessions", expected: "live", relevance: 3 },
+    EvalQuery { query: "how much did I spend on tokens this week", expected: "cv-usage", relevance: 3 },
+    EvalQuery { query: "usage statistics", expected: "cv-usage", relevance: 3 },
+    EvalQuery { query: "session count report", expected: "cv-usage", relevance: 2 },
+    EvalQuery { query: "my disk is full", expected: "win-cleanup", relevance: 3 },
+    EvalQuery { query: "free up space on windows", expected: "win-cleanup", relevance: 3 },
+    EvalQuery { query: "clean temp files", expected: "win-cleanup", relevance: 3 },
+    EvalQuery { query: "review my diff for bugs", expected: "code-review", relevance: 3 },
+    EvalQuery { query: "check this code for correctness", expected: "code-review", relevance: 3 },
+    EvalQuery { query: "find efficiency cleanups", expected: "code-review", relevance: 2 },
+    EvalQuery { query: "research this topic with cited sources", expected: "deep-research", relevance: 3 },
+    EvalQuery { query: "fan out web searches and verify claims", expected: "deep-research", relevance: 3 },
+    EvalQuery { query: "write me a fact checked report", expected: "deep-research", relevance: 3 },
+    EvalQuery { query: "this skill is too verbose", expected: "short-skill", relevance: 3 },
+    EvalQuery { query: "compress a bloated skill", expected: "short-skill", relevance: 3 },
+    EvalQuery { query: "make a shorthand version of a skill", expected: "short-skill", relevance: 3 },
+    EvalQuery { query: "skill is token heavy", expected: "short-skill", relevance: 3 },
+    EvalQuery { query: "what needs my attention", expected: "live", relevance: 3 },
+    EvalQuery { query: "system slow disk space", expected: "win-cleanup", relevance: 2 },
+    EvalQuery { query: "token spend this month", expected: "cv-usage", relevance: 3 },
+    EvalQuery { query: "debug this pull request", expected: "code-review", relevance: 2 },
+    EvalQuery { query: "synthesize research findings", expected: "deep-research", relevance: 3 },
+    EvalQuery { query: "make a shorter skill", expected: "short-skill", relevance: 3 },
+];
+
+struct EvalReport {
+    hit_at_1: f64,
+    hit_at_3: f64,
+    mrr: f64,
+    ndcg: f64,
+    total: usize,
+    passes: u32,
+}
+
+fn run_eval() -> Result<EvalReport, String> {
+    let db_path = crate::paths::skills_db_path();
+    let mut registry =
+        skill_registry::Registry::open_default(&db_path).map_err(|e| e.to_string())?;
+    registry.ensure_fresh().map_err(|e| e.to_string())?;
+
+    let mut hit1 = 0usize;
+    let mut hit3 = 0usize;
+    let mut reciprocal_ranks = Vec::with_capacity(EVAL_QUERIES.len());
+    let mut dcg_scores = Vec::with_capacity(EVAL_QUERIES.len());
+    use skill_registry::MatchMode;
+
+    for eq in EVAL_QUERIES {
+        let mut r = registry.search(eq.query, 3, MatchMode::All).unwrap_or_default();
+        if r.is_empty() {
+            r = registry.search(eq.query, 3, MatchMode::Any).unwrap_or_default();
+        }
+
+        let ideal_dcg = (eq.relevance as f64)
+            + if eq.relevance > 0 {
+                eq.relevance as f64 / (2f64).log2()
+            } else {
+                0.0
+            };
+
+        let dcg = r.first().map_or(0.0, |h| {
+            if h.name == eq.expected {
+                eq.relevance as f64
+            } else {
+                0.0
+            }
+        });
+
+        dcg_scores.push((dcg, ideal_dcg));
+
+        if r.first().is_some_and(|h| h.name == eq.expected) {
+            hit1 += 1;
+            hit3 += 1;
+            reciprocal_ranks.push(1.0 / 1.0);
+        } else if r.iter().any(|h| h.name == eq.expected) {
+            hit3 += 1;
+            let pos = r.iter().position(|h| h.name == eq.expected).unwrap_or(2) + 1;
+            reciprocal_ranks.push(1.0 / pos as f64);
+        } else {
+            reciprocal_ranks.push(0.0);
+        }
+    }
+
+    let total = EVAL_QUERIES.len();
+    let hit_at_1 = hit1 as f64 / total as f64;
+    let hit_at_3 = hit3 as f64 / total as f64;
+    let mrr = reciprocal_ranks.iter().sum::<f64>() / total as f64;
+    let ndcg = dcg_scores
+        .iter()
+        .map(|(d, i)| if *i > 0.0 { d / i } else { 0.0 })
+        .sum::<f64>()
+        / total as f64;
+
+    let mut passes = 0u32;
+    if hit_at_1 >= 0.70 { passes += 1; }
+    if hit_at_3 >= 0.85 { passes += 1; }
+    if mrr >= 0.75 { passes += 1; }
+    if ndcg >= 0.80 { passes += 1; }
+
+    Ok(EvalReport { hit_at_1, hit_at_3, mrr, ndcg, total, passes })
+}
+
+fn print_eval(report: &EvalReport) {
+    println!("━━━ skill eval ━━━");
+    println!("  queries:  {}", report.total);
+    println!("  Hit@1:    {:.3}  {}", report.hit_at_1, if report.hit_at_1 >= 0.70 { "✓" } else { "✗" });
+    println!("  Hit@3:    {:.3}  {}", report.hit_at_3, if report.hit_at_3 >= 0.85 { "✓" } else { "✗" });
+    println!("  MRR:      {:.3}  {}", report.mrr, if report.mrr >= 0.75 { "✓" } else { "✗" });
+    println!("  nDCG:     {:.3}  {}", report.ndcg, if report.ndcg >= 0.80 { "✓" } else { "✗" });
+    let verdict = if report.passes == 4 { "PASS" } else { "FAIL" };
+    println!("  verdict:  {verdict} ({}/{})", report.passes, 4);
+}
+
 impl SkillArgs {
     pub fn run(self) {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -269,6 +397,18 @@ impl SkillArgs {
                 }
             }
             SkillAction::Registry { action } => run_registry(action),
+            SkillAction::Eval => match run_eval() {
+                Ok(report) => {
+                    print_eval(&report);
+                    if report.passes < 4 {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("eval error: {e}");
+                    std::process::exit(1);
+                }
+            },
         }
     }
 }

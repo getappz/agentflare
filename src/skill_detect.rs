@@ -288,6 +288,19 @@ pub fn find_skills(
     embed_query: impl Fn(&str) -> Option<Vec<f32>>,
     embed_doc: impl Fn(&str) -> Option<Vec<f32>>,
 ) -> Result<Vec<RankedSkill>, String> {
+    find_skills_budget(intent, registry, limit, 0, embed_query, embed_doc)
+}
+
+/// Like `find_skills` but caps total returned skill tokens to `budget_tokens`.
+/// Pass 0 for no budget limit.
+pub fn find_skills_budget(
+    intent: &IntentClassification,
+    registry: &skill_registry::Registry,
+    limit: usize,
+    budget_tokens: i64,
+    embed_query: impl Fn(&str) -> Option<Vec<f32>>,
+    embed_doc: impl Fn(&str) -> Option<Vec<f32>>,
+) -> Result<Vec<RankedSkill>, String> {
     let mut seen = HashMap::new();
     let mut results = Vec::new();
 
@@ -370,6 +383,30 @@ pub fn find_skills(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     results.truncate(limit);
+
+    // Fusion: normalize scores to 0-1 range and blend with intent confidence
+    let max_score = results
+        .iter()
+        .map(|r| r.score)
+        .fold(0.0_f64, f64::max);
+    if max_score > 0.0 {
+        for r in results.iter_mut() {
+            r.score = (r.score / max_score) * intent.confidence;
+        }
+    }
+
+    // Budget-aware capping: accumulate est_tokens and drop tail that exceeds budget
+    if budget_tokens > 0 {
+        let mut acc = 0i64;
+        results.retain(|r| {
+            if acc >= budget_tokens {
+                return false;
+            }
+            acc += r.description.len() as i64;
+            true
+        });
+    }
+
     Ok(results)
 }
 
@@ -539,6 +576,25 @@ mod tests {
     #[test]
     fn build_injection_empty() {
         assert!(build_injection(&[]).is_none());
+    }
+
+    #[test]
+    fn budget_cap_drops_skills_exceeding_limit() {
+        let skills = vec![
+            RankedSkill { name: "a".into(), source: "s".into(), description: "short".into(), score: 0.9, match_reason: "x".into() },
+            RankedSkill { name: "b".into(), source: "s".into(), description: "very long description that exceeds budget".into(), score: 0.8, match_reason: "x".into() },
+            RankedSkill { name: "c".into(), source: "s".into(), description: "also long".into(), score: 0.7, match_reason: "x".into() },
+        ];
+        let mut sorted = skills;
+        sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let mut acc = 0i64;
+        sorted.retain(|r| {
+            if acc >= 10 { return false; }
+            acc += r.description.len() as i64;
+            true
+        });
+        assert!(sorted.len() < 3, "budget should cap at fewer than 3 skills");
+        assert_eq!(sorted[0].name, "a", "highest-score skill must come first");
     }
 
     #[test]

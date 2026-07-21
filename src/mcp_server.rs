@@ -303,7 +303,26 @@ impl AgentflareMcp {
                 }
                 let result = self.with_fresh_registry(|reg| reg.load(&name, req.original))?;
                 match result {
-                    Ok(s) => Ok(serde_json::to_string_pretty(&s).unwrap_or_default()),
+                    Ok(s) => {
+                        let json = serde_json::to_string_pretty(&s).unwrap_or_default();
+                        if req.activation_wrapper {
+                            let siblings: Vec<String> = s
+                                .siblings
+                                .iter()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .collect();
+                            let siblings_block = if siblings.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\n\nCompanion scripts:\n- {}", siblings.join("\n- "))
+                            };
+                            Ok(format!(
+                                "<SKILL_ACTIVATION>\nFollow this skill definition verbatim:{json}{siblings_block}\n</SKILL_ACTIVATION>"
+                            ))
+                        } else {
+                            Ok(json)
+                        }
+                    }
                     Err(e @ skill_registry::LoadError::NotFound(_))
                     | Err(e @ skill_registry::LoadError::Ambiguous(_)) => {
                         Err(ErrorData::invalid_params(e.to_string(), None))

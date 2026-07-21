@@ -50,6 +50,11 @@ pub(crate) struct SkillRequest {
     #[schemars(description = "true = load the original even when a compressed copy exists (load)")]
     #[serde(default)]
     pub(crate) original: bool,
+    #[schemars(
+        description = "Wrap skill body + siblings in a <SKILL_ACTIVATION> enforcement block (load only, default false)"
+    )]
+    #[serde(default)]
+    pub(crate) activation_wrapper: bool,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]

@@ -12,13 +12,16 @@ CREATE TABLE IF NOT EXISTS skills (
   source TEXT NOT NULL,
   path TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL DEFAULT '',
+  neg_text TEXT NOT NULL DEFAULT '',
   tags TEXT NOT NULL DEFAULT '',
   est_tokens INTEGER NOT NULL DEFAULT 0,
   mtime INTEGER NOT NULL DEFAULT 0,
+  last_used_at INTEGER NOT NULL DEFAULT 0,
   shadow_path TEXT,
   PRIMARY KEY (name, source)
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(name, description, tags);
+CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(name, description, body, tags, neg_text);
 ";
 
 pub fn open_db(path: &Path) -> rusqlite::Result<Connection> {
@@ -49,11 +52,11 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
         // OR IGNORE: a single bad skill (duplicate (name, source)) must not
         // roll back the whole rebuild and disable every skill_search/skill_load.
         let mut ins = tx.prepare(
-            "INSERT OR IGNORE INTO skills (name, source, path, description, tags, est_tokens, mtime, shadow_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR IGNORE INTO skills (name, source, path, description, body, neg_text, tags, est_tokens, mtime, last_used_at, shadow_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
         )?;
         let mut fts = tx.prepare(
-            "INSERT INTO skills_fts (rowid, name, description, tags) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO skills_fts (rowid, name, description, body, tags, neg_text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         for e in entries {
             ins.execute(params![
@@ -61,6 +64,8 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
                 e.source,
                 e.path.to_string_lossy(),
                 e.description,
+                e.body,
+                e.neg_text,
                 e.tags,
                 e.est_tokens,
                 e.mtime,
@@ -74,7 +79,7 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
                 continue;
             }
             let rowid = tx.last_insert_rowid();
-            fts.execute(params![rowid, e.name, e.description, e.tags])?;
+            fts.execute(params![rowid, e.name, e.description, e.body, e.tags, e.neg_text])?;
         }
     }
     tx.commit()
@@ -91,6 +96,8 @@ mod tests {
             source: source.into(),
             path: PathBuf::from(format!("/x/{name}/SKILL.md")),
             description: desc.into(),
+            body: String::new(),
+            neg_text: String::new(),
             tags: String::new(),
             est_tokens: 100,
             mtime: 1,
