@@ -19,6 +19,7 @@ mod optimize;
 mod review;
 mod run;
 mod serve;
+mod skill;
 mod uninstall;
 mod update;
 mod vent;
@@ -69,6 +70,7 @@ pub enum Commands {
     Channel(channel::ChannelArgs),
     Claim(claim::ClaimArgs),
     Review(review::ReviewArgs),
+    Skill(skill::SkillArgs),
     Memory(memory::MemoryArgs),
     Serve(serve::ServeArgs),
     Vent(vent::VentArgs),
@@ -99,6 +101,7 @@ impl Commands {
             Self::Channel(cmd) => cmd.run(),
             Self::Claim(cmd) => cmd.run(),
             Self::Review(cmd) => cmd.run(),
+            Self::Skill(cmd) => cmd.run(),
             Self::Memory(cmd) => cmd.run(),
             Self::Serve(cmd) => cmd.run(),
             Self::Daemon(cmd) => cmd.run(),
