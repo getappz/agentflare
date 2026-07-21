@@ -122,7 +122,12 @@ fn classify(
         ),
         "Write" | "Edit" => {
             let path = tool_input
-                .and_then(|v| v.get("file_path").or_else(|| v.get("path")))
+                .and_then(|v| {
+                    // opencode's native tools send camelCase `filePath`.
+                    v.get("file_path")
+                        .or_else(|| v.get("path"))
+                        .or_else(|| v.get("filePath"))
+                })
                 .and_then(Value::as_str)?;
             is_spec_like_path(path).then(|| {
                 format!(
@@ -150,8 +155,12 @@ pub fn redirect_decision(tool_name: &str, tool_input: Option<&Value>) -> Option<
         // host cwd.
         let (current, default) = if MUTATING_TOOLS.contains(&tool_name.as_str()) {
             let target_repo = tool_input.as_ref().and_then(|ti| {
+                // opencode's native tools send camelCase `filePath`; without
+                // it here the target repo resolves to None and the branch
+                // guard silently allows the edit.
                 ti.get("file_path")
                     .or_else(|| ti.get("path"))
+                    .or_else(|| ti.get("filePath"))
                     .and_then(Value::as_str)
                     .map(Path::new)
                     .and_then(|p| p.parent())
@@ -266,6 +275,50 @@ mod tests {
         assert!(classify("apply_patch", None, ctx).is_some());
         assert!(classify("multiedit", None, ctx).is_some());
         assert!(classify("MultiEdit", None, ctx).is_some());
+    }
+
+    #[test]
+    fn classify_reads_camel_case_file_path_for_spec_redirect() {
+        let input = json!({ "filePath": "docs/superpowers/specs/foo.md" });
+        assert!(classify("Write", Some(&input), ON_FEATURE_BRANCH).is_some());
+    }
+
+    #[test]
+    fn redirect_decision_resolves_repo_from_camel_case_file_path() {
+        // Regression: opencode's native edit/write send `filePath`; if the
+        // key isn't parsed the target repo resolves to None and a default-
+        // branch edit slips through.
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "master"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "x",
+        ]);
+        std::fs::write(tmp.path().join("f.rs"), "x").unwrap();
+        let input = json!({ "filePath": tmp.path().join("f.rs").to_string_lossy() });
+        let decision = redirect_decision("edit", Some(&input))
+            .expect("camelCase filePath must reach the branch guard");
+        assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny");
     }
 
     #[test]
