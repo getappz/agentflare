@@ -9,7 +9,7 @@ mod cost;
 mod daemon;
 mod dev_install;
 mod gateway;
-mod git;
+pub(crate) mod git;
 mod handoff;
 mod hook;
 mod init;

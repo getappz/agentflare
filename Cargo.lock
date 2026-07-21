@@ -103,6 +103,7 @@ dependencies = [
  "rusqlite",
  "rusqlite_migration",
  "rust-embed",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -132,10 +133,12 @@ dependencies = [
 name = "agentflare-artifacts"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "nanoid",
  "serde",
  "serde_json",
  "similar",
+ "tempfile",
 ]
 
 [[package]]
@@ -249,6 +252,7 @@ dependencies = [
  "blake3",
  "bytemuck",
  "dirs",
+ "flate2",
  "ndarray",
  "ort",
  "parking_lot",
@@ -1025,6 +1029,7 @@ dependencies = [
  "agentflare-backend",
  "chrono",
  "dirs",
+ "fs2",
  "rusqlite",
  "serde",
  "serde_json",

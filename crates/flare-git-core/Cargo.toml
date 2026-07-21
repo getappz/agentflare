@@ -16,6 +16,7 @@ agentflare-backend = { package = "agentflare-backend", path = "../agentflare-bac
 dirs = "6"
 agent-detector = "0.2.1"
 which = "6"
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

@@ -304,6 +304,19 @@ pub fn get_components(host: &str) -> Vec<Component> {
                 crate::mise_install::MiseOutcome::Failed(m) => format!("mise install failed — {m}"),
             }),
         },
+        // PATH shims (`~/.agentflare/shims/`): route bare tool-name calls
+        // (git, npm, cargo, ...) through lean-ctx when an agent CLI is
+        // active. Host-independent -- the shim binary itself gates on
+        // agent-env markers at runtime, so installing it once here covers
+        // every agent. No-ops (and says so) on a build that doesn't bundle
+        // the shim binaries next to `agentflare` yet.
+        Component {
+            id: "shims",
+            needs_consent: true,
+            describe: "PATH shims (~/.agentflare/shims/) for git + common CLI tools — routes bare tool calls through lean-ctx while an agent CLI is active".to_string(),
+            check: Box::new(crate::shim_install::all_shims_present),
+            apply: Box::new(crate::shim_install::install),
+        },
         Component {
             id: "leanctx",
             needs_consent: true,
@@ -572,6 +585,7 @@ mod tests {
         let expected: Vec<&str> = vec![
             "rules",
             "mise",
+            "shims",
             "leanctx",
             "agentflare-mcp",
             "optimize-code-mode",
@@ -580,6 +594,7 @@ mod tests {
         let expected: Vec<&str> = vec![
             "rules",
             "mise",
+            "shims",
             "leanctx",
             "agentflare-mcp",
             "optimize-code-mode",

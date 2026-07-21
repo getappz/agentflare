@@ -14,6 +14,14 @@ const CONTENT_FILE: &str = "content";
 
 const VERSIONS_DIR: &str = "versions";
 
+/// Version snapshots beyond this many most-recent are pruned on publish — a
+/// bound on runaway republish loops (e.g. a stuck `/loop` session hammering
+/// one artifact), not a limit normal editing ever reaches. `diff`/
+/// `get_version` on a pruned version returns NotFound; `versions()` (the
+/// history list) is untouched, so what happened is still visible even after
+/// old snapshot bodies are gone. v1 is always kept as the origin anchor.
+const MAX_KEPT_VERSIONS: u32 = 50;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ArtifactMeta {
     pub id: String,
@@ -135,8 +143,9 @@ impl ArtifactStore {
         if !unchanged {
             fs::write(
                 dir.join(VERSIONS_DIR).join(version.to_string()),
-                &req.content,
+                gzip(req.content.as_bytes())?,
             )?;
+            prune_old_versions(&dir, version, MAX_KEPT_VERSIONS);
         }
         fs::write(dir.join(META_FILE), serde_json::to_string_pretty(&meta)?)?;
         fs::write(dir.join(CONTENT_FILE), &req.content)?;
@@ -159,8 +168,8 @@ impl ArtifactStore {
     /// Unified diff between two version snapshots of an artifact.
     pub fn diff(&self, id: &str, from: u32, to: u32) -> std::io::Result<String> {
         let versions_dir = self.artifact_dir(id).join(VERSIONS_DIR);
-        let old = fs::read_to_string(versions_dir.join(from.to_string()))?;
-        let new = fs::read_to_string(versions_dir.join(to.to_string()))?;
+        let old = read_version_file(&versions_dir.join(from.to_string()))?;
+        let new = read_version_file(&versions_dir.join(to.to_string()))?;
         let diff = similar::TextDiff::from_lines(&old, &new);
         Ok(diff
             .unified_diff()
@@ -185,7 +194,7 @@ impl ArtifactStore {
             .artifact_dir(id)
             .join(VERSIONS_DIR)
             .join(version.to_string());
-        artifact.content = fs::read_to_string(content_path)?;
+        artifact.content = read_version_file(&content_path)?;
         artifact.version = version;
         Ok(artifact)
     }
@@ -295,5 +304,163 @@ impl ArtifactStore {
 
     pub fn base_path(&self) -> &Path {
         &self.base_path
+    }
+}
+
+/// Delete version-snapshot bodies older than the `keep` most-recent, always
+/// preserving v1 as the origin anchor. Oldest-first, no-op once already
+/// under the cap — safe to call unconditionally on every publish.
+fn prune_old_versions(dir: &Path, latest_version: u32, keep: u32) {
+    if latest_version <= keep {
+        return;
+    }
+    let cutoff = latest_version - keep;
+    let versions_dir = dir.join(VERSIONS_DIR);
+    for v in 2..=cutoff {
+        let _ = fs::remove_file(versions_dir.join(v.to_string()));
+    }
+}
+
+fn gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(data)?;
+    enc.finish()
+}
+
+/// Reads a version-snapshot file, transparently decompressing it if it's
+/// gzip (2-byte magic `1f 8b`). A snapshot written before compression
+/// landed has no such header, so it's read as plain UTF-8 text unchanged —
+/// self-describing, no version marker or migration needed to keep serving
+/// snapshots written by older builds.
+fn read_version_file(path: &Path) -> std::io::Result<String> {
+    let data = fs::read(path)?;
+    let bytes = if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut out = Vec::new();
+        GzDecoder::new(&data[..]).read_to_end(&mut out)?;
+        out
+    } else {
+        data
+    };
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, ArtifactStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::new(tmp.path().to_path_buf());
+        (tmp, store)
+    }
+
+    fn publish(store: &ArtifactStore, update_id: Option<String>, content: &str) -> String {
+        store
+            .publish(&PublishRequest {
+                name: "doc".into(),
+                artifact_type: ArtifactType::Markdown,
+                content: content.into(),
+                session_id: "s1".into(),
+                update_id,
+                ..Default::default()
+            })
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn prune_old_versions_is_a_noop_under_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(VERSIONS_DIR)).unwrap();
+        for v in 1..=5u32 {
+            fs::write(dir.path().join(VERSIONS_DIR).join(v.to_string()), "x").unwrap();
+        }
+        prune_old_versions(dir.path(), 5, 50);
+        for v in 1..=5u32 {
+            assert!(dir.path().join(VERSIONS_DIR).join(v.to_string()).exists());
+        }
+    }
+
+    #[test]
+    fn prune_old_versions_drops_the_old_tail_but_keeps_v1_and_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(VERSIONS_DIR)).unwrap();
+        for v in 1..=10u32 {
+            fs::write(dir.path().join(VERSIONS_DIR).join(v.to_string()), "x").unwrap();
+        }
+        prune_old_versions(dir.path(), 10, 3);
+        let exists = |v: u32| dir.path().join(VERSIONS_DIR).join(v.to_string()).exists();
+        assert!(exists(1), "v1 is always kept as the origin anchor");
+        for v in 2..=7u32 {
+            assert!(
+                !exists(v),
+                "v{v} is older than the last 3 kept and should be pruned"
+            );
+        }
+        for v in 8..=10u32 {
+            assert!(exists(v), "v{v} is within the last 3 kept");
+        }
+    }
+
+    #[test]
+    fn publish_loop_prunes_old_version_bodies_but_keeps_full_history() {
+        let (_tmp, store) = store();
+        let id = publish(&store, None, "v1");
+        let mut last_id = id.clone();
+        for i in 2..=60 {
+            last_id = publish(&store, Some(last_id), &format!("v{i}"));
+        }
+
+        // history (the version list) still shows every publish...
+        let history = store.versions(&id).unwrap();
+        assert_eq!(history.len(), 60);
+
+        // ...but old version bodies beyond the cap are gone from disk, while
+        // v1 and the recent tail survive.
+        assert!(store.diff(&id, 1, 2).is_err(), "v2 body pruned by now");
+        assert!(store.get_version(&id, 1).is_ok(), "v1 anchor kept");
+        assert!(store.get_version(&id, 60).is_ok(), "latest version kept");
+    }
+
+    #[test]
+    fn version_snapshots_are_stored_gzip_compressed() {
+        let (_tmp, store) = store();
+        let content = "repeat me ".repeat(200);
+        let id = publish(&store, None, &content);
+
+        let raw = fs::read(store.artifact_dir(&id).join(VERSIONS_DIR).join("1")).unwrap();
+        assert!(
+            raw.len() < content.len(),
+            "on-disk snapshot ({} bytes) should be smaller than the source ({} bytes)",
+            raw.len(),
+            content.len()
+        );
+        assert_eq!(&raw[..2], &[0x1f, 0x8b], "gzip magic header");
+
+        assert_eq!(store.get_version(&id, 1).unwrap().content, content);
+    }
+
+    #[test]
+    fn a_legacy_plaintext_version_written_before_gzip_still_reads_back() {
+        let (_tmp, store) = store();
+        let id = publish(&store, None, "v1");
+
+        // Simulate a snapshot written by a build predating compression: no
+        // gzip magic, plain UTF-8 text on disk.
+        fs::write(
+            store.artifact_dir(&id).join(VERSIONS_DIR).join("1"),
+            "legacy plaintext, no gzip header",
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.get_version(&id, 1).unwrap().content,
+            "legacy plaintext, no gzip header"
+        );
     }
 }
