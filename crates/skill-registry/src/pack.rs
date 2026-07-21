@@ -75,7 +75,8 @@ impl SkillBundle {
     pub fn dedup(&mut self) -> usize {
         let before = self.entries.len();
         let mut seen: HashSet<(String, String)> = HashSet::new();
-        self.entries.retain(|e| seen.insert((e.name.clone(), e.source.clone())));
+        self.entries
+            .retain(|e| seen.insert((e.name.clone(), e.source.clone())));
         before - self.entries.len()
     }
 
@@ -157,7 +158,8 @@ mod tests {
 
     #[test]
     fn merge_adds_new_keys_only() {
-        let mut bundle = SkillBundle::new(&[sample_entry("a", "local"), sample_entry("b", "local")]);
+        let mut bundle =
+            SkillBundle::new(&[sample_entry("a", "local"), sample_entry("b", "local")]);
         let other = SkillBundle::new(&[sample_entry("b", "local"), sample_entry("c", "local")]);
         assert_eq!(bundle.merge(&other), 1);
         assert_eq!(bundle.entries.len(), 3);

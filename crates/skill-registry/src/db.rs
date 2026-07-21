@@ -8,9 +8,8 @@ use std::path::Path;
 
 /// Run PRAGMA integrity_check. Returns error message on failure, None if OK.
 pub fn integrity_check(conn: &Connection) -> Option<String> {
-    let result: Result<String, _> = conn.pragma_query_value(None, "integrity_check", |r| {
-        r.get::<_, String>(0)
-    });
+    let result: Result<String, _> =
+        conn.pragma_query_value(None, "integrity_check", |r| r.get::<_, String>(0));
     match result {
         Ok(s) if s == "ok" => None,
         Ok(s) => Some(s),
@@ -122,7 +121,14 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
                 continue;
             }
             let rowid = tx.last_insert_rowid();
-            fts.execute(params![rowid, e.name, e.description, e.body, e.tags, e.neg_text])?;
+            fts.execute(params![
+                rowid,
+                e.name,
+                e.description,
+                e.body,
+                e.tags,
+                e.neg_text
+            ])?;
         }
     }
     tx.commit()

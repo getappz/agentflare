@@ -385,10 +385,7 @@ pub fn find_skills_budget(
     results.truncate(limit);
 
     // Fusion: normalize scores to 0-1 range and blend with intent confidence
-    let max_score = results
-        .iter()
-        .map(|r| r.score)
-        .fold(0.0_f64, f64::max);
+    let max_score = results.iter().map(|r| r.score).fold(0.0_f64, f64::max);
     if max_score > 0.0 {
         for r in results.iter_mut() {
             r.score = (r.score / max_score) * intent.confidence;
@@ -581,15 +578,39 @@ mod tests {
     #[test]
     fn budget_cap_drops_skills_exceeding_limit() {
         let skills = vec![
-            RankedSkill { name: "a".into(), source: "s".into(), description: "short".into(), score: 0.9, match_reason: "x".into() },
-            RankedSkill { name: "b".into(), source: "s".into(), description: "very long description that exceeds budget".into(), score: 0.8, match_reason: "x".into() },
-            RankedSkill { name: "c".into(), source: "s".into(), description: "also long".into(), score: 0.7, match_reason: "x".into() },
+            RankedSkill {
+                name: "a".into(),
+                source: "s".into(),
+                description: "short".into(),
+                score: 0.9,
+                match_reason: "x".into(),
+            },
+            RankedSkill {
+                name: "b".into(),
+                source: "s".into(),
+                description: "very long description that exceeds budget".into(),
+                score: 0.8,
+                match_reason: "x".into(),
+            },
+            RankedSkill {
+                name: "c".into(),
+                source: "s".into(),
+                description: "also long".into(),
+                score: 0.7,
+                match_reason: "x".into(),
+            },
         ];
         let mut sorted = skills;
-        sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut acc = 0i64;
         sorted.retain(|r| {
-            if acc >= 10 { return false; }
+            if acc >= 10 {
+                return false;
+            }
             acc += r.description.len() as i64;
             true
         });

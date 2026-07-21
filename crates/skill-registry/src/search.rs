@@ -55,7 +55,7 @@ pub fn search(
         "SELECT s.name, s.source, s.description, s.est_tokens,
                 s.shadow_path IS NOT NULL,
                 s.last_used_at,
-                bm25(skills_fts, 3.0, 1.0, 0.5, 2.0, 2.0) AS score
+                bm25(skills_fts, 3.0, 1.0, 0.5, 2.0, 0.0) AS score
          FROM skills_fts
          JOIN skills s ON s.rowid = skills_fts.rowid
          WHERE skills_fts MATCH ?1
@@ -126,6 +126,17 @@ pub fn list_all_names(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     rows.collect()
 }
 
+/// Every (name, source) pair currently indexed. Unlike `list_all_names`,
+/// this preserves source attribution -- required for callers (export/hub
+/// push) that need to reconstruct a qualified `source:name` lookup key,
+/// since bare names collide across sources and `list_all_names` cannot
+/// be split on to recover the source (skill names contain no separator).
+pub fn list_all_name_source_pairs(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT name, source FROM skills ORDER BY name")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,7 +145,6 @@ mod tests {
     use std::path::PathBuf;
 
     fn seed() -> Connection {
-
         let mut conn = open_in_memory().unwrap();
         let mk = |name: &str, desc: &str, body: &str, shadow: bool| SkillEntry {
             name: name.into(),
@@ -192,8 +202,16 @@ mod tests {
         rebuild(
             &mut conn,
             &[
-                mk("skill-a", "Use for general automation", "handles file parsing and data extraction"),
-                mk("skill-b", "Use for general automation", "unrelated topic coverage"),
+                mk(
+                    "skill-a",
+                    "Use for general automation",
+                    "handles file parsing and data extraction",
+                ),
+                mk(
+                    "skill-b",
+                    "Use for general automation",
+                    "unrelated topic coverage",
+                ),
             ],
         )
         .unwrap();
@@ -271,8 +289,10 @@ mod tests {
         // "OpenAI" matches both: claude-api via neg_text (penalty), openai-tool via description (positive).
         // openai-tool should rank higher.
         let hits = search(&conn, "OpenAI", 5, MatchMode::Any).unwrap();
-        assert_eq!(hits[0].name, "openai-tool",
-            "neg_text match must penalize claude-api below the genuinely-positive hit");
+        assert_eq!(
+            hits[0].name, "openai-tool",
+            "neg_text match must penalize claude-api below the genuinely-positive hit"
+        );
     }
 
     #[test]
@@ -321,11 +341,31 @@ mod tests {
     #[test]
     fn usage_decay_penalizes_stale_skills() {
         let now = 1_000_000_000i64;
-        let recent = now - 3600;  // 1 hour ago
+        let recent = now - 3600; // 1 hour ago
         let stale = now - 90 * 86400; // 90 days ago
         let mut hits = vec![
-            SkillHit { name: "recent".into(), source: "s".into(), description: "d".into(), est_tokens: 100, compressed: false, score: 1.0, last_used_at: recent, install_hint: None, remote_url: None },
-            SkillHit { name: "stale".into(), source: "s".into(), description: "d".into(), est_tokens: 100, compressed: false, score: 1.0, last_used_at: stale, install_hint: None, remote_url: None },
+            SkillHit {
+                name: "recent".into(),
+                source: "s".into(),
+                description: "d".into(),
+                est_tokens: 100,
+                compressed: false,
+                score: 1.0,
+                last_used_at: recent,
+                install_hint: None,
+                remote_url: None,
+            },
+            SkillHit {
+                name: "stale".into(),
+                source: "s".into(),
+                description: "d".into(),
+                est_tokens: 100,
+                compressed: false,
+                score: 1.0,
+                last_used_at: stale,
+                install_hint: None,
+                remote_url: None,
+            },
         ];
         apply_usage_decay(&mut hits, now);
         let recent_hit = hits.iter().find(|h| h.name == "recent").unwrap();
@@ -341,9 +381,15 @@ mod tests {
     #[test]
     fn usage_decay_noop_for_never_used() {
         let mut hits = vec![SkillHit {
-            name: "n".into(), source: "s".into(), description: "d".into(),
-            est_tokens: 100, compressed: false, score: 0.5, last_used_at: 0,
-            install_hint: None, remote_url: None,
+            name: "n".into(),
+            source: "s".into(),
+            description: "d".into(),
+            est_tokens: 100,
+            compressed: false,
+            score: 0.5,
+            last_used_at: 0,
+            install_hint: None,
+            remote_url: None,
         }];
         let original = hits[0].score;
         apply_usage_decay(&mut hits, 1_000_000);
@@ -363,6 +409,42 @@ mod tests {
         assert_eq!(
             merged[0].source, "mcp_registry",
             "registry-fallback hits must carry a distinguishable source, not an empty string local skills could also have"
+        );
+    }
+
+    #[test]
+    fn neg_text_penalty_holds_even_when_neg_text_is_short_and_positive_match_is_diluted() {
+        // Regression guard: a positive bm25 column weight only ever BOOSTS relevance;
+        // penalizing a column requires a NEGATIVE weight. This constructs the adversarial
+        // case (short, dense neg_text vs. a long diluted genuine positive match) that a
+        // merely-large-but-positive weight fails on.
+        let mut conn = open_in_memory().unwrap();
+        let mk = |name: &str, desc: &str, neg: &str| SkillEntry {
+            name: name.into(),
+            source: "claude-user".into(),
+            path: PathBuf::from(format!("/x/{name}/SKILL.md")),
+            description: desc.into(),
+            body: String::new(),
+            neg_text: neg.into(),
+            tags: String::new(),
+            est_tokens: 100,
+            mtime: 1,
+            shadow_path: None,
+        };
+        rebuild(
+            &mut conn,
+            &[
+                mk("short-neg", "General purpose helper for miscellaneous small unrelated tasks around the workspace", "Zephyr"),
+                mk("long-desc", "A very long winded description covering many many different unrelated capabilities and features and options and configuration knobs before finally getting to the point where it mentions Zephyr just once near the very end of this extremely long descriptive sentence about many other things entirely", ""),
+            ],
+        )
+        .unwrap();
+        let hits = search(&conn, "Zephyr", 5, MatchMode::Any).unwrap();
+        assert_eq!(
+            hits[0].name,
+            "long-desc",
+            "a genuine (if diluted) positive match must outrank a short neg_text-only match; got order: {:?}",
+            hits.iter().map(|h| h.name.clone()).collect::<Vec<_>>()
         );
     }
 }

@@ -283,31 +283,131 @@ struct EvalQuery {
 }
 
 const EVAL_QUERIES: &[EvalQuery] = &[
-    EvalQuery { query: "what's running right now", expected: "live", relevance: 3 },
-    EvalQuery { query: "are my agents stuck", expected: "live", relevance: 3 },
-    EvalQuery { query: "check on background sessions", expected: "live", relevance: 3 },
-    EvalQuery { query: "how much did I spend on tokens this week", expected: "cv-usage", relevance: 3 },
-    EvalQuery { query: "usage statistics", expected: "cv-usage", relevance: 3 },
-    EvalQuery { query: "session count report", expected: "cv-usage", relevance: 2 },
-    EvalQuery { query: "my disk is full", expected: "win-cleanup", relevance: 3 },
-    EvalQuery { query: "free up space on windows", expected: "win-cleanup", relevance: 3 },
-    EvalQuery { query: "clean temp files", expected: "win-cleanup", relevance: 3 },
-    EvalQuery { query: "review my diff for bugs", expected: "code-review", relevance: 3 },
-    EvalQuery { query: "check this code for correctness", expected: "code-review", relevance: 3 },
-    EvalQuery { query: "find efficiency cleanups", expected: "code-review", relevance: 2 },
-    EvalQuery { query: "research this topic with cited sources", expected: "deep-research", relevance: 3 },
-    EvalQuery { query: "fan out web searches and verify claims", expected: "deep-research", relevance: 3 },
-    EvalQuery { query: "write me a fact checked report", expected: "deep-research", relevance: 3 },
-    EvalQuery { query: "this skill is too verbose", expected: "short-skill", relevance: 3 },
-    EvalQuery { query: "compress a bloated skill", expected: "short-skill", relevance: 3 },
-    EvalQuery { query: "make a shorthand version of a skill", expected: "short-skill", relevance: 3 },
-    EvalQuery { query: "skill is token heavy", expected: "short-skill", relevance: 3 },
-    EvalQuery { query: "what needs my attention", expected: "live", relevance: 3 },
-    EvalQuery { query: "system slow disk space", expected: "win-cleanup", relevance: 2 },
-    EvalQuery { query: "token spend this month", expected: "cv-usage", relevance: 3 },
-    EvalQuery { query: "debug this pull request", expected: "code-review", relevance: 2 },
-    EvalQuery { query: "synthesize research findings", expected: "deep-research", relevance: 3 },
-    EvalQuery { query: "make a shorter skill", expected: "short-skill", relevance: 3 },
+    EvalQuery {
+        query: "what's running right now",
+        expected: "live",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "are my agents stuck",
+        expected: "live",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "check on background sessions",
+        expected: "live",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "how much did I spend on tokens this week",
+        expected: "cv-usage",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "usage statistics",
+        expected: "cv-usage",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "session count report",
+        expected: "cv-usage",
+        relevance: 2,
+    },
+    EvalQuery {
+        query: "my disk is full",
+        expected: "win-cleanup",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "free up space on windows",
+        expected: "win-cleanup",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "clean temp files",
+        expected: "win-cleanup",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "review my diff for bugs",
+        expected: "code-review",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "check this code for correctness",
+        expected: "code-review",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "find efficiency cleanups",
+        expected: "code-review",
+        relevance: 2,
+    },
+    EvalQuery {
+        query: "research this topic with cited sources",
+        expected: "deep-research",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "fan out web searches and verify claims",
+        expected: "deep-research",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "write me a fact checked report",
+        expected: "deep-research",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "this skill is too verbose",
+        expected: "short-skill",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "compress a bloated skill",
+        expected: "short-skill",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "make a shorthand version of a skill",
+        expected: "short-skill",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "skill is token heavy",
+        expected: "short-skill",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "what needs my attention",
+        expected: "live",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "system slow disk space",
+        expected: "win-cleanup",
+        relevance: 2,
+    },
+    EvalQuery {
+        query: "token spend this month",
+        expected: "cv-usage",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "debug this pull request",
+        expected: "code-review",
+        relevance: 2,
+    },
+    EvalQuery {
+        query: "synthesize research findings",
+        expected: "deep-research",
+        relevance: 3,
+    },
+    EvalQuery {
+        query: "make a shorter skill",
+        expected: "short-skill",
+        relevance: 3,
+    },
 ];
 
 struct EvalReport {
@@ -332,9 +432,13 @@ fn run_eval() -> Result<EvalReport, String> {
     use skill_registry::MatchMode;
 
     for eq in EVAL_QUERIES {
-        let mut r = registry.search(eq.query, 3, MatchMode::All).unwrap_or_default();
+        let mut r = registry
+            .search(eq.query, 3, MatchMode::All)
+            .unwrap_or_default();
         if r.is_empty() {
-            r = registry.search(eq.query, 3, MatchMode::Any).unwrap_or_default();
+            r = registry
+                .search(eq.query, 3, MatchMode::Any)
+                .unwrap_or_default();
         }
 
         let ideal_dcg = (eq.relevance as f64)
@@ -357,7 +461,7 @@ fn run_eval() -> Result<EvalReport, String> {
         if r.first().is_some_and(|h| h.name == eq.expected) {
             hit1 += 1;
             hit3 += 1;
-            reciprocal_ranks.push(1.0 / 1.0);
+            reciprocal_ranks.push(1.0);
         } else if r.iter().any(|h| h.name == eq.expected) {
             hit3 += 1;
             let pos = r.iter().position(|h| h.name == eq.expected).unwrap_or(2) + 1;
@@ -378,21 +482,60 @@ fn run_eval() -> Result<EvalReport, String> {
         / total as f64;
 
     let mut passes = 0u32;
-    if hit_at_1 >= 0.70 { passes += 1; }
-    if hit_at_3 >= 0.85 { passes += 1; }
-    if mrr >= 0.75 { passes += 1; }
-    if ndcg >= 0.80 { passes += 1; }
+    if hit_at_1 >= 0.70 {
+        passes += 1;
+    }
+    if hit_at_3 >= 0.85 {
+        passes += 1;
+    }
+    if mrr >= 0.75 {
+        passes += 1;
+    }
+    if ndcg >= 0.80 {
+        passes += 1;
+    }
 
-    Ok(EvalReport { hit_at_1, hit_at_3, mrr, ndcg, total, passes })
+    Ok(EvalReport {
+        hit_at_1,
+        hit_at_3,
+        mrr,
+        ndcg,
+        total,
+        passes,
+    })
 }
 
 fn print_eval(report: &EvalReport) {
     println!("━━━ skill eval ━━━");
     println!("  queries:  {}", report.total);
-    println!("  Hit@1:    {:.3}  {}", report.hit_at_1, if report.hit_at_1 >= 0.70 { "✓" } else { "✗" });
-    println!("  Hit@3:    {:.3}  {}", report.hit_at_3, if report.hit_at_3 >= 0.85 { "✓" } else { "✗" });
-    println!("  MRR:      {:.3}  {}", report.mrr, if report.mrr >= 0.75 { "✓" } else { "✗" });
-    println!("  nDCG:     {:.3}  {}", report.ndcg, if report.ndcg >= 0.80 { "✓" } else { "✗" });
+    println!(
+        "  Hit@1:    {:.3}  {}",
+        report.hit_at_1,
+        if report.hit_at_1 >= 0.70 {
+            "✓"
+        } else {
+            "✗"
+        }
+    );
+    println!(
+        "  Hit@3:    {:.3}  {}",
+        report.hit_at_3,
+        if report.hit_at_3 >= 0.85 {
+            "✓"
+        } else {
+            "✗"
+        }
+    );
+    println!(
+        "  MRR:      {:.3}  {}",
+        report.mrr,
+        if report.mrr >= 0.75 { "✓" } else { "✗" }
+    );
+    println!(
+        "  nDCG:     {:.3}  {}",
+        report.ndcg,
+        if report.ndcg >= 0.80 { "✓" } else { "✗" }
+    );
     let verdict = if report.passes == 4 { "PASS" } else { "FAIL" };
     println!("  verdict:  {verdict} ({}/{})", report.passes, 4);
 }
@@ -400,18 +543,14 @@ fn print_eval(report: &EvalReport) {
 fn run_export(output: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let db_path = crate::paths::skills_db_path();
     let conn = skill_registry::db::open_db(&db_path)?;
-    let names = skill_registry::search::list_all_names(&conn)?;
+    let pairs = skill_registry::search::list_all_name_source_pairs(&conn)?;
     let mut entries = Vec::new();
-    for name in &names {
-        let parts = name.split_once('/');
-        let (skill_name, source) = match parts {
-            Some((sn, src)) => (sn, src),
-            None => (name.as_str(), "unknown"),
-        };
-        let skill = skill_registry::load(&conn, name, false)?;
+    for (skill_name, source) in &pairs {
+        let qualified = format!("{source}:{skill_name}");
+        let skill = skill_registry::load(&conn, &qualified, false)?;
         entries.push(skill_registry::sources::SkillEntry {
-            name: skill_name.into(),
-            source: source.into(),
+            name: skill_name.clone(),
+            source: source.clone(),
             path: PathBuf::new(),
             description: skill.description.clone(),
             body: skill.body.clone(),
@@ -454,16 +593,15 @@ fn run_hub(action: HubAction) -> Result<String, Box<dyn std::error::Error>> {
             let home = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir);
             let cwd = std::env::current_dir().ok();
             let cwd = cwd.as_deref().unwrap_or(Path::new("."));
-            let sources = skill_registry::sources::default_sources(
-                &home,
-                cwd,
-                &["claude-code".to_string()],
-            );
+            let sources =
+                skill_registry::sources::default_sources(&home, cwd, &["claude-code".to_string()]);
             let scan = skill_registry::sources::scan_sources(&sources);
             let local_count = scan.entries.len();
             let mut all = scan.entries;
-            let local_keys: HashSet<(String, String)> =
-                all.iter().map(|e| (e.name.clone(), e.source.clone())).collect();
+            let local_keys: HashSet<(String, String)> = all
+                .iter()
+                .map(|e| (e.name.clone(), e.source.clone()))
+                .collect();
             for e in bundle.to_entries(Path::new("hub")) {
                 if !local_keys.contains(&(e.name.clone(), e.source.clone())) {
                     all.push(e);
@@ -471,23 +609,22 @@ fn run_hub(action: HubAction) -> Result<String, Box<dyn std::error::Error>> {
             }
             skill_registry::db::rebuild(&mut conn, &all)?;
             let net_new = all.len() - local_count;
-            Ok(format!("pulled {net_new} skills from hub, total {}", all.len()))
+            Ok(format!(
+                "pulled {net_new} skills from hub, total {}",
+                all.len()
+            ))
         }
         HubAction::Push { url } => {
             let db_path = crate::paths::skills_db_path();
             let conn = skill_registry::db::open_db(&db_path)?;
-            let names = skill_registry::search::list_all_names(&conn)?;
+            let pairs = skill_registry::search::list_all_name_source_pairs(&conn)?;
             let mut entries = Vec::new();
-            for name in &names {
-                let parts = name.split_once('/');
-                let (skill_name, source) = match parts {
-                    Some((sn, src)) => (sn, src),
-                    None => (name.as_str(), "unknown"),
-                };
-                let skill = skill_registry::load(&conn, name, false)?;
+            for (skill_name, source) in &pairs {
+                let qualified = format!("{source}:{skill_name}");
+                let skill = skill_registry::load(&conn, &qualified, false)?;
                 entries.push(skill_registry::sources::SkillEntry {
-                    name: skill_name.into(),
-                    source: source.into(),
+                    name: skill_name.clone(),
+                    source: source.clone(),
                     path: PathBuf::new(),
                     description: skill.description.clone(),
                     body: skill.body.clone(),
@@ -529,13 +666,12 @@ impl SkillArgs {
                 }
             }
             SkillAction::Registry { action } => run_registry(action),
-            SkillAction::Export { output } => match run_export(output.as_deref()) {
-                Err(e) => {
+            SkillAction::Export { output } => {
+                if let Err(e) = run_export(output.as_deref()) {
                     eprintln!("export error: {e}");
                     std::process::exit(1);
                 }
-                Ok(()) => {}
-            },
+            }
             SkillAction::Import { path } => match run_import(&path) {
                 Err(e) => {
                     eprintln!("import error: {e}");

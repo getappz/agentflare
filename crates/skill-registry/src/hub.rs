@@ -38,7 +38,7 @@ fn retryable(err: &ureq::Error) -> bool {
 
 fn with_retry<F, T>(label: &str, f: &mut F) -> Result<T, HubError>
 where
-    F: FnMut() -> Result<T, ureq::Error>,
+    F: FnMut() -> Result<T, Box<ureq::Error>>,
 {
     let mut last_err = None;
     for attempt in 0..MAX_RETRIES {
@@ -56,19 +56,18 @@ where
             }
         }
     }
-    Err(HubError::RetryExhausted(format!(
-        "{label}: {last_err:?}"
-    )))
+    Err(HubError::RetryExhausted(format!("{label}: {last_err:?}")))
 }
 
 /// Pull a SkillBundle from a remote hub URL (GET /skills/bundle).
 pub fn pull_bundle(hub_url: &str) -> Result<SkillBundle, HubError> {
     let url = format!("{}/skills/bundle", hub_url.trim_end_matches('/'));
-    let body = with_retry("pull", &mut || -> Result<String, ureq::Error> {
-        Ok(ureq::get(&url)
+    let body = with_retry("pull", &mut || -> Result<String, Box<ureq::Error>> {
+        ureq::get(&url)
             .set("User-Agent", "agentflare-skill-registry/0.1")
             .call()?
-            .into_string()?)
+            .into_string()
+            .map_err(|e| Box::new(ureq::Error::from(e)))
     })?;
     SkillBundle::from_json(&body).map_err(|e| HubError::Serde(e.to_string()))
 }
@@ -76,7 +75,9 @@ pub fn pull_bundle(hub_url: &str) -> Result<SkillBundle, HubError> {
 /// Push a SkillBundle to a remote hub (PUT /skills/bundle).
 pub fn push_bundle(hub_url: &str, bundle: &SkillBundle) -> Result<(), HubError> {
     let url = format!("{}/skills/bundle", hub_url.trim_end_matches('/'));
-    let json = bundle.to_json().map_err(|e| HubError::Serde(e.to_string()))?;
+    let json = bundle
+        .to_json()
+        .map_err(|e| HubError::Serde(e.to_string()))?;
     // Use a flag rather than a retryable error: 4xx/5xx from the hub is not
     // likely to succeed on retry, but timeouts and transport errors are.
     let mut http_err: Option<String> = None;

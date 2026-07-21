@@ -46,6 +46,11 @@ pub fn load_settings() -> SkillAdvisorySettings {
         .unwrap_or_default()
 }
 
+// TODO(task-6-followup): no CLI/MCP path calls this yet -- the snooze/dismiss
+// write side (e.g. `skill snooze <name>`) is unbuilt, only the read side
+// (proactive_suggestions() checking skill_overrides) exists. Remove this
+// allow once a caller lands.
+#[allow(dead_code)]
 pub fn save_settings(settings: &SkillAdvisorySettings) {
     if let Some(parent) = SETTINGS_PATH.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -80,7 +85,11 @@ pub fn proactive_suggestions() -> Option<String> {
         .unwrap_or(0);
 
     let mut suggestions: Vec<String> = Vec::new();
-    let threshold = if settings.proactivity_level == "quiet" { 0.8 } else { 0.5 };
+    let threshold = if settings.proactivity_level == "quiet" {
+        0.8
+    } else {
+        0.5
+    };
 
     for q in &queries {
         let intent = crate::skill_detect::classify(q);
@@ -98,10 +107,10 @@ pub fn proactive_suggestions() -> Option<String> {
         for s in &skills {
             let name = &s.name;
             let override_ = settings.skill_overrides.get(name);
-            if let Some(o) = override_ {
-                if o.dismissed || (o.snooze_until > 0 && o.snooze_until > now) {
-                    continue;
-                }
+            if let Some(o) = override_
+                && (o.dismissed || (o.snooze_until > 0 && o.snooze_until > now))
+            {
+                continue;
             }
             suggestions.push(format!(
                 "  - {}: {} (confidence {:.0}%)",

@@ -27,7 +27,9 @@ pub enum LoadError {
     Db(String),
 }
 
-fn row_to_parts(r: &rusqlite::Row) -> rusqlite::Result<(String, String, String, Option<String>, String)> {
+fn row_to_parts(
+    r: &rusqlite::Row,
+) -> rusqlite::Result<(String, String, String, Option<String>, String)> {
     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
 }
 
@@ -52,7 +54,9 @@ pub fn load(conn: &Connection, name: &str, original: bool) -> Result<LoadedSkill
     }
     if candidates.is_empty() {
         let mut stmt = conn
-            .prepare("SELECT name, source, path, shadow_path, description FROM skills WHERE name = ?1")
+            .prepare(
+                "SELECT name, source, path, shadow_path, description FROM skills WHERE name = ?1",
+            )
             .map_err(db)?;
         let rows = stmt
             .query_map([name], row_to_parts)
