@@ -28,6 +28,12 @@ impl AgentflareMcp {
             Err(e) => return Err(e),
         };
 
+        // Artifacts live in the artifacts store, not agentflare-store docs
+        // (and asset docs carry empty FTS content — the bytes are in blobs),
+        // so fold artifact matches in as their own group; without this the
+        // "artifacts, notes" the tool description promises never match.
+        let artifact_hits = self.artifact_search_hits(q, None).unwrap_or_default();
+
         self.with_store(|store| -> Result<String, ErrorData> {
             let matches = store
                 .doc_search(&ws_id, q, limit)
@@ -65,6 +71,13 @@ impl AgentflareMcp {
                     })
                     .or_default()
                     .push(entry);
+            }
+
+            if !artifact_hits.is_empty() {
+                grouped.insert(
+                    "artifact".into(),
+                    artifact_hits.into_iter().take(limit).collect(),
+                );
             }
 
             let result = serde_json::json!({
@@ -184,9 +197,14 @@ impl AgentflareMcp {
         let guard = self.ensure_gateway_registry().await?;
         let reg = guard.as_ref().expect("ensured above");
 
+        // rivalsearch's web_search takes `num_results` (1..=20), not
+        // `max_results`; its crawl/extract flags default ON, far too heavy
+        // for a search arm — ask for the plain result list.
         let args = serde_json::json!({
             "query": q,
-            "max_results": limit,
+            "num_results": limit.clamp(1, 20),
+            "extract_content": false,
+            "follow_links": false,
         });
 
         match reg.execute("rivalsearch", "web_search", args).await {
