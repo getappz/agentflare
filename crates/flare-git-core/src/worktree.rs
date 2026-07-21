@@ -164,9 +164,17 @@ fn isolate_worktree_target_dir(worktree_path: &Path) {
                    target-dir = \"target\"\n"
         .to_string();
     if sccache_available() {
-        content.push_str("rustc-wrapper = \"sccache\"\n\n[env]\nSCCACHE_BASEDIRS = '");
-        content.push_str(&worktree_path.to_string_lossy());
-        content.push_str("'\n");
+        // TOML literal strings ('...') can't escape a single quote, so a
+        // worktree path containing one (e.g. "C:\Users\John's PC\repo")
+        // would produce invalid TOML. Use a basic string instead, with
+        // backslashes and double quotes escaped.
+        let escaped_path = worktree_path
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        content.push_str(&format!(
+            "rustc-wrapper = \"sccache\"\n\n[env]\nSCCACHE_BASEDIRS = \"{escaped_path}\"\n"
+        ));
     }
     if let Err(e) = std::fs::write(&config_path, content) {
         eprintln!(
@@ -574,7 +582,11 @@ mod tests {
                 content.contains("rustc-wrapper = \"sccache\""),
                 "expected sccache wired up as rustc-wrapper, got: {content}"
             );
-            let basedir_line = format!("SCCACHE_BASEDIRS = '{}'", wt.to_string_lossy());
+            let escaped = wt
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            let basedir_line = format!("SCCACHE_BASEDIRS = \"{escaped}\"");
             assert!(
                 content.contains(&basedir_line),
                 "expected SCCACHE_BASEDIRS to strip this worktree's own path, got: {content}"
