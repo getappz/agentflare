@@ -5,6 +5,7 @@
 // redirect rule that needs IO (e.g. a backend DB lookup) can never wedge the
 // host's tool call — it just falls through to allow instead.
 use serde_json::{Value, json};
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -57,14 +58,26 @@ fn is_spec_like_path(path: &str) -> bool {
     normalized.contains("/specs/") && normalized.ends_with(".md")
 }
 
-fn current_branch() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    flare_git_core::branch::current_branch(&cwd)
+/// Resolve the current branch of the repo containing `start_path`, or cwd if
+/// `start_path` is None. `None` outside a git repo.
+fn current_branch(start_path: Option<&Path>) -> Option<String> {
+    if let Some(p) = start_path {
+        flare_git_core::branch::current_branch(p)
+    } else {
+        flare_git_core::branch::current_branch(&std::env::current_dir().ok()?)
+    }
 }
 
-fn default_branch() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    Some(flare_git_core::branch::resolve_default_branch(&cwd))
+/// Resolve the default branch of the repo containing `start_path`, or cwd if
+/// `start_path` is None.
+fn default_branch(start_path: Option<&Path>) -> Option<String> {
+    if let Some(p) = start_path {
+        Some(flare_git_core::branch::resolve_default_branch(p))
+    } else {
+        Some(flare_git_core::branch::resolve_default_branch(
+            &std::env::current_dir().ok()?,
+        ))
+    }
 }
 
 /// Pure decision core for the branch guard — no git process spawned here, so
@@ -122,17 +135,33 @@ fn classify(
 }
 
 /// Build the PreToolUse deny decision for a classified redirect, or `None` to
-/// let the call through unchanged.
+/// let the call through unchanged. Resolves the target file's git repo for
+/// branch guard checks (not host cwd), so editing a file outside any git repo
+/// (e.g. ~/.claude/memory/) is never blocked, and editing a file in a
+/// different repo than cwd checks that repo's branch, not cwd's.
 pub fn redirect_decision(tool_name: &str, tool_input: Option<&Value>) -> Option<Value> {
     let tool_name = tool_name.to_string();
     let tool_input = tool_input.cloned();
     decide_with_timeout(GATING_TIMEOUT, move || {
-        // Only mutating tools ever consult the branch guard (see
-        // `classify`) — resolving it unconditionally would spawn several
-        // git subprocesses on every single tool call (Read, Bash, Grep,
-        // ...), not just the handful that actually need it.
+        // Only mutating tools ever consult the branch guard — resolving it
+        // unconditionally would spawn several git subprocesses on every
+        // single tool call (Read, Bash, Grep, ...), not just the ones that
+        // need it. When we do check, resolve the target file's repo, not
+        // host cwd.
         let (current, default) = if MUTATING_TOOLS.contains(&tool_name.as_str()) {
-            (current_branch(), default_branch())
+            let target_repo = tool_input.as_ref().and_then(|ti| {
+                ti.get("file_path")
+                    .or_else(|| ti.get("path"))
+                    .and_then(Value::as_str)
+                    .map(Path::new)
+                    .and_then(|p| p.parent())
+                    .and_then(flare_git_core::branch::repo_toplevel)
+            });
+            match target_repo {
+                Some(repo) => (current_branch(Some(&repo)), default_branch(Some(&repo))),
+                // Target path not in any git repo → no branch guard.
+                None => (None, None),
+            }
         } else {
             (None, None)
         };
