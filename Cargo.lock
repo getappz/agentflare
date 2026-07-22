@@ -179,6 +179,7 @@ name = "agentflare-flare-code"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "regex",
  "serde",
  "serde_json",
  "sysinfo 0.34.2",
