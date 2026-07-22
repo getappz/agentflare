@@ -423,7 +423,9 @@ fn run_eval() -> Result<EvalReport, String> {
     let db_path = crate::paths::skills_db_path();
     let mut registry =
         skill_registry::Registry::open_default(&db_path).map_err(|e| e.to_string())?;
-    registry.ensure_fresh().map_err(|e| e.to_string())?;
+    registry
+        .ensure_fresh(crate::components::detected_skill_agents)
+        .map_err(|e| e.to_string())?;
 
     let mut hit1 = 0usize;
     let mut hit3 = 0usize;

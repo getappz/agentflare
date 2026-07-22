@@ -173,7 +173,7 @@ impl AgentflareMcp {
             *guard = Some(reg);
         }
         let reg = guard.as_mut().expect("just initialized above");
-        reg.ensure_fresh()?;
+        reg.ensure_fresh(crate::components::detected_skill_agents)?;
         Ok(f(reg))
     }
     #[tool(

@@ -18,7 +18,6 @@ fastrand = "2"
 thiserror = "2"
 dirs = "6"
 flare-search-kit = { path = "../flare-search-kit" }
-agent-registry = { package = "agentflare-agent-registry", path = "../agent-registry" }
 gateway-registry = { package = "agentflare-gateway-registry", path = "../gateway-registry" }
 
 [dev-dependencies]
