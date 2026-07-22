@@ -459,6 +459,129 @@ pub fn push_branch(
     Some(branch)
 }
 
+/// Information about an orphaned worktree detected during audit.
+pub struct OrphanWorktree {
+    pub name: String,
+    pub path: PathBuf,
+    pub sequence_id: Option<i64>,
+    pub size_bytes: u64,
+    pub has_broken_gitdir: bool,
+}
+
+/// Scan `.worktrees/task/*` for orphaned worktree directories.
+///
+/// A worktree is considered orphaned when its `.git` gitdir pointer is
+/// broken (the file exists but points to a path that no longer exists).
+/// This typically means `git worktree remove` was interrupted or the
+/// repository's `.git/worktrees/<name>` metadata was manually cleaned
+/// up without removing the worktree's working directory.
+///
+/// When `claimed_item_ids` is provided, any directory whose name matches
+/// a live item's sequence_id is excluded from the orphan list — that
+/// worktree may simply need a metadata fix rather than removal.
+pub fn audit_orphans(
+    repo_root: &Path,
+    claimed_item_ids: Option<&std::collections::HashSet<String>>,
+) -> Vec<OrphanWorktree> {
+    let task_dir = repo_root.join(".worktrees").join("task");
+    if !task_dir.exists() {
+        return Vec::new();
+    }
+    let mut orphans = Vec::new();
+    let entries = match walkdir::WalkDir::new(&task_dir)
+        .max_depth(1)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(e) => e,
+        Err(_) => return orphans,
+    };
+    for entry in entries.iter().skip(1) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let dot_git = path.join(".git");
+        let has_broken_gitdir = if dot_git.is_file() {
+            match std::fs::read_to_string(&dot_git) {
+                Ok(content) => {
+                    let gitdir = content.trim().trim_start_matches("gitdir: ");
+                    !std::path::Path::new(gitdir).exists()
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        // Exclude directories whose name matches a live claimed item
+        if let Some(claimed) = claimed_item_ids
+            && claimed.contains(&dir_name)
+        {
+            continue;
+        }
+        // Only consider as orphan when the gitdir pointer is broken
+        if !has_broken_gitdir {
+            continue;
+        }
+        let sequence_id = dir_name.parse::<i64>().ok();
+        let size_bytes = dir_size(path);
+        orphans.push(OrphanWorktree {
+            name: dir_name,
+            path: path.to_path_buf(),
+            sequence_id,
+            size_bytes,
+            has_broken_gitdir,
+        });
+    }
+    orphans
+}
+
+/// Delete orphaned worktrees: snapshot first, then remove.
+///
+/// Takes a list of worktree names (as returned by `audit_orphans`) and
+/// snapshots each one before removing it. Returns the names actually
+/// deleted.
+pub fn gc_orphans(repo_root: &Path, names: &[String]) -> Vec<String> {
+    let mut deleted = Vec::new();
+    for name in names {
+        let worktree_path = repo_root.join(".worktrees").join("task").join(name);
+        if !worktree_path.exists() {
+            continue;
+        }
+        // Snapshot before deletion
+        let reason = format!("gc orphan worktree {}", name);
+        let _ = crate::snapshot::snapshot_before(repo_root, &reason);
+        // Remove the worktree directory
+        match std::fs::remove_dir_all(&worktree_path) {
+            Ok(()) => {
+                deleted.push(name.clone());
+            }
+            Err(e) => {
+                eprintln!("worktree: failed to remove orphan '{}': {}", name, e);
+            }
+        }
+    }
+    // Prune git's worktree metadata after removal
+    if !deleted.is_empty() {
+        let _ = crate::shell::run_in(repo_root, &["worktree", "prune"]);
+    }
+    deleted
+}
+
+/// Recursive directory size in bytes.
+fn dir_size(path: &Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

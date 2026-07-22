@@ -43,7 +43,7 @@ pub fn is_owner(conn: &Connection, item_id: &str, owner: &str) -> rusqlite::Resu
 /// Default claim TTL, mirrored from the main binary's `claims::ttl_secs()`
 /// (this lower-level crate can't depend on it) — override via
 /// AGENTFLARE_CLAIM_TTL_SECS so the two stay in sync.
-fn default_ttl_secs() -> i64 {
+pub fn default_ttl_secs() -> i64 {
     std::env::var("AGENTFLARE_CLAIM_TTL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -78,4 +78,14 @@ pub fn has_active_claim_by_other(
     Ok(claims
         .iter()
         .any(|c| c.key == [item_id] && c.owner != owner))
+}
+
+/// Returns the item IDs (keys) of all active, non-stale claims.
+pub fn list_active(conn: &Connection, now: i64, ttl_secs: i64) -> rusqlite::Result<Vec<String>> {
+    let claims = LEDGER.list(conn, false, now, ttl_secs)?;
+    Ok(claims
+        .into_iter()
+        .filter(|c| c.key.len() == 1)
+        .map(|c| c.key.into_iter().next().unwrap())
+        .collect())
 }

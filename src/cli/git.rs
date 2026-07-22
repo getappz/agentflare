@@ -13,7 +13,8 @@
 
 use crate::paths::home;
 use clap::{Args, Subcommand};
-use flare_git_core::{audit, branch, classify, provenance, scope, shell, snapshot};
+use flare_git_core::{audit, branch, classify, provenance, scope, shell, snapshot, worktree};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,8 @@ pub enum GitCommand {
     /// live claim scopes -- see item #234.
     #[command(hide = true)]
     ScopeCheck(ScopeCheckArgs),
+    /// Preview or prune orphaned worktree directories.
+    Audit(WorktreeAuditArgs),
 }
 
 #[derive(Args)]
@@ -114,6 +117,31 @@ pub struct SnapshotPruneArgs {
     pub keep: usize,
 }
 
+#[derive(Args)]
+pub struct WorktreeAuditArgs {
+    #[command(subcommand)]
+    pub command: WorktreeAuditCommand,
+}
+
+#[derive(Subcommand)]
+pub enum WorktreeAuditCommand {
+    /// List orphaned worktree directories.
+    Preview,
+    /// Remove orphaned worktree directories (snapshots taken first).
+    Prune(WorktreeAuditPruneArgs),
+}
+
+#[derive(Args)]
+pub struct WorktreeAuditPruneArgs {
+    /// Names of worktrees to prune (as shown by preview). Pass --all to
+    /// prune every orphan.
+    #[arg(required_unless_present = "all")]
+    pub names: Vec<String>,
+    /// Prune all orphaned worktrees.
+    #[arg(long, short)]
+    pub all: bool,
+}
+
 /// Canonical location: `~/.agentflare/githooks/`.
 fn shared_hooks_dir() -> PathBuf {
     home().join(".agentflare").join("githooks")
@@ -156,6 +184,7 @@ pub fn run(args: GitArgs) {
         GitCommand::TrailerInject(opts) => trailer_inject(&opts.msg_file),
         GitCommand::RefTransactionLog => ref_transaction_log(),
         GitCommand::ScopeCheck(opts) => scope_check(&opts.subcommand),
+        GitCommand::Audit(opts) => worktree_audit_cmd(opts),
     }
 }
 
@@ -353,8 +382,102 @@ fn install_hooks(opts: InstallHooksArgs) {
     }
 }
 
+fn worktree_audit_cmd(args: WorktreeAuditArgs) {
+    let Some(repo_root) = resolve_repo_root("audit") else {
+        return;
+    };
+    match args.command {
+        WorktreeAuditCommand::Preview => worktree_audit_preview(&repo_root),
+        WorktreeAuditCommand::Prune(opts) => worktree_audit_prune(&repo_root, &opts),
+    }
+}
+
+fn worktree_audit_preview(repo_root: &Path) {
+    let claimed = claimed_sequence_ids(repo_root);
+    let orphans = worktree::audit_orphans(repo_root, Some(&claimed));
+    if orphans.is_empty() {
+        println!("No orphaned worktrees found.");
+        return;
+    }
+    for o in &orphans {
+        let size_mb = o.size_bytes as f64 / 1_048_576.0;
+        let seq = o
+            .sequence_id
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".into());
+        let flag = if o.has_broken_gitdir {
+            " [broken .git]"
+        } else {
+            ""
+        };
+        println!("{seq:>6}  {size_mb:>8.2} MB  {}{flag}", o.name);
+    }
+    let total_mb = orphans.iter().map(|o| o.size_bytes).sum::<u64>() as f64 / 1_048_576.0;
+    println!("────────────────────────────");
+    println!("{} orphan(s), {total_mb:.2} MB total", orphans.len());
+}
+
+fn worktree_audit_prune(repo_root: &Path, opts: &WorktreeAuditPruneArgs) {
+    let claimed = claimed_sequence_ids(repo_root);
+    let orphans = worktree::audit_orphans(repo_root, Some(&claimed));
+    let to_prune: Vec<String> = if opts.all {
+        orphans.into_iter().map(|o| o.name).collect()
+    } else {
+        let set: HashSet<&str> = opts.names.iter().map(|s| s.as_str()).collect();
+        orphans
+            .into_iter()
+            .filter(|o| set.contains(o.name.as_str()))
+            .map(|o| o.name)
+            .collect()
+    };
+    if to_prune.is_empty() {
+        println!("No matching orphans to prune.");
+        return;
+    }
+    let deleted = worktree::gc_orphans(repo_root, &to_prune);
+    for name in &deleted {
+        println!("pruned: {}", name);
+    }
+    if deleted.len() < to_prune.len() {
+        for name in to_prune.iter().filter(|n| !deleted.contains(n)) {
+            eprintln!("warning: failed to prune '{}'", name);
+        }
+    }
+}
+
 /// Resolves the git repo root from the current working directory, printing
 /// a consistent error and returning `None` if we're not inside one.
+/// Build set of claimed item sequence_ids from the DB.
+fn claimed_sequence_ids(_repo_root: &Path) -> HashSet<String> {
+    let conn = match crate::db::open() {
+        Ok(c) => c,
+        Err(_) => return HashSet::new(),
+    };
+    let now = db_kit::ids::now();
+    let ttl = agentflare_backend::claim::default_ttl_secs();
+    let claimed_ids: HashSet<String> = match agentflare_backend::claim::list_active(&conn, now, ttl)
+    {
+        Ok(c) => c.into_iter().collect(),
+        Err(_) => return HashSet::new(),
+    };
+    // Query all non-deleted items across all projects whose id appears
+    // in the active-claim set, collect their sequence_ids.
+    let mut stmt = match conn.prepare("SELECT id, sequence_id FROM items WHERE deleted_at IS NULL")
+    {
+        Ok(s) => s,
+        Err(_) => return HashSet::new(),
+    };
+    let rows: Vec<(String, i64)> =
+        match stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+            Ok(r) => r.filter_map(|r| r.ok()).collect(),
+            Err(_) => return HashSet::new(),
+        };
+    rows.into_iter()
+        .filter(|(id, _)| claimed_ids.contains(id))
+        .map(|(_, seq)| seq.to_string())
+        .collect()
+}
+
 fn resolve_repo_root(command_name: &str) -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let root = branch::repo_toplevel(&cwd);
