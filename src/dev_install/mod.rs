@@ -112,6 +112,18 @@ fn install_shims(release: bool, target: &Path) {
         }
     }
     crate::ui::info(&crate::shim_install::install());
+
+    // The git-named staging copy only exists so shim_install::install() (just
+    // above) can find and hardlink it into the real, dedicated shims dir.
+    // bin_dir is often a general-purpose PATH dir (e.g. ~/.cargo/bin for a
+    // `cargo install` setup dev-install runs from) shared with unrelated
+    // tools, so a leftover file literally named "git"/"git.exe" there would
+    // silently shadow the real git for anything else resolving it via that
+    // PATH entry. dev-install rebuilds this staging copy fresh every run, so
+    // it's safe to remove once install() has consumed it. agentflare-shim is
+    // left in place -- its name can't collide with anything else on PATH.
+    let git_shim_name = crate::cli::git::shim_dest_name();
+    let _ = std::fs::remove_file(bin_dir.join(git_shim_name));
 }
 
 /// Run `<binary> --version` and confirm it exits successfully within
