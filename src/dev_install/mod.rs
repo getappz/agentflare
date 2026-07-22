@@ -81,6 +81,49 @@ pub fn run(release: bool, dry_run: bool) {
     }
     crate::ui::success(&format!("installed to {}", target.display()));
     crate::ui::info("run `agentflare --version` to confirm");
+
+    install_shims(release, &target);
+}
+
+/// Build and place the PATH-shim binaries next to the freshly installed
+/// `agentflare`, then run the same hardlink-install `init`'s "shims"
+/// component does. Best-effort only: a compile failure or missing crate
+/// here must never fail `dev-install` overall -- the main binary is already
+/// installed by the time this runs. See `shim_install`'s module doc.
+fn install_shims(release: bool, target: &Path) {
+    let Some(bin_dir) = target.parent() else {
+        return;
+    };
+    crate::ui::step("building PATH shims (agentflare-shim, git)...");
+    let (shim, git_shim) = match cargo::build_shims(release) {
+        Ok(paths) => paths,
+        Err(e) => {
+            crate::ui::info(&format!("skipping PATH shims: {e}"));
+            return;
+        }
+    };
+    for (name, src) in [
+        (crate::shim_install::generic_shim_binary_name(), shim),
+        (crate::cli::git::shim_dest_name().to_string(), git_shim),
+    ] {
+        if let Err(e) = std::fs::copy(&src, bin_dir.join(&name)) {
+            crate::ui::info(&format!("could not place {name} next to agentflare: {e}"));
+            return;
+        }
+    }
+    crate::ui::info(&crate::shim_install::install());
+
+    // The git-named staging copy only exists so shim_install::install() (just
+    // above) can find and hardlink it into the real, dedicated shims dir.
+    // bin_dir is often a general-purpose PATH dir (e.g. ~/.cargo/bin for a
+    // `cargo install` setup dev-install runs from) shared with unrelated
+    // tools, so a leftover file literally named "git"/"git.exe" there would
+    // silently shadow the real git for anything else resolving it via that
+    // PATH entry. dev-install rebuilds this staging copy fresh every run, so
+    // it's safe to remove once install() has consumed it. agentflare-shim is
+    // left in place -- its name can't collide with anything else on PATH.
+    let git_shim_name = crate::cli::git::shim_dest_name();
+    let _ = std::fs::remove_file(bin_dir.join(git_shim_name));
 }
 
 /// Run `<binary> --version` and confirm it exits successfully within

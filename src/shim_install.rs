@@ -84,7 +84,7 @@ fn exe_name(stem: &str) -> String {
     }
 }
 
-fn generic_shim_binary_name() -> String {
+pub(crate) fn generic_shim_binary_name() -> String {
     exe_name("agentflare-shim")
 }
 
