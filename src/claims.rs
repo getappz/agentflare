@@ -188,6 +188,33 @@ pub fn ttl_secs() -> i64 {
         .unwrap_or(DEFAULT_TTL_SECS) as i64
 }
 
+/// When an item's `assignee_agent` is updated to a different agent, release
+/// any existing claim on that item held by the old agent. Uses `agent_of()`
+/// to compare agent parts (ignoring `:<instance>` suffix), so a same-agent
+/// re-assignment (e.g. instance refresh) does NOT release the claim.
+///
+/// Deliberately NOT authz-gated on caller identity: agentflare is local-only and
+/// cooperative (see SECURITY.md), so a reassignment is an intentional hand-off —
+/// the coordinator or new assignee, not necessarily the current owner, may trigger
+/// the release. An owner-only gate here would break legitimate hand-offs.
+pub fn reassignment_releases_claim(
+    conn: &rusqlite::Connection,
+    item_id: &str,
+    new_assignee: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let Some(owner) = agentflare_backend::claim::current_owner(conn, item_id) else {
+        return Ok(false);
+    };
+    let Some(new) = new_assignee else {
+        return Ok(false);
+    };
+    if agent_of(&owner) == agent_of(new) {
+        return Ok(false);
+    }
+    agentflare_backend::claim::release(conn, item_id, &owner)?;
+    Ok(true)
+}
+
 pub fn now() -> i64 {
     db_kit::ids::now()
 }

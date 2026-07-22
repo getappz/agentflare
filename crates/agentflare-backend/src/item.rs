@@ -1401,6 +1401,29 @@ mod tests {
     }
 
     #[test]
+    fn current_owner_returns_the_claim_owner() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        assert!(crate::claim::current_owner(&conn, &item.id).is_none());
+        claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+        assert_eq!(
+            crate::claim::current_owner(&conn, &item.id).as_deref(),
+            Some("agent:1")
+        );
+    }
+
+    #[test]
+    fn current_owner_returns_none_after_done() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+        crate::claim::done(&conn, &item.id, "agent:1", 2000).unwrap();
+        assert!(crate::claim::current_owner(&conn, &item.id).is_none());
+    }
+
+    #[test]
     fn mark_completed_moves_to_completed_state_and_lease_stays_held() {
         let conn = db::open_in_memory().unwrap();
         let (pid, sid) = seed_project(&conn, "");
