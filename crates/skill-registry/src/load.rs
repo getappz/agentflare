@@ -103,6 +103,7 @@ pub fn load(conn: &Connection, name: &str, original: bool) -> Result<LoadedSkill
 /// Facade owning the connection + refresh debounce.
 pub struct Registry {
     conn: Connection,
+    detected_agents: Vec<String>,
     last_refresh: std::time::Instant,
     refreshed_once: bool,
 }
@@ -114,27 +115,28 @@ impl Registry {
         let conn = crate::db::open_db(db_path).map_err(|e| LoadError::Db(e.to_string()))?;
         Ok(Registry {
             conn,
+            detected_agents: Vec::new(),
             last_refresh: std::time::Instant::now(),
             refreshed_once: false,
         })
     }
 
-    /// Rescan sources when never scanned or debounce elapsed.
-    pub fn ensure_fresh(&mut self) -> Result<(), LoadError> {
+    /// Rescan sources when never scanned or debounce elapsed. `detect_agents` is
+    /// only invoked when a rescan actually happens (not on every debounced call),
+    /// so a long-lived cached `Registry` (e.g. mcp_server.rs's per-process cache)
+    /// still picks up newly-installed agent CLIs roughly every
+    /// `REFRESH_DEBOUNCE_SECS`, instead of freezing detection at construction time.
+    pub fn ensure_fresh(
+        &mut self,
+        detect_agents: impl FnOnce() -> Vec<String>,
+    ) -> Result<(), LoadError> {
         if self.refreshed_once && self.last_refresh.elapsed().as_secs() < REFRESH_DEBOUNCE_SECS {
             return Ok(());
         }
+        self.detected_agents = detect_agents();
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        // Detected agents: agent-registry's detect_all needs a version cache;
-        // skill discovery only needs agent IDs, so pass an empty cache.
-        let mut cache = std::collections::HashMap::new();
-        let detected: Vec<String> =
-            agent_registry::detect_all(agent_registry::REGISTRY, &mut cache)
-                .into_iter()
-                .map(|d| d.id.to_lowercase())
-                .collect();
-        let sources = crate::sources::default_sources(&home, &cwd, &detected);
+        let sources = crate::sources::default_sources(&home, &cwd, &self.detected_agents);
         let out = crate::sources::scan_sources(&sources);
         crate::db::rebuild(&mut self.conn, &out.entries)
             .map_err(|e| LoadError::Db(e.to_string()))?;

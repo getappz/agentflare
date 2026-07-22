@@ -153,7 +153,7 @@ fn session_start_message(agent: &str) -> String {
         if db_path.exists()
             && let Ok(mut registry) = skill_registry::Registry::open_default(&db_path)
         {
-            let _ = registry.ensure_fresh();
+            let _ = registry.ensure_fresh(crate::components::detected_skill_agents);
             for q in &project_queries {
                 if let Ok(hits) = registry.search(q, 2, skill_registry::MatchMode::Any)
                     && !hits.is_empty()
@@ -515,7 +515,7 @@ pub fn prompt_submit(agent: &str) {
         if db_path.exists()
             && let Ok(mut registry) = skill_registry::Registry::open_default(&db_path)
         {
-            let _ = registry.ensure_fresh();
+            let _ = registry.ensure_fresh(crate::components::detected_skill_agents);
             if let Ok(skills) = crate::skill_detect::find_skills(
                 &intent,
                 &registry,

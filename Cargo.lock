@@ -247,7 +247,6 @@ dependencies = [
 name = "agentflare-skill-registry"
 version = "0.1.1"
 dependencies = [
- "agentflare-agent-registry",
  "agentflare-gateway-registry",
  "dirs",
  "flare-search-kit",

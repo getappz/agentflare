@@ -197,6 +197,21 @@ pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
     }
 }
 
+/// Agent IDs detected on this machine, for `skill_registry::Registry::open_default`'s
+/// `detected_agents` param. skill-registry itself has no `agent-registry` dependency
+/// (deliberately decoupled — skill discovery only needs agent IDs, not the version-
+/// detection machinery); every call site collects them the same way, using a
+/// throwaway cache since none of these callers need cross-call version caching.
+pub(crate) fn detected_skill_agents() -> Vec<String> {
+    agent_registry::detect_all(
+        agent_registry::REGISTRY,
+        &mut std::collections::HashMap::new(),
+    )
+    .into_iter()
+    .map(|d| d.id.to_lowercase())
+    .collect()
+}
+
 /// Every skill name the shared skill_registry cache currently knows about —
 /// same source `skill_search`/`skill_load` (mcp_server.rs) already serve
 /// from, so "known skills" here always matches what those tools can find.
@@ -204,7 +219,9 @@ pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
 fn discover_skill_names() -> Result<Vec<String>, String> {
     let mut registry = skill_registry::Registry::open_default(&crate::paths::skills_db_path())
         .map_err(|e| e.to_string())?;
-    registry.ensure_fresh().map_err(|e| e.to_string())?;
+    registry
+        .ensure_fresh(detected_skill_agents)
+        .map_err(|e| e.to_string())?;
     registry.list_all_names().map_err(|e| e.to_string())
 }
 
