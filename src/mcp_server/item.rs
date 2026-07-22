@@ -300,12 +300,20 @@ impl AgentflareMcp {
                 description: req.description,
                 priority: req.priority,
                 state_id: None,
-                assignee_agent: req.assignee_agent,
+                assignee_agent: req.assignee_agent.clone(),
                 sort_order: None,
                 metadata: req.metadata.map(|v| v.to_string()),
             };
             let item =
                 agentflare_backend::item::update(conn, &id, input).map_err(map_backend_err)?;
+            if req.assignee_agent.is_some() {
+                crate::claims::reassignment_releases_claim(
+                    conn,
+                    &id,
+                    req.assignee_agent.as_deref(),
+                )
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            }
             Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
         })?
     }

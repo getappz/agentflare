@@ -139,6 +139,112 @@ fn item_cancel_releases_the_callers_own_claim() {
     assert_eq!(reclaimed["status"], "acquired");
 }
 
+fn claim_harness() -> (AgentflareMcp, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+    (s, tmp)
+}
+
+#[test]
+fn item_update_assignee_to_different_agent_releases_old_claim() {
+    let (s, _tmp) = claim_harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let claimed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(claimed["status"], "acquired");
+    let owner = claimed["owner"].as_str().unwrap().to_string();
+
+    // Derive a target agent guaranteed to differ from whatever agent this
+    // test process auto-detects as (avoids collisions with the real
+    // ambient AGENTFLARE_AGENT / agent-detector identity, e.g. "claude-code").
+    let different_agent = format!("{}-other", crate::claims::agent_of(&owner));
+
+    // Reassign to a different agent — should release the old claim.
+    s.item(Parameters(ItemRequest {
+        action: "update".into(),
+        id: Some(item_id.clone()),
+        assignee_agent: Some(different_agent),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    // The claim row must be gone — the only thing that proves a release happened.
+    // (Re-claiming by the same owner returns "acquired" either way.)
+    assert_eq!(
+        s.with_backend_db(|conn| agentflare_backend::claim::current_owner(conn, &item_id))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn item_update_assignee_to_different_instance_does_not_release_claim() {
+    let (s, _tmp) = claim_harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let claimed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(claimed["status"], "acquired");
+    let owner = claimed["owner"].as_str().unwrap().to_string();
+
+    // Detect the agent portion of the owner (e.g. "opencode" from "opencode:13112")
+    // and reassign to the same agent with a different instance — claim stays held.
+    let my_agent = crate::claims::agent_of(&owner);
+    let same_agent_different_instance = format!("{my_agent}:99999");
+
+    s.item(Parameters(ItemRequest {
+        action: "update".into(),
+        id: Some(item_id.clone()),
+        assignee_agent: Some(same_agent_different_instance),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    // Verify claim still held by the original owner via backend query.
+    assert_eq!(
+        s.with_backend_db(|conn| agentflare_backend::claim::current_owner(conn, &item_id))
+            .unwrap(),
+        Some(owner)
+    );
+}
+
 #[test]
 fn item_list_rejects_negative_limit_and_offset() {
     let (_tmp, s) = harness();
