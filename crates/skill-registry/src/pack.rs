@@ -65,6 +65,8 @@ impl SkillBundle {
                 tags: be.tags.clone(),
                 est_tokens: be.est_tokens,
                 mtime: 0,
+                bandit_alpha: 1.0,
+                bandit_beta: 1.0,
                 shadow_path: None,
             })
             .collect()
@@ -115,6 +117,8 @@ mod tests {
             tags: String::new(),
             est_tokens: 10,
             mtime: 0,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
             shadow_path: None,
         }
     }

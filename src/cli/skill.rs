@@ -558,6 +558,8 @@ fn run_export(output: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
             tags: String::new(),
             est_tokens: skill.body.len() as i64 / 4,
             mtime: 0,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
             shadow_path: None,
         });
     }
@@ -632,6 +634,8 @@ fn run_hub(action: HubAction) -> Result<String, Box<dyn std::error::Error>> {
                     tags: String::new(),
                     est_tokens: skill.body.len() as i64 / 4,
                     mtime: 0,
+                    bandit_alpha: 1.0,
+                    bandit_beta: 1.0,
                     shadow_path: None,
                 });
             }

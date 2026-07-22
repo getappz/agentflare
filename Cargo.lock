@@ -236,6 +236,7 @@ dependencies = [
  "agentflare-agent-registry",
  "agentflare-gateway-registry",
  "dirs",
+ "fastrand",
  "flare-search-kit",
  "regex",
  "rusqlite",

@@ -14,6 +14,8 @@ pub struct SkillHit {
     pub compressed: bool,
     pub score: f64,
     pub last_used_at: i64,
+    pub bandit_alpha: f64,
+    pub bandit_beta: f64,
     /// How to install this as an MCP server (only set for registry fallback hits).
     pub install_hint: Option<String>,
     /// Streamable HTTP URL (only set for registry hits with remotes).
@@ -42,6 +44,46 @@ fn apply_usage_decay(hits: &mut [SkillHit], now: i64) {
     }
 }
 
+/// Sample from Gamma(shape, 1) via the Marsaglia-Tsang method (shape >= 1).
+fn gamma_sample(shape: f64) -> f64 {
+    if shape < 1.0 {
+        let u: f64 = fastrand::f64();
+        return gamma_sample(shape + 1.0) * u.powf(1.0 / shape);
+    }
+    let d = shape - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    loop {
+        // Box-Muller for a standard normal sample.
+        let u1: f64 = fastrand::f64().max(f64::MIN_POSITIVE);
+        let u2: f64 = fastrand::f64();
+        let x = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+        let v = 1.0 + c * x;
+        if v <= 0.0 {
+            continue;
+        }
+        let v3 = v * v * v;
+        let u3: f64 = fastrand::f64();
+        if u3 < 1.0 - 0.0331 * x.powi(4) || u3.ln() < 0.5 * x * x + d * (1.0 - v3 + v3.ln()) {
+            return d * v3;
+        }
+    }
+}
+
+/// Sample from Beta(alpha, beta) as X/(X+Y) for X~Gamma(alpha,1), Y~Gamma(beta,1)
+/// (standard Gamma-ratio construction). Returns 0.0..1.0. Flat prior = Beta(1,1)
+/// → uniform 0..1.
+fn beta_sample(alpha: f64, beta: f64) -> f64 {
+    if alpha <= 0.0 || beta <= 0.0 {
+        return 0.5;
+    }
+    let x = gamma_sample(alpha);
+    let y = gamma_sample(beta);
+    if x + y <= 0.0 {
+        return 0.5;
+    }
+    (x / (x + y)).clamp(0.0, 1.0)
+}
+
 pub fn search(
     conn: &Connection,
     query: &str,
@@ -55,6 +97,8 @@ pub fn search(
         "SELECT s.name, s.source, s.description, s.est_tokens,
                 s.shadow_path IS NOT NULL,
                 s.last_used_at,
+                s.bandit_alpha,
+                s.bandit_beta,
                 bm25(skills_fts, 3.0, 1.0, 0.5, 2.0, 0.0) AS score
          FROM skills_fts
          JOIN skills s ON s.rowid = skills_fts.rowid
@@ -71,7 +115,9 @@ pub fn search(
                 est_tokens: r.get(3)?,
                 compressed: r.get(4)?,
                 last_used_at: r.get(5)?,
-                score: r.get(6)?,
+                bandit_alpha: r.get(6)?,
+                bandit_beta: r.get(7)?,
+                score: r.get(8)?,
                 install_hint: None,
                 remote_url: None,
             })
@@ -82,6 +128,13 @@ pub fn search(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     apply_usage_decay(&mut rows, now);
+    // Blend Beta-bandit exploration into the score: final = bm25 * (0.8 + 0.2 * sample)
+    // This gives a ±20% exploration boost to under-explored skills while keeping
+    // relevance as the dominant signal.
+    for h in rows.iter_mut() {
+        let sample = beta_sample(h.bandit_alpha, h.bandit_beta);
+        h.score *= 0.8 + 0.2 * sample;
+    }
     Ok(rows)
 }
 
@@ -105,6 +158,8 @@ pub fn merge_registry_hits(
         compressed: false,
         score: gateway_registry::REGISTRY_FALLBACK_SCORE,
         last_used_at: 0,
+        bandit_alpha: 1.0,
+        bandit_beta: 1.0,
         install_hint: hit.install_hint.map(|h| {
             if let Some(runtime) = h.runtime_hint {
                 format!("{} {}", runtime, h.identifier)
@@ -156,6 +211,8 @@ mod tests {
             tags: String::new(),
             est_tokens: 100,
             mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
             shadow_path: shadow.then(|| PathBuf::from(format!("/s/{name}/SKILL.md"))),
         };
         rebuild(
@@ -197,6 +254,8 @@ mod tests {
             tags: String::new(),
             est_tokens: 100,
             mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
             shadow_path: None,
         };
         rebuild(
@@ -272,6 +331,8 @@ mod tests {
             tags: String::new(),
             est_tokens: 100,
             mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
             shadow_path: None,
         };
         rebuild(
@@ -352,6 +413,8 @@ mod tests {
                 compressed: false,
                 score: 1.0,
                 last_used_at: recent,
+                bandit_alpha: 1.0,
+                bandit_beta: 1.0,
                 install_hint: None,
                 remote_url: None,
             },
@@ -363,6 +426,8 @@ mod tests {
                 compressed: false,
                 score: 1.0,
                 last_used_at: stale,
+                bandit_alpha: 1.0,
+                bandit_beta: 1.0,
                 install_hint: None,
                 remote_url: None,
             },
@@ -388,6 +453,8 @@ mod tests {
             compressed: false,
             score: 0.5,
             last_used_at: 0,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
             install_hint: None,
             remote_url: None,
         }];
@@ -429,6 +496,8 @@ mod tests {
             tags: String::new(),
             est_tokens: 100,
             mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
             shadow_path: None,
         };
         rebuild(

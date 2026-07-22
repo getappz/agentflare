@@ -14,6 +14,8 @@ pub struct SkillEntry {
     pub tags: String, // space-joined, FTS column
     pub est_tokens: i64,
     pub mtime: i64,
+    pub bandit_alpha: f64,
+    pub bandit_beta: f64,
     /// Compressed shadow copy of this skill, when one exists.
     pub shadow_path: Option<PathBuf>,
 }
@@ -120,6 +122,8 @@ fn read_entry(id: &str, path: &Path) -> Option<SkillEntry> {
         tags: fm.tags.join(" "),
         est_tokens: est_tokens(meta.len()),
         mtime,
+        bandit_alpha: 1.0,
+        bandit_beta: 1.0,
         shadow_path: None,
     })
 }

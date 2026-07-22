@@ -49,10 +49,18 @@ CREATE TABLE IF NOT EXISTS skills (
   est_tokens INTEGER NOT NULL DEFAULT 0,
   mtime INTEGER NOT NULL DEFAULT 0,
   last_used_at INTEGER NOT NULL DEFAULT 0,
+  bandit_alpha REAL NOT NULL DEFAULT 1.0,
+  bandit_beta REAL NOT NULL DEFAULT 1.0,
   shadow_path TEXT,
   PRIMARY KEY (name, source)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(name, description, body, tags, neg_text);
+CREATE TABLE IF NOT EXISTS skill_impressions (
+  name TEXT NOT NULL,
+  source TEXT NOT NULL,
+  surfaced_at INTEGER NOT NULL,
+  PRIMARY KEY (name, source)
+);
 ";
 
 pub fn open_db(path: &Path) -> rusqlite::Result<Connection> {
@@ -94,8 +102,8 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
         // OR IGNORE: a single bad skill (duplicate (name, source)) must not
         // roll back the whole rebuild and disable every skill_search/skill_load.
         let mut ins = tx.prepare(
-            "INSERT OR IGNORE INTO skills (name, source, path, description, body, neg_text, tags, est_tokens, mtime, last_used_at, shadow_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
+            "INSERT OR IGNORE INTO skills (name, source, path, description, body, neg_text, tags, est_tokens, mtime, last_used_at, bandit_alpha, bandit_beta, shadow_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?11, ?12, ?10)",
         )?;
         let mut fts = tx.prepare(
             "INSERT INTO skills_fts (rowid, name, description, body, tags, neg_text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -114,6 +122,8 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
                 e.shadow_path
                     .as_ref()
                     .map(|p| p.to_string_lossy().to_string()),
+                e.bandit_alpha,
+                e.bandit_beta,
             ])?;
             if tx.changes() == 0 {
                 // Duplicate (name, source) was ignored: no new skills row,
@@ -150,6 +160,8 @@ mod tests {
             tags: String::new(),
             est_tokens: 100,
             mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
             shadow_path: None,
         }
     }

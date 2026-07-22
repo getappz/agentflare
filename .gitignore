@@ -9,6 +9,8 @@
 
 # Competitive audit clones and reports — large, transient, per-machine
 /.competitive-audit/
+# Reference clones of external repos for code analysis — large, transient, per-machine
+/.refs/
 
 # Local opencode config — carries per-machine MCP server paths, not shared
 /opencode.json
