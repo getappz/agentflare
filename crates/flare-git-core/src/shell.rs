@@ -218,11 +218,14 @@ mod tests {
     }
 
     #[test]
-    fn paths_eq_matches_case_and_separator_variants_on_windows_and_macos() {
-        let a = Path::new(r"C:\Users\shiva\.agentflare\shims");
-        let b = Path::new("c:/Users/shiva/.AGENTFLARE/shims");
+    fn paths_eq_matches_case_variants_on_case_insensitive_platforms() {
+        // Forward slashes only -- macOS never treats `\` as a separator, so
+        // a backslash path would split into components differently there.
+        // Separator normalization is Windows-specific (see below).
+        let a = Path::new("/Users/shiva/.agentflare/shims");
+        let b = Path::new("/Users/shiva/.AGENTFLARE/shims");
         #[cfg(any(windows, target_os = "macos"))]
-        assert!(paths_eq(a, b), "case/separator-only differences must match");
+        assert!(paths_eq(a, b), "case-only differences must match");
         #[cfg(all(not(windows), not(target_os = "macos")))]
         assert!(
             !paths_eq(a, b),
@@ -233,5 +236,13 @@ mod tests {
             Path::new("/home/user/.agentflare/shims"),
             Path::new("/home/user/.cargo/bin")
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paths_eq_matches_separator_variants_on_windows() {
+        let a = Path::new(r"C:\Users\shiva\.agentflare\shims");
+        let b = Path::new("C:/Users/shiva/.agentflare/shims");
+        assert!(paths_eq(a, b), "/ vs \\ differences must match on Windows");
     }
 }
