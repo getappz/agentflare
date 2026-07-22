@@ -64,7 +64,10 @@ pub fn flush_stale_impressions(conn: &Connection) -> rusqlite::Result<()> {
          )",
     )?;
     stmt.execute(rusqlite::params![cutoff])?;
-    conn.execute("DELETE FROM skill_impressions WHERE surfaced_at < ?1", rusqlite::params![cutoff])?;
+    conn.execute(
+        "DELETE FROM skill_impressions WHERE surfaced_at < ?1",
+        rusqlite::params![cutoff],
+    )?;
     Ok(())
 }
 
