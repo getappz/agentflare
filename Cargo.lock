@@ -1111,6 +1111,8 @@ version = "0.1.0"
 dependencies = [
  "agentflare-shim",
  "flare-git-core",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

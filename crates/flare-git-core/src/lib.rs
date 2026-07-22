@@ -8,6 +8,7 @@ pub mod audit;
 pub mod branch;
 pub mod classify;
 pub mod provenance;
+pub mod scope;
 pub mod shell;
 pub mod snapshot;
 pub mod worktree;

@@ -29,18 +29,34 @@ impl AgentflareMcp {
                 } else {
                     Self::git_provenance().and_then(|g| g.commit)
                 };
+                let scope_arg = (!req.scope.is_empty()).then_some(req.scope.as_slice());
                 let outcome = crate::claims::acquire(
                     &conn,
                     &repo,
                     &target,
                     &owner,
                     commit.as_deref(),
+                    scope_arg,
                     crate::claims::now(),
                     crate::claims::ttl_secs(),
                 )
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(match outcome {
-                    crate::claims::Acquire::Acquired => serde_json::json!({ "status": "acquired", "repo": repo, "target": target, "owner": owner }),
+                    crate::claims::Acquire::Acquired => {
+                        let scope_warning = scope_arg.and_then(|s| {
+                            crate::claims::scope_overlap_warning(
+                                &conn,
+                                &repo,
+                                &target,
+                                s,
+                                crate::claims::now(),
+                                crate::claims::ttl_secs(),
+                            )
+                            .ok()
+                            .flatten()
+                        });
+                        serde_json::json!({ "status": "acquired", "repo": repo, "target": target, "owner": owner, "scope_warning": scope_warning })
+                    }
                     crate::claims::Acquire::Held { owner: holder, age_secs } => serde_json::json!({ "status": "held", "repo": repo, "target": target, "owner": holder, "age_secs": age_secs }),
                 }.to_string())
             }

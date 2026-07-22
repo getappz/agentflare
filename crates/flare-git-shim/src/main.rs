@@ -159,6 +159,54 @@ fn deny_canonical_detach_reason(
     ))
 }
 
+#[derive(serde::Deserialize)]
+struct ScopeCheckResult {
+    deny: bool,
+    reason: Option<String>,
+}
+
+/// Path-scope enforcement (item #234): shells out to `agentflare git
+/// scope-check`, since this shim has no direct DB access to live claims.
+/// Deliberately FAIL-CLOSED here, unlike the rest of this crate's fail-open
+/// default -- any error resolving scope (binary missing, bad JSON,
+/// non-zero exit) is treated as a deny. The existing bypass envs
+/// (`AGENTFLARE_GIT_BYPASS` and friends, checked earlier in `main`) remain
+/// the escape hatch for a broken/missing `agentflare` binary, same as any
+/// other misclassification.
+fn scope_check_deny_reason(subcommand: &str) -> Option<String> {
+    let output = match std::process::Command::new("agentflare")
+        .args(["git", "scope-check", "--subcommand", subcommand])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return Some(format!(
+                "scope-check could not run ('agentflare' on PATH?): {e}"
+            ));
+        }
+    };
+    if !output.status.success() {
+        return Some(format!(
+            "scope-check exited non-zero: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: ScopeCheckResult = match serde_json::from_str(stdout.trim()) {
+        Ok(r) => r,
+        Err(e) => return Some(format!("scope-check returned unparseable output: {e}")),
+    };
+    if result.deny {
+        Some(
+            result
+                .reason
+                .unwrap_or_else(|| "scope-check denied (no reason given)".to_string()),
+        )
+    } else {
+        None
+    }
+}
+
 fn main() {
     let depth: u32 = env::var(RECURSION_ENV)
         .ok()
@@ -275,6 +323,22 @@ fn main() {
             exit(1);
         }
         classify::Disposition::Passthrough | classify::Disposition::SilentExempt => {
+            if matches!(subcommand.as_str(), "commit" | "push")
+                && let Some(reason) = scope_check_deny_reason(&subcommand)
+            {
+                let scope_event = classify::Event {
+                    subcommand: subcommand.clone(),
+                    args: rest.clone(),
+                    disposition: classify::Disposition::Deny {
+                        reason: reason.clone(),
+                    },
+                };
+                if let Some(audit_path) = audit::default_path("git.jsonl") {
+                    let _ = audit::log_event(&audit_path, &scope_event);
+                }
+                eprintln!("agentflare git shim: denied — {reason}");
+                exit(1);
+            }
             if snapshots_enabled() && classify::is_destructive(&subcommand, &rest) {
                 let reason = format!("pre-{subcommand} snapshot ({})", rest.join(" "));
                 match snapshot::snapshot_before(&repo_root, &reason) {

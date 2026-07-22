@@ -17,6 +17,11 @@ pub enum ClaimAction {
         /// Repo key (default: normalized origin remote, owner/name).
         #[arg(long)]
         repo: Option<String>,
+        /// Path glob(s) this claim owns write scope over (repeatable), e.g.
+        /// --scope crates/foo/ --scope docs/foo/. Omit for the back-compat
+        /// default (unscoped -- never enforced against other agents).
+        #[arg(long)]
+        scope: Vec<String>,
     },
     /// Refresh the lease on a target you own.
     Heartbeat {
@@ -64,36 +69,11 @@ impl ClaimArgs {
         let now = crate::claims::now();
 
         match self.action {
-            ClaimAction::Acquire { target, repo } => {
-                // Only attach the current checkout's commit when the repo was
-                // auto-resolved from it; an explicit --repo may name a different
-                // repository, so HEAD here would be misleading provenance.
-                let commit = if repo.is_none() { git_commit() } else { None };
-                let repo = require_repo(repo);
-                match crate::claims::acquire(
-                    &conn,
-                    &repo,
-                    &target,
-                    &owner,
-                    commit.as_deref(),
-                    now,
-                    ttl,
-                ) {
-                    Ok(crate::claims::Acquire::Acquired) => {
-                        println!("claimed {repo} {target}  (owner {owner})");
-                    }
-                    Ok(crate::claims::Acquire::Held {
-                        owner: holder,
-                        age_secs,
-                    }) => {
-                        crate::ui::error(&format!(
-                            "{repo} {target} already held by {holder} ({age_secs}s since heartbeat)"
-                        ));
-                        std::process::exit(1);
-                    }
-                    Err(e) => fail(e),
-                }
-            }
+            ClaimAction::Acquire {
+                target,
+                repo,
+                scope,
+            } => acquire_cmd(&conn, &owner, ttl, now, target, repo, scope),
             ClaimAction::Heartbeat { target, repo } => {
                 let repo = require_repo(repo);
                 report(
@@ -152,6 +132,57 @@ impl ClaimArgs {
                 }
             }
         }
+    }
+}
+
+/// `ClaimAction::Acquire` handler, split out to keep `run`'s dispatch match
+/// flat now that scope handling adds a warning check on top of the plain
+/// acquire/held/error branches.
+fn acquire_cmd(
+    conn: &rusqlite::Connection,
+    owner: &str,
+    ttl: i64,
+    now: i64,
+    target: String,
+    repo: Option<String>,
+    scope: Vec<String>,
+) {
+    // Only attach the current checkout's commit when the repo was
+    // auto-resolved from it; an explicit --repo may name a different
+    // repository, so HEAD here would be misleading provenance.
+    let commit = if repo.is_none() { git_commit() } else { None };
+    let repo = require_repo(repo);
+    let scope_arg = (!scope.is_empty()).then_some(scope.as_slice());
+    match crate::claims::acquire(
+        conn,
+        &repo,
+        &target,
+        owner,
+        commit.as_deref(),
+        scope_arg,
+        now,
+        ttl,
+    ) {
+        Ok(crate::claims::Acquire::Acquired) => {
+            println!("claimed {repo} {target}  (owner {owner})");
+            if let Some(s) = scope_arg {
+                let warning =
+                    crate::claims::scope_overlap_warning(conn, &repo, &target, s, now, ttl);
+                if let Ok(Some(warning)) = warning {
+                    crate::ui::error(&format!("warning: {warning}"));
+                }
+            }
+        }
+        Ok(crate::claims::Acquire::Held {
+            owner: holder,
+            age_secs,
+        }) => {
+            crate::ui::error(&format!(
+                "{repo} {target} already held by {holder} ({age_secs}s since heartbeat)"
+            ));
+            std::process::exit(1);
+        }
+        Err(e) => fail(e),
     }
 }
 

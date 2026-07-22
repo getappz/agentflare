@@ -106,6 +106,11 @@ pub(crate) struct ClaimRequest {
     #[schemars(description = "List across every repo in the ledger (default false) (list)")]
     #[serde(default)]
     pub(crate) all_repos: bool,
+    #[schemars(
+        description = "Path glob(s) this claim owns write scope over (acquire). Omit for the back-compat default (unscoped -- never enforced against other agents)."
+    )]
+    #[serde(default)]
+    pub(crate) scope: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

@@ -13,7 +13,7 @@
 
 use crate::paths::home;
 use clap::{Args, Subcommand};
-use flare_git_core::{audit, branch, provenance, snapshot};
+use flare_git_core::{audit, branch, classify, provenance, scope, shell, snapshot};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -43,6 +43,10 @@ pub enum GitCommand {
     /// updates from stdin and appends them to the backstop audit log.
     #[command(hide = true)]
     RefTransactionLog,
+    /// (Internal, called by flare-git-shim.) Checks a commit/push against
+    /// live claim scopes -- see item #234.
+    #[command(hide = true)]
+    ScopeCheck(ScopeCheckArgs),
 }
 
 #[derive(Args)]
@@ -66,6 +70,13 @@ pub struct InstallHooksArgs {
 pub struct TrailerInjectArgs {
     /// Path to the commit-message file (`prepare-commit-msg`'s `$1`).
     pub msg_file: PathBuf,
+}
+
+#[derive(Args)]
+pub struct ScopeCheckArgs {
+    /// The subcommand being checked -- "commit" or "push".
+    #[arg(long)]
+    pub subcommand: String,
 }
 
 #[derive(Args)]
@@ -144,6 +155,7 @@ pub fn run(args: GitArgs) {
         GitCommand::Snapshot(opts) => snapshot_cmd(opts),
         GitCommand::TrailerInject(opts) => trailer_inject(&opts.msg_file),
         GitCommand::RefTransactionLog => ref_transaction_log(),
+        GitCommand::ScopeCheck(opts) => scope_check(&opts.subcommand),
     }
 }
 
@@ -466,4 +478,130 @@ fn ref_transaction_log() {
     if let Some(path) = audit::default_path("git-refs.jsonl") {
         let _ = audit::log_event(&path, &event);
     }
+}
+
+#[derive(serde::Serialize)]
+struct ScopeCheckResult {
+    deny: bool,
+    reason: Option<String>,
+}
+
+fn scope_pass() -> ScopeCheckResult {
+    ScopeCheckResult {
+        deny: false,
+        reason: None,
+    }
+}
+
+fn scope_deny(reason: String) -> ScopeCheckResult {
+    ScopeCheckResult {
+        deny: true,
+        reason: Some(reason),
+    }
+}
+
+/// `agentflare git scope-check --subcommand commit|push` -- called by
+/// flare-git-shim before letting a commit/push through, to enforce item
+/// #234's claim path-scopes (data the shim itself has no DB access to).
+/// Always prints one line of JSON to stdout and exits 0 -- denial lives IN
+/// the JSON (`deny`/`reason`), not the exit code, so the shim can tell
+/// "scope-check ran and said no" apart from "scope-check itself failed to
+/// run at all" (the latter is the shim's fail-closed case, per this
+/// feature's spec -- unlike this crate's usual fail-open default).
+fn scope_check(subcommand: &str) {
+    let result = run_scope_check(subcommand);
+    let json = serde_json::to_string(&result).unwrap_or_else(|_| {
+        r#"{"deny":true,"reason":"internal error serializing scope-check result"}"#.to_string()
+    });
+    println!("{json}");
+}
+
+fn run_scope_check(subcommand: &str) -> ScopeCheckResult {
+    // Scope enforcement only applies to agent-driven invocations, mirroring
+    // `flare-git-shim`'s existing canonical-detach guard -- interactive
+    // human use is never affected.
+    if !classify::agent_invocation_detected() {
+        return scope_pass();
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Some(repo_root) = branch::repo_toplevel(&cwd) else {
+        return scope_pass(); // not in a repo -- nothing to check
+    };
+    let Some(repo) = crate::claims::resolve_repo(None) else {
+        return scope_pass(); // no resolvable repo key -> no claims possible
+    };
+    let conn = match crate::db::open() {
+        Ok(c) => c,
+        Err(e) => return scope_deny(format!("cannot open claim ledger: {e}")),
+    };
+    let now = crate::claims::now();
+    let ttl = crate::claims::ttl_secs();
+    let live = match crate::claims::list(&conn, Some(&repo), false, now, ttl) {
+        Ok(v) => v,
+        Err(e) => return scope_deny(format!("cannot query live claims: {e}")),
+    };
+    if live.is_empty() {
+        return scope_pass();
+    }
+
+    let owner = crate::claims::owner_id();
+    let agent = crate::claims::agent_of(&owner);
+    let own_target = live
+        .iter()
+        .find(|c| crate::claims::agent_of(&c.owner) == agent)
+        .map(|c| c.target.clone());
+    let others: Vec<scope::ClaimScope> = live
+        .iter()
+        .filter(|c| crate::claims::agent_of(&c.owner) != agent)
+        .map(|c| scope::ClaimScope {
+            target: c.target.clone(),
+            owner: c.owner.clone(),
+            scopes: c.scope.clone(),
+        })
+        .collect();
+
+    let changed = changed_paths(&repo_root, subcommand);
+    let in_worktree = branch::is_linked_worktree(&repo_root);
+    match scope::classify_scopes(&changed, own_target.as_deref(), in_worktree, &others) {
+        scope::ScopeVerdict::Overlapping {
+            owner,
+            target,
+            scope,
+        } => scope_deny(format!(
+            "this touches path(s) inside claim '{target}' (owner {owner}, scope '{scope}') -- work inside that claim's own worktree, or coordinate with {owner}."
+        )),
+        scope::ScopeVerdict::OutOfTree { target } => scope_deny(format!(
+            "you hold claim '{target}' -- do this work in its isolated worktree, not the canonical checkout (see `git worktree add`)."
+        )),
+        scope::ScopeVerdict::Clear | scope::ScopeVerdict::Related => scope_pass(),
+    }
+}
+
+/// Changed paths for the mutation about to happen -- staged paths for
+/// `commit`, paths diffed against the default branch for `push`. A v1
+/// simplification for `push`: diffs current-vs-default rather than parsing
+/// the actual push refspec across the CLI subprocess boundary. An
+/// unreadable diff yields no changed paths (nothing to enforce), matching
+/// this crate's fail-open default for diff resolution specifically -- only
+/// scope RESOLUTION errors (ledger/DB) are fail-closed, per the spec.
+fn changed_paths(repo_root: &Path, subcommand: &str) -> Vec<String> {
+    let range_args: Vec<String> = match subcommand {
+        "commit" => vec![
+            "diff".to_string(),
+            "--cached".to_string(),
+            "--name-only".to_string(),
+        ],
+        "push" => {
+            let default_branch = branch::resolve_default_branch(repo_root);
+            let current =
+                branch::current_branch(repo_root).unwrap_or_else(|| default_branch.clone());
+            let range = format!("{default_branch}...{current}");
+            vec!["diff".to_string(), "--name-only".to_string(), range]
+        }
+        _ => return Vec::new(),
+    };
+    let args: Vec<&str> = range_args.iter().map(String::as_str).collect();
+    shell::run_in(repo_root, &args)
+        .map(|s| s.lines().map(String::from).collect())
+        .unwrap_or_default()
 }
