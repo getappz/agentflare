@@ -77,7 +77,9 @@ pub fn proactive_suggestions() -> Option<String> {
 
     let db_path = crate::paths::skills_db_path();
     let mut registry = skill_registry::Registry::open_default(&db_path).ok()?;
-    registry.ensure_fresh(crate::components::detected_skill_agents).ok()?;
+    registry
+        .ensure_fresh(crate::components::detected_skill_agents)
+        .ok()?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
