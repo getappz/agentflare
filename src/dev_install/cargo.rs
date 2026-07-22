@@ -74,6 +74,13 @@ pub(crate) fn build_and_locate(release: bool) -> Result<PathBuf, String> {
 /// is unit-testable without invoking cargo. Returns the last matching
 /// `compiler-artifact` executable (there is normally exactly one).
 fn parse_executable_path(build_json: &str) -> Option<PathBuf> {
+    parse_named_executable_path(build_json, "agentflare")
+}
+
+/// Same as [`parse_executable_path`], generalized to any cargo target name --
+/// `build_shims` requests two binaries (`agentflare-shim`, `git`) in one
+/// invocation and needs to pick each one out of the same JSON stream.
+fn parse_named_executable_path(build_json: &str, target_name: &str) -> Option<PathBuf> {
     let mut found = None;
     for line in build_json.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -86,7 +93,7 @@ fn parse_executable_path(build_json: &str) -> Option<PathBuf> {
             .get("target")
             .and_then(|t| t.get("name"))
             .and_then(serde_json::Value::as_str);
-        if name != Some("agentflare") {
+        if name != Some(target_name) {
             continue;
         }
         if let Some(exe) = v.get("executable").and_then(serde_json::Value::as_str) {
@@ -96,6 +103,57 @@ fn parse_executable_path(build_json: &str) -> Option<PathBuf> {
     found
 }
 
+/// Build the PATH-shim binaries (`agentflare-shim`, and `flare-git-shim`'s
+/// `git`-named bin) from the current source tree.
+///
+/// Independent of [`build_and_locate`] on purpose: these are a nice-to-have
+/// (see `shim_install`'s module doc), so a compile error here must never
+/// abort `dev-install`'s main-binary swap. Returns `(shim, git_shim)`.
+pub(crate) fn build_shims(release: bool) -> Result<(PathBuf, PathBuf), String> {
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "-p",
+        "agentflare-shim",
+        "--bin",
+        "agentflare-shim",
+        "-p",
+        "flare-git-shim",
+        "--bin",
+        "git",
+        "--message-format",
+        "json-render-diagnostics",
+    ]);
+    if release {
+        cmd.arg("--release");
+    }
+
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("failed to run cargo build: {e}"))?;
+
+    let mut json = String::new();
+    let read_result = child
+        .stdout
+        .take()
+        .expect("stdout was piped")
+        .read_to_string(&mut json);
+
+    let status = child.wait().map_err(|e| format!("waiting on cargo: {e}"))?;
+    read_result.map_err(|e| format!("reading cargo output: {e}"))?;
+    if !status.success() {
+        return Err("cargo build failed".to_string());
+    }
+
+    let shim = parse_named_executable_path(&json, "agentflare-shim")
+        .ok_or_else(|| "cargo build did not report an agentflare-shim executable".to_string())?;
+    let git_shim = parse_named_executable_path(&json, "git").ok_or_else(|| {
+        "cargo build did not report a git (flare-git-shim) executable".to_string()
+    })?;
+    Ok((shim, git_shim))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

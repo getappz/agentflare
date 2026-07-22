@@ -110,12 +110,12 @@ pub fn pre_filter(text: &str) -> String {
 pub fn detect_over_engineering(text: &str) -> Vec<Finding> {
     let text = pre_filter(text);
     let mut findings = Vec::new();
-    ponytail_engineering_check_internal(&text, &mut findings, 0);
+    over_engineering_check_internal(&text, &mut findings, 0);
     findings.sort_by_key(|f| f.line);
     findings
 }
 
-fn ponytail_engineering_check_internal(text: &str, findings: &mut Vec<Finding>, base_line: usize) {
+fn over_engineering_check_internal(text: &str, findings: &mut Vec<Finding>, base_line: usize) {
     let patterns: &[(&str, &str, &str, &[&str])] = &[
         (
             "lodash",
