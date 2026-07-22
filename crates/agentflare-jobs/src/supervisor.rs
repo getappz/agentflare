@@ -170,4 +170,11 @@ fn kill_graceful(child: &mut std::process::Child, kill_after: Duration) {
     {
         let _ = child.kill();
     }
+    // Both external kill commands above swallow their errors (missing
+    // binary, permission denied, etc.), so the process may still be alive.
+    // Fall back to a direct OS-level kill so the caller's child.wait() can
+    // never block forever on a process we failed to actually terminate.
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = child.kill();
+    }
 }
