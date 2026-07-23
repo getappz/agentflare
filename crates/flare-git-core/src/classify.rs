@@ -190,15 +190,17 @@ pub fn is_destructive(subcommand: &str, args: &[String]) -> bool {
 
 /// Pure classification core — no I/O, so it's unit-testable with fixed
 /// inputs. `default_branch` is the repo's resolved default branch.
-/// `push_touches_trust_root` is pre-resolved by the caller (requires a real
-/// `git diff`, hence not something a pure function can determine itself)
-/// and is only consulted when `subcommand == "push"`.
+/// `push_touches_trust_root` and `push_targets_default_branch` are
+/// pre-resolved by the caller (both require resolving the actual pushed
+/// branch, hence not something a pure function can determine itself) and
+/// are only consulted when `subcommand == "push"`.
 #[must_use]
 pub fn classify_pure(
     subcommand: &str,
     args: &[String],
     default_branch: &str,
     push_touches_trust_root: bool,
+    push_targets_default_branch: bool,
 ) -> Disposition {
     if READ_ONLY_SUBCOMMANDS.contains(&subcommand)
         || ALLOWED_MUTATING_SUBCOMMANDS.contains(&subcommand)
@@ -252,6 +254,12 @@ pub fn classify_pure(
             if push_touches_trust_root {
                 Disposition::Deny {
                     reason: "this push carries changes to a trust-root path (.githooks/, .agentflare/, or Cargo.toml) — blocked by the agentflare git shim.".to_string(),
+                }
+            } else if push_targets_default_branch {
+                Disposition::Deny {
+                    reason: format!(
+                        "pushing the default branch '{default_branch}' to a remote is blocked by the agentflare git shim — push a feature/worktree branch and open a PR instead."
+                    ),
                 }
             } else {
                 Disposition::Passthrough
@@ -315,10 +323,25 @@ fn pushed_branch(repo_root: &Path, args: &[String]) -> Option<String> {
 #[must_use]
 pub fn classify(repo_root: &Path, subcommand: &str, args: &[String]) -> Event {
     let default_branch = resolve_default_branch(repo_root);
-    let touches_trust_root = subcommand == "push"
-        && pushed_branch(repo_root, args)
-            .is_some_and(|b| push_touches_trust_root(repo_root, &b, &default_branch));
-    let disposition = classify_pure(subcommand, args, &default_branch, touches_trust_root);
+    // Resolve the actual pushed branch once, then derive both push facts from
+    // it: whether it carries trust-root changes and whether it *is* the
+    // default branch (direct push blocked in favour of a PR).
+    let pushed = (subcommand == "push")
+        .then(|| pushed_branch(repo_root, args))
+        .flatten();
+    let touches_trust_root = pushed
+        .as_deref()
+        .is_some_and(|b| push_touches_trust_root(repo_root, b, &default_branch));
+    let targets_default_branch = pushed
+        .as_deref()
+        .is_some_and(|b| is_protected_branch(b, Some(&default_branch)));
+    let disposition = classify_pure(
+        subcommand,
+        args,
+        &default_branch,
+        touches_trust_root,
+        targets_default_branch,
+    );
     Event {
         subcommand: subcommand.to_string(),
         args: args.to_vec(),
@@ -337,11 +360,11 @@ mod tests {
     #[test]
     fn read_only_subcommands_pass_through() {
         assert_eq!(
-            classify_pure("status", &[], "master", false),
+            classify_pure("status", &[], "master", false, false),
             Disposition::Passthrough
         );
         assert_eq!(
-            classify_pure("log", &args(&["-5"]), "master", false),
+            classify_pure("log", &args(&["-5"]), "master", false, false),
             Disposition::Passthrough
         );
     }
@@ -349,11 +372,11 @@ mod tests {
     #[test]
     fn ordinary_mutating_subcommands_pass_through() {
         assert_eq!(
-            classify_pure("commit", &args(&["-m", "x"]), "master", false),
+            classify_pure("commit", &args(&["-m", "x"]), "master", false, false),
             Disposition::Passthrough
         );
         assert_eq!(
-            classify_pure("reset", &args(&["HEAD~1"]), "master", false),
+            classify_pure("reset", &args(&["HEAD~1"]), "master", false, false),
             Disposition::Passthrough
         );
     }
@@ -363,19 +386,19 @@ mod tests {
         // Fail-open: this shim must never block a subcommand it hasn't
         // been explicitly taught to deny.
         assert_eq!(
-            classify_pure("some-future-subcommand", &[], "master", false),
+            classify_pure("some-future-subcommand", &[], "master", false, false),
             Disposition::Passthrough
         );
         assert_eq!(
-            classify_pure("submodule", &args(&["update"]), "master", false),
+            classify_pure("submodule", &args(&["update"]), "master", false, false),
             Disposition::Passthrough
         );
         assert_eq!(
-            classify_pure("bisect", &args(&["start"]), "master", false),
+            classify_pure("bisect", &args(&["start"]), "master", false, false),
             Disposition::Passthrough
         );
         assert_eq!(
-            classify_pure("lfs", &args(&["pull"]), "master", false),
+            classify_pure("lfs", &args(&["pull"]), "master", false, false),
             Disposition::Passthrough
         );
     }
@@ -383,11 +406,11 @@ mod tests {
     #[test]
     fn plumbing_commands_are_denied() {
         assert!(matches!(
-            classify_pure("update-index", &[], "master", false),
+            classify_pure("update-index", &[], "master", false, false),
             Disposition::Deny { .. }
         ));
         assert!(matches!(
-            classify_pure("apply", &[], "master", false),
+            classify_pure("apply", &[], "master", false, false),
             Disposition::Deny { .. }
         ));
     }
@@ -395,21 +418,21 @@ mod tests {
     #[test]
     fn worktree_is_denied() {
         assert!(matches!(
-            classify_pure("worktree", &args(&["add", "../x"]), "master", false),
+            classify_pure("worktree", &args(&["add", "../x"]), "master", false, false),
             Disposition::Deny { .. }
         ));
     }
 
     #[test]
     fn checkout_to_protected_branch_is_denied() {
-        let d = classify_pure("checkout", &args(&["master"]), "master", false);
+        let d = classify_pure("checkout", &args(&["master"]), "master", false, false);
         assert!(matches!(d, Disposition::Deny { .. }));
     }
 
     #[test]
     fn switch_to_feature_branch_passes_through() {
         assert_eq!(
-            classify_pure("switch", &args(&["feature/x"]), "master", false),
+            classify_pure("switch", &args(&["feature/x"]), "master", false, false),
             Disposition::Passthrough
         );
     }
@@ -418,7 +441,7 @@ mod tests {
     fn checkout_with_no_target_arg_passes_through() {
         // `git switch -` (previous branch) — nothing to protect against.
         assert_eq!(
-            classify_pure("switch", &args(&["-"]), "master", false),
+            classify_pure("switch", &args(&["-"]), "master", false, false),
             Disposition::Passthrough
         );
     }
@@ -426,7 +449,13 @@ mod tests {
     #[test]
     fn push_touching_trust_root_is_denied() {
         assert!(matches!(
-            classify_pure("push", &args(&["origin", "feature/x"]), "master", true),
+            classify_pure(
+                "push",
+                &args(&["origin", "feature/x"]),
+                "master",
+                true,
+                false
+            ),
             Disposition::Deny { .. }
         ));
     }
@@ -434,7 +463,37 @@ mod tests {
     #[test]
     fn push_not_touching_trust_root_passes_through() {
         assert_eq!(
-            classify_pure("push", &args(&["origin", "feature/x"]), "master", false),
+            classify_pure(
+                "push",
+                &args(&["origin", "feature/x"]),
+                "master",
+                false,
+                false
+            ),
+            Disposition::Passthrough
+        );
+    }
+
+    #[test]
+    fn push_of_default_branch_is_denied_even_without_trust_root_changes() {
+        // Enforce PR-only: pushing the default branch straight to a remote is
+        // blocked regardless of what the diff touches.
+        assert!(matches!(
+            classify_pure("push", &args(&["origin", "master"]), "master", false, true),
+            Disposition::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn push_of_feature_branch_is_not_a_default_branch_push() {
+        assert_eq!(
+            classify_pure(
+                "push",
+                &args(&["origin", "feature/x"]),
+                "master",
+                false,
+                false
+            ),
             Disposition::Passthrough
         );
     }
@@ -442,11 +501,17 @@ mod tests {
     #[test]
     fn branch_delete_of_protected_branch_is_denied() {
         assert!(matches!(
-            classify_pure("branch", &args(&["-D", "master"]), "master", false),
+            classify_pure("branch", &args(&["-D", "master"]), "master", false, false),
             Disposition::Deny { .. }
         ));
         assert!(matches!(
-            classify_pure("branch", &args(&["--delete", "master"]), "master", false),
+            classify_pure(
+                "branch",
+                &args(&["--delete", "master"]),
+                "master",
+                false,
+                false
+            ),
             Disposition::Deny { .. }
         ));
     }
@@ -458,6 +523,7 @@ mod tests {
                 "branch",
                 &args(&["-M", "master", "renamed"]),
                 "master",
+                false,
                 false
             ),
             Disposition::Deny { .. }
@@ -467,7 +533,13 @@ mod tests {
     #[test]
     fn branch_delete_of_feature_branch_passes_through() {
         assert_eq!(
-            classify_pure("branch", &args(&["-D", "feature/x"]), "master", false),
+            classify_pure(
+                "branch",
+                &args(&["-D", "feature/x"]),
+                "master",
+                false,
+                false
+            ),
             Disposition::Passthrough
         );
     }
@@ -475,11 +547,11 @@ mod tests {
     #[test]
     fn branch_listing_and_creation_pass_through() {
         assert_eq!(
-            classify_pure("branch", &[], "master", false),
+            classify_pure("branch", &[], "master", false, false),
             Disposition::Passthrough
         );
         assert_eq!(
-            classify_pure("branch", &args(&["feature/new"]), "master", false),
+            classify_pure("branch", &args(&["feature/new"]), "master", false, false),
             Disposition::Passthrough
         );
     }
@@ -612,6 +684,20 @@ mod tests {
         crate::shell::run_in(&repo.path, &["checkout", "-b", "feature/z"]).unwrap();
         crate::shell::run_in(&repo.path, &["commit", "-m", "touch trust root"]).unwrap();
         let event = classify(&repo.path, "push", &args(&["-u", "origin", "feature/z"]));
+        assert!(
+            matches!(event.disposition, Disposition::Deny { .. }),
+            "{:?}",
+            event.disposition
+        );
+    }
+
+    #[test]
+    fn bare_push_on_default_branch_is_denied_end_to_end() {
+        // The common case: `git push` while checked out on the default branch
+        // resolves the current branch (master) and must be blocked, PR-only.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        crate::shell::run_in(&repo.path, &["commit", "--allow-empty", "-m", "init"]).unwrap();
+        let event = classify(&repo.path, "push", &[]);
         assert!(
             matches!(event.disposition, Disposition::Deny { .. }),
             "{:?}",
