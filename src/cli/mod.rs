@@ -8,6 +8,7 @@ mod coaching;
 mod cost;
 mod daemon;
 mod dev_install;
+mod docs;
 mod gateway;
 pub(crate) mod git;
 mod handoff;
@@ -75,6 +76,7 @@ pub enum Commands {
     Serve(serve::ServeArgs),
     Vent(vent::VentArgs),
     Work(work::WorkArgs),
+    Docs(docs::DocsArgs),
 }
 
 impl Commands {
@@ -107,6 +109,7 @@ impl Commands {
             Self::Daemon(cmd) => cmd.run(),
             Self::Vent(cmd) => vent::run(cmd),
             Self::Work(cmd) => cmd.run(),
+            Self::Docs(cmd) => docs::run(cmd),
         }
     }
 }
