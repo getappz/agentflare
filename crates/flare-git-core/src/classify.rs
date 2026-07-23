@@ -190,16 +190,16 @@ pub fn is_destructive(subcommand: &str, args: &[String]) -> bool {
 
 /// Pure classification core — no I/O, so it's unit-testable with fixed
 /// inputs. `default_branch` is the repo's resolved default branch.
-/// `push_touches_trust_root` and `push_targets_default_branch` are
-/// pre-resolved by the caller (both require resolving the actual pushed
-/// branch, hence not something a pure function can determine itself) and
-/// are only consulted when `subcommand == "push"`.
+/// `trust_root_touch` and `push_targets_default_branch` are pre-resolved by
+/// the caller (both require resolving the actual pushed branch, hence not
+/// something a pure function can determine itself) and are only consulted
+/// when `subcommand == "push"`.
 #[must_use]
 pub fn classify_pure(
     subcommand: &str,
     args: &[String],
     default_branch: &str,
-    push_touches_trust_root: bool,
+    trust_root_touch: &TrustRootTouch,
     push_targets_default_branch: bool,
 ) -> Disposition {
     if READ_ONLY_SUBCOMMANDS.contains(&subcommand)
@@ -250,21 +250,23 @@ pub fn classify_pure(
                 Disposition::Passthrough
             }
         }
-        "push" => {
-            if push_touches_trust_root {
-                Disposition::Deny {
-                    reason: "this push carries changes to a trust-root path (.githooks/, .agentflare/, or Cargo.toml) — blocked by the agentflare git shim.".to_string(),
-                }
-            } else if push_targets_default_branch {
-                Disposition::Deny {
-                    reason: format!(
-                        "pushing the default branch '{default_branch}' to a remote is blocked by the agentflare git shim — push a feature/worktree branch and open a PR instead."
-                    ),
-                }
-            } else {
-                Disposition::Passthrough
-            }
-        }
+        "push" => match trust_root_touch {
+            TrustRootTouch::Touched(paths) => Disposition::Deny {
+                reason: format!(
+                    "this push carries changes to a trust-root path ({}) — blocked by the agentflare git shim.",
+                    paths.join(", ")
+                ),
+            },
+            TrustRootTouch::Unknown => Disposition::Deny {
+                reason: "this push's diff against trust-root paths (.githooks/, .agentflare/, Cargo.toml) could not be verified — blocked by the agentflare git shim as a precaution.".to_string(),
+            },
+            TrustRootTouch::Clean if push_targets_default_branch => Disposition::Deny {
+                reason: format!(
+                    "pushing the default branch '{default_branch}' to a remote is blocked by the agentflare git shim — push a feature/worktree branch and open a PR instead."
+                ),
+            },
+            TrustRootTouch::Clean => Disposition::Passthrough,
+        },
         "worktree" => Disposition::Deny {
             reason: "'git worktree' is orchestrator-managed by agentflare — use the `item` MCP tool's claim flow instead of calling it directly.".to_string(),
         },
@@ -275,20 +277,49 @@ pub fn classify_pure(
     }
 }
 
-/// Whether pushing would carry changes to a trust-root path — inspects the
-/// diff between `branch` and `target`. Errs toward `true` (blocking) if
-/// that diff can't be determined at all: an unreadable diff is not a safe
-/// default to let through.
+/// Result of checking whether a `push` would carry changes to a trust-root
+/// path — `Touched` names exactly the matched path(s) so the shim's deny
+/// message doesn't have to fall back to listing every pattern it knows
+/// about, forcing the caller to guess which one actually applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustRootTouch {
+    Clean,
+    Touched(Vec<String>),
+    /// The diff couldn't be read at all — fail closed rather than assume
+    /// `Clean`, but say so plainly instead of naming paths that were never
+    /// actually confirmed.
+    Unknown,
+}
+
+/// Resolves whether pushing would carry changes to a trust-root path —
+/// inspects the diff between `branch` and `target` and names exactly which
+/// configured pattern(s) matched. Fails to `Unknown` (still blocks) if that
+/// diff can't be determined at all: an unreadable diff is not a safe
+/// default to let through, but the caller shouldn't claim to know which
+/// path caused it.
 #[must_use]
-pub fn push_touches_trust_root(repo_root: &Path, branch: &str, target: &str) -> bool {
+pub fn resolve_trust_root_touch(repo_root: &Path, branch: &str, target: &str) -> TrustRootTouch {
     let extra = extra_trust_root_paths_from_env();
     let range = format!("{target}...{branch}");
     match crate::shell::run_in(repo_root, &["diff", "--name-only", &range]) {
-        Ok(names) => names.lines().any(|f| {
-            TRUST_ROOT_PATHS.iter().any(|p| f.starts_with(p))
-                || extra.iter().any(|p| f.starts_with(p.as_str()))
-        }),
-        Err(_) => true,
+        Ok(names) => {
+            let mut matched: Vec<String> = names
+                .lines()
+                .filter(|f| {
+                    TRUST_ROOT_PATHS.iter().any(|p| f.starts_with(p))
+                        || extra.iter().any(|p| f.starts_with(p.as_str()))
+                })
+                .map(str::to_string)
+                .collect();
+            matched.sort();
+            matched.dedup();
+            if matched.is_empty() {
+                TrustRootTouch::Clean
+            } else {
+                TrustRootTouch::Touched(matched)
+            }
+        }
+        Err(_) => TrustRootTouch::Unknown,
     }
 }
 
@@ -329,9 +360,10 @@ pub fn classify(repo_root: &Path, subcommand: &str, args: &[String]) -> Event {
     let pushed = (subcommand == "push")
         .then(|| pushed_branch(repo_root, args))
         .flatten();
-    let touches_trust_root = pushed
+    let trust_root_touch = pushed
         .as_deref()
-        .is_some_and(|b| push_touches_trust_root(repo_root, b, &default_branch));
+        .map(|b| resolve_trust_root_touch(repo_root, b, &default_branch))
+        .unwrap_or(TrustRootTouch::Clean);
     let targets_default_branch = pushed
         .as_deref()
         .is_some_and(|b| is_protected_branch(b, Some(&default_branch)));
@@ -339,7 +371,7 @@ pub fn classify(repo_root: &Path, subcommand: &str, args: &[String]) -> Event {
         subcommand,
         args,
         &default_branch,
-        touches_trust_root,
+        &trust_root_touch,
         targets_default_branch,
     );
     Event {
@@ -360,11 +392,17 @@ mod tests {
     #[test]
     fn read_only_subcommands_pass_through() {
         assert_eq!(
-            classify_pure("status", &[], "master", false, false),
+            classify_pure("status", &[], "master", &TrustRootTouch::Clean, false),
             Disposition::Passthrough
         );
         assert_eq!(
-            classify_pure("log", &args(&["-5"]), "master", false, false),
+            classify_pure(
+                "log",
+                &args(&["-5"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
             Disposition::Passthrough
         );
     }
@@ -372,11 +410,23 @@ mod tests {
     #[test]
     fn ordinary_mutating_subcommands_pass_through() {
         assert_eq!(
-            classify_pure("commit", &args(&["-m", "x"]), "master", false, false),
+            classify_pure(
+                "commit",
+                &args(&["-m", "x"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
             Disposition::Passthrough
         );
         assert_eq!(
-            classify_pure("reset", &args(&["HEAD~1"]), "master", false, false),
+            classify_pure(
+                "reset",
+                &args(&["HEAD~1"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
             Disposition::Passthrough
         );
     }
@@ -386,19 +436,43 @@ mod tests {
         // Fail-open: this shim must never block a subcommand it hasn't
         // been explicitly taught to deny.
         assert_eq!(
-            classify_pure("some-future-subcommand", &[], "master", false, false),
+            classify_pure(
+                "some-future-subcommand",
+                &[],
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
             Disposition::Passthrough
         );
         assert_eq!(
-            classify_pure("submodule", &args(&["update"]), "master", false, false),
+            classify_pure(
+                "submodule",
+                &args(&["update"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
             Disposition::Passthrough
         );
         assert_eq!(
-            classify_pure("bisect", &args(&["start"]), "master", false, false),
+            classify_pure(
+                "bisect",
+                &args(&["start"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
             Disposition::Passthrough
         );
         assert_eq!(
-            classify_pure("lfs", &args(&["pull"]), "master", false, false),
+            classify_pure(
+                "lfs",
+                &args(&["pull"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
             Disposition::Passthrough
         );
     }
@@ -406,11 +480,11 @@ mod tests {
     #[test]
     fn plumbing_commands_are_denied() {
         assert!(matches!(
-            classify_pure("update-index", &[], "master", false, false),
+            classify_pure("update-index", &[], "master", &TrustRootTouch::Clean, false),
             Disposition::Deny { .. }
         ));
         assert!(matches!(
-            classify_pure("apply", &[], "master", false, false),
+            classify_pure("apply", &[], "master", &TrustRootTouch::Clean, false),
             Disposition::Deny { .. }
         ));
     }
@@ -418,21 +492,39 @@ mod tests {
     #[test]
     fn worktree_is_denied() {
         assert!(matches!(
-            classify_pure("worktree", &args(&["add", "../x"]), "master", false, false),
+            classify_pure(
+                "worktree",
+                &args(&["add", "../x"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
             Disposition::Deny { .. }
         ));
     }
 
     #[test]
     fn checkout_to_protected_branch_is_denied() {
-        let d = classify_pure("checkout", &args(&["master"]), "master", false, false);
+        let d = classify_pure(
+            "checkout",
+            &args(&["master"]),
+            "master",
+            &TrustRootTouch::Clean,
+            false,
+        );
         assert!(matches!(d, Disposition::Deny { .. }));
     }
 
     #[test]
     fn switch_to_feature_branch_passes_through() {
         assert_eq!(
-            classify_pure("switch", &args(&["feature/x"]), "master", false, false),
+            classify_pure(
+                "switch",
+                &args(&["feature/x"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
             Disposition::Passthrough
         );
     }
@@ -441,7 +533,13 @@ mod tests {
     fn checkout_with_no_target_arg_passes_through() {
         // `git switch -` (previous branch) — nothing to protect against.
         assert_eq!(
-            classify_pure("switch", &args(&["-"]), "master", false, false),
+            classify_pure(
+                "switch",
+                &args(&["-"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
             Disposition::Passthrough
         );
     }
@@ -453,7 +551,7 @@ mod tests {
                 "push",
                 &args(&["origin", "feature/x"]),
                 "master",
-                true,
+                &TrustRootTouch::Touched(vec!["Cargo.toml".to_string()]),
                 false
             ),
             Disposition::Deny { .. }
@@ -467,7 +565,7 @@ mod tests {
                 "push",
                 &args(&["origin", "feature/x"]),
                 "master",
-                false,
+                &TrustRootTouch::Clean,
                 false
             ),
             Disposition::Passthrough
@@ -479,7 +577,13 @@ mod tests {
         // Enforce PR-only: pushing the default branch straight to a remote is
         // blocked regardless of what the diff touches.
         assert!(matches!(
-            classify_pure("push", &args(&["origin", "master"]), "master", false, true),
+            classify_pure(
+                "push",
+                &args(&["origin", "master"]),
+                "master",
+                &TrustRootTouch::Clean,
+                true
+            ),
             Disposition::Deny { .. }
         ));
     }
@@ -491,7 +595,7 @@ mod tests {
                 "push",
                 &args(&["origin", "feature/x"]),
                 "master",
-                false,
+                &TrustRootTouch::Clean,
                 false
             ),
             Disposition::Passthrough
@@ -501,7 +605,13 @@ mod tests {
     #[test]
     fn branch_delete_of_protected_branch_is_denied() {
         assert!(matches!(
-            classify_pure("branch", &args(&["-D", "master"]), "master", false, false),
+            classify_pure(
+                "branch",
+                &args(&["-D", "master"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
             Disposition::Deny { .. }
         ));
         assert!(matches!(
@@ -509,7 +619,7 @@ mod tests {
                 "branch",
                 &args(&["--delete", "master"]),
                 "master",
-                false,
+                &TrustRootTouch::Clean,
                 false
             ),
             Disposition::Deny { .. }
@@ -523,7 +633,7 @@ mod tests {
                 "branch",
                 &args(&["-M", "master", "renamed"]),
                 "master",
-                false,
+                &TrustRootTouch::Clean,
                 false
             ),
             Disposition::Deny { .. }
@@ -537,7 +647,7 @@ mod tests {
                 "branch",
                 &args(&["-D", "feature/x"]),
                 "master",
-                false,
+                &TrustRootTouch::Clean,
                 false
             ),
             Disposition::Passthrough
@@ -547,11 +657,17 @@ mod tests {
     #[test]
     fn branch_listing_and_creation_pass_through() {
         assert_eq!(
-            classify_pure("branch", &[], "master", false, false),
+            classify_pure("branch", &[], "master", &TrustRootTouch::Clean, false),
             Disposition::Passthrough
         );
         assert_eq!(
-            classify_pure("branch", &args(&["feature/new"]), "master", false, false),
+            classify_pure(
+                "branch",
+                &args(&["feature/new"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
             Disposition::Passthrough
         );
     }
@@ -703,5 +819,44 @@ mod tests {
             "{:?}",
             event.disposition
         );
+    }
+
+    #[test]
+    fn push_trust_root_deny_message_names_only_the_touched_path() {
+        let touch = TrustRootTouch::Touched(vec!["Cargo.toml".to_string()]);
+        let d = classify_pure(
+            "push",
+            &args(&["origin", "feature/x"]),
+            "master",
+            &touch,
+            false,
+        );
+        let Disposition::Deny { reason } = d else {
+            panic!("expected Deny, got {d:?}");
+        };
+        assert!(reason.contains("Cargo.toml"), "{reason}");
+        assert!(
+            !reason.contains(".agentflare/"),
+            "message must not name paths that weren't actually touched: {reason}"
+        );
+        assert!(
+            !reason.contains(".githooks/"),
+            "message must not name paths that weren't actually touched: {reason}"
+        );
+    }
+
+    #[test]
+    fn push_with_unreadable_diff_denies_with_unknown_message() {
+        let d = classify_pure(
+            "push",
+            &args(&["origin", "feature/x"]),
+            "master",
+            &TrustRootTouch::Unknown,
+            false,
+        );
+        let Disposition::Deny { reason } = d else {
+            panic!("expected Deny, got {d:?}");
+        };
+        assert!(reason.contains("could not be verified"), "{reason}");
     }
 }
