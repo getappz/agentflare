@@ -83,6 +83,33 @@ defect - brief-authoring artifact only).
 Minor (plan-inherited): get/refresh arms near-identical boilerplate
 (verbatim brief code, follow-up could extract a serialize() helper).
 
+Task 5: complete (3c407e50..0f8bc70b, review approved, no Critical/Important).
+`agentflare docs search|get|list|refresh` CLI subcommand, thin wrapper over
+the same flare_docs API Task 4's MCP tool uses. No async runtime anywhere
+(fetch_and_store called directly, sync). mod docs; inserted alphabetically;
+Docs variant appended at enum end matching the file's real append-newest-
+at-end convention (not alphabetical there, correctly not forced to be); free-
+function docs::run(cmd) dispatch matches vent/about/git's pattern as
+directed. Commit-message backtick-mangling incident caught+fixed via amend
+before anything else, diff unaffected (0f8bc70b is the correct final commit).
+IMPORTANT DISCOVERY (not a Task 5 defect — Task 5's job was to surface it,
+which it did correctly by propagating the crate error via eprintln!+exit(1)):
+manual live-network verification (`docs get serde`) failed with "invalid
+rustdoc json: missing \"root\" field" — Task 3's extract_root_docstring was
+tested only against a synthetic string-typed root id fixture ("0:0"); the
+REAL docs.rs payload (format_version 60) has root as a JSON NUMBER (e.g.
+3177), with index keyed by the stringified number. Logged via vent (event
+d6a8cb6a). Controller independently reproduced by fetching+decompressing the
+real serde/latest payload via a throwaway (deleted, uncommitted) example
+using flare-docs's own decompress_zstd+serde_json — confirmed root cause
+exactly. Dispatched a fix task to crates/flare-docs/src/rustdoc.rs (accept
+root as either string or number, stringify for index lookup) before the
+final whole-branch review, since this is core happy-path functionality
+(fetching real crate docs), not cosmetic.
+Minor (plan-inherited): Get's --help text says "or read from cache" but
+always re-fetches (TTL/cache-check explicitly deferred); print_or_die-style
+error-handling boilerplate repeated per arm (brief-mandated verbatim code).
+
 Task 1: complete (68cd5dd..df08c42, review approved — one Important finding
 resolved by controller as a false positive: brief's "Interfaces" line used
 gateway_registry::db:: as a fully-qualified-path label, not a public-API
