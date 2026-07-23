@@ -334,19 +334,24 @@ impl CodeAction {
 
 /// Build the flare-code statusline badge for `mode`, or `None` when nothing
 /// should render (`off`/empty mode, or the badge is hidden via
-/// `FLARE_CODE_HIDE_STATUS`). `ultra` gets a distinct amber (256-color 173);
-/// every other active mode is green (108) — matching upstream ponytail.
+/// `FLARE_CODE_HIDE_STATUS`).
+///
+/// Styled after Claude Code's own status-line hints (`⏵⏵ auto mode on
+/// (shift+tab to cycle) · …`): arrow-glyph prefix, lowercase phrase, a
+/// parenthetical carrying the active mode, and a trailing `·` segment
+/// separator. Single cyan accent (256-color 51) matching Claude's hints;
+/// `full` is the unqualified default, every other mode names itself in the
+/// parenthetical (e.g. `(optimize code: ultra)`).
 fn statusline_badge(mode: &str, hide: bool) -> Option<String> {
     if hide || mode == "off" || mode.is_empty() {
         return None;
     }
-    let color = if mode == "ultra" { 173 } else { 108 };
-    let label = if mode == "full" {
-        "[FLARE-CODE]".to_string()
+    let hint = if mode == "full" {
+        "optimize code".to_string()
     } else {
-        format!("[FLARE-CODE:{}]", mode.to_uppercase())
+        format!("optimize code: {mode}")
     };
-    Some(format!("\x1b[38;5;{color}m{label}\x1b[0m"))
+    Some(format!("\x1b[38;5;51m⏵⏵ flare mode on ({hint}) ·\x1b[0m"))
 }
 
 #[cfg(test)]
@@ -361,26 +366,26 @@ mod statusline_tests {
     }
 
     #[test]
-    fn full_is_green_and_unlabeled() {
+    fn full_mode_uses_native_hint_style() {
         assert_eq!(
             statusline_badge("full", false).as_deref(),
-            Some("\x1b[38;5;108m[FLARE-CODE]\x1b[0m")
+            Some("\x1b[38;5;51m⏵⏵ flare mode on (optimize code) ·\x1b[0m")
         );
     }
 
     #[test]
-    fn ultra_is_amber_173() {
+    fn other_modes_name_themselves_in_the_parenthetical() {
         assert_eq!(
             statusline_badge("ultra", false).as_deref(),
-            Some("\x1b[38;5;173m[FLARE-CODE:ULTRA]\x1b[0m")
+            Some("\x1b[38;5;51m⏵⏵ flare mode on (optimize code: ultra) ·\x1b[0m")
         );
-    }
-
-    #[test]
-    fn other_modes_are_green_labeled() {
         assert_eq!(
             statusline_badge("lite", false).as_deref(),
-            Some("\x1b[38;5;108m[FLARE-CODE:LITE]\x1b[0m")
+            Some("\x1b[38;5;51m⏵⏵ flare mode on (optimize code: lite) ·\x1b[0m")
+        );
+        assert_eq!(
+            statusline_badge("review", false).as_deref(),
+            Some("\x1b[38;5;51m⏵⏵ flare mode on (optimize code: review) ·\x1b[0m")
         );
     }
 }
