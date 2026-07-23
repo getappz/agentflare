@@ -128,9 +128,49 @@ ALL 5 TASKS + 1 CROSS-TASK FIX COMPLETE. Full history: 4aee28c4 (base) ->
 d013ec10 (T1) -> b1a2076c/cd53ee78/00b9eae6 (T2, 3 design iterations:
 wreq->reqwest->ureq, human-directed) -> 87e01431 (T3) -> 3c407e50 (T4) ->
 0f8bc70b (T5) -> e3ced028 (T3 numeric-root-id fix, discovered via T5's live
-network smoke test). Next: final whole-branch review per
-superpowers:subagent-driven-development, then
-superpowers:finishing-a-development-branch.
+network smoke test).
+
+FINAL WHOLE-BRANCH REVIEW (opus, d503df01..e3ced028 = merge-base..HEAD, note
+this range also contains 2 unrelated already-merged PRs (#313/#314) at its
+base -- actual feature range is 4aee28c4..e3ced028): "Ready with fixes".
+Both cross-task properties independently verified by tracing source (not
+trusting the ledger): (1) PROJECT_ID="global" enforcement airtight -- every
+Document read/write funnels through DocsStore, no caller anywhere touches
+agentflare_store::Store's doc methods directly or opens the shared store.db;
+(2) sync pipeline confirmed zero async/tokio/await leakage in the crate.
+ONE Important finding (real, invisible to any single task's diff): the
+blocking ureq fetch inside the sync #[tool] fn flare_docs runs INLINE on the
+MCP server's single-threaded (new_current_thread) tokio runtime -- rmcp's
+#[tool] macro only Box::pins async fns, so a sync fn's body (including a
+blocking network call) executes directly on the runtime thread with no
+spawn_blocking anywhere in rmcp's dispatch tree. A get/refresh freezes the
+WHOLE MCP server (transport, other tool calls, cancellation) for the fetch
+duration (up to ~330s on a hung socket per the configured timeouts), and the
+std::sync::Mutex guard is held across the blocking call too, serializing
+concurrent flare_docs requests behind it. Fix: make flare_docs async, run
+the network fetch via tokio::task::spawn_blocking (NOT block_in_place --
+panics on current-thread runtimes), never hold the store mutex across an
+.await. Dispatching ONE fix for this per skill guidance (Critical+Important
+get fix dispatches; Minor goes to ledger for human triage, not auto-fixed).
+
+Minor findings (not auto-fixed, for human triage before merge):
+1. 404/bad-package-name maps to internal_error not invalid_params in get/
+   refresh (src/mcp_server/flare_docs.rs) -- doesn't mirror the
+   gateway_execute/skill_load caller-mistake-vs-infra-failure discrimination
+   pattern already established elsewhere in this file.
+2. FlareDocsRequest.limit / CLI --limit unbounded (MemoryRequest documents
+   "max 50" by contrast).
+3. decompress_zstd/read_to_end have no output-size cap (theoretical hardening
+   against a compromised/oversized docs.rs payload; docs.rs is trusted today).
+4. CLI docs.rs: Get's --help says "or read from cache" but Get/Refresh share
+   one arm and both always re-fetch (TTL/cache-check explicitly deferred,
+   ledger-acknowledged from Task 5's own review already).
+5. fetch.rs's `!(200..300).contains(&status)` check is dead code (ureq's
+   .call() already errors non-2xx) -- ledger-noted from Task 2's review.
+6. docs_rs_json_url hard-codes host so no SSRF/traversal surface, but ureq
+   follows redirects by default -- crate-name charset validation would close
+   even the theoretical redirect-amplification surface (defense-in-depth
+   only, not a real vuln today).
 
 Task 1: complete (68cd5dd..df08c42, review approved — one Important finding
 resolved by controller as a false positive: brief's "Interfaces" line used
