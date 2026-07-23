@@ -77,7 +77,12 @@ pub struct Finding {
 }
 
 static NOISE_PATTERNS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*(//\s*(Copyright|SPDX)|#\s*(Copyright|SPDX)|\-\-\s*Copyright)").unwrap()
+    // Case-insensitive: real headers vary ("Copyright" vs "COPYRIGHT (c)").
+    // `--` (SQL-style) covers SPDX too, matching the `//`/`#` branches --
+    // the original only recognized `-- Copyright`, silently letting
+    // `-- SPDX-License-Identifier: ...` through in SQL files.
+    Regex::new(r"(?im)^\s*(//\s*(Copyright|SPDX)|#\s*(Copyright|SPDX)|\-\-\s*(Copyright|SPDX))")
+        .unwrap()
 });
 
 static GENERATED_MARKERS: LazyLock<Regex> = LazyLock::new(|| {
@@ -257,6 +262,18 @@ mod tests {
         let result =
             pre_filter("// Copyright 2024 Acme Corp\n// SPDX-License-Identifier: MIT\nfn foo() {}");
         assert_eq!(result, "\n\nfn foo() {}");
+    }
+
+    #[test]
+    fn pre_filter_removes_sql_style_spdx_header() {
+        let result = pre_filter("-- SPDX-License-Identifier: MIT\nSELECT 1;");
+        assert_eq!(result, "\nSELECT 1;");
+    }
+
+    #[test]
+    fn pre_filter_removes_lowercase_copyright_header() {
+        let result = pre_filter("// copyright 2024 Acme Corp\nfn foo() {}");
+        assert_eq!(result, "\nfn foo() {}");
     }
 
     #[test]

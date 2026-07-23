@@ -1,4 +1,20 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 reviews:
   auto_review:
-    drafts: true
+    # Default is false; this repo previously overrode it to true, reviewing
+    # draft PRs too and burning review budget before a PR is even ready.
+    drafts: false
+    # Default is 5. This repo's PRs commonly get several small fast-follow
+    # commits pushed within one session (fmt/clippy fixes, review-response
+    # commits) -- pause incremental re-review earlier and use
+    # `@coderabbitai review` on demand for a fresh pass instead of burning
+    # the per-developer review-rate limit on every push.
+    auto_pause_after_reviewed_commits: 2
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+      - "[skip review]"
+    ignore_usernames:
+      - "dependabot[bot]"
+      - "renovate[bot]"
+      - "github-actions[bot]"

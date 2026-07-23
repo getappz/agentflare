@@ -97,11 +97,35 @@ for b in "${!candidates[@]}"; do
   fi
 
   if [[ -n "$wt" ]]; then
-    if git worktree remove "$wt" 2>/dev/null; then
-      echo "removed worktree $wt"
-    else
-      echo "skip $b: worktree $wt has uncommitted changes" >&2
-      continue
+    # Retry worktree removal on Windows where file locks (rust-analyzer,
+    # proc-macro-srv) can transiently block deletion. Exponential backoff
+    # up to ~16s total before falling through.
+    wt_removed=0
+    delay=1
+    for attempt in 1 2 3 4 5; do
+      if git worktree remove "$wt" 2>/dev/null; then
+        echo "removed worktree $wt"
+        wt_removed=1
+        break
+      fi
+      # Distinguish "Permission denied" (file lock) from "dirty" (unsafe)
+      err=$(git worktree remove "$wt" 2>&1 1>/dev/null) || true
+      if [[ "$err" == *"dirty"* || "$err" == *"has untracked"* || "$err" == *"has uncommitted"* ]]; then
+        echo "skip $b: worktree $wt has uncommitted changes" >&2
+        break
+      fi
+      if ((attempt < 5)); then
+        sleep "$delay"
+        delay=$((delay * 2))
+      fi
+    done
+    if ((wt_removed == 0)); then
+      # Permission denied after retries — likely rust-analyzer locking
+      # files on Windows. Still prune the git metadata so the branch
+      # itself can be cleaned up. The leftover directory will be caught
+      # by gc_orphans (which has retry+rmdir fallback) on next audit.
+      echo "warn: worktree $wt could not be removed (likely file lock)" >&2
+      echo "warn: pruning git admin entry, dir will be cleaned later" >&2
     fi
   fi
 
