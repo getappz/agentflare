@@ -100,6 +100,27 @@ pub struct AgentflareMcp {
     store_override: Option<std::path::PathBuf>,
 }
 
+/// Resolve a flare-code mode (explicit arg, else active/default) and return a
+/// pretty JSON string `{mode, instructions}`. Read-only: unlike the
+/// `/optimize` prompt it never mutates the active mode. `Err` carries a
+/// human-readable reason for an invalid explicit mode.
+fn build_optimize_instructions(mode: Option<&str>) -> Result<String, String> {
+    let resolved = match mode {
+        Some(m) if !m.trim().is_empty() => crate::optimize::code::normalize_config_mode(m.trim())
+            .ok_or_else(|| format!("invalid mode: {m}"))?
+            .to_string(),
+        _ => {
+            crate::optimize::code::active_mode().unwrap_or_else(crate::optimize::code::default_mode)
+        }
+    };
+    let inst = crate::optimize::code::build_instructions(&resolved, None);
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "mode": inst.mode,
+        "instructions": inst.body,
+    }))
+    .unwrap_or_default())
+}
+
 #[tool_router]
 impl AgentflareMcp {
     #[tool(
@@ -129,6 +150,16 @@ impl AgentflareMcp {
             }
         };
         Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Get the flare-code (code-minimalism / lazy-senior-dev) instructions for a mode, as structured {mode, instructions}. Read-only — does not change the active mode. Omit `mode` for the active/default one."
+    )]
+    fn optimize_instructions(
+        &self,
+        Parameters(OptimizeInstructionsRequest { mode }): Parameters<OptimizeInstructionsRequest>,
+    ) -> Result<String, ErrorData> {
+        build_optimize_instructions(mode.as_deref()).map_err(|e| ErrorData::invalid_params(e, None))
     }
 
     #[tool(description = "Get a model routing suggestion for a given prompt.")]
@@ -1704,6 +1735,34 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let service = AgentflareMcp::from_env().serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod optimize_instructions_tests {
+    use super::build_optimize_instructions;
+
+    #[test]
+    fn explicit_mode_returns_structured_instructions() {
+        let json = build_optimize_instructions(Some("lite")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["mode"], "lite");
+        assert!(
+            v["instructions"].as_str().is_some_and(|s| !s.is_empty()),
+            "instructions must be non-empty"
+        );
+    }
+
+    #[test]
+    fn sub_skill_mode_is_accepted() {
+        let json = build_optimize_instructions(Some("review")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["mode"], "review");
+    }
+
+    #[test]
+    fn invalid_mode_errors() {
+        assert!(build_optimize_instructions(Some("extreme")).is_err());
+    }
 }
 
 #[cfg(test)]

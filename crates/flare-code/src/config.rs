@@ -188,6 +188,24 @@ pub fn set_default_mode(mode: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `true` when the statusline badge should be suppressed while flare-code
+/// stays active — `FLARE_CODE_HIDE_STATUS` (legacy `PONYTAIL_HIDE_STATUS`).
+/// Truthy = anything but empty / `0` / `false` / `no` (case-insensitive),
+/// matching upstream's `getHideStatus` semantics. Does not affect the active
+/// flag, only whether the badge is rendered.
+#[must_use]
+pub fn hide_status() -> bool {
+    std::env::var("FLARE_CODE_HIDE_STATUS")
+        .or_else(|_| std::env::var("PONYTAIL_HIDE_STATUS"))
+        .ok()
+        .is_some_and(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no"
+            )
+        })
+}
+
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod tests {
@@ -247,6 +265,26 @@ mod tests {
             assert_eq!(default_mode(), "lite");
             unsafe { std::env::remove_var("FLARE_CODE_DEFAULT_MODE") };
         });
+    }
+
+    #[test]
+    fn hide_status_respects_truthiness_and_legacy_var() {
+        let _guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { std::env::remove_var("FLARE_CODE_HIDE_STATUS") };
+        unsafe { std::env::remove_var("PONYTAIL_HIDE_STATUS") };
+        assert!(!hide_status(), "unset -> shown");
+        for falsey in ["", "0", "false", "no", "NO", " False "] {
+            unsafe { std::env::set_var("FLARE_CODE_HIDE_STATUS", falsey) };
+            assert!(!hide_status(), "{falsey:?} must not hide");
+        }
+        unsafe { std::env::set_var("FLARE_CODE_HIDE_STATUS", "1") };
+        assert!(hide_status());
+        unsafe { std::env::remove_var("FLARE_CODE_HIDE_STATUS") };
+        unsafe { std::env::set_var("PONYTAIL_HIDE_STATUS", "true") };
+        assert!(hide_status(), "legacy var honored");
+        unsafe { std::env::remove_var("PONYTAIL_HIDE_STATUS") };
     }
 }
 

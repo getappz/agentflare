@@ -321,18 +321,67 @@ impl CodeAction {
                 CodeHookEvent::Statusline => {
                     let mode = crate::optimize::code::active_mode()
                         .unwrap_or_else(crate::optimize::code::default_mode);
-                    if mode == "off" || mode.is_empty() {
-                        return;
-                    }
-                    if mode == "full" {
-                        print!("\x1b[38;5;108m[FLARE-CODE]\x1b[0m");
-                    } else {
-                        let upper = mode.to_uppercase();
-                        print!("\x1b[38;5;108m[FLARE-CODE:{upper}]\x1b[0m");
+                    if let Some(badge) =
+                        statusline_badge(&mode, crate::optimize::code::hide_status())
+                    {
+                        print!("{badge}");
                     }
                 }
             },
         }
+    }
+}
+
+/// Build the flare-code statusline badge for `mode`, or `None` when nothing
+/// should render (`off`/empty mode, or the badge is hidden via
+/// `FLARE_CODE_HIDE_STATUS`). `ultra` gets a distinct amber (256-color 173);
+/// every other active mode is green (108) — matching upstream ponytail.
+fn statusline_badge(mode: &str, hide: bool) -> Option<String> {
+    if hide || mode == "off" || mode.is_empty() {
+        return None;
+    }
+    let color = if mode == "ultra" { 173 } else { 108 };
+    let label = if mode == "full" {
+        "[FLARE-CODE]".to_string()
+    } else {
+        format!("[FLARE-CODE:{}]", mode.to_uppercase())
+    };
+    Some(format!("\x1b[38;5;{color}m{label}\x1b[0m"))
+}
+
+#[cfg(test)]
+mod statusline_tests {
+    use super::statusline_badge;
+
+    #[test]
+    fn hidden_or_off_renders_nothing() {
+        assert_eq!(statusline_badge("full", true), None);
+        assert_eq!(statusline_badge("off", false), None);
+        assert_eq!(statusline_badge("", false), None);
+    }
+
+    #[test]
+    fn full_is_green_and_unlabeled() {
+        assert_eq!(
+            statusline_badge("full", false).as_deref(),
+            Some("\x1b[38;5;108m[FLARE-CODE]\x1b[0m")
+        );
+    }
+
+    #[test]
+    fn ultra_is_amber_173() {
+        assert_eq!(
+            statusline_badge("ultra", false).as_deref(),
+            Some("\x1b[38;5;173m[FLARE-CODE:ULTRA]\x1b[0m")
+        );
+    }
+
+    #[test]
+    fn other_modes_are_green_labeled() {
+        assert_eq!(
+            statusline_badge("lite", false).as_deref(),
+            Some("\x1b[38;5;108m[FLARE-CODE:LITE]\x1b[0m")
+        );
     }
 }
 

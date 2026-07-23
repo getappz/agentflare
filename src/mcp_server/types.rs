@@ -16,6 +16,14 @@ pub(crate) struct CheckSessionHealthRequest {
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct OptimizeInstructionsRequest {
+    #[schemars(
+        description = "Intensity level (lite|full|ultra) or a sub-skill name (review|audit|debt|gain|help|playbook|no-hallucination). Omit for the currently-active/default mode."
+    )]
+    pub(crate) mode: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SkillDetectRequest {
     #[schemars(description = "The user prompt to classify and match against skills")]
     pub(crate) prompt: String,
