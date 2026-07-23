@@ -67,6 +67,10 @@ impl DocsStore {
     pub fn list(&self) -> Result<Vec<Document>, Error> {
         Ok(self.inner.doc_list(PROJECT_ID)?)
     }
+
+    pub fn blob_store_raw(&self, data: &[u8]) -> Result<String, Error> {
+        Ok(self.inner.blob_store(data)?)
+    }
 }
 
 #[cfg(test)]
