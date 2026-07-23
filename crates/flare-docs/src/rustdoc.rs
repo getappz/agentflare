@@ -23,13 +23,25 @@ pub fn docs_rs_json_url(crate_name: &str, version: &str) -> String {
 pub fn extract_root_docstring(json_bytes: &[u8]) -> Result<Option<String>, RustdocError> {
     let value: serde_json::Value = serde_json::from_slice(json_bytes)
         .map_err(|e| RustdocError::InvalidJson(e.to_string()))?;
-    let root_id = value
+    let root_value = value
         .get("root")
-        .and_then(|v| v.as_str())
         .ok_or_else(|| RustdocError::InvalidJson("missing \"root\" field".to_string()))?;
+    // Real docs.rs rustdoc-JSON output (format_version 60) encodes `root` as a
+    // JSON number (e.g. `3177`), while some synthetic fixtures use a string
+    // (e.g. `"0:0"`). `index`'s keys are always JSON object keys, i.e.
+    // strings, so a numeric root must be stringified before the lookup.
+    let root_key = match root_value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        other => {
+            return Err(RustdocError::InvalidJson(format!(
+                "\"root\" field has unexpected type: {other:?}"
+            )));
+        }
+    };
     let docs = value
         .get("index")
-        .and_then(|idx| idx.get(root_id))
+        .and_then(|idx| idx.get(&root_key))
         .and_then(|item| item.get("docs"))
         .and_then(|d| d.as_str())
         .map(|s| s.to_string());
@@ -112,6 +124,21 @@ mod tests {
         let fixture = br#"{ "index": {} }"#;
         let result = extract_root_docstring(fixture);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn extracts_root_docstring_when_root_is_a_json_number() {
+        let fixture = br#"{
+            "root": 3177,
+            "index": {
+                "3177": { "docs": "A generic serialization/deserialization framework." }
+            }
+        }"#;
+        let docs = extract_root_docstring(fixture).unwrap();
+        assert_eq!(
+            docs,
+            Some("A generic serialization/deserialization framework.".to_string())
+        );
     }
 
     use crate::fetch::FetchedBytes;
