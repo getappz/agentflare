@@ -44,26 +44,26 @@ mod tests {
     }
 }
 
-pub struct WreqFetcher {
-    client: wreq::Client,
+pub struct ReqwestFetcher {
+    client: reqwest::Client,
 }
 
-impl WreqFetcher {
+impl ReqwestFetcher {
     pub fn new() -> Self {
         Self {
-            client: wreq::Client::new(),
+            client: reqwest::Client::new(),
         }
     }
 }
 
-impl Default for WreqFetcher {
+impl Default for ReqwestFetcher {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl Fetcher for WreqFetcher {
+impl Fetcher for ReqwestFetcher {
     async fn fetch(&self, url: &str) -> Result<FetchedBytes, FetchError> {
         let resp = self
             .client
