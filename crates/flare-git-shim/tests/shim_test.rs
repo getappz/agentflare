@@ -19,6 +19,9 @@ fn init_repo() -> tempfile::TempDir {
     flare_git_core::shell::run_in(path, &["config", "user.email", "test@test.com"]).unwrap();
     flare_git_core::shell::run_in(path, &["config", "user.name", "Test"]).unwrap();
     flare_git_core::shell::run_in(path, &["commit", "--allow-empty", "-m", "initial"]).unwrap();
+    // All denials are now scoped to agentflare-tracked repos -- these tests
+    // are about the deny logic itself, so mark this fixture as tracked.
+    std::fs::create_dir_all(path.join(".agentflare")).unwrap();
     dir
 }
 
@@ -88,6 +91,28 @@ fn outside_a_git_repo_passes_through() {
     let dir = tempfile::TempDir::new().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let out = shim(dir.path(), home.path(), &["--version"]);
+    assert!(out.status.success(), "{out:?}");
+}
+
+#[test]
+fn worktree_add_passes_through_in_a_git_repo_with_no_agentflare_tracking() {
+    // The real-world bug this closes: a standalone project with no
+    // `.agentflare/` marker at all got the same "orchestrator-managed by
+    // agentflare" deny as agentflare's own repo, through this exact binary.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path();
+    flare_git_core::shell::run_in(path, &["init", "-b", "master"]).unwrap();
+    flare_git_core::shell::run_in(path, &["config", "user.email", "test@test.com"]).unwrap();
+    flare_git_core::shell::run_in(path, &["config", "user.name", "Test"]).unwrap();
+    flare_git_core::shell::run_in(path, &["commit", "--allow-empty", "-m", "initial"]).unwrap();
+    // Deliberately no .agentflare/ marker -- this is an untracked project.
+
+    let home = tempfile::TempDir::new().unwrap();
+    let out = shim(
+        path,
+        home.path(),
+        &["worktree", "add", "../wt", "-b", "feature/x"],
+    );
     assert!(out.status.success(), "{out:?}");
 }
 
