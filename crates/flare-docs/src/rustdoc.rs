@@ -1,4 +1,4 @@
-use crate::fetch::{decompress_zstd, FetchError, FetchedBytes, Fetcher};
+use crate::fetch::{FetchError, FetchedBytes, Fetcher, decompress_zstd};
 use crate::store::{DocsStore, Error as StoreError};
 use agentflare_store::documents::{DocUpsertOpts, Document};
 
@@ -21,8 +21,8 @@ pub fn docs_rs_json_url(crate_name: &str, version: &str) -> String {
 }
 
 pub fn extract_root_docstring(json_bytes: &[u8]) -> Result<Option<String>, RustdocError> {
-    let value: serde_json::Value = serde_json::from_slice(json_bytes)
-        .map_err(|e| RustdocError::InvalidJson(e.to_string()))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(json_bytes).map_err(|e| RustdocError::InvalidJson(e.to_string()))?;
     let root_value = value
         .get("root")
         .ok_or_else(|| RustdocError::InvalidJson("missing \"root\" field".to_string()))?;
@@ -180,11 +180,12 @@ mod tests {
             "index": { "0:0": { "docs": "A fake crate for testing." } }
         }"#;
         let compressed = zstd::stream::encode_all(&raw_json[..], 0).unwrap();
-        let fetcher = FakeFetcher { response: compressed };
+        let fetcher = FakeFetcher {
+            response: compressed,
+        };
         let store = DocsStore::open_memory().unwrap();
 
-        let doc = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0")
-            .unwrap();
+        let doc = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
 
         assert_eq!(doc.content, "A fake crate for testing.");
         assert_eq!(doc.path, "docsrs/fake-crate/1.0.0");

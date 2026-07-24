@@ -23,26 +23,6 @@ pub fn decompress_zstd(bytes: &[u8]) -> Result<Vec<u8>, FetchError> {
     zstd::stream::decode_all(bytes).map_err(|e| FetchError::Decompress(e.to_string()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decompress_zstd_round_trip() {
-        let original = b"hello rustdoc json world";
-        let compressed = zstd::stream::encode_all(&original[..], 0).unwrap();
-        let decompressed = decompress_zstd(&compressed).unwrap();
-        assert_eq!(decompressed, original);
-    }
-
-    #[test]
-    fn decompress_zstd_rejects_garbage() {
-        let garbage = b"not zstd data at all";
-        let result = decompress_zstd(garbage);
-        assert!(result.is_err());
-    }
-}
-
 const USER_AGENT: &str = concat!("flare-docs/", env!("CARGO_PKG_VERSION"));
 
 pub struct UreqFetcher {
@@ -93,5 +73,25 @@ impl Fetcher for UreqFetcher {
             etag,
             content_type,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decompress_zstd_round_trip() {
+        let original = b"hello rustdoc json world";
+        let compressed = zstd::stream::encode_all(&original[..], 0).unwrap();
+        let decompressed = decompress_zstd(&compressed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn decompress_zstd_rejects_garbage() {
+        let garbage = b"not zstd data at all";
+        let result = decompress_zstd(garbage);
+        assert!(result.is_err());
     }
 }

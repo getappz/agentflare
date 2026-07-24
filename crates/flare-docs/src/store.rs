@@ -1,4 +1,4 @@
-use agentflare_store::documents::{DocMatch, Document, DocUpsertOpts};
+use agentflare_store::documents::{DocMatch, DocUpsertOpts, Document};
 use std::path::{Path, PathBuf};
 
 /// Every row in the flare-docs store uses this fixed project_id. agentflare-store's
@@ -53,7 +53,9 @@ impl DocsStore {
         content: &str,
         opts: DocUpsertOpts,
     ) -> Result<Document, Error> {
-        Ok(self.inner.doc_upsert_with_opts(PROJECT_ID, id_path, content, opts)?)
+        Ok(self
+            .inner
+            .doc_upsert_with_opts(PROJECT_ID, id_path, content, opts)?)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<Document>, Error> {
@@ -89,7 +91,11 @@ mod tests {
             ..Default::default()
         };
         let doc = store
-            .upsert("docsrs/serde", "A generic serialization/deserialization framework", opts)
+            .upsert(
+                "docsrs/serde",
+                "A generic serialization/deserialization framework",
+                opts,
+            )
             .unwrap();
         assert_eq!(doc.project_id, PROJECT_ID);
         assert_eq!(doc.path, "docsrs/serde");
@@ -97,7 +103,10 @@ mod tests {
         assert_eq!(doc.tags, vec!["serde", "rust"]);
 
         let fetched = store.get(&doc.id).unwrap().unwrap();
-        assert_eq!(fetched.content, "A generic serialization/deserialization framework");
+        assert_eq!(
+            fetched.content,
+            "A generic serialization/deserialization framework"
+        );
 
         let hits = store.search("serialization", 10).unwrap();
         assert_eq!(hits.len(), 1);

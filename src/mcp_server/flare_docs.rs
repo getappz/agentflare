@@ -9,7 +9,7 @@ use super::*;
 // `flare_docs::DocsStore` expecting the crate type, so it must be
 // re-exported (not just privately imported) through this submodule for that
 // path to resolve.
-pub(crate) use ::flare_docs::{docs_rs_json_url, store_fetched, DocsStore, Fetcher, UreqFetcher};
+pub(crate) use ::flare_docs::{DocsStore, Fetcher, UreqFetcher, docs_rs_json_url, store_fetched};
 
 const DEFAULT_LIMIT: usize = 10;
 const DEFAULT_VERSION: &str = "latest";
@@ -48,25 +48,25 @@ impl AgentflareMcp {
                 })?
             }
             "get" => {
-                let package = req
-                    .package
-                    .ok_or_else(|| ErrorData::invalid_params("get requires \"id\" or \"package\"", None))?;
+                let package = req.package.ok_or_else(|| {
+                    ErrorData::invalid_params("get requires \"id\" or \"package\"", None)
+                })?;
                 let version = req.version.unwrap_or_else(|| DEFAULT_VERSION.to_string());
-                self.fetch_and_store_via_spawn_blocking(package, version).await
+                self.fetch_and_store_via_spawn_blocking(package, version)
+                    .await
             }
             "refresh" => {
-                let package = req
-                    .package
-                    .ok_or_else(|| ErrorData::invalid_params("refresh requires \"package\"", None))?;
+                let package = req.package.ok_or_else(|| {
+                    ErrorData::invalid_params("refresh requires \"package\"", None)
+                })?;
                 let version = req.version.unwrap_or_else(|| DEFAULT_VERSION.to_string());
-                self.fetch_and_store_via_spawn_blocking(package, version).await
+                self.fetch_and_store_via_spawn_blocking(package, version)
+                    .await
             }
-            other => {
-                return Err(ErrorData::invalid_params(
-                    format!("unknown action \"{other}\" (expected search|get|list|refresh)"),
-                    None,
-                ))
-            }
+            other => Err(ErrorData::invalid_params(
+                format!("unknown action \"{other}\" (expected search|get|list|refresh)"),
+                None,
+            )),
         }
     }
 

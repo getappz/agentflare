@@ -817,7 +817,9 @@ impl AgentflareMcp {
             .flare_docs_store
             .lock()
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(f(guard.as_ref().expect("ensure_flare_docs_store just initialized it")))
+        Ok(f(guard
+            .as_ref()
+            .expect("ensure_flare_docs_store just initialized it")))
     }
 
     /// The one and only workspace on this system: reused if it already
@@ -1242,7 +1244,10 @@ impl AgentflareMcp {
     #[tool(
         description = "On-demand third-party package/API documentation — search|get|list|refresh. Fetches and caches docs (Rust crates via docs.rs today) in a global store shared across all projects, separate from project-scoped documents."
     )]
-    async fn flare_docs(&self, Parameters(req): Parameters<FlareDocsRequest>) -> Result<String, ErrorData> {
+    async fn flare_docs(
+        &self,
+        Parameters(req): Parameters<FlareDocsRequest>,
+    ) -> Result<String, ErrorData> {
         self.flare_docs_impl(req).await
     }
 

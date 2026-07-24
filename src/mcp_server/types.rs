@@ -424,7 +424,9 @@ pub(crate) struct FlareDocsRequest {
     #[schemars(description = "Package/crate name to fetch or refresh (get, refresh)")]
     #[serde(default)]
     pub(crate) package: Option<String>,
-    #[schemars(description = "Version requirement, e.g. \"latest\" or an exact semver (get, refresh); defaults to \"latest\"")]
+    #[schemars(
+        description = "Version requirement, e.g. \"latest\" or an exact semver (get, refresh); defaults to \"latest\""
+    )]
     #[serde(default)]
     pub(crate) version: Option<String>,
     #[schemars(description = "Max results to return (search, list); defaults to 10")]
