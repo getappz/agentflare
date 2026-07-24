@@ -57,7 +57,9 @@ fn paths_eq(a: &Path, b: &Path) -> bool {
     {
         let normalize =
             |c: std::path::Component<'_>| c.as_os_str().to_string_lossy().to_lowercase();
-        a.components().map(normalize).eq(b.components().map(normalize))
+        a.components()
+            .map(normalize)
+            .eq(b.components().map(normalize))
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
@@ -78,34 +80,6 @@ pub fn path_without_shim_dir(shim_dir: &Path) -> Option<OsString> {
             .filter(|p| !paths_eq(p, shim_dir) && !is_cargo_target_profile_dir(p)),
     )
     .ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn paths_eq_matches_case_variants_on_case_insensitive_platforms() {
-        let a = Path::new("/Users/shiva/.agentflare/shims");
-        let b = Path::new("/Users/shiva/.AGENTFLARE/shims");
-        #[cfg(any(windows, target_os = "macos"))]
-        assert!(paths_eq(a, b), "case-only differences must match");
-        #[cfg(all(not(windows), not(target_os = "macos")))]
-        assert!(!paths_eq(a, b), "byte-equal comparison on case-sensitive platforms");
-
-        assert!(!paths_eq(
-            Path::new("/home/user/.agentflare/shims"),
-            Path::new("/home/user/.cargo/bin")
-        ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn paths_eq_matches_separator_variants_on_windows() {
-        let a = Path::new(r"C:\Users\shiva\.agentflare\shims");
-        let b = Path::new("C:/Users/shiva/.agentflare/shims");
-        assert!(paths_eq(a, b), "/ vs \\ differences must match on Windows");
-    }
 }
 
 /// The tool name a shim binary is standing in for, derived from its own
@@ -135,5 +109,36 @@ pub fn run_real(tool: &str, filtered_path: Option<&OsString>, args: &[OsString])
             eprintln!("agentflare-shim: failed to exec {tool}: {e}");
             exit(127)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_eq_matches_case_variants_on_case_insensitive_platforms() {
+        let a = Path::new("/Users/shiva/.agentflare/shims");
+        let b = Path::new("/Users/shiva/.AGENTFLARE/shims");
+        #[cfg(any(windows, target_os = "macos"))]
+        assert!(paths_eq(a, b), "case-only differences must match");
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        assert!(
+            !paths_eq(a, b),
+            "byte-equal comparison on case-sensitive platforms"
+        );
+
+        assert!(!paths_eq(
+            Path::new("/home/user/.agentflare/shims"),
+            Path::new("/home/user/.cargo/bin")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paths_eq_matches_separator_variants_on_windows() {
+        let a = Path::new(r"C:\Users\shiva\.agentflare\shims");
+        let b = Path::new("C:/Users/shiva/.agentflare/shims");
+        assert!(paths_eq(a, b), "/ vs \\ differences must match on Windows");
     }
 }
