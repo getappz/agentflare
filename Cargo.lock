@@ -1111,6 +1111,7 @@ version = "0.1.0"
 dependencies = [
  "agent-detector",
  "agentflare-backend",
+ "agentflare-shim",
  "chrono",
  "dirs",
  "fs2",
@@ -1127,6 +1128,7 @@ name = "flare-git-shim"
 version = "0.1.0"
 dependencies = [
  "agentflare-shim",
+ "dirs",
  "flare-git-core",
  "serde",
  "serde_json",
