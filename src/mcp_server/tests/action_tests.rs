@@ -311,6 +311,49 @@ fn item_claim_response_includes_worktree_path() {
 }
 
 #[test]
+fn item_claim_response_includes_worktree_error_instead_of_silently_omitting_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Deliberately NOT a git repo — `git worktree add` must fail here, and
+    // that failure must surface as `worktree_error` instead of just
+    // vanishing (the bug this test guards against: `worktree_path` silently
+    // missing with zero indication why, which read as an unexplained
+    // claim/worktree deadlock).
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let result: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["status"], "acquired");
+    assert!(
+        result.get("worktree_path").is_none(),
+        "worktree creation must have failed, so no path should be present"
+    );
+    assert!(
+        result.get("worktree_error").is_some(),
+        "a failed worktree creation must surface why, not just omit worktree_path"
+    );
+    assert!(!result["worktree_error"].as_str().unwrap().is_empty());
+}
+
+#[test]
 fn item_done_without_new_commits_omits_pr_fields() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();

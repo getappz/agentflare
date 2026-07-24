@@ -863,7 +863,15 @@ mod tests {
         std::fs::create_dir_all(&bad_root).unwrap();
         let item = test_item(1);
         let result = create_worktree(&item, &bad_root, "master", None);
-        assert!(result.is_err());
+        let err = result.expect_err("not a git repo, worktree add must fail");
+        assert!(
+            err.contains(&item.id),
+            "error must name the item it failed for: {err}"
+        );
+        assert!(
+            err.len() > format!("worktree: creation skipped for item {}: ", item.id).len(),
+            "error must carry the underlying git failure detail, not just the prefix: {err}"
+        );
     }
 
     #[test]
