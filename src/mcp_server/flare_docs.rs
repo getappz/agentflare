@@ -9,10 +9,16 @@ use super::*;
 // `flare_docs::DocsStore` expecting the crate type, so it must be
 // re-exported (not just privately imported) through this submodule for that
 // path to resolve.
-pub(crate) use ::flare_docs::{DocsStore, Fetcher, UreqFetcher, docs_rs_json_url, store_fetched};
+pub(crate) use ::flare_docs::{
+    DocsStore, Fetcher, UreqFetcher, docs_id_path, docs_rs_json_url, store_fetched,
+};
 
 const DEFAULT_LIMIT: usize = 10;
 const DEFAULT_VERSION: &str = "latest";
+/// Caps how long a single MCP tool call can block on a docs.rs fetch. Shorter
+/// than `UreqFetcher`'s 300s read timeout so a stalled response fails fast
+/// with a clear error instead of freezing the calling agent/session.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl AgentflareMcp {
     pub async fn flare_docs_impl(&self, req: FlareDocsRequest) -> Result<String, ErrorData> {
@@ -52,8 +58,19 @@ impl AgentflareMcp {
                     ErrorData::invalid_params("get requires \"id\" or \"package\"", None)
                 })?;
                 let version = req.version.unwrap_or_else(|| DEFAULT_VERSION.to_string());
-                self.fetch_and_store_via_spawn_blocking(package, version)
-                    .await
+                let cached = self.with_flare_docs_store(|store| {
+                    store
+                        .get_by_path(&docs_id_path(&package, &version))
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+                })??;
+                match cached {
+                    Some(doc) => serde_json::to_string(&doc)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None)),
+                    None => {
+                        self.fetch_and_store_via_spawn_blocking(package, version)
+                            .await
+                    }
+                }
             }
             "refresh" => {
                 let package = req.package.ok_or_else(|| {
@@ -81,11 +98,20 @@ impl AgentflareMcp {
         version: String,
     ) -> Result<String, ErrorData> {
         let url = docs_rs_json_url(&package, &version);
-        let fetched = tokio::task::spawn_blocking(move || {
-            let fetcher = UreqFetcher::new();
-            fetcher.fetch(&url)
-        })
+        let fetched = tokio::time::timeout(
+            FETCH_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let fetcher = UreqFetcher::new();
+                fetcher.fetch(&url)
+            }),
+        )
         .await
+        .map_err(|_| {
+            ErrorData::internal_error(
+                format!("docs.rs fetch timed out after {FETCH_TIMEOUT:?}"),
+                None,
+            )
+        })?
         .map_err(|e| ErrorData::internal_error(format!("fetch task panicked: {e}"), None))?
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -100,6 +126,7 @@ impl AgentflareMcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::flare_docs::DocUpsertOpts;
 
     fn test_mcp() -> AgentflareMcp {
         AgentflareMcp {
@@ -117,6 +144,33 @@ mod tests {
         };
         let result = mcp.flare_docs_impl(req).await.unwrap();
         assert_eq!(result, "[]");
+    }
+
+    #[tokio::test]
+    async fn get_by_package_reads_the_cache_without_fetching() {
+        // Pre-seed the store directly (no network involved), then confirm
+        // "get" returns the cached doc rather than attempting a live fetch
+        // -- a live fetch in this test environment would error/hang, so a
+        // successful, fast result proves the cache path was taken.
+        let mcp = test_mcp();
+        mcp.with_flare_docs_store(|store| {
+            store
+                .upsert(
+                    &docs_id_path("serde", "latest"),
+                    "cached docs",
+                    DocUpsertOpts::default(),
+                )
+                .unwrap()
+        })
+        .unwrap();
+
+        let req = FlareDocsRequest {
+            action: "get".to_string(),
+            package: Some("serde".to_string()),
+            ..Default::default()
+        };
+        let result = mcp.flare_docs_impl(req).await.unwrap();
+        assert!(result.contains("cached docs"), "{result}");
     }
 
     #[tokio::test]

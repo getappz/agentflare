@@ -20,6 +20,11 @@ pub fn docs_rs_json_url(crate_name: &str, version: &str) -> String {
     format!("https://docs.rs/crate/{crate_name}/{version}/json")
 }
 
+/// The [`DocsStore`] path a package/version's fetched docs are cached under.
+pub fn docs_id_path(crate_name: &str, version: &str) -> String {
+    format!("docsrs/{crate_name}/{version}")
+}
+
 pub fn extract_root_docstring(json_bytes: &[u8]) -> Result<Option<String>, RustdocError> {
     let value: serde_json::Value =
         serde_json::from_slice(json_bytes).map_err(|e| RustdocError::InvalidJson(e.to_string()))?;
@@ -98,7 +103,7 @@ pub fn store_fetched(
         blob_hash: Some(store_raw_json_blob(store, &decompressed)?),
         ..Default::default()
     };
-    let id_path = format!("docsrs/{crate_name}/{version}");
+    let id_path = docs_id_path(crate_name, version);
     Ok(store.upsert(&id_path, &docstring, opts)?)
 }
 

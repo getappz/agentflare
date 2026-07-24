@@ -62,6 +62,10 @@ impl DocsStore {
         Ok(self.inner.doc_get(id)?)
     }
 
+    pub fn get_by_path(&self, path: &str) -> Result<Option<Document>, Error> {
+        Ok(self.inner.doc_get_by_path(PROJECT_ID, path)?)
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<DocMatch>, Error> {
         Ok(self.inner.doc_search(PROJECT_ID, query, limit)?)
     }
@@ -115,5 +119,18 @@ mod tests {
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, doc.id);
+    }
+
+    #[test]
+    fn get_by_path_finds_an_existing_doc_and_none_for_a_missing_one() {
+        let store = DocsStore::open_memory().unwrap();
+        store
+            .upsert("docsrs/serde", "docs", DocUpsertOpts::default())
+            .unwrap();
+
+        let found = store.get_by_path("docsrs/serde").unwrap().unwrap();
+        assert_eq!(found.path, "docsrs/serde");
+
+        assert!(store.get_by_path("docsrs/nope").unwrap().is_none());
     }
 }

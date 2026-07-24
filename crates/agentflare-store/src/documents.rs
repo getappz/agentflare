@@ -295,6 +295,22 @@ impl Store {
         .optional()
     }
 
+    pub fn doc_get_by_path(
+        &self,
+        project_id: &str,
+        path: &str,
+    ) -> rusqlite::Result<Option<Document>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT id, project_id, path, content, title, doc_type, blob_hash, mime, tags,
+                        session_id, source, version, metadata, size, created_at, updated_at, deleted_at
+                 FROM store_documents WHERE project_id = ?1 AND path = ?2 AND deleted_at IS NULL",
+            params![project_id, path],
+            Self::row_to_document,
+        )
+        .optional()
+    }
+
     pub fn doc_delete(&self, id: &str) -> rusqlite::Result<bool> {
         let conn = self.conn();
         let now = db_kit::ids::now();

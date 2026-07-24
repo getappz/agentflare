@@ -1,11 +1,20 @@
 use std::io::Read;
 
+/// docs.rs rustdoc-JSON payloads for real-world crates run from a few KB to
+/// low tens of MB compressed; these caps are generous headroom over that,
+/// not a tight fit — they exist to bound memory use against a compromised or
+/// misbehaving response, not to reject legitimate payloads.
+const MAX_COMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     #[error("http error: {0}")]
     Http(String),
     #[error("decompression error: {0}")]
     Decompress(String),
+    #[error("response too large: {0}")]
+    TooLarge(String),
 }
 
 #[derive(Debug, Clone)]
@@ -19,8 +28,21 @@ pub trait Fetcher: Send + Sync {
     fn fetch(&self, url: &str) -> Result<FetchedBytes, FetchError>;
 }
 
+/// Reads at most `max + 1` bytes so an oversized source is detected without
+/// buffering the whole (potentially unbounded) stream first.
+fn read_capped(reader: impl Read, max: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    reader.take(max + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max {
+        return Err(std::io::Error::other(format!("exceeded {max} byte limit")));
+    }
+    Ok(buf)
+}
+
 pub fn decompress_zstd(bytes: &[u8]) -> Result<Vec<u8>, FetchError> {
-    zstd::stream::decode_all(bytes).map_err(|e| FetchError::Decompress(e.to_string()))
+    let decoder = zstd::stream::read::Decoder::new(bytes)
+        .map_err(|e| FetchError::Decompress(e.to_string()))?;
+    read_capped(decoder, MAX_DECOMPRESSED_BYTES).map_err(|e| FetchError::TooLarge(e.to_string()))
 }
 
 const USER_AGENT: &str = concat!("flare-docs/", env!("CARGO_PKG_VERSION"));
@@ -63,10 +85,8 @@ impl Fetcher for UreqFetcher {
         let etag = resp.header("etag").map(|s| s.to_string());
         let content_type = resp.header("content-type").map(|s| s.to_string());
 
-        let mut bytes = Vec::new();
-        resp.into_reader()
-            .read_to_end(&mut bytes)
-            .map_err(|e| FetchError::Http(e.to_string()))?;
+        let bytes = read_capped(resp.into_reader(), MAX_COMPRESSED_BYTES)
+            .map_err(|e| FetchError::TooLarge(e.to_string()))?;
 
         Ok(FetchedBytes {
             bytes,
@@ -93,5 +113,30 @@ mod tests {
         let garbage = b"not zstd data at all";
         let result = decompress_zstd(garbage);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_capped_rejects_input_over_the_limit() {
+        let data = [0u8; 101];
+        assert!(read_capped(&data[..], 100).is_err());
+    }
+
+    #[test]
+    fn read_capped_allows_input_at_exactly_the_limit() {
+        let data = [0u8; 100];
+        let read = read_capped(&data[..], 100).unwrap();
+        assert_eq!(read.len(), 100);
+    }
+
+    #[test]
+    fn decompress_zstd_rejects_output_over_the_limit() {
+        // A payload whose decompressed size alone exceeds
+        // MAX_DECOMPRESSED_BYTES must be rejected without ever fully
+        // materializing in memory.
+        let huge = vec![0u8; (MAX_DECOMPRESSED_BYTES + 1) as usize];
+        let compressed = zstd::stream::encode_all(&huge[..], 0).unwrap();
+        drop(huge);
+        let result = decompress_zstd(&compressed);
+        assert!(matches!(result, Err(FetchError::TooLarge(_))));
     }
 }

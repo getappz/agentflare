@@ -54,15 +54,30 @@ pub fn run(args: DocsArgs) {
                 std::process::exit(1);
             }
         },
-        DocsCmd::Get { package, version } | DocsCmd::Refresh { package, version } => {
-            let fetcher = flare_docs::UreqFetcher::new();
-            match flare_docs::fetch_and_store(&fetcher, &store, &package, &version) {
-                Ok(doc) => println!("{}", serde_json::to_string_pretty(&doc).unwrap()),
+        DocsCmd::Get { package, version } => {
+            let cached = match store.get_by_path(&flare_docs::docs_id_path(&package, &version)) {
+                Ok(cached) => cached,
                 Err(e) => {
-                    eprintln!("flare-docs: fetch failed: {e}");
+                    eprintln!("flare-docs: cache lookup failed: {e}");
                     std::process::exit(1);
                 }
+            };
+            match cached {
+                Some(doc) => println!("{}", serde_json::to_string_pretty(&doc).unwrap()),
+                None => fetch_and_print(&store, &package, &version),
             }
+        }
+        DocsCmd::Refresh { package, version } => fetch_and_print(&store, &package, &version),
+    }
+}
+
+fn fetch_and_print(store: &flare_docs::DocsStore, package: &str, version: &str) {
+    let fetcher = flare_docs::UreqFetcher::new();
+    match flare_docs::fetch_and_store(&fetcher, store, package, version) {
+        Ok(doc) => println!("{}", serde_json::to_string_pretty(&doc).unwrap()),
+        Err(e) => {
+            eprintln!("flare-docs: fetch failed: {e}");
+            std::process::exit(1);
         }
     }
 }
