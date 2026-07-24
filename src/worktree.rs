@@ -27,7 +27,7 @@ pub fn create_worktree(
     repo_root: &Path,
     target_branch: &str,
     progress: Option<&ProgressSender>,
-) -> Option<PathBuf> {
+) -> Result<PathBuf, String> {
     flare_git_core::worktree::create_worktree(item, repo_root, target_branch, as_progress(progress))
 }
 

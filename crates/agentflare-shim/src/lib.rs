@@ -41,6 +41,32 @@ fn is_cargo_target_profile_dir(p: &Path) -> bool {
     })
 }
 
+/// Case-insensitive, separator-normalized path comparison. macOS (HFS+/
+/// APFS) and Windows volumes are case-insensitive by default, so a byte-equal
+/// `PathBuf` comparison can miss a real match when inputs differ only by
+/// case or by `/` vs `\` -- and a missed match here means `shim_dir` leaks
+/// back into the filtered PATH, so a shim binary's own real-binary lookup
+/// resolves back to itself (see `flare_git_core::shell::git_binary`'s
+/// identically-named helper, added in PR #304 for the same reason after
+/// this exact bug class blocked `create_worktree`'s internal `git`
+/// resolution -- this copy exists because `agentflare-shim` is dependency-
+/// light generic plumbing shared by every shim binary and deliberately
+/// doesn't depend on `flare-git-core`).
+fn paths_eq(a: &Path, b: &Path) -> bool {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let normalize =
+            |c: std::path::Component<'_>| c.as_os_str().to_string_lossy().to_lowercase();
+        a.components()
+            .map(normalize)
+            .eq(b.components().map(normalize))
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        a == b
+    }
+}
+
 /// PATH with `shim_dir` removed, so a shim binary's own real-binary lookup
 /// (and any child process it spawns) doesn't resolve back into itself --
 /// also strips any cargo build-profile directory tree (see
@@ -50,7 +76,8 @@ fn is_cargo_target_profile_dir(p: &Path) -> bool {
 pub fn path_without_shim_dir(shim_dir: &Path) -> Option<OsString> {
     let path_var = env::var_os("PATH")?;
     env::join_paths(
-        env::split_paths(&path_var).filter(|p| p != shim_dir && !is_cargo_target_profile_dir(p)),
+        env::split_paths(&path_var)
+            .filter(|p| !paths_eq(p, shim_dir) && !is_cargo_target_profile_dir(p)),
     )
     .ok()
 }
@@ -82,5 +109,36 @@ pub fn run_real(tool: &str, filtered_path: Option<&OsString>, args: &[OsString])
             eprintln!("agentflare-shim: failed to exec {tool}: {e}");
             exit(127)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_eq_matches_case_variants_on_case_insensitive_platforms() {
+        let a = Path::new("/Users/shiva/.agentflare/shims");
+        let b = Path::new("/Users/shiva/.AGENTFLARE/shims");
+        #[cfg(any(windows, target_os = "macos"))]
+        assert!(paths_eq(a, b), "case-only differences must match");
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        assert!(
+            !paths_eq(a, b),
+            "byte-equal comparison on case-sensitive platforms"
+        );
+
+        assert!(!paths_eq(
+            Path::new("/home/user/.agentflare/shims"),
+            Path::new("/home/user/.cargo/bin")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paths_eq_matches_separator_variants_on_windows() {
+        let a = Path::new(r"C:\Users\shiva\.agentflare\shims");
+        let b = Path::new("C:/Users/shiva/.agentflare/shims");
+        assert!(paths_eq(a, b), "/ vs \\ differences must match on Windows");
     }
 }
