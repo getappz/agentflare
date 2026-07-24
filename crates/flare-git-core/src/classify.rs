@@ -250,16 +250,28 @@ pub fn classify_pure(
                 Disposition::Passthrough
             }
         }
+        // Trust-root touches are only blocked when the push targets the
+        // default branch directly. A trust-root change pushed to a feature
+        // branch still has to clear a PR review before it reaches the
+        // default branch — the same safety net that already applies to
+        // every other kind of change — so blocking it here too just forces
+        // routine work (adding a crate/dependency) through a manual push
+        // every time, without adding real protection over the default-
+        // branch guard below.
         "push" => match trust_root_touch {
-            TrustRootTouch::Touched(paths) => Disposition::Deny {
+            TrustRootTouch::Touched(paths) if push_targets_default_branch => Disposition::Deny {
                 reason: format!(
-                    "this push carries changes to a trust-root path ({}) — blocked by the agentflare git shim.",
+                    "this push carries changes to a trust-root path ({}) and targets the repo's default branch '{default_branch}' — blocked by the agentflare git shim. Push a feature/worktree branch and open a PR instead.",
                     paths.join(", ")
                 ),
             },
-            TrustRootTouch::Unknown => Disposition::Deny {
-                reason: "this push's diff against trust-root paths (.githooks/, .agentflare/, Cargo.toml) could not be verified — blocked by the agentflare git shim as a precaution.".to_string(),
+            TrustRootTouch::Touched(_) => Disposition::Passthrough,
+            TrustRootTouch::Unknown if push_targets_default_branch => Disposition::Deny {
+                reason: format!(
+                    "this push's diff against trust-root paths (.githooks/, .agentflare/, Cargo.toml) could not be verified, and it targets the repo's default branch '{default_branch}' — blocked by the agentflare git shim as a precaution."
+                ),
             },
+            TrustRootTouch::Unknown => Disposition::Passthrough,
             TrustRootTouch::Clean if push_targets_default_branch => Disposition::Deny {
                 reason: format!(
                     "pushing the default branch '{default_branch}' to a remote is blocked by the agentflare git shim — push a feature/worktree branch and open a PR instead."
@@ -545,14 +557,30 @@ mod tests {
     }
 
     #[test]
-    fn push_touching_trust_root_is_denied() {
-        assert!(matches!(
+    fn push_touching_trust_root_on_feature_branch_passes_through() {
+        // A PR-review gate still applies before this reaches the default
+        // branch — same reasoning as any other feature-branch push.
+        assert_eq!(
             classify_pure(
                 "push",
                 &args(&["origin", "feature/x"]),
                 "master",
                 &TrustRootTouch::Touched(vec!["Cargo.toml".to_string()]),
                 false
+            ),
+            Disposition::Passthrough
+        );
+    }
+
+    #[test]
+    fn push_touching_trust_root_on_default_branch_is_denied() {
+        assert!(matches!(
+            classify_pure(
+                "push",
+                &args(&["origin", "master"]),
+                "master",
+                &TrustRootTouch::Touched(vec!["Cargo.toml".to_string()]),
+                true
             ),
             Disposition::Deny { .. }
         ));
@@ -791,20 +819,19 @@ mod tests {
     }
 
     #[test]
-    fn push_with_leading_flags_touching_trust_root_is_still_detected() {
+    fn push_with_leading_flags_touching_trust_root_on_feature_branch_passes_through() {
         // End-to-end regression for the classify()-level bug: a flag before
-        // remote/refspec must not make the trust-root check silently pass.
+        // remote/refspec must not throw off which branch gets diffed. Once
+        // correctly resolved to "feature/z" (not the default branch), a
+        // trust-root touch there is allowed — PR review gates it before
+        // master.
         let repo = crate::shell::test_support::init_repo_with_branch("master");
         std::fs::write(repo.path.join("Cargo.toml"), "[package]\n").unwrap();
         crate::shell::run_in(&repo.path, &["add", "Cargo.toml"]).unwrap();
         crate::shell::run_in(&repo.path, &["checkout", "-b", "feature/z"]).unwrap();
         crate::shell::run_in(&repo.path, &["commit", "-m", "touch trust root"]).unwrap();
         let event = classify(&repo.path, "push", &args(&["-u", "origin", "feature/z"]));
-        assert!(
-            matches!(event.disposition, Disposition::Deny { .. }),
-            "{:?}",
-            event.disposition
-        );
+        assert_eq!(event.disposition, Disposition::Passthrough, "{event:?}");
     }
 
     #[test]
@@ -824,13 +851,7 @@ mod tests {
     #[test]
     fn push_trust_root_deny_message_names_only_the_touched_path() {
         let touch = TrustRootTouch::Touched(vec!["Cargo.toml".to_string()]);
-        let d = classify_pure(
-            "push",
-            &args(&["origin", "feature/x"]),
-            "master",
-            &touch,
-            false,
-        );
+        let d = classify_pure("push", &args(&["origin", "master"]), "master", &touch, true);
         let Disposition::Deny { reason } = d else {
             panic!("expected Deny, got {d:?}");
         };
@@ -846,17 +867,31 @@ mod tests {
     }
 
     #[test]
-    fn push_with_unreadable_diff_denies_with_unknown_message() {
+    fn push_with_unreadable_diff_on_default_branch_denies_with_unknown_message() {
         let d = classify_pure(
             "push",
-            &args(&["origin", "feature/x"]),
+            &args(&["origin", "master"]),
             "master",
             &TrustRootTouch::Unknown,
-            false,
+            true,
         );
         let Disposition::Deny { reason } = d else {
             panic!("expected Deny, got {d:?}");
         };
         assert!(reason.contains("could not be verified"), "{reason}");
+    }
+
+    #[test]
+    fn push_with_unreadable_diff_on_feature_branch_passes_through() {
+        assert_eq!(
+            classify_pure(
+                "push",
+                &args(&["origin", "feature/x"]),
+                "master",
+                &TrustRootTouch::Unknown,
+                false
+            ),
+            Disposition::Passthrough
+        );
     }
 }
