@@ -23,12 +23,17 @@ pub const PROJECT_MARKER: &str = ".agentflare";
 /// Walk up from `start` looking for `.agentflare`, stopping at `home`
 /// (exclusive) -- `~/.agentflare` is agentflare's own data dir, not a
 /// project marker, and would otherwise false-positive on everything
-/// under the user's home directory.
+/// under the user's home directory. Uses `paths_eq` rather than plain `==`
+/// for the boundary check: a byte-equal comparison can miss the real match
+/// when the ambient home dir and the walked-up ancestor differ only by case
+/// or separator style (observed live: a real ambient `dirs::home_dir()` on a
+/// Windows CI runner didn't byte-match the walk's own ancestor path, so the
+/// boundary silently never triggered and the walk kept climbing).
 #[must_use]
 pub fn in_scoped_project(start: &Path, home: Option<&Path>) -> bool {
     let mut dir = Some(start);
     while let Some(d) = dir {
-        if home.is_some_and(|h| h == d) {
+        if home.is_some_and(|h| paths_eq(h, d)) {
             return false;
         }
         if d.join(PROJECT_MARKER).exists() {
@@ -198,6 +203,22 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(tmp.join(PROJECT_MARKER), "").unwrap();
         assert!(!in_scoped_project(&sub, Some(&tmp)));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn stops_at_home_even_when_it_only_case_matches_the_walked_ancestor() {
+        // Regression for the exact bug this fix closes: a real ambient home
+        // dir on a Windows CI runner didn't byte-match the walk's own
+        // ancestor path, so the `home` boundary never triggered.
+        let tmp =
+            std::env::temp_dir().join(format!("agentflare-shim-test-case-{}", std::process::id()));
+        let sub = tmp.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(tmp.join(PROJECT_MARKER), "").unwrap();
+        let uppercased_home = Path::new(&tmp.to_string_lossy().to_uppercase()).to_path_buf();
+        assert!(!in_scoped_project(&sub, Some(&uppercased_home)));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

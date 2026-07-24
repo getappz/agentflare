@@ -108,10 +108,16 @@ fn worktree_add_passes_through_in_a_git_repo_with_no_agentflare_tracking() {
     // Deliberately no .agentflare/ marker -- this is an untracked project.
 
     let home = tempfile::TempDir::new().unwrap();
+    // Absolute, uniquely-named path (its own fresh TempDir, not created yet --
+    // `git worktree add` creates it) rather than a relative "../wt", which
+    // risks colliding with leftover state from a previous run in the same
+    // parent directory.
+    let worktree_dir = tempfile::TempDir::new().unwrap();
+    let worktree_path = worktree_dir.path().join("wt").to_string_lossy().to_string();
     let out = shim(
         path,
         home.path(),
-        &["worktree", "add", "../wt", "-b", "feature/x"],
+        &["worktree", "add", &worktree_path, "-b", "feature/x"],
     );
     assert!(out.status.success(), "{out:?}");
 }

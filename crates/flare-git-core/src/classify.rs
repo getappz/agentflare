@@ -399,6 +399,22 @@ fn pushed_branch(repo_root: &Path, args: &[String]) -> Option<String> {
 /// trust-root path, then delegates to `classify_pure`.
 #[must_use]
 pub fn classify(repo_root: &Path, subcommand: &str, args: &[String]) -> Event {
+    classify_with_home(repo_root, subcommand, args, dirs::home_dir().as_deref())
+}
+
+/// Same as `classify`, but with the `in_scoped_project` home boundary
+/// injectable -- the real ambient home dir's exact path (short-name vs.
+/// long-name forms, drive/case differences) isn't something a test should
+/// depend on to stay deterministic across platforms/CI runners; a synthetic
+/// `home` here mirrors how `agentflare_shim::in_scoped_project`'s own tests
+/// already avoid that dependency.
+#[must_use]
+pub fn classify_with_home(
+    repo_root: &Path,
+    subcommand: &str,
+    args: &[String],
+    home: Option<&Path>,
+) -> Event {
     let default_branch = resolve_default_branch(repo_root);
     // Resolve the actual pushed branch once, then derive both push facts from
     // it: whether it carries trust-root changes and whether it *is* the
@@ -429,7 +445,7 @@ pub fn classify(repo_root: &Path, subcommand: &str, args: &[String]) -> Event {
     // prevent. `in_scoped_project` is agentflare-shim's own established
     // project-detection walk-up (shared so this doesn't reinvent it).
     if matches!(disposition, Disposition::Deny { .. })
-        && !agentflare_shim::in_scoped_project(repo_root, dirs::home_dir().as_deref())
+        && !agentflare_shim::in_scoped_project(repo_root, home)
     {
         disposition = Disposition::Passthrough;
     }
@@ -976,11 +992,16 @@ mod tests {
         // No `.agentflare/project.json` -- this repo has nothing to do with
         // agentflare's item-tracking system, so the orchestrator-managed
         // rationale doesn't apply and ordinary worktree use must not be blocked.
+        // Bounds the walk-up with the repo's own parent as a synthetic home,
+        // same technique agentflare_shim::in_scoped_project's own tests use --
+        // the real ambient home dir's exact path form isn't something a test
+        // should depend on to stay deterministic across platforms/CI runners.
         let repo = crate::shell::test_support::init_repo_with_branch("master");
-        let event = classify(
+        let event = classify_with_home(
             &repo.path,
             "worktree",
             &["add".to_string(), "../x".to_string()],
+            repo.path.parent(),
         );
         assert_eq!(event.disposition, Disposition::Passthrough);
     }
@@ -991,7 +1012,12 @@ mod tests {
         // policy produces exists for agentflare's own orchestration, so none
         // of it should apply outside a project agentflare actually tracks.
         let repo = crate::shell::test_support::init_repo_with_branch("master");
-        let event = classify(&repo.path, "checkout", &["master".to_string()]);
+        let event = classify_with_home(
+            &repo.path,
+            "checkout",
+            &["master".to_string()],
+            repo.path.parent(),
+        );
         assert_eq!(event.disposition, Disposition::Passthrough);
     }
 
