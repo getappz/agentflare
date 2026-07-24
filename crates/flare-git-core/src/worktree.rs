@@ -208,7 +208,7 @@ pub fn create_worktree(
     repo_root: &Path,
     target_branch: &str,
     progress: Option<&dyn Progress>,
-) -> Option<PathBuf> {
+) -> Result<PathBuf, String> {
     let branch = format!("task/{}", item.sequence_id);
     let worktree_path = repo_root
         .join(".worktrees")
@@ -220,7 +220,7 @@ pub fn create_worktree(
         // and re-warn since the ambient env can still be shadowing it.
         warn_if_ambient_target_dir();
         isolate_worktree_target_dir(&worktree_path);
-        return Some(worktree_path);
+        return Ok(worktree_path);
     }
     ensure_worktrees_ignored(repo_root);
     if let Some(parent) = worktree_path.parent() {
@@ -285,11 +285,12 @@ pub fn create_worktree(
                 p.send(1.0, Some(1.0), Some("Worktree created".into()));
             }
             isolate_worktree_target_dir(&worktree_path);
-            Some(worktree_path)
+            Ok(worktree_path)
         }
         Err(e) => {
-            eprintln!("worktree: creation skipped for item {}: {}", item.id, e);
-            None
+            let msg = format!("worktree: creation skipped for item {}: {}", item.id, e);
+            eprintln!("{msg}");
+            Err(msg)
         }
     }
 }
@@ -851,7 +852,7 @@ mod tests {
         let item = test_item(1);
         let target = resolve_default_branch(&repo.path);
         let result = create_worktree(&item, &repo.path, &target, None);
-        assert!(result.is_some());
+        assert!(result.is_ok());
         assert!(worktree_path.exists());
     }
 
@@ -862,7 +863,7 @@ mod tests {
         std::fs::create_dir_all(&bad_root).unwrap();
         let item = test_item(1);
         let result = create_worktree(&item, &bad_root, "master", None);
-        assert!(result.is_none());
+        assert!(result.is_err());
     }
 
     #[test]

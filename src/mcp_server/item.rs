@@ -383,14 +383,16 @@ impl AgentflareMcp {
             };
             Ok::<_, ErrorData>((outcome, item_id, item, target_branch))
         })??;
-        let worktree_path = match (&item, &target_branch) {
-            (Some(item), Some(target)) => PROGRESS_SENDER
-                .try_with(|ps| {
-                    crate::worktree::create_worktree(item, &repo_root, target, ps.as_ref())
-                })
-                .unwrap_or_else(|_| {
-                    crate::worktree::create_worktree(item, &repo_root, target, None)
-                }),
+        let worktree_result = match (&item, &target_branch) {
+            (Some(item), Some(target)) => Some(
+                PROGRESS_SENDER
+                    .try_with(|ps| {
+                        crate::worktree::create_worktree(item, &repo_root, target, ps.as_ref())
+                    })
+                    .unwrap_or_else(|_| {
+                        crate::worktree::create_worktree(item, &repo_root, target, None)
+                    }),
+            ),
             _ => None,
         };
         Ok(match outcome {
@@ -400,9 +402,20 @@ impl AgentflareMcp {
                     "item_id": item_id,
                     "owner": owner,
                 });
-                if let Some(ref path) = worktree_path {
-                    resp["worktree_path"] =
-                        serde_json::Value::String(path.to_string_lossy().to_string());
+                // Surface *why* no worktree_path came back instead of silently
+                // omitting the field — a swallowed error here reads to the
+                // caller as an unexplained circular claim/worktree block
+                // (confirmed live: a stale daemon's `git_binary()` PATH-shim
+                // self-deny, see PR #304, produced exactly this symptom).
+                match worktree_result {
+                    Some(Ok(path)) => {
+                        resp["worktree_path"] =
+                            serde_json::Value::String(path.to_string_lossy().to_string());
+                    }
+                    Some(Err(e)) => {
+                        resp["worktree_error"] = serde_json::Value::String(e);
+                    }
+                    None => {}
                 }
                 resp.to_string()
             }
