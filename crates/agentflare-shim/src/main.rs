@@ -30,7 +30,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 
-use agentflare_shim::{is_set, path_without_shim_dir, run_real, tool_name_from_exe, trace};
+use agentflare_shim::{
+    in_scoped_project, is_set, path_without_shim_dir, run_real, tool_name_from_exe, trace,
+};
 
 const KILL_SWITCHES: &[&str] = &["LEAN_CTX_DISABLED", "LEAN_CTX_NO_HOOK"];
 
@@ -43,28 +45,8 @@ const AGENT_ENV_VARS: &[&str] = &[
     "CODEBUDDY",
 ];
 
-const PROJECT_MARKER: &str = ".agentflare";
-
 fn any_set(names: &[&str]) -> bool {
     names.iter().any(|n| is_set(n))
-}
-
-/// Walk up from `start` looking for `.agentflare`, stopping at `home`
-/// (exclusive) -- `~/.agentflare` is agentflare's own data dir, not a
-/// project marker, and would otherwise false-positive on everything
-/// under the user's home directory.
-fn in_scoped_project(start: &Path, home: Option<&Path>) -> bool {
-    let mut dir = Some(start);
-    while let Some(d) = dir {
-        if home.is_some_and(|h| h == d) {
-            return false;
-        }
-        if d.join(PROJECT_MARKER).exists() {
-            return true;
-        }
-        dir = d.parent();
-    }
-    false
 }
 
 fn main() {
@@ -110,57 +92,4 @@ fn main() {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    #[test]
-    fn finds_marker_in_start_dir() {
-        let tmp = std::env::temp_dir().join(format!("agentflare-shim-test-{}", std::process::id()));
-        fs::create_dir_all(&tmp).unwrap();
-        fs::write(tmp.join(PROJECT_MARKER), "").unwrap();
-        assert!(in_scoped_project(&tmp, None));
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn finds_marker_in_an_ancestor_dir() {
-        let tmp =
-            std::env::temp_dir().join(format!("agentflare-shim-test-anc-{}", std::process::id()));
-        let sub = tmp.join("a").join("b");
-        fs::create_dir_all(&sub).unwrap();
-        fs::write(tmp.join(PROJECT_MARKER), "").unwrap();
-        assert!(in_scoped_project(&sub, None));
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn stops_at_home_without_treating_agentflares_own_dir_as_a_project_marker() {
-        // ~/.agentflare is agentflare's own app-data dir, not a project
-        // marker -- walking past `home` (inclusive of home itself) must
-        // never false-positive on it. Regression for the bug the doc
-        // comment on `in_scoped_project` calls out.
-        let tmp =
-            std::env::temp_dir().join(format!("agentflare-shim-test-home-{}", std::process::id()));
-        let sub = tmp.join("sub");
-        fs::create_dir_all(&sub).unwrap();
-        fs::write(tmp.join(PROJECT_MARKER), "").unwrap();
-        assert!(!in_scoped_project(&sub, Some(&tmp)));
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn no_marker_anywhere_is_not_scoped() {
-        // Bound the walk-up with an explicit synthetic `home` one level
-        // above `tmp`, rather than `None` -- an unbounded walk from a real
-        // temp dir keeps climbing past this test's control (e.g. up into
-        // the real machine's actual `~/.agentflare`, giving a false pass/fail
-        // that has nothing to do with the logic under test).
-        let tmp =
-            std::env::temp_dir().join(format!("agentflare-shim-test-none-{}", std::process::id()));
-        fs::create_dir_all(&tmp).unwrap();
-        assert!(!in_scoped_project(&tmp, tmp.parent()));
-        let _ = fs::remove_dir_all(&tmp);
-    }
-}
+// `in_scoped_project` and its tests moved to lib.rs (shared with flare-git-core).

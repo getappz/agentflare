@@ -16,6 +16,7 @@ agentflare-shim = { path = "../agentflare-shim" }
 flare-git-core = { path = "../flare-git-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+dirs = "6"
 
 [dev-dependencies]
 tempfile = "3"
