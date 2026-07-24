@@ -610,6 +610,34 @@ fn remove_worktree_dir(path: &Path, name: &str) -> bool {
             return true;
         }
 
+        // `rmdir`/`remove_dir_all` both fail identically against a genuine
+        // ACL denial, not just a transient in-use lock -- item #267's actual
+        // failure mode: cargo's own `target/*/.fingerprint/*` files can end
+        // up ACL-restricted (not merely open), which no amount of retrying
+        // or an in-use-lock-only tool like `rmdir` can clear. `icacls /grant
+        // ... /T` resets ownership access recursively before one final
+        // delete attempt; a no-op (and thus never destructive) if the real
+        // problem was actually an in-use lock the retries above already
+        // would have cleared.
+        if let Ok(user) = std::env::var("USERNAME") {
+            let icacls_args: Vec<String> = vec![
+                path.to_string_lossy().to_string(),
+                "/grant".to_string(),
+                format!("{user}:F"),
+                "/T".to_string(),
+                "/C".to_string(),
+                "/Q".to_string(),
+            ];
+            let _ = std::process::Command::new("icacls")
+                .args(&icacls_args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if std::fs::remove_dir_all(path).is_ok() {
+                return true;
+            }
+        }
+
         for handle_exe in &["handle64.exe", "handle.exe"] {
             if let Ok(output) = std::process::Command::new(handle_exe)
                 .args(["-accepteula", "-nobanner", &path.to_string_lossy()])
@@ -662,6 +690,38 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("file.txt"), b"hello").unwrap();
         assert!(remove_worktree_dir(&dir, "test"));
+        assert!(!dir.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_worktree_dir_clears_a_genuine_acl_denial() {
+        // item #267's actual failure mode: cargo's own target/*/.fingerprint/*
+        // files can end up ACL-restricted, not just transiently open. Neither
+        // the retry loop nor `cmd /c rmdir` clears a real ACL deny -- only
+        // `icacls /grant ... /T` does.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("wt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let locked_file = dir.join("locked.txt");
+        std::fs::write(&locked_file, b"hello").unwrap();
+
+        let user = std::env::var("USERNAME").unwrap();
+        let deny_args: Vec<String> = vec![
+            locked_file.to_string_lossy().to_string(),
+            "/deny".to_string(),
+            format!("{user}:(D)"),
+        ];
+        let status = std::process::Command::new("icacls")
+            .args(&deny_args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "test setup: icacls /deny must succeed");
+
+        assert!(
+            remove_worktree_dir(&dir, "test"),
+            "must clear the ACL denial via icacls /grant, not just retry"
+        );
         assert!(!dir.exists());
     }
 
