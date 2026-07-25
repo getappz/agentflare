@@ -40,6 +40,57 @@ pub fn all() -> Vec<&'static str> {
     vec![EXA, GIT, LEANCTX]
 }
 
+/// opencode's own PreToolUse-equivalent: a local plugin dropped into
+/// `~/.config/opencode/plugin/` (opencode auto-loads every file there, no
+/// config registration needed). Shells out to the same `agentflare hook
+/// pre-tool-use` classifier Claude Code's PreToolUse hook already uses, so
+/// there's one branch-guard decision, not a JS reimplementation of it.
+pub const OPENCODE_BRANCH_GUARD_JS: &str = r#"// opencode has no PreToolUse hook wired to agentflare's own PreToolUse guard
+// (that's Claude-Code-only, ~/.claude/settings.json), and opencode's own
+// permission config isn't branch-aware -- so write/edit/patch tools went
+// through unchecked while HEAD is on master/main. Rather than duplicating
+// branch-check logic here, this shells out to the same `agentflare hook
+// pre-tool-use` entry point Claude Code's PreToolUse hook already uses --
+// one classifier (src/hook_redirect.rs, backed by
+// flare_git_core::branch::is_protected_branch), consulted from every
+// harness. Fail-open if the agentflare binary is missing/errors, matching
+// this repo's other guards' fail-open philosophy.
+const GUARDED_TOOLS = new Set(["write", "edit", "patch", "apply_patch", "multiedit"])
+
+export const BranchGuard = async (ctx) => {
+  return {
+    "tool.execute.before": async ({ tool, sessionID }, { args }) => {
+      if (!GUARDED_TOOLS.has(tool)) return
+      const payload = JSON.stringify({
+        session_id: sessionID,
+        tool_name: tool,
+        tool_input: args ?? {},
+      })
+      let stdout
+      try {
+        stdout = await ctx.$`echo ${payload} | agentflare hook pre-tool-use`
+          .cwd(ctx.directory)
+          .quiet()
+          .nothrow()
+          .text()
+      } catch {
+        return // agentflare not on PATH, or the call itself failed -- fail open
+      }
+      let decision
+      try {
+        decision = JSON.parse(stdout)
+      } catch {
+        return // no JSON on stdout (e.g. a nudge-only run) -- nothing to deny
+      }
+      const out = decision?.hookSpecificOutput
+      if (out?.permissionDecision === "deny") {
+        throw new Error(`[branch-guard] ${out.permissionDecisionReason}`)
+      }
+    },
+  }
+}
+"#;
+
 /// Known-old wording for a rule file, keyed by its filename — empty for rules
 /// that have never changed. Used to tell "this file still has text we shipped
 /// before" (safe to offer a refresh) apart from "the user edited this" (leave

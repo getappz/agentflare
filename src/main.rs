@@ -11,6 +11,7 @@ mod auth_crypt;
 mod auth_db;
 mod auth_runner;
 mod banner;
+mod bashenv;
 mod build_time;
 mod channels;
 mod claims;
