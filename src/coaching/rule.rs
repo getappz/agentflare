@@ -1,6 +1,31 @@
 //! Coaching rule data model: the `CoachingRule` struct and the
 //! `coaching-<id>.md` file format (parsing + serialization).
 
+/// Whether a rule ships as an agentflare default (drift-protected across
+/// version bumps) or is a user override (always wins, always overwrites).
+#[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
+pub enum RuleTier {
+    Builtin,
+    Override,
+}
+
+impl RuleTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RuleTier::Builtin => "builtin",
+            RuleTier::Override => "override",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "builtin" => Some(RuleTier::Builtin),
+            "override" => Some(RuleTier::Override),
+            _ => None,
+        }
+    }
+}
+
 /// A coaching rule loaded from a `coaching-<id>.md` file.
 #[derive(Debug)]
 pub struct CoachingRule {
@@ -9,6 +34,8 @@ pub struct CoachingRule {
     pub body: String,
     pub applied_at: String,
     pub trigger: Option<RuleTrigger>,
+    pub tier: RuleTier,
+    pub sync: Vec<String>,
 }
 
 /// Declares when a rule should fire contextually instead of at every
@@ -33,6 +60,16 @@ pub(super) fn is_valid_rule_id(id: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+const KNOWN_SYNC_HOSTS: &[&str] = &[
+    "claude-code",
+    "opencode",
+    "cursor",
+    "codex",
+    "windsurf",
+    "vscode-copilot",
+    "cline",
+];
+
 /// Validates fields that will be serialized into a rule file's header.
 /// A title containing a newline would break the one-line-per-header-field
 /// format; commas/semicolons or newlines in a tool name would corrupt the
@@ -43,9 +80,18 @@ pub(super) fn is_valid_rule_id(id: &str) -> bool {
 pub(super) fn validate_rule_fields(
     title: &str,
     trigger: Option<&RuleTrigger>,
+    sync: &[String],
 ) -> Result<(), String> {
     if title.contains('\n') {
         return Err("rule title must not contain newlines".to_string());
+    }
+    for host in sync {
+        if !KNOWN_SYNC_HOSTS.contains(&host.as_str()) {
+            return Err(format!(
+                "invalid sync host '{host}': must be one of {}",
+                KNOWN_SYNC_HOSTS.join(", ")
+            ));
+        }
     }
     let Some(trigger) = trigger else {
         return Ok(());
@@ -133,6 +179,8 @@ pub(super) fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
     let mut title = String::new();
     let mut applied_at = String::new();
     let mut trigger = None;
+    let mut tier = RuleTier::Override;
+    let mut sync = Vec::new();
     let mut in_header = false;
     let mut header_done = false;
     let mut body_lines = Vec::new();
@@ -159,6 +207,16 @@ pub(super) fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
                         "[agentflare] coaching: malformed or empty Trigger line, treating as untriggered: {rest:?}"
                     );
                 }
+            } else if let Some(rest) = line.strip_prefix("# Tier:") {
+                if let Some(t) = RuleTier::parse(rest) {
+                    tier = t;
+                }
+            } else if let Some(rest) = line.strip_prefix("# Sync:") {
+                sync = rest
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
         } else if !line.is_empty() {
             body_lines.push(line);
@@ -175,6 +233,8 @@ pub(super) fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
         body: body_lines.join(" "),
         applied_at,
         trigger,
+        tier,
+        sync,
     })
 }
 
@@ -184,6 +244,8 @@ pub(super) fn write_rule_file(
     title: &str,
     body: &str,
     trigger: Option<&RuleTrigger>,
+    tier: RuleTier,
+    sync: &[String],
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let date = chrono::Local::now().date_naive();
@@ -191,8 +253,14 @@ pub(super) fn write_rule_file(
         Some(t) => format!("\n# Trigger: {}", format_trigger_line(t)),
         None => String::new(),
     };
+    let sync_line = if sync.is_empty() {
+        String::new()
+    } else {
+        format!("\n# Sync: {}", sync.join(", "))
+    };
     let content = format!(
-        "---\n# Pattern: {id} \u{2014} {title}\n# Applied: {date}{trigger_line}\n---\n\n{body}\n"
+        "---\n# Pattern: {id} \u{2014} {title}\n# Applied: {date}{trigger_line}\n# Tier: {}{sync_line}\n---\n\n{body}\n",
+        tier.as_str()
     );
     let final_path = dir.join(format!("coaching-{id}.md"));
     let tmp_path = dir.join(format!("coaching-{id}.md.tmp"));
@@ -222,8 +290,8 @@ mod tests {
 
     #[test]
     fn validate_rule_fields_rejects_newline_in_title() {
-        assert!(validate_rule_fields("bad\ntitle", None).is_err());
-        assert!(validate_rule_fields("fine title", None).is_ok());
+        assert!(validate_rule_fields("bad\ntitle", None, &[]).is_err());
+        assert!(validate_rule_fields("fine title", None, &[]).is_ok());
     }
 
     #[test]
@@ -232,7 +300,7 @@ mod tests {
             tools: vec![],
             auto_match: false,
         };
-        assert!(validate_rule_fields("Title", Some(&empty)).is_err());
+        assert!(validate_rule_fields("Title", Some(&empty), &[]).is_err());
     }
 
     #[test]
@@ -241,13 +309,23 @@ mod tests {
             tools: vec!["a,b".to_string()],
             auto_match: false,
         };
-        assert!(validate_rule_fields("Title", Some(&bad)).is_err());
+        assert!(validate_rule_fields("Title", Some(&bad), &[]).is_err());
 
         let ok = RuleTrigger {
             tools: vec!["mcp__flare__review".to_string()],
             auto_match: false,
         };
-        assert!(validate_rule_fields("Title", Some(&ok)).is_ok());
+        assert!(validate_rule_fields("Title", Some(&ok), &[]).is_ok());
+    }
+
+    #[test]
+    fn validate_rule_fields_rejects_unknown_sync_host() {
+        assert!(
+            validate_rule_fields("Title", None, &["unknown".to_string()]).is_err()
+        );
+        assert!(
+            validate_rule_fields("Title", None, &["claude-code".to_string()]).is_ok()
+        );
     }
 
     #[test]
@@ -337,11 +415,15 @@ mod tests {
             "Reviews ship with fixes",
             "Body text",
             Some(&trigger),
+            RuleTier::Override,
+            &[],
         )
         .unwrap();
 
         let rule = parse_rule_file(&dir.join("coaching-revfix.md")).unwrap();
         assert_eq!(rule.trigger, Some(trigger));
+        assert_eq!(rule.tier, RuleTier::Override);
+        assert!(rule.sync.is_empty());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -349,7 +431,7 @@ mod tests {
     #[test]
     fn write_then_parse_roundtrips_no_trigger() {
         let dir = temp_dir_for_test();
-        write_rule_file(&dir, "hygiene", "Title", "Body", None).unwrap();
+        write_rule_file(&dir, "hygiene", "Title", "Body", None, RuleTier::Override, &[]).unwrap();
 
         let rule = parse_rule_file(&dir.join("coaching-hygiene.md")).unwrap();
         assert_eq!(rule.trigger, None);
@@ -358,9 +440,46 @@ mod tests {
     }
 
     #[test]
+    fn write_then_parse_roundtrips_tier_and_sync() {
+        let dir = temp_dir_for_test();
+        write_rule_file(
+            &dir,
+            "search17",
+            "Search",
+            "Body",
+            None,
+            RuleTier::Builtin,
+            &["claude-code".to_string(), "opencode".to_string()],
+        )
+        .unwrap();
+
+        let rule = parse_rule_file(&dir.join("coaching-search17.md")).unwrap();
+        assert_eq!(rule.tier, RuleTier::Builtin);
+        assert_eq!(rule.sync, vec!["claude-code".to_string(), "opencode".to_string()]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_old_file_without_tier_sync_defaults_to_override() {
+        let dir = temp_dir_for_test();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("coaching-old.md"),
+            "---\n# Pattern: old \u{2014} Old\n# Applied: 2026-01-01\n---\n\nBody\n",
+        )
+        .unwrap();
+        let rule = parse_rule_file(&dir.join("coaching-old.md")).unwrap();
+        assert_eq!(rule.tier, RuleTier::Override);
+        assert!(rule.sync.is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn parse_rule_file_skips_file_with_invalid_id_in_filename() {
         let dir = temp_dir_for_test();
-        write_rule_file(&dir, "hygiene", "Title", "Body", None).unwrap();
+        write_rule_file(&dir, "hygiene", "Title", "Body", None, RuleTier::Override, &[]).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("coaching-not a valid id.md"),

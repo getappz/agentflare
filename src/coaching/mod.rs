@@ -15,8 +15,8 @@ mod cli;
 pub(crate) mod rule;
 mod store;
 
-pub use cli::{cli_apply, cli_remove, print_list};
-pub use store::{rule_bodies_for_prompt, rule_bodies_for_tool, untriggered_rule_bodies};
+pub use cli::{cli_apply, cli_remove, cli_sync, print_list};
+pub use store::{rule_bodies_for_prompt, rule_bodies_for_tool, superseded_bodies, sync_targets_for_host, untriggered_rule_bodies};
 
 // Only reached from hook.rs's SessionStart test (#[cfg(test)]), to seed a
 // rule before asserting it appears in the printed message — a plain,
