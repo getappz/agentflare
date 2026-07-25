@@ -693,6 +693,7 @@ second line
 
     #[test]
     fn session_start_includes_untriggered_coaching_rule_bodies() {
+        use crate::coaching::rule::RuleTier;
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
             crate::coaching::apply_rule(
@@ -700,6 +701,8 @@ second line
                 "Close sessions promptly",
                 "Wrap up each phase before starting the next.",
                 None,
+                RuleTier::Override,
+                vec![],
             )
             .unwrap();
 
@@ -748,6 +751,7 @@ second line
 
     #[test]
     fn pre_tool_use_surfaces_tool_triggered_coaching_rule() {
+        use crate::coaching::rule::RuleTier;
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
             crate::coaching::apply_rule(
@@ -758,6 +762,8 @@ second line
                     vec!["mcp__flare__review".to_string()],
                     false,
                 )),
+                RuleTier::Override,
+                vec![],
             )
             .unwrap();
 
@@ -769,6 +775,7 @@ second line
 
     #[test]
     fn prompt_submit_surfaces_auto_match_coaching_rule() {
+        use crate::coaching::rule::RuleTier;
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
             crate::coaching::apply_rule(
@@ -776,6 +783,8 @@ second line
                 "Reviews ship with fixes",
                 "Every review finding needs a diff.",
                 Some(crate::coaching::test_support::trigger(vec![], true)),
+                RuleTier::Override,
+                vec![],
             )
             .unwrap();
 

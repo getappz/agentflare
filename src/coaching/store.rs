@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use super::rule::{self, CoachingRule};
+use super::rule::{self, CoachingRule, RuleTier};
 
 pub(super) const MAX_RULES: usize = 8;
 
@@ -86,13 +86,15 @@ pub fn apply_rule(
     title: &str,
     body: &str,
     trigger: Option<rule::RuleTrigger>,
+    tier: RuleTier,
+    sync: Vec<String>,
 ) -> Result<CoachingRule, String> {
     if !rule::is_valid_rule_id(id) {
         return Err(format!(
             "invalid rule id '{id}': must be 1-10 chars, start with a letter, and contain only letters, digits, or hyphens"
         ));
     }
-    rule::validate_rule_fields(title, trigger.as_ref())?;
+    rule::validate_rule_fields(title, trigger.as_ref(), &sync)?;
 
     let _lock = RulesLock::acquire(&rules_dir())
         .map_err(|e| format!("failed to acquire rules lock: {e}"))?;
@@ -105,7 +107,16 @@ pub fn apply_rule(
         ));
     }
 
-    rule::write_rule_file(&rules_dir(), id, title, body, trigger.as_ref())
+    if is_overwrite
+        && tier == rule::RuleTier::Builtin
+        && let Some(prev) = existing.iter().find(|r| r.id == id)
+        && prev.body != body
+    {
+        snapshot_previous_body(id, &prev.body)
+            .map_err(|e| format!("failed to snapshot previous rule body: {e}"))?;
+    }
+
+    rule::write_rule_file(&rules_dir(), id, title, body, trigger.as_ref(), tier.clone(), &sync)
         .map_err(|e| format!("failed to write rule file: {e}"))?;
 
     list_rules()
@@ -114,8 +125,9 @@ pub fn apply_rule(
         .ok_or_else(|| "rule written but could not be re-read".to_string())
 }
 
-/// Remove a coaching rule file by id.
-pub(super) fn remove_rule(id: &str) -> Result<(), String> {
+/// Remove a coaching rule file by id. Returns the rule's sync hosts so the
+/// caller can clean up generated files for those hosts (see components::unsync_host).
+pub(super) fn remove_rule(id: &str) -> Result<Vec<String>, String> {
     if !rule::is_valid_rule_id(id) {
         return Err(format!("invalid rule id '{id}'"));
     }
@@ -125,7 +137,55 @@ pub(super) fn remove_rule(id: &str) -> Result<(), String> {
     if !path.exists() {
         return Err(format!("rule not found: {id}"));
     }
-    std::fs::remove_file(&path).map_err(|e| format!("failed to remove rule file: {e}"))
+    let sync = list_rules()
+        .into_iter()
+        .find(|r| r.id == id)
+        .map(|r| r.sync)
+        .unwrap_or_default();
+    std::fs::remove_file(&path).map_err(|e| format!("failed to remove rule file: {e}"))?;
+    Ok(sync)
+}
+
+/// (id, body) pairs for every rule in the store that is tagged to sync
+/// to `host`, in rule-id order. Callers (components::rule_targets) build
+/// the actual per-host file path themselves.
+pub fn sync_targets_for_host(host: &str) -> Vec<(String, String)> {
+    list_rules()
+        .into_iter()
+        .filter(|r| r.sync.iter().any(|h| h == host))
+        .map(|r| (r.id, r.body))
+        .collect()
+}
+
+/// Appends `previous_body` to `~/.agentflare/rules/superseded-<id>.json`
+/// (creating it if absent) — the coaching-store equivalent of
+/// `rule_text::superseded()`'s hardcoded lists, built automatically
+/// instead of hand-maintained, so `init::is_stale_rule` can tell "still
+/// has a body we shipped before" from "user edited this" for builtin-tier
+/// coaching rules the same way it already does for `rule_text.rs` consts.
+fn snapshot_previous_body(id: &str, previous_body: &str) -> std::io::Result<()> {
+    let path = rules_dir().join(format!("superseded-{id}.json"));
+    let mut bodies: Vec<String> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if !bodies.iter().any(|b| b == previous_body) {
+        bodies.push(previous_body.to_string());
+    }
+    std::fs::create_dir_all(&rules_dir())?;
+    std::fs::write(&path, serde_json::to_string(&bodies).unwrap_or_default())
+}
+
+/// Known old bodies for a coaching-sourced builtin rule, by id — the
+/// coaching-store analogue of `rule_text::superseded(filename)`, built
+/// automatically instead of hand-maintained, so `init::is_stale_rule` can
+/// tell "still has a body we shipped before" from "user edited this".
+pub fn superseded_bodies(id: &str) -> Vec<String> {
+    let path = rules_dir().join(format!("superseded-{id}.json"));
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 /// Bodies of rules with no Trigger declared, in id order, what
@@ -202,6 +262,8 @@ mod tests {
                 "Close sessions promptly",
                 "Wrap up each phase before starting the next.",
                 None,
+                RuleTier::Override,
+                vec![],
             )
             .unwrap();
             assert_eq!(applied.id, "hygiene");
@@ -217,7 +279,7 @@ mod tests {
     #[test]
     fn apply_rule_rejects_invalid_id() {
         with_temp_home(|| {
-            let err = apply_rule("1bad", "Title", "Body", None).unwrap_err();
+            let err = apply_rule("1bad", "Title", "Body", None, RuleTier::Override, vec![]).unwrap_err();
             assert!(err.contains("invalid rule id"));
             assert!(list_rules().is_empty());
         });
@@ -226,7 +288,7 @@ mod tests {
     #[test]
     fn apply_rule_rejects_newline_in_title() {
         with_temp_home(|| {
-            let err = apply_rule("hygiene", "bad\ntitle", "Body", None).unwrap_err();
+            let err = apply_rule("hygiene", "bad\ntitle", "Body", None, RuleTier::Override, vec![]).unwrap_err();
             assert!(err.contains("newline"));
             assert!(list_rules().is_empty());
         });
@@ -239,7 +301,7 @@ mod tests {
                 tools: vec![],
                 auto_match: false,
             };
-            let err = apply_rule("hygiene", "Title", "Body", Some(empty)).unwrap_err();
+            let err = apply_rule("hygiene", "Title", "Body", Some(empty), RuleTier::Override, vec![]).unwrap_err();
             assert!(err.contains("empty trigger"));
             assert!(list_rules().is_empty());
         });
@@ -249,9 +311,9 @@ mod tests {
     fn apply_rule_enforces_max_rules_for_new_ids() {
         with_temp_home(|| {
             for i in 0..MAX_RULES {
-                apply_rule(&format!("r{i}"), "T", "B", None).unwrap();
+                apply_rule(&format!("r{i}"), "T", "B", None, RuleTier::Override, vec![]).unwrap();
             }
-            let err = apply_rule("one-more", "T", "B", None).unwrap_err();
+            let err = apply_rule("one-more", "T", "B", None, RuleTier::Override, vec![]).unwrap_err();
             assert!(err.contains("maximum"));
             assert_eq!(list_rules().len(), MAX_RULES);
         });
@@ -261,9 +323,9 @@ mod tests {
     fn apply_rule_allows_overwriting_existing_id_at_capacity() {
         with_temp_home(|| {
             for i in 0..MAX_RULES {
-                apply_rule(&format!("r{i}"), "T", "B", None).unwrap();
+                apply_rule(&format!("r{i}"), "T", "B", None, RuleTier::Override, vec![]).unwrap();
             }
-            let updated = apply_rule("r0", "New Title", "New Body", None).unwrap();
+            let updated = apply_rule("r0", "New Title", "New Body", None, RuleTier::Override, vec![]).unwrap();
             assert_eq!(updated.title, "New Title");
             assert_eq!(list_rules().len(), MAX_RULES);
         });
@@ -272,7 +334,7 @@ mod tests {
     #[test]
     fn remove_rule_deletes_existing_file() {
         with_temp_home(|| {
-            apply_rule("hygiene", "T", "B", None).unwrap();
+            apply_rule("hygiene", "T", "B", None, RuleTier::Override, vec![]).unwrap();
             remove_rule("hygiene").unwrap();
             assert!(list_rules().is_empty());
         });
@@ -291,7 +353,7 @@ mod tests {
         with_temp_home(|| {
             std::fs::create_dir_all(rules_dir()).unwrap();
             std::fs::write(rules_dir().join("coaching-broken.md"), "").unwrap();
-            apply_rule("good", "T", "B", None).unwrap();
+            apply_rule("good", "T", "B", None, RuleTier::Override, vec![]).unwrap();
 
             let rules = list_rules();
             assert_eq!(
@@ -306,8 +368,8 @@ mod tests {
     #[test]
     fn untriggered_rule_bodies_returns_all_untriggered_bodies_in_id_order() {
         with_temp_home(|| {
-            apply_rule("b-rule", "Title B", "Body B", None).unwrap();
-            apply_rule("a-rule", "Title A", "Body A", None).unwrap();
+            apply_rule("b-rule", "Title B", "Body B", None, RuleTier::Override, vec![]).unwrap();
+            apply_rule("a-rule", "Title A", "Body A", None, RuleTier::Override, vec![]).unwrap();
             assert_eq!(
                 untriggered_rule_bodies(),
                 vec!["Body A".to_string(), "Body B".to_string()]
@@ -318,7 +380,7 @@ mod tests {
     #[test]
     fn apply_rule_body_with_dashes_line_is_not_truncated() {
         with_temp_home(|| {
-            let applied = apply_rule("dashes", "Title", "before\n---\nafter", None).unwrap();
+            let applied = apply_rule("dashes", "Title", "before\n---\nafter", None, RuleTier::Override, vec![]).unwrap();
             assert!(
                 applied.body.contains("before"),
                 "body should contain text before the --- line: {}",
@@ -340,7 +402,7 @@ mod tests {
     #[test]
     fn apply_rule_title_with_em_dash_is_not_truncated() {
         with_temp_home(|| {
-            let applied = apply_rule("emdash", "Foo \u{2014} Bar", "Body", None).unwrap();
+            let applied = apply_rule("emdash", "Foo \u{2014} Bar", "Body", None, RuleTier::Override, vec![]).unwrap();
             assert_eq!(applied.title, "Foo \u{2014} Bar");
 
             let rules = list_rules();
@@ -356,7 +418,7 @@ mod tests {
                 tools: vec!["mcp__flare__review".to_string()],
                 auto_match: true,
             };
-            let applied = apply_rule("revfix", "Title", "Body", Some(trigger.clone())).unwrap();
+            let applied = apply_rule("revfix", "Title", "Body", Some(trigger.clone()), RuleTier::Override, vec![]).unwrap();
             assert_eq!(applied.trigger, Some(trigger.clone()));
 
             let rules = list_rules();
@@ -368,7 +430,7 @@ mod tests {
     #[test]
     fn apply_rule_without_trigger_is_untriggered() {
         with_temp_home(|| {
-            let applied = apply_rule("hygiene", "Title", "Body", None).unwrap();
+            let applied = apply_rule("hygiene", "Title", "Body", None, RuleTier::Override, vec![]).unwrap();
             assert_eq!(applied.trigger, None);
         });
     }
@@ -376,7 +438,7 @@ mod tests {
     #[test]
     fn untriggered_rule_bodies_excludes_triggered_rules() {
         with_temp_home(|| {
-            apply_rule("plain", "T", "Plain body", None).unwrap();
+            apply_rule("plain", "T", "Plain body", None, RuleTier::Override, vec![]).unwrap();
             apply_rule(
                 "scoped",
                 "T",
@@ -385,6 +447,8 @@ mod tests {
                     tools: vec!["mcp__flare__review".to_string()],
                     auto_match: false,
                 }),
+                RuleTier::Override,
+                vec![],
             )
             .unwrap();
 
@@ -403,6 +467,8 @@ mod tests {
                     tools: vec!["mcp__flare__review".to_string()],
                     auto_match: false,
                 }),
+                RuleTier::Override,
+                vec![],
             )
             .unwrap();
 
@@ -426,6 +492,8 @@ mod tests {
                     tools: vec![],
                     auto_match: true,
                 }),
+                RuleTier::Override,
+                vec![],
             )
             .unwrap();
 
@@ -448,6 +516,8 @@ mod tests {
                     tools: vec![],
                     auto_match: true,
                 }),
+                RuleTier::Override,
+                vec![],
             )
             .unwrap();
 
@@ -458,7 +528,7 @@ mod tests {
     #[test]
     fn rule_bodies_for_prompt_ignores_non_auto_match_rules() {
         with_temp_home(|| {
-            apply_rule("plain", "T", "Plain body", None).unwrap();
+            apply_rule("plain", "T", "Plain body", None, RuleTier::Override, vec![]).unwrap();
             apply_rule(
                 "tool-only",
                 "T",
@@ -467,6 +537,8 @@ mod tests {
                     tools: vec!["mcp__flare__review".to_string()],
                     auto_match: false,
                 }),
+                RuleTier::Override,
+                vec![],
             )
             .unwrap();
 
@@ -478,6 +550,36 @@ mod tests {
     fn rule_bodies_for_prompt_returns_empty_when_no_auto_match_candidates() {
         with_temp_home(|| {
             assert!(rule_bodies_for_prompt("anything").is_empty());
+        });
+    }
+
+    #[test]
+    fn apply_rule_snapshots_previous_body_when_overwriting_a_builtin_rule() {
+        with_temp_home(|| {
+            apply_rule("search17", "T", "Old body", None, rule::RuleTier::Builtin, vec!["claude-code".to_string()]).unwrap();
+            apply_rule("search17", "T", "New body", None, rule::RuleTier::Builtin, vec!["claude-code".to_string()]).unwrap();
+
+            let path = rules_dir().join("superseded-search17.json");
+            let bodies: Vec<String> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(bodies, vec!["Old body".to_string()]);
+        });
+    }
+
+    #[test]
+    fn apply_rule_does_not_snapshot_when_overwriting_an_override_tier_rule() {
+        with_temp_home(|| {
+            apply_rule("hygiene", "T", "Old body", None, rule::RuleTier::Override, vec![]).unwrap();
+            apply_rule("hygiene", "T", "New body", None, rule::RuleTier::Override, vec![]).unwrap();
+            assert!(!rules_dir().join("superseded-hygiene.json").exists());
+        });
+    }
+
+    #[test]
+    fn apply_rule_does_not_snapshot_when_body_is_unchanged() {
+        with_temp_home(|| {
+            apply_rule("search17", "T", "Same body", None, rule::RuleTier::Builtin, vec![]).unwrap();
+            apply_rule("search17", "T", "Same body", None, rule::RuleTier::Builtin, vec![]).unwrap();
+            assert!(!rules_dir().join("superseded-search17.json").exists());
         });
     }
 }
