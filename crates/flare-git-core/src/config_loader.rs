@@ -1,3 +1,46 @@
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Default)]
+pub struct ConfigLayers {
+    pub project_local: Option<(PathBuf, toml::Value)>,
+    pub user_home: Option<(PathBuf, toml::Value)>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{path}: {source}")]
+pub struct LoaderError {
+    pub path: PathBuf,
+    #[source]
+    pub source: toml::de::Error,
+}
+
+fn parse_if_exists(path: &Path) -> Result<Option<(PathBuf, toml::Value)>, LoaderError> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    toml::from_str(&contents)
+        .map(|v| Some((path.to_path_buf(), v)))
+        .map_err(|source| LoaderError {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+pub fn locate_and_parse(
+    repo_root: &Path,
+    home: Option<&Path>,
+) -> Result<ConfigLayers, LoaderError> {
+    let project_local = parse_if_exists(&repo_root.join(".agentflare").join("config.toml"))?;
+    let user_home = match home {
+        Some(h) => parse_if_exists(&h.join(".agentflare").join("config.toml"))?,
+        None => None,
+    };
+    Ok(ConfigLayers {
+        project_local,
+        user_home,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
