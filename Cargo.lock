@@ -271,6 +271,7 @@ dependencies = [
  "blake3",
  "bytemuck",
  "dirs",
+ "flare-search-kit",
  "flate2",
  "ndarray",
  "ort",

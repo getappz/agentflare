@@ -466,7 +466,16 @@ impl Store {
              ORDER BY rank
              LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![query, project_id, limit as i64], |row| {
+        // store_docs_fts is a single unnamed-column table matched with a bare
+        // `MATCH ?1` (no AND/OR structure of our own) -- fts_phrase_query
+        // individually quotes every whitespace token so embedded FTS5
+        // operators/column-filter syntax (NEAR, *, `word:`) in the raw query
+        // can't be reinterpreted as query structure. Without this, a query
+        // like "axum::extract::State" errors ("no such column: axum")
+        // instead of searching, because FTS5 parses a bare `word:` prefix as
+        // a column filter.
+        let fts_query = flare_search_kit::fts_phrase_query(query);
+        let rows = stmt.query_map(params![fts_query, project_id, limit as i64], |row| {
             Ok(DocMatch {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
@@ -690,6 +699,26 @@ mod tests {
         let results = s.doc_search("p", "quick fox", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "/a.md");
+    }
+
+    #[test]
+    fn fts_search_handles_double_colon_query_without_erroring() {
+        // Regression: a raw `::`-containing query (the natural way to
+        // search for a Rust fully-qualified path, e.g. "axum::extract::State")
+        // used to be passed straight to FTS5 MATCH, which parses a bare
+        // `word:` prefix as column-filter syntax and errored with
+        // "no such column: axum" instead of searching.
+        let s = store();
+        s.doc_upsert(
+            "p",
+            "/state.md",
+            "State is an extractor for axum::extract::State shared state",
+        )
+        .unwrap();
+
+        let results = s.doc_search("p", "axum::extract::State", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "/state.md");
     }
 
     #[test]
