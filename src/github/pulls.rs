@@ -33,6 +33,24 @@ pub fn list(client: &Client, repo: &RepoId, state: &str) -> Result<Vec<PullReque
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
+/// Finds an existing PR -- open, merged, or manually closed -- whose
+/// `head.ref` matches `branch`. Callers that auto-open a PR for a branch
+/// should check this first: GitHub's own API only rejects a duplicate while
+/// the existing PR is still open, but once it's merged, a second PR against
+/// the same branch is perfectly legal to create, which is how `item done`
+/// re-running on an already-merged branch ended up opening a redundant PR
+/// (2026-07-25, PR #328 duplicating already-merged #327).
+pub fn find_existing(
+    client: &Client,
+    repo: &RepoId,
+    branch: &str,
+) -> Result<Option<PullRequest>, GitHubError> {
+    let prs = list(client, repo, "all")?;
+    Ok(prs
+        .into_iter()
+        .find(|pr| pr.head.as_ref().is_some_and(|h| h.git_ref == branch)))
+}
+
 pub fn get(client: &Client, repo: &RepoId, number: u64) -> Result<PullRequest, GitHubError> {
     let path = format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.repo);
     let json = client.request("GET", &path, None)?;
@@ -204,6 +222,35 @@ mod tests {
         assert_eq!(
             server.requests()[0].path,
             "/repos/o/r/pulls?state=open&per_page=100&page=1"
+        );
+    }
+
+    #[test]
+    fn find_existing_returns_the_pr_matching_head_ref() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"[{"number":5,"html_url":"https://gh/o/r/pull/5","state":"closed","title":"t","head":{"ref":"task/348","sha":"abc"}}]"#,
+        )]);
+        let client = server.client(None);
+        let found = find_existing(&client, &repo(), "task/348").unwrap();
+        assert_eq!(found.unwrap().number, 5);
+        assert_eq!(
+            server.requests()[0].path,
+            "/repos/o/r/pulls?state=all&per_page=100&page=1"
+        );
+    }
+
+    #[test]
+    fn find_existing_returns_none_when_no_pr_matches_the_branch() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"[{"number":5,"html_url":"u","state":"open","title":"t","head":{"ref":"other-branch","sha":"abc"}}]"#,
+        )]);
+        let client = server.client(None);
+        assert!(
+            find_existing(&client, &repo(), "task/348")
+                .unwrap()
+                .is_none()
         );
     }
 
