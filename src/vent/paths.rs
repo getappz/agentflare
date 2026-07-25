@@ -96,6 +96,9 @@ mod tests {
 
     #[test]
     fn global_paths_are_siblings_and_not_repo_scoped() {
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let log = global_log_path();
         let filed = global_filed_path();
         assert!(log.to_string_lossy().contains("agentflare-core.jsonl"));

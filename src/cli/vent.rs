@@ -33,9 +33,11 @@ pub fn run(args: VentArgs) {
             tags,
         } => {
             let severity = crate::vent::classify::normalize_severity(Some(&severity));
-            let log = crate::vent::paths::log_path();
-            match crate::vent::capture::append(&log, None, severity, &tags, message.trim()) {
-                Ok(id) => println!("vented {id}"),
+            match crate::vent::capture::append_routed(None, severity, &tags, message.trim()) {
+                Ok((id, true)) => {
+                    println!("vent {id} suppressed (same friction already vented recently)")
+                }
+                Ok((id, false)) => println!("vented {id}"),
                 Err(e) => eprintln!("vent failed: {e}"),
             }
         }
@@ -104,6 +106,20 @@ pub fn run(args: VentArgs) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn say_via_append_routed_marks_agentflare_core_message_as_suppressed_on_repeat() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_, first) =
+                crate::vent::capture::append_routed(None, "high", &[], "af-guard blocked a push")
+                    .unwrap();
+            let (_, second) =
+                crate::vent::capture::append_routed(None, "high", &[], "af-guard blocked a push")
+                    .unwrap();
+            assert!(!first);
+            assert!(second);
+        });
+    }
+
     #[test]
     fn append_then_read_back_roundtrips() {
         let dir = tempfile::tempdir().unwrap();

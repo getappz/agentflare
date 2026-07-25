@@ -1185,12 +1185,10 @@ impl AgentflareMcp {
         }
         let severity = crate::vent::classify::normalize_severity(req.severity.as_deref());
         let tags = req.tags.unwrap_or_default();
-        let log = crate::vent::paths::log_path();
-        let event_id =
-            crate::vent::capture::append(&log, None, severity, &tags, req.message.trim()).map_err(
-                |e| ErrorData::internal_error(format!("vent capture failed: {e}"), None),
-            )?;
-        Ok(serde_json::json!({ "ok": true, "event_id": event_id }).to_string())
+        let (event_id, suppressed) =
+            crate::vent::capture::append_routed(None, severity, &tags, req.message.trim())
+                .map_err(|e| ErrorData::internal_error(format!("vent capture failed: {e}"), None))?;
+        Ok(serde_json::json!({ "ok": true, "event_id": event_id, "suppressed": suppressed }).to_string())
     }
 
     /// Rejects PR titles that don't start with a conventional-commit type,
