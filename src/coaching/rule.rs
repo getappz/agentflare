@@ -320,12 +320,8 @@ mod tests {
 
     #[test]
     fn validate_rule_fields_rejects_unknown_sync_host() {
-        assert!(
-            validate_rule_fields("Title", None, &["unknown".to_string()]).is_err()
-        );
-        assert!(
-            validate_rule_fields("Title", None, &["claude-code".to_string()]).is_ok()
-        );
+        assert!(validate_rule_fields("Title", None, &["unknown".to_string()]).is_err());
+        assert!(validate_rule_fields("Title", None, &["claude-code".to_string()]).is_ok());
     }
 
     #[test]
@@ -431,7 +427,16 @@ mod tests {
     #[test]
     fn write_then_parse_roundtrips_no_trigger() {
         let dir = temp_dir_for_test();
-        write_rule_file(&dir, "hygiene", "Title", "Body", None, RuleTier::Override, &[]).unwrap();
+        write_rule_file(
+            &dir,
+            "hygiene",
+            "Title",
+            "Body",
+            None,
+            RuleTier::Override,
+            &[],
+        )
+        .unwrap();
 
         let rule = parse_rule_file(&dir.join("coaching-hygiene.md")).unwrap();
         assert_eq!(rule.trigger, None);
@@ -455,7 +460,10 @@ mod tests {
 
         let rule = parse_rule_file(&dir.join("coaching-search17.md")).unwrap();
         assert_eq!(rule.tier, RuleTier::Builtin);
-        assert_eq!(rule.sync, vec!["claude-code".to_string(), "opencode".to_string()]);
+        assert_eq!(
+            rule.sync,
+            vec!["claude-code".to_string(), "opencode".to_string()]
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -479,7 +487,16 @@ mod tests {
     #[test]
     fn parse_rule_file_skips_file_with_invalid_id_in_filename() {
         let dir = temp_dir_for_test();
-        write_rule_file(&dir, "hygiene", "Title", "Body", None, RuleTier::Override, &[]).unwrap();
+        write_rule_file(
+            &dir,
+            "hygiene",
+            "Title",
+            "Body",
+            None,
+            RuleTier::Override,
+            &[],
+        )
+        .unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("coaching-not a valid id.md"),

@@ -51,7 +51,7 @@ pub struct Event {
 /// Trust-root paths a `push` must never carry changes to — agentflare's own
 /// enforcement config, not something an agent should be able to push a
 /// change to and quietly weaken.
-const TRUST_ROOT_PATHS: &[&str] = &[".githooks/", ".agentflare/", "Cargo.toml"];
+pub(crate) const TRUST_ROOT_PATHS: &[&str] = &[".githooks/", ".agentflare/", "Cargo.toml"];
 
 /// `AGENTFLARE_GIT_TRUST_ROOT_PATHS`, comma-separated, appended to
 /// `TRUST_ROOT_PATHS` -- e.g. `".githooks/,policy.toml"`. Empty/unset ->
@@ -156,7 +156,7 @@ const READ_ONLY_SUBCOMMANDS: &[&str] = &[
 /// Ordinary mutating workflow commands, allowed by default — none of these
 /// are individually dangerous the way `reset --hard`/`clean -f`/protected-
 /// branch checkout/trust-root push are.
-const ALLOWED_MUTATING_SUBCOMMANDS: &[&str] = &[
+pub(crate) const ALLOWED_MUTATING_SUBCOMMANDS: &[&str] = &[
     "add",
     "commit",
     "merge",
@@ -173,7 +173,7 @@ const ALLOWED_MUTATING_SUBCOMMANDS: &[&str] = &[
 
 /// Low-level plumbing that can bypass the higher-level checks above —
 /// denied outright rather than reasoned about case by case.
-const DENIED_PLUMBING_SUBCOMMANDS: &[&str] = &[
+pub(crate) const DENIED_PLUMBING_SUBCOMMANDS: &[&str] = &[
     "read-tree",
     "update-index",
     "apply",

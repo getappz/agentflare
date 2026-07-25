@@ -2,7 +2,7 @@ use crate::types::{
     Artifact, ArtifactSummary, ArtifactType, GitProvenance, PublishRequest, PublishResponse,
     VersionInfo,
 };
-use agentflare_store::{Store, documents::DocUpsertOpts};
+use agentflare_store::{documents::DocUpsertOpts, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -113,7 +113,9 @@ impl ArtifactStore {
 
     fn doc_to_summary(doc: &agentflare_store::documents::Document) -> ArtifactSummary {
         let meta: Option<ArtifactMeta> = serde_json::from_str(&doc.metadata).ok();
-        let art_type = meta.as_ref().map(|m| m.artifact_type.clone())
+        let art_type = meta
+            .as_ref()
+            .map(|m| m.artifact_type.clone())
             .or_else(|| doc.tags.first().map(|s| ArtifactType::from(s.as_str())))
             .unwrap_or(ArtifactType::Text);
         ArtifactSummary {
@@ -133,7 +135,12 @@ impl ArtifactStore {
         }
     }
 
-    fn meta_to_metadata(prev: Option<&ArtifactMeta>, req: &PublishRequest, new_version: u32, now: i64) -> String {
+    fn meta_to_metadata(
+        prev: Option<&ArtifactMeta>,
+        req: &PublishRequest,
+        new_version: u32,
+        now: i64,
+    ) -> String {
         let keep = |new: &Option<String>, old: fn(&ArtifactMeta) -> Option<String>| {
             new.clone().or_else(|| prev.and_then(old))
         };
@@ -170,13 +177,18 @@ impl ArtifactStore {
         self.publish_flat(req)
     }
 
-    fn publish_store(&self, store: &Store, req: &PublishRequest) -> std::io::Result<PublishResponse> {
+    fn publish_store(
+        &self,
+        store: &Store,
+        req: &PublishRequest,
+    ) -> std::io::Result<PublishResponse> {
         let id = req.update_id.clone().unwrap_or_else(|| nanoid::nanoid!());
         let now = db_kit::ids::now();
         let path = &id;
 
         // Read existing doc to check CAS and dedup
-        let existing = store.doc_get_by_path(DOC_PROJECT, path)
+        let existing = store
+            .doc_get_by_path(DOC_PROJECT, path)
             .map_err(Self::store_conn_err)?;
 
         if let (Some(base), Some(doc)) = (req.base_version, existing.as_ref()) {
@@ -202,33 +214,47 @@ impl ArtifactStore {
 
         if !unchanged {
             // Store content as blob for size efficiency
-            let blob_hash = store.blob_store(req.content.as_bytes())
+            let blob_hash = store
+                .blob_store(req.content.as_bytes())
                 .map_err(Self::store_conn_err)?;
 
-            let prev_meta: Option<ArtifactMeta> = existing.as_ref().and_then(|doc| {
-                serde_json::from_str(&doc.metadata).ok()
-            });
+            let prev_meta: Option<ArtifactMeta> = existing
+                .as_ref()
+                .and_then(|doc| serde_json::from_str(&doc.metadata).ok());
 
             let next_version = existing.as_ref().map(|d| d.version as u32 + 1).unwrap_or(1);
             let metadata = Self::meta_to_metadata(prev_meta.as_ref(), req, next_version, now);
 
-            store.doc_upsert_with_opts(DOC_PROJECT, path, "", DocUpsertOpts {
-                title: Some(req.name.clone()),
-                doc_type: Some("artifact".into()),
-                blob_hash: Some(blob_hash),
-                mime: Some(req.artifact_type.mime_type().into()),
-                tags: Some(vec![req.artifact_type.to_string()]),
-                session_id: Some(req.session_id.clone()),
-                source: Some("artifact".into()),
-                metadata: Some(metadata),
-                size: Some(req.content.len() as i64),
-                ..Default::default()
-            }).map_err(Self::store_conn_err)?;
+            store
+                .doc_upsert_with_opts(
+                    DOC_PROJECT,
+                    path,
+                    "",
+                    DocUpsertOpts {
+                        title: Some(req.name.clone()),
+                        doc_type: Some("artifact".into()),
+                        blob_hash: Some(blob_hash),
+                        mime: Some(req.artifact_type.mime_type().into()),
+                        tags: Some(vec![req.artifact_type.to_string()]),
+                        session_id: Some(req.session_id.clone()),
+                        source: Some("artifact".into()),
+                        metadata: Some(metadata),
+                        size: Some(req.content.len() as i64),
+                        ..Default::default()
+                    },
+                )
+                .map_err(Self::store_conn_err)?;
         }
 
-        let doc = store.doc_get_by_path(DOC_PROJECT, path)
+        let doc = store
+            .doc_get_by_path(DOC_PROJECT, path)
             .map_err(Self::store_conn_err)?
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "artifact not found after upsert"))?;
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "artifact not found after upsert",
+                )
+            })?;
 
         let version = doc.version as u32;
         let response = PublishResponse {
@@ -365,9 +391,15 @@ impl ArtifactStore {
     /// Version history, oldest first.
     pub fn versions(&self, id: &str) -> std::io::Result<Vec<VersionInfo>> {
         if let Some(ref store) = self.store {
-            let doc = store.doc_get_by_path(DOC_PROJECT, id)
+            let doc = store
+                .doc_get_by_path(DOC_PROJECT, id)
                 .map_err(Self::store_conn_err)?
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("artifact {id} not found")))?;
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("artifact {id} not found"),
+                    )
+                })?;
             let meta: ArtifactMeta = serde_json::from_str(&doc.metadata)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             return Ok(meta.history);
@@ -380,41 +412,67 @@ impl ArtifactStore {
         })
     }
 
-    fn get_version_store(&self, store: &Store, id: &str, version: u32) -> std::io::Result<Artifact> {
-        let doc = store.doc_get_by_path(DOC_PROJECT, id)
+    fn get_version_store(
+        &self,
+        store: &Store,
+        id: &str,
+        version: u32,
+    ) -> std::io::Result<Artifact> {
+        let doc = store
+            .doc_get_by_path(DOC_PROJECT, id)
             .map_err(Self::store_conn_err)?
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("artifact {id} not found")))?;
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("artifact {id} not found"),
+                )
+            })?;
         let latest = Self::doc_to_artifact(&doc)?;
         if doc.version as u32 == version {
             let content = Self::blob_or_content(store, &doc)?;
             return Ok(Artifact { content, ..latest });
         }
-        let hist = store.doc_history(&doc.id)
-            .map_err(Self::store_conn_err)?;
+        let hist = store.doc_history(&doc.id).map_err(Self::store_conn_err)?;
         for h in hist {
             if h.version as u32 == version {
                 let content = match &h.blob_hash {
                     Some(hash) => {
-                        let bytes = store.blob_get(hash)
+                        let bytes = store
+                            .blob_get(hash)
                             .map_err(Self::store_conn_err)?
-                            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "blob not found"))?;
+                            .ok_or_else(|| {
+                                std::io::Error::new(std::io::ErrorKind::NotFound, "blob not found")
+                            })?;
                         String::from_utf8(bytes)
                             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
                     }
                     None => h.content,
                 };
-                return Ok(Artifact { content, version, ..latest });
+                return Ok(Artifact {
+                    content,
+                    version,
+                    ..latest
+                });
             }
         }
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("version {version} not found")))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("version {version} not found"),
+        ))
     }
 
-    fn blob_or_content(store: &Store, doc: &agentflare_store::documents::Document) -> std::io::Result<String> {
+    fn blob_or_content(
+        store: &Store,
+        doc: &agentflare_store::documents::Document,
+    ) -> std::io::Result<String> {
         match &doc.blob_hash {
             Some(hash) => {
-                let bytes = store.blob_get(hash)
+                let bytes = store
+                    .blob_get(hash)
                     .map_err(Self::store_conn_err)?
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "blob not found"))?;
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "blob not found")
+                    })?;
                 String::from_utf8(bytes)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             }
@@ -423,9 +481,15 @@ impl ArtifactStore {
     }
 
     fn get_store(&self, store: &Store, id: &str) -> std::io::Result<Artifact> {
-        let doc = store.doc_get_by_path(DOC_PROJECT, id)
+        let doc = store
+            .doc_get_by_path(DOC_PROJECT, id)
             .map_err(Self::store_conn_err)?
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("artifact {id} not found")))?;
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("artifact {id} not found"),
+                )
+            })?;
         let content = Self::blob_or_content(store, &doc)?;
         let meta: ArtifactMeta = serde_json::from_str(&doc.metadata)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -497,8 +561,7 @@ impl ArtifactStore {
 
     pub fn list(&self, session_id: Option<&str>) -> std::io::Result<Vec<ArtifactSummary>> {
         if let Some(ref store) = self.store {
-            let docs = store.doc_list(DOC_PROJECT)
-                .map_err(Self::store_conn_err)?;
+            let docs = store.doc_list(DOC_PROJECT).map_err(Self::store_conn_err)?;
             let mut artifacts: Vec<ArtifactSummary> = docs
                 .iter()
                 .filter(|d| session_id.is_none_or(|sid| d.session_id.as_deref() == Some(sid)))
@@ -546,11 +609,11 @@ impl ArtifactStore {
 
     pub fn delete(&self, id: &str) -> std::io::Result<bool> {
         if let Some(ref store) = self.store {
-            let doc = store.doc_get_by_path(DOC_PROJECT, id)
+            let doc = store
+                .doc_get_by_path(DOC_PROJECT, id)
                 .map_err(Self::store_conn_err)?;
             return match doc {
-                Some(d) => store.doc_delete(&d.id)
-                    .map_err(Self::store_conn_err),
+                Some(d) => store.doc_delete(&d.id).map_err(Self::store_conn_err),
                 None => Ok(false),
             };
         }

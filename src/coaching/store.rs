@@ -116,8 +116,16 @@ pub fn apply_rule(
             .map_err(|e| format!("failed to snapshot previous rule body: {e}"))?;
     }
 
-    rule::write_rule_file(&rules_dir(), id, title, body, trigger.as_ref(), tier.clone(), &sync)
-        .map_err(|e| format!("failed to write rule file: {e}"))?;
+    rule::write_rule_file(
+        &rules_dir(),
+        id,
+        title,
+        body,
+        trigger.as_ref(),
+        tier.clone(),
+        &sync,
+    )
+    .map_err(|e| format!("failed to write rule file: {e}"))?;
 
     list_rules()
         .into_iter()
@@ -172,7 +180,7 @@ fn snapshot_previous_body(id: &str, previous_body: &str) -> std::io::Result<()> 
     if !bodies.iter().any(|b| b == previous_body) {
         bodies.push(previous_body.to_string());
     }
-    std::fs::create_dir_all(&rules_dir())?;
+    std::fs::create_dir_all(rules_dir())?;
     std::fs::write(&path, serde_json::to_string(&bodies).unwrap_or_default())
 }
 
@@ -279,7 +287,8 @@ mod tests {
     #[test]
     fn apply_rule_rejects_invalid_id() {
         with_temp_home(|| {
-            let err = apply_rule("1bad", "Title", "Body", None, RuleTier::Override, vec![]).unwrap_err();
+            let err =
+                apply_rule("1bad", "Title", "Body", None, RuleTier::Override, vec![]).unwrap_err();
             assert!(err.contains("invalid rule id"));
             assert!(list_rules().is_empty());
         });
@@ -288,7 +297,15 @@ mod tests {
     #[test]
     fn apply_rule_rejects_newline_in_title() {
         with_temp_home(|| {
-            let err = apply_rule("hygiene", "bad\ntitle", "Body", None, RuleTier::Override, vec![]).unwrap_err();
+            let err = apply_rule(
+                "hygiene",
+                "bad\ntitle",
+                "Body",
+                None,
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap_err();
             assert!(err.contains("newline"));
             assert!(list_rules().is_empty());
         });
@@ -301,7 +318,15 @@ mod tests {
                 tools: vec![],
                 auto_match: false,
             };
-            let err = apply_rule("hygiene", "Title", "Body", Some(empty), RuleTier::Override, vec![]).unwrap_err();
+            let err = apply_rule(
+                "hygiene",
+                "Title",
+                "Body",
+                Some(empty),
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap_err();
             assert!(err.contains("empty trigger"));
             assert!(list_rules().is_empty());
         });
@@ -313,7 +338,8 @@ mod tests {
             for i in 0..MAX_RULES {
                 apply_rule(&format!("r{i}"), "T", "B", None, RuleTier::Override, vec![]).unwrap();
             }
-            let err = apply_rule("one-more", "T", "B", None, RuleTier::Override, vec![]).unwrap_err();
+            let err =
+                apply_rule("one-more", "T", "B", None, RuleTier::Override, vec![]).unwrap_err();
             assert!(err.contains("maximum"));
             assert_eq!(list_rules().len(), MAX_RULES);
         });
@@ -325,7 +351,15 @@ mod tests {
             for i in 0..MAX_RULES {
                 apply_rule(&format!("r{i}"), "T", "B", None, RuleTier::Override, vec![]).unwrap();
             }
-            let updated = apply_rule("r0", "New Title", "New Body", None, RuleTier::Override, vec![]).unwrap();
+            let updated = apply_rule(
+                "r0",
+                "New Title",
+                "New Body",
+                None,
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
             assert_eq!(updated.title, "New Title");
             assert_eq!(list_rules().len(), MAX_RULES);
         });
@@ -368,8 +402,24 @@ mod tests {
     #[test]
     fn untriggered_rule_bodies_returns_all_untriggered_bodies_in_id_order() {
         with_temp_home(|| {
-            apply_rule("b-rule", "Title B", "Body B", None, RuleTier::Override, vec![]).unwrap();
-            apply_rule("a-rule", "Title A", "Body A", None, RuleTier::Override, vec![]).unwrap();
+            apply_rule(
+                "b-rule",
+                "Title B",
+                "Body B",
+                None,
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
+            apply_rule(
+                "a-rule",
+                "Title A",
+                "Body A",
+                None,
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
             assert_eq!(
                 untriggered_rule_bodies(),
                 vec!["Body A".to_string(), "Body B".to_string()]
@@ -380,7 +430,15 @@ mod tests {
     #[test]
     fn apply_rule_body_with_dashes_line_is_not_truncated() {
         with_temp_home(|| {
-            let applied = apply_rule("dashes", "Title", "before\n---\nafter", None, RuleTier::Override, vec![]).unwrap();
+            let applied = apply_rule(
+                "dashes",
+                "Title",
+                "before\n---\nafter",
+                None,
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
             assert!(
                 applied.body.contains("before"),
                 "body should contain text before the --- line: {}",
@@ -402,7 +460,15 @@ mod tests {
     #[test]
     fn apply_rule_title_with_em_dash_is_not_truncated() {
         with_temp_home(|| {
-            let applied = apply_rule("emdash", "Foo \u{2014} Bar", "Body", None, RuleTier::Override, vec![]).unwrap();
+            let applied = apply_rule(
+                "emdash",
+                "Foo \u{2014} Bar",
+                "Body",
+                None,
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
             assert_eq!(applied.title, "Foo \u{2014} Bar");
 
             let rules = list_rules();
@@ -418,7 +484,15 @@ mod tests {
                 tools: vec!["mcp__flare__review".to_string()],
                 auto_match: true,
             };
-            let applied = apply_rule("revfix", "Title", "Body", Some(trigger.clone()), RuleTier::Override, vec![]).unwrap();
+            let applied = apply_rule(
+                "revfix",
+                "Title",
+                "Body",
+                Some(trigger.clone()),
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
             assert_eq!(applied.trigger, Some(trigger.clone()));
 
             let rules = list_rules();
@@ -430,7 +504,8 @@ mod tests {
     #[test]
     fn apply_rule_without_trigger_is_untriggered() {
         with_temp_home(|| {
-            let applied = apply_rule("hygiene", "Title", "Body", None, RuleTier::Override, vec![]).unwrap();
+            let applied =
+                apply_rule("hygiene", "Title", "Body", None, RuleTier::Override, vec![]).unwrap();
             assert_eq!(applied.trigger, None);
         });
     }
@@ -556,11 +631,28 @@ mod tests {
     #[test]
     fn apply_rule_snapshots_previous_body_when_overwriting_a_builtin_rule() {
         with_temp_home(|| {
-            apply_rule("search17", "T", "Old body", None, rule::RuleTier::Builtin, vec!["claude-code".to_string()]).unwrap();
-            apply_rule("search17", "T", "New body", None, rule::RuleTier::Builtin, vec!["claude-code".to_string()]).unwrap();
+            apply_rule(
+                "search17",
+                "T",
+                "Old body",
+                None,
+                rule::RuleTier::Builtin,
+                vec!["claude-code".to_string()],
+            )
+            .unwrap();
+            apply_rule(
+                "search17",
+                "T",
+                "New body",
+                None,
+                rule::RuleTier::Builtin,
+                vec!["claude-code".to_string()],
+            )
+            .unwrap();
 
             let path = rules_dir().join("superseded-search17.json");
-            let bodies: Vec<String> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let bodies: Vec<String> =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
             assert_eq!(bodies, vec!["Old body".to_string()]);
         });
     }
@@ -568,8 +660,24 @@ mod tests {
     #[test]
     fn apply_rule_does_not_snapshot_when_overwriting_an_override_tier_rule() {
         with_temp_home(|| {
-            apply_rule("hygiene", "T", "Old body", None, rule::RuleTier::Override, vec![]).unwrap();
-            apply_rule("hygiene", "T", "New body", None, rule::RuleTier::Override, vec![]).unwrap();
+            apply_rule(
+                "hygiene",
+                "T",
+                "Old body",
+                None,
+                rule::RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
+            apply_rule(
+                "hygiene",
+                "T",
+                "New body",
+                None,
+                rule::RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
             assert!(!rules_dir().join("superseded-hygiene.json").exists());
         });
     }
@@ -577,8 +685,24 @@ mod tests {
     #[test]
     fn apply_rule_does_not_snapshot_when_body_is_unchanged() {
         with_temp_home(|| {
-            apply_rule("search17", "T", "Same body", None, rule::RuleTier::Builtin, vec![]).unwrap();
-            apply_rule("search17", "T", "Same body", None, rule::RuleTier::Builtin, vec![]).unwrap();
+            apply_rule(
+                "search17",
+                "T",
+                "Same body",
+                None,
+                rule::RuleTier::Builtin,
+                vec![],
+            )
+            .unwrap();
+            apply_rule(
+                "search17",
+                "T",
+                "Same body",
+                None,
+                rule::RuleTier::Builtin,
+                vec![],
+            )
+            .unwrap();
             assert!(!rules_dir().join("superseded-search17.json").exists());
         });
     }

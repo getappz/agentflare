@@ -40,9 +40,22 @@ pub fn print_list() {
     println!("agentflare coaching rules ({}/{MAX_RULES}):\n", rules.len());
     for r in &rules {
         if !r.sync.is_empty() {
-            println!("  {:<10} {}  (synced: {})", r.id, r.title, r.sync.join(", "));
+            println!(
+                "  {:<10} {}  ({}, applied {}, synced: {})",
+                r.id,
+                r.title,
+                r.tier.as_str(),
+                r.applied_at,
+                r.sync.join(", ")
+            );
         } else {
-            println!("  {:<10} {}  (no sync)", r.id, r.title);
+            println!(
+                "  {:<10} {}  ({}, applied {}, no sync)",
+                r.id,
+                r.title,
+                r.tier.as_str(),
+                r.applied_at
+            );
         }
         println!("    {}", r.body);
         println!("    {}", describe_trigger(r.trigger.as_ref()));
