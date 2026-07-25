@@ -1,4 +1,5 @@
 use agentflare_store::documents::{DocMatch, DocUpsertOpts, Document};
+use rusqlite::OptionalExtension;
 use std::path::{Path, PathBuf};
 
 /// Every row in the flare-docs store uses this fixed project_id. agentflare-store's
@@ -89,13 +90,36 @@ impl DocsStore {
     /// stable across refreshes) have no use for version history, and
     /// writing it unconditionally would be pure amplification at this
     /// volume.
+    ///
+    /// An item whose content is byte-identical to what's already stored is
+    /// skipped entirely (no row write, no FTS resync, no version bump) — a
+    /// crate whose docs haven't changed since the last fetch would otherwise
+    /// still pay the full per-item write cost (and grow `version`
+    /// unboundedly) on every refresh, the same amplification problem
+    /// [`agentflare_store::Store::doc_upsert_with_opts`]'s content-hash
+    /// short-circuit exists to avoid for the single-doc path.
+    ///
+    /// Returns the number of items actually written (inserted or changed),
+    /// not the total number of items passed in.
     pub fn upsert_batch(&self, items: &[BatchItem]) -> Result<usize, Error> {
         let conn = self.inner.conn();
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
         let now = db_kit::ids::now();
+        let mut written = 0usize;
 
         for item in items {
+            let existing_content: Option<String> = tx
+                .query_row(
+                    "SELECT content FROM store_documents WHERE project_id = ?1 AND path = ?2 AND deleted_at IS NULL",
+                    rusqlite::params![PROJECT_ID, item.path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing_content.as_deref() == Some(item.content.as_str()) {
+                continue;
+            }
+
             let tags_json = serde_json::to_string(&item.tags).unwrap_or_else(|_| "[]".into());
             let id = db_kit::ids::new_id();
             let rowid: i64 = tx.query_row(
@@ -134,10 +158,11 @@ impl DocsStore {
                 "INSERT INTO store_docs_fts(rowid, content) VALUES (?1, ?2)",
                 rusqlite::params![rowid, item.content],
             )?;
+            written += 1;
         }
 
         tx.commit()?;
-        Ok(items.len())
+        Ok(written)
     }
 }
 
@@ -260,6 +285,49 @@ mod tests {
         assert_eq!(updated.id, original.id);
         assert_eq!(updated.content, "v2");
         assert_eq!(updated.version, 2);
+    }
+
+    #[test]
+    fn upsert_batch_skips_unchanged_items_entirely() {
+        let store = DocsStore::open_memory().unwrap();
+        let make = |content: &str| {
+            vec![BatchItem {
+                path: "docsrs/foo/latest/foo::Bar".into(),
+                content: content.into(),
+                title: "Bar".into(),
+                doc_type: "rust-item".into(),
+                tags: vec![],
+                source: "docsrs".into(),
+            }]
+        };
+
+        let n = store.upsert_batch(&make("same content")).unwrap();
+        assert_eq!(n, 1, "first write is a real insert");
+        let original = store
+            .get_by_path("docsrs/foo/latest/foo::Bar")
+            .unwrap()
+            .unwrap();
+
+        // Re-running the batch with identical content must not bump
+        // version or count as a write -- this is the exact write
+        // amplification the content-hash check exists to avoid.
+        let n = store.upsert_batch(&make("same content")).unwrap();
+        assert_eq!(n, 0, "unchanged content must not be counted as written");
+        let unchanged = store
+            .get_by_path("docsrs/foo/latest/foo::Bar")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.version, original.version);
+
+        // A real content change is still written normally.
+        let n = store.upsert_batch(&make("different content")).unwrap();
+        assert_eq!(n, 1);
+        let changed = store
+            .get_by_path("docsrs/foo/latest/foo::Bar")
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.content, "different content");
+        assert_eq!(changed.version, original.version + 1);
     }
 
     #[test]

@@ -108,7 +108,16 @@ pub fn store_fetched(
     let id_path = docs_id_path(crate_name, version);
     let overview_doc = store.upsert(&id_path, &docstring, opts)?;
 
-    index_items(store, &decompressed, crate_name, &id_path)?;
+    // Per-item indexing is a best-effort enhancement on top of the
+    // crate-overview doc above, which has already succeeded. A rustdoc-json
+    // schema mismatch on some items (e.g. an `ItemKind` variant newer than
+    // this crate's pinned `rustdoc-types` version recognizes) fails
+    // `IndexCrate`'s deserialization for the *entire* crate's item set --
+    // that must not turn an otherwise-successful fetch into a reported
+    // failure, or mask the overview doc's success from the caller.
+    if let Err(e) = index_items(store, &decompressed, crate_name, &id_path) {
+        eprintln!("flare-docs: per-item indexing failed for {crate_name}@{version}: {e}");
+    }
 
     Ok(overview_doc)
 }
@@ -307,6 +316,40 @@ mod tests {
         assert_eq!(
             hits[0].path,
             "docsrs/fake-crate/1.0.0/item/fake_crate::extract::State"
+        );
+    }
+
+    #[test]
+    fn fetch_and_store_survives_unparseable_item_index() {
+        // Regression: an item whose "kind" is a value the pinned
+        // rustdoc-types version doesn't recognize fails IndexCrate's
+        // deserialization for the whole crate -- fetch_and_store must still
+        // return Ok with the overview doc, not propagate that as a failure.
+        let raw_json = br#"{
+            "root": 0,
+            "index": {
+                "0": { "docs": "A fake crate for testing." },
+                "1": { "name": "Weird", "docs": "docs for an item rustdoc-types can't parse yet." }
+            },
+            "paths": {
+                "1": { "crate_id": 0, "path": ["fake_crate", "Weird"], "kind": "some_future_kind" }
+            }
+        }"#;
+        let compressed = zstd::stream::encode_all(&raw_json[..], 0).unwrap();
+        let fetcher = FakeFetcher {
+            response: compressed,
+        };
+        let store = DocsStore::open_memory().unwrap();
+
+        let doc = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
+        assert_eq!(doc.content, "A fake crate for testing.");
+
+        // The unparseable item simply wasn't indexed -- no crash, no error.
+        assert!(
+            store
+                .get_by_path("docsrs/fake-crate/1.0.0/item/fake_crate::Weird")
+                .unwrap()
+                .is_none()
         );
     }
 
