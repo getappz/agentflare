@@ -71,22 +71,6 @@ pub fn start() -> Result<(), String> {
     }
 }
 
-#[allow(dead_code)]
-pub fn is_installed() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        plist_path().exists()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        service_path().exists()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        false
-    }
-}
-
 // Both only called from the macOS LaunchAgent / Linux systemd install paths
 // below, which are themselves target_os-gated -- gate the helpers to match
 // so non-macOS/Linux builds (e.g. Windows) don't see them as dead code.
