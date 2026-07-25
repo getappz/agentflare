@@ -117,9 +117,14 @@ fi"#
 /// and whether anything changed.
 fn upsert_block(content: &str, start: &str, end: &str, block: &str) -> (String, bool) {
     let full_block = format!("{start}\n{block}\n{end}");
-    if let Some(s) = content.find(start)
-        && let Some(rel_e) = content[s..].find(end)
-    {
+    if let Some(s) = content.find(start) {
+        // A start marker with no matching end is a truncated/corrupted block
+        // (e.g. a user's manual edit cut it off mid-way) -- leave it alone
+        // rather than guessing where it ends and appending a second copy
+        // after it.
+        let Some(rel_e) = content[s..].find(end) else {
+            return (content.to_string(), false);
+        };
         let e = s + rel_e + end.len();
         if content[s..e] == full_block {
             return (content.to_string(), false);
@@ -158,23 +163,37 @@ fn bash_env_is_set() -> bool {
         == Some(bash_env_value().as_str())
 }
 
-fn set_bash_env_setting() -> bool {
+/// Outcome of wiring `BASH_ENV` into `~/.claude/settings.json`, distinct
+/// from a plain bool so a write failure can't be reported as "already set".
+enum EnvWireOutcome {
+    AlreadySet,
+    Wired,
+    Failed,
+}
+
+fn set_bash_env_setting() -> EnvWireOutcome {
     if bash_env_is_set() {
-        return false;
+        return EnvWireOutcome::AlreadySet;
     }
     let path = claude_settings_path();
     let mut settings = read_json_object(&path, || json!({}));
     let obj = settings.as_object_mut().unwrap();
-    let env_obj = obj
-        .entry("env")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .unwrap();
+    // `env` may already exist as something other than an object (null, a
+    // stray string from a hand-edit, ...) -- coerce it rather than
+    // unwrap-panicking on as_object_mut().
+    if !obj.get("env").is_some_and(|v| v.is_object()) {
+        obj.insert("env".to_string(), json!({}));
+    }
+    let env_obj = obj.get_mut("env").unwrap().as_object_mut().unwrap();
     env_obj.insert("BASH_ENV".to_string(), json!(bash_env_value()));
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    write_json_pretty(&path, &settings).is_ok()
+    if write_json_pretty(&path, &settings).is_ok() {
+        EnvWireOutcome::Wired
+    } else {
+        EnvWireOutcome::Failed
+    }
 }
 
 /// `true` once both marker blocks hold current content and `BASH_ENV` is
@@ -205,16 +224,21 @@ pub fn ensure_installed() -> String {
         }
     }
 
-    let env_wired = set_bash_env_setting();
-
-    match (file_changed, env_wired) {
-        (true, true) => format!(
+    match (file_changed, set_bash_env_setting()) {
+        (true, EnvWireOutcome::Wired) => format!(
             "{} written; BASH_ENV wired in ~/.claude/settings.json",
             path.display()
         ),
-        (true, false) => format!("{} written", path.display()),
-        (false, true) => "BASH_ENV wired in ~/.claude/settings.json".to_string(),
-        (false, false) => format!("{} already up to date", path.display()),
+        (true, EnvWireOutcome::AlreadySet) => format!("{} written", path.display()),
+        (true, EnvWireOutcome::Failed) => format!(
+            "{} written; failed to wire BASH_ENV in ~/.claude/settings.json",
+            path.display()
+        ),
+        (false, EnvWireOutcome::Wired) => "BASH_ENV wired in ~/.claude/settings.json".to_string(),
+        (false, EnvWireOutcome::AlreadySet) => format!("{} already up to date", path.display()),
+        (false, EnvWireOutcome::Failed) => {
+            "failed to wire BASH_ENV in ~/.claude/settings.json".to_string()
+        }
     }
 }
 
@@ -255,6 +279,14 @@ mod tests {
             content,
             "# before\n# >>> x >>>\nnew body\n# <<< x <<<\n# after\n"
         );
+    }
+
+    #[test]
+    fn upsert_block_leaves_a_truncated_marker_alone_instead_of_duplicating() {
+        let corrupt = "# before\n# >>> x >>>\nhalf-written, no end marker\n";
+        let (content, changed) = upsert_block(corrupt, "# >>> x >>>", "# <<< x <<<", "body");
+        assert!(!changed);
+        assert_eq!(content, corrupt);
     }
 
     #[test]
@@ -330,6 +362,21 @@ mod tests {
             let settings: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
             assert_eq!(settings["env"]["OTHER_VAR"], "1");
+            assert_eq!(settings["env"]["BASH_ENV"], bash_env_value());
+        });
+    }
+
+    #[test]
+    fn ensure_installed_coerces_a_non_object_env_value_instead_of_panicking() {
+        with_temp_home(|| {
+            let settings_path = claude_settings_path();
+            fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+            fs::write(&settings_path, r#"{"env": null}"#).unwrap();
+
+            ensure_installed();
+
+            let settings: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
             assert_eq!(settings["env"]["BASH_ENV"], bash_env_value());
         });
     }
