@@ -1185,12 +1185,67 @@ impl AgentflareMcp {
         }
         let severity = crate::vent::classify::normalize_severity(req.severity.as_deref());
         let tags = req.tags.unwrap_or_default();
-        let log = crate::vent::paths::log_path();
-        let event_id =
-            crate::vent::capture::append(&log, None, severity, &tags, req.message.trim()).map_err(
-                |e| ErrorData::internal_error(format!("vent capture failed: {e}"), None),
-            )?;
-        Ok(serde_json::json!({ "ok": true, "event_id": event_id }).to_string())
+        let (event_id, suppressed) =
+            crate::vent::capture::append_routed(None, severity, &tags, req.message.trim())
+                .map_err(|e| {
+                    ErrorData::internal_error(format!("vent capture failed: {e}"), None)
+                })?;
+        Ok(
+            serde_json::json!({ "ok": true, "event_id": event_id, "suppressed": suppressed })
+                .to_string(),
+        )
+    }
+
+    #[tool(
+        description = "List or file agentflare's own tooling bugs (git shim, af-guard, item-tracker friction -- NOT this project's own vents) as ONE batched GitHub issue on getappz/agentflare. Call without title/body to see the pending batch and write a summary yourself; call again with both to file it."
+    )]
+    fn vent_file(&self, Parameters(req): Parameters<VentFileRequest>) -> Result<String, ErrorData> {
+        let log = crate::vent::paths::global_log_path();
+        let filed = crate::vent::paths::global_filed_path();
+        let batch = crate::vent::file::pending_batch(&log, &filed, chrono::Utc::now().timestamp());
+        if batch.is_empty() {
+            return Ok(serde_json::json!({ "ok": true, "pending": [] }).to_string());
+        }
+        match (req.title, req.body) {
+            (Some(title), Some(body)) => {
+                let url = crate::vent::file::create_github_issue(&title, &body).map_err(|e| {
+                    ErrorData::internal_error(format!("gh issue create failed: {e}"), None)
+                })?;
+                let keys: Vec<String> = batch.iter().map(|g| g.topic_key.clone()).collect();
+                let now = chrono::Utc::now().timestamp();
+                // The issue itself is already created at this point — even if
+                // mark_filed fails, the caller must still learn the issue_url
+                // (not just an opaque error), or the same batch gets re-filed
+                // as a duplicate issue on the next call.
+                match crate::vent::file::mark_filed(&filed, &keys, &url, now) {
+                    Ok(()) => Ok(serde_json::json!({
+                        "ok": true,
+                        "issue_url": url,
+                        "filed_count": keys.len(),
+                    })
+                    .to_string()),
+                    Err(e) => Ok(serde_json::json!({
+                        "ok": true,
+                        "issue_url": url,
+                        "filed_count": keys.len(),
+                        "warning": format!(
+                            "issue created but failed to record filed-state ({e}) — re-filing \
+                             will create a duplicate issue until this is reconciled by hand"
+                        ),
+                    })
+                    .to_string()),
+                }
+            }
+            (None, None) => Ok(serde_json::json!({ "ok": true, "pending": batch }).to_string()),
+            (title, body) => Err(ErrorData::invalid_params(
+                format!(
+                    "vent_file needs both title and body to file (got title={}, body={}), or neither to list pending",
+                    title.is_some(),
+                    body.is_some()
+                ),
+                None,
+            )),
+        }
     }
 
     /// Rejects PR titles that don't start with a conventional-commit type,

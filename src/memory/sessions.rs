@@ -68,16 +68,6 @@ pub fn get(conn: &Connection, id: &str) -> rusqlite::Result<Option<Session>> {
     .optional()
 }
 
-#[allow(dead_code)]
-pub fn update_status(conn: &Connection, id: &str, status: &str) -> rusqlite::Result<()> {
-    let now = now_iso();
-    conn.execute(
-        "UPDATE sessions SET status = ?2, updated_at = ?3 WHERE id = ?1",
-        params![id, status, now],
-    )?;
-    Ok(())
-}
-
 pub fn close(conn: &Connection, id: &str, summary: &str) -> rusqlite::Result<()> {
     let now = now_iso();
     conn.execute(

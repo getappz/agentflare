@@ -54,10 +54,6 @@ impl ArtifactServer {
         self.port
     }
 
-    pub fn url_for(&self, id: &str) -> String {
-        format!("http://{}:{}/{id}", self.host, self.port)
-    }
-
     pub fn base_url(&self) -> String {
         format!("http://{}:{}", self.host, self.port)
     }

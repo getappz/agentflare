@@ -151,7 +151,6 @@ fn parse_other_pids(raw: &str, self_pid: u32) -> Vec<u32> {
     pids
 }
 
-#[allow(dead_code)]
 pub fn run_with_timeout<F, T>(f: F, timeout: Duration) -> Result<T, String>
 where
     F: FnOnce() -> T,

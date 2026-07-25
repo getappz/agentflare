@@ -364,36 +364,6 @@ impl Store {
         }
     }
 
-    pub fn doc_hard_delete(&self, id: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn();
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-        let Some(rowid) = tx
-            .query_row(
-                "SELECT rowid FROM store_documents WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-        else {
-            return Ok(false);
-        };
-
-        // Delete dependents before the parent row, all in one transaction.
-        tx.execute(
-            "DELETE FROM store_doc_history WHERE doc_id = ?1",
-            params![id],
-        )?;
-        tx.execute("DELETE FROM store_docs_vec WHERE doc_id = ?1", params![id])?;
-        tx.execute(
-            "DELETE FROM store_docs_fts WHERE rowid = ?1",
-            params![rowid],
-        )?;
-        tx.execute("DELETE FROM store_documents WHERE id = ?1", params![id])?;
-        tx.commit()?;
-        Ok(true)
-    }
-
     pub fn doc_history(&self, doc_id: &str) -> rusqlite::Result<Vec<DocVersion>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
@@ -417,34 +387,6 @@ impl Store {
             })
         })?;
         rows.collect()
-    }
-
-    pub fn doc_get_version(
-        &self,
-        doc_id: &str,
-        version: i32,
-    ) -> rusqlite::Result<Option<DocVersion>> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT id, doc_id, version, content, blob_hash, mime, title, metadata, size, created_at
-                 FROM store_doc_history WHERE doc_id = ?1 AND version = ?2",
-            params![doc_id, version],
-            |row| {
-                Ok(DocVersion {
-                    id: row.get(0)?,
-                    doc_id: row.get(1)?,
-                    version: row.get(2)?,
-                    content: row.get(3)?,
-                    blob_hash: row.get(4)?,
-                    mime: row.get(5)?,
-                    title: row.get(6)?,
-                    metadata: row.get(7)?,
-                    size: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            },
-        )
-        .optional()
     }
 
     pub fn doc_search(

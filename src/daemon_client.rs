@@ -2,7 +2,6 @@
 // landing in a follow-up PR (see task-report.md). Not reachable yet.
 #![allow(dead_code)]
 
-use crate::daemon::{is_daemon_running, start_daemon};
 use crate::ipc::{DaemonAddr, connect};
 
 pub fn daemon_request(
@@ -62,23 +61,4 @@ pub fn daemon_health_check(addr: &DaemonAddr) -> Result<String, String> {
 pub fn daemon_tool_call(addr: &DaemonAddr, tool: &str, args: &str) -> Result<String, String> {
     let body = format!(r#"{{"tool":"{tool}","args":{args}}}"#);
     daemon_request(addr, "POST", "/v1/tools/call", Some(&body))
-}
-
-pub fn try_daemon_tool_call_blocking(tool: &str, args: &str) -> Result<String, String> {
-    if let Some(pid) = is_daemon_running() {
-        let addr = DaemonAddr::default_for_pid(pid);
-        return daemon_tool_call(&addr, tool, args);
-    }
-
-    let pid = start_daemon()?;
-    let addr = DaemonAddr::default_for_pid(pid);
-
-    for _ in 0..10 {
-        if daemon_health_check(&addr).is_ok() {
-            return daemon_tool_call(&addr, tool, args);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    }
-
-    Err("daemon did not become healthy".to_string())
 }
