@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::branch::{current_branch, is_protected_branch, resolve_default_branch};
+use crate::policy_config::ResolvedGitShimPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Disposition {
@@ -214,13 +215,21 @@ pub fn classify_pure(
     default_branch: &str,
     trust_root_touch: &TrustRootTouch,
     push_targets_default_branch: bool,
+    policy: &ResolvedGitShimPolicy,
 ) -> Disposition {
     if READ_ONLY_SUBCOMMANDS.contains(&subcommand)
-        || ALLOWED_MUTATING_SUBCOMMANDS.contains(&subcommand)
+        || policy
+            .allowed_mutating_subcommands
+            .iter()
+            .any(|s| s.as_str() == subcommand)
     {
         return Disposition::Passthrough;
     }
-    if DENIED_PLUMBING_SUBCOMMANDS.contains(&subcommand) {
+    if policy
+        .denied_plumbing_subcommands
+        .iter()
+        .any(|s| s.as_str() == subcommand)
+    {
         return Disposition::Deny {
             reason: format!(
                 "'git {subcommand}' is a low-level plumbing command blocked by the agentflare git shim — it can bypass the checks this shim applies to higher-level commands."
@@ -344,17 +353,18 @@ pub enum TrustRootTouch {
 /// default to let through, but the caller shouldn't claim to know which
 /// path caused it.
 #[must_use]
-pub fn resolve_trust_root_touch(repo_root: &Path, branch: &str, target: &str) -> TrustRootTouch {
-    let extra = extra_trust_root_paths_from_env();
+pub fn resolve_trust_root_touch(
+    repo_root: &Path,
+    branch: &str,
+    target: &str,
+    trust_root_paths: &[String],
+) -> TrustRootTouch {
     let range = format!("{target}...{branch}");
     match crate::shell::run_in(repo_root, &["diff", "--name-only", &range]) {
         Ok(names) => {
             let mut matched: Vec<String> = names
                 .lines()
-                .filter(|f| {
-                    TRUST_ROOT_PATHS.iter().any(|p| f.starts_with(p))
-                        || extra.iter().any(|p| f.starts_with(p.as_str()))
-                })
+                .filter(|f| trust_root_paths.iter().any(|p| f.starts_with(p.as_str())))
                 .map(str::to_string)
                 .collect();
             matched.sort();
@@ -415,6 +425,17 @@ pub fn classify_with_home(
     args: &[String],
     home: Option<&Path>,
 ) -> Event {
+    let policy = crate::policy_config::resolve(repo_root, home).unwrap_or_else(|e| {
+        eprintln!(
+            "WARNING: agentflare git-shim config at {} is invalid ({}) -- \
+             using baseline policy only, no config-sourced additions applied. \
+             Git operations are not blocked by this; fix the file to restore \
+             your customizations.",
+            e.path.display(),
+            e.source
+        );
+        ResolvedGitShimPolicy::baseline()
+    });
     let default_branch = resolve_default_branch(repo_root);
     // Resolve the actual pushed branch once, then derive both push facts from
     // it: whether it carries trust-root changes and whether it *is* the
@@ -424,7 +445,7 @@ pub fn classify_with_home(
         .flatten();
     let trust_root_touch = pushed
         .as_deref()
-        .map(|b| resolve_trust_root_touch(repo_root, b, &default_branch))
+        .map(|b| resolve_trust_root_touch(repo_root, b, &default_branch, &policy.trust_root_paths))
         .unwrap_or(TrustRootTouch::Clean);
     let targets_default_branch = pushed
         .as_deref()
@@ -435,6 +456,7 @@ pub fn classify_with_home(
         &default_branch,
         &trust_root_touch,
         targets_default_branch,
+        &policy,
     );
     // Every deny above (protected-branch checkout/switch/delete/rename,
     // trust-root push, plumbing block, worktree) exists to protect agentflare's
@@ -466,8 +488,16 @@ mod tests {
 
     #[test]
     fn read_only_subcommands_pass_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
-            classify_pure("status", &[], "master", &TrustRootTouch::Clean, false),
+            classify_pure(
+                "status",
+                &[],
+                "master",
+                &TrustRootTouch::Clean,
+                false,
+                &policy
+            ),
             Disposition::Passthrough
         );
         assert_eq!(
@@ -476,7 +506,8 @@ mod tests {
                 &args(&["-5"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -484,13 +515,15 @@ mod tests {
 
     #[test]
     fn ordinary_mutating_subcommands_pass_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "commit",
                 &args(&["-m", "x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -500,7 +533,8 @@ mod tests {
                 &args(&["HEAD~1"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -508,6 +542,7 @@ mod tests {
 
     #[test]
     fn unknown_subcommand_passes_through_by_default() {
+        let policy = ResolvedGitShimPolicy::baseline();
         // Fail-open: this shim must never block a subcommand it hasn't
         // been explicitly taught to deny.
         assert_eq!(
@@ -516,7 +551,8 @@ mod tests {
                 &[],
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -526,7 +562,8 @@ mod tests {
                 &args(&["update"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -536,7 +573,8 @@ mod tests {
                 &args(&["start"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -546,7 +584,8 @@ mod tests {
                 &args(&["pull"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -554,25 +593,42 @@ mod tests {
 
     #[test]
     fn plumbing_commands_are_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
-            classify_pure("update-index", &[], "master", &TrustRootTouch::Clean, false),
+            classify_pure(
+                "update-index",
+                &[],
+                "master",
+                &TrustRootTouch::Clean,
+                false,
+                &policy
+            ),
             Disposition::Deny { .. }
         ));
         assert!(matches!(
-            classify_pure("apply", &[], "master", &TrustRootTouch::Clean, false),
+            classify_pure(
+                "apply",
+                &[],
+                "master",
+                &TrustRootTouch::Clean,
+                false,
+                &policy
+            ),
             Disposition::Deny { .. }
         ));
     }
 
     #[test]
     fn worktree_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
             classify_pure(
                 "worktree",
                 &args(&["add", "../x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -580,13 +636,15 @@ mod tests {
 
     #[test]
     fn worktree_remove_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
             classify_pure(
                 "worktree",
                 &args(&["remove", "../x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -594,13 +652,15 @@ mod tests {
 
     #[test]
     fn worktree_list_is_passthrough() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "worktree",
                 &args(&["list"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -608,13 +668,15 @@ mod tests {
 
     #[test]
     fn worktree_prune_dry_run_is_passthrough() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "worktree",
                 &args(&["prune", "--dry-run"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -622,13 +684,15 @@ mod tests {
 
     #[test]
     fn worktree_prune_without_dry_run_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
             classify_pure(
                 "worktree",
                 &args(&["prune"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -636,25 +700,29 @@ mod tests {
 
     #[test]
     fn checkout_to_protected_branch_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         let d = classify_pure(
             "checkout",
             &args(&["master"]),
             "master",
             &TrustRootTouch::Clean,
             false,
+            &policy,
         );
         assert!(matches!(d, Disposition::Deny { .. }));
     }
 
     #[test]
     fn switch_to_feature_branch_passes_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "switch",
                 &args(&["feature/x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -662,6 +730,7 @@ mod tests {
 
     #[test]
     fn checkout_with_no_target_arg_passes_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         // `git switch -` (previous branch) — nothing to protect against.
         assert_eq!(
             classify_pure(
@@ -669,7 +738,8 @@ mod tests {
                 &args(&["-"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -677,6 +747,7 @@ mod tests {
 
     #[test]
     fn push_touching_trust_root_on_feature_branch_passes_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         // A PR-review gate still applies before this reaches the default
         // branch — same reasoning as any other feature-branch push.
         assert_eq!(
@@ -685,7 +756,8 @@ mod tests {
                 &args(&["origin", "feature/x"]),
                 "master",
                 &TrustRootTouch::Touched(vec!["Cargo.toml".to_string()]),
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -693,13 +765,15 @@ mod tests {
 
     #[test]
     fn push_touching_trust_root_on_default_branch_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
             classify_pure(
                 "push",
                 &args(&["origin", "master"]),
                 "master",
                 &TrustRootTouch::Touched(vec!["Cargo.toml".to_string()]),
-                true
+                true,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -707,13 +781,15 @@ mod tests {
 
     #[test]
     fn push_not_touching_trust_root_passes_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "push",
                 &args(&["origin", "feature/x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -721,6 +797,7 @@ mod tests {
 
     #[test]
     fn push_of_default_branch_is_denied_even_without_trust_root_changes() {
+        let policy = ResolvedGitShimPolicy::baseline();
         // Enforce PR-only: pushing the default branch straight to a remote is
         // blocked regardless of what the diff touches.
         assert!(matches!(
@@ -729,7 +806,8 @@ mod tests {
                 &args(&["origin", "master"]),
                 "master",
                 &TrustRootTouch::Clean,
-                true
+                true,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -737,13 +815,15 @@ mod tests {
 
     #[test]
     fn push_of_feature_branch_is_not_a_default_branch_push() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "push",
                 &args(&["origin", "feature/x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -751,13 +831,15 @@ mod tests {
 
     #[test]
     fn branch_delete_of_protected_branch_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
             classify_pure(
                 "branch",
                 &args(&["-D", "master"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -767,7 +849,8 @@ mod tests {
                 &args(&["--delete", "master"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -775,13 +858,15 @@ mod tests {
 
     #[test]
     fn branch_rename_of_protected_branch_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
             classify_pure(
                 "branch",
                 &args(&["-M", "master", "renamed"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -789,13 +874,15 @@ mod tests {
 
     #[test]
     fn branch_delete_of_feature_branch_passes_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "branch",
                 &args(&["-D", "feature/x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -803,8 +890,16 @@ mod tests {
 
     #[test]
     fn branch_listing_and_creation_pass_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
-            classify_pure("branch", &[], "master", &TrustRootTouch::Clean, false),
+            classify_pure(
+                "branch",
+                &[],
+                "master",
+                &TrustRootTouch::Clean,
+                false,
+                &policy
+            ),
             Disposition::Passthrough
         );
         assert_eq!(
@@ -813,7 +908,8 @@ mod tests {
                 &args(&["feature/new"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -1035,8 +1131,16 @@ mod tests {
 
     #[test]
     fn push_trust_root_deny_message_names_only_the_touched_path() {
+        let policy = ResolvedGitShimPolicy::baseline();
         let touch = TrustRootTouch::Touched(vec!["Cargo.toml".to_string()]);
-        let d = classify_pure("push", &args(&["origin", "master"]), "master", &touch, true);
+        let d = classify_pure(
+            "push",
+            &args(&["origin", "master"]),
+            "master",
+            &touch,
+            true,
+            &policy,
+        );
         let Disposition::Deny { reason } = d else {
             panic!("expected Deny, got {d:?}");
         };
@@ -1053,12 +1157,14 @@ mod tests {
 
     #[test]
     fn push_with_unreadable_diff_on_default_branch_denies_with_unknown_message() {
+        let policy = ResolvedGitShimPolicy::baseline();
         let d = classify_pure(
             "push",
             &args(&["origin", "master"]),
             "master",
             &TrustRootTouch::Unknown,
             true,
+            &policy,
         );
         let Disposition::Deny { reason } = d else {
             panic!("expected Deny, got {d:?}");
@@ -1068,15 +1174,39 @@ mod tests {
 
     #[test]
     fn push_with_unreadable_diff_on_feature_branch_passes_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "push",
                 &args(&["origin", "feature/x"]),
                 "master",
                 &TrustRootTouch::Unknown,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
+        );
+    }
+
+    #[test]
+    fn malformed_project_local_config_falls_back_to_baseline_without_blocking_git() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        std::fs::write(repo.path.join(".agentflare").join("project.json"), "{}").unwrap();
+        std::fs::write(
+            repo.path.join(".agentflare").join("config.toml"),
+            "this is not valid toml [[[",
+        )
+        .unwrap();
+
+        // An ordinary read-only command must still pass through -- a broken
+        // config file must never block git operations.
+        let event = classify(&repo.path, "status", &[]);
+        assert_eq!(
+            event.disposition,
+            Disposition::Passthrough,
+            "{:?}",
+            event.disposition
         );
     }
 }
