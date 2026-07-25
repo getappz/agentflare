@@ -1,4 +1,5 @@
 use agentflare_store::documents::{DocMatch, DocUpsertOpts, Document};
+use rusqlite::OptionalExtension;
 use std::path::{Path, PathBuf};
 
 /// Every row in the flare-docs store uses this fixed project_id. agentflare-store's
@@ -77,6 +78,103 @@ impl DocsStore {
     pub fn blob_store_raw(&self, data: &[u8]) -> Result<String, Error> {
         Ok(self.inner.blob_store(data)?)
     }
+
+    /// Upserts many documents in a single transaction.
+    ///
+    /// A crate's rustdoc JSON can have thousands of items; upserting them
+    /// one at a time through [`Self::upsert`] would open a separate
+    /// `BEGIN IMMEDIATE` transaction (and FTS resync) per item, turning a
+    /// single `get`/`refresh` into thousands of exclusive-lock commits.
+    /// This batches the whole set into one transaction and never writes
+    /// `store_doc_history` rows — cache-type per-item docs (rustdoc text is
+    /// stable across refreshes) have no use for version history, and
+    /// writing it unconditionally would be pure amplification at this
+    /// volume.
+    ///
+    /// An item whose content is byte-identical to what's already stored is
+    /// skipped entirely (no row write, no FTS resync, no version bump) — a
+    /// crate whose docs haven't changed since the last fetch would otherwise
+    /// still pay the full per-item write cost (and grow `version`
+    /// unboundedly) on every refresh, the same amplification problem
+    /// [`agentflare_store::Store::doc_upsert_with_opts`]'s content-hash
+    /// short-circuit exists to avoid for the single-doc path.
+    ///
+    /// Returns the number of items actually written (inserted or changed),
+    /// not the total number of items passed in.
+    pub fn upsert_batch(&self, items: &[BatchItem]) -> Result<usize, Error> {
+        let conn = self.inner.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let now = db_kit::ids::now();
+        let mut written = 0usize;
+
+        for item in items {
+            let existing_content: Option<String> = tx
+                .query_row(
+                    "SELECT content FROM store_documents WHERE project_id = ?1 AND path = ?2 AND deleted_at IS NULL",
+                    rusqlite::params![PROJECT_ID, item.path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing_content.as_deref() == Some(item.content.as_str()) {
+                continue;
+            }
+
+            let tags_json = serde_json::to_string(&item.tags).unwrap_or_else(|_| "[]".into());
+            let id = db_kit::ids::new_id();
+            let rowid: i64 = tx.query_row(
+                "INSERT INTO store_documents
+                 (id, project_id, path, content, title, doc_type, blob_hash, mime, tags, session_id, source, metadata, size, version, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, '', ?7, NULL, ?8, '{}', 0, 1, ?9, ?9)
+                 ON CONFLICT(project_id, path) DO UPDATE SET
+                    content = excluded.content,
+                    title = excluded.title,
+                    doc_type = excluded.doc_type,
+                    tags = excluded.tags,
+                    source = excluded.source,
+                    version = store_documents.version + 1,
+                    updated_at = excluded.updated_at,
+                    deleted_at = NULL
+                 RETURNING rowid",
+                rusqlite::params![
+                    id,
+                    PROJECT_ID,
+                    item.path,
+                    item.content,
+                    item.title,
+                    item.doc_type,
+                    tags_json,
+                    item.source,
+                    now,
+                ],
+                |row| row.get(0),
+            )?;
+
+            tx.execute(
+                "DELETE FROM store_docs_fts WHERE rowid = ?1",
+                rusqlite::params![rowid],
+            )?;
+            tx.execute(
+                "INSERT INTO store_docs_fts(rowid, content) VALUES (?1, ?2)",
+                rusqlite::params![rowid, item.content],
+            )?;
+            written += 1;
+        }
+
+        tx.commit()?;
+        Ok(written)
+    }
+}
+
+/// One document to write via [`DocsStore::upsert_batch`].
+#[derive(Debug, Clone)]
+pub struct BatchItem {
+    pub path: String,
+    pub content: String,
+    pub title: String,
+    pub doc_type: String,
+    pub tags: Vec<String>,
+    pub source: String,
 }
 
 #[cfg(test)]
@@ -119,6 +217,117 @@ mod tests {
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, doc.id);
+    }
+
+    #[test]
+    fn upsert_batch_inserts_multiple_documents_in_one_call() {
+        let store = DocsStore::open_memory().unwrap();
+        let items = vec![
+            BatchItem {
+                path: "docsrs/axum/latest/axum::extract::State".into(),
+                content: "State docs".into(),
+                title: "State".into(),
+                doc_type: "rust-item".into(),
+                tags: vec!["axum".into(), "rust".into(), "struct".into()],
+                source: "docsrs".into(),
+            },
+            BatchItem {
+                path: "docsrs/axum/latest/axum::Router".into(),
+                content: "Router docs".into(),
+                title: "Router".into(),
+                doc_type: "rust-item".into(),
+                tags: vec!["axum".into(), "rust".into(), "struct".into()],
+                source: "docsrs".into(),
+            },
+        ];
+
+        let n = store.upsert_batch(&items).unwrap();
+        assert_eq!(n, 2);
+
+        let state_doc = store
+            .get_by_path("docsrs/axum/latest/axum::extract::State")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state_doc.content, "State docs");
+        assert_eq!(state_doc.title, "State");
+        assert_eq!(state_doc.project_id, PROJECT_ID);
+
+        let hits = store.search("State docs", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn upsert_batch_updates_existing_row_and_preserves_id() {
+        let store = DocsStore::open_memory().unwrap();
+        let make = |content: &str| {
+            vec![BatchItem {
+                path: "docsrs/foo/latest/foo::Bar".into(),
+                content: content.into(),
+                title: "Bar".into(),
+                doc_type: "rust-item".into(),
+                tags: vec![],
+                source: "docsrs".into(),
+            }]
+        };
+
+        store.upsert_batch(&make("v1")).unwrap();
+        let original = store
+            .get_by_path("docsrs/foo/latest/foo::Bar")
+            .unwrap()
+            .unwrap();
+
+        store.upsert_batch(&make("v2")).unwrap();
+        let updated = store
+            .get_by_path("docsrs/foo/latest/foo::Bar")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(updated.id, original.id);
+        assert_eq!(updated.content, "v2");
+        assert_eq!(updated.version, 2);
+    }
+
+    #[test]
+    fn upsert_batch_skips_unchanged_items_entirely() {
+        let store = DocsStore::open_memory().unwrap();
+        let make = |content: &str| {
+            vec![BatchItem {
+                path: "docsrs/foo/latest/foo::Bar".into(),
+                content: content.into(),
+                title: "Bar".into(),
+                doc_type: "rust-item".into(),
+                tags: vec![],
+                source: "docsrs".into(),
+            }]
+        };
+
+        let n = store.upsert_batch(&make("same content")).unwrap();
+        assert_eq!(n, 1, "first write is a real insert");
+        let original = store
+            .get_by_path("docsrs/foo/latest/foo::Bar")
+            .unwrap()
+            .unwrap();
+
+        // Re-running the batch with identical content must not bump
+        // version or count as a write -- this is the exact write
+        // amplification the content-hash check exists to avoid.
+        let n = store.upsert_batch(&make("same content")).unwrap();
+        assert_eq!(n, 0, "unchanged content must not be counted as written");
+        let unchanged = store
+            .get_by_path("docsrs/foo/latest/foo::Bar")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.version, original.version);
+
+        // A real content change is still written normally.
+        let n = store.upsert_batch(&make("different content")).unwrap();
+        assert_eq!(n, 1);
+        let changed = store
+            .get_by_path("docsrs/foo/latest/foo::Bar")
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.content, "different content");
+        assert_eq!(changed.version, original.version + 1);
     }
 
     #[test]
