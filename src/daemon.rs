@@ -1,14 +1,8 @@
 use fs2::FileExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::ipc::{DaemonAddr, process};
-
-// Scaffolding for the daemon HTTP server / foreground-daemon wiring,
-// landing in a follow-up PR (see task-report.md). Not reachable yet.
-#[allow(dead_code)]
-static IS_FOREGROUND_DAEMON: AtomicBool = AtomicBool::new(false);
 
 pub fn daemon_pid_path() -> PathBuf {
     dirs::runtime_dir()
@@ -20,24 +14,6 @@ pub fn daemon_start_lock_path() -> PathBuf {
     dirs::runtime_dir()
         .map(|d| d.join("agentflare").join("daemon.start.lock"))
         .unwrap_or_else(|| std::env::temp_dir().join("agentflare-daemon.start.lock"))
-}
-
-#[allow(dead_code)]
-pub fn is_foreground_daemon() -> bool {
-    IS_FOREGROUND_DAEMON.load(Ordering::Relaxed)
-}
-
-#[allow(dead_code)]
-pub fn init_foreground_daemon() -> Result<(), String> {
-    IS_FOREGROUND_DAEMON.store(true, Ordering::Relaxed);
-    let pid_path = daemon_pid_path();
-    if let Some(parent) = pid_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create pid dir {parent:?}: {e}"))?;
-    }
-    let pid = std::process::id();
-    std::fs::write(&pid_path, pid.to_string())
-        .map_err(|e| format!("write pid file {pid_path:?}: {e}"))?;
-    Ok(())
 }
 
 pub fn cleanup_daemon_files() {

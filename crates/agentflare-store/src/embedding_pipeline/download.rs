@@ -224,20 +224,6 @@ fn write_lockfile(model_dir: &Path, lock: &BTreeMap<String, String>) -> anyhow::
     Ok(())
 }
 
-pub fn clean_model(model_dir: &Path) -> anyhow::Result<()> {
-    for name in ["model.onnx", "vocab.txt", "tokenizer.json", LOCKFILE] {
-        let path = model_dir.join(name);
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-        }
-        let tmp_path = model_dir.join(format!("{name}.tmp"));
-        if tmp_path.exists() {
-            std::fs::remove_file(&tmp_path)?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(all(test, feature = "embeddings"))]
 mod tests {
     use super::*;
