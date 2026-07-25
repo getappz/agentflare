@@ -64,20 +64,6 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Relation>> {
 }
 
 #[allow(dead_code)]
-pub fn list_for_observation(conn: &Connection, obs_id: i64) -> rusqlite::Result<Vec<Relation>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, source_id, target_id, relation, judgment_status, reason, evidence,
-                confidence, marked_by_actor, marked_by_kind, marked_by_model,
-                session_id, created_at, updated_at
-         FROM memory_relations
-         WHERE source_id = ?1 OR target_id = ?1
-         ORDER BY created_at DESC",
-    )?;
-    let rows = stmt.query_map(params![obs_id], map_relation)?;
-    rows.collect()
-}
-
-#[allow(dead_code)]
 fn map_relation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Relation> {
     Ok(Relation {
         id: r.get(0)?,

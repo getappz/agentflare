@@ -1,4 +1,5 @@
 pub mod fetch;
+pub mod index_types;
 pub mod rustdoc;
 pub mod store;
 

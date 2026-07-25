@@ -8,7 +8,8 @@
 use crate::components::{get_components, rule_targets};
 use crate::jsonc::{read_json_object, write_json_pretty};
 use crate::paths::{
-    agentflare_binary, claude_settings_path, home, opencode_config_path, opencode_rules_dir,
+    agentflare_binary, claude_settings_path, home, opencode_config_path, opencode_json_path,
+    opencode_rules_dir,
 };
 use crate::rule_text;
 use crate::ui;
@@ -24,7 +25,7 @@ fn cwd() -> PathBuf {
 /// content matches a KNOWN old version verbatim — anything else (already
 /// current, or diverging for some other reason) is left untouched, since
 /// that "some other reason" is most likely a user edit.
-fn is_stale_rule(path: &PathBuf, current: &str) -> bool {
+pub(crate) fn is_stale_rule(path: &PathBuf, current: &str) -> bool {
     let Some(filename) = path.file_name().and_then(|f| f.to_str()) else {
         return false;
     };
@@ -197,6 +198,32 @@ fn add_hook_entry(
     true
 }
 
+/// Adds one prompt-type hook entry for `event` unless an entry containing
+/// `marker` is already present. Same idempotency pattern as `add_hook_entry`
+/// but for `"type": "prompt"` hooks (used for PostToolUseFailure judge).
+fn add_prompt_hook_entry(
+    hooks_obj: &mut Map<String, Value>,
+    event: &str,
+    marker: &str,
+    matcher: &str,
+    prompt: &str,
+    timeout: u64,
+) -> bool {
+    let arr = hooks_obj
+        .entry(event)
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .unwrap();
+    if arr.iter().any(|v| v.to_string().contains(marker)) {
+        return false;
+    }
+    arr.push(json!({
+        "matcher": matcher,
+        "hooks": [{ "type": "prompt", "prompt": prompt, "timeout": timeout, "continueOnBlock": true }]
+    }));
+    true
+}
+
 fn wire_claude_code() {
     let path = claude_settings_path();
     let mut settings = read_json_object(&path, || json!({}));
@@ -234,6 +261,14 @@ fn wire_claude_code() {
         "hook pre-compact",
         format!("\"{bin}\" hook pre-compact"),
         5,
+    );
+    added |= add_prompt_hook_entry(
+        hooks_obj,
+        "PostToolUseFailure",
+        "genuine FRICTION",
+        "Bash|Edit|Write",
+        crate::rule_text::VENT_JUDGE_PROMPT,
+        15,
     );
 
     if !added {
@@ -381,6 +416,20 @@ fn wire_opencode() {
     let rules_dir = opencode_rules_dir();
     let rule_files: &[&str] = &["exa.md", "git.md", "lean-ctx.md"];
 
+    // opencode deep-merges opencode.json with opencode.jsonc, so a rule
+    // entry the user (or a hand-written opencode.json) already registered
+    // over there counts as present too -- otherwise this would keep
+    // re-adding a duplicate entry into opencode.jsonc every run.
+    let sibling_instructions: Vec<String> = read_json_object(&opencode_json_path(), || json!({}))
+        .get("instructions")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut config = read_json_object(&path, || json!({}));
 
     let instructions = config
@@ -414,7 +463,8 @@ fn wire_opencode() {
         let path_str = rule_path.to_string_lossy().replace('\\', "/");
         let has_it = arr
             .iter()
-            .any(|v| v.as_str().map(|s| s.contains(file)).unwrap_or(false));
+            .any(|v| v.as_str().map(|s| s.contains(file)).unwrap_or(false))
+            || sibling_instructions.iter().any(|s| s.contains(file));
         if !has_it && rule_path.exists() {
             arr.push(json!(path_str));
             added += 1;
@@ -679,6 +729,7 @@ mod tests {
             assert!(content.contains("UserPromptSubmit"));
             assert!(content.contains("PreToolUse"));
             assert!(content.contains("PreCompact"));
+            assert!(content.contains("PostToolUseFailure"));
         });
     }
 
@@ -730,6 +781,32 @@ mod tests {
             wire_claude_code();
             let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
             assert!(!content.contains("SessionEnd"));
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_wires_post_tool_use_failure_judge_prompt() {
+        with_temp_home(|| {
+            wire_claude_code();
+            let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+            assert!(
+                content.contains("genuine FRICTION"),
+                "expected the judge-prompt marker in PostToolUseFailure hooks"
+            );
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_post_tool_use_failure_is_idempotent() {
+        with_temp_home(|| {
+            wire_claude_code();
+            let first = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+            wire_claude_code();
+            let second = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+            assert_eq!(
+                first, second,
+                "second run must not duplicate PostToolUseFailure"
+            );
         });
     }
 
@@ -865,6 +942,32 @@ mod tests {
                 first, second,
                 "second run should not duplicate instructions"
             );
+        });
+    }
+
+    #[test]
+    fn wire_opencode_does_not_duplicate_instructions_already_in_sibling_json_file() {
+        with_temp_home(|| {
+            let opencode_dir = home().join(".config").join("opencode");
+            let rules_dir = opencode_dir.join("rules");
+            fs::create_dir_all(&rules_dir).unwrap();
+            fs::write(rules_dir.join("exa.md"), "# exa\n").unwrap();
+
+            let exa_path = rules_dir
+                .join("exa.md")
+                .to_string_lossy()
+                .replace('\\', "/");
+            fs::write(
+                opencode_dir.join("opencode.json"),
+                serde_json::json!({ "instructions": [exa_path] }).to_string(),
+            )
+            .unwrap();
+
+            wire_opencode();
+
+            // Nothing needed adding (exa.md is already covered by the
+            // sibling file), so jsonc is never even created.
+            assert!(!opencode_dir.join("opencode.jsonc").exists());
         });
     }
 

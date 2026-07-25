@@ -18,6 +18,14 @@ pub enum VentCmd {
     },
     /// Triage buffered vents now (also run automatically once per turn).
     Consolidate,
+    /// List (or file, with --title/--body) pending agentflare-core vents as
+    /// ONE batched GitHub issue on getappz/agentflare.
+    File {
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+    },
     /// List triaged vents for this repo's project.
     List {
         #[arg(long)]
@@ -33,9 +41,11 @@ pub fn run(args: VentArgs) {
             tags,
         } => {
             let severity = crate::vent::classify::normalize_severity(Some(&severity));
-            let log = crate::vent::paths::log_path();
-            match crate::vent::capture::append(&log, None, severity, &tags, message.trim()) {
-                Ok(id) => println!("vented {id}"),
+            match crate::vent::capture::append_routed(None, severity, &tags, message.trim()) {
+                Ok((id, true)) => {
+                    println!("vent {id} suppressed (same friction already vented recently)")
+                }
+                Ok((id, false)) => println!("vented {id}"),
                 Err(e) => eprintln!("vent failed: {e}"),
             }
         }
@@ -56,6 +66,49 @@ pub fn run(args: VentArgs) {
             );
             for id in r.items_created {
                 println!("  filed item {id}");
+            }
+        }
+        VentCmd::File { title, body } => {
+            let log = crate::vent::paths::global_log_path();
+            let filed = crate::vent::paths::global_filed_path();
+            let batch =
+                crate::vent::file::pending_batch(&log, &filed, chrono::Utc::now().timestamp());
+            if batch.is_empty() {
+                println!("nothing to file");
+                return;
+            }
+            let (title, body) = match (title, body) {
+                (Some(title), Some(body)) => (title, body),
+                (None, None) => {
+                    println!("{} pending agentflare-core vent(s):", batch.len());
+                    for g in &batch {
+                        println!("  [{}] seen×{} {}", g.severity, g.seen_count, g.message);
+                    }
+                    println!("re-run with --title and --body to file these as one GitHub issue");
+                    return;
+                }
+                (title, body) => {
+                    eprintln!(
+                        "vent file: need both --title and --body to file (got title={}, body={})",
+                        title.is_some(),
+                        body.is_some()
+                    );
+                    return;
+                }
+            };
+            match crate::vent::file::create_github_issue(&title, &body) {
+                Ok(url) => {
+                    let keys: Vec<String> = batch.iter().map(|g| g.topic_key.clone()).collect();
+                    let now = chrono::Utc::now().timestamp();
+                    match crate::vent::file::mark_filed(&filed, &keys, &url, now) {
+                        Ok(()) => println!("filed {url} ({} vent(s))", keys.len()),
+                        Err(e) => eprintln!(
+                            "filed {url} but failed to record state ({e}) — re-filing will \
+                             create a duplicate issue until this is reconciled by hand"
+                        ),
+                    }
+                }
+                Err(e) => eprintln!("gh issue create failed: {e}"),
             }
         }
         VentCmd::List { actionable } => {
@@ -104,6 +157,28 @@ pub fn run(args: VentArgs) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_command_reports_nothing_when_batch_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, filed) = (dir.path().join("v.jsonl"), dir.path().join("v.filed.json"));
+        let batch = crate::vent::file::pending_batch(&log, &filed, chrono::Utc::now().timestamp());
+        assert!(batch.is_empty(), "no log file yet means nothing pending");
+    }
+
+    #[test]
+    fn say_via_append_routed_marks_agentflare_core_message_as_suppressed_on_repeat() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (_, first) =
+                crate::vent::capture::append_routed(None, "high", &[], "af-guard blocked a push")
+                    .unwrap();
+            let (_, second) =
+                crate::vent::capture::append_routed(None, "high", &[], "af-guard blocked a push")
+                    .unwrap();
+            assert!(!first);
+            assert!(second);
+        });
+    }
+
     #[test]
     fn append_then_read_back_roundtrips() {
         let dir = tempfile::tempdir().unwrap();

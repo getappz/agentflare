@@ -68,7 +68,6 @@ skill-registry = { package = "agentflare-skill-registry", path = "crates/skill-r
 gateway-registry = { package = "agentflare-gateway-registry", path = "crates/gateway-registry" }
 flare-output = { package = "agentflare-flare-output", path = "crates/flare-output" }
 regex = "1"
-sysinfo = { version = "0.34", optional = true, default-features = false, features = ["system"] }
 agentflare-artifacts = { path = "crates/agentflare-artifacts" }
 agentflare-backend = { package = "agentflare-backend", path = "crates/agentflare-backend" }
 db_kit = { package = "agentflare-db-kit", path = "crates/agentflare-db-kit" }
@@ -76,7 +75,6 @@ agent-detector = "0.2.1"
 flare-search-kit = { path = "crates/flare-search-kit" }
 axum = "0.8"
 fs2 = "0.4"
-tower-http = { version = "0.6", features = ["trace"] }
 rust-embed = "8"
 tokio-stream = { version = "0.1", features = ["sync"] }
 agentflare-store = { path = "crates/agentflare-store" }
@@ -93,7 +91,6 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 
 [features]
 default = []
-process-tree = ["sysinfo"]
 # Off by default, not part of released builds: syncs Claude Code's
 # skillOverrides to suppress skill descriptions from the always-on listing.
 # Measured to save ~900 tokens/turn of context-window space, but that's

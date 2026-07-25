@@ -327,6 +327,14 @@ pub(crate) struct VentRequest {
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct VentFileRequest {
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+    #[serde(default)]
+    pub(crate) body: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct MemoryRequest {
     #[schemars(description = "Action: compact|context|curate|handoff|recall|relate|remember")]
     pub(crate) action: String,

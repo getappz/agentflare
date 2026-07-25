@@ -46,7 +46,7 @@ pub struct DocMatch {
     pub score: f64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DocUpsertOpts {
     pub title: Option<String>,
     pub doc_type: Option<String>,
@@ -57,6 +57,29 @@ pub struct DocUpsertOpts {
     pub source: Option<String>,
     pub metadata: Option<String>,
     pub size: Option<i64>,
+    /// Whether an update should snapshot the previous row into
+    /// `store_doc_history`. Defaults to `true` to preserve existing
+    /// behavior; cache-type consumers (e.g. flare-docs) that never need
+    /// "what changed between refreshes" can set this to `false` to avoid
+    /// unbounded history-table growth from repeated re-fetches.
+    pub track_history: bool,
+}
+
+impl Default for DocUpsertOpts {
+    fn default() -> Self {
+        Self {
+            title: None,
+            doc_type: None,
+            blob_hash: None,
+            mime: None,
+            tags: None,
+            session_id: None,
+            source: None,
+            metadata: None,
+            size: None,
+            track_history: true,
+        }
+    }
 }
 
 impl Store {
@@ -158,14 +181,19 @@ impl Store {
         )) = existing
         {
             let new_version = old_version + 1;
-            let history_id = db_kit::ids::new_id();
 
-            // Snapshot current version to history
-            tx.execute(
-                "INSERT INTO store_doc_history (id, doc_id, version, content, blob_hash, mime, title, metadata, size, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT title FROM store_documents WHERE id = ?2), ?7, ?8, ?9)",
-                params![history_id, existing_id, old_version, old_content, old_blob_hash, old_mime, old_metadata, old_size, now],
-            )?;
+            // Snapshot current version to history, unless the caller opted
+            // out (cache-type documents) or content is byte-identical to
+            // what's already stored (a no-op re-upsert has nothing to
+            // snapshot).
+            if opts.track_history && old_content != content {
+                let history_id = db_kit::ids::new_id();
+                tx.execute(
+                    "INSERT INTO store_doc_history (id, doc_id, version, content, blob_hash, mime, title, metadata, size, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT title FROM store_documents WHERE id = ?2), ?7, ?8, ?9)",
+                    params![history_id, existing_id, old_version, old_content, old_blob_hash, old_mime, old_metadata, old_size, now],
+                )?;
+            }
 
             tx.execute(
                 "UPDATE store_documents SET
@@ -336,36 +364,6 @@ impl Store {
         }
     }
 
-    pub fn doc_hard_delete(&self, id: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn();
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-        let Some(rowid) = tx
-            .query_row(
-                "SELECT rowid FROM store_documents WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-        else {
-            return Ok(false);
-        };
-
-        // Delete dependents before the parent row, all in one transaction.
-        tx.execute(
-            "DELETE FROM store_doc_history WHERE doc_id = ?1",
-            params![id],
-        )?;
-        tx.execute("DELETE FROM store_docs_vec WHERE doc_id = ?1", params![id])?;
-        tx.execute(
-            "DELETE FROM store_docs_fts WHERE rowid = ?1",
-            params![rowid],
-        )?;
-        tx.execute("DELETE FROM store_documents WHERE id = ?1", params![id])?;
-        tx.commit()?;
-        Ok(true)
-    }
-
     pub fn doc_history(&self, doc_id: &str) -> rusqlite::Result<Vec<DocVersion>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
@@ -391,34 +389,6 @@ impl Store {
         rows.collect()
     }
 
-    pub fn doc_get_version(
-        &self,
-        doc_id: &str,
-        version: i32,
-    ) -> rusqlite::Result<Option<DocVersion>> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT id, doc_id, version, content, blob_hash, mime, title, metadata, size, created_at
-                 FROM store_doc_history WHERE doc_id = ?1 AND version = ?2",
-            params![doc_id, version],
-            |row| {
-                Ok(DocVersion {
-                    id: row.get(0)?,
-                    doc_id: row.get(1)?,
-                    version: row.get(2)?,
-                    content: row.get(3)?,
-                    blob_hash: row.get(4)?,
-                    mime: row.get(5)?,
-                    title: row.get(6)?,
-                    metadata: row.get(7)?,
-                    size: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            },
-        )
-        .optional()
-    }
-
     pub fn doc_search(
         &self,
         project_id: &str,
@@ -438,7 +408,16 @@ impl Store {
              ORDER BY rank
              LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![query, project_id, limit as i64], |row| {
+        // store_docs_fts is a single unnamed-column table matched with a bare
+        // `MATCH ?1` (no AND/OR structure of our own) -- fts_phrase_query
+        // individually quotes every whitespace token so embedded FTS5
+        // operators/column-filter syntax (NEAR, *, `word:`) in the raw query
+        // can't be reinterpreted as query structure. Without this, a query
+        // like "axum::extract::State" errors ("no such column: axum")
+        // instead of searching, because FTS5 parses a bare `word:` prefix as
+        // a column filter.
+        let fts_query = flare_search_kit::fts_phrase_query(query);
+        let rows = stmt.query_map(params![fts_query, project_id, limit as i64], |row| {
             Ok(DocMatch {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
@@ -665,6 +644,26 @@ mod tests {
     }
 
     #[test]
+    fn fts_search_handles_double_colon_query_without_erroring() {
+        // Regression: a raw `::`-containing query (the natural way to
+        // search for a Rust fully-qualified path, e.g. "axum::extract::State")
+        // used to be passed straight to FTS5 MATCH, which parses a bare
+        // `word:` prefix as column-filter syntax and errored with
+        // "no such column: axum" instead of searching.
+        let s = store();
+        s.doc_upsert(
+            "p",
+            "/state.md",
+            "State is an extractor for axum::extract::State shared state",
+        )
+        .unwrap();
+
+        let results = s.doc_search("p", "axum::extract::State", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "/state.md");
+    }
+
+    #[test]
     fn fts_search_scoped_to_project() {
         let s = store();
         s.doc_upsert("p1", "/doc.md", "shared term").unwrap();
@@ -793,6 +792,63 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].version, 1);
         assert_eq!(history[0].content, "v1");
+    }
+
+    #[test]
+    fn track_history_false_skips_history_row() {
+        let s = store();
+        s.doc_upsert_with_opts(
+            "p",
+            "/v.md",
+            "v1",
+            DocUpsertOpts {
+                track_history: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let updated = s
+            .doc_upsert_with_opts(
+                "p",
+                "/v.md",
+                "v2",
+                DocUpsertOpts {
+                    track_history: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.content, "v2");
+        assert!(s.doc_history(&updated.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn identical_content_reupsert_skips_history_row() {
+        let s = store();
+        let doc = s.doc_upsert("p", "/same.md", "same content").unwrap();
+        let updated = s.doc_upsert("p", "/same.md", "same content").unwrap();
+        assert_eq!(updated.id, doc.id);
+        assert!(
+            s.doc_history(&updated.id).unwrap().is_empty(),
+            "no history row should be written when content is unchanged"
+        );
+    }
+
+    #[test]
+    fn project_path_unique_index_rejects_duplicate_raw_insert() {
+        let s = store();
+        s.doc_upsert("p", "/dup.md", "content").unwrap();
+        let conn = s.conn();
+        let result = conn.execute(
+            "INSERT INTO store_documents
+             (id, project_id, path, content, title, doc_type, blob_hash, mime, tags, session_id, source, metadata, size, version, created_at, updated_at)
+             VALUES ('dup-id-2', 'p', '/dup.md', 'other', '', 'file', NULL, '', '[]', NULL, '', '{}', 0, 1, 0, 0)",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "duplicate (project_id, path) should be rejected by the unique index"
+        );
     }
 
     #[test]

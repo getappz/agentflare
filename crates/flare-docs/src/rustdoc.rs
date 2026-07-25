@@ -1,5 +1,6 @@
 use crate::fetch::{FetchError, FetchedBytes, Fetcher, decompress_zstd};
-use crate::store::{DocsStore, Error as StoreError};
+use crate::index_types::{IndexCrate, indexed_items};
+use crate::store::{BatchItem, DocsStore, Error as StoreError};
 use agentflare_store::documents::{DocUpsertOpts, Document};
 
 #[derive(Debug, thiserror::Error)]
@@ -101,10 +102,54 @@ pub fn store_fetched(
         source: Some("docsrs".to_string()),
         tags: Some(vec![crate_name.to_string(), "rust".to_string()]),
         blob_hash: Some(store_raw_json_blob(store, &decompressed)?),
+        track_history: false,
         ..Default::default()
     };
     let id_path = docs_id_path(crate_name, version);
-    Ok(store.upsert(&id_path, &docstring, opts)?)
+    let overview_doc = store.upsert(&id_path, &docstring, opts)?;
+
+    // Per-item indexing is a best-effort enhancement on top of the
+    // crate-overview doc above, which has already succeeded. A rustdoc-json
+    // schema mismatch on some items (e.g. an `ItemKind` variant newer than
+    // this crate's pinned `rustdoc-types` version recognizes) fails
+    // `IndexCrate`'s deserialization for the *entire* crate's item set --
+    // that must not turn an otherwise-successful fetch into a reported
+    // failure, or mask the overview doc's success from the caller.
+    if let Err(e) = index_items(store, &decompressed, crate_name, &id_path) {
+        eprintln!("flare-docs: per-item indexing failed for {crate_name}@{version}: {e}");
+    }
+
+    Ok(overview_doc)
+}
+
+/// Parses the full rustdoc-JSON `index`/`paths` maps and upserts one
+/// document per item that has both a docstring and a public path (see
+/// [`indexed_items`]). Runs as a single batched transaction via
+/// [`DocsStore::upsert_batch`] — a crate can have thousands of items, and
+/// upserting them one at a time would turn a single fetch into thousands of
+/// individual commits.
+fn index_items(
+    store: &DocsStore,
+    decompressed_json: &[u8],
+    crate_name: &str,
+    crate_id_path: &str,
+) -> Result<usize, RustdocError> {
+    let index_crate: IndexCrate = serde_json::from_slice(decompressed_json)
+        .map_err(|e| RustdocError::InvalidJson(e.to_string()))?;
+
+    let batch: Vec<BatchItem> = indexed_items(&index_crate)
+        .into_iter()
+        .map(|item| BatchItem {
+            path: format!("{crate_id_path}/item/{}", item.fq_path),
+            content: item.docs,
+            title: item.name,
+            doc_type: "rust-item".to_string(),
+            tags: vec![crate_name.to_string(), "rust".to_string(), item.kind],
+            source: "docsrs".to_string(),
+        })
+        .collect();
+
+    Ok(store.upsert_batch(&batch)?)
 }
 
 fn store_raw_json_blob(store: &DocsStore, decompressed_json: &[u8]) -> Result<String, StoreError> {
@@ -231,10 +276,89 @@ mod tests {
     }
 
     #[test]
+    fn fetch_and_store_indexes_individual_items_with_docs() {
+        let raw_json = br#"{
+            "root": 0,
+            "index": {
+                "0": { "docs": "A fake crate for testing." },
+                "1": { "name": "State", "docs": "Extractor for shared state." },
+                "2": { "name": "Router", "docs": "The router type." }
+            },
+            "paths": {
+                "1": { "crate_id": 0, "path": ["fake_crate", "extract", "State"], "kind": "struct" },
+                "2": { "crate_id": 0, "path": ["fake_crate", "Router"], "kind": "struct" }
+            }
+        }"#;
+        let compressed = zstd::stream::encode_all(&raw_json[..], 0).unwrap();
+        let fetcher = FakeFetcher {
+            response: compressed,
+        };
+        let store = DocsStore::open_memory().unwrap();
+
+        let doc = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
+        assert_eq!(doc.content, "A fake crate for testing.");
+
+        let state_doc = store
+            .get_by_path("docsrs/fake-crate/1.0.0/item/fake_crate::extract::State")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state_doc.content, "Extractor for shared state.");
+        assert_eq!(state_doc.title, "State");
+
+        let router_doc = store
+            .get_by_path("docsrs/fake-crate/1.0.0/item/fake_crate::Router")
+            .unwrap()
+            .unwrap();
+        assert_eq!(router_doc.content, "The router type.");
+
+        let hits = store.search("Extractor for shared state", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].path,
+            "docsrs/fake-crate/1.0.0/item/fake_crate::extract::State"
+        );
+    }
+
+    #[test]
+    fn fetch_and_store_survives_unparseable_item_index() {
+        // Regression: an item whose "kind" is a value the pinned
+        // rustdoc-types version doesn't recognize fails IndexCrate's
+        // deserialization for the whole crate -- fetch_and_store must still
+        // return Ok with the overview doc, not propagate that as a failure.
+        let raw_json = br#"{
+            "root": 0,
+            "index": {
+                "0": { "docs": "A fake crate for testing." },
+                "1": { "name": "Weird", "docs": "docs for an item rustdoc-types can't parse yet." }
+            },
+            "paths": {
+                "1": { "crate_id": 0, "path": ["fake_crate", "Weird"], "kind": "some_future_kind" }
+            }
+        }"#;
+        let compressed = zstd::stream::encode_all(&raw_json[..], 0).unwrap();
+        let fetcher = FakeFetcher {
+            response: compressed,
+        };
+        let store = DocsStore::open_memory().unwrap();
+
+        let doc = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
+        assert_eq!(doc.content, "A fake crate for testing.");
+
+        // The unparseable item simply wasn't indexed -- no crash, no error.
+        assert!(
+            store
+                .get_by_path("docsrs/fake-crate/1.0.0/item/fake_crate::Weird")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn fetch_and_store_persists_the_docstring() {
         let raw_json = br#"{
-            "root": "0:0",
-            "index": { "0:0": { "docs": "A fake crate for testing." } }
+            "root": 0,
+            "index": { "0": { "docs": "A fake crate for testing." } },
+            "paths": {}
         }"#;
         let compressed = zstd::stream::encode_all(&raw_json[..], 0).unwrap();
         let fetcher = FakeFetcher {

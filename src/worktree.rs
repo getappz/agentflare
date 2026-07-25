@@ -75,6 +75,30 @@ pub fn push_and_open_pr(
             return None;
         }
     };
+    // Check for an existing PR on this branch before opening a new one.
+    // GitHub's own API only rejects a duplicate while the existing PR is
+    // still open -- once it's merged (or manually closed), a second PR
+    // against the same branch is perfectly legal to create, which is
+    // exactly how a `done` re-run on an already-merged item ended up
+    // opening a redundant PR (2026-07-25). A lookup failure here is
+    // soft-failed the same way the rest of this function is: log and fall
+    // through to `create`, since a rare duplicate is a far smaller harm
+    // than silently never opening a PR on a lookup hiccup.
+    match crate::github::pulls::find_existing(&client, &repo, &branch) {
+        Ok(Some(existing)) => {
+            if let Some(p) = progress {
+                p.send(1.0, Some(1.0), Some("PR already exists".into()));
+            }
+            return Some(existing.html_url);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!(
+                "worktree: could not check for an existing PR for item {}: {e} -- creating one anyway",
+                item.id
+            );
+        }
+    }
     match crate::github::pulls::create(
         &client,
         &repo,
