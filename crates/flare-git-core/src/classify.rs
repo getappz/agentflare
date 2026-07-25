@@ -9,11 +9,24 @@
 //! git's full subcommand surface (submodule, bisect, notes, gc, lfs, ...).
 //! Only the specific, deliberately-chosen cases below (protected-branch
 //! checkout/switch/delete/rename, trust-root push, low-level plumbing,
-//! `worktree`) are ever denied -- those are known and intentional, not
-//! "doesn't recognize it". `RedirectToWorktree` exists in the `Disposition` enum for API
-//! completeness (mirroring the inspiration project's 4-way model) but v1's
-//! policy never produces it — agentflare has no per-agent worktree binding
-//! data available at classify time yet.
+//! mutating `worktree` subcommands) are ever denied -- those are known and
+//! intentional, not "doesn't recognize it". `RedirectToWorktree` exists in
+//! the `Disposition` enum for API completeness (mirroring the inspiration
+//! project's 4-way model) but v1's policy never produces it — agentflare has
+//! no per-agent worktree binding data available at classify time yet.
+//!
+//! `worktree`'s deny is further scoped: read-only subcommands (`list`,
+//! `prune --dry-run`) always pass through regardless of tracking status --
+//! decided right here since it only needs `args`. Mutating `worktree`
+//! subcommands still classify as `Deny` from this pure function, same as
+//! every other deny case above -- but `classify()` (the I/O-resolving
+//! wrapper) then downgrades ANY deny to `Passthrough` when the repo isn't
+//! actually agentflare-tracked (`agentflare_shim::in_scoped_project`).
+//! Every one of this policy's protections exists for agentflare's own
+//! orchestration; none of that rationale holds in a project agentflare
+//! doesn't track, and this shim is installed globally on PATH, so without
+//! that gate it would police ordinary git use in every unrelated project on
+//! the machine too.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -221,14 +234,24 @@ pub fn classify_pure(
         // Every other `branch` usage (listing, creating a new branch,
         // --set-upstream-to, ...) stays Passthrough.
         "branch" => {
-            let deletes_or_renames = args
-                .iter()
-                .any(|a| matches!(a.as_str(), "-D" | "-d" | "--delete" | "-M" | "-m" | "--move"));
+            let deletes_or_renames = args.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "-D" | "-d" | "--delete" | "-M" | "-m" | "--move"
+                )
+            });
             if !deletes_or_renames {
                 return Disposition::Passthrough;
             }
-            let targets: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).map(String::as_str).collect();
-            if targets.iter().any(|t| is_protected_branch(t, Some(default_branch))) {
+            let targets: Vec<&str> = args
+                .iter()
+                .filter(|a| !a.starts_with('-'))
+                .map(String::as_str)
+                .collect();
+            if targets
+                .iter()
+                .any(|t| is_protected_branch(t, Some(default_branch)))
+            {
                 Disposition::Deny {
                     reason: "this 'git branch' invocation would delete or rename the repo's default branch — blocked by the agentflare git shim.".to_string(),
                 }
@@ -279,9 +302,20 @@ pub fn classify_pure(
             },
             TrustRootTouch::Clean => Disposition::Passthrough,
         },
-        "worktree" => Disposition::Deny {
-            reason: "'git worktree' is orchestrator-managed by agentflare — use the `item` MCP tool's claim flow instead of calling it directly.".to_string(),
-        },
+        "worktree" => {
+            let is_read_only = match args.first().map(String::as_str) {
+                Some("list") => true,
+                Some("prune") => args.iter().any(|a| a == "--dry-run"),
+                _ => false,
+            };
+            if is_read_only {
+                Disposition::Passthrough
+            } else {
+                Disposition::Deny {
+                    reason: "'git worktree' is orchestrator-managed by agentflare — use the `item` MCP tool's claim flow instead of calling it directly.".to_string(),
+                }
+            }
+        }
         // Fail-open: anything not explicitly matched above is allowed through
         // unchanged. This shim must never block a git subcommand it simply
         // hasn't been taught about yet.
@@ -365,6 +399,22 @@ fn pushed_branch(repo_root: &Path, args: &[String]) -> Option<String> {
 /// trust-root path, then delegates to `classify_pure`.
 #[must_use]
 pub fn classify(repo_root: &Path, subcommand: &str, args: &[String]) -> Event {
+    classify_with_home(repo_root, subcommand, args, dirs::home_dir().as_deref())
+}
+
+/// Same as `classify`, but with the `in_scoped_project` home boundary
+/// injectable -- the real ambient home dir's exact path (short-name vs.
+/// long-name forms, drive/case differences) isn't something a test should
+/// depend on to stay deterministic across platforms/CI runners; a synthetic
+/// `home` here mirrors how `agentflare_shim::in_scoped_project`'s own tests
+/// already avoid that dependency.
+#[must_use]
+pub fn classify_with_home(
+    repo_root: &Path,
+    subcommand: &str,
+    args: &[String],
+    home: Option<&Path>,
+) -> Event {
     let default_branch = resolve_default_branch(repo_root);
     // Resolve the actual pushed branch once, then derive both push facts from
     // it: whether it carries trust-root changes and whether it *is* the
@@ -379,13 +429,26 @@ pub fn classify(repo_root: &Path, subcommand: &str, args: &[String]) -> Event {
     let targets_default_branch = pushed
         .as_deref()
         .is_some_and(|b| is_protected_branch(b, Some(&default_branch)));
-    let disposition = classify_pure(
+    let mut disposition = classify_pure(
         subcommand,
         args,
         &default_branch,
         &trust_root_touch,
         targets_default_branch,
     );
+    // Every deny above (protected-branch checkout/switch/delete/rename,
+    // trust-root push, plumbing block, worktree) exists to protect agentflare's
+    // own orchestration in a project it actually tracks. None of that rationale
+    // holds in an untracked repo -- this shim is installed globally on PATH, so
+    // without this gate it would police ordinary git use in every unrelated
+    // project on the machine too, which is worse than the risk it's meant to
+    // prevent. `in_scoped_project` is agentflare-shim's own established
+    // project-detection walk-up (shared so this doesn't reinvent it).
+    if matches!(disposition, Disposition::Deny { .. })
+        && !agentflare_shim::in_scoped_project(repo_root, home)
+    {
+        disposition = Disposition::Passthrough;
+    }
     Event {
         subcommand: subcommand.to_string(),
         args: args.to_vec(),
@@ -507,6 +570,62 @@ mod tests {
             classify_pure(
                 "worktree",
                 &args(&["add", "../x"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
+            Disposition::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn worktree_remove_is_denied() {
+        assert!(matches!(
+            classify_pure(
+                "worktree",
+                &args(&["remove", "../x"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
+            Disposition::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn worktree_list_is_passthrough() {
+        assert_eq!(
+            classify_pure(
+                "worktree",
+                &args(&["list"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
+            Disposition::Passthrough
+        );
+    }
+
+    #[test]
+    fn worktree_prune_dry_run_is_passthrough() {
+        assert_eq!(
+            classify_pure(
+                "worktree",
+                &args(&["prune", "--dry-run"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false
+            ),
+            Disposition::Passthrough
+        );
+    }
+
+    #[test]
+    fn worktree_prune_without_dry_run_is_denied() {
+        assert!(matches!(
+            classify_pure(
+                "worktree",
+                &args(&["prune"]),
                 "master",
                 &TrustRootTouch::Clean,
                 false
@@ -838,9 +957,75 @@ mod tests {
     fn bare_push_on_default_branch_is_denied_end_to_end() {
         // The common case: `git push` while checked out on the default branch
         // resolves the current branch (master) and must be blocked, PR-only.
+        // Needs the `.agentflare` marker now that denies are gated to tracked
+        // repos -- this test is about the push-deny logic, not the gate.
         let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
         crate::shell::run_in(&repo.path, &["commit", "--allow-empty", "-m", "init"]).unwrap();
         let event = classify(&repo.path, "push", &[]);
+        assert!(
+            matches!(event.disposition, Disposition::Deny { .. }),
+            "{:?}",
+            event.disposition
+        );
+    }
+
+    #[test]
+    fn worktree_add_is_denied_in_an_agentflare_tracked_repo() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        std::fs::write(repo.path.join(".agentflare").join("project.json"), "{}").unwrap();
+        let event = classify(
+            &repo.path,
+            "worktree",
+            &["add".to_string(), "../x".to_string()],
+        );
+        assert!(
+            matches!(event.disposition, Disposition::Deny { .. }),
+            "{:?}",
+            event.disposition
+        );
+    }
+
+    #[test]
+    fn worktree_add_passes_through_in_an_untracked_repo() {
+        // No `.agentflare/project.json` -- this repo has nothing to do with
+        // agentflare's item-tracking system, so the orchestrator-managed
+        // rationale doesn't apply and ordinary worktree use must not be blocked.
+        // Bounds the walk-up with the repo's own parent as a synthetic home,
+        // same technique agentflare_shim::in_scoped_project's own tests use --
+        // the real ambient home dir's exact path form isn't something a test
+        // should depend on to stay deterministic across platforms/CI runners.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        let event = classify_with_home(
+            &repo.path,
+            "worktree",
+            &["add".to_string(), "../x".to_string()],
+            repo.path.parent(),
+        );
+        assert_eq!(event.disposition, Disposition::Passthrough);
+    }
+
+    #[test]
+    fn protected_branch_checkout_passes_through_in_an_untracked_repo() {
+        // The untracked-repo gate isn't worktree-specific: every deny this
+        // policy produces exists for agentflare's own orchestration, so none
+        // of it should apply outside a project agentflare actually tracks.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        let event = classify_with_home(
+            &repo.path,
+            "checkout",
+            &["master".to_string()],
+            repo.path.parent(),
+        );
+        assert_eq!(event.disposition, Disposition::Passthrough);
+    }
+
+    #[test]
+    fn protected_branch_checkout_is_still_denied_in_a_tracked_repo() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        let event = classify(&repo.path, "checkout", &["master".to_string()]);
         assert!(
             matches!(event.disposition, Disposition::Deny { .. }),
             "{:?}",

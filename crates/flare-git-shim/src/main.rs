@@ -133,9 +133,10 @@ fn snapshots_enabled() -> bool {
 
 /// Deny reason for the canonical-repo HEAD-detach guard, or `None` to let
 /// the op through. Scoped tightly on purpose: agent-invoked (self-reported
-/// via env markers, same as `agentflare-shim`'s own gate) AND the canonical
-/// (non-worktree) checkout AND the command would actually detach HEAD.
-/// Interactive human use, and any use inside an isolated worktree, is
+/// via env markers, same as `agentflare-shim`'s own gate) AND an agentflare-
+/// tracked project AND the canonical (non-worktree) checkout AND the command
+/// would actually detach HEAD. Interactive human use, any use inside an
+/// isolated worktree, and any project agentflare doesn't track, are all
 /// completely unaffected.
 fn deny_canonical_detach_reason(
     repo_root: &Path,
@@ -146,6 +147,9 @@ fn deny_canonical_detach_reason(
         return None;
     }
     if !classify::agent_invocation_detected() {
+        return None;
+    }
+    if !agentflare_shim::in_scoped_project(repo_root, dirs::home_dir().as_deref()) {
         return None;
     }
     if branch::is_linked_worktree(repo_root) {
