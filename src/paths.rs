@@ -53,15 +53,34 @@ pub fn opencode_dir() -> PathBuf {
     home().join(".config").join("opencode")
 }
 
-/// `~/.config/opencode/opencode.jsonc` — OpenCode's config file (JSONC).
+/// `~/.config/opencode/opencode.jsonc` — the file agentflare itself owns and
+/// writes to. A hand-maintained sibling `opencode.json` (see
+/// `opencode_json_path`) commonly carries the user's own MCP/plugin entries;
+/// opencode deep-merges both, but agentflare only ever writes this one.
 pub fn opencode_config_path() -> PathBuf {
     opencode_dir().join("opencode.jsonc")
+}
+
+/// `~/.config/opencode/opencode.json` — opencode's other config file.
+/// Read-only from agentflare's side: idempotency checks must look here too
+/// (via `components::opencode_config_merged`) so a value the user hand-added
+/// here isn't seen as "missing" and re-written into `opencode.jsonc`, but
+/// writes always target `opencode_config_path` instead of this file.
+pub fn opencode_json_path() -> PathBuf {
+    opencode_dir().join("opencode.json")
 }
 
 /// `~/.config/opencode/rules` — where agentflare drops its rule markdown for
 /// OpenCode.
 pub fn opencode_rules_dir() -> PathBuf {
     opencode_dir().join("rules")
+}
+
+/// `~/.config/opencode/plugin` — opencode auto-loads every plugin file
+/// dropped directly in this directory (singular "plugin"; the similarly
+/// named "plugins" is not an opencode convention and isn't scanned).
+pub fn opencode_plugin_dir() -> PathBuf {
+    opencode_dir().join("plugin")
 }
 
 /// Shared by mcp_server.rs (serving skill_search/skill_load) and

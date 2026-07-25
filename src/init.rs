@@ -8,7 +8,8 @@
 use crate::components::{get_components, rule_targets};
 use crate::jsonc::{read_json_object, write_json_pretty};
 use crate::paths::{
-    agentflare_binary, claude_settings_path, home, opencode_config_path, opencode_rules_dir,
+    agentflare_binary, claude_settings_path, home, opencode_config_path, opencode_json_path,
+    opencode_rules_dir,
 };
 use crate::rule_text;
 use crate::ui;
@@ -381,6 +382,20 @@ fn wire_opencode() {
     let rules_dir = opencode_rules_dir();
     let rule_files: &[&str] = &["exa.md", "git.md", "lean-ctx.md"];
 
+    // opencode deep-merges opencode.json with opencode.jsonc, so a rule
+    // entry the user (or a hand-written opencode.json) already registered
+    // over there counts as present too -- otherwise this would keep
+    // re-adding a duplicate entry into opencode.jsonc every run.
+    let sibling_instructions: Vec<String> = read_json_object(&opencode_json_path(), || json!({}))
+        .get("instructions")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut config = read_json_object(&path, || json!({}));
 
     let instructions = config
@@ -414,7 +429,8 @@ fn wire_opencode() {
         let path_str = rule_path.to_string_lossy().replace('\\', "/");
         let has_it = arr
             .iter()
-            .any(|v| v.as_str().map(|s| s.contains(file)).unwrap_or(false));
+            .any(|v| v.as_str().map(|s| s.contains(file)).unwrap_or(false))
+            || sibling_instructions.iter().any(|s| s.contains(file));
         if !has_it && rule_path.exists() {
             arr.push(json!(path_str));
             added += 1;
@@ -865,6 +881,32 @@ mod tests {
                 first, second,
                 "second run should not duplicate instructions"
             );
+        });
+    }
+
+    #[test]
+    fn wire_opencode_does_not_duplicate_instructions_already_in_sibling_json_file() {
+        with_temp_home(|| {
+            let opencode_dir = home().join(".config").join("opencode");
+            let rules_dir = opencode_dir.join("rules");
+            fs::create_dir_all(&rules_dir).unwrap();
+            fs::write(rules_dir.join("exa.md"), "# exa\n").unwrap();
+
+            let exa_path = rules_dir
+                .join("exa.md")
+                .to_string_lossy()
+                .replace('\\', "/");
+            fs::write(
+                opencode_dir.join("opencode.json"),
+                serde_json::json!({ "instructions": [exa_path] }).to_string(),
+            )
+            .unwrap();
+
+            wire_opencode();
+
+            // Nothing needed adding (exa.md is already covered by the
+            // sibling file), so jsonc is never even created.
+            assert!(!opencode_dir.join("opencode.jsonc").exists());
         });
     }
 

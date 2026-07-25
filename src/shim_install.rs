@@ -76,6 +76,21 @@ const GENERIC_SHIM_TOOLS: &[&str] = &[
     "zig",
 ];
 
+/// `GENERIC_SHIM_TOOLS` plus the two tools that get their own dedicated
+/// shims (`git`, via `crates/flare-git-shim`; `uv`, hardlinked separately —
+/// see `~/.agentflare/shims/`) — the full tool-name list the `.bashenv`
+/// function dispatcher needs (`bashenv.rs`), sorted to match its `for _af_c
+/// in ...` line. One source of truth for "which tools does agentflare route
+/// through lean-ctx", shared by the PATH-shim install above and the
+/// bash-function dispatcher.
+pub(crate) fn bashenv_tool_list() -> Vec<&'static str> {
+    let mut tools: Vec<&'static str> = GENERIC_SHIM_TOOLS.to_vec();
+    tools.push("git");
+    tools.push("uv");
+    tools.sort_unstable();
+    tools
+}
+
 fn exe_name(stem: &str) -> String {
     if cfg!(windows) {
         format!("{stem}.exe")

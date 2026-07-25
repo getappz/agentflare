@@ -5,7 +5,7 @@
 use crate::jsonc::{read_json_object, write_json_pretty};
 use crate::paths::{
     claude_json_path, claude_rules_dir, claude_settings_path, home, opencode_config_path,
-    opencode_rules_dir,
+    opencode_json_path, opencode_plugin_dir, opencode_rules_dir,
 };
 use crate::rule_text;
 use serde_json::Value;
@@ -64,6 +64,35 @@ fn remove_claude_mcp_server(name: &str) -> bool {
 
 fn json_at(path: &std::path::Path) -> Value {
     crate::jsonc::read_jsonc(path, || Value::Null)
+}
+
+/// Recursively overlays `overlay` onto `base` (objects merge key-by-key;
+/// anything else in `overlay` replaces `base` outright), mirroring how
+/// opencode itself deep-merges `opencode.json` with `opencode.jsonc`.
+fn deep_merge(base: &mut Value, overlay: &Value) {
+    if let (Value::Object(base_map), Value::Object(overlay_map)) = (&mut *base, overlay) {
+        for (k, v) in overlay_map {
+            match base_map.get_mut(k) {
+                Some(existing) => deep_merge(existing, v),
+                None => {
+                    base_map.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    } else if !overlay.is_null() {
+        *base = overlay.clone();
+    }
+}
+
+/// opencode's merged view of `opencode.json` (hand-maintained) +
+/// `opencode.jsonc` (agentflare-owned) — the same shape opencode itself
+/// sees. Idempotency `check`s read this so a value the user already has in
+/// either file isn't treated as missing; `apply` always writes only to
+/// `opencode_config_path` (jsonc), never to the hand-maintained sibling.
+fn opencode_config_merged() -> Value {
+    let mut merged = json_at(&opencode_json_path());
+    deep_merge(&mut merged, &json_at(&opencode_config_path()));
+    merged
 }
 
 fn write_pinned_mode(path: &PathBuf) -> bool {
@@ -334,6 +363,56 @@ pub fn get_components(host: &str) -> Vec<Component> {
             check: Box::new(crate::shim_install::all_shims_present),
             apply: Box::new(crate::shim_install::install),
         },
+        // Claude Code's non-interactive Bash tool sources `~/.bashenv` via
+        // BASH_ENV -- the lean-ctx function dispatcher (bash-level companion
+        // to the PATH shims above) and the force-push/rm -rf DEBUG-trap
+        // guard both live there. Only claude-code has a BASH_ENV mechanism
+        // to hook, so every other host reports satisfied.
+        Component {
+            id: "claude-code-bashenv-guard",
+            needs_consent: true,
+            describe: "~/.bashenv (BASH_ENV) — lean-ctx tool dispatch + force-push/rm -rf DEBUG-trap guardrails for Claude Code's non-interactive Bash tool".to_string(),
+            check: {
+                let host = host_owned.clone();
+                Box::new(move || host != "claude-code" || crate::bashenv::is_installed())
+            },
+            apply: {
+                let host = host_owned.clone();
+                Box::new(move || {
+                    if host != "claude-code" {
+                        return "not applicable for this host".to_string();
+                    }
+                    crate::bashenv::ensure_installed()
+                })
+            },
+        },
+        // opencode has no PreToolUse hook of its own to wire agentflare's
+        // branch guard into (that's Claude-Code-only) -- it does auto-load
+        // any plugin file dropped directly in `~/.config/opencode/plugin/`,
+        // so ship the same branch-guard classifier as a local plugin there.
+        Component {
+            id: "opencode-branch-guard",
+            needs_consent: true,
+            describe: "opencode branch-guard plugin (~/.config/opencode/plugin/branch-guard.js) — blocks write/edit/patch on master/main via `agentflare hook pre-tool-use`".to_string(),
+            check: {
+                let host = host_owned.clone();
+                Box::new(move || host != "opencode" || opencode_plugin_dir().join("branch-guard.js").exists())
+            },
+            apply: {
+                let host = host_owned.clone();
+                Box::new(move || {
+                    if host != "opencode" {
+                        return "not applicable for this host".to_string();
+                    }
+                    let path = opencode_plugin_dir().join("branch-guard.js");
+                    if write_if_absent(&path, rule_text::OPENCODE_BRANCH_GUARD_JS) {
+                        format!("{} written", path.display())
+                    } else {
+                        format!("{} exists, skipped", path.display())
+                    }
+                })
+            },
+        },
         Component {
             id: "leanctx",
             needs_consent: true,
@@ -419,7 +498,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
                         .and_then(|m| m.get("flare"))
                         .is_some(),
                     "continue" => cwd().join(".continue").join("mcpServers").join("flare.json").exists(),
-                    "opencode" => json_at(&opencode_config_path())
+                    "opencode" => opencode_config_merged()
                         .get("mcp")
                         .and_then(|m| m.get("flare"))
                         .is_some(),
@@ -603,6 +682,8 @@ mod tests {
             "rules",
             "mise",
             "shims",
+            "claude-code-bashenv-guard",
+            "opencode-branch-guard",
             "leanctx",
             "agentflare-mcp",
             "optimize-code-mode",
@@ -612,6 +693,8 @@ mod tests {
             "rules",
             "mise",
             "shims",
+            "claude-code-bashenv-guard",
+            "opencode-branch-guard",
             "leanctx",
             "agentflare-mcp",
             "optimize-code-mode",
@@ -916,6 +999,108 @@ mod tests {
     fn remove_claude_mcp_server_is_a_noop_when_absent() {
         crate::paths::test_support::with_temp_home(|| {
             assert!(!remove_claude_mcp_server("lean-ctx"));
+        });
+    }
+
+    #[test]
+    fn opencode_config_merged_sees_both_files() {
+        crate::paths::test_support::with_temp_home(|| {
+            fs::create_dir_all(opencode_json_path().parent().unwrap()).unwrap();
+            fs::write(
+                opencode_json_path(),
+                r#"{"mcp": {"other": {"command": "foo"}}, "plugin": ["a.js"]}"#,
+            )
+            .unwrap();
+            fs::write(
+                opencode_config_path(),
+                r#"{"mcp": {"flare": {"command": "agentflare"}}}"#,
+            )
+            .unwrap();
+
+            let merged = opencode_config_merged();
+            assert!(merged["mcp"]["other"].is_object());
+            assert!(merged["mcp"]["flare"].is_object());
+            assert_eq!(merged["plugin"][0], "a.js");
+        });
+    }
+
+    #[test]
+    fn agentflare_mcp_opencode_check_sees_flare_entry_in_sibling_json_file() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("opencode");
+            let agentflare_mcp = components
+                .iter()
+                .find(|c| c.id == "agentflare-mcp")
+                .unwrap();
+            assert!(!(agentflare_mcp.check)());
+
+            fs::create_dir_all(opencode_json_path().parent().unwrap()).unwrap();
+            fs::write(
+                opencode_json_path(),
+                r#"{"mcp": {"flare": {"command": "agentflare"}}}"#,
+            )
+            .unwrap();
+
+            assert!(
+                (agentflare_mcp.check)(),
+                "flare entry in opencode.json (not just opencode.jsonc) should satisfy the check"
+            );
+        });
+    }
+
+    #[test]
+    fn opencode_branch_guard_check_then_apply_then_check() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("opencode");
+            let guard = components
+                .iter()
+                .find(|c| c.id == "opencode-branch-guard")
+                .unwrap();
+            assert!(!(guard.check)());
+            (guard.apply)();
+            assert!((guard.check)());
+            assert_eq!(
+                fs::read_to_string(opencode_plugin_dir().join("branch-guard.js")).unwrap(),
+                rule_text::OPENCODE_BRANCH_GUARD_JS
+            );
+        });
+    }
+
+    #[test]
+    fn opencode_branch_guard_is_satisfied_for_non_opencode_hosts() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("claude-code");
+            let guard = components
+                .iter()
+                .find(|c| c.id == "opencode-branch-guard")
+                .unwrap();
+            assert!((guard.check)());
+        });
+    }
+
+    #[test]
+    fn claude_code_bashenv_guard_check_then_apply_then_check() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("claude-code");
+            let guard = components
+                .iter()
+                .find(|c| c.id == "claude-code-bashenv-guard")
+                .unwrap();
+            assert!(!(guard.check)());
+            (guard.apply)();
+            assert!((guard.check)());
+        });
+    }
+
+    #[test]
+    fn claude_code_bashenv_guard_is_satisfied_for_non_claude_code_hosts() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("opencode");
+            let guard = components
+                .iter()
+                .find(|c| c.id == "claude-code-bashenv-guard")
+                .unwrap();
+            assert!((guard.check)());
         });
     }
 }
