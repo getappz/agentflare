@@ -36,8 +36,15 @@ pub const LEANCTX_SUPERSEDED: &[&str] = &[
     "@use: lean-ctx over native tools — ctx_read>Read/cat, ctx_shell>Bash, ctx_search>Grep, ctx_glob>Glob, ctx_callgraph>grep for \"who calls X\"\n@when: unfamiliar code — ctx_compose FIRST, one call vs search→read→search chain\n@scope: every subagent",
 ];
 
+pub const FLARE_DOCS: &str = r#"@use: mcp__flare__flare_docs — search|get|list|refresh for Rust crate API docs (docs.rs-backed, cached)
+@when: writing/reviewing code against a crate's API, or before citing a Rust library's behavior from memory
+@fallback: flare_docs missing from your tool list? It's deferred — ToolSearch("select:mcp__flare__flare_docs") first
+@scope: every session + subagent"#;
+
+pub const FLARE_DOCS_SUPERSEDED: &[&str] = &[];
+
 pub fn all() -> Vec<&'static str> {
-    vec![EXA, GIT, LEANCTX]
+    vec![EXA, GIT, LEANCTX, FLARE_DOCS]
 }
 
 /// opencode's own PreToolUse-equivalent: a local plugin dropped into
@@ -100,6 +107,7 @@ pub fn superseded(filename: &str) -> &'static [&'static str] {
         "exa.md" => EXA_SUPERSEDED,
         "git.md" => GIT_SUPERSEDED,
         "lean-ctx.md" => LEANCTX_SUPERSEDED,
+        "flare-docs.md" => FLARE_DOCS_SUPERSEDED,
         _ => &[],
     }
 }

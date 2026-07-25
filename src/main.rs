@@ -28,6 +28,7 @@ mod dashboard;
 mod db;
 mod dev_install;
 mod dev_vars;
+mod doctor;
 mod errors;
 mod gateway_integrations;
 mod gateway_secrets;

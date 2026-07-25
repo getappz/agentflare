@@ -304,6 +304,7 @@ pub fn run_headless(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use agent_registry::detect::PATH_LOCK as GLOBAL_STATE_LOCK;
     use agent_registry::{Agent, Tier};
 

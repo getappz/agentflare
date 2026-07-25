@@ -183,6 +183,7 @@ pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
                 (dir.join("exa.md"), rule_text::EXA.to_string()),
                 (dir.join("git.md"), rule_text::GIT.to_string()),
                 (dir.join("lean-ctx.md"), rule_text::LEANCTX.to_string()),
+                (dir.join("flare-docs.md"), rule_text::FLARE_DOCS.to_string()),
             ]
         }
         "cursor" => {
@@ -220,6 +221,7 @@ pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
                 (dir.join("exa.md"), rule_text::EXA.to_string()),
                 (dir.join("git.md"), rule_text::GIT.to_string()),
                 (dir.join("lean-ctx.md"), rule_text::LEANCTX.to_string()),
+                (dir.join("flare-docs.md"), rule_text::FLARE_DOCS.to_string()),
             ]
         }
         _ => vec![], // "continue" — no dedicated rules convention found
@@ -754,6 +756,43 @@ mod tests {
 
         // "continue" has no dedicated rules convention — empty on purpose.
         assert!(rule_targets("continue").is_empty());
+    }
+
+    #[test]
+    fn flare_docs_rule_is_written_for_claude_code_and_opencode() {
+        let cc_targets = rule_targets("claude-code");
+        let cc_flare_docs = cc_targets
+            .iter()
+            .find(|(path, _)| path.to_string_lossy().ends_with("flare-docs.md"));
+        assert!(
+            cc_flare_docs.is_some(),
+            "claude-code rule_targets should include flare-docs.md"
+        );
+        assert_eq!(cc_flare_docs.unwrap().1, rule_text::FLARE_DOCS);
+
+        let oc_targets = rule_targets("opencode");
+        assert!(
+            oc_targets
+                .iter()
+                .any(|(path, _)| path.to_string_lossy().ends_with("flare-docs.md")),
+            "opencode rule_targets should include flare-docs.md"
+        );
+    }
+
+    #[test]
+    fn flare_docs_rule_is_included_in_joined_hosts() {
+        // Hosts that concatenate rule_text::all() (cursor, codex, windsurf,
+        // vscode-copilot, cline) should pick up FLARE_DOCS automatically
+        // once it's added to all() -- no per-host wiring needed for those.
+        for host in ["cursor", "codex", "windsurf", "vscode-copilot", "cline"] {
+            let targets = rule_targets(host);
+            assert!(
+                targets
+                    .iter()
+                    .any(|(_, content)| content.contains(rule_text::FLARE_DOCS)),
+                "'{host}' joined rule content should include the flare-docs rule text"
+            );
+        }
     }
 
     #[test]

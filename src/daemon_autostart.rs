@@ -1,3 +1,4 @@
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::PathBuf;
 
 pub fn install() -> Result<(), String> {
@@ -86,6 +87,10 @@ pub fn is_installed() -> bool {
     }
 }
 
+// Both only called from the macOS LaunchAgent / Linux systemd install paths
+// below, which are themselves target_os-gated -- gate the helpers to match
+// so non-macOS/Linux builds (e.g. Windows) don't see them as dead code.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn agentflare_binary() -> String {
     std::env::current_exe()
         .ok()
@@ -93,6 +98,7 @@ fn agentflare_binary() -> String {
         .unwrap_or_else(|| "agentflare".to_string())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn daemon_home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
