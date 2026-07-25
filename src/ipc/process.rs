@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 pub fn is_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
@@ -147,6 +149,25 @@ fn parse_other_pids(raw: &str, self_pid: u32) -> Vec<u32> {
         }
     }
     pids
+}
+
+pub fn run_with_timeout<F, T>(f: F, timeout: Duration) -> Result<T, String>
+where
+    F: FnOnce() -> T,
+    F: Send + 'static,
+    T: Send + 'static,
+{
+    let handle = std::thread::spawn(f);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if handle.is_finished() {
+            return Ok(handle.join().unwrap());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("timed out".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(test)]

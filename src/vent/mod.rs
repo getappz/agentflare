@@ -1,6 +1,7 @@
 pub mod capture;
 pub mod classify;
 pub mod consolidate;
+pub mod file;
 pub mod paths;
 
 pub fn event_id(message: &str) -> String {

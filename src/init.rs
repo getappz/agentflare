@@ -198,6 +198,32 @@ fn add_hook_entry(
     true
 }
 
+/// Adds one prompt-type hook entry for `event` unless an entry containing
+/// `marker` is already present. Same idempotency pattern as `add_hook_entry`
+/// but for `"type": "prompt"` hooks (used for PostToolUseFailure judge).
+fn add_prompt_hook_entry(
+    hooks_obj: &mut Map<String, Value>,
+    event: &str,
+    marker: &str,
+    matcher: &str,
+    prompt: &str,
+    timeout: u64,
+) -> bool {
+    let arr = hooks_obj
+        .entry(event)
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .unwrap();
+    if arr.iter().any(|v| v.to_string().contains(marker)) {
+        return false;
+    }
+    arr.push(json!({
+        "matcher": matcher,
+        "hooks": [{ "type": "prompt", "prompt": prompt, "timeout": timeout, "continueOnBlock": true }]
+    }));
+    true
+}
+
 fn wire_claude_code() {
     let path = claude_settings_path();
     let mut settings = read_json_object(&path, || json!({}));
@@ -235,6 +261,14 @@ fn wire_claude_code() {
         "hook pre-compact",
         format!("\"{bin}\" hook pre-compact"),
         5,
+    );
+    added |= add_prompt_hook_entry(
+        hooks_obj,
+        "PostToolUseFailure",
+        "genuine FRICTION",
+        "Bash|Edit|Write",
+        crate::rule_text::VENT_JUDGE_PROMPT,
+        15,
     );
 
     if !added {
@@ -695,6 +729,7 @@ mod tests {
             assert!(content.contains("UserPromptSubmit"));
             assert!(content.contains("PreToolUse"));
             assert!(content.contains("PreCompact"));
+            assert!(content.contains("PostToolUseFailure"));
         });
     }
 
@@ -746,6 +781,32 @@ mod tests {
             wire_claude_code();
             let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
             assert!(!content.contains("SessionEnd"));
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_wires_post_tool_use_failure_judge_prompt() {
+        with_temp_home(|| {
+            wire_claude_code();
+            let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+            assert!(
+                content.contains("genuine FRICTION"),
+                "expected the judge-prompt marker in PostToolUseFailure hooks"
+            );
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_post_tool_use_failure_is_idempotent() {
+        with_temp_home(|| {
+            wire_claude_code();
+            let first = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+            wire_claude_code();
+            let second = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+            assert_eq!(
+                first, second,
+                "second run must not duplicate PostToolUseFailure"
+            );
         });
     }
 
