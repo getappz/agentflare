@@ -955,11 +955,11 @@ pub(crate) struct SearchRequest {
     #[schemars(description = "Search query")]
     pub(crate) query: String,
     #[schemars(
-        description = "Search type: 'store' (default, FTS across store documents, grouped by doc_type), 'memory' (FTS across brain.db observations), 'code' (gateway leanctx ctx_search), or 'web' (rivalsearch internet search)"
+        description = "Search type: 'store' (default, FTS across store docs), 'memory' (brain.db observations), 'code' (leanctx ctx_search), 'web' (rivalsearch internet), 'social' (9 platforms), 'news' (5 sources), 'github' (repos), 'academic' (papers), 'datasets' (hubs), 'websites' (crawl), 'weather' (Open-Meteo), 'financial' (SEC), 'crypto' (CoinGecko), 'fx' (ECB rates), 'indicators' (World Bank), 'youtube' (transcripts), 'bluesky' (profiles)"
     )]
     #[serde(default)]
     pub(crate) r#type: Option<String>,
-    #[schemars(description = "Max results (default 20; code 50, web 10)")]
+    #[schemars(description = "Max results (default 20; code 50, web/social/academic 10)")]
     #[serde(default)]
     pub(crate) limit: Option<usize>,
 }
