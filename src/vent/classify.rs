@@ -10,6 +10,24 @@ static MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("static marker regex is valid")
 });
 
+static ORIGIN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)af-guard|agentflare git shim|orchestrator-managed by agentflare|item tracker is wired up for this repo",
+    )
+    .expect("static origin regex is valid")
+});
+
+/// Classifies which pipeline a vent message belongs to: agentflare's own
+/// tooling (git shim, af-guard, item-tracker redirects) vs. everything else.
+/// Deliberately narrow so plain errors mentioning "git worktree" don't match.
+pub fn origin(message: &str) -> &'static str {
+    if ORIGIN_RE.is_match(message) {
+        "agentflare-core"
+    } else {
+        "external"
+    }
+}
+
 pub fn topic_key(message: &str) -> String {
     message
         .to_lowercase()
@@ -82,5 +100,41 @@ mod tests {
         assert_eq!(normalize_severity(Some("LOW")), "low");
         assert_eq!(normalize_severity(Some("garbage")), "medium");
         assert_eq!(normalize_severity(None), "medium");
+    }
+
+    #[test]
+    fn origin_detects_agentflare_core_signatures() {
+        assert_eq!(
+            origin("af-guard's Bash hook blocked git merge-base --is-ancestor"),
+            "agentflare-core"
+        );
+        assert_eq!(
+            origin("agentflare git shim: denied -- use item tool's claim flow"),
+            "agentflare-core"
+        );
+        assert_eq!(
+            origin("'git worktree' is orchestrator-managed by agentflare"),
+            "agentflare-core"
+        );
+        assert_eq!(
+            origin("agentflare-backend's item tracker is wired up for this repo -- use the `item` MCP tool"),
+            "agentflare-core"
+        );
+    }
+
+    #[test]
+    fn origin_defaults_to_external_for_unrelated_failures() {
+        assert_eq!(
+            origin("bash: a for loop expanded $d to every file in cwd"),
+            "external"
+        );
+        assert_eq!(
+            origin("lean-ctx ctx_read failed with os error 5 on a directory"),
+            "external"
+        );
+        assert_eq!(
+            origin("git worktree remove failed: Filename too long"),
+            "external",
+        );
     }
 }
