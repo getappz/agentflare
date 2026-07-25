@@ -86,7 +86,7 @@ impl ArtifactStore {
     }
 
     fn store_conn_err(e: impl std::fmt::Display) -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        std::io::Error::other(e.to_string())
     }
 
     fn doc_to_artifact(doc: &agentflare_store::documents::Document) -> std::io::Result<Artifact> {
@@ -179,7 +179,7 @@ impl ArtifactStore {
         let existing = store.doc_get_by_path(DOC_PROJECT, path)
             .map_err(Self::store_conn_err)?;
 
-        if let (Some(base), Some(ref doc)) = (req.base_version, existing.as_ref()) {
+        if let (Some(base), Some(doc)) = (req.base_version, existing.as_ref()) {
             if base as i32 != doc.version {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -222,6 +222,7 @@ impl ArtifactStore {
                 source: Some("artifact".into()),
                 metadata: Some(metadata),
                 size: Some(req.content.len() as i64),
+                ..Default::default()
             }).map_err(Self::store_conn_err)?;
         }
 
