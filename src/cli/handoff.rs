@@ -89,10 +89,18 @@ impl HandoffArgs {
             .or_else(agent_detector::agent_name)
             .unwrap_or_else(|| "cli".into());
 
-        let dir = self
-            .dir
-            .unwrap_or_else(|| crate::paths::home().join(".agentflare").join("artifacts"));
-        let store = agentflare_artifacts::ArtifactStore::new(dir);
+        let store: agentflare_artifacts::ArtifactStore = match self.dir.clone() {
+            Some(d) => agentflare_artifacts::ArtifactStore::new(d),
+            None => match crate::store::open() {
+                Ok(s) => agentflare_artifacts::ArtifactStore::with_store(s),
+                Err(e) => {
+                    eprintln!("[handoff] fallback to flat-file store: {e}");
+                    agentflare_artifacts::ArtifactStore::new(
+                        crate::paths::home().join(".agentflare").join("artifacts"),
+                    )
+                }
+            },
+        };
         let req = agentflare_artifacts::PublishRequest {
             name: self.name.or(stem).unwrap_or_else(|| "handoff".into()),
             artifact_type: agentflare_artifacts::ArtifactType::from(

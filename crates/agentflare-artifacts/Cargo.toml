@@ -12,6 +12,9 @@ nanoid = "0.5"
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+agentflare-store = { path = "../agentflare-store" }
+db_kit = { package = "agentflare-db-kit", path = "../agentflare-db-kit" }
+blake3 = "1.5"
 
 [dev-dependencies]
 tempfile = "3"
