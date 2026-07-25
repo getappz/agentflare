@@ -38,11 +38,15 @@ fn load_filed(filed_path: &Path) -> BTreeMap<String, FiledEntry> {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
+/// Writes via a sibling temp file + rename so a process killed mid-write
+/// can never leave `filed_path` holding a truncated/corrupt JSON document.
 fn save_filed(filed_path: &Path, filed: &BTreeMap<String, FiledEntry>) -> std::io::Result<()> {
     if let Some(parent) = filed_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(filed_path, serde_json::to_string_pretty(filed)?)
+    let tmp_path = filed_path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, serde_json::to_string_pretty(filed)?)?;
+    std::fs::rename(&tmp_path, filed_path)
 }
 
 /// Groups the global agentflare-core log by topic, applies the same
@@ -100,14 +104,38 @@ pub fn mark_filed(
     save_filed(filed_path, &filed)
 }
 
+const GH_ISSUE_CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Shells out to `gh issue create`. Not unit tested (matches this repo's existing
 /// convention for subprocess calls) — exercised at the integration/manual level.
+/// Bounded by `GH_ISSUE_CREATE_TIMEOUT` so a hung `gh` (network stall, stuck
+/// auth prompt) can't block the calling MCP tool call/CLI invocation forever.
 pub fn create_github_issue(title: &str, body: &str) -> std::io::Result<String> {
-    let output = std::process::Command::new("gh")
-        .args([
-            "issue", "create", "--repo", "getappz/agentflare", "--title", title, "--body", body,
-        ])
-        .output()?;
+    let title = title.to_string();
+    let body = body.to_string();
+    let output = crate::ipc::process::run_with_timeout(
+        move || {
+            std::process::Command::new("gh")
+                .args([
+                    "issue",
+                    "create",
+                    "--repo",
+                    "getappz/agentflare",
+                    "--title",
+                    &title,
+                    "--body",
+                    &body,
+                ])
+                .output()
+        },
+        GH_ISSUE_CREATE_TIMEOUT,
+    )
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("gh issue create did not finish within {GH_ISSUE_CREATE_TIMEOUT:?}"),
+        )
+    })??;
     if !output.status.success() {
         return Err(std::io::Error::other(
             String::from_utf8_lossy(&output.stderr).to_string(),
@@ -155,7 +183,10 @@ mod tests {
         );
         let batch = pending_batch(&log, &filed, 0);
         assert_eq!(batch.len(), 2, "two distinct topics");
-        let guard_group = batch.iter().find(|g| g.message.contains("af-guard")).unwrap();
+        let guard_group = batch
+            .iter()
+            .find(|g| g.message.contains("af-guard"))
+            .unwrap();
         assert_eq!(guard_group.seen_count, 2);
     }
 
@@ -176,7 +207,13 @@ mod tests {
         let batch = pending_batch(&log, &filed, now);
         assert_eq!(batch.len(), 1);
         let keys: Vec<String> = batch.iter().map(|g| g.topic_key.clone()).collect();
-        mark_filed(&filed, &keys, "https://github.com/getappz/agentflare/issues/1", now).unwrap();
+        mark_filed(
+            &filed,
+            &keys,
+            "https://github.com/getappz/agentflare/issues/1",
+            now,
+        )
+        .unwrap();
         assert!(
             pending_batch(&log, &filed, now + 60).is_empty(),
             "already-filed topic must not reappear within the TTL window"

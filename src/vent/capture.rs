@@ -56,7 +56,10 @@ fn recent_matches_for_topic(
         .filter(|v| crate::vent::classify::topic_key(&v.message) == topic_key)
         .filter(|v| {
             chrono::DateTime::parse_from_rfc3339(&v.ts)
-                .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds() < THROTTLE_WINDOW_SECS)
+                .map(|t| {
+                    let t = t.with_timezone(&chrono::Utc);
+                    t <= now && (now - t).num_seconds() < THROTTLE_WINDOW_SECS
+                })
                 .unwrap_or(false)
         })
         .collect()
@@ -119,10 +122,30 @@ mod tests {
     fn recent_count_ignores_lines_outside_the_window() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("v.jsonl");
-        write_line_at(&log, "2020-01-01T00:00:00Z", "high", "an old repeated failure");
+        write_line_at(
+            &log,
+            "2020-01-01T00:00:00Z",
+            "high",
+            "an old repeated failure",
+        );
         let now = chrono::Utc::now();
         let key = crate::vent::classify::topic_key("an old repeated failure");
         assert_eq!(recent_matches_for_topic(&log, &key, now).len(), 0);
+    }
+
+    #[test]
+    fn recent_count_ignores_future_dated_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("v.jsonl");
+        let now = chrono::Utc::now();
+        let future = now + chrono::Duration::seconds(60);
+        write_line_at(&log, &future.to_rfc3339(), "high", "a future-dated entry");
+        let key = crate::vent::classify::topic_key("a future-dated entry");
+        assert_eq!(
+            recent_matches_for_topic(&log, &key, now).len(),
+            0,
+            "a future timestamp must not count as recent just because the age is negative"
+        );
     }
 
     #[test]
@@ -143,7 +166,10 @@ mod tests {
             let (_, suppressed2) =
                 append_routed(None, "high", &[], "the exact same af-guard bug").unwrap();
             assert!(!suppressed1, "first occurrence must be captured");
-            assert!(suppressed2, "second identical vent within the window must be throttled");
+            assert!(
+                suppressed2,
+                "second identical vent within the window must be throttled"
+            );
         });
     }
 
@@ -166,12 +192,18 @@ mod tests {
     #[test]
     fn append_routed_sends_agentflare_core_and_external_to_different_logs() {
         crate::paths::test_support::with_temp_home(|| {
-            append_routed(None, "high", &[], "af-guard blocked a protected branch push").unwrap();
+            append_routed(
+                None,
+                "high",
+                &[],
+                "af-guard blocked a protected branch push",
+            )
+            .unwrap();
             append_routed(None, "high", &[], "a totally unrelated bash quoting bug").unwrap();
-            let global_text = std::fs::read_to_string(crate::vent::paths::global_log_path())
-                .unwrap_or_default();
-            let repo_text = std::fs::read_to_string(crate::vent::paths::log_path())
-                .unwrap_or_default();
+            let global_text =
+                std::fs::read_to_string(crate::vent::paths::global_log_path()).unwrap_or_default();
+            let repo_text =
+                std::fs::read_to_string(crate::vent::paths::log_path()).unwrap_or_default();
             assert!(global_text.contains("af-guard"));
             assert!(!repo_text.contains("af-guard"));
             assert!(repo_text.contains("bash quoting bug"));

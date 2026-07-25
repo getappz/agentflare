@@ -1187,8 +1187,13 @@ impl AgentflareMcp {
         let tags = req.tags.unwrap_or_default();
         let (event_id, suppressed) =
             crate::vent::capture::append_routed(None, severity, &tags, req.message.trim())
-                .map_err(|e| ErrorData::internal_error(format!("vent capture failed: {e}"), None))?;
-        Ok(serde_json::json!({ "ok": true, "event_id": event_id, "suppressed": suppressed }).to_string())
+                .map_err(|e| {
+                    ErrorData::internal_error(format!("vent capture failed: {e}"), None)
+                })?;
+        Ok(
+            serde_json::json!({ "ok": true, "event_id": event_id, "suppressed": suppressed })
+                .to_string(),
+        )
     }
 
     #[tool(
@@ -1197,8 +1202,7 @@ impl AgentflareMcp {
     fn vent_file(&self, Parameters(req): Parameters<VentFileRequest>) -> Result<String, ErrorData> {
         let log = crate::vent::paths::global_log_path();
         let filed = crate::vent::paths::global_filed_path();
-        let batch =
-            crate::vent::file::pending_batch(&log, &filed, chrono::Utc::now().timestamp());
+        let batch = crate::vent::file::pending_batch(&log, &filed, chrono::Utc::now().timestamp());
         if batch.is_empty() {
             return Ok(serde_json::json!({ "ok": true, "pending": [] }).to_string());
         }
@@ -1209,11 +1213,28 @@ impl AgentflareMcp {
                 })?;
                 let keys: Vec<String> = batch.iter().map(|g| g.topic_key.clone()).collect();
                 let now = chrono::Utc::now().timestamp();
-                crate::vent::file::mark_filed(&filed, &keys, &url, now).map_err(|e| {
-                    ErrorData::internal_error(format!("mark_filed failed: {e}"), None)
-                })?;
-                Ok(serde_json::json!({ "ok": true, "issue_url": url, "filed_count": keys.len() })
-                    .to_string())
+                // The issue itself is already created at this point — even if
+                // mark_filed fails, the caller must still learn the issue_url
+                // (not just an opaque error), or the same batch gets re-filed
+                // as a duplicate issue on the next call.
+                match crate::vent::file::mark_filed(&filed, &keys, &url, now) {
+                    Ok(()) => Ok(serde_json::json!({
+                        "ok": true,
+                        "issue_url": url,
+                        "filed_count": keys.len(),
+                    })
+                    .to_string()),
+                    Err(e) => Ok(serde_json::json!({
+                        "ok": true,
+                        "issue_url": url,
+                        "filed_count": keys.len(),
+                        "warning": format!(
+                            "issue created but failed to record filed-state ({e}) — re-filing \
+                             will create a duplicate issue until this is reconciled by hand"
+                        ),
+                    })
+                    .to_string()),
+                }
             }
             (None, None) => Ok(serde_json::json!({ "ok": true, "pending": batch }).to_string()),
             (title, body) => Err(ErrorData::invalid_params(

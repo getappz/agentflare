@@ -102,7 +102,10 @@ pub fn run(args: VentArgs) {
                     let now = chrono::Utc::now().timestamp();
                     match crate::vent::file::mark_filed(&filed, &keys, &url, now) {
                         Ok(()) => println!("filed {url} ({} vent(s))", keys.len()),
-                        Err(e) => eprintln!("filed issue but failed to record state: {e}"),
+                        Err(e) => eprintln!(
+                            "filed {url} but failed to record state ({e}) — re-filing will \
+                             create a duplicate issue until this is reconciled by hand"
+                        ),
                     }
                 }
                 Err(e) => eprintln!("gh issue create failed: {e}"),
