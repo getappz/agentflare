@@ -76,6 +76,7 @@ pub fn consolidate_core(
         severity: String,
         count: i64,
         first_event: String,
+        tags: Vec<String>,
     }
     let mut groups: BTreeMap<String, Group> = BTreeMap::new();
     for l in &lines {
@@ -85,9 +86,11 @@ pub fn consolidate_core(
             severity: l.severity.clone(),
             count: 0,
             first_event: l.event_id.clone(),
+            tags: l.tags.clone(),
         });
         g.count += 1;
         g.message = l.message.clone();
+        g.tags = l.tags.clone();
         if severity_rank(&l.severity) > severity_rank(&g.severity) {
             g.severity = l.severity.clone();
         }
@@ -95,13 +98,13 @@ pub fn consolidate_core(
 
     for (key, g) in groups {
         report.consolidated += g.count as usize;
-        let tags_json = "[]";
+        let tags_json = serde_json::to_string(&g.tags).unwrap_or_else(|_| "[]".to_string());
         let out = match agentflare_backend::vent::upsert(
             conn,
             project_id,
             &g.message,
             &g.severity,
-            tags_json,
+            &tags_json,
             &key,
             &g.first_event,
             g.count,
@@ -299,5 +302,34 @@ mod tests {
             .query_row("SELECT seen_count FROM vents", [], |r| r.get(0))
             .unwrap();
         assert_eq!(seen, 43);
+    }
+
+    #[test]
+    fn tags_survive_consolidation_instead_of_being_dropped() {
+        let conn = open_in_memory().unwrap();
+        let (p, s) = seed(&conn);
+        let dir = tempfile::tempdir().unwrap();
+        let (log, cur) = (dir.path().join("v.jsonl"), dir.path().join("v.cursor"));
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        let line = crate::vent::capture::VentLine {
+            event_id: crate::vent::event_id("tagged failure"),
+            ts: "t".into(),
+            session: None,
+            severity: "high".to_string(),
+            tags: vec!["dx".to_string()],
+            message: "tagged failure".to_string(),
+        };
+        writeln!(f, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+        drop(f);
+        consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+        let tags: String = conn
+            .query_row("SELECT tags FROM vents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tags, r#"["dx"]"#, "tags must flow through, not be hardcoded to []");
     }
 }
