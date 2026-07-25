@@ -76,13 +76,24 @@ pub fn run(args: VentArgs) {
                 println!("nothing to file");
                 return;
             }
-            let (Some(title), Some(body)) = (title, body) else {
-                println!("{} pending agentflare-core vent(s):", batch.len());
-                for g in &batch {
-                    println!("  [{}] seen×{} {}", g.severity, g.seen_count, g.message);
+            let (title, body) = match (title, body) {
+                (Some(title), Some(body)) => (title, body),
+                (None, None) => {
+                    println!("{} pending agentflare-core vent(s):", batch.len());
+                    for g in &batch {
+                        println!("  [{}] seen×{} {}", g.severity, g.seen_count, g.message);
+                    }
+                    println!("re-run with --title and --body to file these as one GitHub issue");
+                    return;
                 }
-                println!("re-run with --title and --body to file these as one GitHub issue");
-                return;
+                (title, body) => {
+                    eprintln!(
+                        "vent file: need both --title and --body to file (got title={}, body={})",
+                        title.is_some(),
+                        body.is_some()
+                    );
+                    return;
+                }
             };
             match crate::vent::file::create_github_issue(&title, &body) {
                 Ok(url) => {

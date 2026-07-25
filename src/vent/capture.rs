@@ -43,13 +43,13 @@ pub fn append(
 pub const THROTTLE_WINDOW_SECS: i64 = 300;
 pub const THROTTLE_MAX_PER_WINDOW: usize = 1;
 
-fn recent_count_for_topic(
+fn recent_matches_for_topic(
     log_path: &Path,
     topic_key: &str,
     now: chrono::DateTime<chrono::Utc>,
-) -> usize {
+) -> Vec<VentLine> {
     let Ok(text) = std::fs::read_to_string(log_path) else {
-        return 0;
+        return Vec::new();
     };
     text.lines()
         .filter_map(|l| serde_json::from_str::<VentLine>(l).ok())
@@ -59,7 +59,7 @@ fn recent_count_for_topic(
                 .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds() < THROTTLE_WINDOW_SECS)
                 .unwrap_or(false)
         })
-        .count()
+        .collect()
 }
 
 /// Classifies origin, picks the destination log (global agentflare-core vs.
@@ -79,8 +79,16 @@ pub fn append_routed(
     };
     let topic_key = crate::vent::classify::topic_key(message);
     let now = chrono::Utc::now();
-    if recent_count_for_topic(&log_path, &topic_key, now) >= THROTTLE_MAX_PER_WINDOW {
-        return Ok((crate::vent::event_id(message), true));
+    let matches = recent_matches_for_topic(&log_path, &topic_key, now);
+    if matches.len() >= THROTTLE_MAX_PER_WINDOW {
+        // Reference the real, already-logged event instead of minting a
+        // fresh id — `event_id()` is time-salted, so a second call would
+        // return an id that was never written anywhere.
+        let id = matches
+            .last()
+            .map(|v| v.event_id.clone())
+            .unwrap_or_else(|| crate::vent::event_id(message));
+        return Ok((id, true));
     }
     let id = append(&log_path, session, severity, tags, message)?;
     Ok((id, false))
@@ -114,7 +122,7 @@ mod tests {
         write_line_at(&log, "2020-01-01T00:00:00Z", "high", "an old repeated failure");
         let now = chrono::Utc::now();
         let key = crate::vent::classify::topic_key("an old repeated failure");
-        assert_eq!(recent_count_for_topic(&log, &key, now), 0);
+        assert_eq!(recent_matches_for_topic(&log, &key, now).len(), 0);
     }
 
     #[test]
@@ -124,7 +132,7 @@ mod tests {
         let now = chrono::Utc::now();
         write_line_at(&log, &now.to_rfc3339(), "high", "a fresh repeated failure");
         let key = crate::vent::classify::topic_key("a fresh repeated failure");
-        assert_eq!(recent_count_for_topic(&log, &key, now), 1);
+        assert_eq!(recent_matches_for_topic(&log, &key, now).len(), 1);
     }
 
     #[test]
@@ -136,6 +144,22 @@ mod tests {
                 append_routed(None, "high", &[], "the exact same af-guard bug").unwrap();
             assert!(!suppressed1, "first occurrence must be captured");
             assert!(suppressed2, "second identical vent within the window must be throttled");
+        });
+    }
+
+    #[test]
+    fn append_routed_suppressed_call_returns_original_event_id() {
+        crate::paths::test_support::with_temp_home(|| {
+            let (first_id, suppressed1) =
+                append_routed(None, "high", &[], "the exact same af-guard bug").unwrap();
+            let (second_id, suppressed2) =
+                append_routed(None, "high", &[], "the exact same af-guard bug").unwrap();
+            assert!(!suppressed1);
+            assert!(suppressed2);
+            assert_eq!(
+                second_id, first_id,
+                "suppressed call must reference the real logged event, not a fabricated id"
+            );
         });
     }
 

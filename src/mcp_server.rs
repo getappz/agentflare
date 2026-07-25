@@ -1214,7 +1214,15 @@ impl AgentflareMcp {
                 Ok(serde_json::json!({ "ok": true, "issue_url": url, "filed_count": keys.len() })
                     .to_string())
             }
-            _ => Ok(serde_json::json!({ "ok": true, "pending": batch }).to_string()),
+            (None, None) => Ok(serde_json::json!({ "ok": true, "pending": batch }).to_string()),
+            (title, body) => Err(ErrorData::invalid_params(
+                format!(
+                    "vent_file needs both title and body to file (got title={}, body={}), or neither to list pending",
+                    title.is_some(),
+                    body.is_some()
+                ),
+                None,
+            )),
         }
     }
 
