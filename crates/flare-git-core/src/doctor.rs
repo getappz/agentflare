@@ -9,6 +9,12 @@ pub struct LaneHealth {
     pub path: String,
     pub sequence_id: Option<i64>,
     pub flags: Vec<HealthFlag>,
+    /// True for the main/canonical worktree (`git worktree list`'s first
+    /// entry) as opposed to a linked worktree. `reclaim` must never delete
+    /// this lane, regardless of flags or `--force` — see the 2026-07-25
+    /// incident where treating it like any other lane wiped the entire
+    /// checkout, including every linked worktree nested under it.
+    pub is_main_worktree: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -69,7 +75,11 @@ pub fn scan(
     let worktrees = list_worktrees(repo_root);
     let git_worktree_entries = parse_worktree_list(&worktrees);
 
-    for entry in &git_worktree_entries {
+    for (entry_idx, entry) in git_worktree_entries.iter().enumerate() {
+        // `git worktree list` always lists the main/canonical worktree
+        // first, followed by linked worktrees — this is documented,
+        // stable git behavior, not an assumption specific to this repo.
+        let is_main_worktree = entry_idx == 0;
         let path = Path::new(&entry.path);
         let name = entry
             .branch
@@ -102,6 +112,7 @@ pub fn scan(
                 path: entry.path.clone(),
                 sequence_id,
                 flags,
+                is_main_worktree,
             });
             continue;
         }
@@ -129,6 +140,7 @@ pub fn scan(
             path: entry.path.clone(),
             sequence_id,
             flags,
+            is_main_worktree,
         });
     }
 
@@ -230,6 +242,16 @@ pub fn scan(
 pub fn reclaim(repo_root: &Path, report: &DoctorReport, force: bool) -> Vec<String> {
     let mut reclaimed = Vec::new();
     for lane in &report.lanes {
+        // Never reclaim the main/canonical worktree, full stop -- not even
+        // under `--force`. `git worktree remove` itself refuses to ever
+        // remove the main worktree; treating this lane like any other
+        // linked worktree previously let `remove_dir_all` wipe the entire
+        // checkout (and, since linked worktrees live nested under it,
+        // every other lane along with it) whenever the main worktree
+        // happened to pick up a flag like `MissingUpstream` or `Stale`.
+        if lane.is_main_worktree {
+            continue;
+        }
         let has_dirty = lane.flags.iter().any(|f| matches!(f, HealthFlag::Dirty));
         if has_dirty && !force {
             continue;
@@ -546,5 +568,102 @@ mod tests {
             lane.flags
         );
         assert!(!lane.flags.iter().any(|f| matches!(f, HealthFlag::Dirty)));
+    }
+
+    #[test]
+    fn reclaim_never_deletes_the_main_worktree_even_when_flagged() {
+        // Regression for the 2026-07-25 incident: `reclaim` treated the
+        // main worktree like any other lane, and since linked worktrees
+        // live nested under it (mirroring this repo's own
+        // `.worktrees/<name>` layout), deleting it wiped everything.
+        let repo = crate::shell::test_support::init_repo_with_branch("main");
+        // Mirrors this repo's own `.gitignore` (`/.worktrees/`) -- without
+        // it, the main lane's `git status` would see the linked worktree's
+        // directory itself as an untracked path and flag Dirty, which
+        // isn't what production looks like and isn't what this test means
+        // to exercise.
+        std::fs::write(repo.path.join(".gitignore"), ".worktrees/\n").unwrap();
+        crate::shell::run_in(&repo.path, &["add", ".gitignore"]).unwrap();
+        crate::shell::run_in(&repo.path, &["commit", "-m", "gitignore worktrees"]).unwrap();
+        let linked_path = repo.path.join(".worktrees").join("linked");
+        std::fs::create_dir_all(repo.path.join(".worktrees")).unwrap();
+        crate::shell::run_in(
+            &repo.path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-branch",
+                linked_path.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        // Make the linked worktree dirty so it is NOT individually
+        // reclaim-eligible under force=false -- if it disappears anyway,
+        // that can only be because deleting the main worktree cascaded
+        // into it (linked worktrees are nested underneath), not because it
+        // was legitimately reclaimed on its own.
+        std::fs::write(linked_path.join("scratch.txt"), "uncommitted\n").unwrap();
+
+        let report = scan(&repo.path, 14, &std::collections::HashMap::new());
+        let main_lane = report
+            .lanes
+            .iter()
+            .find(|l| l.is_main_worktree)
+            .expect("scan must report the main worktree as a lane");
+        // Neither branch has a configured upstream in this local-only test
+        // repo -- the main lane picks up MissingUpstream naturally, exactly
+        // the kind of ordinary flag that used to make it reclaim-eligible.
+        assert!(
+            main_lane
+                .flags
+                .iter()
+                .any(|f| matches!(f, HealthFlag::MissingUpstream)),
+            "test setup assumption: main lane should be flagged, got {:?}",
+            main_lane.flags
+        );
+        assert!(
+            !main_lane
+                .flags
+                .iter()
+                .any(|f| matches!(f, HealthFlag::Dirty)),
+            "main lane must be clean here to exercise the pre-fix vulnerable path, got {:?}",
+            main_lane.flags
+        );
+        let main_name = main_lane.name.clone();
+        let linked_lane = report
+            .lanes
+            .iter()
+            .find(|l| !l.is_main_worktree)
+            .expect("scan must report the linked worktree as a lane");
+        assert!(
+            linked_lane
+                .flags
+                .iter()
+                .any(|f| matches!(f, HealthFlag::Dirty)),
+            "test setup assumption: linked lane should be dirty, got {:?}",
+            linked_lane.flags
+        );
+
+        let reclaimed = reclaim(&repo.path, &report, false);
+
+        assert!(
+            repo.path.exists(),
+            "main worktree must survive reclaim even when flagged"
+        );
+        assert!(
+            repo.path.join(".git").exists(),
+            "main worktree's .git must survive reclaim"
+        );
+        assert!(
+            linked_path.exists(),
+            "linked worktree nested under the main one must survive -- it's \
+             dirty so wouldn't be reclaimed on its own, and must not be \
+             cascaded away by main-worktree deletion"
+        );
+        assert!(
+            !reclaimed.contains(&main_name),
+            "main worktree must never be reported as reclaimed"
+        );
     }
 }
