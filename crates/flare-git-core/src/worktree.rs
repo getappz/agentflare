@@ -237,49 +237,92 @@ pub fn create_worktree(
             )),
         );
     }
-    // Branch off the freshly-fetched remote ref when reachable, so a stale
-    // local checkout (e.g. hasn't pulled a just-merged PR) doesn't silently
-    // seed new work from old code. Soft-fails to today's local-ref behavior
-    // when there's no remote, we're offline, or the branch was never pushed
-    // (common for a parent item's task/N branch) — never blocks a claim on
-    // network reachability, matching every other soft-fail in this file.
-    // Routed through `run_output_timeout` (not the plain blocking
-    // `run_git_in`): an unreachable remote or a credential prompt must not
-    // be able to hang a claim indefinitely.
     let fetch_timeout_secs = 30;
-    let start_point = match run_output_timeout(
-        crate::shell::git_binary(),
-        &["fetch", "origin", target_branch],
+    // `branch` (task/N) can already exist with no worktree owning it -- e.g. a
+    // second-session claim on an item whose branch survived from before.
+    // `git worktree add -b <branch>` unconditionally fails in that case ("a
+    // branch named 'task/N' already exists"), with no recovery: check first,
+    // and reuse the existing ref instead of trying to recreate it.
+    let branch_ref = format!("refs/heads/{branch}");
+    let mut branch_exists = run_git_in_ok(
         repo_root,
-        fetch_timeout_secs,
-    ) {
-        Ok(out)
-            if out.status.success()
-                && run_git_in_ok(
-                    repo_root,
-                    &["rev-parse", "--verify", &format!("origin/{target_branch}")],
-                ) =>
-        {
-            format!("origin/{target_branch}")
-        }
-        _ => {
-            eprintln!(
-                "worktree: could not fetch '{target_branch}' from origin, branching off the local ref instead"
-            );
-            target_branch.to_string()
-        }
+        &["rev-parse", "--verify", "--quiet", &branch_ref],
+    );
+    if !branch_exists {
+        // Might exist only on the remote (pushed from another machine/session
+        // with no local ref yet) -- fetch it specifically and check again.
+        // Soft-fails like every other network step in this file: no remote,
+        // offline, or never pushed all fall through to the brand-new-branch
+        // path below, unchanged from today's behavior.
+        let _ = run_output_timeout(
+            crate::shell::git_binary(),
+            &["fetch", "origin", &branch],
+            repo_root,
+            fetch_timeout_secs,
+        );
+        branch_exists = run_git_in_ok(
+            repo_root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/origin/{branch}"),
+            ],
+        );
+    }
+    let worktree_add_args: Vec<String> = if branch_exists {
+        // Existing branch (local or now-fetched remote-tracking): check it out
+        // as-is, no `-b` -- git auto-creates the local tracking branch when
+        // only the remote-tracking ref exists, same as `git checkout <branch>`.
+        vec![
+            "worktree".to_string(),
+            "add".to_string(),
+            worktree_path.to_string_lossy().to_string(),
+            branch.clone(),
+        ]
+    } else {
+        // Brand new branch: branch off the freshly-fetched remote ref when
+        // reachable, so a stale local checkout (e.g. hasn't pulled a
+        // just-merged PR) doesn't silently seed new work from old code.
+        // Soft-fails to today's local-ref behavior when there's no remote,
+        // we're offline, or the branch was never pushed (common for a parent
+        // item's task/N branch) — never blocks a claim on network
+        // reachability. Routed through `run_output_timeout` (not the plain
+        // blocking `run_git_in`): an unreachable remote or a credential
+        // prompt must not be able to hang a claim indefinitely.
+        let start_point = match run_output_timeout(
+            crate::shell::git_binary(),
+            &["fetch", "origin", target_branch],
+            repo_root,
+            fetch_timeout_secs,
+        ) {
+            Ok(out)
+                if out.status.success()
+                    && run_git_in_ok(
+                        repo_root,
+                        &["rev-parse", "--verify", &format!("origin/{target_branch}")],
+                    ) =>
+            {
+                format!("origin/{target_branch}")
+            }
+            _ => {
+                eprintln!(
+                    "worktree: could not fetch '{target_branch}' from origin, branching off the local ref instead"
+                );
+                target_branch.to_string()
+            }
+        };
+        vec![
+            "worktree".to_string(),
+            "add".to_string(),
+            worktree_path.to_string_lossy().to_string(),
+            "-b".to_string(),
+            branch.clone(),
+            start_point,
+        ]
     };
-    match run_git_in(
-        repo_root,
-        &[
-            "worktree",
-            "add",
-            &worktree_path.to_string_lossy(),
-            "-b",
-            &branch,
-            &start_point,
-        ],
-    ) {
+    let arg_refs: Vec<&str> = worktree_add_args.iter().map(String::as_str).collect();
+    match run_git_in(repo_root, &arg_refs) {
         Ok(_) => {
             if let Some(p) = progress {
                 p.send(1.0, Some(1.0), Some("Worktree created".into()));
@@ -854,6 +897,25 @@ mod tests {
         let result = create_worktree(&item, &repo.path, &target, None);
         assert!(result.is_ok());
         assert!(worktree_path.exists());
+    }
+
+    #[test]
+    fn create_worktree_reuses_a_branch_that_exists_with_no_owning_worktree() {
+        // The task/29 collision: a plain local branch survives (e.g. from a
+        // prior session) with no worktree ever created for it. `-b` alone
+        // would fail here ("a branch named 'task/1' already exists") --
+        // create_worktree must detect this and check out the existing
+        // branch instead of trying to recreate it.
+        let repo = init_repo();
+        run_git_in(&repo.path, &["branch", "task/1"]).unwrap();
+        let worktree_path = repo.path.join(".worktrees").join("task").join("1");
+        let item = test_item(1);
+        let target = resolve_default_branch(&repo.path);
+        let result = create_worktree(&item, &repo.path, &target, None);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(worktree_path.exists());
+        let checked_out = run_git_in(&worktree_path, &["branch", "--show-current"]).unwrap();
+        assert_eq!(checked_out, "task/1");
     }
 
     #[test]
