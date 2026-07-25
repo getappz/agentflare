@@ -377,13 +377,30 @@ impl AgentflareMcp {
         if q.is_empty() {
             return Err(ErrorData::invalid_params("query must not be empty", None));
         }
-        // q = ticker or company name — try SEC EDGAR company search
+        // Ticker→CIK is a static whole-file mapping, not queryable by ticker via URL —
+        // resolve it locally first, then fetch that filer's submissions.
         let ticker = q.to_uppercase();
-        let url = format!("https://data.sec.gov/submissions/CIKLookup/{ticker}.json");
-        let resp = match ureq::get(&url)
-            .set("User-Agent", "agentflare/1.0 (github.com/getappz/agentflare)")
+        let ua = "agentflare/1.0 (github.com/getappz/agentflare)";
+        let tickers = match ureq::get("https://www.sec.gov/files/company_tickers.json")
+            .set("User-Agent", ua)
             .call()
         {
+            Ok(r) => r.into_json::<serde_json::Value>().unwrap_or_default(),
+            Err(e) => return Ok(serde_json::json!({"source": "financial", "query": q, "error": format!("SEC ticker lookup failed: {e}")}).to_string()),
+        };
+        let cik = tickers
+            .as_object()
+            .and_then(|m| {
+                m.values()
+                    .find(|v| v["ticker"].as_str() == Some(ticker.as_str()))
+            })
+            .and_then(|v| v["cik_str"].as_u64());
+        let Some(cik) = cik else {
+            return Ok(serde_json::json!({"source": "financial", "query": q, "error": format!("no SEC filer found for ticker '{ticker}'")}).to_string());
+        };
+
+        let url = format!("https://data.sec.gov/submissions/CIK{cik:010}.json");
+        let resp = match ureq::get(&url).set("User-Agent", ua).call() {
             Ok(r) => r.into_json::<serde_json::Value>().unwrap_or_default(),
             Err(e) => return Ok(serde_json::json!({"source": "financial", "query": q, "error": format!("SEC lookup failed: {e}")}).to_string()),
         };
@@ -396,8 +413,13 @@ impl AgentflareMcp {
         if q.is_empty() {
             return Err(ErrorData::invalid_params("query must not be empty", None));
         }
-        // q = coin name/symbol e.g. "bitcoin" or "btc"
-        let coin = q.to_lowercase();
+        // q = coin id or ticker symbol e.g. "bitcoin" or "btc" — CoinGecko's `ids` param
+        // wants the id slug, so map common ticker symbols to it first.
+        let key = q.to_lowercase();
+        let coin = CRYPTO_SYMBOL_TO_ID
+            .iter()
+            .find_map(|(sym, id)| (*sym == key).then_some(*id))
+            .unwrap_or(key.as_str());
         let url =
             format!("https://api.coingecko.com/api/v3/simple/price?ids={coin}&vs_currencies=usd");
         let resp = match ureq::get(&url).call() {
@@ -502,6 +524,31 @@ impl AgentflareMcp {
     }
 }
 
+/// Common ticker symbols → CoinGecko coin ids; CoinGecko's `ids` param wants
+/// the id slug ("bitcoin"), not the ticker ("btc"). Full ids pass through as-is.
+const CRYPTO_SYMBOL_TO_ID: &[(&str, &str)] = &[
+    ("btc", "bitcoin"),
+    ("eth", "ethereum"),
+    ("usdt", "tether"),
+    ("bnb", "binancecoin"),
+    ("sol", "solana"),
+    ("xrp", "ripple"),
+    ("usdc", "usd-coin"),
+    ("ada", "cardano"),
+    ("doge", "dogecoin"),
+    ("trx", "tron"),
+    ("ton", "the-open-network"),
+    ("dot", "polkadot"),
+    ("matic", "matic-network"),
+    ("ltc", "litecoin"),
+    ("shib", "shiba-inu"),
+    ("link", "chainlink"),
+    ("avax", "avalanche-2"),
+    ("bch", "bitcoin-cash"),
+    ("xlm", "stellar"),
+    ("atom", "cosmos"),
+];
+
 /// Percent-encode a string for URL query parameters (simple version, covers
 /// the common cases without pulling in a full URL library as a new dep).
 fn urlencoding(s: &str) -> String {
@@ -512,11 +559,7 @@ fn urlencoding(s: &str) -> String {
                 out.push(b as char)
             }
             b' ' => out.push_str("%20"),
-            _ => {
-                for byte in std::ascii::escape_default(b) {
-                    out.push(byte as char);
-                }
-            }
+            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
     out
