@@ -18,6 +18,14 @@ pub enum VentCmd {
     },
     /// Triage buffered vents now (also run automatically once per turn).
     Consolidate,
+    /// List (or file, with --title/--body) pending agentflare-core vents as
+    /// ONE batched GitHub issue on getappz/agentflare.
+    File {
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+    },
     /// List triaged vents for this repo's project.
     List {
         #[arg(long)]
@@ -58,6 +66,34 @@ pub fn run(args: VentArgs) {
             );
             for id in r.items_created {
                 println!("  filed item {id}");
+            }
+        }
+        VentCmd::File { title, body } => {
+            let log = crate::vent::paths::global_log_path();
+            let filed = crate::vent::paths::global_filed_path();
+            let batch = crate::vent::file::pending_batch(&log, &filed);
+            if batch.is_empty() {
+                println!("nothing to file");
+                return;
+            }
+            let (Some(title), Some(body)) = (title, body) else {
+                println!("{} pending agentflare-core vent(s):", batch.len());
+                for g in &batch {
+                    println!("  [{}] seen×{} {}", g.severity, g.seen_count, g.message);
+                }
+                println!("re-run with --title and --body to file these as one GitHub issue");
+                return;
+            };
+            match crate::vent::file::create_github_issue(&title, &body) {
+                Ok(url) => {
+                    let keys: Vec<String> = batch.iter().map(|g| g.topic_key.clone()).collect();
+                    let now = chrono::Utc::now().timestamp();
+                    match crate::vent::file::mark_filed(&filed, &keys, &url, now) {
+                        Ok(()) => println!("filed {url} ({} vent(s))", keys.len()),
+                        Err(e) => eprintln!("filed issue but failed to record state: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("gh issue create failed: {e}"),
             }
         }
         VentCmd::List { actionable } => {
@@ -106,6 +142,14 @@ pub fn run(args: VentArgs) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_command_reports_nothing_when_batch_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, filed) = (dir.path().join("v.jsonl"), dir.path().join("v.filed.json"));
+        let batch = crate::vent::file::pending_batch(&log, &filed);
+        assert!(batch.is_empty(), "no log file yet means nothing pending");
+    }
+
     #[test]
     fn say_via_append_routed_marks_agentflare_core_message_as_suppressed_on_repeat() {
         crate::paths::test_support::with_temp_home(|| {
