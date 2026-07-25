@@ -485,6 +485,24 @@ pub(crate) fn wire_opencode_instructions() {
         .filter_map(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
         .collect();
 
+    // Drop entries under our rules_dir for coaching-sourced rules that are
+    // no longer synced to opencode (e.g. after `coaching remove` or a
+    // `--sync` list edit) — otherwise unsync_host's file deletion leaves a
+    // dangling path registered here forever.
+    let rules_dir_str = rules_dir.to_string_lossy().replace('\\', "/");
+    let before_prune = arr.len();
+    arr.retain(|v| {
+        let Some(s) = v.as_str() else { return true };
+        let normalized = s.replace('\\', "/");
+        if !normalized.starts_with(&rules_dir_str) {
+            return true;
+        }
+        expected_filenames
+            .iter()
+            .any(|f| normalized.ends_with(f.as_str()))
+    });
+    let pruned = before_prune - arr.len();
+
     let mut added = 0;
     for file in &expected_filenames {
         let rule_path = rules_dir.join(file);
@@ -499,13 +517,16 @@ pub(crate) fn wire_opencode_instructions() {
         }
     }
 
-    if added > 0 || removed_legacy {
+    if added > 0 || removed_legacy || pruned > 0 {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
         match write_json_pretty(&path, &config) {
             Ok(_) if removed_legacy => ui::success(&format!(
                 "opencode.jsonc instructions wired ({added} rule(s), removed stale engram.md)"
+            )),
+            Ok(_) if pruned > 0 => ui::success(&format!(
+                "opencode.jsonc instructions wired ({added} rule(s), pruned {pruned} stale rule(s))"
             )),
             Ok(_) => ui::success(&format!(
                 "opencode.jsonc instructions wired ({added} rule(s))"
@@ -1135,6 +1156,43 @@ mod tests {
             );
             assert!(content.contains("exa.md"));
             assert!(content.contains("lean-ctx.md"));
+        });
+    }
+
+    #[test]
+    fn wire_opencode_prunes_stale_coaching_rule_entry() {
+        with_temp_home(|| {
+            let config_path = home()
+                .join(".config")
+                .join("opencode")
+                .join("opencode.jsonc");
+            let rules_dir = home().join(".config").join("opencode").join("rules");
+            fs::create_dir_all(&rules_dir).unwrap();
+
+            // Simulates a coaching rule that was synced to opencode and then
+            // removed: unsync_host already deleted rules/search17.md, but
+            // without pruning this would leave the array entry dangling.
+            let stale_rule_path = rules_dir
+                .join("search17.md")
+                .to_string_lossy()
+                .replace('\\', "/");
+            fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+            fs::write(
+                &config_path,
+                serde_json::to_string(&json!({
+                    "instructions": [stale_rule_path.clone()]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            wire_opencode_instructions();
+
+            let content = fs::read_to_string(&config_path).unwrap();
+            assert!(
+                !content.contains(&stale_rule_path),
+                "dangling coaching rule entry should be pruned: {content}"
+            );
         });
     }
 }
