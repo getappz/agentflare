@@ -102,7 +102,11 @@ mod tests {
         let log = global_log_path();
         let filed = global_filed_path();
         assert!(log.to_string_lossy().contains("agentflare-core.jsonl"));
-        assert!(filed.to_string_lossy().contains("agentflare-core.filed.json"));
+        assert!(
+            filed
+                .to_string_lossy()
+                .contains("agentflare-core.filed.json")
+        );
         assert_eq!(log.parent(), filed.parent());
         assert_eq!(global_log_path(), global_log_path());
     }

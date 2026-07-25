@@ -803,7 +803,10 @@ mod tests {
             let first = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
             wire_claude_code();
             let second = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
-            assert_eq!(first, second, "second run must not duplicate PostToolUseFailure");
+            assert_eq!(
+                first, second,
+                "second run must not duplicate PostToolUseFailure"
+            );
         });
     }
 

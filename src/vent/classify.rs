@@ -117,7 +117,9 @@ mod tests {
             "agentflare-core"
         );
         assert_eq!(
-            origin("agentflare-backend's item tracker is wired up for this repo -- use the `item` MCP tool"),
+            origin(
+                "agentflare-backend's item tracker is wired up for this repo -- use the `item` MCP tool"
+            ),
             "agentflare-core"
         );
     }

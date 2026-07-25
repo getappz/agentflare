@@ -330,6 +330,9 @@ mod tests {
         let tags: String = conn
             .query_row("SELECT tags FROM vents", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(tags, r#"["dx"]"#, "tags must flow through, not be hardcoded to []");
+        assert_eq!(
+            tags, r#"["dx"]"#,
+            "tags must flow through, not be hardcoded to []"
+        );
     }
 }
