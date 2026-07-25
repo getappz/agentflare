@@ -17,6 +17,11 @@ struct FiledEntry {
     filed_at: i64,
 }
 
+/// How long a filed topic stays excluded from `pending_batch` before it's
+/// eligible to resurface. Without this, a bug that regresses after its issue
+/// is closed (or never actually gets fixed) would be hidden forever.
+pub const FILED_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+
 fn read_all_lines(log_path: &Path) -> Vec<VentLine> {
     let Ok(text) = std::fs::read_to_string(log_path) else {
         return Vec::new();
@@ -42,8 +47,10 @@ fn save_filed(filed_path: &Path, filed: &BTreeMap<String, FiledEntry>) -> std::i
 
 /// Groups the global agentflare-core log by topic, applies the same
 /// actionability rule the per-project pipeline uses, and excludes anything
-/// already recorded in `filed_path`.
-pub fn pending_batch(log_path: &Path, filed_path: &Path) -> Vec<PendingGroup> {
+/// recorded in `filed_path` less than `FILED_TTL_SECS` ago — a topic filed
+/// longer than that resurfaces so a recurring or unfixed bug isn't hidden
+/// forever behind a single old issue.
+pub fn pending_batch(log_path: &Path, filed_path: &Path, now: i64) -> Vec<PendingGroup> {
     let lines = read_all_lines(log_path);
     let filed = load_filed(filed_path);
     let mut groups: BTreeMap<String, PendingGroup> = BTreeMap::new();
@@ -64,7 +71,10 @@ pub fn pending_batch(log_path: &Path, filed_path: &Path) -> Vec<PendingGroup> {
     groups
         .into_values()
         .filter(|g| classify(&g.severity, g.seen_count, &g.message))
-        .filter(|g| !filed.contains_key(&g.topic_key))
+        .filter(|g| match filed.get(&g.topic_key) {
+            Some(entry) => now - entry.filed_at >= FILED_TTL_SECS,
+            None => true,
+        })
         .collect()
 }
 
@@ -143,7 +153,7 @@ mod tests {
                 ("high", "a totally different bug"),
             ],
         );
-        let batch = pending_batch(&log, &filed);
+        let batch = pending_batch(&log, &filed, 0);
         assert_eq!(batch.len(), 2, "two distinct topics");
         let guard_group = batch.iter().find(|g| g.message.contains("af-guard")).unwrap();
         assert_eq!(guard_group.seen_count, 2);
@@ -154,7 +164,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (log, filed) = (dir.path().join("v.jsonl"), dir.path().join("v.filed.json"));
         write_lines(&log, &[("low", "just a calm note")]);
-        assert!(pending_batch(&log, &filed).is_empty());
+        assert!(pending_batch(&log, &filed, 0).is_empty());
     }
 
     #[test]
@@ -162,13 +172,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (log, filed) = (dir.path().join("v.jsonl"), dir.path().join("v.filed.json"));
         write_lines(&log, &[("high", "af-guard blocked something")]);
-        let batch = pending_batch(&log, &filed);
+        let now = 1_700_000_000;
+        let batch = pending_batch(&log, &filed, now);
         assert_eq!(batch.len(), 1);
         let keys: Vec<String> = batch.iter().map(|g| g.topic_key.clone()).collect();
-        mark_filed(&filed, &keys, "https://github.com/getappz/agentflare/issues/1", 1234).unwrap();
+        mark_filed(&filed, &keys, "https://github.com/getappz/agentflare/issues/1", now).unwrap();
         assert!(
-            pending_batch(&log, &filed).is_empty(),
-            "already-filed topic must not reappear"
+            pending_batch(&log, &filed, now + 60).is_empty(),
+            "already-filed topic must not reappear within the TTL window"
         );
+    }
+
+    #[test]
+    fn pending_batch_allows_refiling_after_ttl_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, filed) = (dir.path().join("v.jsonl"), dir.path().join("v.filed.json"));
+        write_lines(&log, &[("high", "af-guard blocked something")]);
+        let filed_at = 1_700_000_000;
+        let keys = vec![topic_key("af-guard blocked something")];
+        mark_filed(
+            &filed,
+            &keys,
+            "https://github.com/getappz/agentflare/issues/1",
+            filed_at,
+        )
+        .unwrap();
+        assert!(
+            pending_batch(&log, &filed, filed_at + FILED_TTL_SECS - 1).is_empty(),
+            "still within the TTL window"
+        );
+        let batch = pending_batch(&log, &filed, filed_at + FILED_TTL_SECS + 1);
+        assert_eq!(batch.len(), 1, "must resurface once the TTL has elapsed");
     }
 }

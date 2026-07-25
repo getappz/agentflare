@@ -71,7 +71,8 @@ pub fn run(args: VentArgs) {
         VentCmd::File { title, body } => {
             let log = crate::vent::paths::global_log_path();
             let filed = crate::vent::paths::global_filed_path();
-            let batch = crate::vent::file::pending_batch(&log, &filed);
+            let batch =
+                crate::vent::file::pending_batch(&log, &filed, chrono::Utc::now().timestamp());
             if batch.is_empty() {
                 println!("nothing to file");
                 return;
@@ -157,7 +158,7 @@ mod tests {
     fn file_command_reports_nothing_when_batch_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let (log, filed) = (dir.path().join("v.jsonl"), dir.path().join("v.filed.json"));
-        let batch = crate::vent::file::pending_batch(&log, &filed);
+        let batch = crate::vent::file::pending_batch(&log, &filed, chrono::Utc::now().timestamp());
         assert!(batch.is_empty(), "no log file yet means nothing pending");
     }
 

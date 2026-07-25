@@ -1197,7 +1197,8 @@ impl AgentflareMcp {
     fn vent_file(&self, Parameters(req): Parameters<VentFileRequest>) -> Result<String, ErrorData> {
         let log = crate::vent::paths::global_log_path();
         let filed = crate::vent::paths::global_filed_path();
-        let batch = crate::vent::file::pending_batch(&log, &filed);
+        let batch =
+            crate::vent::file::pending_batch(&log, &filed, chrono::Utc::now().timestamp());
         if batch.is_empty() {
             return Ok(serde_json::json!({ "ok": true, "pending": [] }).to_string());
         }
