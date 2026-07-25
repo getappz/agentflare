@@ -416,8 +416,14 @@ impl AgentflareMcp {
                     (store, ArtifactBackend::Owned(server))
                 }
                 None => {
-                    let dir = crate::paths::home().join(".agentflare").join("artifacts");
-                    let store = std::sync::Arc::new(agentflare_artifacts::ArtifactStore::new(dir));
+                    let store = match crate::store::open() {
+                        Ok(s) => std::sync::Arc::new(agentflare_artifacts::ArtifactStore::with_store(s)),
+                        Err(e) => {
+                            eprintln!("[artifacts] fallback to flat-file store: {e}");
+                            let dir = crate::paths::home().join(".agentflare").join("artifacts");
+                            std::sync::Arc::new(agentflare_artifacts::ArtifactStore::new(dir))
+                        }
+                    };
                     let backend = Self::shared_backend(&store)?;
                     (store, backend)
                 }

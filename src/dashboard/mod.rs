@@ -1,3 +1,4 @@
+mod artifacts;
 mod data;
 mod server;
 

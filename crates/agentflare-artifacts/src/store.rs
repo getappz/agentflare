@@ -2,6 +2,7 @@ use crate::types::{
     Artifact, ArtifactSummary, ArtifactType, GitProvenance, PublishRequest, PublishResponse,
     VersionInfo,
 };
+use agentflare_store::{Store, documents::DocUpsertOpts};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -21,6 +22,9 @@ const VERSIONS_DIR: &str = "versions";
 /// history list) is untouched, so what happened is still visible even after
 /// old snapshot bodies are gone. v1 is always kept as the origin anchor.
 const MAX_KEPT_VERSIONS: u32 = 50;
+
+/// Doc-store project key for artifact documents.
+const DOC_PROJECT: &str = "__artifacts__";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ArtifactMeta {
@@ -54,6 +58,7 @@ struct ArtifactMeta {
 pub struct ArtifactStore {
     base_path: PathBuf,
     live_broadcast: Arc<Mutex<HashMap<String, Vec<std::sync::mpsc::Sender<String>>>>>,
+    store: Option<Arc<Store>>,
 }
 
 impl ArtifactStore {
@@ -61,12 +66,185 @@ impl ArtifactStore {
         let store = ArtifactStore {
             base_path: base_path.join(ARTIFACTS_DIR),
             live_broadcast: Arc::new(Mutex::new(HashMap::new())),
+            store: None,
         };
         let _ = fs::create_dir_all(&store.base_path);
         store
     }
 
+    pub fn with_store(store: Store) -> Self {
+        ArtifactStore {
+            base_path: PathBuf::from("store:"),
+            live_broadcast: Arc::new(Mutex::new(HashMap::new())),
+            store: Some(Arc::new(store)),
+        }
+    }
+
+    /// True when the store is backed by agentflare_store documents+blobs.
+    pub fn has_store(&self) -> bool {
+        self.store.is_some()
+    }
+
+    fn store_conn_err(e: impl std::fmt::Display) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+    }
+
+    fn doc_to_artifact(doc: &agentflare_store::documents::Document) -> std::io::Result<Artifact> {
+        let meta: ArtifactMeta = serde_json::from_str(&doc.metadata)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Artifact {
+            id: doc.path.clone(),
+            name: doc.title.clone(),
+            artifact_type: meta.artifact_type,
+            content: doc.content.clone(),
+            session_id: doc.session_id.clone().unwrap_or_default(),
+            created_at: doc.created_at as u64,
+            updated_at: doc.updated_at as u64,
+            version: doc.version as u32,
+            description: meta.description,
+            favicon: meta.favicon,
+            sender: meta.sender,
+            recipient: meta.recipient,
+            thread_id: meta.thread_id,
+            reply_to: meta.reply_to,
+            git: meta.git,
+        })
+    }
+
+    fn doc_to_summary(doc: &agentflare_store::documents::Document) -> ArtifactSummary {
+        let meta: Option<ArtifactMeta> = serde_json::from_str(&doc.metadata).ok();
+        let art_type = meta.as_ref().map(|m| m.artifact_type.clone())
+            .or_else(|| doc.tags.first().map(|s| ArtifactType::from(s.as_str())))
+            .unwrap_or(ArtifactType::Text);
+        ArtifactSummary {
+            id: doc.path.clone(),
+            name: doc.title.clone(),
+            artifact_type: art_type,
+            session_id: doc.session_id.clone().unwrap_or_default(),
+            created_at: doc.created_at as u64,
+            updated_at: doc.updated_at as u64,
+            version: doc.version as u32,
+            description: meta.as_ref().and_then(|m| m.description.clone()),
+            favicon: meta.as_ref().and_then(|m| m.favicon.clone()),
+            sender: meta.as_ref().and_then(|m| m.sender.clone()),
+            recipient: meta.as_ref().and_then(|m| m.recipient.clone()),
+            thread_id: meta.as_ref().and_then(|m| m.thread_id.clone()),
+            reply_to: meta.as_ref().and_then(|m| m.reply_to.clone()),
+        }
+    }
+
+    fn meta_to_metadata(prev: Option<&ArtifactMeta>, req: &PublishRequest, new_version: u32, now: i64) -> String {
+        let keep = |new: &Option<String>, old: fn(&ArtifactMeta) -> Option<String>| {
+            new.clone().or_else(|| prev.and_then(old))
+        };
+        let mut history = prev.map(|m| m.history.clone()).unwrap_or_default();
+        history.push(VersionInfo {
+            version: new_version,
+            label: req.label.clone(),
+            created_at: now as u64,
+        });
+        let meta = ArtifactMeta {
+            id: String::new(),
+            name: req.name.clone(),
+            artifact_type: req.artifact_type.clone(),
+            session_id: req.session_id.clone(),
+            created_at: prev.map(|m| m.created_at).unwrap_or(now as u64),
+            updated_at: now as u64,
+            version: new_version,
+            description: keep(&req.description, |m| m.description.clone()),
+            favicon: keep(&req.favicon, |m| m.favicon.clone()),
+            history,
+            sender: keep(&req.sender, |m| m.sender.clone()),
+            recipient: keep(&req.recipient, |m| m.recipient.clone()),
+            thread_id: keep(&req.thread_id, |m| m.thread_id.clone()),
+            reply_to: keep(&req.reply_to, |m| m.reply_to.clone()),
+            git: req.git.clone().or_else(|| prev.and_then(|m| m.git.clone())),
+        };
+        serde_json::to_string(&meta).unwrap_or_else(|_| "{}".into())
+    }
+
     pub fn publish(&self, req: &PublishRequest) -> std::io::Result<PublishResponse> {
+        if let Some(ref store) = self.store {
+            return self.publish_store(store, req);
+        }
+        self.publish_flat(req)
+    }
+
+    fn publish_store(&self, store: &Store, req: &PublishRequest) -> std::io::Result<PublishResponse> {
+        let id = req.update_id.clone().unwrap_or_else(|| nanoid::nanoid!());
+        let now = db_kit::ids::now();
+        let path = &id;
+
+        // Read existing doc to check CAS and dedup
+        let existing = store.doc_get_by_path(DOC_PROJECT, path)
+            .map_err(Self::store_conn_err)?;
+
+        if let (Some(base), Some(ref doc)) = (req.base_version, existing.as_ref()) {
+            if base as i32 != doc.version {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "version conflict: base_version {base}, but current version is {}",
+                        doc.version
+                    ),
+                ));
+            }
+        }
+
+        let unchanged = existing.as_ref().is_some_and(|doc| {
+            if !doc.content.is_empty() {
+                doc.content == req.content
+            } else {
+                let new_hash = blake3::hash(req.content.as_bytes()).to_hex().to_string();
+                doc.blob_hash.as_deref() == Some(&new_hash)
+            }
+        });
+
+        if !unchanged {
+            // Store content as blob for size efficiency
+            let blob_hash = store.blob_store(req.content.as_bytes())
+                .map_err(Self::store_conn_err)?;
+
+            let prev_meta: Option<ArtifactMeta> = existing.as_ref().and_then(|doc| {
+                serde_json::from_str(&doc.metadata).ok()
+            });
+
+            let next_version = existing.as_ref().map(|d| d.version as u32 + 1).unwrap_or(1);
+            let metadata = Self::meta_to_metadata(prev_meta.as_ref(), req, next_version, now);
+
+            store.doc_upsert_with_opts(DOC_PROJECT, path, "", DocUpsertOpts {
+                title: Some(req.name.clone()),
+                doc_type: Some("artifact".into()),
+                blob_hash: Some(blob_hash),
+                mime: Some(req.artifact_type.mime_type().into()),
+                tags: Some(vec![req.artifact_type.to_string()]),
+                session_id: Some(req.session_id.clone()),
+                source: Some("artifact".into()),
+                metadata: Some(metadata),
+                size: Some(req.content.len() as i64),
+            }).map_err(Self::store_conn_err)?;
+        }
+
+        let doc = store.doc_get_by_path(DOC_PROJECT, path)
+            .map_err(Self::store_conn_err)?
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "artifact not found after upsert"))?;
+
+        let version = doc.version as u32;
+        let response = PublishResponse {
+            id: id.clone(),
+            url: format!("/{id}"),
+            session_id: req.session_id.clone(),
+            version,
+        };
+
+        if existing.is_some() && !unchanged {
+            self.broadcast(&id, "refresh");
+        }
+
+        Ok(response)
+    }
+
+    fn publish_flat(&self, req: &PublishRequest) -> std::io::Result<PublishResponse> {
         let id = req
             .update_id
             .clone()
@@ -92,8 +270,6 @@ impl ArtifactStore {
             }
         }
 
-        // Dedupe: an update whose content is byte-identical refreshes
-        // metadata in place — no new snapshot, no bump, no broadcast.
         let dir = self.artifact_dir(&id);
         let unchanged = prev.is_some()
             && fs::read_to_string(dir.join(CONTENT_FILE))
@@ -114,7 +290,6 @@ impl ArtifactStore {
             });
         }
 
-        // Omitted optional fields on an update keep their old value.
         let keep = |new: &Option<String>, old: fn(&ArtifactMeta) -> Option<String>| {
             new.clone().or_else(|| prev.as_ref().and_then(old))
         };
@@ -167,6 +342,15 @@ impl ArtifactStore {
 
     /// Unified diff between two version snapshots of an artifact.
     pub fn diff(&self, id: &str, from: u32, to: u32) -> std::io::Result<String> {
+        if let Some(ref store) = self.store {
+            let old = self.get_version_store(store, id, from)?;
+            let new = self.get_version_store(store, id, to)?;
+            let diff = similar::TextDiff::from_lines(&old.content, &new.content);
+            return Ok(diff
+                .unified_diff()
+                .header(&format!("{id} v{from}"), &format!("{id} v{to}"))
+                .to_string());
+        }
         let versions_dir = self.artifact_dir(id).join(VERSIONS_DIR);
         let old = read_version_file(&versions_dir.join(from.to_string()))?;
         let new = read_version_file(&versions_dir.join(to.to_string()))?;
@@ -179,6 +363,14 @@ impl ArtifactStore {
 
     /// Version history, oldest first.
     pub fn versions(&self, id: &str) -> std::io::Result<Vec<VersionInfo>> {
+        if let Some(ref store) = self.store {
+            let doc = store.doc_get_by_path(DOC_PROJECT, id)
+                .map_err(Self::store_conn_err)?
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("artifact {id} not found")))?;
+            let meta: ArtifactMeta = serde_json::from_str(&doc.metadata)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            return Ok(meta.history);
+        }
         self.read_meta(id).map(|m| m.history).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -187,8 +379,79 @@ impl ArtifactStore {
         })
     }
 
+    fn get_version_store(&self, store: &Store, id: &str, version: u32) -> std::io::Result<Artifact> {
+        let doc = store.doc_get_by_path(DOC_PROJECT, id)
+            .map_err(Self::store_conn_err)?
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("artifact {id} not found")))?;
+        let latest = Self::doc_to_artifact(&doc)?;
+        if doc.version as u32 == version {
+            let content = Self::blob_or_content(store, &doc)?;
+            return Ok(Artifact { content, ..latest });
+        }
+        let hist = store.doc_history(&doc.id)
+            .map_err(Self::store_conn_err)?;
+        for h in hist {
+            if h.version as u32 == version {
+                let content = match &h.blob_hash {
+                    Some(hash) => {
+                        let bytes = store.blob_get(hash)
+                            .map_err(Self::store_conn_err)?
+                            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "blob not found"))?;
+                        String::from_utf8(bytes)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                    }
+                    None => h.content,
+                };
+                return Ok(Artifact { content, version, ..latest });
+            }
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("version {version} not found")))
+    }
+
+    fn blob_or_content(store: &Store, doc: &agentflare_store::documents::Document) -> std::io::Result<String> {
+        match &doc.blob_hash {
+            Some(hash) => {
+                let bytes = store.blob_get(hash)
+                    .map_err(Self::store_conn_err)?
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "blob not found"))?;
+                String::from_utf8(bytes)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            }
+            None => Ok(doc.content.clone()),
+        }
+    }
+
+    fn get_store(&self, store: &Store, id: &str) -> std::io::Result<Artifact> {
+        let doc = store.doc_get_by_path(DOC_PROJECT, id)
+            .map_err(Self::store_conn_err)?
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("artifact {id} not found")))?;
+        let content = Self::blob_or_content(store, &doc)?;
+        let meta: ArtifactMeta = serde_json::from_str(&doc.metadata)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Artifact {
+            id: doc.path.clone(),
+            name: doc.title.clone(),
+            artifact_type: meta.artifact_type,
+            content,
+            session_id: doc.session_id.clone().unwrap_or_default(),
+            created_at: doc.created_at as u64,
+            updated_at: doc.updated_at as u64,
+            version: doc.version as u32,
+            description: meta.description,
+            favicon: meta.favicon,
+            sender: meta.sender,
+            recipient: meta.recipient,
+            thread_id: meta.thread_id,
+            reply_to: meta.reply_to,
+            git: meta.git,
+        })
+    }
+
     /// A specific version's snapshot; `get()` always serves the latest.
     pub fn get_version(&self, id: &str, version: u32) -> std::io::Result<Artifact> {
+        if let Some(ref store) = self.store {
+            return self.get_version_store(store, id, version);
+        }
         let mut artifact = self.get(id)?;
         let content_path = self
             .artifact_dir(id)
@@ -200,6 +463,9 @@ impl ArtifactStore {
     }
 
     pub fn get(&self, id: &str) -> std::io::Result<Artifact> {
+        if let Some(ref store) = self.store {
+            return self.get_store(store, id);
+        }
         let dir = self.artifact_dir(id);
         if !dir.exists() {
             return Err(std::io::Error::new(
@@ -229,6 +495,17 @@ impl ArtifactStore {
     }
 
     pub fn list(&self, session_id: Option<&str>) -> std::io::Result<Vec<ArtifactSummary>> {
+        if let Some(ref store) = self.store {
+            let docs = store.doc_list(DOC_PROJECT)
+                .map_err(Self::store_conn_err)?;
+            let mut artifacts: Vec<ArtifactSummary> = docs
+                .iter()
+                .filter(|d| session_id.is_none_or(|sid| d.session_id.as_deref() == Some(sid)))
+                .map(Self::doc_to_summary)
+                .collect();
+            artifacts.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+            return Ok(artifacts);
+        }
         let dir = &self.base_path;
         if !dir.exists() {
             return Ok(vec![]);
@@ -267,6 +544,15 @@ impl ArtifactStore {
     }
 
     pub fn delete(&self, id: &str) -> std::io::Result<bool> {
+        if let Some(ref store) = self.store {
+            let doc = store.doc_get_by_path(DOC_PROJECT, id)
+                .map_err(Self::store_conn_err)?;
+            return match doc {
+                Some(d) => store.doc_delete(&d.id)
+                    .map_err(Self::store_conn_err),
+                None => Ok(false),
+            };
+        }
         let dir = self.artifact_dir(id);
         if !dir.exists() {
             return Ok(false);
@@ -356,6 +642,14 @@ mod tests {
     fn store() -> (tempfile::TempDir, ArtifactStore) {
         let tmp = tempfile::tempdir().unwrap();
         let store = ArtifactStore::new(tmp.path().to_path_buf());
+        (tmp, store)
+    }
+
+    fn doc_store() -> (tempfile::TempDir, ArtifactStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("store.db");
+        let s = agentflare_store::Store::open_file(&db_path).unwrap();
+        let store = ArtifactStore::with_store(s);
         (tmp, store)
     }
 
@@ -462,5 +756,100 @@ mod tests {
             store.get_version(&id, 1).unwrap().content,
             "legacy plaintext, no gzip header"
         );
+    }
+
+    // ── store-backed (agentflare_store) tests ──
+
+    #[test]
+    fn doc_store_publish_and_get() {
+        let (_tmp, store) = doc_store();
+        assert!(store.has_store());
+        let id = publish(&store, None, "hello from doc store");
+        let artifact = store.get(&id).unwrap();
+        assert_eq!(artifact.content, "hello from doc store");
+        assert_eq!(artifact.version, 1);
+    }
+
+    #[test]
+    fn doc_store_update_increments_version() {
+        let (_tmp, store) = doc_store();
+        let id = publish(&store, None, "v1");
+        assert_eq!(store.get(&id).unwrap().version, 1);
+
+        let id2 = publish(&store, Some(id.clone()), "v2");
+        assert_eq!(id, id2);
+        assert_eq!(store.get(&id).unwrap().content, "v2");
+        assert_eq!(store.get(&id).unwrap().version, 2);
+    }
+
+    #[test]
+    fn doc_store_versions_and_history() {
+        let (_tmp, store) = doc_store();
+        let id = publish(&store, None, "v1");
+        publish(&store, Some(id.clone()), "v2");
+        publish(&store, Some(id.clone()), "v3");
+
+        let history = store.versions(&id).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].version, 1);
+        assert_eq!(history[1].version, 2);
+        assert_eq!(history[2].version, 3);
+
+        assert_eq!(store.get_version(&id, 1).unwrap().content, "v1");
+        assert_eq!(store.get_version(&id, 2).unwrap().content, "v2");
+        assert_eq!(store.get_version(&id, 3).unwrap().content, "v3");
+    }
+
+    #[test]
+    fn doc_store_list_by_session() {
+        let (_tmp, store) = doc_store();
+        let s1 = PublishRequest {
+            name: "s1-doc".into(),
+            artifact_type: ArtifactType::Text,
+            content: "a".into(),
+            session_id: "session-A".into(),
+            ..Default::default()
+        };
+        let s2 = PublishRequest {
+            name: "s2-doc".into(),
+            artifact_type: ArtifactType::Text,
+            content: "b".into(),
+            session_id: "session-B".into(),
+            ..Default::default()
+        };
+        store.publish(&s1).unwrap();
+        store.publish(&s2).unwrap();
+
+        let all = store.list(None).unwrap();
+        assert_eq!(all.len(), 2);
+
+        let only_a = store.list(Some("session-A")).unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].name, "s1-doc");
+
+        let only_b = store.list(Some("session-B")).unwrap();
+        assert_eq!(only_b.len(), 1);
+    }
+
+    #[test]
+    fn doc_store_delete() {
+        let (_tmp, store) = doc_store();
+        let id = publish(&store, None, "to-delete");
+        assert!(store.get(&id).is_ok());
+        assert!(store.delete(&id).unwrap());
+        assert!(store.get(&id).is_err());
+        // second delete returns false
+        assert!(!store.delete(&id).unwrap());
+    }
+
+    #[test]
+    fn doc_store_diff_between_versions() {
+        let (_tmp, store) = doc_store();
+        let id = publish(&store, None, "line one\nline two\n");
+        publish(&store, Some(id.clone()), "line one\nline two modified\n");
+
+        let d = store.diff(&id, 1, 2).unwrap();
+        assert!(d.contains("line two"));
+        assert!(d.contains("line two modified"));
     }
 }
