@@ -1538,7 +1538,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Global unified search across four sources. type='store' (default) — FTS search across indexed store documents (artifacts, notes), grouped by doc_type. type='memory' — FTS search across brain.db observations (decisions, findings, patterns). type='code' — code search delegated to the gateway's leanctx ctx_search (regex, compressed output). type='web' — internet search via rivalsearch web_search tool. Returns { query, source, total, groups|results }."
+        description = "Unified search across 17 sources. type='store' (FTS store docs), 'memory' (brain.db observations), 'code' (leanctx), 'web' (rivalsearch), 'social' (9 platforms), 'news' (5 sources), 'github' (repos), 'academic' (papers, 5 dbs), 'datasets' (4 hubs), 'websites' (crawl), 'weather' (Open-Meteo), 'financial' (SEC EDGAR), 'crypto' (CoinGecko), 'fx' (ECB/Frankfurter), 'indicators' (World Bank), 'youtube' (transcripts), 'bluesky' (profiles+feed). Returns { query, source, total, groups|results }."
     )]
     async fn search(
         &self,
