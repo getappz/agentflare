@@ -1191,6 +1191,33 @@ impl AgentflareMcp {
         Ok(serde_json::json!({ "ok": true, "event_id": event_id, "suppressed": suppressed }).to_string())
     }
 
+    #[tool(
+        description = "List or file agentflare's own tooling bugs (git shim, af-guard, item-tracker friction -- NOT this project's own vents) as ONE batched GitHub issue on getappz/agentflare. Call without title/body to see the pending batch and write a summary yourself; call again with both to file it."
+    )]
+    fn vent_file(&self, Parameters(req): Parameters<VentFileRequest>) -> Result<String, ErrorData> {
+        let log = crate::vent::paths::global_log_path();
+        let filed = crate::vent::paths::global_filed_path();
+        let batch = crate::vent::file::pending_batch(&log, &filed);
+        if batch.is_empty() {
+            return Ok(serde_json::json!({ "ok": true, "pending": [] }).to_string());
+        }
+        match (req.title, req.body) {
+            (Some(title), Some(body)) => {
+                let url = crate::vent::file::create_github_issue(&title, &body).map_err(|e| {
+                    ErrorData::internal_error(format!("gh issue create failed: {e}"), None)
+                })?;
+                let keys: Vec<String> = batch.iter().map(|g| g.topic_key.clone()).collect();
+                let now = chrono::Utc::now().timestamp();
+                crate::vent::file::mark_filed(&filed, &keys, &url, now).map_err(|e| {
+                    ErrorData::internal_error(format!("mark_filed failed: {e}"), None)
+                })?;
+                Ok(serde_json::json!({ "ok": true, "issue_url": url, "filed_count": keys.len() })
+                    .to_string())
+            }
+            _ => Ok(serde_json::json!({ "ok": true, "pending": batch }).to_string()),
+        }
+    }
+
     /// Rejects PR titles that don't start with a conventional-commit type,
     /// mirroring `.github/workflows/pr-title.yml`'s
     /// `amannn/action-semantic-pull-request` config so the check fires here
