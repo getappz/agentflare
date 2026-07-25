@@ -200,7 +200,11 @@ pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
                 (dir.join("lean-ctx.md"), rule_text::LEANCTX.to_string()),
                 (dir.join("flare-docs.md"), rule_text::FLARE_DOCS.to_string()),
             ];
-            v.extend(coaching.iter().map(|(id, body)| (dir.join(format!("{id}.md")), body.clone())));
+            v.extend(
+                coaching
+                    .iter()
+                    .map(|(id, body)| (dir.join(format!("{id}.md")), body.clone())),
+            );
             v
         }
         "cursor" => {
@@ -240,7 +244,11 @@ pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
                 (dir.join("lean-ctx.md"), rule_text::LEANCTX.to_string()),
                 (dir.join("flare-docs.md"), rule_text::FLARE_DOCS.to_string()),
             ];
-            v.extend(coaching.iter().map(|(id, body)| (dir.join(format!("{id}.md")), body.clone())));
+            v.extend(
+                coaching
+                    .iter()
+                    .map(|(id, body)| (dir.join(format!("{id}.md")), body.clone())),
+            );
             v
         }
         _ => vec![], // "continue" — no dedicated rules convention found
@@ -868,16 +876,28 @@ mod tests {
     fn rule_targets_includes_coaching_sourced_rule_for_claude_code_and_opencode() {
         crate::paths::test_support::with_temp_home(|| {
             crate::coaching::apply_rule(
-                "search17", "T", "Coaching body", None,
+                "search17",
+                "T",
+                "Coaching body",
+                None,
                 crate::coaching::rule::RuleTier::Builtin,
                 vec!["claude-code".to_string(), "opencode".to_string()],
-            ).unwrap();
+            )
+            .unwrap();
 
             let cc = rule_targets("claude-code");
-            assert!(cc.iter().any(|(p, c)| p.to_string_lossy().ends_with("search17.md") && c == "Coaching body"));
+            assert!(
+                cc.iter()
+                    .any(|(p, c)| p.to_string_lossy().ends_with("search17.md")
+                        && c == "Coaching body")
+            );
 
             let oc = rule_targets("opencode");
-            assert!(oc.iter().any(|(p, c)| p.to_string_lossy().ends_with("search17.md") && c == "Coaching body"));
+            assert!(
+                oc.iter()
+                    .any(|(p, c)| p.to_string_lossy().ends_with("search17.md")
+                        && c == "Coaching body")
+            );
         });
     }
 
@@ -885,15 +905,22 @@ mod tests {
     fn rule_targets_appends_coaching_sourced_body_into_joined_hosts() {
         crate::paths::test_support::with_temp_home(|| {
             crate::coaching::apply_rule(
-                "search17", "T", "Coaching body", None,
+                "search17",
+                "T",
+                "Coaching body",
+                None,
                 crate::coaching::rule::RuleTier::Builtin,
                 vec!["cursor".to_string()],
-            ).unwrap();
+            )
+            .unwrap();
 
             let targets = rule_targets("cursor");
             assert_eq!(targets.len(), 1, "cursor stays a single joined file");
             assert!(targets[0].1.contains("Coaching body"));
-            assert!(targets[0].1.contains(rule_text::FLARE_DOCS), "existing builtin content must still be present");
+            assert!(
+                targets[0].1.contains(rule_text::FLARE_DOCS),
+                "existing builtin content must still be present"
+            );
         });
     }
 
@@ -901,10 +928,14 @@ mod tests {
     fn rule_targets_omits_coaching_rule_not_synced_to_this_host() {
         crate::paths::test_support::with_temp_home(|| {
             crate::coaching::apply_rule(
-                "search17", "T", "Coaching body", None,
+                "search17",
+                "T",
+                "Coaching body",
+                None,
                 crate::coaching::rule::RuleTier::Builtin,
                 vec!["opencode".to_string()],
-            ).unwrap();
+            )
+            .unwrap();
 
             let cc = rule_targets("claude-code");
             assert!(!cc.iter().any(|(_, c)| c == "Coaching body"));

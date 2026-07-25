@@ -39,7 +39,7 @@ pub(crate) fn is_stale_rule(path: &PathBuf, current: &str) -> bool {
 
     // Check compiled-in superseded bodies first (exa.md, git.md, etc.).
     let superseded = rule_text::superseded(filename);
-    if superseded.iter().any(|old| trimmed == *old) {
+    if superseded.contains(&trimmed) {
         return true;
     }
 
@@ -507,10 +507,13 @@ pub(crate) fn wire_opencode_instructions() {
     for file in &expected_filenames {
         let rule_path = rules_dir.join(file);
         let path_str = rule_path.to_string_lossy().replace('\\', "/");
-        let has_it = arr
+        let has_it = arr.iter().any(|v| {
+            v.as_str()
+                .map(|s| s.contains(file.as_str()))
+                .unwrap_or(false)
+        }) || sibling_instructions
             .iter()
-            .any(|v| v.as_str().map(|s| s.contains(file.as_str())).unwrap_or(false))
-            || sibling_instructions.iter().any(|s| s.contains(file.as_str()));
+            .any(|s| s.contains(file.as_str()));
         if !has_it && rule_path.exists() {
             arr.push(json!(path_str));
             added += 1;

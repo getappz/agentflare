@@ -76,12 +76,20 @@ fn is_spec_like_path(path: &str) -> bool {
 /// mid-migration ... store.db ... ~/.agentflare/*.db*" — none of that is an
 /// executed command, but a whole-string substring check can't tell).
 fn destructive_data_file_reason(command: &str) -> Option<String> {
-    for statement in command.split([';', '\n']).flat_map(|s| s.split("&&")).flat_map(|s| s.split("||")).flat_map(|s| s.split('|')) {
+    for statement in command
+        .split([';', '\n'])
+        .flat_map(|s| s.split("&&"))
+        .flat_map(|s| s.split("||"))
+        .flat_map(|s| s.split('|'))
+    {
         let trimmed = statement.trim().to_lowercase().replace('\\', "/");
         let Some(first_word) = trimmed.split_whitespace().next() else {
             continue;
         };
-        let is_destructive_verb = matches!(first_word, "rm" | "del" | "erase" | "remove-item" | "unlink" | "rmdir");
+        let is_destructive_verb = matches!(
+            first_word,
+            "rm" | "del" | "erase" | "remove-item" | "unlink" | "rmdir"
+        );
         if !is_destructive_verb {
             continue;
         }
