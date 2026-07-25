@@ -46,7 +46,7 @@ pub struct DocMatch {
     pub score: f64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DocUpsertOpts {
     pub title: Option<String>,
     pub doc_type: Option<String>,
@@ -57,6 +57,29 @@ pub struct DocUpsertOpts {
     pub source: Option<String>,
     pub metadata: Option<String>,
     pub size: Option<i64>,
+    /// Whether an update should snapshot the previous row into
+    /// `store_doc_history`. Defaults to `true` to preserve existing
+    /// behavior; cache-type consumers (e.g. flare-docs) that never need
+    /// "what changed between refreshes" can set this to `false` to avoid
+    /// unbounded history-table growth from repeated re-fetches.
+    pub track_history: bool,
+}
+
+impl Default for DocUpsertOpts {
+    fn default() -> Self {
+        Self {
+            title: None,
+            doc_type: None,
+            blob_hash: None,
+            mime: None,
+            tags: None,
+            session_id: None,
+            source: None,
+            metadata: None,
+            size: None,
+            track_history: true,
+        }
+    }
 }
 
 impl Store {
@@ -158,14 +181,19 @@ impl Store {
         )) = existing
         {
             let new_version = old_version + 1;
-            let history_id = db_kit::ids::new_id();
 
-            // Snapshot current version to history
-            tx.execute(
-                "INSERT INTO store_doc_history (id, doc_id, version, content, blob_hash, mime, title, metadata, size, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT title FROM store_documents WHERE id = ?2), ?7, ?8, ?9)",
-                params![history_id, existing_id, old_version, old_content, old_blob_hash, old_mime, old_metadata, old_size, now],
-            )?;
+            // Snapshot current version to history, unless the caller opted
+            // out (cache-type documents) or content is byte-identical to
+            // what's already stored (a no-op re-upsert has nothing to
+            // snapshot).
+            if opts.track_history && old_content != content {
+                let history_id = db_kit::ids::new_id();
+                tx.execute(
+                    "INSERT INTO store_doc_history (id, doc_id, version, content, blob_hash, mime, title, metadata, size, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT title FROM store_documents WHERE id = ?2), ?7, ?8, ?9)",
+                    params![history_id, existing_id, old_version, old_content, old_blob_hash, old_mime, old_metadata, old_size, now],
+                )?;
+            }
 
             tx.execute(
                 "UPDATE store_documents SET
@@ -793,6 +821,63 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].version, 1);
         assert_eq!(history[0].content, "v1");
+    }
+
+    #[test]
+    fn track_history_false_skips_history_row() {
+        let s = store();
+        s.doc_upsert_with_opts(
+            "p",
+            "/v.md",
+            "v1",
+            DocUpsertOpts {
+                track_history: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let updated = s
+            .doc_upsert_with_opts(
+                "p",
+                "/v.md",
+                "v2",
+                DocUpsertOpts {
+                    track_history: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.content, "v2");
+        assert!(s.doc_history(&updated.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn identical_content_reupsert_skips_history_row() {
+        let s = store();
+        let doc = s.doc_upsert("p", "/same.md", "same content").unwrap();
+        let updated = s.doc_upsert("p", "/same.md", "same content").unwrap();
+        assert_eq!(updated.id, doc.id);
+        assert!(
+            s.doc_history(&updated.id).unwrap().is_empty(),
+            "no history row should be written when content is unchanged"
+        );
+    }
+
+    #[test]
+    fn project_path_unique_index_rejects_duplicate_raw_insert() {
+        let s = store();
+        s.doc_upsert("p", "/dup.md", "content").unwrap();
+        let conn = s.conn();
+        let result = conn.execute(
+            "INSERT INTO store_documents
+             (id, project_id, path, content, title, doc_type, blob_hash, mime, tags, session_id, source, metadata, size, version, created_at, updated_at)
+             VALUES ('dup-id-2', 'p', '/dup.md', 'other', '', 'file', NULL, '', '[]', NULL, '', '{}', 0, 1, 0, 0)",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "duplicate (project_id, path) should be rejected by the unique index"
+        );
     }
 
     #[test]

@@ -86,5 +86,8 @@ pub fn migrations() -> Migrations<'static> {
              ALTER TABLE store_doc_history ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';
              ALTER TABLE store_doc_history ADD COLUMN size INTEGER NOT NULL DEFAULT 0;",
         ),
+        M::up(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_project_path ON store_documents(project_id, path);",
+        ),
     ])
 }
