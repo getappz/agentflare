@@ -9,6 +9,7 @@ mod cost;
 mod daemon;
 mod dev_install;
 mod docs;
+mod doctor;
 mod gateway;
 pub(crate) mod git;
 mod handoff;
@@ -51,6 +52,7 @@ pub enum Commands {
     Hook(hook::HookArgs),
     Cost(cost::CostArgs),
     DevInstall(dev_install::DevInstallArgs),
+    Doctor(doctor::DoctorArgs),
     Coaching(coaching::CoachingArgs),
     Gateway(gateway::GatewayArgs),
     Git(git::GitArgs),
@@ -86,6 +88,7 @@ impl Commands {
             Self::Hook(cmd) => cmd.run(),
             Self::Cost(cmd) => cmd.run(),
             Self::DevInstall(cmd) => cmd.run(),
+            Self::Doctor(cmd) => cmd.run(),
             Self::Coaching(cmd) => cmd.run(),
             Self::Gateway(cmd) => cmd.run(),
             Self::Git(cmd) => git::run(cmd),

@@ -25,7 +25,7 @@ fn cwd() -> PathBuf {
 /// content matches a KNOWN old version verbatim — anything else (already
 /// current, or diverging for some other reason) is left untouched, since
 /// that "some other reason" is most likely a user edit.
-fn is_stale_rule(path: &PathBuf, current: &str) -> bool {
+pub(crate) fn is_stale_rule(path: &PathBuf, current: &str) -> bool {
     let Some(filename) = path.file_name().and_then(|f| f.to_str()) else {
         return false;
     };
