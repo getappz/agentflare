@@ -959,7 +959,9 @@ pub(crate) struct SearchRequest {
     )]
     #[serde(default)]
     pub(crate) r#type: Option<String>,
-    #[schemars(description = "Max results (default 20; code 50, web/social/academic 10)")]
+    #[schemars(
+        description = "Max results (store/memory 20, code 50, web/social/news/github/academic/datasets 10, websites 5). Ignored by weather/financial/crypto/fx/indicators/youtube/bluesky."
+    )]
     #[serde(default)]
     pub(crate) limit: Option<usize>,
 }
