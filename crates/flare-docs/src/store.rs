@@ -133,23 +133,39 @@ impl DocsStore {
         let now = db_kit::ids::now();
         let fresh_paths: std::collections::HashSet<&str> =
             items.iter().map(|i| i.path.as_str()).collect();
+        // SQLite's LIKE is case-insensitive for ASCII by default, but a path
+        // prefix match must be exact -- re-check with a case-sensitive
+        // `starts_with` in Rust so a path that only coincidentally matches
+        // `path_prefix` case-insensitively (e.g. a different crate/version
+        // segment differing only in case) is never treated as belonging to
+        // this prefix.
         let like_pattern = format!("{}%", escape_like(path_prefix));
         let mut stmt = tx.prepare(
-            "SELECT path FROM store_documents
+            "SELECT rowid, path FROM store_documents
              WHERE project_id = ?1 AND path LIKE ?2 ESCAPE '\\' AND deleted_at IS NULL",
         )?;
-        let stored_paths: Vec<String> = stmt
+        let stored: Vec<(i64, String)> = stmt
             .query_map(rusqlite::params![PROJECT_ID, like_pattern], |row| {
-                row.get(0)
+                Ok((row.get(0)?, row.get(1)?))
             })?
             .collect::<rusqlite::Result<_>>()?;
         drop(stmt);
 
-        for stored_path in stored_paths {
-            if !fresh_paths.contains(stored_path.as_str()) {
+        for (rowid, stored_path) in stored {
+            if stored_path.starts_with(path_prefix) && !fresh_paths.contains(stored_path.as_str()) {
                 tx.execute(
-                    "UPDATE store_documents SET deleted_at = ?1 WHERE project_id = ?2 AND path = ?3",
-                    rusqlite::params![now, PROJECT_ID, stored_path],
+                    "UPDATE store_documents SET deleted_at = ?1 WHERE rowid = ?2",
+                    rusqlite::params![now, rowid],
+                )?;
+                // Mirror write_batch_items's explicit FTS sync -- store_docs_fts
+                // is a manually-synced table, not a content=/external-content
+                // FTS5 table, so a soft-deleted row's stale entry would
+                // otherwise stay directly matchable via `store_docs_fts MATCH`
+                // (doc_search's own deleted_at filter still excludes it, but
+                // nothing else queries store_docs_fts through that guard).
+                tx.execute(
+                    "DELETE FROM store_docs_fts WHERE rowid = ?1",
+                    rusqlite::params![rowid],
                 )?;
             }
         }
@@ -417,5 +433,88 @@ mod tests {
         assert_eq!(found.path, "docsrs/serde");
 
         assert!(store.get_by_path("docsrs/nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn upsert_batch_reconciled_removes_stale_items_and_their_fts_entries() {
+        let store = DocsStore::open_memory().unwrap();
+        let prefix = "docsrs/axum/latest/item/";
+        let make = |path: &str, content: &str| BatchItem {
+            path: format!("{prefix}{path}"),
+            content: content.into(),
+            title: path.into(),
+            doc_type: "rust-item".into(),
+            tags: vec![],
+            source: "docsrs".into(),
+        };
+
+        store
+            .upsert_batch_reconciled(
+                prefix,
+                &[
+                    make("axum::Router", "router docs unique marker"),
+                    make("axum::extract::State", "state docs"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.search("unique marker", 10).unwrap().len(), 1);
+
+        // Refetch with Router gone -- it must be soft-deleted...
+        store
+            .upsert_batch_reconciled(prefix, &[make("axum::extract::State", "state docs")])
+            .unwrap();
+        assert!(
+            store
+                .get_by_path(&format!("{prefix}axum::Router"))
+                .unwrap()
+                .is_none()
+        );
+        // ...and its FTS entry must be gone too, not just excluded by
+        // doc_search's deleted_at filter -- searching for its old content
+        // must return nothing.
+        assert!(
+            store.search("unique marker", 10).unwrap().is_empty(),
+            "a soft-deleted item's FTS entry must not remain matchable"
+        );
+    }
+
+    #[test]
+    fn upsert_batch_reconciled_prefix_match_is_case_sensitive() {
+        let store = DocsStore::open_memory().unwrap();
+        // A path that only matches the LIKE pattern case-insensitively
+        // (different case on the crate segment) must not be treated as
+        // belonging to this prefix and must survive reconciliation.
+        store
+            .upsert_batch(&[BatchItem {
+                path: "docsrs/Axum/latest/item/axum::Other".into(),
+                content: "other-case docs".into(),
+                title: "Other".into(),
+                doc_type: "rust-item".into(),
+                tags: vec![],
+                source: "docsrs".into(),
+            }])
+            .unwrap();
+
+        store
+            .upsert_batch_reconciled(
+                "docsrs/axum/latest/item/",
+                &[BatchItem {
+                    path: "docsrs/axum/latest/item/axum::Router".into(),
+                    content: "router docs".into(),
+                    title: "Router".into(),
+                    doc_type: "rust-item".into(),
+                    tags: vec![],
+                    source: "docsrs".into(),
+                }],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .get_by_path("docsrs/Axum/latest/item/axum::Other")
+                .unwrap()
+                .is_some(),
+            "a differently-cased path must not be soft-deleted by a case-insensitive LIKE match"
+        );
     }
 }
