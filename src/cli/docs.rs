@@ -19,6 +19,10 @@ pub enum DocsCmd {
         package: String,
         #[arg(long, default_value = "latest")]
         version: String,
+        /// Registry to look the package up in: rust (docs.rs) or npm.
+        /// Defaults to rust; scoped names (@scope/pkg) imply npm.
+        #[arg(long, short = 'e')]
+        ecosystem: Option<String>,
     },
     /// List every cached document.
     List,
@@ -27,6 +31,9 @@ pub enum DocsCmd {
         package: String,
         #[arg(long, default_value = "latest")]
         version: String,
+        /// Registry to look the package up in: rust (docs.rs) or npm.
+        #[arg(long, short = 'e')]
+        ecosystem: Option<String>,
     },
 }
 
@@ -54,8 +61,13 @@ pub fn run(args: DocsArgs) {
                 std::process::exit(1);
             }
         },
-        DocsCmd::Get { package, version } => {
-            let cached = match store.get_by_path(&flare_docs::docs_id_path(&package, &version)) {
+        DocsCmd::Get {
+            package,
+            version,
+            ecosystem,
+        } => {
+            let eco = resolve_ecosystem(ecosystem.as_deref(), &package);
+            let cached = match store.get_by_path(&eco.docs_id_path(&package, &version)) {
                 Ok(cached) => cached,
                 Err(e) => {
                     eprintln!("flare-docs: cache lookup failed: {e}");
@@ -68,16 +80,49 @@ pub fn run(args: DocsArgs) {
                 // caller's point of view -- print only the doc, matching the
                 // cache-hit shape above, rather than inventing fetch-outcome
                 // telemetry a plain "get" never asked for.
-                None => fetch_and_print(&store, &package, &version, false),
+                None => fetch_and_print(&store, eco, &package, &version, false),
             }
         }
-        DocsCmd::Refresh { package, version } => fetch_and_print(&store, &package, &version, true),
+        DocsCmd::Refresh {
+            package,
+            version,
+            ecosystem,
+        } => {
+            let eco = resolve_ecosystem(ecosystem.as_deref(), &package);
+            fetch_and_print(&store, eco, &package, &version, true)
+        }
     }
 }
 
-fn fetch_and_print(store: &flare_docs::DocsStore, package: &str, version: &str, verbose: bool) {
+fn resolve_ecosystem(explicit: Option<&str>, package: &str) -> flare_docs::Ecosystem {
+    match flare_docs::Ecosystem::resolve(explicit, package) {
+        Ok(eco) => eco,
+        Err(e) => {
+            eprintln!("flare-docs: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn fetch_and_print(
+    store: &flare_docs::DocsStore,
+    eco: flare_docs::Ecosystem,
+    package: &str,
+    version: &str,
+    verbose: bool,
+) {
     let fetcher = flare_docs::UreqFetcher::new();
-    match flare_docs::fetch_and_store(&fetcher, store, package, version) {
+    let fetched = match eco {
+        flare_docs::Ecosystem::Rust => {
+            flare_docs::fetch_and_store(&fetcher, store, package, version)
+                .map_err(|e| e.to_string())
+        }
+        flare_docs::Ecosystem::Npm => {
+            flare_docs::npm::fetch_and_store(&fetcher, store, package, version)
+                .map_err(|e| e.to_string())
+        }
+    };
+    match fetched {
         Ok(outcome) => {
             if verbose {
                 println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
@@ -89,7 +134,10 @@ fn fetch_and_print(store: &flare_docs::DocsStore, package: &str, version: &str, 
             }
         }
         Err(e) => {
-            eprintln!("flare-docs: fetch failed: {e}");
+            eprintln!(
+                "flare-docs: fetch failed: {e} — {}",
+                eco.other_ecosystem_hint(package)
+            );
             std::process::exit(1);
         }
     }

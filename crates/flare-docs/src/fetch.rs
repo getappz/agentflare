@@ -9,6 +9,11 @@ const MAX_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
+    /// Split out from [`Self::Http`] so callers can tell "the server said this
+    /// does not exist" from "the request never got an answer". Collapsing the
+    /// two turns a timeout into a confident, wrong claim of absence.
+    #[error("not found")]
+    NotFound,
     #[error("http error: {0}")]
     Http(String),
     #[error("decompression error: {0}")]
@@ -78,6 +83,9 @@ impl Fetcher for UreqFetcher {
             .map_err(|e| FetchError::Http(e.to_string()))?;
 
         let status = resp.status();
+        if status == 404 {
+            return Err(FetchError::NotFound);
+        }
         if !(200..300).contains(&status) {
             return Err(FetchError::Http(format!("status {status}")));
         }

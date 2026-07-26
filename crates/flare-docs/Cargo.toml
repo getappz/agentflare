@@ -18,6 +18,15 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 zstd = "0.13"
 ureq = "2"
 rustdoc-types = "0.60"
+# npm/JSR ecosystem: tarballs ship gzipped tar, and package API surface is
+# extracted from TypeScript declaration files via tree-sitter. Deliberately not
+# deno_doc — that crate costs ~100 transitive crates and +4.8 MB of binary, and
+# still leaves Node module resolution to the caller. See npm::extract.
+flate2 = "1"
+tar = "0.4"
+tree-sitter = "0.25"
+tree-sitter-typescript = "0.23"
+streaming-iterator = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

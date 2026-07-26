@@ -1173,11 +1173,11 @@ impl AgentflareMcp {
         self.memory_impl(req)
     }
 
-    // --- flare_docs tool ---
+    // --- docs tool ---
     #[tool(
-        description = "On-demand third-party package/API documentation — search|get|list|refresh. Fetches and caches docs (Rust crates via docs.rs today) in a global store shared across all projects, separate from project-scoped documents."
+        description = "On-demand third-party package/API documentation — search|get|list|refresh. Fetches and caches docs in a global store shared across all projects, separate from project-scoped documents. Rust crates via docs.rs (ecosystem=\"rust\", the default); npm packages via npmjs.org, indexed per exported symbol from their TypeScript declarations with a DefinitelyTyped fallback for untyped packages (ecosystem=\"npm\"; scoped names like \"@types/node\" are detected automatically)."
     )]
-    async fn flare_docs(
+    async fn docs(
         &self,
         Parameters(req): Parameters<FlareDocsRequest>,
     ) -> Result<String, ErrorData> {
