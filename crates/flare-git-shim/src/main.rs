@@ -8,6 +8,12 @@
 //!
 //! Installed onto PATH as `git`/`git.exe` in the same shim directory
 //! `agentflare-shim` already uses (see `agentflare git install-shim`).
+//!
+//! Agent-only, same as `agentflare-shim`: every deny this shim can produce
+//! exists to protect agentflare's own orchestration from AGENT-driven git
+//! calls, not to restrict ordinary interactive human use. `main` bails out
+//! to real git immediately when `classify::agent_invocation_detected()` is
+//! false, before any classify/scope-check/audit work runs at all.
 
 use std::env;
 use std::ffi::OsString;
@@ -246,6 +252,18 @@ fn main() {
     // hardlinked/copied under another name (it shouldn't be), fall
     // straight through rather than guessing at a policy for it.
     if tool != "git" {
+        run_real(&tool, filtered_path.as_ref(), &args);
+    }
+
+    // Agent-only gate, same catalog `agentflare-shim`'s own dispatcher and
+    // `classify::agent_invocation_detected` already use -- this shim's whole
+    // policy (protected-branch checkout/switch/delete/rename, trust-root
+    // push, plumbing block, worktree block, scope-check) exists to protect
+    // agentflare's own orchestration from AGENT-driven git calls. A regular
+    // human interactively running git in a tracked repo must see zero
+    // restrictions from this shim, not just the narrower canonical-detach
+    // guard inside `classify` that already carried this same check alone.
+    if !classify::agent_invocation_detected() {
         run_real(&tool, filtered_path.as_ref(), &args);
     }
 

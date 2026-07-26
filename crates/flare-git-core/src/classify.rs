@@ -70,26 +70,23 @@ pub fn extra_trust_root_paths_from_env() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Env vars agent CLIs set on themselves -- same catalog `agentflare-shim`
-/// gates its own dispatch behind. Used ONLY to scope the canonical-repo
-/// mutation guard (see `would_detach_head`) to agent-driven invocations --
-/// never to change ordinary git behavior for interactive human use.
-const AGENT_ENV_VARS: &[&str] = &[
-    "CLAUDECODE",
-    "CURSOR_AGENT",
-    "CODEX_CLI_SESSION",
-    "GEMINI_SESSION",
-    "CODEBUDDY",
-    "AGENTFLARE_AGENT",
-];
-
-/// `true` if any agent-identifying env var is set -- this invocation is
-/// (self-reportedly) agent-driven, not an interactive human shell.
+/// `true` if this invocation is (self-reportedly) agent-driven, not an
+/// interactive human shell. Delegates to the `agent-detector` crate (already
+/// a dependency here, see `provenance.rs`) rather than maintaining a second,
+/// narrower hardcoded env-var list of the same kind `agentflare-shim` and
+/// `flare-code::detect` each already carry -- `agent-detector` covers a much
+/// wider agent catalog (opencode, codex, gemini, cursor, windsurf, aider,
+/// devin, ...), not just the handful this crate used to check directly. The
+/// `AGENTFLARE_AGENT` OR-clause stays as a second check alongside it: it's
+/// agentflare's own internal marker (set by its orchestrator on subagents),
+/// not something `agent-detector`'s external, tool-agnostic catalog knows
+/// about, and `bypass_agent_env_var_bypasses_only_for_the_matching_agent`
+/// (flare-git-shim's own tests) depends on it alone being sufficient to
+/// count as agent-invoked.
 #[must_use]
 pub fn agent_invocation_detected() -> bool {
-    AGENT_ENV_VARS
-        .iter()
-        .any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()))
+    agent_detector::is_agent()
+        || std::env::var_os("AGENTFLARE_AGENT").is_some_and(|s| !s.is_empty())
 }
 
 /// `true` if `subcommand`/`args` would detach HEAD -- `git checkout
