@@ -37,7 +37,15 @@ pub trait ClientError {
 
 impl ClientError for FetchError {
     fn is_client_error(&self) -> bool {
-        matches!(self, FetchError::Status(400..=499))
+        match self {
+            // 408 and 429 sit in the 4xx range but are retryable: the request
+            // was well-formed and the caller simply needs to wait. Reporting
+            // them as `invalid_params` sends an agent off to "fix" arguments
+            // that were never wrong, when the correct response is to back off.
+            FetchError::Status(408 | 429) => false,
+            FetchError::Status(400..=499) => true,
+            _ => false,
+        }
     }
 }
 
@@ -169,6 +177,9 @@ mod tests {
         assert!(FetchError::Status(499).is_client_error());
         assert!(!FetchError::Status(500).is_client_error());
         assert!(!FetchError::Status(302).is_client_error());
+        // Retryable 4xx: the arguments were fine, the caller just has to wait.
+        assert!(!FetchError::Status(429).is_client_error());
+        assert!(!FetchError::Status(408).is_client_error());
         assert!(!FetchError::Http("connection refused".into()).is_client_error());
         assert!(!FetchError::TooLarge("too big".into()).is_client_error());
     }

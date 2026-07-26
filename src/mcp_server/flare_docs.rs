@@ -10,8 +10,8 @@ use super::*;
 // re-exported (not just privately imported) through this submodule for that
 // path to resolve.
 pub(crate) use ::flare_docs::{
-    ClientError, DocsStore, Ecosystem, FetchOutcome, Fetcher, UreqFetcher, docs_rs_json_url, npm,
-    store_fetched,
+    ClientError, DocsStore, Ecosystem, FetchOutcome, Fetcher, MAX_SEARCH_LIMIT, UreqFetcher,
+    docs_rs_json_url, npm, store_fetched,
 };
 
 const DEFAULT_LIMIT: usize = 10;
@@ -37,13 +37,23 @@ impl AgentflareMcp {
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
                 })?
             }
-            "list" => self.with_flare_docs_store(|store| {
-                let docs = store
-                    .list()
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                serde_json::to_string(&docs)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-            })?,
+            "list" => {
+                // `list` returns everything by default -- callers use it to
+                // enumerate the cache -- but an explicit `limit` is honoured
+                // and capped, so the documented ceiling is not a claim the
+                // tool quietly ignores.
+                let limit = req.limit.map(|n| n.min(MAX_SEARCH_LIMIT));
+                self.with_flare_docs_store(|store| {
+                    let mut docs = store
+                        .list()
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                    if let Some(n) = limit {
+                        docs.truncate(n);
+                    }
+                    serde_json::to_string(&docs)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+                })?
+            }
             "get" if req.id.is_some() => {
                 let id = req.id.expect("guarded by is_some() above");
                 self.with_flare_docs_store(|store| {
@@ -350,6 +360,47 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn list_returns_everything_by_default_but_honours_a_capped_limit() {
+        // The schema documents a ceiling on `limit` for both search and list;
+        // `list` used to ignore the field entirely, making that documentation
+        // a promise the tool did not keep.
+        let mcp = test_mcp();
+        mcp.with_flare_docs_store(|store| {
+            for i in 0..(MAX_SEARCH_LIMIT + 5) {
+                store
+                    .upsert(
+                        &Ecosystem::Rust.docs_id_path(&format!("crate{i}"), "latest"),
+                        "docs",
+                        DocUpsertOpts::default(),
+                    )
+                    .unwrap();
+            }
+        })
+        .unwrap();
+
+        let all = mcp
+            .flare_docs_impl(FlareDocsRequest {
+                action: "list".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let all: serde_json::Value = serde_json::from_str(&all).unwrap();
+        assert_eq!(all.as_array().unwrap().len(), MAX_SEARCH_LIMIT + 5);
+
+        let capped = mcp
+            .flare_docs_impl(FlareDocsRequest {
+                action: "list".to_string(),
+                limit: Some(usize::MAX),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let capped: serde_json::Value = serde_json::from_str(&capped).unwrap();
+        assert_eq!(capped.as_array().unwrap().len(), MAX_SEARCH_LIMIT);
     }
 
     #[tokio::test]
