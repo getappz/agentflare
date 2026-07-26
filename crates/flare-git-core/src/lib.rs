@@ -7,7 +7,9 @@
 pub mod audit;
 pub mod branch;
 pub mod classify;
+pub mod config_loader;
 pub mod doctor;
+pub mod policy_config;
 pub mod provenance;
 pub mod scope;
 pub mod shell;
