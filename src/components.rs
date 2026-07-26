@@ -176,56 +176,133 @@ fn write_if_absent(path: &PathBuf, content: &str) -> bool {
 /// no dedicated rules convention (per research), so it gets none.
 pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
     let joined = || rule_text::all().join("\n\n");
+    let coaching: Vec<(String, String)> = crate::coaching::sync_targets_for_host(host);
+    let joined_extra = || {
+        coaching
+            .iter()
+            .map(|(_, body)| body.clone())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let append_joined = |base: String| {
+        if coaching.is_empty() {
+            base
+        } else {
+            format!("{base}\n\n{}", joined_extra())
+        }
+    };
     match host {
         "claude-code" => {
             let dir = claude_rules_dir();
-            vec![
+            let mut v = vec![
                 (dir.join("exa.md"), rule_text::EXA.to_string()),
                 (dir.join("git.md"), rule_text::GIT.to_string()),
                 (dir.join("lean-ctx.md"), rule_text::LEANCTX.to_string()),
                 (dir.join("flare-docs.md"), rule_text::FLARE_DOCS.to_string()),
-            ]
+            ];
+            v.extend(
+                coaching
+                    .iter()
+                    .map(|(id, body)| (dir.join(format!("{id}.md")), body.clone())),
+            );
+            v
         }
         "cursor" => {
-            let content = format!("---\nalwaysApply: true\n---\n\n{}", joined());
+            let content = format!("---\nalwaysApply: true\n---\n\n{}", append_joined(joined()));
             vec![(
                 cwd().join(".cursor").join("rules").join("agentflare.mdc"),
                 content,
             )]
         }
         "codex" => {
-            let content = format!("# Rules (agentflare)\n\n{}\n", joined());
+            let content = format!("# Rules (agentflare)\n\n{}\n", append_joined(joined()));
             vec![(cwd().join("AGENTS.md"), content)]
         }
         "windsurf" => {
             vec![(
                 cwd().join(".windsurf").join("rules").join("agentflare.md"),
-                joined() + "\n",
+                append_joined(joined()) + "\n",
             )]
         }
         "vscode-copilot" => {
             vec![(
                 cwd().join(".github").join("copilot-instructions.md"),
-                joined() + "\n",
+                append_joined(joined()) + "\n",
             )]
         }
         "cline" => {
             vec![(
                 cwd().join(".clinerules").join("agentflare.md"),
-                joined() + "\n",
+                append_joined(joined()) + "\n",
             )]
         }
         "opencode" => {
             let dir = opencode_rules_dir();
-            vec![
+            let mut v = vec![
                 (dir.join("exa.md"), rule_text::EXA.to_string()),
                 (dir.join("git.md"), rule_text::GIT.to_string()),
                 (dir.join("lean-ctx.md"), rule_text::LEANCTX.to_string()),
                 (dir.join("flare-docs.md"), rule_text::FLARE_DOCS.to_string()),
-            ]
+            ];
+            v.extend(
+                coaching
+                    .iter()
+                    .map(|(id, body)| (dir.join(format!("{id}.md")), body.clone())),
+            );
+            v
         }
         _ => vec![], // "continue" — no dedicated rules convention found
     }
+}
+
+/// Immediately materializes every `rule_targets(host)` entry to disk:
+/// writes it if absent, refreshes it if `init::is_stale_rule` says its
+/// current content is a known-old wording, otherwise leaves it alone
+/// (a hand-edit, or already current). For `host == "opencode"`, also
+/// re-runs the instructions-array registration.
+pub(crate) fn sync_now(host: &str) -> Result<String, String> {
+    let mut written = 0usize;
+    let mut refreshed = 0usize;
+    for (path, content) in rule_targets(host) {
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::write(&path, format!("{content}\n")).map_err(|e| e.to_string())?;
+            written += 1;
+        } else if crate::init::is_stale_rule(&path, &content) {
+            fs::write(&path, format!("{content}\n")).map_err(|e| e.to_string())?;
+            refreshed += 1;
+        }
+    }
+    if host == "opencode" {
+        crate::init::wire_opencode_instructions();
+    }
+    Ok(format!("{written} written, {refreshed} refreshed"))
+}
+
+/// Remove a coaching rule's generated file from `host`'s rules directory.
+/// Returns Ok(()) if the file didn't exist or was successfully deleted.
+pub(crate) fn unsync_host(rule_id: &str, host: &str) -> Result<(), String> {
+    use crate::paths::{claude_rules_dir, opencode_rules_dir};
+    let dir = match host {
+        "claude-code" => claude_rules_dir(),
+        "opencode" => opencode_rules_dir(),
+        "cursor" => cwd().join(".cursor").join("rules"),
+        "codex" => cwd().join("."),
+        "windsurf" => cwd().join(".windsurf").join("rules"),
+        "vscode-copilot" => cwd().join(".github"),
+        "cline" => cwd().join(".clinerules"),
+        _ => return Ok(()),
+    };
+    let path = dir.join(format!("{rule_id}.md"));
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("failed to remove {path:?}: {e}"))?;
+    }
+    if host == "opencode" {
+        crate::init::wire_opencode_instructions();
+    }
+    Ok(())
 }
 
 /// Agent IDs detected on this machine, for `skill_registry::Registry::open_default`'s
@@ -793,6 +870,76 @@ mod tests {
                 "'{host}' joined rule content should include the flare-docs rule text"
             );
         }
+    }
+
+    #[test]
+    fn rule_targets_includes_coaching_sourced_rule_for_claude_code_and_opencode() {
+        crate::paths::test_support::with_temp_home(|| {
+            crate::coaching::apply_rule(
+                "search17",
+                "T",
+                "Coaching body",
+                None,
+                crate::coaching::rule::RuleTier::Builtin,
+                vec!["claude-code".to_string(), "opencode".to_string()],
+            )
+            .unwrap();
+
+            let cc = rule_targets("claude-code");
+            assert!(
+                cc.iter()
+                    .any(|(p, c)| p.to_string_lossy().ends_with("search17.md")
+                        && c == "Coaching body")
+            );
+
+            let oc = rule_targets("opencode");
+            assert!(
+                oc.iter()
+                    .any(|(p, c)| p.to_string_lossy().ends_with("search17.md")
+                        && c == "Coaching body")
+            );
+        });
+    }
+
+    #[test]
+    fn rule_targets_appends_coaching_sourced_body_into_joined_hosts() {
+        crate::paths::test_support::with_temp_home(|| {
+            crate::coaching::apply_rule(
+                "search17",
+                "T",
+                "Coaching body",
+                None,
+                crate::coaching::rule::RuleTier::Builtin,
+                vec!["cursor".to_string()],
+            )
+            .unwrap();
+
+            let targets = rule_targets("cursor");
+            assert_eq!(targets.len(), 1, "cursor stays a single joined file");
+            assert!(targets[0].1.contains("Coaching body"));
+            assert!(
+                targets[0].1.contains(rule_text::FLARE_DOCS),
+                "existing builtin content must still be present"
+            );
+        });
+    }
+
+    #[test]
+    fn rule_targets_omits_coaching_rule_not_synced_to_this_host() {
+        crate::paths::test_support::with_temp_home(|| {
+            crate::coaching::apply_rule(
+                "search17",
+                "T",
+                "Coaching body",
+                None,
+                crate::coaching::rule::RuleTier::Builtin,
+                vec!["opencode".to_string()],
+            )
+            .unwrap();
+
+            let cc = rule_targets("claude-code");
+            assert!(!cc.iter().any(|(_, c)| c == "Coaching body"));
+        });
     }
 
     #[test]

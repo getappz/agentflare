@@ -183,10 +183,15 @@ impl Store {
             let new_version = old_version + 1;
 
             // Snapshot current version to history, unless the caller opted
-            // out (cache-type documents) or content is byte-identical to
-            // what's already stored (a no-op re-upsert has nothing to
-            // snapshot).
-            if opts.track_history && old_content != content {
+            // out (cache-type documents) or nothing actually changed. Blob-
+            // backed callers (e.g. agentflare-artifacts) always pass an
+            // empty `content` string here -- the real payload lives in
+            // `blob_hash` -- so comparing inline `content` alone would never
+            // detect a change and history would never record; also check
+            // `blob_hash` so a no-op re-upsert still skips (both unchanged)
+            // while a genuine new blob still snapshots (content stays "").
+            let unchanged = old_content == content && old_blob_hash == opts.blob_hash;
+            if opts.track_history && !unchanged {
                 let history_id = db_kit::ids::new_id();
                 tx.execute(
                     "INSERT INTO store_doc_history (id, doc_id, version, content, blob_hash, mime, title, metadata, size, created_at)

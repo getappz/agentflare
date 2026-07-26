@@ -58,6 +58,60 @@ fn is_spec_like_path(path: &str) -> bool {
     normalized.contains("/specs/") && normalized.ends_with(".md")
 }
 
+/// Blocks shell commands that delete agentflare's own SQLite data files
+/// (`~/.agentflare/*.db*`, or the `.agentflare` dir wholesale). Landed after
+/// a 2026-07-25 incident: opencode ran a delete mid-migration and silently
+/// wiped `store.db`'s metadata for 168 artifacts — recovered by hand from a
+/// pre-migration flat-file backup that happened to still exist, but nothing
+/// would have caught it if that backup hadn't been there. `rm`/`del`/
+/// `Remove-Item`/`unlink`/`rmdir` are the verbs every shell tool (Bash,
+/// PowerShell, opencode's `bash`) actually uses; deletion of these files is
+/// something only the user should ever do by hand.
+///
+/// Checks each `;`/`&&`/`||`/`|`/newline-separated statement's *first word*
+/// against the destructive-verb list, rather than substring-matching the
+/// whole command blob — a raw `.contains("rm ")` also fires on a `git commit`
+/// whose heredoc message happens to describe this very guard in prose (this
+/// function's own commit message is a real example: "opencode ran an rm
+/// mid-migration ... store.db ... ~/.agentflare/*.db*" — none of that is an
+/// executed command, but a whole-string substring check can't tell).
+fn destructive_data_file_reason(command: &str) -> Option<String> {
+    for statement in command
+        .split([';', '\n'])
+        .flat_map(|s| s.split("&&"))
+        .flat_map(|s| s.split("||"))
+        .flat_map(|s| s.split('|'))
+    {
+        let trimmed = statement.trim().to_lowercase().replace('\\', "/");
+        let Some(first_word) = trimmed.split_whitespace().next() else {
+            continue;
+        };
+        let is_destructive_verb = matches!(
+            first_word,
+            "rm" | "del" | "erase" | "remove-item" | "unlink" | "rmdir"
+        );
+        if !is_destructive_verb {
+            continue;
+        }
+        let targets_agentflare_dir =
+            trimmed.contains(".agentflare/") || trimmed.ends_with(".agentflare");
+        if !targets_agentflare_dir {
+            continue;
+        }
+        // Either a specific *.db*/-wal/-shm file, or a recursive/whole-dir
+        // delete of .agentflare itself (which would take the db files with it).
+        let targets_db_or_whole_dir = trimmed.contains(".db")
+            || trimmed.ends_with(".agentflare")
+            || trimmed.contains(" -r ")
+            || trimmed.contains(" -rf")
+            || trimmed.contains("-recurse");
+        if targets_db_or_whole_dir {
+            return Some("deleting agentflare's local data files (~/.agentflare/*.db, *.db-wal, *.db-shm, or the .agentflare directory itself) is blocked — they hold tracked items, artifacts, and secrets with no automatic backup. If a file genuinely needs to be removed, ask the user to run the command themselves.".to_string());
+        }
+    }
+    None
+}
+
 /// Resolve the current branch of the repo containing `start_path`, or cwd if
 /// `start_path` is None. `None` outside a git repo.
 fn current_branch(start_path: Option<&Path>) -> Option<String> {
@@ -134,6 +188,19 @@ fn classify(
                     "specs/design docs/plans belong attached to the relevant item as an asset (the `asset` tool, action=attach), not committed to the repo at '{path}' — create/assign an item first if one doesn't already track this work."
                 )
             })
+        }
+        "Bash" | "bash" | "PowerShell" | "powershell" | "shell" => {
+            // "command" is Claude Code's and (by convention) opencode's bash
+            // tool field; "cmd"/"script" are cheap insurance against a
+            // harness using a different name rather than a hard dependency
+            // on guessing right.
+            let input = tool_input?;
+            let command = input
+                .get("command")
+                .or_else(|| input.get("cmd"))
+                .or_else(|| input.get("script"))
+                .and_then(Value::as_str)?;
+            destructive_data_file_reason(command)
         }
         _ => None,
     }
@@ -254,6 +321,60 @@ mod tests {
     fn classify_ignores_unrelated_tools() {
         assert!(classify("Read", None, NOT_A_REPO).is_none());
         assert!(classify("Bash", None, NOT_A_REPO).is_none());
+    }
+
+    #[test]
+    fn classify_blocks_rm_of_agentflare_db_via_bash() {
+        let input = json!({ "command": "rm ~/.agentflare/store.db" });
+        let reason = classify("Bash", Some(&input), NOT_A_REPO).unwrap();
+        assert!(reason.contains("blocked"), "{reason}");
+    }
+
+    #[test]
+    fn classify_blocks_del_of_agentflare_db_via_opencode_bash() {
+        let input = json!({ "command": "del C:\\Users\\shiva\\.agentflare\\backend.db" });
+        assert!(classify("bash", Some(&input), NOT_A_REPO).is_some());
+    }
+
+    #[test]
+    fn classify_blocks_remove_item_via_powershell() {
+        let input =
+            json!({ "command": "Remove-Item $env:USERPROFILE\\.agentflare\\agentflare.db" });
+        assert!(classify("PowerShell", Some(&input), NOT_A_REPO).is_some());
+    }
+
+    #[test]
+    fn classify_blocks_recursive_delete_of_whole_agentflare_dir() {
+        let input = json!({ "command": "rm -rf ~/.agentflare" });
+        assert!(classify("Bash", Some(&input), NOT_A_REPO).is_some());
+    }
+
+    #[test]
+    fn classify_allows_unrelated_rm_commands() {
+        let input = json!({ "command": "rm /tmp/scratch.txt" });
+        assert!(classify("Bash", Some(&input), NOT_A_REPO).is_none());
+    }
+
+    #[test]
+    fn classify_allows_non_destructive_agentflare_db_commands() {
+        let input = json!({ "command": "sqlite3 ~/.agentflare/store.db '.tables'" });
+        assert!(classify("Bash", Some(&input), NOT_A_REPO).is_none());
+    }
+
+    #[test]
+    fn classify_allows_commit_message_prose_mentioning_rm_and_db_paths() {
+        // Regression: this exact scenario blocked the real commit that landed
+        // this guard -- a `git commit` heredoc whose message describes the
+        // incident in prose ("opencode ran an rm ... store.db ...
+        // ~/.agentflare/*.db*") is not an executed rm, and must not match.
+        let input = json!({ "command": "git commit -m \"$(cat <<'EOF'\nhook_redirect: block agent shell commands from deleting agentflare db files\n\nopencode ran an rm mid-migration and silently wiped store.db's metadata,\ntargeting ~/.agentflare/*.db* or the .agentflare dir itself.\nEOF\n)\"" });
+        assert!(classify("Bash", Some(&input), NOT_A_REPO).is_none());
+    }
+
+    #[test]
+    fn classify_blocks_rm_as_second_statement_after_separator() {
+        let input = json!({ "command": "cd /tmp && rm ~/.agentflare/store.db" });
+        assert!(classify("Bash", Some(&input), NOT_A_REPO).is_some());
     }
 
     #[test]

@@ -29,17 +29,29 @@ pub(crate) fn is_stale_rule(path: &PathBuf, current: &str) -> bool {
     let Some(filename) = path.file_name().and_then(|f| f.to_str()) else {
         return false;
     };
-    let superseded = rule_text::superseded(filename);
-    if superseded.is_empty() {
-        return false;
-    }
     let Ok(existing) = fs::read_to_string(path) else {
         return false;
     };
-    existing.trim_end() != current.trim_end()
-        && superseded
-            .iter()
-            .any(|old| existing.trim_end() == old.trim_end())
+    let trimmed = existing.trim_end();
+    if trimmed == current.trim_end() {
+        return false;
+    }
+
+    // Check compiled-in superseded bodies first (exa.md, git.md, etc.).
+    let superseded = rule_text::superseded(filename);
+    if superseded.contains(&trimmed) {
+        return true;
+    }
+
+    // For coaching-sourced rules (<id>.md), also check auto-tracked bodies.
+    if let Some(id) = filename.strip_suffix(".md") {
+        let coaching = crate::coaching::superseded_bodies(id);
+        if coaching.iter().any(|old| trimmed == old.as_str()) {
+            return true;
+        }
+    }
+
+    false
 }
 
 pub(crate) fn prompt_yes(message: &str, agent: &str, yes: bool) -> bool {
@@ -412,9 +424,20 @@ fn wire_codex_hooks() {
 }
 
 fn wire_opencode() {
+    wire_opencode_instructions();
+}
+
+/// Re-register opencode.jsonc instructions from `rule_targets`, adding any
+/// coaching-sourced rule files and removing entries for rules no longer synced.
+/// Shared between `wire_opencode` (called by `init`) and `sync_now`/`unsync_host`
+/// (called by `coaching apply/remove`).
+pub(crate) fn wire_opencode_instructions() {
     let path = opencode_config_path();
     let rules_dir = opencode_rules_dir();
-    let rule_files: &[&str] = &["exa.md", "git.md", "lean-ctx.md"];
+    let rule_paths: Vec<PathBuf> = crate::components::rule_targets("opencode")
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
 
     // opencode deep-merges opencode.json with opencode.jsonc, so a rule
     // entry the user (or a hand-written opencode.json) already registered
@@ -457,27 +480,56 @@ fn wire_opencode() {
     arr.retain(|v| v.as_str() != Some(legacy_engram_path.as_str()));
     let removed_legacy = arr.len() != before_cleanup;
 
+    let expected_filenames: Vec<String> = rule_paths
+        .iter()
+        .filter_map(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
+        .collect();
+
+    // Drop entries under our rules_dir for coaching-sourced rules that are
+    // no longer synced to opencode (e.g. after `coaching remove` or a
+    // `--sync` list edit) — otherwise unsync_host's file deletion leaves a
+    // dangling path registered here forever.
+    let rules_dir_str = rules_dir.to_string_lossy().replace('\\', "/");
+    let before_prune = arr.len();
+    arr.retain(|v| {
+        let Some(s) = v.as_str() else { return true };
+        let normalized = s.replace('\\', "/");
+        if !normalized.starts_with(&rules_dir_str) {
+            return true;
+        }
+        expected_filenames
+            .iter()
+            .any(|f| normalized.ends_with(f.as_str()))
+    });
+    let pruned = before_prune - arr.len();
+
     let mut added = 0;
-    for &file in rule_files {
+    for file in &expected_filenames {
         let rule_path = rules_dir.join(file);
         let path_str = rule_path.to_string_lossy().replace('\\', "/");
-        let has_it = arr
+        let has_it = arr.iter().any(|v| {
+            v.as_str()
+                .map(|s| s.contains(file.as_str()))
+                .unwrap_or(false)
+        }) || sibling_instructions
             .iter()
-            .any(|v| v.as_str().map(|s| s.contains(file)).unwrap_or(false))
-            || sibling_instructions.iter().any(|s| s.contains(file));
+            .any(|s| s.contains(file.as_str()));
         if !has_it && rule_path.exists() {
             arr.push(json!(path_str));
             added += 1;
         }
     }
 
-    if added > 0 || removed_legacy {
+    if added > 0 || removed_legacy || pruned > 0 {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
         match write_json_pretty(&path, &config) {
             Ok(_) if removed_legacy => ui::success(&format!(
                 "opencode.jsonc instructions wired ({added} rule(s), removed stale engram.md)"
+            )),
+            Ok(_) if pruned > 0 => ui::success(&format!(
+                "opencode.jsonc instructions wired ({added} rule(s), pruned {pruned} stale rule(s))"
             )),
             Ok(_) => ui::success(&format!(
                 "opencode.jsonc instructions wired ({added} rule(s))"
@@ -688,6 +740,35 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, "some old lean-ctx rule text\n").unwrap();
             assert!(!is_stale_rule(&path, rule_text::LEANCTX));
+        });
+    }
+
+    #[test]
+    fn is_stale_rule_true_for_coaching_builtin_with_known_old_body() {
+        with_temp_home(|| {
+            let dir = home().join(".claude").join("rules");
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("search17.md");
+            fs::write(&path, "Old body\n").unwrap();
+            let state_rules = crate::state::state_dir().join("rules");
+            fs::create_dir_all(&state_rules).unwrap();
+            fs::write(
+                state_rules.join("superseded-search17.json"),
+                r#"["Old body"]"#,
+            )
+            .unwrap();
+            assert!(is_stale_rule(&path, "New body"));
+        });
+    }
+
+    #[test]
+    fn is_stale_rule_false_for_coaching_builtin_with_unrecognized_content() {
+        with_temp_home(|| {
+            let dir = home().join(".claude").join("rules");
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("search17.md");
+            fs::write(&path, "Hand-edited content\n").unwrap();
+            assert!(!is_stale_rule(&path, "New body"));
         });
     }
 
@@ -1078,6 +1159,43 @@ mod tests {
             );
             assert!(content.contains("exa.md"));
             assert!(content.contains("lean-ctx.md"));
+        });
+    }
+
+    #[test]
+    fn wire_opencode_prunes_stale_coaching_rule_entry() {
+        with_temp_home(|| {
+            let config_path = home()
+                .join(".config")
+                .join("opencode")
+                .join("opencode.jsonc");
+            let rules_dir = home().join(".config").join("opencode").join("rules");
+            fs::create_dir_all(&rules_dir).unwrap();
+
+            // Simulates a coaching rule that was synced to opencode and then
+            // removed: unsync_host already deleted rules/search17.md, but
+            // without pruning this would leave the array entry dangling.
+            let stale_rule_path = rules_dir
+                .join("search17.md")
+                .to_string_lossy()
+                .replace('\\', "/");
+            fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+            fs::write(
+                &config_path,
+                serde_json::to_string(&json!({
+                    "instructions": [stale_rule_path.clone()]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            wire_opencode_instructions();
+
+            let content = fs::read_to_string(&config_path).unwrap();
+            assert!(
+                !content.contains(&stale_rule_path),
+                "dangling coaching rule entry should be pruned: {content}"
+            );
         });
     }
 }

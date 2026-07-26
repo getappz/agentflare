@@ -131,6 +131,9 @@ dependencies = [
 name = "agentflare-artifacts"
 version = "0.1.0"
 dependencies = [
+ "agentflare-db-kit",
+ "agentflare-store",
+ "blake3",
  "flate2",
  "nanoid",
  "serde",
