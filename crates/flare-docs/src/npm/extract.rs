@@ -296,15 +296,35 @@ pub fn extract(source: &str) -> Result<Vec<ApiItem>, ExtractError> {
 /// is downloaded as one tarball instead of file-by-file.
 pub fn relative_imports(source: &str) -> Vec<String> {
     let mut out = Vec::new();
+    // A named import whose specifier list wraps puts `from` on a different
+    // line than the `import`/`export` keyword, so scanning line by line drops
+    // it. Accumulate wrapped lines into one logical statement instead, keeping
+    // the keyword anchor -- matching a bare `from` anywhere would also catch
+    // prose in doc comments.
+    let mut pending: Option<String> = None;
     for line in source.lines() {
         let line = line.trim();
-        if !(line.starts_with("export") || line.starts_with("import")) {
-            continue;
-        }
-        let Some(from_idx) = line.find("from ") else {
+        let stmt = match pending.take() {
+            Some(mut acc) => {
+                acc.push(' ');
+                acc.push_str(line);
+                acc
+            }
+            None if line.starts_with("export") || line.starts_with("import") => line.to_string(),
+            None => continue,
+        };
+        let Some(from_idx) = stmt.find("from ") else {
+            // No specifier yet: either the statement already ended (a
+            // side-effect `import './x';`) or its list is still open across
+            // lines. Only the latter is worth carrying forward, and the length
+            // bound keeps a file with no terminators from accumulating without
+            // limit.
+            if !stmt.contains(';') && stmt.len() < 8192 {
+                pending = Some(stmt);
+            }
             continue;
         };
-        let rest = &line[from_idx + 5..];
+        let rest = &stmt[from_idx + 5..];
         let quote = match rest.chars().next() {
             Some(c @ ('\'' | '"')) => c,
             _ => continue,
@@ -487,6 +507,29 @@ import { external } from 'some-package';
 "#;
         let imports = relative_imports(src);
         assert_eq!(imports, vec!["./context", "./hono", "./types"]);
+    }
+
+    #[test]
+    fn collects_relative_imports_whose_specifier_list_wraps() {
+        // Formatters wrap long named imports, which puts `from` on its own
+        // line -- the common shape in real .d.ts bundles.
+        let src = r#"
+import {
+  Context,
+  Handler,
+} from './context';
+export {
+  Hono,
+} from "./hono";
+import './side-effect';
+import { after } from './after';
+"#;
+        assert_eq!(
+            relative_imports(src),
+            vec!["./context", "./hono", "./after"],
+            "a wrapped specifier list must not hide its module, and a \
+             side-effect import must not swallow the statement after it"
+        );
     }
 
     #[test]

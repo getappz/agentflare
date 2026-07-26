@@ -70,7 +70,15 @@ pub fn fetch_package(
         let types_pkg = types_package_name(package);
         let fetched = fetcher
             .fetch(&fetch::manifest_url(&types_pkg, "latest"))
-            .map_err(|_| NpmFetchError::NoTypes(package.to_string()))?;
+            .map_err(|e| match e {
+                // Only a 404 actually means "DefinitelyTyped has no package
+                // for this". A timeout, DNS failure, or rate limit must
+                // surface as itself -- reporting a retryable blip as a
+                // permanent absence of types sends the caller to diagnose the
+                // wrong thing.
+                FetchError::NotFound => NpmError::Npm(NpmFetchError::NoTypes(package.to_string())),
+                other => NpmError::Fetch(other),
+            })?;
         let types_manifest = fetch::parse_manifest(&fetched.bytes)?;
         (types_manifest, Some(types_pkg))
     };
@@ -224,7 +232,29 @@ mod tests {
                     });
                 }
             }
-            Err(FetchError::Http(format!("no route for {url}")))
+            // An unregistered URL models "the registry has no such package",
+            // i.e. a 404 -- not a transport failure.
+            Err(FetchError::NotFound)
+        }
+    }
+
+    /// Serves the source manifest but fails the `@types` lookup with a
+    /// transport error, to distinguish "no types published" from "the network
+    /// misbehaved".
+    struct FlakyTypesFetcher {
+        source: Vec<u8>,
+    }
+
+    impl Fetcher for FlakyTypesFetcher {
+        fn fetch(&self, url: &str) -> Result<FetchedBytes, FetchError> {
+            if url.contains("@types/") {
+                return Err(FetchError::Http("timed out".into()));
+            }
+            Ok(FetchedBytes {
+                bytes: self.source.clone(),
+                etag: None,
+                content_type: None,
+            })
         }
     }
 
@@ -305,6 +335,37 @@ export declare class Context {
         assert!(
             hits.iter().any(|h| h.path.ends_with("Context.json")),
             "{hits:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_types_lookup_reports_the_transport_error_not_missing_types() {
+        let fetcher = FlakyTypesFetcher {
+            source: br#"{"name":"express","version":"4.18.2","description":"Fast web framework"}"#
+                .to_vec(),
+        };
+        let err = fetch_package(&fetcher, "express", "4.18.2").unwrap_err();
+        assert!(
+            matches!(err, NpmError::Fetch(FetchError::Http(_))),
+            "a timeout on the @types lookup must surface as itself, not as \
+             \"ships no types\" -- otherwise a retryable blip reads as a \
+             permanent absence: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_package_with_no_types_and_no_definitelytyped_entry_reports_no_types() {
+        let fetcher = FakeFetcher {
+            routes: vec![(
+                "registry.npmjs.org/obscure-pkg/1.0.0".to_string(),
+                br#"{"name":"obscure-pkg","version":"1.0.0","description":"no types anywhere"}"#
+                    .to_vec(),
+            )],
+        };
+        let err = fetch_package(&fetcher, "obscure-pkg", "1.0.0").unwrap_err();
+        assert!(
+            matches!(err, NpmError::Npm(NpmFetchError::NoTypes(_))),
+            "a 404 on the @types lookup is the genuine no-types signal: {err:?}"
         );
     }
 
