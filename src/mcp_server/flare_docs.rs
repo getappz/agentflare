@@ -159,9 +159,10 @@ impl AgentflareMcp {
     /// the fix instead of concluding the package does not exist.
     ///
     /// A caller-caused failure (a package name that 404s, a package with no
-    /// types) comes back as `invalid_params`; only genuine infrastructure
-    /// failures — timeouts, panics, 5xx, transport errors — are
-    /// `internal_error`. A typo is not an outage, and reporting it as one
+    /// types) comes back as `invalid_params`. Everything else is
+    /// `internal_error`: timeouts, panics, 5xx, transport errors, and the
+    /// retryable 4xx (408, 429) where the request was fine and the caller
+    /// only needs to wait. A typo is not an outage, and reporting it as one
     /// sends the caller looking for a broken service instead of a typo.
     async fn blocking_fetch<T, E>(
         eco: Ecosystem,
