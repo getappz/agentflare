@@ -1209,4 +1209,35 @@ mod tests {
             event.disposition
         );
     }
+
+    #[test]
+    fn project_local_config_can_relax_a_denied_plumbing_subcommand() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        std::fs::write(repo.path.join(".agentflare").join("project.json"), "{}").unwrap();
+
+        // Baseline: "apply" is in DENIED_PLUMBING_SUBCOMMANDS.
+        let before = classify(&repo.path, "apply", &["patch.diff".to_string()]);
+        assert!(
+            matches!(before.disposition, Disposition::Deny { .. }),
+            "{:?}",
+            before.disposition
+        );
+
+        // Project-local config explicitly allows it. ALLOWED_MUTATING is
+        // checked before DENIED_PLUMBING in classify_pure, so this relaxes it.
+        std::fs::write(
+            repo.path.join(".agentflare").join("config.toml"),
+            "[git_shim]\nextra_allowed_mutating_subcommands = [\"apply\"]\n",
+        )
+        .unwrap();
+
+        let after = classify(&repo.path, "apply", &["patch.diff".to_string()]);
+        assert_eq!(
+            after.disposition,
+            Disposition::Passthrough,
+            "{:?}",
+            after.disposition
+        );
+    }
 }
