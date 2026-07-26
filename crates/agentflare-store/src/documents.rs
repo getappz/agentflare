@@ -23,6 +23,28 @@ pub struct Document {
     pub deleted_at: Option<i64>,
 }
 
+/// A document without its body.
+///
+/// Exists because enumerating a store and reading a store are different
+/// questions, and only one of them needs the text. A caching store can hold
+/// tens of thousands of documents whose bodies run to megabytes in total;
+/// serializing all of that to answer "what is in here?" is pure waste, and
+/// for an MCP caller it is worse than waste — the response does not fit.
+/// `content_bytes` is kept so a caller can still distinguish an empty
+/// placeholder from a real page without being handed the page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentSummary {
+    pub id: String,
+    pub path: String,
+    pub title: String,
+    pub doc_type: String,
+    pub source: String,
+    pub version: i32,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub content_bytes: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DocVersion {
     pub id: String,
@@ -659,6 +681,68 @@ impl Store {
         let rows = stmt.query_map(params![project_id], Self::row_to_document)?;
         rows.collect()
     }
+
+    /// Live documents in a project, without their bodies.
+    ///
+    /// `LIMIT`/`OFFSET` are pushed into SQL rather than applied to a fetched
+    /// `Vec`: truncating in Rust still makes SQLite read and allocate every
+    /// row's `content` first, which is the cost this projection exists to
+    /// avoid. `content_bytes` casts to BLOB before measuring because
+    /// SQLite's `LENGTH()` counts characters on TEXT, and a byte count is
+    /// what a caller sizing a response actually needs.
+    pub fn doc_list_summaries(
+        &self,
+        project_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> rusqlite::Result<Vec<DocumentSummary>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, title, doc_type, source, version, created_at, updated_at,
+                    LENGTH(CAST(content AS BLOB))
+             FROM store_documents
+             WHERE project_id = ?1 AND deleted_at IS NULL
+             ORDER BY path
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                i64::try_from(limit).unwrap_or(i64::MAX),
+                i64::try_from(offset).unwrap_or(i64::MAX),
+            ],
+            |row| {
+                Ok(DocumentSummary {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    title: row.get(2)?,
+                    doc_type: row.get(3)?,
+                    source: row.get(4)?,
+                    version: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    content_bytes: row.get(8)?,
+                })
+            },
+        )?;
+        rows.collect()
+    }
+
+    /// How many live documents a project holds.
+    ///
+    /// Separate from [`Self::doc_list_summaries`] so a capped listing can
+    /// report the size of the set it was drawn from — a truncated page that
+    /// cannot say how much it left behind reads exactly like a complete one.
+    pub fn doc_count(&self, project_id: &str) -> rusqlite::Result<usize> {
+        let conn = self.conn();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM store_documents
+             WHERE project_id = ?1 AND deleted_at IS NULL",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
 }
 
 #[cfg(test)]
@@ -667,6 +751,52 @@ mod tests {
 
     fn store() -> Store {
         Store::open_memory().unwrap()
+    }
+
+    #[test]
+    fn summaries_page_without_carrying_bodies() {
+        let s = store();
+        let big = "x".repeat(50_000);
+        for i in 0..5 {
+            s.doc_upsert("proj-1", &format!("/doc{i}.md"), &big)
+                .unwrap();
+        }
+
+        let page = s.doc_list_summaries("proj-1", 2, 0).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].path, "/doc0.md");
+        // A byte count, not the bytes: the whole point of the projection.
+        assert_eq!(page[0].content_bytes, 50_000);
+
+        let next = s.doc_list_summaries("proj-1", 2, 2).unwrap();
+        assert_eq!(next[0].path, "/doc2.md");
+
+        assert_eq!(s.doc_count("proj-1").unwrap(), 5);
+    }
+
+    #[test]
+    fn summaries_and_count_skip_deleted_and_other_projects() {
+        let s = store();
+        let keep = s.doc_upsert("proj-1", "/keep.md", "keep").unwrap();
+        let gone = s.doc_upsert("proj-1", "/gone.md", "gone").unwrap();
+        s.doc_upsert("proj-2", "/other.md", "other").unwrap();
+        s.doc_delete(&gone.id).unwrap();
+
+        let page = s.doc_list_summaries("proj-1", 10, 0).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, keep.id);
+        assert_eq!(s.doc_count("proj-1").unwrap(), 1);
+    }
+
+    #[test]
+    fn content_bytes_counts_bytes_not_characters() {
+        // SQLite's LENGTH() counts characters on TEXT; a caller sizing a
+        // response needs bytes, so the projection casts to BLOB first. Without
+        // that cast this doc reports 2, not 6.
+        let s = store();
+        s.doc_upsert("proj-1", "/utf8.md", "日本").unwrap();
+        let page = s.doc_list_summaries("proj-1", 10, 0).unwrap();
+        assert_eq!(page[0].content_bytes, 6);
     }
 
     #[test]

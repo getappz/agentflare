@@ -31,4 +31,6 @@ pub struct FetchOutcome {
 }
 pub use fetch::{ClientError, FetchError, FetchedBytes, Fetcher, UreqFetcher};
 pub use rustdoc::{RustdocError, docs_id_path, docs_rs_json_url, fetch_and_store, store_fetched};
-pub use store::{DocsStore, Error, MAX_SEARCH_LIMIT, PROJECT_ID};
+pub use store::{
+    DEFAULT_LIST_LIMIT, DocsStore, Error, MAX_LIST_LIMIT, MAX_SEARCH_LIMIT, PROJECT_ID,
+};

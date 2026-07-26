@@ -1,4 +1,4 @@
-use agentflare_store::documents::{DocMatch, DocUpsertOpts, Document};
+use agentflare_store::documents::{DocMatch, DocUpsertOpts, Document, DocumentSummary};
 use rusqlite::OptionalExtension;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +15,25 @@ pub const PROJECT_ID: &str = "global";
 /// whole index into a response body. Mirrors the "max 50" the memory tool
 /// already documents.
 pub const MAX_SEARCH_LIMIT: usize = 50;
+
+/// How many documents [`DocsStore::list_summaries`] returns when the caller
+/// names no limit.
+///
+/// A default is not a nicety here. Per-item indexing means one crate
+/// contributes hundreds of documents, so a real cache holds tens of
+/// thousands; "return everything unless asked otherwise" makes the common
+/// call the catastrophic one. Enumeration is also the wrong tool for finding
+/// a specific page — that is what `search` is for — so a first page plus an
+/// honest total serves the actual use.
+pub const DEFAULT_LIST_LIMIT: usize = 100;
+
+/// Ceiling on a single [`DocsStore::list_summaries`] page.
+///
+/// Higher than [`MAX_SEARCH_LIMIT`] because a summary is a fraction of the
+/// size of a search hit (no snippet, no body), and walking a cache in pages
+/// of 50 would be tedious. Paired with `offset`, so the cap bounds one
+/// response without putting any document out of reach.
+pub const MAX_LIST_LIMIT: usize = 500;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -83,8 +102,35 @@ impl DocsStore {
         Ok(self.inner.doc_search(PROJECT_ID, query, limit)?)
     }
 
+    /// Every cached document, bodies included.
+    ///
+    /// Kept for the CLI, which writes to a terminal a human can pipe through
+    /// `jq`/`head`. Callers whose output goes into a context window — the MCP
+    /// tool above all — want [`Self::list_summaries`] instead: a cache of a
+    /// dozen packages is already several megabytes here.
     pub fn list(&self) -> Result<Vec<Document>, Error> {
         Ok(self.inner.doc_list(PROJECT_ID)?)
+    }
+
+    /// One page of cached documents, without their bodies.
+    ///
+    /// `limit` is clamped to [`MAX_LIST_LIMIT`] and `None` means
+    /// [`DEFAULT_LIST_LIMIT`] — the same "cap, don't reject" treatment
+    /// [`Self::search`] gives an oversized request, since asking for
+    /// everything is reasonable and a truncated answer still serves it.
+    pub fn list_summaries(
+        &self,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<DocumentSummary>, Error> {
+        let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
+        Ok(self.inner.doc_list_summaries(PROJECT_ID, limit, offset)?)
+    }
+
+    /// How many documents the cache holds, so a capped listing can say what
+    /// it left out.
+    pub fn count(&self) -> Result<usize, Error> {
+        Ok(self.inner.doc_count(PROJECT_ID)?)
     }
 
     pub fn blob_store_raw(&self, data: &[u8]) -> Result<String, Error> {
