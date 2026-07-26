@@ -8,6 +8,14 @@ use std::path::{Path, PathBuf};
 /// reused by every project) rather than scoped per-project.
 pub const PROJECT_ID: &str = "global";
 
+/// Ceiling on results from a single [`DocsStore::search`] call.
+///
+/// Enforced here rather than at each caller so the MCP tool, the CLI, and any
+/// future caller inherit it — an uncapped `limit` lets one request pull the
+/// whole index into a response body. Mirrors the "max 50" the memory tool
+/// already documents.
+pub const MAX_SEARCH_LIMIT: usize = 50;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -67,7 +75,11 @@ impl DocsStore {
         Ok(self.inner.doc_get_by_path(PROJECT_ID, path)?)
     }
 
+    /// `limit` is clamped to [`MAX_SEARCH_LIMIT`]; a larger request is
+    /// silently capped rather than rejected, since asking for "everything" is
+    /// a reasonable thing to want and a truncated answer still serves it.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<DocMatch>, Error> {
+        let limit = limit.min(MAX_SEARCH_LIMIT);
         Ok(self.inner.doc_search(PROJECT_ID, query, limit)?)
     }
 
@@ -343,6 +355,29 @@ mod tests {
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, doc.id);
+    }
+
+    #[test]
+    fn search_clamps_an_oversized_limit() {
+        // Every caller (MCP tool, CLI) routes through here, so an unbounded
+        // `--limit`/`limit:` can never pull more than the cap.
+        let store = DocsStore::open_memory().unwrap();
+        for i in 0..(MAX_SEARCH_LIMIT + 10) {
+            store
+                .upsert(
+                    &format!("docsrs/crate{i}"),
+                    "serialization framework",
+                    DocUpsertOpts::default(),
+                )
+                .unwrap();
+        }
+
+        let hits = store.search("serialization", usize::MAX).unwrap();
+        assert_eq!(hits.len(), MAX_SEARCH_LIMIT);
+
+        // A limit under the cap is still honoured exactly.
+        let few = store.search("serialization", 3).unwrap();
+        assert_eq!(few.len(), 3);
     }
 
     #[test]

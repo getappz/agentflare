@@ -29,6 +29,6 @@ pub struct FetchOutcome {
     /// `items_indexed` is 0 in that case. `doc` is unaffected either way.
     pub items_error: Option<String>,
 }
-pub use fetch::{FetchError, FetchedBytes, Fetcher, UreqFetcher};
+pub use fetch::{ClientError, FetchError, FetchedBytes, Fetcher, UreqFetcher};
 pub use rustdoc::{RustdocError, docs_id_path, docs_rs_json_url, fetch_and_store, store_fetched};
-pub use store::{DocsStore, Error, PROJECT_ID};
+pub use store::{DocsStore, Error, MAX_SEARCH_LIMIT, PROJECT_ID};

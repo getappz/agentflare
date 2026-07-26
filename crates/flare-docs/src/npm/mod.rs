@@ -11,7 +11,7 @@ pub mod extract;
 pub mod fetch;
 
 use crate::FetchOutcome;
-use crate::fetch::{FetchError, Fetcher};
+use crate::fetch::{ClientError, FetchError, Fetcher};
 use crate::store::{BatchItem, DocsStore, Error as StoreError};
 use agentflare_store::documents::DocUpsertOpts;
 pub use extract::{ApiItem, ExtractError, extract, relative_imports};
@@ -27,6 +27,31 @@ pub enum NpmError {
     Extract(#[from] ExtractError),
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+impl ClientError for NpmError {
+    fn is_client_error(&self) -> bool {
+        match self {
+            NpmError::Fetch(e) => e.is_client_error(),
+            // The package resolved fine; it just ships no types and has no
+            // @types counterpart. That is a fact about what the caller asked
+            // for, not a registry failure.
+            NpmError::Npm(NpmFetchError::NoTypes(_)) => true,
+            // A malformed manifest or unreadable tarball is the registry
+            // serving something broken, and an extract/store failure is ours.
+            _ => false,
+        }
+    }
+
+    fn is_package_missing(&self) -> bool {
+        match self {
+            NpmError::Fetch(e) => e.is_package_missing(),
+            // Deliberately not `NoTypes`: that package was found, it just
+            // ships no declarations. Calling it missing would contradict the
+            // error's own message.
+            _ => false,
+        }
+    }
 }
 
 /// The [`DocsStore`] path an npm package's docs are cached under. Distinct
@@ -76,7 +101,9 @@ pub fn fetch_package(
                 // surface as itself -- reporting a retryable blip as a
                 // permanent absence of types sends the caller to diagnose the
                 // wrong thing.
-                FetchError::NotFound => NpmError::Npm(NpmFetchError::NoTypes(package.to_string())),
+                FetchError::Status(404) => {
+                    NpmError::Npm(NpmFetchError::NoTypes(package.to_string()))
+                }
                 other => NpmError::Fetch(other),
             })?;
         let types_manifest = fetch::parse_manifest(&fetched.bytes)?;
@@ -234,7 +261,7 @@ mod tests {
             }
             // An unregistered URL models "the registry has no such package",
             // i.e. a 404 -- not a transport failure.
-            Err(FetchError::NotFound)
+            Err(FetchError::Status(404))
         }
     }
 

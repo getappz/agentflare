@@ -10,7 +10,8 @@ use super::*;
 // re-exported (not just privately imported) through this submodule for that
 // path to resolve.
 pub(crate) use ::flare_docs::{
-    DocsStore, Ecosystem, FetchOutcome, Fetcher, UreqFetcher, docs_rs_json_url, npm, store_fetched,
+    ClientError, DocsStore, Ecosystem, FetchOutcome, Fetcher, MAX_SEARCH_LIMIT, UreqFetcher,
+    docs_rs_json_url, npm, store_fetched,
 };
 
 const DEFAULT_LIMIT: usize = 10;
@@ -36,13 +37,23 @@ impl AgentflareMcp {
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
                 })?
             }
-            "list" => self.with_flare_docs_store(|store| {
-                let docs = store
-                    .list()
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                serde_json::to_string(&docs)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-            })?,
+            "list" => {
+                // `list` returns everything by default -- callers use it to
+                // enumerate the cache -- but an explicit `limit` is honoured
+                // and capped, so the documented ceiling is not a claim the
+                // tool quietly ignores.
+                let limit = req.limit.map(|n| n.min(MAX_SEARCH_LIMIT));
+                self.with_flare_docs_store(|store| {
+                    let mut docs = store
+                        .list()
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                    if let Some(n) = limit {
+                        docs.truncate(n);
+                    }
+                    serde_json::to_string(&docs)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+                })?
+            }
             "get" if req.id.is_some() => {
                 let id = req.id.expect("guarded by is_some() above");
                 self.with_flare_docs_store(|store| {
@@ -146,6 +157,13 @@ impl AgentflareMcp {
     /// Shared timeout/panic/error plumbing for a blocking registry fetch. A
     /// miss names the other registry, so a caller that guessed wrong is told
     /// the fix instead of concluding the package does not exist.
+    ///
+    /// A caller-caused failure (a package name that 404s, a package with no
+    /// types) comes back as `invalid_params`. Everything else is
+    /// `internal_error`: timeouts, panics, 5xx, transport errors, and the
+    /// retryable 4xx (408, 429) where the request was fine and the caller
+    /// only needs to wait. A typo is not an outage, and reporting it as one
+    /// sends the caller looking for a broken service instead of a typo.
     async fn blocking_fetch<T, E>(
         eco: Ecosystem,
         package: &str,
@@ -153,7 +171,7 @@ impl AgentflareMcp {
     ) -> Result<T, ErrorData>
     where
         T: Send + 'static,
-        E: std::fmt::Display + Send + 'static,
+        E: std::fmt::Display + ClientError + Send + 'static,
     {
         tokio::time::timeout(FETCH_TIMEOUT, tokio::task::spawn_blocking(f))
             .await
@@ -165,10 +183,21 @@ impl AgentflareMcp {
             })?
             .map_err(|e| ErrorData::internal_error(format!("fetch task panicked: {e}"), None))?
             .map_err(|e| {
-                ErrorData::internal_error(
-                    format!("{e} — {}", eco.other_ecosystem_hint(package)),
-                    None,
-                )
+                // The hint asserts the package "was not found", so it may only
+                // be attached when that is actually what happened. Appending it
+                // to a 503, a corrupt tarball, or a package that exists but
+                // ships no types tells the caller something false — and in the
+                // no-types case contradicts the sentence it is appended to.
+                let msg = if e.is_package_missing() {
+                    format!("{e} — {}", eco.other_ecosystem_hint(package))
+                } else {
+                    e.to_string()
+                };
+                if e.is_client_error() {
+                    ErrorData::invalid_params(msg, None)
+                } else {
+                    ErrorData::internal_error(msg, None)
+                }
             })
     }
 }
@@ -284,6 +313,136 @@ mod tests {
         };
         let err = mcp.flare_docs_impl(req).await.unwrap_err();
         assert!(err.to_string().contains("pypi"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_slow_fetch_leaves_the_runtime_free_to_make_progress() {
+        // Regression guard for the inline-fetch bug fixed in 83f76add, which
+        // was previously only proven by an ad-hoc uncommitted script. If
+        // `blocking_fetch` ever runs its closure inline instead of on
+        // `spawn_blocking`, the single-threaded MCP runtime stalls for the
+        // whole fetch and the concurrent ticker below cannot advance.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker_ticks = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticker_ticks.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        AgentflareMcp::blocking_fetch(Ecosystem::Rust, "serde", || {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok::<(), ::flare_docs::FetchError>(())
+        })
+        .await
+        .unwrap();
+
+        // 10 ticks of 10ms each fit comfortably inside a 300ms fetch even
+        // with Windows' ~15ms timer granularity; inline execution yields ~0.
+        let observed = ticks.load(Ordering::SeqCst);
+        assert!(
+            observed >= 5,
+            "runtime was blocked during the fetch: only {observed} ticks elapsed"
+        );
+        ticker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_404_is_the_callers_mistake_not_an_internal_error() {
+        // A package name that does not exist is a bad argument. Reporting it
+        // as `internal_error` sends the caller hunting for a broken registry.
+        let err = AgentflareMcp::blocking_fetch(Ecosystem::Rust, "no-such-crate", || {
+            Err::<(), _>(::flare_docs::FetchError::Status(404))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        // A 5xx genuinely is the registry failing, and must stay internal.
+        let err = AgentflareMcp::blocking_fetch(Ecosystem::Rust, "serde", || {
+            Err::<(), _>(::flare_docs::FetchError::Status(503))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn the_try_other_ecosystem_hint_is_only_attached_to_a_real_miss() {
+        // The hint's wording asserts the package "was not found", so attaching
+        // it to anything else states a falsehood.
+        let missing = AgentflareMcp::blocking_fetch(Ecosystem::Rust, "nope", || {
+            Err::<(), _>(::flare_docs::FetchError::Status(404))
+        })
+        .await
+        .unwrap_err();
+        assert!(missing.message.contains("ecosystem=\"npm\""), "{missing:?}");
+
+        // A package that exists but ships no types is not missing; the hint
+        // would contradict the error's own message.
+        let no_types = AgentflareMcp::blocking_fetch(Ecosystem::Npm, "express", || {
+            Err::<(), _>(::flare_docs::npm::NpmError::Npm(
+                ::flare_docs::npm::NpmFetchError::NoTypes("express".to_string()),
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert!(!no_types.message.contains("was not found"), "{no_types:?}");
+        assert_eq!(no_types.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        // Nor is a registry outage a missing package.
+        let outage = AgentflareMcp::blocking_fetch(Ecosystem::Rust, "serde", || {
+            Err::<(), _>(::flare_docs::FetchError::Status(503))
+        })
+        .await
+        .unwrap_err();
+        assert!(!outage.message.contains("was not found"), "{outage:?}");
+    }
+
+    #[tokio::test]
+    async fn list_returns_everything_by_default_but_honours_a_capped_limit() {
+        // The schema documents a ceiling on `limit` for both search and list;
+        // `list` used to ignore the field entirely, making that documentation
+        // a promise the tool did not keep.
+        let mcp = test_mcp();
+        mcp.with_flare_docs_store(|store| {
+            for i in 0..(MAX_SEARCH_LIMIT + 5) {
+                store
+                    .upsert(
+                        &Ecosystem::Rust.docs_id_path(&format!("crate{i}"), "latest"),
+                        "docs",
+                        DocUpsertOpts::default(),
+                    )
+                    .unwrap();
+            }
+        })
+        .unwrap();
+
+        let all = mcp
+            .flare_docs_impl(FlareDocsRequest {
+                action: "list".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let all: serde_json::Value = serde_json::from_str(&all).unwrap();
+        assert_eq!(all.as_array().unwrap().len(), MAX_SEARCH_LIMIT + 5);
+
+        let capped = mcp
+            .flare_docs_impl(FlareDocsRequest {
+                action: "list".to_string(),
+                limit: Some(usize::MAX),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let capped: serde_json::Value = serde_json::from_str(&capped).unwrap();
+        assert_eq!(capped.as_array().unwrap().len(), MAX_SEARCH_LIMIT);
     }
 
     #[tokio::test]

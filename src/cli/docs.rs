@@ -11,6 +11,7 @@ pub enum DocsCmd {
     /// Search cached third-party documentation.
     Search {
         query: String,
+        /// Max results to return; capped at 50.
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },

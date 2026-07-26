@@ -9,17 +9,57 @@ const MAX_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
-    /// Split out from [`Self::Http`] so callers can tell "the server said this
-    /// does not exist" from "the request never got an answer". Collapsing the
-    /// two turns a timeout into a confident, wrong claim of absence.
-    #[error("not found")]
-    NotFound,
+    /// A response arrived carrying a non-2xx status. Split out from
+    /// [`Self::Http`] so callers can tell "the server said this does not
+    /// exist" from "the request never got an answer" — collapsing the two
+    /// turns a timeout into a confident, wrong claim of absence — and so a
+    /// 4xx ("you asked for the wrong thing") is distinguishable from a 5xx
+    /// ("the registry is broken").
+    #[error("http status {0}")]
+    Status(u16),
     #[error("http error: {0}")]
     Http(String),
     #[error("decompression error: {0}")]
     Decompress(String),
     #[error("response too large: {0}")]
     TooLarge(String),
+}
+
+/// Whether a failure was the caller's fault rather than the service's.
+///
+/// Exists so the MCP layer can map a typo'd package name onto
+/// `invalid_params` instead of reporting `internal_error` for what is really
+/// a bad argument. Implemented per error type because only the error itself
+/// knows which of its variants are caller-caused.
+pub trait ClientError {
+    fn is_client_error(&self) -> bool;
+
+    /// Whether the registry reported the package itself as absent.
+    ///
+    /// Separate from [`Self::is_client_error`] because the two answer
+    /// different questions: a package that exists but ships no types is the
+    /// caller's problem yet is emphatically *not* missing. Only a genuine
+    /// absence justifies "try the other ecosystem" advice — appending it to
+    /// anything else states as fact something that is not true.
+    fn is_package_missing(&self) -> bool;
+}
+
+impl ClientError for FetchError {
+    fn is_client_error(&self) -> bool {
+        match self {
+            // 408 and 429 sit in the 4xx range but are retryable: the request
+            // was well-formed and the caller simply needs to wait. Reporting
+            // them as `invalid_params` sends an agent off to "fix" arguments
+            // that were never wrong, when the correct response is to back off.
+            FetchError::Status(408 | 429) => false,
+            FetchError::Status(400..=499) => true,
+            _ => false,
+        }
+    }
+
+    fn is_package_missing(&self) -> bool {
+        matches!(self, FetchError::Status(404))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -80,14 +120,19 @@ impl Fetcher for UreqFetcher {
             .get(url)
             .set("User-Agent", USER_AGENT)
             .call()
-            .map_err(|e| FetchError::Http(e.to_string()))?;
+            .map_err(|e| match e {
+                // ureq turns any status >= 400 into an error by default, so
+                // this is the arm a 404 for a misspelled package reaches.
+                ureq::Error::Status(code, _) => FetchError::Status(code),
+                other => FetchError::Http(other.to_string()),
+            })?;
 
+        // Not made dead by the `Status` arm above: ureq only auto-errors on
+        // >= 400, so a 1xx/3xx response (redirect budget exhausted, or an
+        // agent configured not to follow them) still arrives here as `Ok`.
         let status = resp.status();
-        if status == 404 {
-            return Err(FetchError::NotFound);
-        }
         if !(200..300).contains(&status) {
-            return Err(FetchError::Http(format!("status {status}")));
+            return Err(FetchError::Status(status));
         }
 
         let etag = resp.header("etag").map(|s| s.to_string());
@@ -134,6 +179,22 @@ mod tests {
         let data = [0u8; 100];
         let read = read_capped(&data[..], 100).unwrap();
         assert_eq!(read.len(), 100);
+    }
+
+    #[test]
+    fn only_4xx_counts_as_a_caller_mistake() {
+        // 404 is a typo'd package name; 500 and a transport failure are the
+        // registry's problem and must stay `internal_error` at the MCP layer.
+        assert!(FetchError::Status(404).is_client_error());
+        assert!(FetchError::Status(400).is_client_error());
+        assert!(FetchError::Status(499).is_client_error());
+        assert!(!FetchError::Status(500).is_client_error());
+        assert!(!FetchError::Status(302).is_client_error());
+        // Retryable 4xx: the arguments were fine, the caller just has to wait.
+        assert!(!FetchError::Status(429).is_client_error());
+        assert!(!FetchError::Status(408).is_client_error());
+        assert!(!FetchError::Http("connection refused".into()).is_client_error());
+        assert!(!FetchError::TooLarge("too big".into()).is_client_error());
     }
 
     #[test]
