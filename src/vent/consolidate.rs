@@ -86,7 +86,12 @@ pub fn consolidate_core(
             severity: l.severity.clone(),
             count: 0,
             first_event: l.event_id.clone(),
-            tags: l.tags.clone(),
+            // Seeded empty, not `l.tags.clone()` -- the dedup loop below
+            // runs for every line including this first one, so seeding
+            // with the raw (possibly internally-duplicated) tags here
+            // would let a duplicate in a single line's own tags array
+            // survive untouched by that loop's `contains` check.
+            tags: Vec::new(),
         });
         g.count += 1;
         g.message = l.message.clone();
@@ -376,6 +381,30 @@ mod tests {
             tags,
             vec!["dx".to_string(), "perf".to_string()],
             "tags from every same-topic line in the batch must union, not just the last line's"
+        );
+    }
+
+    #[test]
+    fn duplicate_tags_within_and_across_lines_are_deduped_in_order() {
+        let conn = open_in_memory().unwrap();
+        let (p, s) = seed(&conn);
+        let dir = tempfile::tempdir().unwrap();
+        let (log, cur) = (dir.path().join("v.jsonl"), dir.path().join("v.cursor"));
+        // "dx" duplicated within the first line's own tags array, "perf"
+        // repeated across lines -- neither must survive into the stored set.
+        write_tagged_line(&log, "same broken thing", &["dx", "dx"]);
+        write_tagged_line(&log, "same broken thing", &["perf", "dx"]);
+        write_tagged_line(&log, "same broken thing", &["perf"]);
+        consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+        let tags_json: String = conn
+            .query_row("SELECT tags FROM vents", [], |r| r.get(0))
+            .unwrap();
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap();
+        assert_eq!(
+            tags,
+            vec!["dx".to_string(), "perf".to_string()],
+            "duplicates (within a line's own tags and across lines) must be deduped, \
+             in first-seen order"
         );
     }
 

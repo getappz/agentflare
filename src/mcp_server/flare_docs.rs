@@ -10,7 +10,7 @@ use super::*;
 // re-exported (not just privately imported) through this submodule for that
 // path to resolve.
 pub(crate) use ::flare_docs::{
-    DocsStore, Fetcher, UreqFetcher, docs_id_path, docs_rs_json_url, store_fetched,
+    DocsStore, FetchOutcome, Fetcher, UreqFetcher, docs_id_path, docs_rs_json_url, store_fetched,
 };
 
 const DEFAULT_LIMIT: usize = 10;
@@ -66,9 +66,17 @@ impl AgentflareMcp {
                 match cached {
                     Some(doc) => serde_json::to_string(&doc)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None)),
+                    // A cache-miss "get" is still just a document lookup --
+                    // return only the doc, matching the cache-hit shape
+                    // above, rather than inventing fetch-outcome telemetry a
+                    // plain "get" never asked for ("refresh" is the action
+                    // for that).
                     None => {
-                        self.fetch_and_store_via_spawn_blocking(package, version)
-                            .await
+                        let outcome = self
+                            .fetch_and_store_via_spawn_blocking(package, version)
+                            .await?;
+                        serde_json::to_string(&outcome.doc)
+                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
                     }
                 }
             }
@@ -77,8 +85,11 @@ impl AgentflareMcp {
                     ErrorData::invalid_params("refresh requires \"package\"", None)
                 })?;
                 let version = req.version.unwrap_or_else(|| DEFAULT_VERSION.to_string());
-                self.fetch_and_store_via_spawn_blocking(package, version)
-                    .await
+                let outcome = self
+                    .fetch_and_store_via_spawn_blocking(package, version)
+                    .await?;
+                serde_json::to_string(&outcome)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             }
             other => Err(ErrorData::invalid_params(
                 format!("unknown action \"{other}\" (expected search|get|list|refresh)"),
@@ -96,7 +107,7 @@ impl AgentflareMcp {
         &self,
         package: String,
         version: String,
-    ) -> Result<String, ErrorData> {
+    ) -> Result<FetchOutcome, ErrorData> {
         let url = docs_rs_json_url(&package, &version);
         let fetched = tokio::time::timeout(
             FETCH_TIMEOUT,
@@ -116,9 +127,7 @@ impl AgentflareMcp {
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         self.with_flare_docs_store(|store| {
-            let outcome = store_fetched(store, &fetched, &package, &version)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            serde_json::to_string(&outcome)
+            store_fetched(store, &fetched, &package, &version)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))
         })?
     }

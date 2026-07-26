@@ -136,17 +136,15 @@ pub fn store_fetched(
     // `IndexCrate`'s deserialization for the *entire* crate's item set --
     // that must not turn an otherwise-successful fetch into a reported
     // failure, or mask the overview doc's success from the caller. It must
-    // not be invisible either, though -- surface it in `FetchOutcome` so a
-    // caller relying on per-item search results can tell the difference
-    // between "nothing changed" and "indexing silently failed".
+    // not be invisible either, though -- surface it in `FetchOutcome` (not
+    // an `eprintln!`, which a library shouldn't own; the CLI and MCP
+    // callers decide what to do with `items_error`) so a caller relying on
+    // per-item search results can tell "nothing changed" apart from
+    // "indexing silently failed".
     let (items_indexed, items_error) = match index_items(store, &decompressed, crate_name, &id_path)
     {
         Ok(n) => (n, None),
-        Err(e) => {
-            let msg = e.to_string();
-            eprintln!("flare-docs: per-item indexing failed for {crate_name}@{version}: {msg}");
-            (0, Some(msg))
-        }
+        Err(e) => (0, Some(e.to_string())),
     };
 
     Ok(FetchOutcome {

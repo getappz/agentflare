@@ -64,18 +64,26 @@ pub fn run(args: DocsArgs) {
             };
             match cached {
                 Some(doc) => println!("{}", serde_json::to_string_pretty(&doc).unwrap()),
-                None => fetch_and_print(&store, &package, &version),
+                // A cache-miss "get" is still just a document lookup from the
+                // caller's point of view -- print only the doc, matching the
+                // cache-hit shape above, rather than inventing fetch-outcome
+                // telemetry a plain "get" never asked for.
+                None => fetch_and_print(&store, &package, &version, false),
             }
         }
-        DocsCmd::Refresh { package, version } => fetch_and_print(&store, &package, &version),
+        DocsCmd::Refresh { package, version } => fetch_and_print(&store, &package, &version, true),
     }
 }
 
-fn fetch_and_print(store: &flare_docs::DocsStore, package: &str, version: &str) {
+fn fetch_and_print(store: &flare_docs::DocsStore, package: &str, version: &str, verbose: bool) {
     let fetcher = flare_docs::UreqFetcher::new();
     match flare_docs::fetch_and_store(&fetcher, store, package, version) {
         Ok(outcome) => {
-            println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
+            if verbose {
+                println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
+            } else {
+                println!("{}", serde_json::to_string_pretty(&outcome.doc).unwrap());
+            }
             if let Some(err) = &outcome.items_error {
                 eprintln!("flare-docs: per-item indexing failed: {err}");
             }
