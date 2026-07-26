@@ -36,12 +36,21 @@ pub const LEANCTX_SUPERSEDED: &[&str] = &[
     "@use: lean-ctx over native tools — ctx_read>Read/cat, ctx_shell>Bash, ctx_search>Grep, ctx_glob>Glob, ctx_callgraph>grep for \"who calls X\"\n@when: unfamiliar code — ctx_compose FIRST, one call vs search→read→search chain\n@scope: every subagent",
 ];
 
-pub const FLARE_DOCS: &str = r#"@use: mcp__flare__flare_docs — search|get|list|refresh for Rust crate API docs (docs.rs-backed, cached)
-@when: writing/reviewing code against a crate's API, or before citing a Rust library's behavior from memory
-@fallback: flare_docs missing from your tool list? It's deferred — ToolSearch("select:mcp__flare__flare_docs") first
+pub const FLARE_DOCS: &str = r#"@use: mcp__flare__docs — search|get|list|refresh for third-party API docs (cached)
+@ecosystems: rust (docs.rs, default) · npm (ecosystem="npm"; @scope/pkg auto-detected, untyped packages fall back to @types)
+@when: writing/reviewing code against a library's API, or before citing its behavior from memory
+@fallback: docs missing from your tool list? It's deferred — ToolSearch("select:mcp__flare__docs") first
 @scope: every session + subagent"#;
 
-pub const FLARE_DOCS_SUPERSEDED: &[&str] = &[];
+/// The pre-rename rule body. Listed here so `agentflare init` replaces it on
+/// existing installs rather than leaving a rule that points agents at a tool
+/// name (`mcp__flare__flare_docs`) the server no longer exposes.
+pub const FLARE_DOCS_SUPERSEDED: &[&str] = &[
+    r#"@use: mcp__flare__flare_docs — search|get|list|refresh for Rust crate API docs (docs.rs-backed, cached)
+@when: writing/reviewing code against a crate's API, or before citing a Rust library's behavior from memory
+@fallback: flare_docs missing from your tool list? It's deferred — ToolSearch("select:mcp__flare__flare_docs") first
+@scope: every session + subagent"#,
+];
 
 pub fn all() -> Vec<&'static str> {
     vec![EXA, GIT, LEANCTX, FLARE_DOCS]

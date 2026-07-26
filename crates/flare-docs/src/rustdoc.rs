@@ -1,7 +1,7 @@
 use crate::fetch::{FetchError, FetchedBytes, Fetcher, decompress_zstd};
 use crate::index_types::{IndexCrate, indexed_items};
 use crate::store::{BatchItem, DocsStore, Error as StoreError};
-use agentflare_store::documents::{DocUpsertOpts, Document};
+use agentflare_store::documents::DocUpsertOpts;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RustdocError {
@@ -20,19 +20,9 @@ pub enum RustdocError {
 /// that must not mean invisible -- previously a failure there only reached
 /// an `eprintln!` on the MCP server's own stderr, which no caller (CLI,
 /// MCP client, tests) could ever observe.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FetchOutcome {
-    #[serde(flatten)]
-    pub doc: Document,
-    /// Number of per-item docs written by this fetch (inserted or changed;
-    /// see [`DocsStore::upsert_batch`]'s doc comment -- a refetch with no
-    /// item content changes reports 0 here even though indexing ran).
-    pub items_indexed: usize,
-    /// Set when per-item indexing failed (e.g. an `ItemKind` variant newer
-    /// than this crate's pinned `rustdoc-types` recognizes). `items_indexed`
-    /// is 0 in that case. The overview doc in `doc` is unaffected either way.
-    pub items_error: Option<String>,
-}
+/// Defined at the crate root because both ecosystems report fetches this way;
+/// re-exported here so existing `rustdoc::FetchOutcome` paths keep resolving.
+pub use crate::FetchOutcome;
 
 /// docs.rs's official rustdoc-JSON endpoint (RFC 2963). Verified live
 /// 2026-07-23: both `latest` and an exact semver return HTTP 200,
