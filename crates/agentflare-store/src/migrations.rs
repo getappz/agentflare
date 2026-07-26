@@ -9,11 +9,51 @@ use rusqlite_migration::{M, Migrations};
 /// inlined into the migration list below) so the dedup behavior itself can
 /// be tested directly against a minimal schema, without needing to
 /// replay/version-track the full production migration sequence.
+///
+/// Discarding a document row is not a single DELETE, because two things
+/// outlive it:
+///
+/// * `store_doc_history.doc_id` references `store_documents(id)`. This
+///   connection never enables `PRAGMA foreign_keys` (see
+///   `db_kit::open_file`), so the delete does not fail -- it silently
+///   strands history rows that no longer name a live document, and nothing
+///   in the codebase ever deletes them.
+/// * `store_blobs.ref_count` is a stored counter, not a live scan over
+///   referencing rows, so a row dropped without decrementing pins its blob
+///   at a positive count forever.
+///
+/// Hence: release the references first, then the history, then the rows.
+/// The decrement is per reference removed rather than per distinct hash --
+/// several discarded rows can point at one blob. Blobs whose count reaches
+/// zero keep their file on disk; reclaiming those is disk-level GC, which
+/// this migration deliberately leaves to the cache-eviction work rather
+/// than doing file I/O from a SQL migration.
 pub(crate) const DEDUP_AND_UNIQUE_INDEX_MIGRATION: &str = "
+    UPDATE store_blobs
+       SET ref_count = MAX(0, ref_count
+           - (SELECT COUNT(*) FROM store_documents d
+               WHERE d.blob_hash = store_blobs.hash
+                 AND d.rowid NOT IN (
+                     SELECT MAX(rowid) FROM store_documents GROUP BY project_id, path))
+           - (SELECT COUNT(*) FROM store_doc_history h
+                JOIN store_documents d ON d.id = h.doc_id
+               WHERE h.blob_hash = store_blobs.hash
+                 AND d.rowid NOT IN (
+                     SELECT MAX(rowid) FROM store_documents GROUP BY project_id, path)));
+
+    DELETE FROM store_doc_history
+    WHERE doc_id IN (
+        SELECT id FROM store_documents
+        WHERE rowid NOT IN (
+            SELECT MAX(rowid) FROM store_documents GROUP BY project_id, path
+        )
+    );
+
     DELETE FROM store_documents
     WHERE rowid NOT IN (
         SELECT MAX(rowid) FROM store_documents GROUP BY project_id, path
     );
+
     CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_project_path ON store_documents(project_id, path);
 ";
 
@@ -111,18 +151,40 @@ pub fn migrations() -> Migrations<'static> {
 mod tests {
     use super::DEDUP_AND_UNIQUE_INDEX_MIGRATION;
 
-    #[test]
-    fn dedup_migration_keeps_newest_row_and_enables_the_unique_index() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+    /// The dependent schema the migration actually has to reckon with:
+    /// `store_doc_history` carries the real foreign key onto
+    /// `store_documents(id)`, and `store_blobs` carries the stored
+    /// `ref_count` that a dropped row would otherwise pin. Foreign keys are
+    /// left at SQLite's default (off) on purpose -- that is how
+    /// `db_kit::open_file` opens the production database, so a test that
+    /// turned them on would be testing a configuration that never runs.
+    fn seed(conn: &rusqlite::Connection) {
         conn.execute_batch(
             "CREATE TABLE store_documents (
                 id         TEXT PRIMARY KEY NOT NULL,
                 project_id TEXT NOT NULL DEFAULT '',
                 path       TEXT NOT NULL,
-                content    TEXT NOT NULL DEFAULT ''
+                content    TEXT NOT NULL DEFAULT '',
+                blob_hash  TEXT
+            );
+            CREATE TABLE store_doc_history (
+                id         TEXT PRIMARY KEY NOT NULL,
+                doc_id     TEXT NOT NULL REFERENCES store_documents(id),
+                version    INTEGER NOT NULL DEFAULT 1,
+                blob_hash  TEXT
+            );
+            CREATE TABLE store_blobs (
+                hash       TEXT PRIMARY KEY NOT NULL,
+                ref_count  INTEGER NOT NULL DEFAULT 0
             );",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn dedup_migration_keeps_newest_row_and_enables_the_unique_index() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        seed(&conn);
 
         // Simulate two legacy duplicate rows for the same (project_id, path)
         // -- exactly what the old, app-only-enforced uniqueness could let
@@ -165,6 +227,116 @@ mod tests {
         assert!(
             dup_insert.is_err(),
             "unique index must reject a new duplicate after the migration"
+        );
+    }
+
+    #[test]
+    fn dedup_migration_drops_history_of_discarded_rows_and_keeps_the_survivor_s() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        seed(&conn);
+        conn.execute_batch(
+            "INSERT INTO store_documents (id, project_id, path) VALUES ('a', 'p', '/dup');
+             INSERT INTO store_documents (id, project_id, path) VALUES ('b', 'p', '/dup');
+             INSERT INTO store_doc_history (id, doc_id, version) VALUES ('h1', 'a', 1);
+             INSERT INTO store_doc_history (id, doc_id, version) VALUES ('h2', 'a', 2);
+             INSERT INTO store_doc_history (id, doc_id, version) VALUES ('h3', 'b', 1);",
+        )
+        .unwrap();
+
+        conn.execute_batch(DEDUP_AND_UNIQUE_INDEX_MIGRATION)
+            .unwrap();
+
+        // Without the history delete these rows would survive pointing at a
+        // document id that no longer exists, unreachable and never cleaned
+        // up by anything.
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM store_doc_history h
+                  WHERE NOT EXISTS (SELECT 1 FROM store_documents d WHERE d.id = h.doc_id)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0, "no history may outlive the document it names");
+
+        let kept: Vec<String> = conn
+            .prepare("SELECT id FROM store_doc_history ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            kept,
+            vec!["h3".to_string()],
+            "the surviving document must keep its own history"
+        );
+    }
+
+    #[test]
+    fn dedup_migration_releases_blob_refs_held_by_discarded_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        seed(&conn);
+        // One blob referenced four times: by both duplicates and by a
+        // history row of each. Only the two references belonging to the
+        // discarded row ('a', the lower rowid) may be released -- a naive
+        // per-distinct-hash decrement would subtract 1 instead of 2.
+        conn.execute_batch(
+            "INSERT INTO store_blobs (hash, ref_count) VALUES ('deadbeef', 4);
+             INSERT INTO store_documents (id, project_id, path, blob_hash) VALUES ('a', 'p', '/dup', 'deadbeef');
+             INSERT INTO store_documents (id, project_id, path, blob_hash) VALUES ('b', 'p', '/dup', 'deadbeef');
+             INSERT INTO store_doc_history (id, doc_id, blob_hash) VALUES ('h1', 'a', 'deadbeef');
+             INSERT INTO store_doc_history (id, doc_id, blob_hash) VALUES ('h2', 'b', 'deadbeef');",
+        )
+        .unwrap();
+
+        conn.execute_batch(DEDUP_AND_UNIQUE_INDEX_MIGRATION)
+            .unwrap();
+
+        let refs: i64 = conn
+            .query_row(
+                "SELECT ref_count FROM store_blobs WHERE hash = 'deadbeef'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            refs, 2,
+            "exactly the references the discarded row and its history held \
+             must be released, leaving the survivor's two intact"
+        );
+    }
+
+    #[test]
+    fn dedup_migration_is_a_no_op_on_a_store_without_duplicates() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        seed(&conn);
+        conn.execute_batch(
+            "INSERT INTO store_blobs (hash, ref_count) VALUES ('deadbeef', 1);
+             INSERT INTO store_documents (id, project_id, path, blob_hash) VALUES ('a', 'p', '/one', 'deadbeef');
+             INSERT INTO store_documents (id, project_id, path) VALUES ('b', 'p', '/two');
+             INSERT INTO store_doc_history (id, doc_id, version) VALUES ('h1', 'a', 1);",
+        )
+        .unwrap();
+
+        conn.execute_batch(DEDUP_AND_UNIQUE_INDEX_MIGRATION)
+            .unwrap();
+
+        // The overwhelmingly common case: a database that was always clean
+        // must come through untouched, blob counts included.
+        let (docs, history, refs): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM store_documents),
+                        (SELECT COUNT(*) FROM store_doc_history),
+                        (SELECT ref_count FROM store_blobs WHERE hash = 'deadbeef')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (docs, history, refs),
+            (2, 1, 1),
+            "a store with no duplicates must be left exactly as it was"
         );
     }
 }
