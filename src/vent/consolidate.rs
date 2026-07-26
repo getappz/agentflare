@@ -90,7 +90,11 @@ pub fn consolidate_core(
         });
         g.count += 1;
         g.message = l.message.clone();
-        g.tags = l.tags.clone();
+        for t in &l.tags {
+            if !g.tags.contains(t) {
+                g.tags.push(t.clone());
+            }
+        }
         if severity_rank(&l.severity) > severity_rank(&g.severity) {
             g.severity = l.severity.clone();
         }
@@ -333,6 +337,66 @@ mod tests {
         assert_eq!(
             tags, r#"["dx"]"#,
             "tags must flow through, not be hardcoded to []"
+        );
+    }
+
+    fn write_tagged_line(log: &std::path::Path, message: &str, tags: &[&str]) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .unwrap();
+        let line = crate::vent::capture::VentLine {
+            event_id: crate::vent::event_id(&format!("{message}{}", tags.join(","))),
+            ts: "t".into(),
+            session: None,
+            severity: "high".to_string(),
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            message: message.to_string(),
+        };
+        writeln!(f, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn same_topic_lines_union_tags_within_one_batch() {
+        let conn = open_in_memory().unwrap();
+        let (p, s) = seed(&conn);
+        let dir = tempfile::tempdir().unwrap();
+        let (log, cur) = (dir.path().join("v.jsonl"), dir.path().join("v.cursor"));
+        write_tagged_line(&log, "same broken thing", &["dx"]);
+        write_tagged_line(&log, "same broken thing", &["perf"]);
+        consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+        let tags_json: String = conn
+            .query_row("SELECT tags FROM vents", [], |r| r.get(0))
+            .unwrap();
+        let mut tags: Vec<String> = serde_json::from_str(&tags_json).unwrap();
+        tags.sort();
+        assert_eq!(
+            tags,
+            vec!["dx".to_string(), "perf".to_string()],
+            "tags from every same-topic line in the batch must union, not just the last line's"
+        );
+    }
+
+    #[test]
+    fn later_untagged_consolidation_does_not_erase_prior_tags() {
+        let conn = open_in_memory().unwrap();
+        let (p, s) = seed(&conn);
+        let dir = tempfile::tempdir().unwrap();
+        let (log, cur) = (dir.path().join("v.jsonl"), dir.path().join("v.cursor"));
+        write_tagged_line(&log, "recurring topic", &["dx"]);
+        consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+
+        write_tagged_line(&log, "recurring topic", &[]);
+        consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+
+        let tags_json: String = conn
+            .query_row("SELECT tags FROM vents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            tags_json, r#"["dx"]"#,
+            "an untagged run must not erase tags a prior run already persisted"
         );
     }
 }
