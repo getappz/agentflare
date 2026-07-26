@@ -443,10 +443,15 @@ pub(crate) struct FlareDocsRequest {
     #[serde(default)]
     pub(crate) version: Option<String>,
     #[schemars(
-        description = "Max results to return, capped at 50 (search, list); search defaults to 10, list returns every cached document unless this is set"
+        description = "Max results to return; search caps at 50 and defaults to 10, list caps at 500 and defaults to 100"
     )]
     #[serde(default)]
     pub(crate) limit: Option<usize>,
+    #[schemars(
+        description = "Documents to skip before the page (list); defaults to 0. Pair with `limit` and the returned `total` to walk a cache larger than one page"
+    )]
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]

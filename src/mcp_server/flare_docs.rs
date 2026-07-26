@@ -10,8 +10,8 @@ use super::*;
 // re-exported (not just privately imported) through this submodule for that
 // path to resolve.
 pub(crate) use ::flare_docs::{
-    ClientError, DocsStore, Ecosystem, FetchOutcome, Fetcher, MAX_SEARCH_LIMIT, UreqFetcher,
-    docs_rs_json_url, npm, store_fetched,
+    ClientError, DocsStore, Ecosystem, FetchOutcome, Fetcher, UreqFetcher, docs_rs_json_url, npm,
+    store_fetched,
 };
 
 const DEFAULT_LIMIT: usize = 10;
@@ -38,20 +38,28 @@ impl AgentflareMcp {
                 })?
             }
             "list" => {
-                // `list` returns everything by default -- callers use it to
-                // enumerate the cache -- but an explicit `limit` is honoured
-                // and capped, so the documented ceiling is not a claim the
-                // tool quietly ignores.
-                let limit = req.limit.map(|n| n.min(MAX_SEARCH_LIMIT));
+                // Bodies are deliberately omitted, and the page is capped
+                // even when the caller names no limit. `list` used to return
+                // every cached document in full; per-item indexing means one
+                // crate contributes hundreds of documents, so a routine cache
+                // reached 10,889 documents / 7.75 MB -- a single response no
+                // context window can hold. `total` travels with the page so a
+                // truncated listing can never be mistaken for a complete one.
+                let offset = req.offset.unwrap_or(0);
                 self.with_flare_docs_store(|store| {
-                    let mut docs = store
-                        .list()
+                    let total = store
+                        .count()
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                    if let Some(n) = limit {
-                        docs.truncate(n);
-                    }
-                    serde_json::to_string(&docs)
-                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+                    let docs = store
+                        .list_summaries(req.limit, offset)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                    serde_json::to_string(&serde_json::json!({
+                        "total": total,
+                        "offset": offset,
+                        "returned": docs.len(),
+                        "docs": docs,
+                    }))
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
                 })?
             }
             "get" if req.id.is_some() => {
@@ -205,7 +213,7 @@ impl AgentflareMcp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ::flare_docs::DocUpsertOpts;
+    use ::flare_docs::{DEFAULT_LIST_LIMIT, DocUpsertOpts, MAX_LIST_LIMIT};
 
     fn test_mcp() -> AgentflareMcp {
         AgentflareMcp {
@@ -215,14 +223,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_on_empty_store_returns_empty_array() {
+    async fn list_on_empty_store_returns_an_empty_page() {
         let mcp = test_mcp();
         let req = FlareDocsRequest {
             action: "list".to_string(),
             ..Default::default()
         };
         let result = mcp.flare_docs_impl(req).await.unwrap();
-        assert_eq!(result, "[]");
+        let out: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(out["docs"].as_array().unwrap().len(), 0);
+        assert_eq!(out["total"].as_u64().unwrap(), 0);
     }
 
     #[tokio::test]
@@ -404,17 +414,18 @@ mod tests {
         assert!(!outage.message.contains("was not found"), "{outage:?}");
     }
 
-    #[tokio::test]
-    async fn list_returns_everything_by_default_but_honours_a_capped_limit() {
-        // The schema documents a ceiling on `limit` for both search and list;
-        // `list` used to ignore the field entirely, making that documentation
-        // a promise the tool did not keep.
+    /// Fills the store with `n` documents and returns the parsed `list`
+    /// response for the given request tweaks.
+    async fn list_with(n: usize, tweak: impl FnOnce(&mut FlareDocsRequest)) -> serde_json::Value {
         let mcp = test_mcp();
         mcp.with_flare_docs_store(|store| {
-            for i in 0..(MAX_SEARCH_LIMIT + 5) {
+            for i in 0..n {
                 store
                     .upsert(
-                        &Ecosystem::Rust.docs_id_path(&format!("crate{i}"), "latest"),
+                        // Zero-padded so the `ORDER BY path` the store applies
+                        // matches numeric order, making offset assertions
+                        // below say what they appear to say.
+                        &Ecosystem::Rust.docs_id_path(&format!("crate{i:04}"), "latest"),
                         "docs",
                         DocUpsertOpts::default(),
                     )
@@ -423,26 +434,93 @@ mod tests {
         })
         .unwrap();
 
-        let all = mcp
-            .flare_docs_impl(FlareDocsRequest {
-                action: "list".to_string(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let all: serde_json::Value = serde_json::from_str(&all).unwrap();
-        assert_eq!(all.as_array().unwrap().len(), MAX_SEARCH_LIMIT + 5);
+        let mut req = FlareDocsRequest {
+            action: "list".to_string(),
+            ..Default::default()
+        };
+        tweak(&mut req);
+        serde_json::from_str(&mcp.flare_docs_impl(req).await.unwrap()).unwrap()
+    }
 
-        let capped = mcp
+    #[tokio::test]
+    async fn list_caps_its_page_by_default_and_reports_what_it_withheld() {
+        // The previous contract was "return everything unless a limit is
+        // given". Per-item indexing turned that into a response no caller can
+        // receive: one real cache reached 10,889 documents / 7.75 MB.
+        let n = DEFAULT_LIST_LIMIT + 5;
+        let out = list_with(n, |_| {}).await;
+
+        assert_eq!(out["docs"].as_array().unwrap().len(), DEFAULT_LIST_LIMIT);
+        assert_eq!(
+            out["returned"].as_u64().unwrap() as usize,
+            DEFAULT_LIST_LIMIT
+        );
+        // Without this a truncated page is indistinguishable from a complete
+        // one, which is how a caller silently concludes the cache is smaller
+        // than it is.
+        assert_eq!(out["total"].as_u64().unwrap() as usize, n);
+    }
+
+    #[tokio::test]
+    async fn list_clamps_an_oversized_limit_rather_than_rejecting_it() {
+        let out = list_with(MAX_LIST_LIMIT + 5, |req| req.limit = Some(usize::MAX)).await;
+        assert_eq!(out["docs"].as_array().unwrap().len(), MAX_LIST_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn list_offset_reaches_documents_past_the_first_page() {
+        // The cap is only defensible if it bounds a response without putting
+        // anything out of reach.
+        let n = DEFAULT_LIST_LIMIT + 5;
+        let out = list_with(n, |req| req.offset = Some(DEFAULT_LIST_LIMIT)).await;
+
+        let docs = out["docs"].as_array().unwrap();
+        assert_eq!(docs.len(), 5);
+        assert_eq!(out["offset"].as_u64().unwrap() as usize, DEFAULT_LIST_LIMIT);
+        assert_eq!(out["total"].as_u64().unwrap() as usize, n);
+        assert!(
+            docs[0]["path"].as_str().unwrap().contains("crate0100"),
+            "expected the page to start where the first one ended, got {:?}",
+            docs[0]["path"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_omits_document_bodies() {
+        // The size property, stated as a property rather than a byte count:
+        // a 100 KB body must not make the listing 100 KB bigger.
+        let mcp = test_mcp();
+        let big = "x".repeat(100_000);
+        mcp.with_flare_docs_store(|store| {
+            store
+                .upsert(
+                    &Ecosystem::Rust.docs_id_path("heavy", "latest"),
+                    &big,
+                    DocUpsertOpts::default(),
+                )
+                .unwrap();
+        })
+        .unwrap();
+
+        let raw = mcp
             .flare_docs_impl(FlareDocsRequest {
                 action: "list".to_string(),
-                limit: Some(usize::MAX),
                 ..Default::default()
             })
             .await
             .unwrap();
-        let capped: serde_json::Value = serde_json::from_str(&capped).unwrap();
-        assert_eq!(capped.as_array().unwrap().len(), MAX_SEARCH_LIMIT);
+
+        assert!(
+            raw.len() < 1_000,
+            "listing carried the body: {} bytes for one document",
+            raw.len()
+        );
+        let out: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let doc = &out["docs"][0];
+        assert!(doc.get("content").is_none(), "{doc:?}");
+        // Kept so a caller can still tell an empty placeholder from a real
+        // page without being handed the page.
+        assert_eq!(doc["content_bytes"].as_u64().unwrap(), 100_000);
     }
 
     #[tokio::test]
