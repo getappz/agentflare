@@ -157,9 +157,13 @@ pub fn store_fetched(
 /// Parses the full rustdoc-JSON `index`/`paths` maps and upserts one
 /// document per item that has both a docstring and a public path (see
 /// [`indexed_items`]). Runs as a single batched transaction via
-/// [`DocsStore::upsert_batch`] — a crate can have thousands of items, and
-/// upserting them one at a time would turn a single fetch into thousands of
-/// individual commits.
+/// [`DocsStore::upsert_batch_reconciled`] — a crate can have thousands of
+/// items, and upserting them one at a time would turn a single fetch into
+/// thousands of individual commits. Reconciling against `crate_id_path`'s
+/// existing items also soft-deletes any item that was present in a
+/// previous fetch but isn't in this one (renamed, removed, or made
+/// private), so search can't keep surfacing docs for an item that no
+/// longer exists in the crate's current index.
 fn index_items(
     store: &DocsStore,
     decompressed_json: &[u8],
@@ -169,10 +173,11 @@ fn index_items(
     let index_crate: IndexCrate = serde_json::from_slice(decompressed_json)
         .map_err(|e| RustdocError::InvalidJson(e.to_string()))?;
 
+    let item_prefix = format!("{crate_id_path}/item/");
     let batch: Vec<BatchItem> = indexed_items(&index_crate)
         .into_iter()
         .map(|item| BatchItem {
-            path: format!("{crate_id_path}/item/{}", item.fq_path),
+            path: format!("{item_prefix}{}", item.fq_path),
             content: item.docs,
             title: item.name,
             doc_type: "rust-item".to_string(),
@@ -181,7 +186,7 @@ fn index_items(
         })
         .collect();
 
-    Ok(store.upsert_batch(&batch)?)
+    Ok(store.upsert_batch_reconciled(&item_prefix, &batch)?)
 }
 
 fn store_raw_json_blob(store: &DocsStore, decompressed_json: &[u8]) -> Result<String, StoreError> {
@@ -350,6 +355,74 @@ mod tests {
         assert_eq!(
             hits[0].path,
             "docsrs/fake-crate/1.0.0/item/fake_crate::extract::State"
+        );
+    }
+
+    #[test]
+    fn refetch_removes_items_no_longer_present_in_the_crate_index() {
+        // Regression for the staleness gap: item A and B are indexed by the
+        // first fetch, then a refetch of the same crate_id_path ("latest")
+        // only has item A -- B must no longer be gettable or searchable
+        // afterward, not linger from the first fetch forever.
+        let first_json = br#"{
+            "root": 0,
+            "index": {
+                "0": { "docs": "A fake crate for testing." },
+                "1": { "name": "State", "docs": "Extractor for shared state." },
+                "2": { "name": "Router", "docs": "The router type." }
+            },
+            "paths": {
+                "1": { "crate_id": 0, "path": ["fake_crate", "extract", "State"], "kind": "struct" },
+                "2": { "crate_id": 0, "path": ["fake_crate", "Router"], "kind": "struct" }
+            }
+        }"#;
+        let store = DocsStore::open_memory().unwrap();
+        let fetcher = FakeFetcher {
+            response: zstd::stream::encode_all(&first_json[..], 0).unwrap(),
+        };
+        fetch_and_store(&fetcher, &store, "fake-crate", "latest").unwrap();
+        assert!(
+            store
+                .get_by_path("docsrs/fake-crate/latest/item/fake_crate::Router")
+                .unwrap()
+                .is_some()
+        );
+
+        // "latest" moved to a new version where Router was removed.
+        let second_json = br#"{
+            "root": 0,
+            "index": {
+                "0": { "docs": "A fake crate for testing." },
+                "1": { "name": "State", "docs": "Extractor for shared state." }
+            },
+            "paths": {
+                "1": { "crate_id": 0, "path": ["fake_crate", "extract", "State"], "kind": "struct" }
+            }
+        }"#;
+        let fetcher = FakeFetcher {
+            response: zstd::stream::encode_all(&second_json[..], 0).unwrap(),
+        };
+        fetch_and_store(&fetcher, &store, "fake-crate", "latest").unwrap();
+
+        assert!(
+            store
+                .get_by_path("docsrs/fake-crate/latest/item/fake_crate::Router")
+                .unwrap()
+                .is_none(),
+            "removed item must not be gettable by path after refetch"
+        );
+        let hits = store.search("The router type", 10).unwrap();
+        assert!(
+            hits.is_empty(),
+            "removed item must not be findable via search after refetch"
+        );
+
+        // The item still present in the new fetch must be unaffected.
+        assert!(
+            store
+                .get_by_path("docsrs/fake-crate/latest/item/fake_crate::extract::State")
+                .unwrap()
+                .is_some()
         );
     }
 
