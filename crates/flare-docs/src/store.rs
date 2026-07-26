@@ -219,19 +219,13 @@ impl DocsStore {
                 if stored_path.starts_with(path_prefix)
                     && !fresh_paths.contains(stored_path.as_str())
                 {
+                    // Soft-deleting the row drops its store_docs_fts entry via
+                    // the base table's AFTER UPDATE trigger, so a stale item
+                    // stops being matchable without this call site having to
+                    // remember it -- which is exactly what it used to forget.
                     tx.execute(
                         "UPDATE store_documents SET deleted_at = ?1 WHERE rowid = ?2",
                         rusqlite::params![now, rowid],
-                    )?;
-                    // Mirror write_batch_items's explicit FTS sync -- store_docs_fts
-                    // is a manually-synced table, not a content=/external-content
-                    // FTS5 table, so a soft-deleted row's stale entry would
-                    // otherwise stay directly matchable via `store_docs_fts MATCH`
-                    // (doc_search's own deleted_at filter still excludes it, but
-                    // nothing else queries store_docs_fts through that guard).
-                    tx.execute(
-                        "DELETE FROM store_docs_fts WHERE rowid = ?1",
-                        rusqlite::params![rowid],
                     )?;
                     if let Some(hash) = blob_hash {
                         stale_blobs.push(hash);
@@ -286,8 +280,8 @@ impl DocsStore {
 
         // Prepared once and reused across every item (rusqlite's statement
         // cache would do this implicitly via prepare_cached, but a crate can
-        // have thousands of items, so holding the four statements open for
-        // the whole loop avoids thousands of cache lookups too).
+        // have thousands of items, so holding both statements open for the
+        // whole loop avoids thousands of cache lookups too).
         {
             let mut select_stmt = tx.prepare_cached(
                 "SELECT content FROM store_documents WHERE project_id = ?1 AND path = ?2 AND deleted_at IS NULL",
@@ -304,13 +298,8 @@ impl DocsStore {
                     source = excluded.source,
                     version = store_documents.version + 1,
                     updated_at = excluded.updated_at,
-                    deleted_at = NULL
-                 RETURNING rowid",
+                    deleted_at = NULL",
             )?;
-            let mut fts_del_stmt =
-                tx.prepare_cached("DELETE FROM store_docs_fts WHERE rowid = ?1")?;
-            let mut fts_ins_stmt =
-                tx.prepare_cached("INSERT INTO store_docs_fts(rowid, content) VALUES (?1, ?2)")?;
 
             for item in items {
                 let existing_content: Option<String> = select_stmt
@@ -322,23 +311,20 @@ impl DocsStore {
 
                 let tags_json = serde_json::to_string(&item.tags).unwrap_or_else(|_| "[]".into());
                 let id = db_kit::ids::new_id();
-                let rowid: i64 = upsert_stmt.query_row(
-                    rusqlite::params![
-                        id,
-                        PROJECT_ID,
-                        item.path,
-                        item.content,
-                        item.title,
-                        item.doc_type,
-                        tags_json,
-                        item.source,
-                        now,
-                    ],
-                    |row| row.get(0),
-                )?;
-
-                fts_del_stmt.execute(rusqlite::params![rowid])?;
-                fts_ins_stmt.execute(rusqlite::params![rowid, item.content])?;
+                // No FTS write here: store_docs_fts is external-content and
+                // trigger-driven, so both arms of this upsert index the item
+                // on their own.
+                upsert_stmt.execute(rusqlite::params![
+                    id,
+                    PROJECT_ID,
+                    item.path,
+                    item.content,
+                    item.title,
+                    item.doc_type,
+                    tags_json,
+                    item.source,
+                    now,
+                ])?;
                 written += 1;
             }
         } // statements dropped here, releasing their borrow of `tx` before commit

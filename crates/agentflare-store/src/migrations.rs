@@ -57,6 +57,71 @@ pub(crate) const DEDUP_AND_UNIQUE_INDEX_MIGRATION: &str = "
     CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_project_path ON store_documents(project_id, path);
 ";
 
+/// Converts `store_docs_fts` from a standalone fts5 table kept in sync by
+/// hand into an external-content one driven by triggers.
+///
+/// The manual scheme put an FTS write next to every `store_documents` write,
+/// across two crates -- and a delete path that forgot one is exactly the bug
+/// #334/#337 fixed (soft-deleted rows stayed matchable). Triggers make the
+/// FTS write a property of the base table instead of something each new call
+/// site has to remember, and external content drops the index's duplicate
+/// copy of every document's text.
+///
+/// Soft-deleted rows stay out of the index, preserving what the manual code
+/// did. That is why the triggers are guarded rather than the straight
+/// mirrors in `src/memory/schema.rs`: for an external-content table the
+/// `'delete'` command must only ever name a row that is actually indexed, so
+/// resurrecting a soft-deleted document (an UPDATE whose `old.deleted_at` is
+/// set) must not try to delete an entry that was already removed.
+///
+/// `UPDATE OF content, deleted_at` and not a bare `UPDATE`: those are the
+/// only two columns the index depends on, and `doc_upsert_with_opts` follows
+/// its content write with up to nine single-column UPDATEs for the optional
+/// fields, each of which would otherwise re-tokenize the whole document.
+///
+/// Note for the cache-eviction work (#339): `store_documents` has a TEXT
+/// primary key, so its rowids are implicit and `VACUUM` may renumber them --
+/// which would desync this index (and `doc_search`'s rowid JOIN, which had
+/// the same coupling before this migration). Anything that VACUUMs must call
+/// [`crate::Store::doc_fts_rebuild`] afterwards.
+pub(crate) const EXTERNAL_CONTENT_FTS_MIGRATION: &str = "
+    DROP TABLE IF EXISTS store_docs_fts;
+
+    CREATE VIRTUAL TABLE store_docs_fts USING fts5(
+        content,
+        content='store_documents'
+    );
+
+    CREATE TRIGGER store_docs_fts_ai AFTER INSERT ON store_documents BEGIN
+        INSERT INTO store_docs_fts(rowid, content)
+            SELECT new.rowid, new.content WHERE new.deleted_at IS NULL;
+    END;
+
+    CREATE TRIGGER store_docs_fts_ad AFTER DELETE ON store_documents BEGIN
+        INSERT INTO store_docs_fts(store_docs_fts, rowid, content)
+            SELECT 'delete', old.rowid, old.content WHERE old.deleted_at IS NULL;
+    END;
+
+    CREATE TRIGGER store_docs_fts_au AFTER UPDATE OF content, deleted_at ON store_documents BEGIN
+        INSERT INTO store_docs_fts(store_docs_fts, rowid, content)
+            SELECT 'delete', old.rowid, old.content WHERE old.deleted_at IS NULL;
+        INSERT INTO store_docs_fts(rowid, content)
+            SELECT new.rowid, new.content WHERE new.deleted_at IS NULL;
+    END;
+
+    INSERT INTO store_docs_fts(rowid, content)
+        SELECT rowid, content FROM store_documents WHERE deleted_at IS NULL;
+";
+
+/// Repopulates `store_docs_fts` from `store_documents`. Not `'rebuild'`,
+/// which would index the soft-deleted rows the triggers deliberately keep
+/// out. See [`EXTERNAL_CONTENT_FTS_MIGRATION`].
+pub(crate) const FTS_REBUILD_SQL: &str = "
+    INSERT INTO store_docs_fts(store_docs_fts) VALUES('delete-all');
+    INSERT INTO store_docs_fts(rowid, content)
+        SELECT rowid, content FROM store_documents WHERE deleted_at IS NULL;
+";
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(
@@ -144,7 +209,108 @@ pub fn migrations() -> Migrations<'static> {
              ALTER TABLE store_doc_history ADD COLUMN size INTEGER NOT NULL DEFAULT 0;",
         ),
         M::up(DEDUP_AND_UNIQUE_INDEX_MIGRATION),
+        M::up(EXTERNAL_CONTENT_FTS_MIGRATION),
     ])
+}
+
+#[cfg(test)]
+mod fts_migration_tests {
+    use super::EXTERNAL_CONTENT_FTS_MIGRATION;
+
+    /// The pre-migration shape: a standalone fts5 table with its own copy of
+    /// the text, and `store_documents` alongside it.
+    fn legacy(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            "CREATE TABLE store_documents (
+                id         TEXT PRIMARY KEY NOT NULL,
+                project_id TEXT NOT NULL DEFAULT '',
+                path       TEXT NOT NULL,
+                content    TEXT NOT NULL DEFAULT '',
+                deleted_at INTEGER
+            );
+            CREATE VIRTUAL TABLE store_docs_fts USING fts5(content);",
+        )
+        .unwrap();
+    }
+
+    fn hits(conn: &rusqlite::Connection, term: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM store_docs_fts WHERE store_docs_fts MATCH ?1",
+            [term],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn migration_reindexes_live_rows_and_leaves_soft_deleted_ones_out() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        legacy(&conn);
+        conn.execute_batch(
+            "INSERT INTO store_documents (id, path, content) VALUES ('a', '/live', 'kept');
+             INSERT INTO store_documents (id, path, content, deleted_at)
+                VALUES ('b', '/dead', 'dropped', 1);
+             INSERT INTO store_docs_fts(rowid, content) VALUES (1, 'kept');",
+        )
+        .unwrap();
+
+        conn.execute_batch(EXTERNAL_CONTENT_FTS_MIGRATION).unwrap();
+
+        assert_eq!(hits(&conn, "kept"), 1, "live rows must survive the rebuild");
+        assert_eq!(
+            hits(&conn, "dropped"),
+            0,
+            "the migration must not index rows the triggers would keep out"
+        );
+    }
+
+    #[test]
+    fn migration_leaves_an_index_that_is_external_content_and_trigger_driven() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        legacy(&conn);
+        conn.execute_batch(EXTERNAL_CONTENT_FTS_MIGRATION).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'store_docs_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("content='store_documents'"),
+            "index must read its text back from the base table, not duplicate it: {sql}"
+        );
+
+        let triggers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'trigger' AND tbl_name = 'store_documents'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(triggers, 3, "insert, delete and update must all be covered");
+    }
+
+    #[test]
+    fn a_row_written_after_the_migration_needs_no_explicit_fts_write() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        legacy(&conn);
+        conn.execute_batch(EXTERNAL_CONTENT_FTS_MIGRATION).unwrap();
+
+        // Deliberately only the base-table write -- the whole point is that a
+        // call site can no longer forget the other half.
+        conn.execute_batch(
+            "INSERT INTO store_documents (id, path, content) VALUES ('a', '/new', 'freshly');",
+        )
+        .unwrap();
+        assert_eq!(hits(&conn, "freshly"), 1);
+
+        conn.execute_batch("UPDATE store_documents SET deleted_at = 1 WHERE id = 'a';")
+            .unwrap();
+        assert_eq!(hits(&conn, "freshly"), 0);
+    }
 }
 
 #[cfg(test)]

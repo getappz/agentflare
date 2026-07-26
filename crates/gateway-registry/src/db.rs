@@ -15,8 +15,51 @@ CREATE TABLE IF NOT EXISTS tools (
   input_schema TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY (server, name)
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS tools_fts USING fts5(server, name, description);
+CREATE VIRTUAL TABLE IF NOT EXISTS tools_fts USING fts5(
+  server, name, description, content='tools'
+);
+CREATE TRIGGER IF NOT EXISTS tools_fts_ai AFTER INSERT ON tools BEGIN
+  INSERT INTO tools_fts(rowid, server, name, description)
+  VALUES (new.rowid, new.server, new.name, new.description);
+END;
+CREATE TRIGGER IF NOT EXISTS tools_fts_ad AFTER DELETE ON tools BEGIN
+  INSERT INTO tools_fts(tools_fts, rowid, server, name, description)
+  VALUES ('delete', old.rowid, old.server, old.name, old.description);
+END;
+CREATE TRIGGER IF NOT EXISTS tools_fts_au
+AFTER UPDATE OF server, name, description ON tools BEGIN
+  INSERT INTO tools_fts(tools_fts, rowid, server, name, description)
+  VALUES ('delete', old.rowid, old.server, old.name, old.description);
+  INSERT INTO tools_fts(rowid, server, name, description)
+  VALUES (new.rowid, new.server, new.name, new.description);
+END;
 ";
+
+/// Databases written before `tools_fts` became external-content carry the old
+/// standalone table, which `CREATE VIRTUAL TABLE IF NOT EXISTS` would leave
+/// in place. Drop it so `SCHEMA` recreates the trigger-backed shape, then
+/// refill from `tools` -- the last-known-good tool list `Registry` falls back
+/// on must stay searchable across the upgrade, not just after the next
+/// `rebuild`. (Mirrors `crates/skill-registry/src/db.rs`.)
+fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let legacy: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+          WHERE type = 'table' AND name = 'tools_fts' AND sql NOT LIKE '%content=%'",
+        [],
+        |r| r.get(0),
+    )?;
+    if legacy > 0 {
+        conn.execute_batch("DROP TABLE tools_fts;")?;
+    }
+    conn.execute_batch(SCHEMA)?;
+    if legacy > 0 {
+        conn.execute_batch(
+            "INSERT INTO tools_fts(rowid, server, name, description)
+             SELECT rowid, server, name, description FROM tools;",
+        )?;
+    }
+    Ok(())
+}
 
 pub fn open_db(path: &Path) -> rusqlite::Result<Connection> {
     if let Some(parent) = path.parent() {
@@ -25,13 +68,13 @@ pub fn open_db(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(std::time::Duration::from_millis(5000))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.execute_batch(SCHEMA)?;
+    apply_schema(&conn)?;
     Ok(conn)
 }
 
 pub fn open_in_memory() -> rusqlite::Result<Connection> {
     let conn = Connection::open_in_memory()?;
-    conn.execute_batch(SCHEMA)?;
+    apply_schema(&conn)?;
     Ok(conn)
 }
 
@@ -43,28 +86,20 @@ pub struct ServerTools {
 
 pub fn rebuild(conn: &mut Connection, entries: &[ServerTools]) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
+    // tools_fts follows along through the AFTER DELETE / AFTER INSERT
+    // triggers — including the OR IGNORE case below, where no row is
+    // inserted and so nothing is indexed.
     tx.execute("DELETE FROM tools", [])?;
-    tx.execute("DELETE FROM tools_fts", [])?;
     {
         let mut ins = tx.prepare(
             "INSERT OR IGNORE INTO tools (server, name, description, input_schema)
              VALUES (?1, ?2, ?3, ?4)",
-        )?;
-        let mut fts = tx.prepare(
-            "INSERT INTO tools_fts (rowid, server, name, description) VALUES (?1, ?2, ?3, ?4)",
         )?;
         for st in entries {
             for t in &st.tools {
                 let schema_json =
                     serde_json::to_string(&t.input_schema).unwrap_or_else(|_| "{}".into());
                 ins.execute(params![st.server, t.name, t.description, schema_json])?;
-                if tx.changes() == 0 {
-                    // Duplicate (server, name) ignored — skip the fts mirror,
-                    // last_insert_rowid() would be stale (mirrors skill-registry).
-                    continue;
-                }
-                let rowid = tx.last_insert_rowid();
-                fts.execute(params![rowid, st.server, t.name, t.description])?;
             }
         }
     }
@@ -107,6 +142,20 @@ pub fn server_tools(conn: &Connection, server: &str) -> rusqlite::Result<Vec<Too
 mod tests {
     use super::*;
 
+    /// Rows the index can actually reach. Deliberately not
+    /// `SELECT count(*) FROM tools_fts`: now that the table is
+    /// external-content, a bare scan is answered from `tools` itself, so it
+    /// reports every tool row whether or not it is indexed. Only a MATCH goes
+    /// through the index.
+    fn fts_hits(conn: &Connection, term: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM tools_fts WHERE tools_fts MATCH ?1",
+            params![term],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
     fn entry(name: &str, desc: &str) -> ToolEntry {
         ToolEntry {
             name: name.into(),
@@ -145,10 +194,12 @@ mod tests {
             .query_row("SELECT count(*) FROM tools", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
-        let f: i64 = conn
-            .query_row("SELECT count(*) FROM tools_fts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(f, 1);
+        assert_eq!(fts_hits(&conn, "gamma"), 1);
+        assert_eq!(
+            fts_hits(&conn, "alpha"),
+            0,
+            "a tool dropped by the rebuild must not stay matchable"
+        );
     }
 
     #[test]
@@ -220,6 +271,44 @@ mod tests {
             serde_json::json!({"type": "object"})
         );
         assert!(server_tools(&conn, "missing").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_legacy_standalone_fts_is_converted_and_refilled_on_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("gateway.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tools (
+                   server TEXT NOT NULL, name TEXT NOT NULL,
+                   description TEXT NOT NULL DEFAULT '',
+                   input_schema TEXT NOT NULL DEFAULT '{}',
+                   PRIMARY KEY (server, name));
+                 CREATE VIRTUAL TABLE tools_fts USING fts5(server, name, description);
+                 INSERT INTO tools (server, name, description) VALUES ('narsil', 'find_symbols', 'alpha');
+                 INSERT INTO tools_fts(rowid, server, name, description)
+                    VALUES (1, 'narsil', 'find_symbols', 'alpha');",
+            )
+            .unwrap();
+        }
+
+        let conn = open_db(&path).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'tools_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("content='tools'"), "must convert: {sql}");
+        // The fallback tool list Registry::ensure_fresh leans on has to stay
+        // searchable across the upgrade, not just after the next rebuild.
+        let hits =
+            crate::search::search(&conn, "alpha", 5, crate::search::MatchMode::All).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].tool, "find_symbols");
     }
 
     #[test]
