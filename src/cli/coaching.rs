@@ -1,5 +1,5 @@
-use clap::{Args, Subcommand};
 use crate::coaching::rule::RuleTier;
+use clap::{Args, Subcommand};
 
 #[derive(Subcommand)]
 pub enum CoachingAction {
@@ -58,7 +58,13 @@ impl CoachingArgs {
                 tier,
                 sync,
             } => crate::coaching::cli_apply(
-                &id, &title, &body, trigger_tool, trigger_auto, tier, sync,
+                &id,
+                &title,
+                &body,
+                trigger_tool,
+                trigger_auto,
+                tier,
+                sync,
             ),
             CoachingAction::Remove { id } => crate::coaching::cli_remove(&id),
             CoachingAction::Sync { agent } => crate::coaching::cli_sync(agent.as_deref()),

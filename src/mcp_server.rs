@@ -417,7 +417,9 @@ impl AgentflareMcp {
                 }
                 None => {
                     let store = match crate::store::open() {
-                        Ok(s) => std::sync::Arc::new(agentflare_artifacts::ArtifactStore::with_store(s)),
+                        Ok(s) => {
+                            std::sync::Arc::new(agentflare_artifacts::ArtifactStore::with_store(s))
+                        }
                         Err(e) => {
                             eprintln!("[artifacts] fallback to flat-file store: {e}");
                             let dir = crate::paths::home().join(".agentflare").join("artifacts");

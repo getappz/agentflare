@@ -46,10 +46,7 @@ struct VersionPath {
     version: u32,
 }
 
-async fn artifact_page(
-    State(state): State<ArtifactState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn artifact_page(State(state): State<ArtifactState>, Path(id): Path<String>) -> Response {
     let Ok(artifact) = state.store.get(&id) else {
         return (StatusCode::NOT_FOUND, "artifact not found").into_response();
     };
@@ -68,10 +65,7 @@ async fn artifact_version_page(
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
 }
 
-async fn versions_json(
-    State(state): State<ArtifactState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn versions_json(State(state): State<ArtifactState>, Path(id): Path<String>) -> Response {
     match state.store.versions(&id) {
         Ok(history) => (
             [(header::CONTENT_TYPE, "application/json")],
@@ -82,10 +76,7 @@ async fn versions_json(
     }
 }
 
-async fn artifact_live(
-    State(state): State<ArtifactState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn artifact_live(State(state): State<ArtifactState>, Path(id): Path<String>) -> Response {
     if !agentflare_artifacts::valid_id(&id) {
         return (StatusCode::NOT_FOUND, "invalid id").into_response();
     }
@@ -99,9 +90,7 @@ async fn artifact_live(
         }
     });
     let stream = UnboundedReceiverStream::new(async_rx).map(|event| {
-        Ok::<_, std::convert::Infallible>(
-            axum::response::sse::Event::default().data(event),
-        )
+        Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(event))
     });
     Sse::new(stream).into_response()
 }
