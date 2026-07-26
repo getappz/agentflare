@@ -112,8 +112,15 @@ impl Store {
     /// is only needed after something rewrites the base table behind the
     /// triggers' back -- notably `VACUUM`, which may renumber the implicit
     /// rowids the index is keyed on.
+    ///
+    /// Transactional: the clear and the refill are two statements, and
+    /// stopping between them would leave the index empty rather than stale.
     pub fn doc_fts_rebuild(&self) -> rusqlite::Result<()> {
-        self.conn().execute_batch(crate::migrations::FTS_REBUILD_SQL)
+        let conn = self.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(crate::migrations::FTS_REBUILD_SQL)?;
+        tx.commit()
     }
 
     fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
@@ -811,12 +818,29 @@ mod tests {
     }
 
     #[test]
-    fn optional_field_updates_do_not_disturb_the_index() {
+    fn the_update_trigger_is_scoped_to_the_indexed_columns() {
         // doc_upsert_with_opts writes content, then up to nine more
-        // single-column UPDATEs. The AFTER UPDATE trigger is scoped to
-        // `content, deleted_at` so those extra writes are not nine
-        // re-tokenizations of the same body -- and, more importantly, cannot
-        // leave the index in a different state than the content write did.
+        // single-column UPDATEs for the optional fields. None of them can
+        // change what is indexed, so none should re-tokenize the body. This
+        // has to be asserted on the trigger definition: an unscoped
+        // AFTER UPDATE produces an identical index, just nine times over.
+        let s = store();
+        let sql: String = s
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'store_docs_fts_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("UPDATE OF content, deleted_at"),
+            "update trigger must not fire for columns the index ignores: {sql}"
+        );
+    }
+
+    #[test]
+    fn optional_field_updates_leave_the_document_indexed() {
         let s = store();
         s.doc_upsert_with_opts(
             "p",

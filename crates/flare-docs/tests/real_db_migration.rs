@@ -22,7 +22,9 @@ fn sample(conn: &rusqlite::Connection, deleted: bool, limit: i64) -> Vec<(i64, S
     );
     conn.prepare(&sql)
         .unwrap()
-        .query_map([limit], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .query_map([limit], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })
         .unwrap()
         .filter_map(|row| {
             let (rowid, content) = row.unwrap();

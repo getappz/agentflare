@@ -41,6 +41,13 @@ END;
 /// refill from `tools` -- the last-known-good tool list `Registry` falls back
 /// on must stay searchable across the upgrade, not just after the next
 /// `rebuild`. (Mirrors `crates/skill-registry/src/db.rs`.)
+///
+/// All of it in one transaction, because the halfway state is not
+/// self-correcting: with `tools_fts` dropped but not yet refilled, the next
+/// open finds no such table, reads `legacy` as 0, and recreates an empty
+/// index over a populated `tools` — search silently missing every tool until
+/// something forces a full `rebuild`. SQLite makes DDL transactional, so the
+/// conversion either lands whole or never happened.
 fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
     let legacy: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master
@@ -48,17 +55,18 @@ fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
         [],
         |r| r.get(0),
     )?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     if legacy > 0 {
-        conn.execute_batch("DROP TABLE tools_fts;")?;
+        tx.execute_batch("DROP TABLE tools_fts;")?;
     }
-    conn.execute_batch(SCHEMA)?;
+    tx.execute_batch(SCHEMA)?;
     if legacy > 0 {
-        conn.execute_batch(
+        tx.execute_batch(
             "INSERT INTO tools_fts(rowid, server, name, description)
              SELECT rowid, server, name, description FROM tools;",
         )?;
     }
-    Ok(())
+    tx.commit()
 }
 
 pub fn open_db(path: &Path) -> rusqlite::Result<Connection> {
@@ -305,8 +313,7 @@ mod tests {
         assert!(sql.contains("content='tools'"), "must convert: {sql}");
         // The fallback tool list Registry::ensure_fresh leans on has to stay
         // searchable across the upgrade, not just after the next rebuild.
-        let hits =
-            crate::search::search(&conn, "alpha", 5, crate::search::MatchMode::All).unwrap();
+        let hits = crate::search::search(&conn, "alpha", 5, crate::search::MatchMode::All).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].tool, "find_symbols");
     }
