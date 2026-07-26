@@ -442,7 +442,7 @@ pub(crate) struct FlareDocsRequest {
     )]
     #[serde(default)]
     pub(crate) version: Option<String>,
-    #[schemars(description = "Max results to return (search, list); defaults to 10")]
+    #[schemars(description = "Max results to return (search, list); defaults to 10, max 50")]
     #[serde(default)]
     pub(crate) limit: Option<usize>,
 }

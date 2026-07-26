@@ -10,7 +10,8 @@ use super::*;
 // re-exported (not just privately imported) through this submodule for that
 // path to resolve.
 pub(crate) use ::flare_docs::{
-    DocsStore, Ecosystem, FetchOutcome, Fetcher, UreqFetcher, docs_rs_json_url, npm, store_fetched,
+    ClientError, DocsStore, Ecosystem, FetchOutcome, Fetcher, UreqFetcher, docs_rs_json_url, npm,
+    store_fetched,
 };
 
 const DEFAULT_LIMIT: usize = 10;
@@ -146,6 +147,12 @@ impl AgentflareMcp {
     /// Shared timeout/panic/error plumbing for a blocking registry fetch. A
     /// miss names the other registry, so a caller that guessed wrong is told
     /// the fix instead of concluding the package does not exist.
+    ///
+    /// A caller-caused failure (a package name that 404s, a package with no
+    /// types) comes back as `invalid_params`; only genuine infrastructure
+    /// failures — timeouts, panics, 5xx, transport errors — are
+    /// `internal_error`. A typo is not an outage, and reporting it as one
+    /// sends the caller looking for a broken service instead of a typo.
     async fn blocking_fetch<T, E>(
         eco: Ecosystem,
         package: &str,
@@ -153,7 +160,7 @@ impl AgentflareMcp {
     ) -> Result<T, ErrorData>
     where
         T: Send + 'static,
-        E: std::fmt::Display + Send + 'static,
+        E: std::fmt::Display + ClientError + Send + 'static,
     {
         tokio::time::timeout(FETCH_TIMEOUT, tokio::task::spawn_blocking(f))
             .await
@@ -165,10 +172,12 @@ impl AgentflareMcp {
             })?
             .map_err(|e| ErrorData::internal_error(format!("fetch task panicked: {e}"), None))?
             .map_err(|e| {
-                ErrorData::internal_error(
-                    format!("{e} — {}", eco.other_ecosystem_hint(package)),
-                    None,
-                )
+                let msg = format!("{e} — {}", eco.other_ecosystem_hint(package));
+                if e.is_client_error() {
+                    ErrorData::invalid_params(msg, None)
+                } else {
+                    ErrorData::internal_error(msg, None)
+                }
             })
     }
 }
@@ -284,6 +293,63 @@ mod tests {
         };
         let err = mcp.flare_docs_impl(req).await.unwrap_err();
         assert!(err.to_string().contains("pypi"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_slow_fetch_leaves_the_runtime_free_to_make_progress() {
+        // Regression guard for the inline-fetch bug fixed in 83f76add, which
+        // was previously only proven by an ad-hoc uncommitted script. If
+        // `blocking_fetch` ever runs its closure inline instead of on
+        // `spawn_blocking`, the single-threaded MCP runtime stalls for the
+        // whole fetch and the concurrent ticker below cannot advance.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker_ticks = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticker_ticks.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        AgentflareMcp::blocking_fetch(Ecosystem::Rust, "serde", || {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok::<(), ::flare_docs::FetchError>(())
+        })
+        .await
+        .unwrap();
+
+        // 10 ticks of 10ms each fit comfortably inside a 300ms fetch even
+        // with Windows' ~15ms timer granularity; inline execution yields ~0.
+        let observed = ticks.load(Ordering::SeqCst);
+        assert!(
+            observed >= 5,
+            "runtime was blocked during the fetch: only {observed} ticks elapsed"
+        );
+        ticker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_404_is_the_callers_mistake_not_an_internal_error() {
+        // A package name that does not exist is a bad argument. Reporting it
+        // as `internal_error` sends the caller hunting for a broken registry.
+        let err = AgentflareMcp::blocking_fetch(Ecosystem::Rust, "no-such-crate", || {
+            Err::<(), _>(::flare_docs::FetchError::Status(404))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        // A 5xx genuinely is the registry failing, and must stay internal.
+        let err = AgentflareMcp::blocking_fetch(Ecosystem::Rust, "serde", || {
+            Err::<(), _>(::flare_docs::FetchError::Status(503))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
     }
 
     #[tokio::test]
