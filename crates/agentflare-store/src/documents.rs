@@ -229,7 +229,11 @@ impl Store {
                     .is_none_or(|v| old_session_id.as_deref() == Some(v))
                 && opts.source.as_deref().is_none_or(|v| v == old_source)
                 && opts.tags.as_ref().is_none_or(|v| *v == old_tags);
-            if opts.track_history && !unchanged {
+            // Bound once because the blob-release decision below depends on
+            // it: a snapshot row is what keeps a superseded blob referenced,
+            // so the two must never disagree about whether one was written.
+            let snapshots_previous_version = opts.track_history && !unchanged;
+            if snapshots_previous_version {
                 let history_id = db_kit::ids::new_id();
                 tx.execute(
                     "INSERT INTO store_doc_history (id, doc_id, version, content, blob_hash, mime, title, metadata, size, created_at)
@@ -259,6 +263,21 @@ impl Store {
                     params![doc_type, existing_id],
                 )?;
             }
+            // A replaced blob loses its last reference here, the same way a
+            // deleted document's does -- but only when nothing else kept it.
+            // A history-tracking upsert has just snapshotted `old_blob_hash`
+            // into store_doc_history, and that row is what `doc_history` and
+            // `diff` read the previous version's bytes back through, so
+            // reclaiming it would silently empty the document's own history.
+            // Cache-type callers (track_history = false) write no snapshot, so
+            // for them the old blob really is orphaned. Released after the
+            // commit below, once the row no longer points at it.
+            let superseded_blob = match (&opts.blob_hash, &old_blob_hash) {
+                (Some(new), Some(old)) if new != old && !snapshots_previous_version => {
+                    Some(old.clone())
+                }
+                _ => None,
+            };
             if opts.blob_hash.is_some() {
                 tx.execute(
                     "UPDATE store_documents SET blob_hash = ?1 WHERE id = ?2",
@@ -306,6 +325,9 @@ impl Store {
             Self::doc_sync_fts(&tx, rowid, content)?;
             tx.commit()?;
             drop(conn);
+            if let Some(old) = superseded_blob {
+                self.blob_unref(&old)?;
+            }
             self.doc_get(&existing_id).map(|o| o.unwrap())
         } else {
             let id = db_kit::ids::new_id();
@@ -383,16 +405,27 @@ impl Store {
     }
 
     pub fn doc_delete(&self, id: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn();
-        let now = db_kit::ids::now();
-        if let Some(rowid) = conn
-            .query_row(
-                "SELECT rowid FROM store_documents WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-        {
+        // Scoped so the connection guard is released before blob_unref, which
+        // takes the same non-reentrant mutex and opens its own transaction.
+        let (found, release_blob) = {
+            let conn = self.conn();
+            let now = db_kit::ids::now();
+            let Some((rowid, blob_hash, already_deleted)) = conn
+                .query_row(
+                    "SELECT rowid, blob_hash, deleted_at IS NOT NULL FROM store_documents WHERE id = ?1",
+                    params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+            else {
+                return Ok(false);
+            };
             conn.execute(
                 "UPDATE store_documents SET deleted_at = ?1 WHERE id = ?2",
                 params![now, id],
@@ -401,10 +434,26 @@ impl Store {
                 "DELETE FROM store_docs_fts WHERE rowid = ?1",
                 params![rowid],
             )?;
-            Ok(true)
-        } else {
-            Ok(false)
+            // Only the delete that actually transitions live -> deleted owns a
+            // reference. Re-deleting an already soft-deleted row must not
+            // decrement again, or a blob shared with a live document loses its
+            // content while that document still looks intact.
+            (true, if already_deleted { None } else { blob_hash })
+        };
+
+        // Releasing the blob after the row is soft-deleted, not before: if the
+        // order were reversed and the row update failed, the last reference's
+        // content would already be gone while the document still read as live.
+        // Same ordering as the asset MCP tool's delete path.
+        //
+        // A caller that later resurrects this row via doc_upsert_with_opts
+        // without supplying a fresh blob_hash would be left pointing at
+        // reclaimed bytes; every blob-backed caller today (assets, artifacts,
+        // flare-docs rustdoc) always passes one on upsert.
+        if let Some(hash) = release_blob {
+            self.blob_unref(&hash)?;
         }
+        Ok(found)
     }
 
     pub fn doc_history(&self, doc_id: &str) -> rusqlite::Result<Vec<DocVersion>> {

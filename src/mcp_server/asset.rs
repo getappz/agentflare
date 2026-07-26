@@ -216,23 +216,19 @@ impl AgentflareMcp {
                 let id =
                     id.ok_or_else(|| ErrorData::invalid_params("id is required for delete", None))?;
                 self.with_store(|store| -> Result<String, ErrorData> {
-                    let doc = store
+                    store
                         .doc_get(&id)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
                         .ok_or_else(|| ErrorData::invalid_params("asset not found", None))?;
 
-                    // Delete the document row before releasing the blob ref: if
-                    // blob_unref ran first and doc_delete then failed, the last
-                    // reference's content would already be gone while the asset
-                    // still showed up as live (not soft-deleted).
+                    // doc_delete releases the blob reference itself (after the
+                    // row is soft-deleted, so a failure can't strand a live
+                    // asset with reclaimed content). Unreffing again here would
+                    // drop two references for one delete and reclaim a blob
+                    // another asset still shares.
                     store
                         .doc_delete(&id)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                    if let Some(ref hash) = doc.blob_hash {
-                        store
-                            .blob_unref(hash)
-                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                    }
 
                     Ok(serde_json::json!({"deleted": true, "id": id}).to_string())
                 })?
