@@ -10,7 +10,7 @@ use super::*;
 // re-exported (not just privately imported) through this submodule for that
 // path to resolve.
 pub(crate) use ::flare_docs::{
-    DocsStore, FetchOutcome, Fetcher, UreqFetcher, docs_id_path, docs_rs_json_url, store_fetched,
+    DocsStore, Ecosystem, FetchOutcome, Fetcher, UreqFetcher, docs_rs_json_url, npm, store_fetched,
 };
 
 const DEFAULT_LIMIT: usize = 10;
@@ -57,10 +57,12 @@ impl AgentflareMcp {
                 let package = req.package.ok_or_else(|| {
                     ErrorData::invalid_params("get requires \"id\" or \"package\"", None)
                 })?;
+                let eco = Ecosystem::resolve(req.ecosystem.as_deref(), &package)
+                    .map_err(|e| ErrorData::invalid_params(e, None))?;
                 let version = req.version.unwrap_or_else(|| DEFAULT_VERSION.to_string());
                 let cached = self.with_flare_docs_store(|store| {
                     store
-                        .get_by_path(&docs_id_path(&package, &version))
+                        .get_by_path(&eco.docs_id_path(&package, &version))
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
                 })??;
                 match cached {
@@ -73,7 +75,7 @@ impl AgentflareMcp {
                     // for that).
                     None => {
                         let outcome = self
-                            .fetch_and_store_via_spawn_blocking(package, version)
+                            .fetch_and_store_via_spawn_blocking(eco, package, version)
                             .await?;
                         serde_json::to_string(&outcome.doc)
                             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
@@ -84,9 +86,11 @@ impl AgentflareMcp {
                 let package = req.package.ok_or_else(|| {
                     ErrorData::invalid_params("refresh requires \"package\"", None)
                 })?;
+                let eco = Ecosystem::resolve(req.ecosystem.as_deref(), &package)
+                    .map_err(|e| ErrorData::invalid_params(e, None))?;
                 let version = req.version.unwrap_or_else(|| DEFAULT_VERSION.to_string());
                 let outcome = self
-                    .fetch_and_store_via_spawn_blocking(package, version)
+                    .fetch_and_store_via_spawn_blocking(eco, package, version)
                     .await?;
                 serde_json::to_string(&outcome)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))
@@ -98,38 +102,74 @@ impl AgentflareMcp {
         }
     }
 
-    /// Runs the docs.rs network fetch on tokio's blocking thread pool (never
+    /// Runs the registry network fetch on tokio's blocking thread pool (never
     /// inline on the single-threaded MCP runtime, and never under the
     /// `std::sync::Mutex` guarding `flare_docs_store`), then, once the fetch
     /// has completed and no `.await` remains, does the fast local
-    /// decompress/parse/store work synchronously via `with_flare_docs_store`.
+    /// parse/store work synchronously via `with_flare_docs_store`.
+    ///
+    /// npm needs several sequential requests (version manifest, possibly a
+    /// DefinitelyTyped manifest, then the tarball), so the whole sequence runs
+    /// inside the one `spawn_blocking` — splitting it would put an `.await`
+    /// between requests for no benefit.
     async fn fetch_and_store_via_spawn_blocking(
         &self,
+        eco: Ecosystem,
         package: String,
         version: String,
     ) -> Result<FetchOutcome, ErrorData> {
-        let url = docs_rs_json_url(&package, &version);
-        let fetched = tokio::time::timeout(
-            FETCH_TIMEOUT,
-            tokio::task::spawn_blocking(move || {
-                let fetcher = UreqFetcher::new();
-                fetcher.fetch(&url)
-            }),
-        )
-        .await
-        .map_err(|_| {
-            ErrorData::internal_error(
-                format!("docs.rs fetch timed out after {FETCH_TIMEOUT:?}"),
-                None,
-            )
-        })?
-        .map_err(|e| ErrorData::internal_error(format!("fetch task panicked: {e}"), None))?
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        match eco {
+            Ecosystem::Rust => {
+                let url = docs_rs_json_url(&package, &version);
+                let fetched =
+                    Self::blocking_fetch(eco, &package, move || UreqFetcher::new().fetch(&url))
+                        .await?;
+                self.with_flare_docs_store(|store| {
+                    store_fetched(store, &fetched, &package, &version)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+                })?
+            }
+            Ecosystem::Npm => {
+                let (pkg, ver) = (package.clone(), version.clone());
+                let fetched = Self::blocking_fetch(eco, &package, move || {
+                    npm::fetch_package(&UreqFetcher::new(), &pkg, &ver)
+                })
+                .await?;
+                self.with_flare_docs_store(|store| {
+                    npm::store_package(store, &fetched)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+                })?
+            }
+        }
+    }
 
-        self.with_flare_docs_store(|store| {
-            store_fetched(store, &fetched, &package, &version)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-        })?
+    /// Shared timeout/panic/error plumbing for a blocking registry fetch. A
+    /// miss names the other registry, so a caller that guessed wrong is told
+    /// the fix instead of concluding the package does not exist.
+    async fn blocking_fetch<T, E>(
+        eco: Ecosystem,
+        package: &str,
+        f: impl FnOnce() -> Result<T, E> + Send + 'static,
+    ) -> Result<T, ErrorData>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
+        tokio::time::timeout(FETCH_TIMEOUT, tokio::task::spawn_blocking(f))
+            .await
+            .map_err(|_| {
+                ErrorData::internal_error(
+                    format!("{} fetch timed out after {FETCH_TIMEOUT:?}", eco.as_str()),
+                    None,
+                )
+            })?
+            .map_err(|e| ErrorData::internal_error(format!("fetch task panicked: {e}"), None))?
+            .map_err(|e| {
+                ErrorData::internal_error(
+                    format!("{e} — {}", eco.other_ecosystem_hint(package)),
+                    None,
+                )
+            })
     }
 }
 
@@ -166,7 +206,7 @@ mod tests {
         mcp.with_flare_docs_store(|store| {
             store
                 .upsert(
-                    &docs_id_path("serde", "latest"),
+                    &Ecosystem::Rust.docs_id_path("serde", "latest"),
                     "cached docs",
                     DocUpsertOpts::default(),
                 )
@@ -181,6 +221,69 @@ mod tests {
         };
         let result = mcp.flare_docs_impl(req).await.unwrap();
         assert!(result.contains("cached docs"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn npm_get_reads_the_npm_cache_prefix_not_the_docsrs_one() {
+        // The two ecosystems share one store; a cached npm package must be
+        // found under `npm/...` and must not be shadowed by, or shadow, a
+        // same-named crate cached under `docsrs/...`.
+        let mcp = test_mcp();
+        mcp.with_flare_docs_store(|store| {
+            store
+                .upsert(
+                    &Ecosystem::Npm.docs_id_path("hono", "latest"),
+                    "cached npm docs",
+                    DocUpsertOpts::default(),
+                )
+                .unwrap()
+        })
+        .unwrap();
+
+        let req = FlareDocsRequest {
+            action: "get".to_string(),
+            package: Some("hono".to_string()),
+            ecosystem: Some("npm".to_string()),
+            ..Default::default()
+        };
+        let result = mcp.flare_docs_impl(req).await.unwrap();
+        assert!(result.contains("cached npm docs"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn scoped_package_names_resolve_to_npm_without_an_explicit_ecosystem() {
+        let mcp = test_mcp();
+        mcp.with_flare_docs_store(|store| {
+            store
+                .upsert(
+                    &Ecosystem::Npm.docs_id_path("@types/node", "latest"),
+                    "scoped npm docs",
+                    DocUpsertOpts::default(),
+                )
+                .unwrap()
+        })
+        .unwrap();
+
+        let req = FlareDocsRequest {
+            action: "get".to_string(),
+            package: Some("@types/node".to_string()),
+            ..Default::default()
+        };
+        let result = mcp.flare_docs_impl(req).await.unwrap();
+        assert!(result.contains("scoped npm docs"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_ecosystem_is_rejected_before_any_network_work() {
+        let mcp = test_mcp();
+        let req = FlareDocsRequest {
+            action: "get".to_string(),
+            package: Some("requests".to_string()),
+            ecosystem: Some("pypi".to_string()),
+            ..Default::default()
+        };
+        let err = mcp.flare_docs_impl(req).await.unwrap_err();
+        assert!(err.to_string().contains("pypi"), "{err}");
     }
 
     #[tokio::test]
