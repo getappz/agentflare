@@ -125,52 +125,75 @@ impl DocsStore {
         path_prefix: &str,
         items: &[BatchItem],
     ) -> Result<usize, Error> {
-        let conn = self.inner.conn();
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-        let written = Self::write_batch_items(&tx, items)?;
+        // Scoped so the connection guard is dropped before the blob unrefs
+        // below, which take the same non-reentrant mutex.
+        let (written, stale_blobs) = {
+            let conn = self.inner.conn();
+            let tx = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let written = Self::write_batch_items(&tx, items)?;
 
-        let now = db_kit::ids::now();
-        let fresh_paths: std::collections::HashSet<&str> =
-            items.iter().map(|i| i.path.as_str()).collect();
-        // SQLite's LIKE is case-insensitive for ASCII by default, but a path
-        // prefix match must be exact -- re-check with a case-sensitive
-        // `starts_with` in Rust so a path that only coincidentally matches
-        // `path_prefix` case-insensitively (e.g. a different crate/version
-        // segment differing only in case) is never treated as belonging to
-        // this prefix.
-        let like_pattern = format!("{}%", escape_like(path_prefix));
-        let mut stmt = tx.prepare(
-            "SELECT rowid, path FROM store_documents
-             WHERE project_id = ?1 AND path LIKE ?2 ESCAPE '\\' AND deleted_at IS NULL",
-        )?;
-        let stored: Vec<(i64, String)> = stmt
-            .query_map(rusqlite::params![PROJECT_ID, like_pattern], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        drop(stmt);
+            let now = db_kit::ids::now();
+            let fresh_paths: std::collections::HashSet<&str> =
+                items.iter().map(|i| i.path.as_str()).collect();
+            // SQLite's LIKE is case-insensitive for ASCII by default, but a path
+            // prefix match must be exact -- re-check with a case-sensitive
+            // `starts_with` in Rust so a path that only coincidentally matches
+            // `path_prefix` case-insensitively (e.g. a different crate/version
+            // segment differing only in case) is never treated as belonging to
+            // this prefix.
+            let like_pattern = format!("{}%", escape_like(path_prefix));
+            let mut stmt = tx.prepare(
+                "SELECT rowid, path, blob_hash FROM store_documents
+                 WHERE project_id = ?1 AND path LIKE ?2 ESCAPE '\\' AND deleted_at IS NULL",
+            )?;
+            let stored: Vec<(i64, String, Option<String>)> = stmt
+                .query_map(rusqlite::params![PROJECT_ID, like_pattern], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            drop(stmt);
 
-        for (rowid, stored_path) in stored {
-            if stored_path.starts_with(path_prefix) && !fresh_paths.contains(stored_path.as_str()) {
-                tx.execute(
-                    "UPDATE store_documents SET deleted_at = ?1 WHERE rowid = ?2",
-                    rusqlite::params![now, rowid],
-                )?;
-                // Mirror write_batch_items's explicit FTS sync -- store_docs_fts
-                // is a manually-synced table, not a content=/external-content
-                // FTS5 table, so a soft-deleted row's stale entry would
-                // otherwise stay directly matchable via `store_docs_fts MATCH`
-                // (doc_search's own deleted_at filter still excludes it, but
-                // nothing else queries store_docs_fts through that guard).
-                tx.execute(
-                    "DELETE FROM store_docs_fts WHERE rowid = ?1",
-                    rusqlite::params![rowid],
-                )?;
+            let mut stale_blobs = Vec::new();
+            for (rowid, stored_path, blob_hash) in stored {
+                if stored_path.starts_with(path_prefix)
+                    && !fresh_paths.contains(stored_path.as_str())
+                {
+                    tx.execute(
+                        "UPDATE store_documents SET deleted_at = ?1 WHERE rowid = ?2",
+                        rusqlite::params![now, rowid],
+                    )?;
+                    // Mirror write_batch_items's explicit FTS sync -- store_docs_fts
+                    // is a manually-synced table, not a content=/external-content
+                    // FTS5 table, so a soft-deleted row's stale entry would
+                    // otherwise stay directly matchable via `store_docs_fts MATCH`
+                    // (doc_search's own deleted_at filter still excludes it, but
+                    // nothing else queries store_docs_fts through that guard).
+                    tx.execute(
+                        "DELETE FROM store_docs_fts WHERE rowid = ?1",
+                        rusqlite::params![rowid],
+                    )?;
+                    if let Some(hash) = blob_hash {
+                        stale_blobs.push(hash);
+                    }
+                }
             }
-        }
 
-        tx.commit()?;
+            tx.commit()?;
+            (written, stale_blobs)
+        };
+
+        // After the commit, for the same reason doc_delete releases blobs last:
+        // the row is the source of truth, so a failure here leaks a file rather
+        // than stranding a live document with no content. Per-item docs store
+        // their text inline, but the crate-overview rows hold the raw rustdoc
+        // JSON as a blob -- without this, reconciling one away orphans that
+        // file in <root>/blobs forever.
+        for hash in stale_blobs {
+            self.inner.blob_unref(&hash)?;
+        }
         Ok(written)
     }
 
@@ -475,6 +498,53 @@ mod tests {
         assert!(
             store.search("unique marker", 10).unwrap().is_empty(),
             "a soft-deleted item's FTS entry must not remain matchable"
+        );
+    }
+
+    // File-backed on purpose: blob bytes only land on disk for file stores, so
+    // an open_memory version of this would pass while real installs leaked.
+    #[test]
+    fn upsert_batch_reconciled_reclaims_a_stale_items_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open_file(&dir.path().join("flare-docs.db")).unwrap();
+        let prefix = "docsrs/axum/latest/item/";
+
+        let hash = store
+            .blob_store_raw(b"raw rustdoc json for a stale item")
+            .unwrap();
+        store
+            .upsert(
+                &format!("{prefix}axum::Router"),
+                "",
+                DocUpsertOpts {
+                    blob_hash: Some(hash.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Mirrors agentflare_store::blobs::blob_disk_path, which is private.
+        let disk_path = dir.path().join("blobs").join(&hash[..2]).join(&hash);
+        assert!(disk_path.exists(), "precondition: blob written to disk");
+
+        // Refetch without the blob-backed item: reconciliation soft-deletes it.
+        store
+            .upsert_batch_reconciled(
+                prefix,
+                &[BatchItem {
+                    path: format!("{prefix}axum::extract::State"),
+                    content: "state docs".into(),
+                    title: "State".into(),
+                    doc_type: "rust-item".into(),
+                    tags: vec![],
+                    source: "docsrs".into(),
+                }],
+            )
+            .unwrap();
+
+        assert!(
+            !disk_path.exists(),
+            "reconciling away the last referrer must reclaim its blob file"
         );
     }
 

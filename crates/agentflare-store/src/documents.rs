@@ -383,16 +383,27 @@ impl Store {
     }
 
     pub fn doc_delete(&self, id: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn();
-        let now = db_kit::ids::now();
-        if let Some(rowid) = conn
-            .query_row(
-                "SELECT rowid FROM store_documents WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-        {
+        // Scoped so the connection guard is released before blob_unref, which
+        // takes the same non-reentrant mutex and opens its own transaction.
+        let (found, release_blob) = {
+            let conn = self.conn();
+            let now = db_kit::ids::now();
+            let Some((rowid, blob_hash, already_deleted)) = conn
+                .query_row(
+                    "SELECT rowid, blob_hash, deleted_at IS NOT NULL FROM store_documents WHERE id = ?1",
+                    params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+            else {
+                return Ok(false);
+            };
             conn.execute(
                 "UPDATE store_documents SET deleted_at = ?1 WHERE id = ?2",
                 params![now, id],
@@ -401,10 +412,26 @@ impl Store {
                 "DELETE FROM store_docs_fts WHERE rowid = ?1",
                 params![rowid],
             )?;
-            Ok(true)
-        } else {
-            Ok(false)
+            // Only the delete that actually transitions live -> deleted owns a
+            // reference. Re-deleting an already soft-deleted row must not
+            // decrement again, or a blob shared with a live document loses its
+            // content while that document still looks intact.
+            (true, if already_deleted { None } else { blob_hash })
+        };
+
+        // Releasing the blob after the row is soft-deleted, not before: if the
+        // order were reversed and the row update failed, the last reference's
+        // content would already be gone while the document still read as live.
+        // Same ordering as the asset MCP tool's delete path.
+        //
+        // A caller that later resurrects this row via doc_upsert_with_opts
+        // without supplying a fresh blob_hash would be left pointing at
+        // reclaimed bytes; every blob-backed caller today (assets, artifacts,
+        // flare-docs rustdoc) always passes one on upsert.
+        if let Some(hash) = release_blob {
+            self.blob_unref(&hash)?;
         }
+        Ok(found)
     }
 
     pub fn doc_history(&self, doc_id: &str) -> rusqlite::Result<Vec<DocVersion>> {

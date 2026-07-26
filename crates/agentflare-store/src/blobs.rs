@@ -335,4 +335,68 @@ mod tests {
             "a pre-compression blob has no gzip magic and must pass through unchanged"
         );
     }
+
+    fn blob_backed_doc(s: &Store, path: &str, hash: &str) -> crate::documents::Document {
+        s.doc_upsert_with_opts(
+            "p",
+            path,
+            "",
+            crate::documents::DocUpsertOpts {
+                blob_hash: Some(hash.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    // File-backed on purpose: only `open_memory` stores blob bytes in
+    // store_blob_chunks, so an in-memory version of this test would pass
+    // while the real on-disk path kept leaking.
+    #[test]
+    fn doc_delete_removes_the_disk_blob_of_its_last_referrer() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open_file(&dir.path().join("store.db")).unwrap();
+        let hash = s.blob_store(b"rustdoc json payload").unwrap();
+        let doc = blob_backed_doc(&s, "/docsrs/serde/latest", &hash);
+
+        let disk_path = blob_disk_path(dir.path(), &hash);
+        assert!(disk_path.exists(), "precondition: blob written to disk");
+
+        s.doc_delete(&doc.id).unwrap();
+
+        assert!(
+            !disk_path.exists(),
+            "deleting the only document referencing a blob must reclaim its disk file"
+        );
+        assert!(s.blob_get(&hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn doc_delete_keeps_a_blob_alive_while_another_document_still_references_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open_file(&dir.path().join("store.db")).unwrap();
+        // Same bytes twice: blob_store dedupes and bumps ref_count to 2.
+        let hash = s.blob_store(b"shared payload").unwrap();
+        assert_eq!(s.blob_store(b"shared payload").unwrap(), hash);
+        let first = blob_backed_doc(&s, "/a", &hash);
+        let second = blob_backed_doc(&s, "/b", &hash);
+
+        let disk_path = blob_disk_path(dir.path(), &hash);
+        s.doc_delete(&first.id).unwrap();
+        assert!(
+            disk_path.exists(),
+            "a blob still referenced by another document must survive"
+        );
+
+        // Re-deleting an already soft-deleted document must not unref twice —
+        // that would strand `second`'s content while its row still looks live.
+        s.doc_delete(&first.id).unwrap();
+        assert!(disk_path.exists(), "double delete must not double-unref");
+
+        s.doc_delete(&second.id).unwrap();
+        assert!(
+            !disk_path.exists(),
+            "the last referrer's delete must reclaim the file"
+        );
+    }
 }
