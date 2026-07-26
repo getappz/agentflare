@@ -371,6 +371,70 @@ mod tests {
         assert!(s.blob_get(&hash).unwrap().is_none());
     }
 
+    fn cached_blob_doc(s: &Store, path: &str, hash: &str) {
+        s.doc_upsert_with_opts(
+            "p",
+            path,
+            "",
+            crate::documents::DocUpsertOpts {
+                blob_hash: Some(hash.to_string()),
+                // Cache-type caller: no history snapshot, so a replaced blob
+                // is genuinely unreferenced afterwards.
+                track_history: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn upserting_a_new_blob_over_an_old_one_reclaims_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open_file(&dir.path().join("store.db")).unwrap();
+        let old_hash = s.blob_store(b"version one payload").unwrap();
+        cached_blob_doc(&s, "/cached", &old_hash);
+        let old_path = blob_disk_path(dir.path(), &old_hash);
+        assert!(old_path.exists(), "precondition: v1 blob on disk");
+
+        // Same path, new blob: the row stops pointing at the old hash, so its
+        // last reference is gone even though no document was deleted.
+        let new_hash = s.blob_store(b"version two payload").unwrap();
+        cached_blob_doc(&s, "/cached", &new_hash);
+
+        assert!(
+            !old_path.exists(),
+            "a superseded blob must be reclaimed, not left behind by the update"
+        );
+        assert!(
+            blob_disk_path(dir.path(), &new_hash).exists(),
+            "the replacement blob must survive"
+        );
+        assert!(s.blob_get(&new_hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn upserting_a_new_blob_keeps_the_old_one_when_history_snapshots_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open_file(&dir.path().join("store.db")).unwrap();
+        let old_hash = s.blob_store(b"version one payload").unwrap();
+        blob_backed_doc(&s, "/versioned", &old_hash);
+
+        // Default opts track history, so the update snapshots old_hash into
+        // store_doc_history -- reclaiming it would empty the previous version.
+        let new_hash = s.blob_store(b"version two payload").unwrap();
+        blob_backed_doc(&s, "/versioned", &new_hash);
+
+        assert!(
+            blob_disk_path(dir.path(), &old_hash).exists(),
+            "a blob a history row still points at must not be reclaimed"
+        );
+        assert_eq!(
+            s.blob_get(&old_hash).unwrap().as_deref(),
+            Some(&b"version one payload"[..]),
+            "the previous version must still read back"
+        );
+    }
+
     #[test]
     fn doc_delete_keeps_a_blob_alive_while_another_document_still_references_it() {
         let dir = tempfile::tempdir().unwrap();

@@ -191,8 +191,19 @@ impl DocsStore {
         // their text inline, but the crate-overview rows hold the raw rustdoc
         // JSON as a blob -- without this, reconciling one away orphans that
         // file in <root>/blobs forever.
+        // Every hash gets its attempt before the first failure is reported:
+        // returning early would strand the rest of the batch as orphans, and
+        // the rows are already committed so there is nothing to roll back. The
+        // error still surfaces -- a failed unref means a leaked file, which is
+        // exactly the condition this whole change exists to stop hiding.
+        let mut first_err = None;
         for hash in stale_blobs {
-            self.inner.blob_unref(&hash)?;
+            if let Err(e) = self.inner.blob_unref(&hash) {
+                first_err = first_err.or(Some(e));
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e.into());
         }
         Ok(written)
     }
