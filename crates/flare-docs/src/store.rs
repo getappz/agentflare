@@ -105,6 +105,74 @@ impl DocsStore {
         let conn = self.inner.conn();
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let written = Self::write_batch_items(&tx, items)?;
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// Like [`Self::upsert_batch`], but also reconciles the store against
+    /// the fresh fetch: any existing, non-deleted document whose path
+    /// starts with `path_prefix` and is *not* in `items` gets soft-deleted
+    /// (`deleted_at` set), in the same transaction as the batch upsert.
+    ///
+    /// This is for cache-refresh callers like rustdoc per-item indexing,
+    /// where a refetch's item set is authoritative for everything under
+    /// `path_prefix` — an item that disappeared from the new fetch (renamed,
+    /// removed, made private) must stop being findable, not linger from the
+    /// previous fetch forever.
+    pub fn upsert_batch_reconciled(
+        &self,
+        path_prefix: &str,
+        items: &[BatchItem],
+    ) -> Result<usize, Error> {
+        let conn = self.inner.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let written = Self::write_batch_items(&tx, items)?;
+
+        let now = db_kit::ids::now();
+        let fresh_paths: std::collections::HashSet<&str> =
+            items.iter().map(|i| i.path.as_str()).collect();
+        let like_pattern = format!("{}%", escape_like(path_prefix));
+        let mut stmt = tx.prepare(
+            "SELECT path FROM store_documents
+             WHERE project_id = ?1 AND path LIKE ?2 ESCAPE '\\' AND deleted_at IS NULL",
+        )?;
+        let stored_paths: Vec<String> = stmt
+            .query_map(rusqlite::params![PROJECT_ID, like_pattern], |row| {
+                row.get(0)
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+
+        for stored_path in stored_paths {
+            if !fresh_paths.contains(stored_path.as_str()) {
+                tx.execute(
+                    "UPDATE store_documents SET deleted_at = ?1 WHERE project_id = ?2 AND path = ?3",
+                    rusqlite::params![now, PROJECT_ID, stored_path],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// Upserts `items` within an already-open transaction. Skips any item
+    /// whose content is byte-identical to what's already stored (no row
+    /// write, no FTS resync, no version bump) — a crate whose docs haven't
+    /// changed since the last fetch would otherwise still pay the full
+    /// per-item write cost (and grow `version` unboundedly) on every
+    /// refresh, the same amplification problem
+    /// [`agentflare_store::Store::doc_upsert_with_opts`]'s content-hash
+    /// short-circuit exists to avoid for the single-doc path.
+    ///
+    /// Returns the number of items actually written (inserted or changed),
+    /// not the total number of items passed in.
+    fn write_batch_items(
+        tx: &rusqlite::Transaction,
+        items: &[BatchItem],
+    ) -> rusqlite::Result<usize> {
         let now = db_kit::ids::now();
         let mut written = 0usize;
 
@@ -161,9 +229,17 @@ impl DocsStore {
             written += 1;
         }
 
-        tx.commit()?;
         Ok(written)
     }
+}
+
+/// Escapes `%`, `_`, and `\` in a LIKE prefix so it matches only literal
+/// text (used with `ESCAPE '\\'`) — crate names commonly contain `_`
+/// (e.g. `serde_json`), which would otherwise match any single character.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// One document to write via [`DocsStore::upsert_batch`].
