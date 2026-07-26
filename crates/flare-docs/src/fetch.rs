@@ -33,6 +33,15 @@ pub enum FetchError {
 /// knows which of its variants are caller-caused.
 pub trait ClientError {
     fn is_client_error(&self) -> bool;
+
+    /// Whether the registry reported the package itself as absent.
+    ///
+    /// Separate from [`Self::is_client_error`] because the two answer
+    /// different questions: a package that exists but ships no types is the
+    /// caller's problem yet is emphatically *not* missing. Only a genuine
+    /// absence justifies "try the other ecosystem" advice — appending it to
+    /// anything else states as fact something that is not true.
+    fn is_package_missing(&self) -> bool;
 }
 
 impl ClientError for FetchError {
@@ -46,6 +55,10 @@ impl ClientError for FetchError {
             FetchError::Status(400..=499) => true,
             _ => false,
         }
+    }
+
+    fn is_package_missing(&self) -> bool {
+        matches!(self, FetchError::Status(404))
     }
 }
 

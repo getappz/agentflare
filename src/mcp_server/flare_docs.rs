@@ -182,7 +182,16 @@ impl AgentflareMcp {
             })?
             .map_err(|e| ErrorData::internal_error(format!("fetch task panicked: {e}"), None))?
             .map_err(|e| {
-                let msg = format!("{e} — {}", eco.other_ecosystem_hint(package));
+                // The hint asserts the package "was not found", so it may only
+                // be attached when that is actually what happened. Appending it
+                // to a 503, a corrupt tarball, or a package that exists but
+                // ships no types tells the caller something false — and in the
+                // no-types case contradicts the sentence it is appended to.
+                let msg = if e.is_package_missing() {
+                    format!("{e} — {}", eco.other_ecosystem_hint(package))
+                } else {
+                    e.to_string()
+                };
                 if e.is_client_error() {
                     ErrorData::invalid_params(msg, None)
                 } else {
@@ -360,6 +369,38 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn the_try_other_ecosystem_hint_is_only_attached_to_a_real_miss() {
+        // The hint's wording asserts the package "was not found", so attaching
+        // it to anything else states a falsehood.
+        let missing = AgentflareMcp::blocking_fetch(Ecosystem::Rust, "nope", || {
+            Err::<(), _>(::flare_docs::FetchError::Status(404))
+        })
+        .await
+        .unwrap_err();
+        assert!(missing.message.contains("ecosystem=\"npm\""), "{missing:?}");
+
+        // A package that exists but ships no types is not missing; the hint
+        // would contradict the error's own message.
+        let no_types = AgentflareMcp::blocking_fetch(Ecosystem::Npm, "express", || {
+            Err::<(), _>(::flare_docs::npm::NpmError::Npm(
+                ::flare_docs::npm::NpmFetchError::NoTypes("express".to_string()),
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert!(!no_types.message.contains("was not found"), "{no_types:?}");
+        assert_eq!(no_types.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        // Nor is a registry outage a missing package.
+        let outage = AgentflareMcp::blocking_fetch(Ecosystem::Rust, "serde", || {
+            Err::<(), _>(::flare_docs::FetchError::Status(503))
+        })
+        .await
+        .unwrap_err();
+        assert!(!outage.message.contains("was not found"), "{outage:?}");
     }
 
     #[tokio::test]

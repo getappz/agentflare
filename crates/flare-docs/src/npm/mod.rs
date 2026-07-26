@@ -42,6 +42,16 @@ impl ClientError for NpmError {
             _ => false,
         }
     }
+
+    fn is_package_missing(&self) -> bool {
+        match self {
+            NpmError::Fetch(e) => e.is_package_missing(),
+            // Deliberately not `NoTypes`: that package was found, it just
+            // ships no declarations. Calling it missing would contradict the
+            // error's own message.
+            _ => false,
+        }
+    }
 }
 
 /// The [`DocsStore`] path an npm package's docs are cached under. Distinct
