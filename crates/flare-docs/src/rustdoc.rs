@@ -13,6 +13,27 @@ pub enum RustdocError {
     InvalidJson(String),
 }
 
+/// Result of [`fetch_and_store`]/[`store_fetched`]: the crate-overview doc,
+/// plus a visible record of whether per-item indexing succeeded. Per-item
+/// indexing is best-effort on top of the overview doc (see [`store_fetched`]
+/// for why a schema-parse failure there must not fail the whole fetch), but
+/// that must not mean invisible -- previously a failure there only reached
+/// an `eprintln!` on the MCP server's own stderr, which no caller (CLI,
+/// MCP client, tests) could ever observe.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FetchOutcome {
+    #[serde(flatten)]
+    pub doc: Document,
+    /// Number of per-item docs written by this fetch (inserted or changed;
+    /// see [`DocsStore::upsert_batch`]'s doc comment -- a refetch with no
+    /// item content changes reports 0 here even though indexing ran).
+    pub items_indexed: usize,
+    /// Set when per-item indexing failed (e.g. an `ItemKind` variant newer
+    /// than this crate's pinned `rustdoc-types` recognizes). `items_indexed`
+    /// is 0 in that case. The overview doc in `doc` is unaffected either way.
+    pub items_error: Option<String>,
+}
+
 /// docs.rs's official rustdoc-JSON endpoint (RFC 2963). Verified live
 /// 2026-07-23: both `latest` and an exact semver return HTTP 200,
 /// `content-type: application/zstd`. version may be "latest" or an exact
@@ -73,7 +94,7 @@ pub fn fetch_and_store(
     store: &DocsStore,
     crate_name: &str,
     version: &str,
-) -> Result<Document, RustdocError> {
+) -> Result<FetchOutcome, RustdocError> {
     let url = docs_rs_json_url(crate_name, version);
     let fetched = fetcher.fetch(&url)?;
     store_fetched(store, &fetched, crate_name, version)
@@ -91,7 +112,7 @@ pub fn store_fetched(
     fetched: &FetchedBytes,
     crate_name: &str,
     version: &str,
-) -> Result<Document, RustdocError> {
+) -> Result<FetchOutcome, RustdocError> {
     let decompressed = decompress_zstd(&fetched.bytes)?;
     let docstring = extract_root_docstring(&decompressed)?
         .unwrap_or_else(|| format!("(no crate-level documentation for {crate_name})"));
@@ -114,12 +135,25 @@ pub fn store_fetched(
     // this crate's pinned `rustdoc-types` version recognizes) fails
     // `IndexCrate`'s deserialization for the *entire* crate's item set --
     // that must not turn an otherwise-successful fetch into a reported
-    // failure, or mask the overview doc's success from the caller.
-    if let Err(e) = index_items(store, &decompressed, crate_name, &id_path) {
-        eprintln!("flare-docs: per-item indexing failed for {crate_name}@{version}: {e}");
-    }
+    // failure, or mask the overview doc's success from the caller. It must
+    // not be invisible either, though -- surface it in `FetchOutcome` so a
+    // caller relying on per-item search results can tell the difference
+    // between "nothing changed" and "indexing silently failed".
+    let (items_indexed, items_error) = match index_items(store, &decompressed, crate_name, &id_path)
+    {
+        Ok(n) => (n, None),
+        Err(e) => {
+            let msg = e.to_string();
+            eprintln!("flare-docs: per-item indexing failed for {crate_name}@{version}: {msg}");
+            (0, Some(msg))
+        }
+    };
 
-    Ok(overview_doc)
+    Ok(FetchOutcome {
+        doc: overview_doc,
+        items_indexed,
+        items_error,
+    })
 }
 
 /// Parses the full rustdoc-JSON `index`/`paths` maps and upserts one
@@ -295,8 +329,10 @@ mod tests {
         };
         let store = DocsStore::open_memory().unwrap();
 
-        let doc = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
-        assert_eq!(doc.content, "A fake crate for testing.");
+        let outcome = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
+        assert_eq!(outcome.doc.content, "A fake crate for testing.");
+        assert_eq!(outcome.items_indexed, 2, "both items should be written");
+        assert!(outcome.items_error.is_none());
 
         let state_doc = store
             .get_by_path("docsrs/fake-crate/1.0.0/item/fake_crate::extract::State")
@@ -325,6 +361,7 @@ mod tests {
         // rustdoc-types version doesn't recognize fails IndexCrate's
         // deserialization for the whole crate -- fetch_and_store must still
         // return Ok with the overview doc, not propagate that as a failure.
+        // But it must surface the failure in `items_error`, not just eat it.
         let raw_json = br#"{
             "root": 0,
             "index": {
@@ -341,8 +378,13 @@ mod tests {
         };
         let store = DocsStore::open_memory().unwrap();
 
-        let doc = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
-        assert_eq!(doc.content, "A fake crate for testing.");
+        let outcome = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
+        assert_eq!(outcome.doc.content, "A fake crate for testing.");
+        assert_eq!(outcome.items_indexed, 0);
+        assert!(
+            outcome.items_error.is_some(),
+            "the parse failure must be visible to the caller, not just eprintln'd"
+        );
 
         // The unparseable item simply wasn't indexed -- no crash, no error.
         assert!(
@@ -366,12 +408,14 @@ mod tests {
         };
         let store = DocsStore::open_memory().unwrap();
 
-        let doc = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
+        let outcome = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
 
-        assert_eq!(doc.content, "A fake crate for testing.");
-        assert_eq!(doc.path, "docsrs/fake-crate/1.0.0");
-        assert_eq!(doc.doc_type, "rust-crate");
-        assert!(doc.blob_hash.is_some());
+        assert_eq!(outcome.doc.content, "A fake crate for testing.");
+        assert_eq!(outcome.doc.path, "docsrs/fake-crate/1.0.0");
+        assert_eq!(outcome.doc.doc_type, "rust-crate");
+        assert!(outcome.doc.blob_hash.is_some());
+        assert_eq!(outcome.items_indexed, 0, "no items in this fixture");
+        assert!(outcome.items_error.is_none());
 
         let hits = store.search("fake crate", 10).unwrap();
         assert_eq!(hits.len(), 1);

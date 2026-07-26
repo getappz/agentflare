@@ -116,9 +116,10 @@ impl AgentflareMcp {
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         self.with_flare_docs_store(|store| {
-            let doc = store_fetched(store, &fetched, &package, &version)
+            let outcome = store_fetched(store, &fetched, &package, &version)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            serde_json::to_string(&doc).map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            serde_json::to_string(&outcome)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))
         })?
     }
 }

@@ -74,7 +74,12 @@ pub fn run(args: DocsArgs) {
 fn fetch_and_print(store: &flare_docs::DocsStore, package: &str, version: &str) {
     let fetcher = flare_docs::UreqFetcher::new();
     match flare_docs::fetch_and_store(&fetcher, store, package, version) {
-        Ok(doc) => println!("{}", serde_json::to_string_pretty(&doc).unwrap()),
+        Ok(outcome) => {
+            println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
+            if let Some(err) = &outcome.items_error {
+                eprintln!("flare-docs: per-item indexing failed: {err}");
+            }
+        }
         Err(e) => {
             eprintln!("flare-docs: fetch failed: {e}");
             std::process::exit(1);
