@@ -151,7 +151,9 @@ impl Store {
 
         let existing = tx
             .query_row(
-                "SELECT id, rowid, content, version, blob_hash, mime, metadata, size FROM store_documents
+                "SELECT id, rowid, content, version, blob_hash, mime, metadata, size,
+                        title, doc_type, tags, session_id, source
+                 FROM store_documents
                  WHERE project_id = ?1 AND path = ?2",
                 params![project_id, path],
                 |row| {
@@ -164,6 +166,11 @@ impl Store {
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, String>(12)?,
                     ))
                 },
             )
@@ -178,6 +185,11 @@ impl Store {
             old_mime,
             old_metadata,
             old_size,
+            old_title,
+            old_doc_type,
+            old_tags_json,
+            old_session_id,
+            old_source,
         )) = existing
         {
             let new_version = old_version + 1;
@@ -190,7 +202,33 @@ impl Store {
             // detect a change and history would never record; also check
             // `blob_hash` so a no-op re-upsert still skips (both unchanged)
             // while a genuine new blob still snapshots (content stays "").
-            let unchanged = old_content == content && old_blob_hash == opts.blob_hash;
+            //
+            // A caller can also re-upsert with unchanged content/blob_hash
+            // but a different title/doc_type/tags/mime/metadata/size --
+            // that's still a real change to the document's persisted state,
+            // so every `Some(...)`-provided opts field must match its
+            // stored value too, not just content, for this to count as a
+            // true no-op. `blob_hash` follows the same Some(...)-provided
+            // rule as the rest: a caller that omits it (None) makes no claim
+            // about it, so it must not force `unchanged` to false just
+            // because the stored value happens to already be Some(...).
+            let old_tags: Vec<String> = serde_json::from_str(&old_tags_json).unwrap_or_default();
+            let unchanged = old_content == content
+                && opts
+                    .blob_hash
+                    .as_deref()
+                    .is_none_or(|v| old_blob_hash.as_deref() == Some(v))
+                && opts.title.as_deref().is_none_or(|v| v == old_title)
+                && opts.doc_type.as_deref().is_none_or(|v| v == old_doc_type)
+                && opts.mime.as_deref().is_none_or(|v| v == old_mime)
+                && opts.metadata.as_deref().is_none_or(|v| v == old_metadata)
+                && opts.size.is_none_or(|v| v == old_size)
+                && opts
+                    .session_id
+                    .as_deref()
+                    .is_none_or(|v| old_session_id.as_deref() == Some(v))
+                && opts.source.as_deref().is_none_or(|v| v == old_source)
+                && opts.tags.as_ref().is_none_or(|v| *v == old_tags);
             if opts.track_history && !unchanged {
                 let history_id = db_kit::ids::new_id();
                 tx.execute(
@@ -836,6 +874,145 @@ mod tests {
         assert!(
             s.doc_history(&updated.id).unwrap().is_empty(),
             "no history row should be written when content is unchanged"
+        );
+    }
+
+    #[test]
+    fn unchanged_content_with_changed_title_still_writes_history() {
+        let s = store();
+        let doc = s
+            .doc_upsert_with_opts(
+                "p",
+                "/title-change.md",
+                "same content",
+                DocUpsertOpts {
+                    title: Some("Old Title".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let updated = s
+            .doc_upsert_with_opts(
+                "p",
+                "/title-change.md",
+                "same content",
+                DocUpsertOpts {
+                    title: Some("New Title".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.id, doc.id);
+        assert_eq!(updated.title, "New Title");
+        let history = s.doc_history(&updated.id).unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "a title-only change must still write a history row even though content didn't change"
+        );
+        assert_eq!(history[0].title, "Old Title");
+    }
+
+    #[test]
+    fn identical_content_and_opts_reupsert_skips_history_row() {
+        let s = store();
+        let opts = || DocUpsertOpts {
+            title: Some("Same Title".into()),
+            tags: Some(vec!["rust".into()]),
+            ..Default::default()
+        };
+        let doc = s
+            .doc_upsert_with_opts("p", "/no-op.md", "same content", opts())
+            .unwrap();
+        let updated = s
+            .doc_upsert_with_opts("p", "/no-op.md", "same content", opts())
+            .unwrap();
+        assert_eq!(updated.id, doc.id);
+        assert!(
+            s.doc_history(&updated.id).unwrap().is_empty(),
+            "a true no-op re-upsert (same content and same opts) must not write history"
+        );
+    }
+
+    #[test]
+    fn omitted_blob_hash_does_not_force_a_history_write() {
+        let s = store();
+        let doc = s
+            .doc_upsert_with_opts(
+                "p",
+                "/blob.md",
+                "same content",
+                DocUpsertOpts {
+                    blob_hash: Some("hash-v1".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Re-upsert with identical content and blob_hash omitted (None) --
+        // omitting a field makes no claim about it, so it must not be
+        // treated as "the blob_hash changed" just because the stored value
+        // happens to already be Some(...).
+        let updated = s
+            .doc_upsert_with_opts("p", "/blob.md", "same content", DocUpsertOpts::default())
+            .unwrap();
+        assert_eq!(updated.id, doc.id);
+        assert_eq!(updated.blob_hash.as_deref(), Some("hash-v1"));
+        assert!(
+            s.doc_history(&updated.id).unwrap().is_empty(),
+            "omitting blob_hash on an otherwise-unchanged re-upsert must not write history"
+        );
+    }
+
+    #[test]
+    fn unchanged_content_with_changed_metadata_still_writes_history() {
+        let s = store();
+        let doc = s
+            .doc_upsert_with_opts(
+                "p",
+                "/meta-change.md",
+                "same content",
+                DocUpsertOpts {
+                    metadata: Some(r#"{"v":1}"#.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let updated = s
+            .doc_upsert_with_opts(
+                "p",
+                "/meta-change.md",
+                "same content",
+                DocUpsertOpts {
+                    metadata: Some(r#"{"v":2}"#.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.id, doc.id);
+        assert_eq!(updated.metadata, r#"{"v":2}"#);
+        let history = s.doc_history(&updated.id).unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "a metadata-only change must still write a history row"
+        );
+        assert_eq!(history[0].metadata, r#"{"v":1}"#);
+
+        // A second re-upsert with identical metadata must be a true no-op.
+        s.doc_upsert_with_opts(
+            "p",
+            "/meta-change.md",
+            "same content",
+            DocUpsertOpts {
+                metadata: Some(r#"{"v":2}"#.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.doc_history(&updated.id).unwrap().len(),
+            1,
+            "identical metadata must not add another history row"
         );
     }
 
