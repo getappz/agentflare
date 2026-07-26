@@ -284,21 +284,15 @@ impl DocsStore {
         let now = db_kit::ids::now();
         let mut written = 0usize;
 
-        for item in items {
-            let existing_content: Option<String> = tx
-                .query_row(
-                    "SELECT content FROM store_documents WHERE project_id = ?1 AND path = ?2 AND deleted_at IS NULL",
-                    rusqlite::params![PROJECT_ID, item.path],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if existing_content.as_deref() == Some(item.content.as_str()) {
-                continue;
-            }
-
-            let tags_json = serde_json::to_string(&item.tags).unwrap_or_else(|_| "[]".into());
-            let id = db_kit::ids::new_id();
-            let rowid: i64 = tx.query_row(
+        // Prepared once and reused across every item (rusqlite's statement
+        // cache would do this implicitly via prepare_cached, but a crate can
+        // have thousands of items, so holding the four statements open for
+        // the whole loop avoids thousands of cache lookups too).
+        {
+            let mut select_stmt = tx.prepare_cached(
+                "SELECT content FROM store_documents WHERE project_id = ?1 AND path = ?2 AND deleted_at IS NULL",
+            )?;
+            let mut upsert_stmt = tx.prepare_cached(
                 "INSERT INTO store_documents
                  (id, project_id, path, content, title, doc_type, blob_hash, mime, tags, session_id, source, metadata, size, version, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, '', ?7, NULL, ?8, '{}', 0, 1, ?9, ?9)
@@ -312,30 +306,42 @@ impl DocsStore {
                     updated_at = excluded.updated_at,
                     deleted_at = NULL
                  RETURNING rowid",
-                rusqlite::params![
-                    id,
-                    PROJECT_ID,
-                    item.path,
-                    item.content,
-                    item.title,
-                    item.doc_type,
-                    tags_json,
-                    item.source,
-                    now,
-                ],
-                |row| row.get(0),
             )?;
+            let mut fts_del_stmt =
+                tx.prepare_cached("DELETE FROM store_docs_fts WHERE rowid = ?1")?;
+            let mut fts_ins_stmt =
+                tx.prepare_cached("INSERT INTO store_docs_fts(rowid, content) VALUES (?1, ?2)")?;
 
-            tx.execute(
-                "DELETE FROM store_docs_fts WHERE rowid = ?1",
-                rusqlite::params![rowid],
-            )?;
-            tx.execute(
-                "INSERT INTO store_docs_fts(rowid, content) VALUES (?1, ?2)",
-                rusqlite::params![rowid, item.content],
-            )?;
-            written += 1;
-        }
+            for item in items {
+                let existing_content: Option<String> = select_stmt
+                    .query_row(rusqlite::params![PROJECT_ID, item.path], |row| row.get(0))
+                    .optional()?;
+                if existing_content.as_deref() == Some(item.content.as_str()) {
+                    continue;
+                }
+
+                let tags_json = serde_json::to_string(&item.tags).unwrap_or_else(|_| "[]".into());
+                let id = db_kit::ids::new_id();
+                let rowid: i64 = upsert_stmt.query_row(
+                    rusqlite::params![
+                        id,
+                        PROJECT_ID,
+                        item.path,
+                        item.content,
+                        item.title,
+                        item.doc_type,
+                        tags_json,
+                        item.source,
+                        now,
+                    ],
+                    |row| row.get(0),
+                )?;
+
+                fts_del_stmt.execute(rusqlite::params![rowid])?;
+                fts_ins_stmt.execute(rusqlite::params![rowid, item.content])?;
+                written += 1;
+            }
+        } // statements dropped here, releasing their borrow of `tx` before commit
 
         Ok(written)
     }
