@@ -66,7 +66,10 @@ fn parse_git_shim(layer: Option<(PathBuf, toml::Value)>) -> Result<GitShimConfig
     };
     ConfigFile::deserialize(value)
         .map(|f| f.git_shim)
-        .map_err(|source| LoaderError { path, source })
+        .map_err(|source| LoaderError {
+            path,
+            source: Box::new(source),
+        })
 }
 
 pub fn resolve(

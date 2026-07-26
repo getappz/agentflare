@@ -11,7 +11,7 @@ pub struct ConfigLayers {
 pub struct LoaderError {
     pub path: PathBuf,
     #[source]
-    pub source: toml::de::Error,
+    pub source: Box<toml::de::Error>,
 }
 
 fn parse_if_exists(path: &Path) -> Result<Option<(PathBuf, toml::Value)>, LoaderError> {
@@ -22,7 +22,7 @@ fn parse_if_exists(path: &Path) -> Result<Option<(PathBuf, toml::Value)>, Loader
         .map(|v| Some((path.to_path_buf(), v)))
         .map_err(|source| LoaderError {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })
 }
 
