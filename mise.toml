@@ -1,0 +1,30 @@
+[tools]
+aube = "latest"
+
+[tasks.install]
+description = "Install JS deps for the whole workspace (site + docs-site)"
+run = "aube install"
+
+[tasks."dev:site"]
+description = "Run the agentflare.dev landing page + Worker dev server"
+depends = ["install"]
+run = "aube run dev --filter agentflare-web"
+
+[tasks."dev:docs"]
+description = "Run the flare-docs Starlight dev server"
+depends = ["install"]
+run = "aube run dev --filter agentflare-docs"
+
+[tasks."build:docs"]
+description = "Build the flare-docs Starlight site (docs-site/dist)"
+depends = ["install"]
+run = "aube run build --filter agentflare-docs"
+
+[tasks.deploy]
+description = "Build docs, copy into site/public/docs, and deploy agentflare.dev"
+depends = ["install"]
+run = "aube run deploy --filter agentflare-web"
+
+[tasks.tail]
+description = "Tail live Cloudflare Worker logs for agentflare.dev"
+run = "aube run tail --filter agentflare-web"
