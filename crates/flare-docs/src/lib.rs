@@ -6,6 +6,7 @@ pub mod rustdoc;
 pub mod store;
 
 pub use agentflare_store::documents::{DocMatch, DocUpsertOpts, Document};
+pub use agentflare_store::maintenance::{GcOpts, GcReport};
 pub use ecosystem::Ecosystem;
 
 /// What a fetch produced, for every ecosystem.

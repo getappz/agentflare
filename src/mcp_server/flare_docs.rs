@@ -10,8 +10,8 @@ use super::*;
 // re-exported (not just privately imported) through this submodule for that
 // path to resolve.
 pub(crate) use ::flare_docs::{
-    ClientError, DocsStore, Ecosystem, FetchOutcome, Fetcher, UreqFetcher, docs_rs_json_url, npm,
-    store_fetched,
+    ClientError, DocsStore, Ecosystem, FetchOutcome, Fetcher, GcOpts, UreqFetcher,
+    docs_rs_json_url, npm, store_fetched,
 };
 
 const DEFAULT_LIMIT: usize = 10;
@@ -35,7 +35,8 @@ impl AgentflareMcp {
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                     serde_json::to_string(&hits)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-                })?
+                })
+                .await?
             }
             "list" => {
                 // Bodies are deliberately omitted, and the page is capped
@@ -60,7 +61,8 @@ impl AgentflareMcp {
                         "docs": docs,
                     }))
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-                })?
+                })
+                .await?
             }
             "get" if req.id.is_some() => {
                 let id = req.id.expect("guarded by is_some() above");
@@ -70,7 +72,8 @@ impl AgentflareMcp {
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                     serde_json::to_string(&doc)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-                })?
+                })
+                .await?
             }
             "get" => {
                 let package = req.package.ok_or_else(|| {
@@ -79,11 +82,13 @@ impl AgentflareMcp {
                 let eco = Ecosystem::resolve(req.ecosystem.as_deref(), &package)
                     .map_err(|e| ErrorData::invalid_params(e, None))?;
                 let version = req.version.unwrap_or_else(|| DEFAULT_VERSION.to_string());
-                let cached = self.with_flare_docs_store(|store| {
-                    store
-                        .get_by_path(&eco.docs_id_path(&package, &version))
-                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-                })??;
+                let cached = self
+                    .with_flare_docs_store(|store| {
+                        store
+                            .get_by_path(&eco.docs_id_path(&package, &version))
+                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+                    })
+                    .await??;
                 match cached {
                     Some(doc) => serde_json::to_string(&doc)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None)),
@@ -122,10 +127,10 @@ impl AgentflareMcp {
     }
 
     /// Runs the registry network fetch on tokio's blocking thread pool (never
-    /// inline on the single-threaded MCP runtime, and never under the
-    /// `std::sync::Mutex` guarding `flare_docs_store`), then, once the fetch
-    /// has completed and no `.await` remains, does the fast local
-    /// parse/store work synchronously via `with_flare_docs_store`.
+    /// inline on the single-threaded MCP runtime, and never while holding the
+    /// mutex guarding `flare_docs_store`), then, once the fetch has
+    /// completed, does the fast local parse/store work through
+    /// `with_flare_docs_store`.
     ///
     /// npm needs several sequential requests (version manifest, possibly a
     /// DefinitelyTyped manifest, then the tarball), so the whole sequence runs
@@ -137,7 +142,7 @@ impl AgentflareMcp {
         package: String,
         version: String,
     ) -> Result<FetchOutcome, ErrorData> {
-        match eco {
+        let outcome = match eco {
             Ecosystem::Rust => {
                 let url = docs_rs_json_url(&package, &version);
                 let fetched =
@@ -146,7 +151,8 @@ impl AgentflareMcp {
                 self.with_flare_docs_store(|store| {
                     store_fetched(store, &fetched, &package, &version)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-                })?
+                })
+                .await?
             }
             Ecosystem::Npm => {
                 let (pkg, ver) = (package.clone(), version.clone());
@@ -157,9 +163,69 @@ impl AgentflareMcp {
                 self.with_flare_docs_store(|store| {
                     npm::store_package(store, &fetched)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-                })?
+                })
+                .await?
             }
+        }?;
+        self.gc_docs_cache().await;
+        Ok(outcome)
+    }
+
+    /// Trims the docs cache back inside its retention and size budgets.
+    ///
+    /// Scheduled by the fetch rather than by a timer: every route that grows
+    /// the cache funnels through the call above, so a completed fetch is
+    /// exactly when there is something new to collect, and nothing has to
+    /// own a background task to make it happen.
+    ///
+    /// On the blocking pool and detached, for the same reason the fetch
+    /// itself is: the MCP runtime is single-threaded, and this is not the
+    /// bounded local work the store's other call sites are. A purge can
+    /// remove thousands of rows, and the first run against a database
+    /// created before `auto_vacuum` was set rewrites the whole file and
+    /// rebuilds the search index — cost that scales with the cache, not
+    /// with what this fetch added. Inline, every other request on the
+    /// runtime would wait behind it. Not awaited because the caller's answer
+    /// does not depend on the result.
+    ///
+    /// Failures are swallowed on purpose. The caller asked for
+    /// documentation, and a cache that could not be trimmed still answers
+    /// the question it was asked; failing a fetch over housekeeping would
+    /// trade a working feature for a disk-space concern.
+    async fn gc_docs_cache(&self) {
+        if self.ensure_flare_docs_store().await.is_err() {
+            return;
         }
+        let store = std::sync::Arc::clone(&self.flare_docs_store);
+        tokio::task::spawn_blocking(move || {
+            // `blocking_lock`, not `lock().await`: this closure is already
+            // off the runtime, and a request waiting on the same mutex
+            // awaits rather than blocking behind it.
+            let guard = store.blocking_lock();
+            let Some(store) = guard.as_ref() else {
+                return;
+            };
+            let Ok(report) = store.gc(GcOpts::default()) else {
+                return;
+            };
+            if report.purged + report.evicted == 0 {
+                return;
+            }
+            // Journaled beside the git shim's log, for the same reason it
+            // has one: a cache that drops content the caller still believes
+            // is there needs a record of what went and when, or the next
+            // surprising cache miss has no explanation behind it.
+            if let Some(path) = flare_git_core::audit::default_path("gc.jsonl") {
+                let _ = flare_git_core::audit::log_event(
+                    &path,
+                    &serde_json::json!({
+                        "at": db_kit::ids::now(),
+                        "store": "flare-docs",
+                        "gc": report,
+                    }),
+                );
+            }
+        });
     }
 
     /// Shared timeout/panic/error plumbing for a blocking registry fetch. A
@@ -251,6 +317,7 @@ mod tests {
                 )
                 .unwrap()
         })
+        .await
         .unwrap();
 
         let req = FlareDocsRequest {
@@ -277,6 +344,7 @@ mod tests {
                 )
                 .unwrap()
         })
+        .await
         .unwrap();
 
         let req = FlareDocsRequest {
@@ -301,6 +369,7 @@ mod tests {
                 )
                 .unwrap()
         })
+        .await
         .unwrap();
 
         let req = FlareDocsRequest {
@@ -432,6 +501,7 @@ mod tests {
                     .unwrap();
             }
         })
+        .await
         .unwrap();
 
         let mut req = FlareDocsRequest {
@@ -500,6 +570,7 @@ mod tests {
                 )
                 .unwrap();
         })
+        .await
         .unwrap();
 
         let raw = mcp

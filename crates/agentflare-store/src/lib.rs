@@ -3,6 +3,7 @@ pub mod documents;
 pub mod embed;
 pub mod kv;
 pub mod leases;
+pub mod maintenance;
 pub mod migrate;
 pub mod migrations;
 pub mod retrieval;
