@@ -105,20 +105,22 @@ impl Default for DocUpsertOpts {
 }
 
 impl Store {
-    fn doc_sync_fts(
-        conn: &rusqlite::Connection,
-        row_id: i64,
-        content: &str,
-    ) -> rusqlite::Result<()> {
-        conn.execute(
-            "DELETE FROM store_docs_fts WHERE rowid = ?1",
-            params![row_id],
-        )?;
-        conn.execute(
-            "INSERT INTO store_docs_fts(rowid, content) VALUES (?1, ?2)",
-            params![row_id, content],
-        )?;
-        Ok(())
+    /// Repopulates the document search index from `store_documents`.
+    ///
+    /// `store_docs_fts` is an external-content fts5 table kept in sync by
+    /// triggers (see `migrations::EXTERNAL_CONTENT_FTS_MIGRATION`), so this
+    /// is only needed after something rewrites the base table behind the
+    /// triggers' back -- notably `VACUUM`, which may renumber the implicit
+    /// rowids the index is keyed on.
+    ///
+    /// Transactional: the clear and the refill are two statements, and
+    /// stopping between them would leave the index empty rather than stale.
+    pub fn doc_fts_rebuild(&self) -> rusqlite::Result<()> {
+        let conn = self.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(crate::migrations::FTS_REBUILD_SQL)?;
+        tx.commit()
     }
 
     fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
@@ -173,7 +175,7 @@ impl Store {
 
         let existing = tx
             .query_row(
-                "SELECT id, rowid, content, version, blob_hash, mime, metadata, size,
+                "SELECT id, content, version, blob_hash, mime, metadata, size,
                         title, doc_type, tags, session_id, source
                  FROM store_documents
                  WHERE project_id = ?1 AND path = ?2",
@@ -181,18 +183,17 @@ impl Store {
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i32>(3)?,
-                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i32>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
                         row.get::<_, String>(8)?,
                         row.get::<_, String>(9)?,
-                        row.get::<_, String>(10)?,
-                        row.get::<_, Option<String>>(11)?,
-                        row.get::<_, String>(12)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, String>(11)?,
                     ))
                 },
             )
@@ -200,7 +201,6 @@ impl Store {
 
         if let Some((
             existing_id,
-            rowid,
             old_content,
             old_version,
             old_blob_hash,
@@ -344,7 +344,6 @@ impl Store {
                 )?;
             }
 
-            Self::doc_sync_fts(&tx, rowid, content)?;
             tx.commit()?;
             drop(conn);
             if let Some(old) = superseded_blob {
@@ -362,8 +361,6 @@ impl Store {
             let metadata = opts.metadata.unwrap_or_else(|| "{}".to_string());
             let size = opts.size.unwrap_or(0);
 
-            // Insert + FTS sync share this transaction so a failure between
-            // the two can't leave a document without its search index row.
             tx.execute(
                 "INSERT INTO store_documents
                  (id, project_id, path, content, title, doc_type, blob_hash, mime, tags, session_id, source, metadata, size, version, created_at, updated_at)
@@ -373,8 +370,6 @@ impl Store {
                     mime, tags_json, opts.session_id, source, metadata, size, now
                 ],
             )?;
-            let rowid = tx.last_insert_rowid();
-            Self::doc_sync_fts(&tx, rowid, content)?;
             tx.commit()?;
             Ok(Document {
                 id,
@@ -432,29 +427,21 @@ impl Store {
         let (found, release_blob) = {
             let conn = self.conn();
             let now = db_kit::ids::now();
-            let Some((rowid, blob_hash, already_deleted)) = conn
+            let Some((blob_hash, already_deleted)) = conn
                 .query_row(
-                    "SELECT rowid, blob_hash, deleted_at IS NOT NULL FROM store_documents WHERE id = ?1",
+                    "SELECT blob_hash, deleted_at IS NOT NULL FROM store_documents WHERE id = ?1",
                     params![id],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, bool>(2)?,
-                        ))
-                    },
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(1)?)),
                 )
                 .optional()?
             else {
                 return Ok(false);
             };
+            // Dropping the row out of store_docs_fts is the AFTER UPDATE
+            // trigger's job now -- see migrations::EXTERNAL_CONTENT_FTS_MIGRATION.
             conn.execute(
                 "UPDATE store_documents SET deleted_at = ?1 WHERE id = ?2",
                 params![now, id],
-            )?;
-            conn.execute(
-                "DELETE FROM store_docs_fts WHERE rowid = ?1",
-                params![rowid],
             )?;
             // Only the delete that actually transitions live -> deleted owns a
             // reference. Re-deleting an already soft-deleted row must not
@@ -751,6 +738,151 @@ mod tests {
 
     fn store() -> Store {
         Store::open_memory().unwrap()
+    }
+
+    /// Rows matchable through `store_docs_fts` directly, with no
+    /// `deleted_at` guard layered on top. `doc_search` filters deleted rows
+    /// itself, so it cannot tell a correctly-maintained index from one full
+    /// of stale entries -- these assertions have to bypass it.
+    fn fts_hits(s: &Store, term: &str) -> i64 {
+        s.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM store_docs_fts WHERE store_docs_fts MATCH ?1",
+                params![term],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn soft_deleting_a_document_drops_its_fts_entry() {
+        let s = store();
+        let doc = s.doc_upsert("p", "/gone.md", "loquacious").unwrap();
+        assert_eq!(fts_hits(&s, "loquacious"), 1);
+
+        s.doc_delete(&doc.id).unwrap();
+
+        assert_eq!(
+            fts_hits(&s, "loquacious"),
+            0,
+            "a soft-deleted document must leave no directly matchable index row"
+        );
+    }
+
+    #[test]
+    fn resurrecting_a_soft_deleted_document_indexes_it_exactly_once() {
+        // The failure mode the guarded triggers exist for: on an
+        // external-content table, a `'delete'` naming a row that is not in
+        // the index corrupts it. A resurrecting upsert is an UPDATE whose
+        // `old` row was soft-deleted (and so already unindexed), which an
+        // unguarded AFTER UPDATE trigger would happily try to delete again.
+        let s = store();
+        let doc = s.doc_upsert("p", "/back.md", "phoenix").unwrap();
+        s.doc_delete(&doc.id).unwrap();
+        assert_eq!(fts_hits(&s, "phoenix"), 0);
+
+        s.doc_upsert("p", "/back.md", "phoenix").unwrap();
+
+        assert_eq!(fts_hits(&s, "phoenix"), 1);
+        assert_eq!(s.doc_search("p", "phoenix", 10).unwrap().len(), 1);
+        // fts5's own verdict on whether the delete/insert bookkeeping stayed
+        // consistent -- an unguarded trigger fails here, not on the counts.
+        s.conn()
+            .execute_batch("INSERT INTO store_docs_fts(store_docs_fts) VALUES('integrity-check');")
+            .expect("index must survive a delete/resurrect cycle intact");
+    }
+
+    #[test]
+    fn hard_deleting_a_row_drops_its_fts_entry() {
+        // Nothing in the crate hard-deletes documents today, but the
+        // cache-eviction work (#339) will. With the index trigger-driven,
+        // that purge gets the FTS delete for free instead of having to
+        // remember it -- which is the class of bug #334/#337 was.
+        let s = store();
+        s.doc_upsert("p", "/purge.md", "ephemeral").unwrap();
+        s.conn()
+            .execute("DELETE FROM store_documents WHERE path = '/purge.md'", [])
+            .unwrap();
+
+        assert_eq!(fts_hits(&s, "ephemeral"), 0);
+    }
+
+    #[test]
+    fn editing_a_document_leaves_only_the_new_content_matchable() {
+        let s = store();
+        s.doc_upsert("p", "/edit.md", "before").unwrap();
+        s.doc_upsert("p", "/edit.md", "after").unwrap();
+
+        assert_eq!(fts_hits(&s, "before"), 0, "superseded text must not match");
+        assert_eq!(fts_hits(&s, "after"), 1);
+    }
+
+    #[test]
+    fn the_update_trigger_is_scoped_to_the_indexed_columns() {
+        // doc_upsert_with_opts writes content, then up to nine more
+        // single-column UPDATEs for the optional fields. None of them can
+        // change what is indexed, so none should re-tokenize the body. This
+        // has to be asserted on the trigger definition: an unscoped
+        // AFTER UPDATE produces an identical index, just nine times over.
+        let s = store();
+        let sql: String = s
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'store_docs_fts_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("UPDATE OF content, deleted_at"),
+            "update trigger must not fire for columns the index ignores: {sql}"
+        );
+    }
+
+    #[test]
+    fn optional_field_updates_leave_the_document_indexed() {
+        let s = store();
+        s.doc_upsert_with_opts(
+            "p",
+            "/opts.md",
+            "indexable",
+            DocUpsertOpts {
+                title: Some("t".into()),
+                mime: Some("text/plain".into()),
+                tags: Some(vec!["a".into()]),
+                source: Some("src".into()),
+                size: Some(9),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fts_hits(&s, "indexable"), 1);
+    }
+
+    #[test]
+    fn doc_fts_rebuild_restores_the_index_and_still_skips_deleted_rows() {
+        let s = store();
+        s.doc_upsert("p", "/live.md", "kept").unwrap();
+        let gone = s.doc_upsert("p", "/dead.md", "dropped").unwrap();
+        s.doc_delete(&gone.id).unwrap();
+
+        // Stand in for whatever desyncs the index behind the triggers' back
+        // -- a VACUUM renumbering store_documents' implicit rowids being the
+        // case doc_fts_rebuild exists for.
+        s.conn()
+            .execute_batch("INSERT INTO store_docs_fts(store_docs_fts) VALUES('delete-all');")
+            .unwrap();
+        assert_eq!(fts_hits(&s, "kept"), 0);
+
+        s.doc_fts_rebuild().unwrap();
+
+        assert_eq!(fts_hits(&s, "kept"), 1);
+        assert_eq!(
+            fts_hits(&s, "dropped"),
+            0,
+            "a rebuild must not resurrect soft-deleted rows the triggers keep out"
+        );
     }
 
     #[test]
