@@ -33,15 +33,24 @@ pub enum Error {
 pub struct Store {
     conn: parking_lot::Mutex<Connection>,
     root: PathBuf,
+    /// Where this store writes blob files. Namespaced per db file because
+    /// `store_blobs` ref counts are per db: two stores sharing a directory
+    /// (`~/.agentflare/store.db` and `flare-docs.db`) can't see each other's
+    /// references, so a shared blob dir lets one store's GC delete content the
+    /// other still points at.
+    blob_dir: PathBuf,
 }
 
 impl Store {
     pub fn open_file(path: &Path) -> Result<Self, Error> {
         let conn = db_kit::open_file(path, &migrations::migrations())?;
         let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        let blob_dir = root.join(format!("blobs-{stem}"));
         Ok(Self {
             conn: parking_lot::Mutex::new(conn),
             root,
+            blob_dir,
         })
     }
 
@@ -50,6 +59,7 @@ impl Store {
         Ok(Self {
             conn: parking_lot::Mutex::new(conn),
             root: PathBuf::from(":memory:"),
+            blob_dir: PathBuf::from(":memory:"),
         })
     }
 
