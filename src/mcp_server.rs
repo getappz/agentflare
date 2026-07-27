@@ -104,8 +104,10 @@ pub struct AgentflareMcp {
     /// crates/flare-docs — third-party package docs must not share a
     /// table/file with project docs; different lifecycle/eviction policy).
     /// `Arc` so cache maintenance can be handed to `spawn_blocking` without
-    /// borrowing `self` — see `flare_docs::gc_docs_cache`.
-    flare_docs_store: std::sync::Arc<std::sync::Mutex<Option<flare_docs::DocsStore>>>,
+    /// borrowing `self`, and a `tokio` mutex so a request that arrives while
+    /// maintenance holds it awaits rather than parking the runtime thread —
+    /// see `flare_docs::gc_docs_cache`.
+    flare_docs_store: std::sync::Arc<tokio::sync::Mutex<Option<flare_docs::DocsStore>>>,
     /// Tests inject a temp path or ":memory:" so they never touch
     /// ~/.agentflare/flare-docs.db.
     flare_docs_store_override: Option<std::path::PathBuf>,
@@ -723,11 +725,8 @@ impl AgentflareMcp {
         Ok(f(guard.as_ref().expect("ensure_store just initialized it")))
     }
 
-    fn ensure_flare_docs_store(&self) -> Result<(), ErrorData> {
-        let mut guard = self
-            .flare_docs_store
-            .lock()
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+    async fn ensure_flare_docs_store(&self) -> Result<(), ErrorData> {
+        let mut guard = self.flare_docs_store.lock().await;
         if guard.is_some() {
             return Ok(());
         }
@@ -743,15 +742,19 @@ impl AgentflareMcp {
         Ok(())
     }
 
-    fn with_flare_docs_store<T>(
+    /// Awaits the docs-store lock instead of blocking on it.
+    ///
+    /// A `std::sync::Mutex` here would park the MCP runtime's only thread
+    /// whenever the store is busy — and since cache maintenance can hold it
+    /// for as long as a purge or a full `VACUUM` takes, that would stall
+    /// every other tool call, not just the docs ones. Awaiting lets the
+    /// runtime run something else while it waits.
+    async fn with_flare_docs_store<T>(
         &self,
         f: impl FnOnce(&flare_docs::DocsStore) -> T,
     ) -> Result<T, ErrorData> {
-        self.ensure_flare_docs_store()?;
-        let guard = self
-            .flare_docs_store
-            .lock()
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        self.ensure_flare_docs_store().await?;
+        let guard = self.flare_docs_store.lock().await;
         Ok(f(guard
             .as_ref()
             .expect("ensure_flare_docs_store just initialized it")))

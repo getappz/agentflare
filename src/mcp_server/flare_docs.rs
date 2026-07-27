@@ -35,7 +35,8 @@ impl AgentflareMcp {
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                     serde_json::to_string(&hits)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-                })?
+                })
+                .await?
             }
             "list" => {
                 // Bodies are deliberately omitted, and the page is capped
@@ -60,7 +61,8 @@ impl AgentflareMcp {
                         "docs": docs,
                     }))
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-                })?
+                })
+                .await?
             }
             "get" if req.id.is_some() => {
                 let id = req.id.expect("guarded by is_some() above");
@@ -70,7 +72,8 @@ impl AgentflareMcp {
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                     serde_json::to_string(&doc)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-                })?
+                })
+                .await?
             }
             "get" => {
                 let package = req.package.ok_or_else(|| {
@@ -79,11 +82,13 @@ impl AgentflareMcp {
                 let eco = Ecosystem::resolve(req.ecosystem.as_deref(), &package)
                     .map_err(|e| ErrorData::invalid_params(e, None))?;
                 let version = req.version.unwrap_or_else(|| DEFAULT_VERSION.to_string());
-                let cached = self.with_flare_docs_store(|store| {
-                    store
-                        .get_by_path(&eco.docs_id_path(&package, &version))
-                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-                })??;
+                let cached = self
+                    .with_flare_docs_store(|store| {
+                        store
+                            .get_by_path(&eco.docs_id_path(&package, &version))
+                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+                    })
+                    .await??;
                 match cached {
                     Some(doc) => serde_json::to_string(&doc)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None)),
@@ -122,10 +127,10 @@ impl AgentflareMcp {
     }
 
     /// Runs the registry network fetch on tokio's blocking thread pool (never
-    /// inline on the single-threaded MCP runtime, and never under the
-    /// `std::sync::Mutex` guarding `flare_docs_store`), then, once the fetch
-    /// has completed and no `.await` remains, does the fast local
-    /// parse/store work synchronously via `with_flare_docs_store`.
+    /// inline on the single-threaded MCP runtime, and never while holding the
+    /// mutex guarding `flare_docs_store`), then, once the fetch has
+    /// completed, does the fast local parse/store work through
+    /// `with_flare_docs_store`.
     ///
     /// npm needs several sequential requests (version manifest, possibly a
     /// DefinitelyTyped manifest, then the tarball), so the whole sequence runs
@@ -146,7 +151,8 @@ impl AgentflareMcp {
                 self.with_flare_docs_store(|store| {
                     store_fetched(store, &fetched, &package, &version)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-                })?
+                })
+                .await?
             }
             Ecosystem::Npm => {
                 let (pkg, ver) = (package.clone(), version.clone());
@@ -157,10 +163,11 @@ impl AgentflareMcp {
                 self.with_flare_docs_store(|store| {
                     npm::store_package(store, &fetched)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-                })?
+                })
+                .await?
             }
         }?;
-        self.gc_docs_cache();
+        self.gc_docs_cache().await;
         Ok(outcome)
     }
 
@@ -185,15 +192,16 @@ impl AgentflareMcp {
     /// documentation, and a cache that could not be trimmed still answers
     /// the question it was asked; failing a fetch over housekeeping would
     /// trade a working feature for a disk-space concern.
-    fn gc_docs_cache(&self) {
-        if self.ensure_flare_docs_store().is_err() {
+    async fn gc_docs_cache(&self) {
+        if self.ensure_flare_docs_store().await.is_err() {
             return;
         }
         let store = std::sync::Arc::clone(&self.flare_docs_store);
         tokio::task::spawn_blocking(move || {
-            let Ok(guard) = store.lock() else {
-                return;
-            };
+            // `blocking_lock`, not `lock().await`: this closure is already
+            // off the runtime, and a request waiting on the same mutex
+            // awaits rather than blocking behind it.
+            let guard = store.blocking_lock();
             let Some(store) = guard.as_ref() else {
                 return;
             };
@@ -309,6 +317,7 @@ mod tests {
                 )
                 .unwrap()
         })
+        .await
         .unwrap();
 
         let req = FlareDocsRequest {
@@ -335,6 +344,7 @@ mod tests {
                 )
                 .unwrap()
         })
+        .await
         .unwrap();
 
         let req = FlareDocsRequest {
@@ -359,6 +369,7 @@ mod tests {
                 )
                 .unwrap()
         })
+        .await
         .unwrap();
 
         let req = FlareDocsRequest {
@@ -490,6 +501,7 @@ mod tests {
                     .unwrap();
             }
         })
+        .await
         .unwrap();
 
         let mut req = FlareDocsRequest {
@@ -558,6 +570,7 @@ mod tests {
                 )
                 .unwrap();
         })
+        .await
         .unwrap();
 
         let raw = mcp
