@@ -81,15 +81,19 @@ mod tests {
         // because the invariant held, and failed outright whenever the two
         // writes straddled a second boundary (seen on a windows-latest
         // runner: 1785126773 against 1785126774).
+        // Edited as JSON rather than by string replacement: the artifact's
+        // created_at and its first history entry's start out identical, so a
+        // textual replace would move both and leave the fixture describing a
+        // version that was created before the artifact it belongs to.
         let meta_path = store.base_path().join(&id).join("meta.json");
-        let created_before = store.get(&id).unwrap().created_at - 3600;
-        let meta = std::fs::read_to_string(&meta_path).unwrap();
-        let backdated = meta.replace(
-            &format!("\"created_at\": {}", created_before + 3600),
-            &format!("\"created_at\": {created_before}"),
-        );
-        assert_ne!(meta, backdated, "created_at not found in {meta_path:?}");
-        std::fs::write(&meta_path, backdated).unwrap();
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        let created_before = meta["created_at"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no created_at in {meta_path:?}"))
+            - 3600;
+        meta["created_at"] = created_before.into();
+        std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
 
         let update = PublishRequest {
             name: "updated".into(),
