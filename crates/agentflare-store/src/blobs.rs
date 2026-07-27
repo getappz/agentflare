@@ -13,23 +13,30 @@ pub struct BlobMeta {
 
 const CHUNK_SIZE: usize = 64 * 1024;
 
-fn blob_disk_path(root: &Path, hash: &str) -> PathBuf {
-    root.join("blobs").join(&hash[..2]).join(hash)
+/// `dir` is a blob directory (`Store::blob_dir` or the legacy shared one), not
+/// the store root.
+fn blob_disk_path(dir: &Path, hash: &str) -> PathBuf {
+    dir.join(&hash[..2]).join(hash)
 }
 
+/// Reads the store's own blob directory first, then the legacy shared
+/// `<root>/blobs` where builds before per-store namespacing wrote everything.
+///
 /// `Ok(None)` means the file genuinely isn't there; other I/O errors (permissions,
 /// disk failures) are propagated instead of being folded into "not found".
-fn read_disk_blob(root: &Path, hash: &str) -> std::io::Result<Option<Vec<u8>>> {
-    let path = blob_disk_path(root, hash);
-    match std::fs::read(&path) {
-        Ok(data) => Ok(Some(decompress_if_gzip(data)?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+fn read_disk_blob(dir: &Path, legacy_dir: &Path, hash: &str) -> std::io::Result<Option<Vec<u8>>> {
+    for d in [dir, legacy_dir] {
+        match std::fs::read(blob_disk_path(d, hash)) {
+            Ok(data) => return Ok(Some(decompress_if_gzip(data)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
     }
+    Ok(None)
 }
 
-fn write_disk_blob(root: &Path, hash: &str, data: &[u8]) -> Result<(), std::io::Error> {
-    let path = blob_disk_path(root, hash);
+fn write_disk_blob(dir: &Path, hash: &str, data: &[u8]) -> Result<(), std::io::Error> {
+    let path = blob_disk_path(dir, hash);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -62,8 +69,12 @@ fn decompress_if_gzip(data: Vec<u8>) -> std::io::Result<Vec<u8>> {
     }
 }
 
-fn delete_disk_blob(root: &Path, hash: &str) {
-    let path = blob_disk_path(root, hash);
+/// Only ever unlinks from this store's own blob directory. The legacy shared
+/// `<root>/blobs` may hold bytes another store's ref counts still cover, and
+/// this store can't see that table — leaking a legacy file is recoverable,
+/// deleting one another store needs is not.
+fn delete_disk_blob(dir: &Path, hash: &str) {
+    let path = blob_disk_path(dir, hash);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -72,6 +83,10 @@ use std::path::PathBuf;
 impl Store {
     fn is_memory(&self) -> bool {
         self.root.to_string_lossy() == ":memory:"
+    }
+
+    fn legacy_blob_dir(&self) -> PathBuf {
+        self.root.join("blobs")
     }
 
     pub fn blob_store(&self, data: &[u8]) -> rusqlite::Result<String> {
@@ -109,7 +124,7 @@ impl Store {
             // Written outside the SQL transaction (files aren't part of it);
             // if the metadata insert below fails, remove it again so a
             // failed store doesn't leak an orphaned file with no DB row.
-            if let Err(e) = write_disk_blob(&self.root, &hash, data) {
+            if let Err(e) = write_disk_blob(&self.blob_dir, &hash, data) {
                 return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)));
             }
         } else {
@@ -126,7 +141,7 @@ impl Store {
             params![hash, data.len() as i64, now],
         ) {
             if !is_memory {
-                delete_disk_blob(&self.root, &hash);
+                delete_disk_blob(&self.blob_dir, &hash);
             }
             return Err(e);
         }
@@ -157,7 +172,7 @@ impl Store {
         };
 
         if !self.is_memory() {
-            return read_disk_blob(&self.root, hash)
+            return read_disk_blob(&self.blob_dir, &self.legacy_blob_dir(), hash)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)));
         }
 
@@ -224,7 +239,7 @@ impl Store {
         // source of truth and is already gone, so a crash here just leaks
         // a file instead of leaving a dangling row with no data.
         if removed && !is_memory {
-            delete_disk_blob(&self.root, hash);
+            delete_disk_blob(&self.blob_dir, hash);
         }
         Ok(n > 0)
     }
@@ -281,7 +296,7 @@ mod tests {
         let data = b"content-addressed on disk";
         let hash = s.blob_store(data).unwrap();
 
-        let disk_path = blob_disk_path(dir.path(), &hash);
+        let disk_path = blob_disk_path(&s.blob_dir, &hash);
         assert!(disk_path.exists(), "blob file should exist on disk");
 
         let retrieved = s.blob_get(&hash).unwrap().unwrap();
@@ -297,7 +312,7 @@ mod tests {
         let data = "compressible ".repeat(200);
         let hash = s.blob_store(data.as_bytes()).unwrap();
 
-        let on_disk = std::fs::read(blob_disk_path(dir.path(), &hash)).unwrap();
+        let on_disk = std::fs::read(blob_disk_path(&s.blob_dir, &hash)).unwrap();
         assert!(
             on_disk.len() < data.len(),
             "on-disk blob ({} bytes) should be smaller than the source ({} bytes)",
@@ -321,7 +336,7 @@ mod tests {
         // Simulate a blob written by a build predating compression: write
         // the raw disk file directly (bypassing blob_store's gzip step) and
         // register its DB row the same way blob_store would.
-        let disk_path = blob_disk_path(dir.path(), &hash);
+        let disk_path = blob_disk_path(&s.blob_dir, &hash);
         std::fs::create_dir_all(disk_path.parent().unwrap()).unwrap();
         std::fs::write(&disk_path, data).unwrap();
         s.conn.lock().execute(
@@ -359,7 +374,7 @@ mod tests {
         let hash = s.blob_store(b"rustdoc json payload").unwrap();
         let doc = blob_backed_doc(&s, "/docsrs/serde/latest", &hash);
 
-        let disk_path = blob_disk_path(dir.path(), &hash);
+        let disk_path = blob_disk_path(&s.blob_dir, &hash);
         assert!(disk_path.exists(), "precondition: blob written to disk");
 
         s.doc_delete(&doc.id).unwrap();
@@ -393,7 +408,7 @@ mod tests {
         let s = Store::open_file(&dir.path().join("store.db")).unwrap();
         let old_hash = s.blob_store(b"version one payload").unwrap();
         cached_blob_doc(&s, "/cached", &old_hash);
-        let old_path = blob_disk_path(dir.path(), &old_hash);
+        let old_path = blob_disk_path(&s.blob_dir, &old_hash);
         assert!(old_path.exists(), "precondition: v1 blob on disk");
 
         // Same path, new blob: the row stops pointing at the old hash, so its
@@ -406,7 +421,7 @@ mod tests {
             "a superseded blob must be reclaimed, not left behind by the update"
         );
         assert!(
-            blob_disk_path(dir.path(), &new_hash).exists(),
+            blob_disk_path(&s.blob_dir, &new_hash).exists(),
             "the replacement blob must survive"
         );
         assert!(s.blob_get(&new_hash).unwrap().is_some());
@@ -425,7 +440,7 @@ mod tests {
         blob_backed_doc(&s, "/versioned", &new_hash);
 
         assert!(
-            blob_disk_path(dir.path(), &old_hash).exists(),
+            blob_disk_path(&s.blob_dir, &old_hash).exists(),
             "a blob a history row still points at must not be reclaimed"
         );
         assert_eq!(
@@ -445,7 +460,7 @@ mod tests {
         let first = blob_backed_doc(&s, "/a", &hash);
         let second = blob_backed_doc(&s, "/b", &hash);
 
-        let disk_path = blob_disk_path(dir.path(), &hash);
+        let disk_path = blob_disk_path(&s.blob_dir, &hash);
         s.doc_delete(&first.id).unwrap();
         assert!(
             disk_path.exists(),
@@ -461,6 +476,79 @@ mod tests {
         assert!(
             !disk_path.exists(),
             "the last referrer's delete must reclaim the file"
+        );
+    }
+
+    // ~/.agentflare/store.db and ~/.agentflare/flare-docs.db share a directory
+    // but keep separate store_blobs tables, so neither can see the other's
+    // references. Sharing one blob directory would let either one's reclaim
+    // strand the other's content.
+    #[test]
+    fn a_reclaim_cannot_strand_identical_bytes_held_by_a_store_sharing_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Store::open_file(&dir.path().join("store.db")).unwrap();
+        let b = Store::open_file(&dir.path().join("flare-docs.db")).unwrap();
+
+        let data = b"identical bytes stored in both";
+        let ha = a.blob_store(data).unwrap();
+        let hb = b.blob_store(data).unwrap();
+        assert_eq!(ha, hb, "content addressing collides these by design");
+
+        // a drops its only reference; b never unreffed.
+        assert!(a.blob_unref(&ha).unwrap());
+        assert!(a.blob_get(&ha).unwrap().is_none());
+
+        assert_eq!(
+            b.blob_get(&hb).unwrap().as_deref(),
+            Some(&data[..]),
+            "the neighbouring store still references these bytes"
+        );
+    }
+
+    /// Seeds a blob the way a build predating per-store blob dirs would have:
+    /// file in the shared `<root>/blobs`, row in this store's table.
+    fn seed_legacy_blob(s: &Store, root: &Path, data: &[u8]) -> String {
+        let hash = blake3::hash(data).to_hex().to_string();
+        let path = blob_disk_path(&root.join("blobs"), &hash);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, gzip(data).unwrap()).unwrap();
+        s.conn
+            .lock()
+            .execute(
+                "INSERT INTO store_blobs (hash, size, ref_count, created_at) VALUES (?1, ?2, 1, ?3)",
+                params![hash, data.len() as i64, db_kit::ids::now()],
+            )
+            .unwrap();
+        hash
+    }
+
+    #[test]
+    fn a_blob_in_the_legacy_shared_dir_still_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open_file(&dir.path().join("store.db")).unwrap();
+        let data = b"stored before blob dirs were namespaced";
+        let hash = seed_legacy_blob(&s, dir.path(), data);
+
+        assert_eq!(
+            s.blob_get(&hash).unwrap().as_deref(),
+            Some(&data[..]),
+            "reads must fall back to the legacy shared directory"
+        );
+    }
+
+    #[test]
+    fn reclaiming_a_blob_never_unlinks_from_the_legacy_shared_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open_file(&dir.path().join("store.db")).unwrap();
+        let data = b"legacy bytes another store may still reference";
+        let hash = seed_legacy_blob(&s, dir.path(), data);
+        let legacy_path = blob_disk_path(&dir.path().join("blobs"), &hash);
+
+        assert!(s.blob_unref(&hash).unwrap());
+
+        assert!(
+            legacy_path.exists(),
+            "a leaked legacy file is recoverable; deleting one a neighbouring store needs is not"
         );
     }
 }

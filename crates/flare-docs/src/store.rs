@@ -253,7 +253,7 @@ impl DocsStore {
         // than stranding a live document with no content. Per-item docs store
         // their text inline, but the crate-overview rows hold the raw rustdoc
         // JSON as a blob -- without this, reconciling one away orphans that
-        // file in <root>/blobs forever.
+        // file in this store's blob directory forever.
         // Every hash gets its attempt before the first failure is reported:
         // returning early would strand the rest of the batch as orphans, and
         // the rows are already committed so there is nothing to roll back. The
@@ -618,8 +618,13 @@ mod tests {
             )
             .unwrap();
 
-        // Mirrors agentflare_store::blobs::blob_disk_path, which is private.
-        let disk_path = dir.path().join("blobs").join(&hash[..2]).join(&hash);
+        // Mirrors agentflare_store::blobs::blob_disk_path, which is private:
+        // blobs live under a directory namespaced by the db file's stem.
+        let disk_path = dir
+            .path()
+            .join("blobs-flare-docs")
+            .join(&hash[..2])
+            .join(&hash);
         assert!(disk_path.exists(), "precondition: blob written to disk");
 
         // Refetch without the blob-backed item: reconciliation soft-deletes it.
