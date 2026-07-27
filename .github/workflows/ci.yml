@@ -9,6 +9,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
+env:
+  # Nothing in CI attaches a debugger, and full debuginfo is expensive twice
+  # over: MSVC spends real link time writing PDBs, and the artifacts they
+  # bloat are what the rust-cache archive has to restore on every run (54s on
+  # Windows against 12s on Linux). `line-tables-only` keeps panic backtraces
+  # readable, which is the only debug information a failing job actually uses.
+  # Workflow-level so build and clippy agree — a per-job value would give them
+  # divergent artifacts and halve the cache hit rate.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 jobs:
   changes:
     runs-on: ubuntu-latest
@@ -40,6 +50,9 @@ jobs:
     # A hung test would otherwise pin a runner for GitHub's 6h default and
     # block the branch's required check indefinitely; fail fast instead. A
     # cold-cache build+test finishes well under this on every OS.
+    #
+    # zizmor: ignore[template-injection] -- github.workspace is a runner path,
+    # not attacker-controlled input.
     timeout-minutes: 25
     strategy:
       matrix:
@@ -66,8 +79,24 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
         uses: mozilla-actions/sccache-action@d651010b8da762cde178750d8eda7b5febfe147a # v0.0.9
-      - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
-        run: cargo build --workspace --verbose
+      # Defender real-time protection is on in the windows-latest image and
+      # scans every object file, PDB and executable rustc writes -- and every
+      # temp file the tests create, which is why the same suite that runs in
+      # ~20s on Linux takes ~90s here. Best-effort: a runner that refuses the
+      # exclusion should build slowly, not fail.
+      - if: runner.os == 'Windows' && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true')
+        shell: pwsh
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}", "$env:USERPROFILE\.cargo", "$env:TEMP" -ErrorAction Stop
+          } catch {
+            Write-Host "Defender exclusions unavailable, continuing: $_"
+          }
+      # No separate `cargo build` step: `cargo test` compiles and links the
+      # same libs and bins (it builds every bin target so integration tests
+      # can spawn them -- see crates/flare-git-shim/tests/shim_test.rs), so
+      # building first was a second full pass over the workspace for nothing.
+      # Non-test targets still get type-checked by `clippy --all-targets`.
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
         run: cargo test --workspace --verbose
 

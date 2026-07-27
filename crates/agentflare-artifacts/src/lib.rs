@@ -74,6 +74,27 @@ mod tests {
         let resp = store.publish(&req).unwrap();
         let id = resp.id.clone();
 
+        // Backdate the stored created_at before updating. Both publishes land
+        // in the same second, so leaving it alone would make "preserved" and
+        // "stamped afresh" indistinguishable — the old assertion compared
+        // created_at to updated_at, which passed for that reason rather than
+        // because the invariant held, and failed outright whenever the two
+        // writes straddled a second boundary (seen on a windows-latest
+        // runner: 1785126773 against 1785126774).
+        // Edited as JSON rather than by string replacement: the artifact's
+        // created_at and its first history entry's start out identical, so a
+        // textual replace would move both and leave the fixture describing a
+        // version that was created before the artifact it belongs to.
+        let meta_path = store.base_path().join(&id).join("meta.json");
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        let created_before = meta["created_at"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no created_at in {meta_path:?}"))
+            - 3600;
+        meta["created_at"] = created_before.into();
+        std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
         let update = PublishRequest {
             name: "updated".into(),
             artifact_type: ArtifactType::Markdown,
@@ -88,8 +109,10 @@ mod tests {
         let artifact = store.get(&id).unwrap();
         assert_eq!(artifact.content, "v2");
         assert_eq!(artifact.artifact_type, ArtifactType::Markdown);
-        // created_at must stay the same on update
-        assert_eq!(artifact.created_at, artifact.updated_at); // same sec
+        // An update must carry the stored created_at forward, not stamp a new
+        // one — the backdating above is what makes the difference visible.
+        assert_eq!(artifact.created_at, created_before);
+        assert!(artifact.updated_at >= artifact.created_at);
     }
 
     #[test]
