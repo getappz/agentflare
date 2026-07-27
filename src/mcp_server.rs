@@ -103,7 +103,9 @@ pub struct AgentflareMcp {
     /// Lazily-opened flare-docs store (separate file from `store`, see
     /// crates/flare-docs — third-party package docs must not share a
     /// table/file with project docs; different lifecycle/eviction policy).
-    flare_docs_store: std::sync::Mutex<Option<flare_docs::DocsStore>>,
+    /// `Arc` so cache maintenance can be handed to `spawn_blocking` without
+    /// borrowing `self` — see `flare_docs::gc_docs_cache`.
+    flare_docs_store: std::sync::Arc<std::sync::Mutex<Option<flare_docs::DocsStore>>>,
     /// Tests inject a temp path or ":memory:" so they never touch
     /// ~/.agentflare/flare-docs.db.
     flare_docs_store_override: Option<std::path::PathBuf>,

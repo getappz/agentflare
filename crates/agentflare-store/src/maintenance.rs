@@ -72,10 +72,12 @@ impl Store {
     /// variable for eviction: pages come back only at the reclaim step,
     /// after the decisions have already been made.
     ///
-    /// Blob bytes are counted whole even though `store_blobs` is shared
-    /// across projects within one database. For a single-project cache
-    /// (flare-docs) that is exact; for a multi-project store it
-    /// over-attributes, which errs toward collecting sooner.
+    /// Only blobs this project's live documents actually reference count.
+    /// `store_blobs` is shared across projects in one database, and summing
+    /// it whole would let another project's bytes push this one over its
+    /// budget — eviction would then run against a project that is not the
+    /// one consuming the space, and could empty it entirely without ever
+    /// getting under a target it never controlled.
     pub fn cache_bytes(&self, project_id: &str) -> rusqlite::Result<u64> {
         let conn = self.conn();
         let content: i64 = conn.query_row(
@@ -85,8 +87,11 @@ impl Store {
             |row| row.get(0),
         )?;
         let blobs: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(size), 0) FROM store_blobs",
-            [],
+            "SELECT COALESCE(SUM(b.size), 0) FROM store_blobs b
+             WHERE EXISTS (SELECT 1 FROM store_documents d
+                            WHERE d.blob_hash = b.hash
+                              AND d.project_id = ?1 AND d.deleted_at IS NULL)",
+            params![project_id],
             |row| row.get(0),
         )?;
         Ok((content + blobs).max(0) as u64)
@@ -121,7 +126,17 @@ impl Store {
         // document still points at.
         report.blobs_released += self.hard_delete_docs(&expired, false)?;
 
-        for id in self.eviction_candidates(project_id, opts.max_bytes)? {
+        // Re-measured after every eviction instead of estimated once for the
+        // whole batch. Two documents can share a blob, which is only
+        // reclaimed when the second of them goes, so any per-document
+        // estimate taken before the deletions start under-counts what the
+        // batch will free — and an estimate that can never reach its target
+        // walks the candidate list to the end and empties the project. The
+        // extra queries only run while over budget.
+        while self.cache_bytes(project_id)? > opts.max_bytes {
+            let Some(id) = self.next_eviction_candidate(project_id)? else {
+                break;
+            };
             report.blobs_released += self.hard_delete_docs(std::slice::from_ref(&id), true)?;
             report.evicted += 1;
         }
@@ -133,47 +148,22 @@ impl Store {
         Ok(report)
     }
 
-    /// Live documents to drop, oldest first, until the project fits its
-    /// budget. Empty while under budget — the common case, one query.
+    /// The next live document to drop, or `None` once the project holds
+    /// none — which is what bounds the eviction loop.
     ///
     /// `updated_at` order, not true LRU: a real last-accessed column costs a
     /// write on every read, and for a cache that is refreshed rather than
-    /// mutated the two orders differ very little. A blob counts toward the
-    /// bytes its document frees only when nothing else references it.
-    fn eviction_candidates(
-        &self,
-        project_id: &str,
-        max_bytes: u64,
-    ) -> rusqlite::Result<Vec<String>> {
-        let over = self.cache_bytes(project_id)?.saturating_sub(max_bytes);
-        if over == 0 {
-            return Ok(Vec::new());
-        }
+    /// mutated the two orders differ very little.
+    fn next_eviction_candidate(&self, project_id: &str) -> rusqlite::Result<Option<String>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT d.id,
-                    length(CAST(d.content AS BLOB))
-                    + COALESCE((SELECT b.size FROM store_blobs b
-                                 WHERE b.hash = d.blob_hash AND b.ref_count = 1), 0)
-             FROM store_documents d
-             WHERE d.project_id = ?1 AND d.deleted_at IS NULL
-             ORDER BY d.updated_at ASC, d.rowid ASC",
-        )?;
-        let rows = stmt.query_map(params![project_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-
-        let mut freed: u64 = 0;
-        let mut victims = Vec::new();
-        for row in rows {
-            let (id, bytes) = row?;
-            victims.push(id);
-            freed = freed.saturating_add(bytes.max(0) as u64);
-            if freed >= over {
-                break;
-            }
-        }
-        Ok(victims)
+        conn.query_row(
+            "SELECT id FROM store_documents
+             WHERE project_id = ?1 AND deleted_at IS NULL
+             ORDER BY updated_at ASC, rowid ASC LIMIT 1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()
     }
 
     /// Physically removes documents and everything hanging off them,
@@ -463,6 +453,89 @@ mod tests {
         assert_eq!(report.evicted, 1);
         assert!(report.blobs_released >= 1);
         assert!(s.blob_get(&hash).unwrap().is_none());
+    }
+
+    /// `store_blobs` is shared across projects in one database. Summing it
+    /// whole made another project's bytes the trigger for this one's
+    /// eviction — and since evicting this project's documents never brought
+    /// that total down, it emptied the project and still finished over
+    /// budget.
+    #[test]
+    fn another_projects_blobs_do_not_evict_this_projects_documents() {
+        let s = store();
+        let hash = s.blob_store(&vec![9u8; 4096]).unwrap();
+        s.doc_upsert_with_opts(
+            "other",
+            "big.md",
+            "",
+            DocUpsertOpts {
+                blob_hash: Some(hash),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mine = s.doc_upsert(PROJECT, "small.md", "tiny").unwrap();
+
+        let report = s
+            .gc(
+                PROJECT,
+                GcOpts {
+                    max_bytes: 1024,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(report.evicted, 0);
+        assert!(row_exists(&s, &mine.id));
+    }
+
+    /// A blob two documents share is only reclaimed when the second one
+    /// goes, so an up-front per-document estimate under-counts what the
+    /// batch frees. The loop re-measures instead: one eviction is not
+    /// enough here, two are, and the third document must survive.
+    #[test]
+    fn eviction_re_measures_rather_than_estimating_a_shared_blob() {
+        let s = store();
+        let payload = vec![3u8; 2048];
+        let mut shared = String::new();
+        for path in ["a.md", "b.md"] {
+            // One `blob_store` per document, the way every real caller
+            // writes one: identical bytes dedupe to a single row whose
+            // ref_count counts the referrers.
+            shared = s.blob_store(&payload).unwrap();
+            s.doc_upsert_with_opts(
+                PROJECT,
+                path,
+                "",
+                DocUpsertOpts {
+                    blob_hash: Some(shared.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let keeper = s.doc_upsert(PROJECT, "c.md", "tiny").unwrap();
+        s.conn()
+            .execute(
+                "UPDATE store_documents SET updated_at = updated_at + 3600 WHERE id = ?1",
+                params![keeper.id],
+            )
+            .unwrap();
+
+        let report = s
+            .gc(
+                PROJECT,
+                GcOpts {
+                    max_bytes: 1024,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(report.evicted, 2);
+        assert!(row_exists(&s, &keeper.id));
+        assert!(s.blob_get(&shared).unwrap().is_none());
     }
 
     #[test]
