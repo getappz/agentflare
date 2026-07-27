@@ -50,9 +50,6 @@ jobs:
     # A hung test would otherwise pin a runner for GitHub's 6h default and
     # block the branch's required check indefinitely; fail fast instead. A
     # cold-cache build+test finishes well under this on every OS.
-    #
-    # zizmor: ignore[template-injection] -- github.workspace is a runner path,
-    # not attacker-controlled input.
     timeout-minutes: 25
     strategy:
       matrix:
@@ -79,19 +76,14 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
         uses: mozilla-actions/sccache-action@d651010b8da762cde178750d8eda7b5febfe147a # v0.0.9
-      # Defender real-time protection is on in the windows-latest image and
-      # scans every object file, PDB and executable rustc writes -- and every
-      # temp file the tests create, which is why the same suite that runs in
-      # ~20s on Linux takes ~90s here. Best-effort: a runner that refuses the
-      # exclusion should build slowly, not fail.
-      - if: runner.os == 'Windows' && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true')
-        shell: pwsh
-        run: |
-          try {
-            Add-MpPreference -ExclusionPath "${{ github.workspace }}", "$env:USERPROFILE\.cargo", "$env:TEMP" -ErrorAction Stop
-          } catch {
-            Write-Host "Defender exclusions unavailable, continuing: $_"
-          }
+      # Windows Defender exclusions were tried here on the theory that
+      # real-time scanning of build output and test temp files was behind the
+      # slow Windows leg. Measured warm-to-warm on master, it wasn't: test
+      # execution went 74.7s to 72.9s, inside the noise band, for a step that
+      # cost 3s. The ~90s figure that motivated it came from a PR run, not the
+      # master baseline it was compared against. Don't re-add it without a
+      # measurement that separates test execution from compilation.
+      #
       # No separate `cargo build` step: `cargo test` compiles and links the
       # same libs and bins (it builds every bin target so integration tests
       # can spawn them -- see crates/flare-git-shim/tests/shim_test.rs), so
