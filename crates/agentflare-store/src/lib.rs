@@ -22,6 +22,8 @@ pub enum Error {
     Migration(#[from] rusqlite_migration::Error),
     #[error(transparent)]
     DbKit(#[from] db_kit::open::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("blob too large: {size} > {max}")]

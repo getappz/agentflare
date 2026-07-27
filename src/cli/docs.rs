@@ -27,6 +27,15 @@ pub enum DocsCmd {
     },
     /// List every cached document.
     List,
+    /// Reclaim orphaned files left in the legacy shared blob directory
+    /// (`~/.agentflare/blobs`) by builds predating per-database blob
+    /// directories. Only removes files that no database in that directory
+    /// still references.
+    SweepLegacyBlobs {
+        /// Report what would be reclaimed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Force a fresh fetch for a package, bypassing the cache.
     Refresh {
         package: String,
@@ -82,6 +91,20 @@ pub fn run(args: DocsArgs) {
                 // cache-hit shape above, rather than inventing fetch-outcome
                 // telemetry a plain "get" never asked for.
                 None => fetch_and_print(&store, eco, &package, &version, false),
+            }
+        }
+        DocsCmd::SweepLegacyBlobs { dry_run } => {
+            // The docs database and store.db share this directory, and the
+            // sweep consults both -- opening the store above also guarantees
+            // there is at least one database for it to consult.
+            let root = flare_docs::DocsStore::default_db_path();
+            let root = root.parent().unwrap_or(std::path::Path::new("."));
+            match agentflare_store::maintenance::sweep_legacy_blobs(root, dry_run) {
+                Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
+                Err(e) => {
+                    eprintln!("flare-docs: legacy blob sweep failed: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         DocsCmd::Refresh {

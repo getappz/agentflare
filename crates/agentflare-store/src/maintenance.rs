@@ -14,6 +14,8 @@
 use crate::Store;
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// How long a soft-deleted row is kept before it is physically removed.
 ///
@@ -284,6 +286,124 @@ impl Store {
     }
 }
 
+/// What one [`sweep_legacy_blobs`] run reclaimed.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct LegacySweepReport {
+    /// Files found in the legacy directory.
+    pub scanned: usize,
+    pub reclaimed: usize,
+    pub bytes_reclaimed: u64,
+    /// File names of the databases whose references were counted.
+    pub databases: Vec<String>,
+    /// True when nothing was actually deleted.
+    pub dry_run: bool,
+}
+
+/// Removes files from the pre-namespacing shared `<root>/blobs` that no
+/// database in `root` still references.
+///
+/// Blob directories are per-database now (`Store::blob_dir`): each `.db` keeps
+/// its own `store_blobs` ref counts, so a shared directory let one store's
+/// reclaim strand another store's content. Writes and deletes moved to the
+/// namespaced directory and reads fall back to this one, which is why nothing
+/// cleans it up in the normal course of things — only a sweep that consults
+/// *every* database in the directory can prove a file here is dead.
+///
+/// Aborts without deleting anything if a database cannot be read: an
+/// incomplete reference set would make live content look like garbage.
+pub fn sweep_legacy_blobs(root: &Path, dry_run: bool) -> Result<LegacySweepReport, crate::Error> {
+    let legacy = root.join("blobs");
+    let mut report = LegacySweepReport {
+        dry_run,
+        ..Default::default()
+    };
+    if !legacy.is_dir() {
+        return Ok(report);
+    }
+
+    let mut dbs: Vec<PathBuf> = std::fs::read_dir(root)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "db"))
+        .collect();
+    dbs.sort();
+
+    // With no database to consult, every file would look unreferenced.
+    if dbs.is_empty() {
+        return Err(crate::Error::NotFound(format!(
+            "no store databases in {} — refusing to sweep",
+            root.display()
+        )));
+    }
+
+    let referenced = collect_referenced_hashes(&dbs, &mut report.databases)?;
+
+    for shard in std::fs::read_dir(&legacy)? {
+        let shard = shard?.path();
+        if !shard.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&shard)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(hash) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            report.scanned += 1;
+            if referenced.contains(hash) {
+                continue;
+            }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if !dry_run {
+                std::fs::remove_file(&path)?;
+            }
+            report.reclaimed += 1;
+            report.bytes_reclaimed += size;
+        }
+        // An emptied shard is clutter; a non-empty one just stays.
+        if !dry_run {
+            let _ = std::fs::remove_dir(&shard);
+        }
+    }
+
+    Ok(report)
+}
+
+/// Every blob hash referenced by any store database in `dbs`, appending the
+/// consulted file names to `consulted`.
+fn collect_referenced_hashes(
+    dbs: &[PathBuf],
+    consulted: &mut Vec<String>,
+) -> Result<HashSet<String>, crate::Error> {
+    let mut referenced = HashSet::new();
+    for db in dbs {
+        // Read-only on purpose, and no migrations: the sweep must not alter a
+        // database it is only consulting.
+        let conn =
+            rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // A `.db` without the table isn't a store database and holds no
+        // references — checked explicitly rather than by swallowing a failed
+        // query, so a database that is broken rather than unrelated still
+        // propagates instead of silently contributing nothing.
+        let is_store = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_blobs'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !is_store {
+            continue;
+        }
+        let mut stmt = conn.prepare("SELECT hash FROM store_blobs")?;
+        for hash in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            referenced.insert(hash?);
+        }
+        consulted.push(db.file_name().unwrap_or_default().to_string_lossy().into());
+    }
+    Ok(referenced)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +413,103 @@ mod tests {
 
     fn store() -> Store {
         Store::open_memory().unwrap()
+    }
+
+    /// Writes a file into the legacy shared `<root>/blobs` the way a build
+    /// predating per-database blob directories would have.
+    fn legacy_file(root: &Path, hash: &str, data: &[u8]) -> PathBuf {
+        let path = root.join("blobs").join(&hash[..2]).join(hash);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, data).unwrap();
+        path
+    }
+
+    /// Registers `hash` in `s`'s ref-count table without writing a file --
+    /// the row is what the sweep consults.
+    fn reference(s: &Store, hash: &str) {
+        s.conn()
+            .execute(
+                "INSERT INTO store_blobs (hash, size, ref_count, created_at) VALUES (?1, 1, 1, ?2)",
+                params![hash, db_kit::ids::now()],
+            )
+            .unwrap();
+    }
+
+    const KEPT: &str = "aa00000000000000000000000000000000000000000000000000000000000001";
+    const DEAD: &str = "bb00000000000000000000000000000000000000000000000000000000000002";
+
+    #[test]
+    fn the_sweep_reclaims_only_files_no_database_in_the_directory_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = Store::open_file(&dir.path().join("flare-docs.db")).unwrap();
+        let _assets = Store::open_file(&dir.path().join("store.db")).unwrap();
+        // Referenced by one of the two databases; the sweep must consult both.
+        reference(&docs, KEPT);
+
+        let kept = legacy_file(dir.path(), KEPT, b"still referenced");
+        let dead = legacy_file(dir.path(), DEAD, b"orphaned by the split");
+
+        let report = sweep_legacy_blobs(dir.path(), false).unwrap();
+
+        assert!(kept.exists(), "a referenced legacy file must survive");
+        assert!(
+            !dead.exists(),
+            "an unreferenced legacy file must be removed"
+        );
+        assert_eq!((report.scanned, report.reclaimed), (2, 1));
+        assert_eq!(
+            report.bytes_reclaimed,
+            b"orphaned by the split".len() as u64
+        );
+        assert_eq!(report.databases.len(), 2, "both databases consulted");
+    }
+
+    #[test]
+    fn a_dry_run_reports_what_it_would_reclaim_without_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let _s = Store::open_file(&dir.path().join("store.db")).unwrap();
+        let dead = legacy_file(dir.path(), DEAD, b"orphan");
+
+        let report = sweep_legacy_blobs(dir.path(), true).unwrap();
+
+        assert!(dead.exists(), "a dry run must not delete");
+        assert_eq!(report.reclaimed, 1);
+        assert!(report.dry_run);
+    }
+
+    // Without a database there is no reference set, so every file would look
+    // dead -- exactly the situation in which deleting is unrecoverable.
+    #[test]
+    fn the_sweep_refuses_to_run_with_no_database_to_consult() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = legacy_file(dir.path(), DEAD, b"unprovable");
+
+        assert!(sweep_legacy_blobs(dir.path(), false).is_err());
+        assert!(orphan.exists(), "a refused sweep must delete nothing");
+    }
+
+    #[test]
+    fn an_unrelated_database_in_the_directory_is_skipped_rather_than_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open_file(&dir.path().join("store.db")).unwrap();
+        reference(&s, KEPT);
+        let kept = legacy_file(dir.path(), KEPT, b"still referenced");
+
+        // A sqlite file that isn't a store: no store_blobs table.
+        let other = rusqlite::Connection::open(dir.path().join("unrelated.db")).unwrap();
+        other
+            .execute_batch("CREATE TABLE notes (id INTEGER)")
+            .unwrap();
+        drop(other);
+
+        let report = sweep_legacy_blobs(dir.path(), false).unwrap();
+
+        assert!(kept.exists());
+        assert_eq!(
+            report.databases,
+            vec!["store.db".to_string()],
+            "only the store database contributes references"
+        );
     }
 
     fn backdate_deletion(store: &Store, id: &str, secs_ago: i64) {
