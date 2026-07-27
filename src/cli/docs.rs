@@ -20,7 +20,7 @@ pub enum DocsCmd {
         package: String,
         #[arg(long, default_value = "latest")]
         version: String,
-        /// Registry to look the package up in: rust (docs.rs) or npm.
+        /// Registry to look the package up in: rust (docs.rs), npm, or python (PyPI).
         /// Defaults to rust; scoped names (@scope/pkg) imply npm.
         #[arg(long, short = 'e')]
         ecosystem: Option<String>,
@@ -32,7 +32,7 @@ pub enum DocsCmd {
         package: String,
         #[arg(long, default_value = "latest")]
         version: String,
-        /// Registry to look the package up in: rust (docs.rs) or npm.
+        /// Registry to look the package up in: rust (docs.rs), npm, or python (PyPI).
         #[arg(long, short = 'e')]
         ecosystem: Option<String>,
     },
@@ -120,6 +120,10 @@ fn fetch_and_print(
         }
         flare_docs::Ecosystem::Npm => {
             flare_docs::npm::fetch_and_store(&fetcher, store, package, version)
+                .map_err(|e| e.to_string())
+        }
+        flare_docs::Ecosystem::Python => {
+            flare_docs::python::fetch_and_store(&fetcher, store, package, version)
                 .map_err(|e| e.to_string())
         }
     };
