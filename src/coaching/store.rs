@@ -56,7 +56,7 @@ impl Drop for RulesLock {
 
 /// List all coaching rules from the rules directory, sorted by id. Returns
 /// an empty vec if the directory doesn't exist or can't be read.
-pub(super) fn list_rules() -> Vec<CoachingRule> {
+pub(crate) fn list_rules() -> Vec<CoachingRule> {
     let dir = rules_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();

@@ -373,6 +373,195 @@ fn sync_skill_overrides() -> Result<usize, String> {
     Ok(added)
 }
 
+/// The core-module coaching rules agentflare ships by default: nudge the
+/// flare gateway's docs/search/lean-ctx/tool-search wrappers over their
+/// native equivalents. Builtin tier so `agentflare init` and every
+/// non-consent SessionStart (see hook::session_start_message) refresh them
+/// if their body drifts from this list; a same-id rule the user has since
+/// tagged Override is left alone — override always wins.
+struct DefaultCoachingRule {
+    id: &'static str,
+    title: &'static str,
+    body: &'static str,
+    tools: &'static [&'static str],
+    sync: &'static [&'static str],
+}
+
+const DEFAULT_COACHING_RULES: &[DefaultCoachingRule] = &[
+    DefaultCoachingRule {
+        id: "usedocs",
+        title: "flare-docs for package API questions",
+        body: "@rule: before writing/reviewing code against any package's API, or citing its behavior, check mcp__flare__docs (search|get) \u{2014} do not rely on memory for library API details @ecosystems: rust (docs.rs, default) \u{b7} npm (ecosystem=\"npm\") @fallback: docs tool missing from your list? ToolSearch(\"select:mcp__flare__docs\") first",
+        tools: &["Edit", "Write"],
+        sync: &["claude-code"],
+    },
+    DefaultCoachingRule {
+        id: "usesearch",
+        title: "flare-search over native web search",
+        body: "@use: mcp__flare__search (global, 17 sources via type=) \u{2014} type=web for general internet search, plus social/news/github/academic/datasets/code/memory/store/websites/weather/financial/crypto/fx/indicators/youtube/bluesky @skip: WebFetch, WebSearch, websearch-agent, web_search_exa \u{2014} superseded by mcp__flare__search type=web @fallback: Exa MCP tools only for what flare-search has no equivalent for \u{2014} get_code_context_exa, company_research_exa",
+        tools: &["WebFetch", "WebSearch"],
+        sync: &["claude-code"],
+    },
+    DefaultCoachingRule {
+        id: "useleanctx",
+        title: "lean-ctx over native file/search/shell tools",
+        body: "@use: lean-ctx over native tools, routed via the flare gateway \u{2014} never call mcp__lean-ctx__* directly. ctx_read>Read/cat, ctx_shell>Bash, ctx_search>Grep, ctx_glob>Glob, ctx_callgraph>grep for \"who calls X\" @call: mcp__flare__tool(action=\"execute\", server=\"leanctx\", tool=\"<name>\", args={...}) for every ctx_* op above @when: unfamiliar code \u{2014} ctx_compose FIRST, one call instead of a search->read->search chain @discover: unsure of a tools args? mcp__flare__tool(action=\"search\", query=\"<name>\") first",
+        tools: &["Read", "Grep", "Glob", "Bash"],
+        sync: &["claude-code"],
+    },
+    DefaultCoachingRule {
+        id: "usetsearch",
+        title: "flare tool-search over native ToolSearch for gateway tools",
+        body: "@use: for MCP tools behind the flare gateway (leanctx, docs, search, memory, review, etc.), prefer mcp__flare__tool(action=\"search\", query=\"<what you need>\") over native ToolSearch \u{2014} it searches downstream servers directly instead of the static deferred-tool list @fallback: native ToolSearch is still right for first-party deferred tools not behind the gateway (WebFetch, EnterPlanMode, mcp__claude-in-chrome__*, etc.)",
+        tools: &["ToolSearch"],
+        sync: &["claude-code"],
+    },
+];
+
+/// True if every `DEFAULT_COACHING_RULES` entry either doesn't exist yet
+/// (needs seeding), exists with content matching this list (already in
+/// sync), or has been overridden by the user (tier Override — left alone).
+fn coaching_defaults_satisfied() -> bool {
+    let existing = crate::coaching::list_rules();
+    DEFAULT_COACHING_RULES.iter().all(|d| {
+        match existing.iter().find(|r| r.id == d.id) {
+            None => false,
+            Some(r) if r.tier == crate::coaching::rule::RuleTier::Override => true,
+            Some(r) => r.body == d.body,
+        }
+    })
+}
+
+/// Seeds any missing `DEFAULT_COACHING_RULES` entry and refreshes any
+/// Builtin-tier one whose body has drifted from this list. Never touches a
+/// same-id rule the user has overridden (tier Override).
+fn apply_coaching_defaults() -> String {
+    let existing = crate::coaching::list_rules();
+    let mut changed = vec![];
+    for d in DEFAULT_COACHING_RULES {
+        if let Some(r) = existing.iter().find(|r| r.id == d.id)
+            && (r.tier == crate::coaching::rule::RuleTier::Override || r.body == d.body)
+        {
+            continue;
+        }
+        let trigger = crate::coaching::rule::RuleTrigger {
+            tools: d.tools.iter().map(|s| s.to_string()).collect(),
+            auto_match: true,
+        };
+        let sync: Vec<String> = d.sync.iter().map(|s| s.to_string()).collect();
+        if crate::coaching::apply_rule(
+            d.id,
+            d.title,
+            d.body,
+            Some(trigger),
+            crate::coaching::rule::RuleTier::Builtin,
+            sync,
+        )
+        .is_ok()
+        {
+            changed.push(d.id);
+        }
+    }
+    if changed.is_empty() {
+        "core-module coaching rules already up to date".to_string()
+    } else {
+        format!(
+            "core-module coaching rules seeded/refreshed: {}",
+            changed.join(", ")
+        )
+    }
+}
+
+/// Fully-qualified flare-gateway tool names every core-module coaching rule
+/// nudges toward. Kept allowlisted in `~/.claude/settings.json` so the
+/// nudge doesn't cost a permission prompt on every call.
+const GATEWAY_PERMISSIONS_ALLOW: &[&str] = &[
+    "mcp__flare__docs",
+    "mcp__flare__search",
+    "mcp__flare__tool",
+    "ToolSearch",
+];
+
+/// Prefix of direct lean-ctx MCP tool names superseded by routing through
+/// `mcp__flare__tool(action="execute", server="leanctx", ...)` instead.
+const STALE_LEANCTX_PERMISSION_PREFIX: &str = "mcp__lean-ctx__";
+
+/// Adds any missing `GATEWAY_PERMISSIONS_ALLOW` entry to
+/// `settings.permissions.allow` and strips any direct `mcp__lean-ctx__*`
+/// entry. Returns the number of entries changed.
+fn apply_gateway_permissions(settings: &mut Value) -> Result<usize, String> {
+    if !settings.is_object() {
+        *settings = serde_json::json!({});
+    }
+    let obj = settings.as_object_mut().expect("just ensured object above");
+    let permissions = obj
+        .entry("permissions")
+        .or_insert_with(|| serde_json::json!({}));
+    if !permissions.is_object() {
+        *permissions = serde_json::json!({});
+    }
+    let perm_obj = permissions
+        .as_object_mut()
+        .ok_or("permissions is not an object")?;
+    let allow = perm_obj
+        .entry("allow")
+        .or_insert_with(|| serde_json::json!([]));
+    let arr = allow
+        .as_array_mut()
+        .ok_or("permissions.allow is not an array")?;
+
+    let before = arr.len();
+    arr.retain(|v| {
+        !v.as_str()
+            .is_some_and(|s| s.starts_with(STALE_LEANCTX_PERMISSION_PREFIX))
+    });
+    let mut changed = before - arr.len();
+
+    for name in GATEWAY_PERMISSIONS_ALLOW {
+        let present = arr.iter().any(|v| v.as_str() == Some(*name));
+        if !present {
+            arr.push(serde_json::json!(*name));
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
+/// True if `~/.claude/settings.json` already allowlists every entry in
+/// `GATEWAY_PERMISSIONS_ALLOW` and carries no stale direct lean-ctx entry.
+fn gateway_permissions_satisfied() -> bool {
+    let settings = claude_settings();
+    let Some(arr) = settings
+        .get("permissions")
+        .and_then(|p| p.get("allow"))
+        .and_then(|a| a.as_array())
+    else {
+        return false;
+    };
+    let has_all = GATEWAY_PERMISSIONS_ALLOW
+        .iter()
+        .all(|name| arr.iter().any(|v| v.as_str() == Some(*name)));
+    let has_stale = arr.iter().any(|v| {
+        v.as_str()
+            .is_some_and(|s| s.starts_with(STALE_LEANCTX_PERMISSION_PREFIX))
+    });
+    has_all && !has_stale
+}
+
+/// Applies `apply_gateway_permissions` to the real `~/.claude/settings.json`,
+/// writing back only if something changed.
+fn sync_gateway_permissions() -> Result<usize, String> {
+    let path = claude_settings_path();
+    let mut settings = claude_settings();
+    let changed = apply_gateway_permissions(&mut settings)?;
+    if changed > 0 {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        write_json_pretty(&path, &settings).map_err(|e| e.to_string())?;
+    }
+    Ok(changed)
+}
 pub fn get_components(host: &str) -> Vec<Component> {
     let claude_code_only = host == "claude-code";
     let host_owned = host.to_string();
@@ -695,6 +884,34 @@ pub fn get_components(host: &str) -> Vec<Component> {
                 })
             },
         },
+        Component {
+            id: "core-coaching",
+            needs_consent: false,
+            describe: "built-in coaching rules nudging flare-docs, flare-search, lean-ctx, and flare tool-search over their native equivalents".to_string(),
+            check: Box::new(move || !claude_code_only || coaching_defaults_satisfied()),
+            apply: Box::new(move || {
+                if !claude_code_only {
+                    return "not applicable for this host".to_string();
+                }
+                apply_coaching_defaults()
+            }),
+        },
+        Component {
+            id: "gateway-permissions",
+            needs_consent: false,
+            describe: "allowlist the flare gateway tools (mcp__flare__docs, mcp__flare__search, mcp__flare__tool, ToolSearch) in ~/.claude/settings.json and remove superseded direct mcp__lean-ctx__* entries".to_string(),
+            check: Box::new(move || !claude_code_only || gateway_permissions_satisfied()),
+            apply: Box::new(move || {
+                if !claude_code_only {
+                    return "not applicable for this host".to_string();
+                }
+                match sync_gateway_permissions() {
+                    Ok(0) => "gateway permissions already up to date".to_string(),
+                    Ok(n) => format!("gateway permissions updated ({n} change(s))"),
+                    Err(e) => format!("gateway permissions sync failed: {e}"),
+                }
+            }),
+        },
     ];
 
     // Gated behind the `skill-overrides-sync` cargo feature (off by
@@ -766,6 +983,8 @@ mod tests {
             "leanctx",
             "agentflare-mcp",
             "optimize-code-mode",
+            "core-coaching",
+            "gateway-permissions",
         ];
         #[cfg(feature = "skill-overrides-sync")]
         let expected: Vec<&str> = vec![
@@ -777,6 +996,8 @@ mod tests {
             "leanctx",
             "agentflare-mcp",
             "optimize-code-mode",
+            "core-coaching",
+            "gateway-permissions",
             "skill-overrides-sync",
         ];
 
@@ -1287,6 +1508,135 @@ mod tests {
                 .find(|c| c.id == "claude-code-bashenv-guard")
                 .unwrap();
             assert!((guard.check)());
+        });
+    }
+
+    #[test]
+    fn apply_gateway_permissions_adds_missing_and_strips_stale_leanctx() {
+        let mut settings = serde_json::json!({
+            "permissions": {
+                "allow": ["mcp__lean-ctx__ctx_read", "mcp__flare__docs"]
+            }
+        });
+        let changed = apply_gateway_permissions(&mut settings).unwrap();
+        assert_eq!(changed, 4, "3 missing entries added + 1 stale entry stripped");
+        let allow = settings["permissions"]["allow"].as_array().unwrap();
+        for name in GATEWAY_PERMISSIONS_ALLOW {
+            assert!(
+                allow.iter().any(|v| v.as_str() == Some(*name)),
+                "expected {name} in permissions.allow"
+            );
+        }
+        assert!(
+            allow
+                .iter()
+                .all(|v| !v.as_str().unwrap().starts_with(STALE_LEANCTX_PERMISSION_PREFIX)),
+            "no direct mcp__lean-ctx__* entry should remain"
+        );
+    }
+
+    #[test]
+    fn apply_gateway_permissions_is_idempotent_once_satisfied() {
+        let mut settings = serde_json::json!({});
+        apply_gateway_permissions(&mut settings).unwrap();
+        let changed = apply_gateway_permissions(&mut settings).unwrap();
+        assert_eq!(changed, 0, "second pass over already-correct settings changes nothing");
+    }
+
+    #[test]
+    fn gateway_permissions_component_check_then_apply_then_check() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("claude-code");
+            let gw = components
+                .iter()
+                .find(|c| c.id == "gateway-permissions")
+                .unwrap();
+            assert!(!(gw.check)(), "fresh temp home has no settings.json yet");
+            (gw.apply)();
+            assert!((gw.check)(), "should be satisfied immediately after apply");
+        });
+    }
+
+    #[test]
+    fn gateway_permissions_is_satisfied_for_non_claude_code_hosts() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("opencode");
+            let gw = components
+                .iter()
+                .find(|c| c.id == "gateway-permissions")
+                .unwrap();
+            assert!((gw.check)());
+        });
+    }
+
+    #[test]
+    fn coaching_defaults_seed_all_four_rules_on_fresh_home() {
+        crate::paths::test_support::with_temp_home(|| {
+            assert!(!coaching_defaults_satisfied());
+            let summary = apply_coaching_defaults();
+            assert!(summary.contains("seeded/refreshed"));
+            assert!(coaching_defaults_satisfied());
+
+            let existing = crate::coaching::list_rules();
+            for d in DEFAULT_COACHING_RULES {
+                let r = existing.iter().find(|r| r.id == d.id).unwrap_or_else(|| {
+                    panic!("expected seeded rule '{}'", d.id)
+                });
+                assert_eq!(r.body, d.body);
+                assert_eq!(r.tier, crate::coaching::rule::RuleTier::Builtin);
+            }
+        });
+    }
+
+    #[test]
+    fn coaching_defaults_apply_is_idempotent_once_seeded() {
+        crate::paths::test_support::with_temp_home(|| {
+            apply_coaching_defaults();
+            let summary = apply_coaching_defaults();
+            assert_eq!(summary, "core-module coaching rules already up to date");
+        });
+    }
+
+    #[test]
+    fn coaching_defaults_never_overwrite_a_user_override() {
+        crate::paths::test_support::with_temp_home(|| {
+            apply_coaching_defaults();
+
+            let first = DEFAULT_COACHING_RULES.first().unwrap();
+            crate::coaching::apply_rule(
+                first.id,
+                "my own title",
+                "my own customized body",
+                None,
+                crate::coaching::rule::RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
+
+            assert!(
+                coaching_defaults_satisfied(),
+                "an Override-tier rule at a default id counts as satisfied"
+            );
+            apply_coaching_defaults();
+
+            let existing = crate::coaching::list_rules();
+            let r = existing.iter().find(|r| r.id == first.id).unwrap();
+            assert_eq!(r.body, "my own customized body");
+            assert_eq!(r.tier, crate::coaching::rule::RuleTier::Override);
+        });
+    }
+
+    #[test]
+    fn coaching_defaults_component_check_then_apply_then_check() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("claude-code");
+            let cc = components
+                .iter()
+                .find(|c| c.id == "core-coaching")
+                .unwrap();
+            assert!(!(cc.check)());
+            (cc.apply)();
+            assert!((cc.check)());
         });
     }
 }
