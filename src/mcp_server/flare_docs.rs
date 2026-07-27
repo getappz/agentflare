@@ -10,8 +10,8 @@ use super::*;
 // re-exported (not just privately imported) through this submodule for that
 // path to resolve.
 pub(crate) use ::flare_docs::{
-    ClientError, DocsStore, Ecosystem, FetchOutcome, Fetcher, UreqFetcher, docs_rs_json_url, npm,
-    store_fetched,
+    ClientError, DocsStore, Ecosystem, FetchOutcome, Fetcher, GcOpts, UreqFetcher,
+    docs_rs_json_url, npm, store_fetched,
 };
 
 const DEFAULT_LIMIT: usize = 10;
@@ -137,7 +137,7 @@ impl AgentflareMcp {
         package: String,
         version: String,
     ) -> Result<FetchOutcome, ErrorData> {
-        match eco {
+        let outcome = match eco {
             Ecosystem::Rust => {
                 let url = docs_rs_json_url(&package, &version);
                 let fetched =
@@ -159,6 +159,42 @@ impl AgentflareMcp {
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
                 })?
             }
+        }?;
+        self.gc_docs_cache();
+        Ok(outcome)
+    }
+
+    /// Trims the docs cache back inside its retention and size budgets.
+    ///
+    /// Runs here rather than on a schedule: every route that grows the cache
+    /// funnels through the fetch above, so a completed fetch is exactly when
+    /// there is something new to collect, and nothing has to own a timer or
+    /// a background task to make it happen.
+    ///
+    /// Failures are swallowed on purpose. The caller asked for
+    /// documentation, and a cache that could not be trimmed still answers
+    /// the question it was asked; failing the fetch over housekeeping would
+    /// trade a working feature for a disk-space concern.
+    fn gc_docs_cache(&self) {
+        let Ok(Ok(report)) = self.with_flare_docs_store(|store| store.gc(GcOpts::default())) else {
+            return;
+        };
+        if report.purged + report.evicted == 0 {
+            return;
+        }
+        // Journaled beside the git shim's log, for the same reason it has
+        // one: a cache that drops content the caller still believes is there
+        // needs a record of what went and when, or the next surprising
+        // cache miss has no explanation behind it.
+        if let Some(path) = flare_git_core::audit::default_path("gc.jsonl") {
+            let _ = flare_git_core::audit::log_event(
+                &path,
+                &serde_json::json!({
+                    "at": db_kit::ids::now(),
+                    "store": "flare-docs",
+                    "gc": report,
+                }),
+            );
         }
     }
 

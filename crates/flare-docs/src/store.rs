@@ -1,4 +1,5 @@
 use agentflare_store::documents::{DocMatch, DocUpsertOpts, Document, DocumentSummary};
+use agentflare_store::maintenance::{GcOpts, GcReport};
 use rusqlite::OptionalExtension;
 use std::path::{Path, PathBuf};
 
@@ -135,6 +136,16 @@ impl DocsStore {
 
     pub fn blob_store_raw(&self, data: &[u8]) -> Result<String, Error> {
         Ok(self.inner.blob_store(data)?)
+    }
+
+    /// Purges expired tombstones and evicts the least recently updated
+    /// documents while the cache is over budget.
+    ///
+    /// Nothing schedules this — the caller runs it on the fetch path, which
+    /// is the only thing that makes the cache bigger. See
+    /// [`agentflare_store::maintenance`].
+    pub fn gc(&self, opts: GcOpts) -> Result<GcReport, Error> {
+        Ok(self.inner.gc(PROJECT_ID, opts)?)
     }
 
     /// Upserts many documents in a single transaction.
