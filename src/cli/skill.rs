@@ -7,7 +7,7 @@ use skill::source::parse_source;
 use skill::types::{
     AgentConfig, AgentId, DiscoverOptions, InstallMode, InstallOptions, InstallScope,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
@@ -44,6 +44,25 @@ pub enum SkillAction {
     Hub {
         #[command(subcommand)]
         action: HubAction,
+    },
+    /// Suppress proactive skill-advisory suggestions for a skill.
+    Snooze {
+        name: String,
+        /// Days to suppress suggestions for.
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+    },
+    /// Permanently suppress proactive skill-advisory suggestions for a skill.
+    Dismiss {
+        name: String,
+    },
+    /// Detect a target repo's stack and recommend indexed skills for it.
+    /// Prints a dry-run report only, unless `--yes` is passed.
+    Provision {
+        path: String,
+        /// Actually provision the recommended skills (default: dry run).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -648,6 +667,148 @@ fn run_hub(action: HubAction) -> Result<String, Box<dyn std::error::Error>> {
     }
 }
 
+fn run_snooze(name: &str, days: i64) {
+    crate::skill_proactive::snooze(name, days);
+    println!("✓ snoozed '{name}' for {days} day(s)");
+}
+
+fn run_dismiss(name: &str) {
+    crate::skill_proactive::dismiss(name);
+    println!("✓ dismissed '{name}' — will not be suggested again");
+}
+
+/// Manifest files/layout that identify a repo's stack. Pure and side-effect
+/// free so it's directly testable without touching the skill DB.
+fn detect_stack(path: &Path) -> Vec<&'static str> {
+    let mut stack = Vec::new();
+    if path.join("Cargo.toml").is_file() {
+        stack.push("rust");
+    }
+    if path.join("package.json").is_file() {
+        stack.push("node");
+        stack.push("javascript");
+    }
+    if path.join("tsconfig.json").is_file() {
+        stack.push("typescript");
+    }
+    if path.join("pyproject.toml").is_file() || path.join("requirements.txt").is_file() {
+        stack.push("python");
+    }
+    if path.join("go.mod").is_file() {
+        stack.push("go");
+    }
+    stack
+}
+
+/// Best-scoring hit per skill name across every stack tag, ranked
+/// descending. Takes a raw `Connection` (not `Registry`) so it's testable
+/// against an in-memory DB seeded via `skill_registry::db::rebuild`.
+fn rank_candidates(
+    conn: &rusqlite::Connection,
+    stack: &[&str],
+) -> Vec<skill_registry::search::SkillHit> {
+    let mut best: HashMap<String, skill_registry::search::SkillHit> = HashMap::new();
+    for tag in stack {
+        let Ok(hits) = skill_registry::search::search(conn, tag, 5, skill_registry::MatchMode::Any)
+        else {
+            continue;
+        };
+        for hit in hits {
+            best.entry(hit.name.clone())
+                .and_modify(|existing| {
+                    if hit.score > existing.score {
+                        *existing = hit.clone();
+                    }
+                })
+                .or_insert(hit);
+        }
+    }
+    let mut ranked: Vec<_> = best.into_values().collect();
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranked
+}
+
+fn run_provision(path: &str, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let repo_path = Path::new(path);
+    let stack = detect_stack(repo_path);
+    if stack.is_empty() {
+        println!(
+            "no recognized stack detected at '{path}' (looked for Cargo.toml/package.json/pyproject.toml/requirements.txt/go.mod)"
+        );
+        return Ok(());
+    }
+    println!("detected stack: {}", stack.join(", "));
+
+    let db_path = crate::paths::skills_db_path();
+    let mut conn = skill_registry::db::open_db(&db_path)?;
+    let ranked = rank_candidates(&conn, &stack);
+    if ranked.is_empty() {
+        println!(
+            "no matching skills found for detected stack — run `agentflare skill list`/`search` first to populate the index"
+        );
+        return Ok(());
+    }
+
+    let total_tokens: i64 = ranked.iter().map(|h| h.est_tokens).sum();
+    println!(
+        "recommended skills ({} candidates, ~{total_tokens} tokens):",
+        ranked.len()
+    );
+    for hit in &ranked {
+        println!(
+            "  {} — {} (confidence {:.0}%, ~{} tokens)",
+            hit.name,
+            hit.description,
+            hit.score.min(1.0) * 100.0,
+            hit.est_tokens
+        );
+    }
+
+    if !yes {
+        println!("\n(dry run — pass --yes to install)");
+        return Ok(());
+    }
+
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let sources =
+        skill_registry::sources::default_sources(&home, &cwd, &["claude-code".to_string()]);
+    let scan = skill_registry::sources::scan_sources(&sources);
+    let mut all = scan.entries;
+    let mut existing: HashSet<(String, String)> = all
+        .iter()
+        .map(|e| (e.name.clone(), e.source.clone()))
+        .collect();
+
+    let provisioned_source = format!("provisioned:{path}");
+    let mut installed = 0;
+    for hit in &ranked {
+        let Some(entry) = all
+            .iter()
+            .find(|e| e.name == hit.name && e.source == hit.source)
+            .cloned()
+        else {
+            continue;
+        };
+        let provisioned = skill_registry::sources::SkillEntry {
+            source: provisioned_source.clone(),
+            ..entry
+        };
+        if existing.insert((provisioned.name.clone(), provisioned.source.clone())) {
+            all.push(provisioned);
+            installed += 1;
+        }
+    }
+
+    skill_registry::db::rebuild(&mut conn, &all)?;
+    println!("✓ provisioned {installed} skill(s) for '{path}' under source '{provisioned_source}'");
+    Ok(())
+}
+
 impl SkillArgs {
     pub fn run(self) {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -704,6 +865,14 @@ impl SkillArgs {
                     std::process::exit(1);
                 }
             },
+            SkillAction::Snooze { name, days } => run_snooze(&name, days),
+            SkillAction::Dismiss { name } => run_dismiss(&name),
+            SkillAction::Provision { path, yes } => {
+                if let Err(e) = run_provision(&path, yes) {
+                    eprintln!("provision error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
@@ -817,5 +986,85 @@ mod tests {
                 "expected {installed:?} to exist after install"
             );
         });
+    }
+
+    #[test]
+    fn detect_stack_identifies_rust_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        assert_eq!(detect_stack(dir.path()), vec!["rust"]);
+    }
+
+    #[test]
+    fn detect_stack_identifies_node_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        assert_eq!(detect_stack(dir.path()), vec!["node", "javascript"]);
+    }
+
+    #[test]
+    fn detect_stack_is_empty_for_unrecognized_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(detect_stack(dir.path()).is_empty());
+    }
+
+    fn fixture_entry(
+        name: &str,
+        description: &str,
+        tags: &str,
+    ) -> skill_registry::sources::SkillEntry {
+        skill_registry::sources::SkillEntry {
+            name: name.to_string(),
+            source: "test".to_string(),
+            path: PathBuf::from(format!("/fixtures/{name}/SKILL.md")),
+            description: description.to_string(),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: tags.to_string(),
+            est_tokens: 42,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        }
+    }
+
+    #[test]
+    fn rank_candidates_differs_by_detected_stack() {
+        let mut conn = skill_registry::db::open_in_memory().unwrap();
+        skill_registry::db::rebuild(
+            &mut conn,
+            &[
+                fixture_entry(
+                    "rust-help",
+                    "Guidance for writing idiomatic rust and using cargo",
+                    "rust cargo",
+                ),
+                fixture_entry(
+                    "node-help",
+                    "Guidance for node projects using npm and javascript",
+                    "node javascript npm",
+                ),
+            ],
+        )
+        .unwrap();
+
+        let rust_ranked = rank_candidates(&conn, &["rust"]);
+        let node_ranked = rank_candidates(&conn, &["node", "javascript"]);
+
+        assert_eq!(rust_ranked.first().unwrap().name, "rust-help");
+        assert_eq!(node_ranked.first().unwrap().name, "node-help");
+        assert_ne!(
+            rust_ranked.first().unwrap().name,
+            node_ranked.first().unwrap().name
+        );
+    }
+
+    #[test]
+    fn rank_candidates_empty_stack_yields_no_candidates() {
+        let mut conn = skill_registry::db::open_in_memory().unwrap();
+        skill_registry::db::rebuild(&mut conn, &[fixture_entry("rust-help", "rust", "rust")])
+            .unwrap();
+        assert!(rank_candidates(&conn, &[]).is_empty());
     }
 }

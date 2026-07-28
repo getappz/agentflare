@@ -46,11 +46,6 @@ pub fn load_settings() -> SkillAdvisorySettings {
         .unwrap_or_default()
 }
 
-// TODO(task-6-followup): no CLI/MCP path calls this yet -- the snooze/dismiss
-// write side (e.g. `skill snooze <name>`) is unbuilt, only the read side
-// (proactive_suggestions() checking skill_overrides) exists. Remove this
-// allow once a caller lands.
-#[allow(dead_code)]
 pub fn save_settings(settings: &SkillAdvisorySettings) {
     if let Some(parent) = SETTINGS_PATH.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -58,6 +53,46 @@ pub fn save_settings(settings: &SkillAdvisorySettings) {
     if let Ok(bytes) = serde_json::to_vec_pretty(settings) {
         let _ = std::fs::write(&*SETTINGS_PATH, bytes);
     }
+}
+
+fn apply_snooze(settings: &mut SkillAdvisorySettings, name: &str, snooze_until: i64) {
+    settings
+        .skill_overrides
+        .entry(name.to_string())
+        .or_insert(SkillOverride {
+            snooze_until: 0,
+            dismissed: false,
+        })
+        .snooze_until = snooze_until;
+}
+
+fn apply_dismiss(settings: &mut SkillAdvisorySettings, name: &str) {
+    settings
+        .skill_overrides
+        .entry(name.to_string())
+        .or_insert(SkillOverride {
+            snooze_until: 0,
+            dismissed: false,
+        })
+        .dismissed = true;
+}
+
+/// Suppress proactive suggestions for `name` for `days` days (from now).
+pub fn snooze(name: &str, days: i64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut settings = load_settings();
+    apply_snooze(&mut settings, name, now + days.max(0) * 86_400);
+    save_settings(&settings);
+}
+
+/// Permanently suppress proactive suggestions for `name`.
+pub fn dismiss(name: &str) {
+    let mut settings = load_settings();
+    apply_dismiss(&mut settings, name);
+    save_settings(&settings);
 }
 
 /// Generate proactive skill suggestions: runs `session_context_queries()` →
@@ -133,4 +168,63 @@ pub fn proactive_suggestions() -> Option<String> {
         "\nRelevant skills for this project:\n{}",
         suggestions.join("\n")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_snooze_sets_until_for_new_and_existing_override() {
+        let mut settings = SkillAdvisorySettings::default();
+        apply_snooze(&mut settings, "flare-code", 12345);
+        assert_eq!(
+            settings
+                .skill_overrides
+                .get("flare-code")
+                .unwrap()
+                .snooze_until,
+            12345
+        );
+        assert!(
+            !settings
+                .skill_overrides
+                .get("flare-code")
+                .unwrap()
+                .dismissed
+        );
+
+        apply_snooze(&mut settings, "flare-code", 99999);
+        assert_eq!(
+            settings
+                .skill_overrides
+                .get("flare-code")
+                .unwrap()
+                .snooze_until,
+            99999
+        );
+    }
+
+    #[test]
+    fn apply_dismiss_sets_flag_without_disturbing_snooze() {
+        let mut settings = SkillAdvisorySettings::default();
+        apply_snooze(&mut settings, "flare-code", 555);
+        apply_dismiss(&mut settings, "flare-code");
+        let entry = settings.skill_overrides.get("flare-code").unwrap();
+        assert!(entry.dismissed);
+        assert_eq!(entry.snooze_until, 555);
+    }
+
+    #[test]
+    fn apply_dismiss_on_unknown_skill_creates_override() {
+        let mut settings = SkillAdvisorySettings::default();
+        apply_dismiss(&mut settings, "never-seen");
+        assert!(
+            settings
+                .skill_overrides
+                .get("never-seen")
+                .unwrap()
+                .dismissed
+        );
+    }
 }
