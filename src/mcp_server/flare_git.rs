@@ -4,7 +4,40 @@ use super::*;
 
 impl AgentflareMcp {
     pub fn flare_git_impl(&self, req: GitHubRequest) -> Result<String, ErrorData> {
-        use crate::github::{Client, RepoId, actions, issues, mcp, pulls, releases};
+        use crate::github::{Client, RepoId, actions, issues, mcp, pulls, releases, repos};
+
+        // Keep in sync with the action names matched below — validating
+        // first means an unknown action fails before repo/client setup
+        // (and credentials) rather than surfacing as an unrelated error.
+        const KNOWN_ACTIONS: &[&str] = &[
+            "pr_create",
+            "pr_list",
+            "pr_get",
+            "pr_status",
+            "pr_merge",
+            "pr_comment",
+            "pr_request_review",
+            "issue_create",
+            "issue_list",
+            "issue_get",
+            "issue_comment",
+            "issue_close",
+            "issue_label",
+            "release_list",
+            "release_get",
+            "release_latest",
+            "release_create",
+            "run_list",
+            "run_get",
+            "run_rerun",
+            "workflow_dispatch",
+        ];
+        if !KNOWN_ACTIONS.contains(&req.action.as_str()) {
+            return Err(ErrorData::invalid_params(
+                format!("unknown action: {}", req.action),
+                None,
+            ));
+        }
 
         let repo = match &req.repo {
             Some(r) => RepoId::parse(r)
@@ -253,17 +286,14 @@ impl AgentflareMcp {
                 }
                 let git_ref = match req.git_ref.as_deref() {
                     Some(r) => r.to_string(),
-                    None => {
-                        if req.repo.is_some() {
-                            return Err(ErrorData::invalid_params(
-                                "git_ref is required when repo is overridden (cannot infer the target repo default branch)",
-                                None,
-                            ));
+                    None => match &req.repo {
+                        Some(_) => {
+                            repos::get_default_branch(&client, &repo).map_err(to_mcp_error)?
                         }
-                        flare_git_core::branch::resolve_default_branch(
+                        None => flare_git_core::branch::resolve_default_branch(
                             &std::env::current_dir().unwrap_or_default(),
-                        )
-                    }
+                        ),
+                    },
                 };
                 actions::dispatch(&client, &repo, wf, &git_ref, req.inputs.as_ref())
                     .map_err(to_mcp_error)?;
@@ -277,5 +307,23 @@ impl AgentflareMcp {
             }
         };
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_action_is_rejected_before_repo_or_client_setup() {
+        // Credential-independent: an unknown action must fail on its own
+        // merits, not because there's no repo/token in the test environment.
+        let mcp = AgentflareMcp::default();
+        let req = GitHubRequest {
+            action: "bogus".to_string(),
+            ..Default::default()
+        };
+        let err = mcp.flare_git_impl(req).unwrap_err();
+        assert!(err.to_string().contains("unknown action: bogus"), "{err}");
     }
 }
