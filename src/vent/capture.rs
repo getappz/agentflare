@@ -97,6 +97,19 @@ pub fn append_routed(
     Ok((id, false))
 }
 
+/// Count of vent log entries for `topic_key` within `THROTTLE_WINDOW_SECS`
+/// of now, across both the per-repo and global logs (a topic may have
+/// landed in either, depending on `classify::origin`). Used by
+/// `hook::post_tool_failure` to feed `classify::classify`'s seen_count
+/// input without duplicating the log-scan logic here.
+pub(crate) fn recent_count_for_topic(topic_key: &str) -> i64 {
+    let now = chrono::Utc::now();
+    let repo_count = recent_matches_for_topic(&crate::vent::paths::log_path(), topic_key, now).len();
+    let global_count =
+        recent_matches_for_topic(&crate::vent::paths::global_log_path(), topic_key, now).len();
+    (repo_count + global_count) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +237,15 @@ mod tests {
         assert_eq!(first.severity, "high");
         assert_eq!(first.message, "boom");
         assert_eq!(first.tags, vec!["dx".to_string()]);
+    }
+
+    #[test]
+    fn recent_count_for_topic_counts_matching_recent_entries() {
+        crate::paths::test_support::with_temp_home(|| {
+            append_routed(None, "medium", &[], "the build fails on windows").unwrap();
+            let key = crate::vent::classify::topic_key("the build fails on windows");
+            assert_eq!(recent_count_for_topic(&key), 1);
+            assert_eq!(recent_count_for_topic("totally unrelated topic"), 0);
+        });
     }
 }
