@@ -440,10 +440,19 @@ mod tests {
         };
         // Streak lengths 4 and 5 (2 and 3 prior Bash calls respectively)
         // must be silent -- 3 already fired, 6 hasn't arrived yet.
-        assert!(batching_nudge(&make_recent(3), "Bash").is_none(), "streak len 4");
-        assert!(batching_nudge(&make_recent(4), "Bash").is_none(), "streak len 5");
+        assert!(
+            batching_nudge(&make_recent(3), "Bash").is_none(),
+            "streak len 4"
+        );
+        assert!(
+            batching_nudge(&make_recent(4), "Bash").is_none(),
+            "streak len 5"
+        );
         // Streak length 6 (5 prior calls) is the next milestone.
-        assert!(batching_nudge(&make_recent(5), "Bash").is_some(), "streak len 6");
+        assert!(
+            batching_nudge(&make_recent(5), "Bash").is_some(),
+            "streak len 6"
+        );
     }
 
     #[test]
@@ -476,14 +485,26 @@ mod tests {
     #[test]
     fn batching_streak_resets_when_a_different_tool_interrupts() {
         let mut recent = vec![
-            ToolCallRecord { name: "Bash".to_string(), ts: 1 },
-            ToolCallRecord { name: "Bash".to_string(), ts: 2 },
+            ToolCallRecord {
+                name: "Bash".to_string(),
+                ts: 1,
+            },
+            ToolCallRecord {
+                name: "Bash".to_string(),
+                ts: 2,
+            },
         ];
         // 3rd Bash call -> milestone.
         assert!(batching_nudge(&recent, "Bash").is_some());
-        recent.push(ToolCallRecord { name: "Bash".to_string(), ts: 3 });
+        recent.push(ToolCallRecord {
+            name: "Bash".to_string(),
+            ts: 3,
+        });
         // A different tool breaks the streak entirely.
-        recent.push(ToolCallRecord { name: "Read".to_string(), ts: 4 });
+        recent.push(ToolCallRecord {
+            name: "Read".to_string(),
+            ts: 4,
+        });
         // Back to Bash: streak restarts at 1, well under the next milestone.
         assert!(batching_nudge(&recent, "Bash").is_none());
     }

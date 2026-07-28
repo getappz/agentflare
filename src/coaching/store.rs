@@ -156,7 +156,13 @@ pub fn set_enforced(id: &str, enforced: bool) -> Result<CoachingRule, String> {
         .iter()
         .find(|r| r.id == id)
         .ok_or_else(|| format!("rule not found: {id}"))?;
-    if enforced && target.trigger.as_ref().map(|t| t.tools.is_empty()).unwrap_or(true) {
+    if enforced
+        && target
+            .trigger
+            .as_ref()
+            .map(|t| t.tools.is_empty())
+            .unwrap_or(true)
+    {
         return Err(format!(
             "rule '{id}' has no tool trigger \u{2014} enforced rules must declare a tool trigger so the hook knows which calls to block"
         ));
@@ -849,7 +855,10 @@ mod tests {
 
             let rules = list_rules();
             assert_eq!(rules[0].body, "New body");
-            assert!(rules[0].enforced, "enforced flag must survive a body refresh");
+            assert!(
+                rules[0].enforced,
+                "enforced flag must survive a body refresh"
+            );
         });
     }
 

@@ -12,11 +12,11 @@ pub mod fetch;
 
 use crate::FetchOutcome;
 use crate::fetch::{ClientError, FetchError, Fetcher};
+use crate::readme;
 use crate::store::{BatchItem, DocsStore, Error as StoreError};
 use agentflare_store::documents::DocUpsertOpts;
 pub use extract::{ApiItem, ExtractError, extract, relative_imports};
 pub use fetch::{DtsFile, MarkdownFile, NpmFetchError, PackageManifest, types_package_name};
-use crate::readme;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NpmError {
@@ -313,7 +313,10 @@ fn index_examples(
                 format!("{}: {}", doc_example.source_path, doc_example.example.title)
             };
             BatchItem {
-                path: format!("{example_prefix}{i:03}-{}", slugify(&doc_example.example.title)),
+                path: format!(
+                    "{example_prefix}{i:03}-{}",
+                    slugify(&doc_example.example.title)
+                ),
                 content: doc_example.example.code.clone(),
                 title,
                 doc_type: "npm-example".to_string(),

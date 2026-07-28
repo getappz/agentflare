@@ -24,9 +24,7 @@ pub enum PythonFetchError {
     InvalidManifest(String),
     #[error("wheel error: {0}")]
     Wheel(String),
-    #[error(
-        "package \"{0}\" ships no type stubs, and no types-{0} package was found on PyPI"
-    )]
+    #[error("package \"{0}\" ships no type stubs, and no types-{0} package was found on PyPI")]
     NoTypes(String),
 }
 
@@ -346,8 +344,8 @@ mod tests {
         {
             let cursor = std::io::Cursor::new(&mut buf);
             let mut writer = zip::ZipWriter::new(cursor);
-            let opts: zip::write::FileOptions<'_, ()> =
-                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
             for (path, body) in files {
                 writer.start_file(*path, opts).unwrap();
                 std::io::Write::write_all(&mut writer, body.as_bytes()).unwrap();
@@ -362,7 +360,10 @@ mod tests {
         let zip = fake_wheel(&[
             ("requests/api.pyi", "def get(url: str) -> Response: ..."),
             ("requests/api.py", "def get(url): ..."),
-            ("requests-2.32.3.dist-info/METADATA", "Metadata-Version: 2.1"),
+            (
+                "requests-2.32.3.dist-info/METADATA",
+                "Metadata-Version: 2.1",
+            ),
         ]);
         let files = extract_pyi(&zip).unwrap();
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();

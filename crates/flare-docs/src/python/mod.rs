@@ -12,11 +12,11 @@ pub mod fetch;
 
 use crate::FetchOutcome;
 use crate::fetch::{ClientError, FetchError, Fetcher};
+use crate::readme;
 use crate::store::{BatchItem, DocsStore, Error as StoreError};
 use agentflare_store::documents::DocUpsertOpts;
 pub use extract::{ApiItem, ExtractError};
 pub use fetch::{PackageManifest, PyiFile, PythonFetchError, types_package_name};
-use crate::readme;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PythonError {
@@ -505,7 +505,8 @@ class Session:
     fn a_failed_typeshed_lookup_reports_the_transport_error_not_missing_types() {
         // No wheel_url in the manifest -> straight to the typeshed fallback,
         // which then times out rather than 404ing.
-        let manifest = br#"{"info": {"name": "obscure", "version": "1.0.0", "summary": "d"}, "urls": []}"#;
+        let manifest =
+            br#"{"info": {"name": "obscure", "version": "1.0.0", "summary": "d"}, "urls": []}"#;
         let fetcher = FlakyTypeshedFetcher {
             source: manifest.to_vec(),
         };
@@ -601,7 +602,12 @@ class Session:
             ],
         };
         fetch_and_store(&first, &store, "p", "latest").unwrap();
-        assert!(store.get_by_path("pypi/p/latest/item/drop").unwrap().is_some());
+        assert!(
+            store
+                .get_by_path("pypi/p/latest/item/drop")
+                .unwrap()
+                .is_some()
+        );
 
         let second = FakeFetcher {
             routes: vec![
@@ -615,10 +621,18 @@ class Session:
         fetch_and_store(&second, &store, "p", "latest").unwrap();
 
         assert!(
-            store.get_by_path("pypi/p/latest/item/drop").unwrap().is_none(),
+            store
+                .get_by_path("pypi/p/latest/item/drop")
+                .unwrap()
+                .is_none(),
             "a removed export must stop being gettable"
         );
-        assert!(store.get_by_path("pypi/p/latest/item/keep").unwrap().is_some());
+        assert!(
+            store
+                .get_by_path("pypi/p/latest/item/keep")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -628,9 +642,6 @@ class Session:
             crate::docs_id_path("serde", "latest"),
             "docsrs/serde/latest"
         );
-        assert_eq!(
-            crate::npm::docs_id_path("hono", "4.6.3"),
-            "npm/hono/4.6.3"
-        );
+        assert_eq!(crate::npm::docs_id_path("hono", "4.6.3"), "npm/hono/4.6.3");
     }
 }

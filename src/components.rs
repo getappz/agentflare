@@ -446,7 +446,8 @@ fn apply_coaching_defaults() -> String {
     let mut failed = vec![];
     for d in DEFAULT_COACHING_RULES {
         if let Some(r) = existing.iter().find(|r| r.id == d.id)
-            && (r.tier == crate::coaching::rule::RuleTier::Override || (r.body == d.body && r.enforced == d.enforced))
+            && (r.tier == crate::coaching::rule::RuleTier::Override
+                || (r.body == d.body && r.enforced == d.enforced))
         {
             continue;
         }

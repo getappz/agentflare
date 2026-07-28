@@ -6,8 +6,8 @@
 //! used for real `.py` source recovers the API surface directly, no separate
 //! "declaration file" grammar needed the way TypeScript's `.d.ts` required.
 
-use tree_sitter::{Node, Parser, Query, QueryCursor};
 use streaming_iterator::StreamingIterator;
+use tree_sitter::{Node, Parser, Query, QueryCursor};
 
 /// Grammar verified against tree-sitter-python's own `queries/tags.scm`:
 /// both node types carry a `name: (identifier)` field.
@@ -81,7 +81,9 @@ fn is_public(name: &str) -> bool {
 fn enclosing_path(node: Node, src: &str) -> Option<String> {
     let mut cur = node.parent();
     while let Some(n) = cur {
-        if n.kind() == "class_definition" && let Some(name) = n.child_by_field_name("name") {
+        if n.kind() == "class_definition"
+            && let Some(name) = n.child_by_field_name("name")
+        {
             return Some(src[name.byte_range()].to_string());
         }
         cur = n.parent();
@@ -235,7 +237,10 @@ class Session:
         assert_eq!(session.kind, "class");
         assert_eq!(session.docs, "A persistent HTTP session.");
 
-        let request = items.iter().find(|i| i.fq_path == "Session.request").unwrap();
+        let request = items
+            .iter()
+            .find(|i| i.fq_path == "Session.request")
+            .unwrap();
         assert_eq!(request.kind, "method");
         assert_eq!(
             request.signature,

@@ -222,7 +222,10 @@ pub fn extract_markdown(tarball_gz: &[u8]) -> Result<Vec<MarkdownFile>, NpmFetch
         if entry.read_to_string(&mut buf).is_err() {
             continue;
         }
-        out.push(MarkdownFile { path: rel, source: buf });
+        out.push(MarkdownFile {
+            path: rel,
+            source: buf,
+        });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
@@ -352,9 +355,18 @@ mod tests {
     #[test]
     fn extracts_markdown_and_strips_the_package_prefix() {
         let tgz = fake_tarball(&[
-            ("README.md", "# hono\n\n## Usage\n\n```js\nconst app = new Hono()\n```\n"),
-            ("docs/quickstart.md", "## Quickstart\n\n```js\napp.get('/', c => c.text('hi'))\n```\n"),
-            ("CHANGELOG.md", "## 4.6.3\n\n```js\nthis example must not be indexed\n```\n"),
+            (
+                "README.md",
+                "# hono\n\n## Usage\n\n```js\nconst app = new Hono()\n```\n",
+            ),
+            (
+                "docs/quickstart.md",
+                "## Quickstart\n\n```js\napp.get('/', c => c.text('hi'))\n```\n",
+            ),
+            (
+                "CHANGELOG.md",
+                "## 4.6.3\n\n```js\nthis example must not be indexed\n```\n",
+            ),
             ("index.js", "module.exports = {}"),
         ]);
         let files = extract_markdown(&tgz).unwrap();

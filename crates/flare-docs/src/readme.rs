@@ -45,8 +45,25 @@ const LOW_SIGNAL_HEADINGS: &[&str] = &[
 /// snippet) is setup, not a usage example, even under an otherwise-fine
 /// heading like "Quick Start".
 const SETUP_ONLY_PREFIXES: &[&str] = &[
-    "git ", "pip ", "pip3 ", "python -m pip", "python3 -m pip", "npm ", "npx ", "yarn ", "pnpm ",
-    "cd ", "curl ", "wget ", "make", "pytest", "tox", "cargo install", "brew ", "apt ", "apt-get ",
+    "git ",
+    "pip ",
+    "pip3 ",
+    "python -m pip",
+    "python3 -m pip",
+    "npm ",
+    "npx ",
+    "yarn ",
+    "pnpm ",
+    "cd ",
+    "curl ",
+    "wget ",
+    "make",
+    "pytest",
+    "tox",
+    "cargo install",
+    "brew ",
+    "apt ",
+    "apt-get ",
     "docker ",
 ];
 
@@ -208,12 +225,21 @@ mod tests {
         // a fence mid-block isn't something this extractor does.
         let md = "## Usage\n\n```bash\ngit clone https://example.com/repo.git\nmytool run --config ./config.yaml\n```\n";
         let examples = extract_readme_examples(md);
-        assert_eq!(examples.len(), 1, "a block that isn't *purely* setup commands must survive");
+        assert_eq!(
+            examples.len(),
+            1,
+            "a block that isn't *purely* setup commands must survive"
+        );
     }
 
     #[test]
     fn low_signal_headings_are_skipped_regardless_of_content() {
-        for heading in ["## Installation", "## Contributing", "## License", "### Running tests"] {
+        for heading in [
+            "## Installation",
+            "## Contributing",
+            "## License",
+            "### Running tests",
+        ] {
             let md = format!("{heading}\n\n```python\nimport sys\nprint(sys.version_info)\n```\n");
             assert!(
                 extract_readme_examples(&md).is_empty(),

@@ -44,9 +44,8 @@ impl Ecosystem {
     /// unscoped npm package — they always need an explicit `ecosystem`.
     pub fn resolve(explicit: Option<&str>, package: &str) -> Result<Self, String> {
         if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-            return Self::parse(raw).ok_or_else(|| {
-                format!("unknown ecosystem \"{raw}\" (expected rust|npm|python)")
-            });
+            return Self::parse(raw)
+                .ok_or_else(|| format!("unknown ecosystem \"{raw}\" (expected rust|npm|python)"));
         }
         if package.starts_with('@') {
             return Ok(Self::Npm);

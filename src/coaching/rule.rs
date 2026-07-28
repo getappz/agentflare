@@ -243,6 +243,7 @@ pub(super) fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn write_rule_file(
     dir: &std::path::Path,
     id: &str,
