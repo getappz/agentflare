@@ -1262,6 +1262,42 @@ fn item_list_respects_limit_and_offset() {
 }
 
 #[test]
+fn item_list_pagination_edges_out_of_range_offset_and_zero_limit() {
+    let (_tmp, s) = harness();
+    for name in ["A", "B", "C"] {
+        s.item(Parameters(empty_item_create(name))).unwrap();
+    }
+
+    let past_end: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "list".into(),
+            limit: Some(1),
+            offset: Some(100),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(past_end["items"].as_array().unwrap().len(), 0);
+    assert_eq!(past_end["next_offset"], serde_json::Value::Null);
+    assert_eq!(past_end["prev_offset"], 2);
+
+    let zero_limit: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "list".into(),
+            limit: Some(0),
+            offset: Some(1),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(zero_limit["items"].as_array().unwrap().len(), 0);
+    assert_eq!(zero_limit["next_offset"], serde_json::Value::Null);
+    assert_eq!(zero_limit["prev_offset"], serde_json::Value::Null);
+}
+
+#[test]
 fn item_list_returns_lean_projection_with_readable_state() {
     let (_tmp, s) = harness();
     s.item(Parameters(empty_item_create("Test"))).unwrap();

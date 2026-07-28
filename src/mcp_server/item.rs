@@ -291,8 +291,10 @@ impl AgentflareMcp {
                 })
                 .collect();
 
-            let next_offset = (offset + summaries.len() < total && limit > 0).then_some(offset + limit);
-            let prev_offset = (offset > 0).then_some(offset.saturating_sub(limit.max(1)));
+            let next_offset = (offset.saturating_add(summaries.len()) < total && limit > 0)
+                .then_some(offset.saturating_add(limit));
+            let prev_offset = (limit > 0 && offset > 0 && total > 0)
+                .then_some(offset.min(total).saturating_sub(limit));
 
             let page = ItemListPage {
                 items: summaries,
