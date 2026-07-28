@@ -104,7 +104,8 @@ pub fn append_routed(
 /// input without duplicating the log-scan logic here.
 pub(crate) fn recent_count_for_topic(topic_key: &str) -> i64 {
     let now = chrono::Utc::now();
-    let repo_count = recent_matches_for_topic(&crate::vent::paths::log_path(), topic_key, now).len();
+    let repo_count =
+        recent_matches_for_topic(&crate::vent::paths::log_path(), topic_key, now).len();
     let global_count =
         recent_matches_for_topic(&crate::vent::paths::global_log_path(), topic_key, now).len();
     (repo_count + global_count) as i64
