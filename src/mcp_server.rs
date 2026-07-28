@@ -1180,7 +1180,7 @@ impl AgentflareMcp {
 
     // --- docs tool ---
     #[tool(
-        description = "On-demand third-party package/API documentation — search|get|list|refresh. Fetches and caches docs in a global store shared across all projects, separate from project-scoped documents. Rust crates via docs.rs (ecosystem=\"rust\", the default); npm packages via npmjs.org, indexed per exported symbol from their TypeScript declarations with a DefinitelyTyped fallback for untyped packages (ecosystem=\"npm\"; scoped names like \"@types/node\" are detected automatically)."
+        description = "On-demand third-party package/API documentation — search|get|list|refresh. Fetches and caches docs in a global store shared across all projects, separate from project-scoped documents. Rust crates via docs.rs (ecosystem=\"rust\", the default); npm packages via npmjs.org, indexed per exported symbol from their TypeScript declarations with a DefinitelyTyped fallback for untyped packages (ecosystem=\"npm\"; scoped names like \"@types/node\" are detected automatically); Python packages via PyPI, indexed from their PEP 561 .pyi type stubs with a typeshed fallback for untyped packages (ecosystem=\"python\")."
     )]
     async fn docs(
         &self,

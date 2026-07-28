@@ -433,7 +433,7 @@ pub(crate) struct FlareDocsRequest {
     #[serde(default)]
     pub(crate) package: Option<String>,
     #[schemars(
-        description = "Registry to look the package up in: rust (docs.rs, default) or npm (npmjs.org, with @types fallback). Scoped names like \"@types/node\" are treated as npm automatically."
+        description = "Registry to look the package up in: rust (docs.rs, default), npm (npmjs.org, with @types fallback), or python (PyPI, with typeshed fallback). Scoped names like \"@types/node\" are treated as npm automatically."
     )]
     #[serde(default)]
     pub(crate) ecosystem: Option<String>,

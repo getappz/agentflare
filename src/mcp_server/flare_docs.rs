@@ -11,7 +11,7 @@ use super::*;
 // path to resolve.
 pub(crate) use ::flare_docs::{
     ClientError, DocsStore, Ecosystem, FetchOutcome, Fetcher, GcOpts, UreqFetcher,
-    docs_rs_json_url, npm, store_fetched,
+    docs_rs_json_url, npm, python, store_fetched,
 };
 
 const DEFAULT_LIMIT: usize = 10;
@@ -162,6 +162,18 @@ impl AgentflareMcp {
                 .await?;
                 self.with_flare_docs_store(|store| {
                     npm::store_package(store, &fetched)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+                })
+                .await?
+            }
+            Ecosystem::Python => {
+                let (pkg, ver) = (package.clone(), version.clone());
+                let fetched = Self::blocking_fetch(eco, &package, move || {
+                    python::fetch_package(&UreqFetcher::new(), &pkg, &ver)
+                })
+                .await?;
+                self.with_flare_docs_store(|store| {
+                    python::store_package(store, &fetched)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
                 })
                 .await?
@@ -386,12 +398,12 @@ mod tests {
         let mcp = test_mcp();
         let req = FlareDocsRequest {
             action: "get".to_string(),
-            package: Some("requests".to_string()),
-            ecosystem: Some("pypi".to_string()),
+            package: Some("nokogiri".to_string()),
+            ecosystem: Some("rubygems".to_string()),
             ..Default::default()
         };
         let err = mcp.flare_docs_impl(req).await.unwrap_err();
-        assert!(err.to_string().contains("pypi"), "{err}");
+        assert!(err.to_string().contains("rubygems"), "{err}");
     }
 
     #[tokio::test]

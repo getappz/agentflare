@@ -59,6 +59,9 @@ pub fn print_list() {
         }
         println!("    {}", r.body);
         println!("    {}", describe_trigger(r.trigger.as_ref()));
+        if r.enforced {
+            println!("    [MANDATORY]");
+        }
     }
 }
 
@@ -93,6 +96,19 @@ pub fn cli_apply(
         }
         Err(e) => {
             crate::ui::error(&format!("agentflare coaching apply: {e}"));
+            std::process::exit(1);
+        }
+    }
+}
+
+pub fn cli_enforce(id: &str, enforced: bool) {
+    match store::set_enforced(id, enforced) {
+        Ok(rule) => {
+            let state = if enforced { "MANDATORY" } else { "advisory" };
+            println!("Rule '{}' is now {state}.", rule.id);
+        }
+        Err(e) => {
+            crate::ui::error(&format!("agentflare coaching enforce: {e}"));
             std::process::exit(1);
         }
     }

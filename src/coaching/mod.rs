@@ -15,11 +15,11 @@ mod cli;
 pub(crate) mod rule;
 mod store;
 
-pub use cli::{cli_apply, cli_remove, cli_sync, print_list};
+pub use cli::{cli_apply, cli_enforce, cli_remove, cli_sync, print_list};
 pub(crate) use store::list_rules;
 pub use store::{
-    rule_bodies_for_prompt, rule_bodies_for_tool, superseded_bodies, sync_targets_for_host,
-    untriggered_rule_bodies,
+    enforced_rule_reason_for_tool, rule_bodies_for_prompt, rule_bodies_for_tool, set_enforced,
+    superseded_bodies, sync_targets_for_host, untriggered_rule_bodies,
 };
 
 // Also used by components.rs to seed/refresh the built-in core-module

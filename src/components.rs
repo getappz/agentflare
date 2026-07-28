@@ -385,6 +385,7 @@ struct DefaultCoachingRule {
     body: &'static str,
     tools: &'static [&'static str],
     sync: &'static [&'static str],
+    enforced: bool,
 }
 
 const DEFAULT_COACHING_RULES: &[DefaultCoachingRule] = &[
@@ -394,6 +395,7 @@ const DEFAULT_COACHING_RULES: &[DefaultCoachingRule] = &[
         body: "@rule: before writing/reviewing code against any package's API, or citing its behavior, check mcp__flare__docs (search|get) \u{2014} do not rely on memory for library API details @ecosystems: rust (docs.rs, default) \u{b7} npm (ecosystem=\"npm\") @fallback: docs tool missing from your list? ToolSearch(\"select:mcp__flare__docs\") first",
         tools: &["Edit", "Write"],
         sync: &["claude-code"],
+        enforced: false,
     },
     DefaultCoachingRule {
         id: "usesearch",
@@ -401,6 +403,7 @@ const DEFAULT_COACHING_RULES: &[DefaultCoachingRule] = &[
         body: "@use: mcp__flare__search (global, 17 sources via type=) \u{2014} type=web for general internet search, plus social/news/github/academic/datasets/code/memory/store/websites/weather/financial/crypto/fx/indicators/youtube/bluesky @skip: WebFetch, WebSearch, websearch-agent, web_search_exa \u{2014} superseded by mcp__flare__search type=web @fallback: Exa MCP tools only for what flare-search has no equivalent for \u{2014} get_code_context_exa, company_research_exa",
         tools: &["WebFetch", "WebSearch"],
         sync: &["claude-code"],
+        enforced: true,
     },
     DefaultCoachingRule {
         id: "useleanctx",
@@ -408,6 +411,7 @@ const DEFAULT_COACHING_RULES: &[DefaultCoachingRule] = &[
         body: "@use: lean-ctx over native tools, routed via the flare gateway \u{2014} never call mcp__lean-ctx__* directly. ctx_read>Read/cat, ctx_shell>Bash, ctx_search>Grep, ctx_glob>Glob, ctx_callgraph>grep for \"who calls X\" @call: mcp__flare__tool(action=\"execute\", server=\"leanctx\", tool=\"<name>\", args={...}) for every ctx_* op above @when: unfamiliar code \u{2014} ctx_compose FIRST, one call instead of a search->read->search chain @discover: unsure of a tools args? mcp__flare__tool(action=\"search\", query=\"<name>\") first",
         tools: &["Read", "Grep", "Glob", "Bash"],
         sync: &["claude-code"],
+        enforced: false,
     },
     DefaultCoachingRule {
         id: "usetsearch",
@@ -415,6 +419,7 @@ const DEFAULT_COACHING_RULES: &[DefaultCoachingRule] = &[
         body: "@use: for MCP tools behind the flare gateway (leanctx, docs, search, memory, review, etc.), prefer mcp__flare__tool(action=\"search\", query=\"<what you need>\") over native ToolSearch \u{2014} it searches downstream servers directly instead of the static deferred-tool list @fallback: native ToolSearch is still right for first-party deferred tools not behind the gateway (WebFetch, EnterPlanMode, mcp__claude-in-chrome__*, etc.)",
         tools: &["ToolSearch"],
         sync: &["claude-code"],
+        enforced: true,
     },
 ];
 
@@ -428,7 +433,7 @@ fn coaching_defaults_satisfied() -> bool {
         .all(|d| match existing.iter().find(|r| r.id == d.id) {
             None => false,
             Some(r) if r.tier == crate::coaching::rule::RuleTier::Override => true,
-            Some(r) => r.body == d.body,
+            Some(r) => r.body == d.body && r.enforced == d.enforced,
         })
 }
 
@@ -441,7 +446,8 @@ fn apply_coaching_defaults() -> String {
     let mut failed = vec![];
     for d in DEFAULT_COACHING_RULES {
         if let Some(r) = existing.iter().find(|r| r.id == d.id)
-            && (r.tier == crate::coaching::rule::RuleTier::Override || r.body == d.body)
+            && (r.tier == crate::coaching::rule::RuleTier::Override
+                || (r.body == d.body && r.enforced == d.enforced))
         {
             continue;
         }
@@ -457,7 +463,14 @@ fn apply_coaching_defaults() -> String {
             Some(trigger),
             crate::coaching::rule::RuleTier::Builtin,
             sync,
-        ) {
+        )
+        .and_then(|r| {
+            if r.enforced == d.enforced {
+                Ok(r)
+            } else {
+                crate::coaching::set_enforced(d.id, d.enforced)
+            }
+        }) {
             Ok(_) => changed.push(d.id),
             // Reported rather than dropped: a swallowed failure leaves
             // `coaching_defaults_satisfied` false forever, so every
@@ -1619,6 +1632,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("expected seeded rule '{}'", d.id));
                 assert_eq!(r.body, d.body);
                 assert_eq!(r.tier, crate::coaching::rule::RuleTier::Builtin);
+                assert_eq!(r.enforced, d.enforced);
             }
         });
     }

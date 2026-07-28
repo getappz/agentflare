@@ -2,6 +2,8 @@ pub mod ecosystem;
 pub mod fetch;
 pub mod index_types;
 pub mod npm;
+pub mod python;
+pub mod readme;
 pub mod rustdoc;
 pub mod store;
 
