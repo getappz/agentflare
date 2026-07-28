@@ -243,6 +243,86 @@ fn parse_pre_tool_use(input: &str) -> Option<PreToolUseInput> {
     })
 }
 
+struct PostToolFailureInput {
+    tool_name: String,
+    failure_text: String,
+}
+
+/// Extracts the tool name and a best-effort failure-text field from a
+/// PostToolUseFailure stdin payload. The exact field name Claude Code uses
+/// for the failure text was not confirmable against the primary hooks
+/// reference at the time this was written (only the common envelope and
+/// the tool_name/tool_input fields shared with PreToolUse/PostToolUse were
+/// confirmed) -- so this tries "error" first (the name given by a
+/// third-party schema reference for this specific event), then falls back
+/// to "tool_response" (confirmed as PostToolUse's own result field, in case
+/// PostToolUseFailure reuses it) and "reason", in that order.
+fn parse_post_tool_failure(input: &str) -> Option<PostToolFailureInput> {
+    let v: serde_json::Value = serde_json::from_str(input).ok()?;
+    let tool_name = v.get("tool_name")?.as_str()?.to_string();
+    let failure_text = ["error", "tool_response", "reason"]
+        .iter()
+        .find_map(|key| v.get(key))
+        .map(|val| {
+            val.as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| val.to_string())
+        })
+        .unwrap_or_default();
+    Some(PostToolFailureInput {
+        tool_name,
+        failure_text,
+    })
+}
+
+fn build_failure_message(tool_name: &str, failure_text: &str) -> String {
+    format!("{tool_name} failed: {failure_text}")
+}
+
+/// PostToolUseFailure command hook: classifies the failure with
+/// vent::classify::classify() directly (no model call -- see the module
+/// doc comment on parse_post_tool_failure for why this is a net
+/// simplification, not a downgrade), gates on nudge_pace so a repeat of
+/// the same topic within DEFAULT_COOLDOWN doesn't re-nudge, and only then
+/// emits a block/nudge decision pointing at mcp__flare__vent.
+pub fn post_tool_failure(_agent: &str) {
+    let Some(input) = read_stdin_or_skip("PostToolUseFailure") else {
+        return;
+    };
+    let Some(parsed) = parse_post_tool_failure(&input) else {
+        return;
+    };
+
+    let message = build_failure_message(&parsed.tool_name, &parsed.failure_text);
+    let topic_key = crate::vent::classify::topic_key(&message);
+    let severity = if crate::vent::classify::origin(&message) == "agentflare-core" {
+        "high"
+    } else {
+        "medium"
+    };
+    let seen_count = crate::vent::capture::recent_count_for_topic(&topic_key);
+
+    if !crate::vent::classify::classify(severity, seen_count, &message) {
+        return;
+    }
+
+    let pace_key = format!("vent-nudge:{topic_key}");
+    if !crate::nudge_pace::should_fire(&pace_key, crate::nudge_pace::DEFAULT_COOLDOWN) {
+        return;
+    }
+    crate::nudge_pace::mark_fired(&pace_key);
+
+    let decision = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUseFailure",
+            "permissionDecisionReason": format!(
+                "Possible friction: {message}. If this is genuine friction (not an ordinary expected failure), call mcp__flare__vent with a concise, specific message and severity={severity}."
+            ),
+        }
+    });
+    println!("{decision}");
+}
+
 pub fn pre_tool_use(_agent: &str) {
     let Some(input) = read_stdin_or_skip("PreToolUse") else {
         return;
@@ -666,6 +746,43 @@ mod tests {
         let input = r#"{"session_id": "abc", "tool_name": "ScheduleWakeup", "tool_input": {"delaySeconds": 280}}"#;
         let parsed = parse_pre_tool_use(input).unwrap();
         assert_eq!(parsed.delay_seconds, Some(280));
+    }
+
+    #[test]
+    fn parse_post_tool_failure_extracts_tool_name_and_error_text() {
+        let input = r#"{
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git worktree add x"},
+            "error": "agentflare git shim: denied -- use item tool's claim flow"
+        }"#;
+        let parsed = parse_post_tool_failure(input).unwrap();
+        assert_eq!(parsed.tool_name, "Bash");
+        assert!(parsed.failure_text.contains("denied"));
+    }
+
+    #[test]
+    fn parse_post_tool_failure_falls_back_across_plausible_field_names() {
+        // Some hook payload shapes may carry the failure text under a
+        // different key than "error" -- tool_response (posttoolusefailure's
+        // sibling event uses tool_response) or reason are tried in order if
+        // "error" is absent.
+        let input =
+            r#"{"session_id":"s1","tool_name":"Edit","tool_response":"parse error: unexpected EOF"}"#;
+        let parsed = parse_post_tool_failure(input).unwrap();
+        assert!(parsed.failure_text.contains("unexpected EOF"));
+    }
+
+    #[test]
+    fn parse_post_tool_failure_returns_none_on_malformed_json() {
+        assert!(parse_post_tool_failure("not json").is_none());
+    }
+
+    #[test]
+    fn post_tool_failure_message_build_includes_tool_name_and_text() {
+        let msg = build_failure_message("Bash", "agentflare git shim: denied");
+        assert!(msg.contains("Bash"));
+        assert!(msg.contains("denied"));
     }
 
     #[test]
