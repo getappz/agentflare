@@ -42,6 +42,10 @@ pub struct PackageManifest {
     /// release — a platform-specific-only release, or an empty `urls` list —
     /// and the caller should treat that like "no types shipped".
     pub wheel_url: Option<String>,
+    /// The release's long description, when PyPI reports it as markdown
+    /// (`description_content_type: "text/markdown"`). `None` for RST/plain
+    /// releases -- out of scope for the fenced-code-block example extractor.
+    pub readme: Option<String>,
 }
 
 /// Project manifest endpoint. `version` may be an exact release version or
@@ -110,12 +114,18 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PackageManifest, PythonFetchError>
     let version = json_str(info, "version")
         .ok_or_else(|| PythonFetchError::InvalidManifest("missing \"info.version\"".into()))?;
     let wheel_url = v.get("urls").and_then(pure_python_wheel_url);
+    let readme = if json_str(info, "description_content_type").as_deref() == Some("text/markdown") {
+        json_str(info, "description")
+    } else {
+        None
+    };
     Ok(PackageManifest {
         name,
         version,
         summary: json_str(info, "summary").unwrap_or_default(),
         homepage: homepage(info),
         wheel_url,
+        readme,
     })
 }
 
@@ -144,7 +154,9 @@ fn is_relevant_py_source(path: &str) -> bool {
     }
     let lower = path.to_ascii_lowercase();
     let base = lower.rsplit('/').next().unwrap_or(&lower);
-    !(lower.contains("/test/")
+    !(lower.starts_with("test/")
+        || lower.starts_with("tests/")
+        || lower.contains("/test/")
         || lower.contains("/tests/")
         || base.starts_with("test_")
         || lower.contains("/_vendor")
@@ -292,6 +304,34 @@ mod tests {
         }"#;
         let m = parse_manifest(manifest).unwrap();
         assert_eq!(m.homepage.as_deref(), Some("https://example.com/p"));
+    }
+
+    #[test]
+    fn readme_is_kept_only_when_pypi_reports_it_as_markdown() {
+        let markdown = br##"{
+            "info": {
+                "name": "p", "version": "1.0.0", "summary": "d",
+                "description": "# p\n\n```python\nimport p\n```\n",
+                "description_content_type": "text/markdown"
+            },
+            "urls": []
+        }"##;
+        let m = parse_manifest(markdown).unwrap();
+        assert!(m.readme.as_deref().unwrap().contains("import p"));
+
+        let rst = br##"{
+            "info": {
+                "name": "p", "version": "1.0.0", "summary": "d",
+                "description": "p\n=\n\n.. code-block:: python\n\n    import p\n",
+                "description_content_type": "text/x-rst"
+            },
+            "urls": []
+        }"##;
+        let m = parse_manifest(rst).unwrap();
+        assert_eq!(
+            m.readme, None,
+            "RST isn't parsed by the fenced-code-block extractor -- keeping it would silently yield nothing"
+        );
     }
 
     #[test]

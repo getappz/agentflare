@@ -161,6 +161,73 @@ pub fn extract_dts(tarball_gz: &[u8]) -> Result<Vec<DtsFile>, NpmFetchError> {
     Ok(out)
 }
 
+/// One markdown file recovered from a package tarball.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownFile {
+    /// Path within the package, e.g. `README.md` or `docs/quickstart.md`.
+    pub path: String,
+    pub source: String,
+}
+
+/// Markdown files that are real files in a package but not usage
+/// documentation — release notes, process docs, licensing, or bundled test
+/// fixtures.
+fn is_excluded_markdown(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let base = lower.rsplit('/').next().unwrap_or(&lower);
+    lower.starts_with("test/")
+        || lower.starts_with("tests/")
+        || lower.starts_with("node_modules/")
+        || lower.starts_with(".github/")
+        || lower.contains("/test/")
+        || lower.contains("/tests/")
+        || lower.contains("/node_modules/")
+        || lower.contains("/.github/")
+        || base.starts_with("changelog")
+        || base.starts_with("contributing")
+        || base.starts_with("code_of_conduct")
+        || base.starts_with("license")
+        || base.starts_with("security")
+}
+
+/// Unpacks a gzipped npm tarball and returns every markdown file worth
+/// scanning for usage examples — the README and any bundled guides, but not
+/// changelogs, licenses, or process docs.
+pub fn extract_markdown(tarball_gz: &[u8]) -> Result<Vec<MarkdownFile>, NpmFetchError> {
+    let decoder = flate2::read::GzDecoder::new(tarball_gz);
+    let mut archive = tar::Archive::new(decoder.take(MAX_UNPACKED_BYTES));
+    let mut out = Vec::new();
+    let entries = archive
+        .entries()
+        .map_err(|e| NpmFetchError::Tarball(e.to_string()))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| NpmFetchError::Tarball(e.to_string()))?;
+        let path = entry
+            .path()
+            .map_err(|e| NpmFetchError::Tarball(e.to_string()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !path.ends_with(".md") && !path.ends_with(".markdown") {
+            continue;
+        }
+        let rel = path.strip_prefix("package/").unwrap_or(&path).to_string();
+        if is_excluded_markdown(&rel) {
+            continue;
+        }
+        let size = entry.header().size().unwrap_or(0);
+        if size as usize > MAX_DTS_BYTES {
+            continue;
+        }
+        let mut buf = String::new();
+        if entry.read_to_string(&mut buf).is_err() {
+            continue;
+        }
+        out.push(MarkdownFile { path: rel, source: buf });
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +347,35 @@ mod tests {
     #[test]
     fn corrupt_tarball_is_an_error_not_a_panic() {
         assert!(extract_dts(b"definitely not a gzip stream").is_err());
+    }
+
+    #[test]
+    fn extracts_markdown_and_strips_the_package_prefix() {
+        let tgz = fake_tarball(&[
+            ("README.md", "# hono\n\n## Usage\n\n```js\nconst app = new Hono()\n```\n"),
+            ("docs/quickstart.md", "## Quickstart\n\n```js\napp.get('/', c => c.text('hi'))\n```\n"),
+            ("CHANGELOG.md", "## 4.6.3\n\n```js\nthis example must not be indexed\n```\n"),
+            ("index.js", "module.exports = {}"),
+        ]);
+        let files = extract_markdown(&tgz).unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["README.md", "docs/quickstart.md"], "{paths:?}");
+    }
+
+    #[test]
+    fn excludes_changelog_contributing_and_license_files() {
+        let tgz = fake_tarball(&[
+            ("CHANGELOG.md", "# Changelog\n\n```js\nx\n```\n"),
+            ("CONTRIBUTING.md", "# Contributing\n\n```js\nx\n```\n"),
+            ("LICENSE.md", "MIT License\n\n```js\nx\n```\n"),
+            ("test/fixtures.md", "```js\nx\n```\n"),
+        ]);
+        assert!(extract_markdown(&tgz).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_tarball_with_no_markdown_yields_an_empty_set_not_an_error() {
+        let tgz = fake_tarball(&[("index.js", "module.exports = {}")]);
+        assert!(extract_markdown(&tgz).unwrap().is_empty());
     }
 }

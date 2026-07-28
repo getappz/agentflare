@@ -16,6 +16,7 @@ use crate::store::{BatchItem, DocsStore, Error as StoreError};
 use agentflare_store::documents::DocUpsertOpts;
 pub use extract::{ApiItem, ExtractError};
 pub use fetch::{PackageManifest, PyiFile, PythonFetchError, types_package_name};
+use crate::readme;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PythonError {
@@ -73,6 +74,10 @@ pub struct FetchedPackage {
     pub pyi: Vec<PyiFile>,
     /// Set when stubs came from typeshed rather than the package itself.
     pub types_from: Option<String>,
+    /// Usage examples pulled from the package's own PyPI long description
+    /// (markdown releases only) — verbatim code the maintainer wrote, never
+    /// LLM-generated.
+    pub examples: Vec<readme::ReadmeExample>,
 }
 
 /// Resolves a package to its stub files, following the typeshed fallback
@@ -101,12 +106,19 @@ pub fn fetch_package(
         None => fetch_typeshed_fallback(fetcher, package)?,
     };
 
+    let examples = manifest
+        .readme
+        .as_deref()
+        .map(readme::extract_readme_examples)
+        .unwrap_or_default();
+
     Ok(FetchedPackage {
         package: package.to_string(),
         requested_version: version.to_string(),
         manifest,
         pyi,
         types_from,
+        examples,
     })
 }
 
@@ -195,10 +207,18 @@ pub fn store_package(
         Ok(n) => (n, None),
         Err(e) => (0, Some(e.to_string())),
     };
+    let (examples_indexed, examples_error) = match index_examples(store, fetched, &id_path) {
+        Ok(n) => (n, None),
+        Err(e) => (0, Some(e.to_string())),
+    };
     Ok(FetchOutcome {
         doc: overview_doc,
-        items_indexed,
-        items_error,
+        items_indexed: items_indexed + examples_indexed,
+        items_error: match (items_error, examples_error) {
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        },
     })
 }
 
@@ -253,6 +273,57 @@ fn index_items(
         }
     }
     Ok(store.upsert_batch_reconciled(&item_prefix, &batch)?)
+}
+
+/// Lowercase, hyphen-joined form of a title, for a stable, readable path
+/// segment ("Quick Start!" -> "quick-start").
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "example".to_string()
+    } else {
+        out
+    }
+}
+
+fn index_examples(
+    store: &DocsStore,
+    fetched: &FetchedPackage,
+    package_id_path: &str,
+) -> Result<usize, PythonError> {
+    let example_prefix = format!("{package_id_path}/example/");
+    let batch: Vec<BatchItem> = fetched
+        .examples
+        .iter()
+        .enumerate()
+        .map(|(i, example)| BatchItem {
+            path: format!("{example_prefix}{i:03}-{}", slugify(&example.title)),
+            content: example.code.clone(),
+            title: example.title.clone(),
+            doc_type: "python-example".to_string(),
+            tags: vec![
+                fetched.package.clone(),
+                "python".to_string(),
+                "pypi".to_string(),
+                "example".to_string(),
+            ],
+            source: "python".to_string(),
+        })
+        .collect();
+    Ok(store.upsert_batch_reconciled(&example_prefix, &batch)?)
 }
 
 #[cfg(test)]
@@ -384,6 +455,49 @@ class Session:
         assert!(
             hits.iter().any(|h| h.path.ends_with("Session.request")),
             "{hits:?}"
+        );
+    }
+
+    #[test]
+    fn indexes_examples_from_a_markdown_readme() {
+        let manifest = br##"{
+            "info": {
+                "name": "p", "version": "1.0.0", "summary": "d",
+                "home_page": "https://example.com/p",
+                "description": "# p\n\n## Usage\n\n```python\nimport p\n\nclient = p.Client()\nclient.run()\n```\n",
+                "description_content_type": "text/markdown"
+            },
+            "urls": [{"packagetype": "bdist_wheel",
+                       "filename": "p-1.0.0-py3-none-any.whl",
+                       "url": "https://files/p-1.0.0-py3-none-any.whl"}]}"##;
+        let fetcher = FakeFetcher {
+            routes: vec![
+                ("pypi.org/pypi/p/1.0.0".to_string(), manifest.to_vec()),
+                (
+                    "p-1.0.0-py3-none-any.whl".to_string(),
+                    fake_wheel(&[("p.pyi", "def run() -> None: ...\n")]),
+                ),
+            ],
+        };
+        let store = DocsStore::open_memory().unwrap();
+        let outcome = fetch_and_store(&fetcher, &store, "p", "1.0.0").unwrap();
+        assert_eq!(outcome.items_error, None);
+
+        let examples = store.list_summaries(None, 0).unwrap();
+        let example = examples
+            .iter()
+            .find(|d| d.path.starts_with("pypi/p/1.0.0/example/"))
+            .expect("a markdown example must be indexed");
+        assert_eq!(example.doc_type, "python-example");
+
+        let doc = store.get_by_path(&example.path).unwrap().unwrap();
+        assert_eq!(doc.title, "Usage");
+        assert!(doc.content.contains("client.run()"));
+
+        let hits = store.search("client.run", 10).unwrap();
+        assert!(
+            hits.iter().any(|h| h.path == example.path),
+            "example must be searchable: {hits:?}"
         );
     }
 
