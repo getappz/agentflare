@@ -39,6 +39,67 @@ pub fn resolve_default_branch(repo_root: &Path) -> String {
         .unwrap_or_else(|| "master".to_string())
 }
 
+/// Bounded-fetch freshness check: how far HEAD has fallen behind a
+/// freshly-fetched `origin/<default_branch>` -- the no-worktree gap item #7
+/// closes (the worktree/claim path already gets this for free from
+/// `create_worktree`'s own fetch-before-branch behavior). `None` on ANY
+/// failure -- offline, no remote, fetch timeout, detached HEAD, or already
+/// on the default branch (that case is the protected-branch guard's job,
+/// not this one) -- this is advisory, so a network hiccup must never be
+/// mistaken for staleness. `Some((default_branch, commits_behind))` on
+/// success; `commits_behind` is how many commits are reachable from
+/// `origin/<default_branch>` but not from HEAD's merge-base with it (0 =
+/// fully caught up).
+#[must_use]
+pub fn commits_behind_origin_default(
+    repo_root: &Path,
+    fetch_timeout_secs: u64,
+) -> Option<(String, u64)> {
+    let default_branch = resolve_default_branch(repo_root);
+    let current = current_branch(repo_root)?;
+    if current == default_branch {
+        return None;
+    }
+    let fetched = crate::worktree::run_output_timeout(
+        crate::shell::git_binary(),
+        &["fetch", "origin", &default_branch],
+        repo_root,
+        fetch_timeout_secs,
+    )
+    .map(|out| out.status.success())
+    .unwrap_or(false);
+    if !fetched {
+        return None;
+    }
+    let remote_ref = format!("origin/{default_branch}");
+    if !run_in_ok(repo_root, &["rev-parse", "--verify", &remote_ref]) {
+        return None;
+    }
+    let merge_base = run_in_opt(repo_root, &["merge-base", "HEAD", &remote_ref])?;
+    let commits_behind = run_in_opt(
+        repo_root,
+        &[
+            "rev-list",
+            "--count",
+            &format!("{merge_base}..{remote_ref}"),
+        ],
+    )?
+    .parse()
+    .ok()?;
+    Some((default_branch, commits_behind))
+}
+
+/// Advisory message for [`commits_behind_origin_default`]'s result -- `None`
+/// when fully caught up (0 commits behind).
+#[must_use]
+pub fn staleness_reason(default_branch: &str, commits_behind: u64) -> Option<String> {
+    (commits_behind > 0).then(|| {
+        format!(
+            "this branch is {commits_behind} commit(s) behind origin/{default_branch} — consider merging/rebasing before continuing, so edits build on the latest code"
+        )
+    })
+}
+
 /// `git rev-parse --show-toplevel` from `start` — handles worktrees/submodules
 /// correctly, works regardless of subdirectory. `None` outside a git repo.
 #[must_use]
@@ -224,5 +285,66 @@ mod tests {
         )
         .unwrap();
         assert!(is_linked_worktree(&wt_path));
+    }
+
+    fn init_remote_and_stale_local_clone()
+    -> (crate::shell::test_support::Repo, PathBuf, tempfile::TempDir) {
+        let remote = init_repo_with_branch("master");
+        let local_container = tempfile::TempDir::new().unwrap();
+        let local_path = local_container.path().join("local");
+        crate::shell::run_in(
+            local_container.path(),
+            &[
+                "clone",
+                remote.path.to_str().unwrap(),
+                local_path.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        crate::shell::run_in(&local_path, &["config", "user.email", "t@t.com"]).unwrap();
+        crate::shell::run_in(&local_path, &["config", "user.name", "t"]).unwrap();
+        crate::shell::run_in(&local_path, &["checkout", "-b", "feature/x"]).unwrap();
+        (remote, local_path, local_container)
+    }
+
+    #[test]
+    fn commits_behind_origin_default_reports_missed_remote_commits() {
+        let (remote, local_path, _container) = init_remote_and_stale_local_clone();
+        crate::shell::run_in(&remote.path, &["commit", "--allow-empty", "-m", "new work"]).unwrap();
+
+        let (default_branch, behind) = commits_behind_origin_default(&local_path, 10).unwrap();
+        assert_eq!(default_branch, "master");
+        assert_eq!(behind, 1);
+    }
+
+    #[test]
+    fn commits_behind_origin_default_zero_when_fully_caught_up() {
+        let (_remote, local_path, _container) = init_remote_and_stale_local_clone();
+        let (_, behind) = commits_behind_origin_default(&local_path, 10).unwrap();
+        assert_eq!(behind, 0);
+    }
+
+    #[test]
+    fn commits_behind_origin_default_none_on_the_default_branch_itself() {
+        let repo = init_repo_with_branch("master");
+        assert!(commits_behind_origin_default(&repo.path, 10).is_none());
+    }
+
+    #[test]
+    fn commits_behind_origin_default_none_without_a_remote() {
+        let repo = init_repo_with_branch("feature/x");
+        assert!(commits_behind_origin_default(&repo.path, 1).is_none());
+    }
+
+    #[test]
+    fn staleness_reason_silent_when_caught_up() {
+        assert!(staleness_reason("master", 0).is_none());
+    }
+
+    #[test]
+    fn staleness_reason_names_branch_and_commit_count() {
+        let reason = staleness_reason("master", 3).unwrap();
+        assert!(reason.contains("3 commit"), "{reason}");
+        assert!(reason.contains("origin/master"), "{reason}");
     }
 }

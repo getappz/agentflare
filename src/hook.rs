@@ -288,6 +288,30 @@ pub fn pre_tool_use(_agent: &str) {
 
     let mut nudges: Vec<String> = vec![];
 
+    // Freshness guard (item #7): on a session's first mutating-tool call,
+    // warn if the target repo's branch has fallen behind a freshly-fetched
+    // origin/<default> -- the no-worktree gap `create_worktree`'s own
+    // fetch-before-branch behavior doesn't cover (that only runs at claim
+    // time, for the worktree path). `insert` returning `true` doubles as
+    // the "haven't checked this session yet" gate, so this only ever fires
+    // once per session -- a bounded `git fetch` on every edit would burn
+    // into PreToolUse's 5s hook budget for no added benefit. A short 1s
+    // fetch timeout leaves headroom in that budget; soft-fails (no nudge)
+    // rather than risk overrunning it.
+    if crate::hook_redirect::MUTATING_TOOLS.contains(&parsed.tool_name.as_str())
+        && runtime
+            .staleness_checked_sessions
+            .insert(parsed.session_id.clone())
+        && let crate::hook_redirect::TargetRepo::Found(repo) =
+            crate::hook_redirect::resolve_mutating_target_repo(parsed.tool_input.as_ref())
+        && let Some((default_branch, commits_behind)) =
+            flare_git_core::branch::commits_behind_origin_default(&repo, 1)
+        && let Some(reason) =
+            flare_git_core::branch::staleness_reason(&default_branch, commits_behind)
+    {
+        nudges.push(reason);
+    }
+
     if let Some(nudge) =
         crate::optimize::batching_nudge(&record.recent_tool_calls, &parsed.tool_name)
     {
