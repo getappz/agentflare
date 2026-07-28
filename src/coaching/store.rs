@@ -89,6 +89,33 @@ pub fn apply_rule(
     tier: RuleTier,
     sync: Vec<String>,
 ) -> Result<CoachingRule, String> {
+    apply_rule_inner(id, title, body, trigger, tier, sync, None)
+}
+
+/// Same as `apply_rule`, but lets the caller set a per-rule pacing cooldown
+/// (seconds) instead of inheriting `nudge_pace::DEFAULT_COOLDOWN`.
+pub fn apply_rule_with_cooldown(
+    id: &str,
+    title: &str,
+    body: &str,
+    trigger: Option<rule::RuleTrigger>,
+    tier: RuleTier,
+    sync: Vec<String>,
+    cooldown_secs: Option<u64>,
+) -> Result<CoachingRule, String> {
+    apply_rule_inner(id, title, body, trigger, tier, sync, cooldown_secs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_rule_inner(
+    id: &str,
+    title: &str,
+    body: &str,
+    trigger: Option<rule::RuleTrigger>,
+    tier: RuleTier,
+    sync: Vec<String>,
+    cooldown_secs: Option<u64>,
+) -> Result<CoachingRule, String> {
     if !rule::is_valid_rule_id(id) {
         return Err(format!(
             "invalid rule id '{id}': must be 1-10 chars, start with a letter, and contain only letters, digits, or hyphens"
@@ -130,6 +157,7 @@ pub fn apply_rule(
         tier.clone(),
         &sync,
         enforced,
+        cooldown_secs,
     )
     .map_err(|e| format!("failed to write rule file: {e}"))?;
 
@@ -177,6 +205,7 @@ pub fn set_enforced(id: &str, enforced: bool) -> Result<CoachingRule, String> {
         target.tier.clone(),
         &target.sync,
         enforced,
+        target.cooldown_secs,
     )
     .map_err(|e| format!("failed to write rule file: {e}"))?;
 

@@ -26,6 +26,7 @@ pub use store::{
 // coaching rules (flare-docs, flare-search, lean-ctx, tool-search) on every
 // `agentflare init` and SessionStart.
 pub use store::apply_rule;
+pub use store::apply_rule_with_cooldown;
 
 #[cfg(test)]
 pub(crate) mod test_support {
