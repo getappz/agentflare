@@ -767,8 +767,7 @@ mod tests {
         // different key than "error" -- tool_response (posttoolusefailure's
         // sibling event uses tool_response) or reason are tried in order if
         // "error" is absent.
-        let input =
-            r#"{"session_id":"s1","tool_name":"Edit","tool_response":"parse error: unexpected EOF"}"#;
+        let input = r#"{"session_id":"s1","tool_name":"Edit","tool_response":"parse error: unexpected EOF"}"#;
         let parsed = parse_post_tool_failure(input).unwrap();
         assert!(parsed.failure_text.contains("unexpected EOF"));
     }
