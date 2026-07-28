@@ -423,13 +423,13 @@ const DEFAULT_COACHING_RULES: &[DefaultCoachingRule] = &[
 /// sync), or has been overridden by the user (tier Override — left alone).
 fn coaching_defaults_satisfied() -> bool {
     let existing = crate::coaching::list_rules();
-    DEFAULT_COACHING_RULES.iter().all(|d| {
-        match existing.iter().find(|r| r.id == d.id) {
+    DEFAULT_COACHING_RULES
+        .iter()
+        .all(|d| match existing.iter().find(|r| r.id == d.id) {
             None => false,
             Some(r) if r.tier == crate::coaching::rule::RuleTier::Override => true,
             Some(r) => r.body == d.body,
-        }
-    })
+        })
 }
 
 /// Seeds any missing `DEFAULT_COACHING_RULES` entry and refreshes any
@@ -438,6 +438,7 @@ fn coaching_defaults_satisfied() -> bool {
 fn apply_coaching_defaults() -> String {
     let existing = crate::coaching::list_rules();
     let mut changed = vec![];
+    let mut failed = vec![];
     for d in DEFAULT_COACHING_RULES {
         if let Some(r) = existing.iter().find(|r| r.id == d.id)
             && (r.tier == crate::coaching::rule::RuleTier::Override || r.body == d.body)
@@ -449,20 +450,32 @@ fn apply_coaching_defaults() -> String {
             auto_match: true,
         };
         let sync: Vec<String> = d.sync.iter().map(|s| s.to_string()).collect();
-        if crate::coaching::apply_rule(
+        match crate::coaching::apply_rule(
             d.id,
             d.title,
             d.body,
             Some(trigger),
             crate::coaching::rule::RuleTier::Builtin,
             sync,
-        )
-        .is_ok()
-        {
-            changed.push(d.id);
+        ) {
+            Ok(_) => changed.push(d.id),
+            // Reported rather than dropped: a swallowed failure leaves
+            // `coaching_defaults_satisfied` false forever, so every
+            // SessionStart retries silently with nothing to explain why.
+            Err(e) => failed.push(format!("{}: {e}", d.id)),
         }
     }
-    if changed.is_empty() {
+    if !failed.is_empty() {
+        format!(
+            "core-module coaching rules failed: {} (seeded/refreshed: {})",
+            failed.join("; "),
+            if changed.is_empty() {
+                "none".to_string()
+            } else {
+                changed.join(", ")
+            }
+        )
+    } else if changed.is_empty() {
         "core-module coaching rules already up to date".to_string()
     } else {
         format!(
@@ -494,12 +507,12 @@ fn apply_gateway_permissions(settings: &mut Value) -> Result<usize, String> {
         *settings = serde_json::json!({});
     }
     let obj = settings.as_object_mut().expect("just ensured object above");
+    // Created when absent, but never replaced when present-and-malformed:
+    // erroring out matches the `allow` handling below and keeps an unexpected
+    // settings file from being destructively rewritten.
     let permissions = obj
         .entry("permissions")
         .or_insert_with(|| serde_json::json!({}));
-    if !permissions.is_object() {
-        *permissions = serde_json::json!({});
-    }
     let perm_obj = permissions
         .as_object_mut()
         .ok_or("permissions is not an object")?;
@@ -570,6 +583,23 @@ pub fn get_components(host: &str) -> Vec<Component> {
 
     #[cfg_attr(not(feature = "skill-overrides-sync"), allow(unused_mut))]
     let mut components = vec![
+        // Ahead of `rules` on purpose: `rule_targets` folds coaching-sourced
+        // rules into the host rule files, and `rules` writes each file only
+        // when absent. Seeded after it, these four would miss the write and
+        // never make it in -- `rules`'s check passes once the files exist, so
+        // there is no later pass to pick them up.
+        Component {
+            id: "core-coaching",
+            needs_consent: false,
+            describe: "built-in coaching rules nudging flare-docs, flare-search, lean-ctx, and flare tool-search over their native equivalents".to_string(),
+            check: Box::new(move || !claude_code_only || coaching_defaults_satisfied()),
+            apply: Box::new(move || {
+                if !claude_code_only {
+                    return "not applicable for this host".to_string();
+                }
+                apply_coaching_defaults()
+            }),
+        },
         Component {
             id: "rules",
             needs_consent: false,
@@ -885,18 +915,6 @@ pub fn get_components(host: &str) -> Vec<Component> {
             },
         },
         Component {
-            id: "core-coaching",
-            needs_consent: false,
-            describe: "built-in coaching rules nudging flare-docs, flare-search, lean-ctx, and flare tool-search over their native equivalents".to_string(),
-            check: Box::new(move || !claude_code_only || coaching_defaults_satisfied()),
-            apply: Box::new(move || {
-                if !claude_code_only {
-                    return "not applicable for this host".to_string();
-                }
-                apply_coaching_defaults()
-            }),
-        },
-        Component {
             id: "gateway-permissions",
             needs_consent: false,
             describe: "allowlist the flare gateway tools (mcp__flare__docs, mcp__flare__search, mcp__flare__tool, ToolSearch) in ~/.claude/settings.json and remove superseded direct mcp__lean-ctx__* entries".to_string(),
@@ -975,6 +993,7 @@ mod tests {
         // $ savings, see Cargo.toml). Expected ids adjust accordingly.
         #[cfg(not(feature = "skill-overrides-sync"))]
         let expected: Vec<&str> = vec![
+            "core-coaching",
             "rules",
             "mise",
             "shims",
@@ -983,11 +1002,11 @@ mod tests {
             "leanctx",
             "agentflare-mcp",
             "optimize-code-mode",
-            "core-coaching",
             "gateway-permissions",
         ];
         #[cfg(feature = "skill-overrides-sync")]
         let expected: Vec<&str> = vec![
+            "core-coaching",
             "rules",
             "mise",
             "shims",
@@ -996,7 +1015,6 @@ mod tests {
             "leanctx",
             "agentflare-mcp",
             "optimize-code-mode",
-            "core-coaching",
             "gateway-permissions",
             "skill-overrides-sync",
         ];
@@ -1519,7 +1537,10 @@ mod tests {
             }
         });
         let changed = apply_gateway_permissions(&mut settings).unwrap();
-        assert_eq!(changed, 4, "3 missing entries added + 1 stale entry stripped");
+        assert_eq!(
+            changed, 4,
+            "3 missing entries added + 1 stale entry stripped"
+        );
         let allow = settings["permissions"]["allow"].as_array().unwrap();
         for name in GATEWAY_PERMISSIONS_ALLOW {
             assert!(
@@ -1528,9 +1549,10 @@ mod tests {
             );
         }
         assert!(
-            allow
-                .iter()
-                .all(|v| !v.as_str().unwrap().starts_with(STALE_LEANCTX_PERMISSION_PREFIX)),
+            allow.iter().all(|v| !v
+                .as_str()
+                .unwrap()
+                .starts_with(STALE_LEANCTX_PERMISSION_PREFIX)),
             "no direct mcp__lean-ctx__* entry should remain"
         );
     }
@@ -1540,7 +1562,19 @@ mod tests {
         let mut settings = serde_json::json!({});
         apply_gateway_permissions(&mut settings).unwrap();
         let changed = apply_gateway_permissions(&mut settings).unwrap();
-        assert_eq!(changed, 0, "second pass over already-correct settings changes nothing");
+        assert_eq!(
+            changed, 0,
+            "second pass over already-correct settings changes nothing"
+        );
+    }
+
+    // Rewriting a settings file we cannot parse would silently discard
+    // whatever the user actually had there.
+    #[test]
+    fn apply_gateway_permissions_errors_on_malformed_permissions_rather_than_clobbering() {
+        let mut settings = serde_json::json!({ "permissions": "not an object" });
+        assert!(apply_gateway_permissions(&mut settings).is_err());
+        assert_eq!(settings["permissions"], "not an object", "left untouched");
     }
 
     #[test]
@@ -1579,9 +1613,10 @@ mod tests {
 
             let existing = crate::coaching::list_rules();
             for d in DEFAULT_COACHING_RULES {
-                let r = existing.iter().find(|r| r.id == d.id).unwrap_or_else(|| {
-                    panic!("expected seeded rule '{}'", d.id)
-                });
+                let r = existing
+                    .iter()
+                    .find(|r| r.id == d.id)
+                    .unwrap_or_else(|| panic!("expected seeded rule '{}'", d.id));
                 assert_eq!(r.body, d.body);
                 assert_eq!(r.tier, crate::coaching::rule::RuleTier::Builtin);
             }
@@ -1630,13 +1665,29 @@ mod tests {
     fn coaching_defaults_component_check_then_apply_then_check() {
         crate::paths::test_support::with_temp_home(|| {
             let components = get_components("claude-code");
-            let cc = components
-                .iter()
-                .find(|c| c.id == "core-coaching")
-                .unwrap();
+            let cc = components.iter().find(|c| c.id == "core-coaching").unwrap();
             assert!(!(cc.check)());
             (cc.apply)();
             assert!((cc.check)());
         });
+    }
+
+    #[test]
+    fn coaching_defaults_are_satisfied_for_non_claude_code_hosts() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("opencode");
+            let cc = components.iter().find(|c| c.id == "core-coaching").unwrap();
+            assert!((cc.check)());
+        });
+    }
+
+    // The seeded rules reach the host rule files only if they exist before
+    // `rules` writes them, and `rules` writes each file just once.
+    #[test]
+    fn core_coaching_is_ordered_before_the_rules_component() {
+        let ids: Vec<&str> = get_components("claude-code").iter().map(|c| c.id).collect();
+        let cc = ids.iter().position(|i| *i == "core-coaching").unwrap();
+        let rules = ids.iter().position(|i| *i == "rules").unwrap();
+        assert!(cc < rules, "core-coaching must be applied before rules");
     }
 }
