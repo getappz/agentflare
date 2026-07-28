@@ -703,6 +703,15 @@ fn detect_stack(path: &Path) -> Vec<&'static str> {
 /// Best-scoring hit per skill name across every stack tag, ranked
 /// descending. Takes a raw `Connection` (not `Registry`) so it's testable
 /// against an in-memory DB seeded via `skill_registry::db::rebuild`.
+/// SQLite FTS5's `bm25()` returns negative values where *lower* (more
+/// negative) is a better match (`search.rs` sorts `ORDER BY score` ascending
+/// on the same raw value). Map that to a bounded, monotonic 0..100 display
+/// value: 0 for no match, asymptotically approaching 100 for a strong one.
+fn confidence_pct(score: f64) -> f64 {
+    let relevance = (-score).max(0.0);
+    100.0 * relevance / (1.0 + relevance)
+}
+
 fn rank_candidates(
     conn: &rusqlite::Connection,
     stack: &[&str],
@@ -716,7 +725,8 @@ fn rank_candidates(
         for hit in hits {
             best.entry(hit.name.clone())
                 .and_modify(|existing| {
-                    if hit.score > existing.score {
+                    // Lower bm25 = better match.
+                    if hit.score < existing.score {
                         *existing = hit.clone();
                     }
                 })
@@ -725,8 +735,8 @@ fn rank_candidates(
     }
     let mut ranked: Vec<_> = best.into_values().collect();
     ranked.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
+        a.score
+            .partial_cmp(&b.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     ranked
@@ -763,7 +773,7 @@ fn run_provision(path: &str, yes: bool) -> Result<(), Box<dyn std::error::Error>
             "  {} — {} (confidence {:.0}%, ~{} tokens)",
             hit.name,
             hit.description,
-            hit.score.min(1.0) * 100.0,
+            confidence_pct(hit.score),
             hit.est_tokens
         );
     }
@@ -775,14 +785,50 @@ fn run_provision(path: &str, yes: bool) -> Result<(), Box<dyn std::error::Error>
 
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let sources =
-        skill_registry::sources::default_sources(&home, &cwd, &["claude-code".to_string()]);
+    let sources = skill_registry::sources::default_sources(
+        &home,
+        &cwd,
+        &crate::components::detected_skill_agents(),
+    );
     let scan = skill_registry::sources::scan_sources(&sources);
     let mut all = scan.entries;
     let mut existing: HashSet<(String, String)> = all
         .iter()
         .map(|e| (e.name.clone(), e.source.clone()))
         .collect();
+
+    // `rebuild()` is documented full-replace ("the filesystem is the source
+    // of truth"), but DB-only rows (prior `provisioned:*`/`imported:*`/
+    // `hub:*` entries) aren't rediscoverable by a flat-dir rescan. Carry them
+    // forward so provisioning one repo doesn't silently drop another's
+    // provisioned/imported skills — same merge shape `HubAction::Pull` uses
+    // for hub entries, generalized to every DB-only source.
+    if let Ok(pairs) = skill_registry::search::list_all_name_source_pairs(&conn) {
+        for (name, source) in pairs {
+            let key = (name.clone(), source.clone());
+            if existing.contains(&key) {
+                continue;
+            }
+            let qualified = format!("{source}:{name}");
+            if let Ok(skill) = skill_registry::load(&conn, &qualified, false) {
+                all.push(skill_registry::sources::SkillEntry {
+                    name,
+                    source,
+                    path: PathBuf::new(),
+                    description: skill.description,
+                    body: skill.body.clone(),
+                    neg_text: String::new(),
+                    tags: String::new(),
+                    est_tokens: skill.body.len() as i64 / 4,
+                    mtime: 0,
+                    bandit_alpha: 1.0,
+                    bandit_beta: 1.0,
+                    shadow_path: None,
+                });
+                existing.insert(key);
+            }
+        }
+    }
 
     let provisioned_source = format!("provisioned:{path}");
     let mut installed = 0;
@@ -1058,6 +1104,45 @@ mod tests {
             rust_ranked.first().unwrap().name,
             node_ranked.first().unwrap().name
         );
+    }
+
+    #[test]
+    fn rank_candidates_prefers_stronger_bm25_match_within_a_tag() {
+        // bm25 is negative-is-better; both entries match "rust" via FTS, but
+        // rust-deep-dive repeats the term across name/description/tags so it
+        // must score more negative (better) than rust-mention, which only
+        // has one incidental occurrence. A max-score (instead of min-score)
+        // selection bug would invert this.
+        let mut conn = skill_registry::db::open_in_memory().unwrap();
+        skill_registry::db::rebuild(
+            &mut conn,
+            &[
+                fixture_entry(
+                    "rust-deep-dive",
+                    "rust rust rust idiomatic rust patterns and rust cargo workflows",
+                    "rust rust cargo",
+                ),
+                fixture_entry(
+                    "misc-notes",
+                    "assorted project notes that mention rust once in passing",
+                    "notes",
+                ),
+            ],
+        )
+        .unwrap();
+
+        let ranked = rank_candidates(&conn, &["rust"]);
+        assert_eq!(ranked.first().unwrap().name, "rust-deep-dive");
+        // The winning (best/lowest) score must sort before the rest.
+        assert!(ranked.windows(2).all(|w| w[0].score <= w[1].score));
+    }
+
+    #[test]
+    fn confidence_pct_is_bounded_and_monotonic() {
+        assert_eq!(confidence_pct(0.0), 0.0);
+        assert!(confidence_pct(-1.0) > 0.0 && confidence_pct(-1.0) < 100.0);
+        assert!(confidence_pct(-1000.0) > confidence_pct(-1.0));
+        assert!(confidence_pct(-1000.0) < 100.0);
     }
 
     #[test]

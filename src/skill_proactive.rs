@@ -84,7 +84,8 @@ pub fn snooze(name: &str, days: i64) {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let mut settings = load_settings();
-    apply_snooze(&mut settings, name, now + days.max(0) * 86_400);
+    let snooze_until = now.saturating_add(days.max(0).saturating_mul(86_400));
+    apply_snooze(&mut settings, name, snooze_until);
     save_settings(&settings);
 }
 
