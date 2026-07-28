@@ -162,8 +162,7 @@ fn detect_filepath_extraction(body: &Value) -> Option<(String, String)> {
         return None;
     }
 
-    let user_has_filepaths = content.to_lowercase().contains("filepaths")
-        || content.to_lowercase().contains("<filepaths>");
+    let user_has_filepaths = content.to_lowercase().contains("filepaths");
 
     let system_has_extract = body
         .get("system")
@@ -546,6 +545,83 @@ mod tests {
                 assert_eq!(msg["stop_reason"], "end_turn");
                 assert_eq!(msg["usage"]["input_tokens"], 10);
                 assert_eq!(msg["usage"]["output_tokens"], 5);
+            }
+            _ => panic!("expected Match"),
+        }
+    }
+
+    fn only(flag: &str) -> ShortCircuitConfig {
+        ShortCircuitConfig {
+            fast_prefix_detection: flag == "prefix",
+            enable_network_probe_mock: flag == "quota",
+            enable_title_generation_skip: flag == "title",
+            enable_suggestion_mode_skip: flag == "suggestion",
+            enable_filepath_extraction_mock: flag == "filepath",
+        }
+    }
+
+    #[test]
+    fn test_short_circuit_prefix_detection_enabled() {
+        let body = json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "<policy_spec>x</policy_spec>\nCommand: git status"}]
+        });
+        match try_short_circuit(&body, &only("prefix")) {
+            ShortCircuitOutcome::Match(msg) => {
+                assert_eq!(msg["content"][0]["text"], "git status");
+                assert_eq!(msg["usage"]["input_tokens"], 100);
+                assert_eq!(msg["usage"]["output_tokens"], 5);
+            }
+            _ => panic!("expected Match"),
+        }
+    }
+
+    #[test]
+    fn test_short_circuit_title_generation_enabled() {
+        let body = json!({
+            "model": "claude-sonnet-4-20250514",
+            "system": "You help generate a new conversation topic and title.",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        match try_short_circuit(&body, &only("title")) {
+            ShortCircuitOutcome::Match(msg) => {
+                assert_eq!(msg["content"][0]["text"], "Conversation");
+                assert_eq!(msg["usage"]["output_tokens"], 5);
+            }
+            _ => panic!("expected Match"),
+        }
+    }
+
+    #[test]
+    fn test_short_circuit_suggestion_mode_enabled() {
+        let body = json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "something [SUGGESTION MODE: on]"}]
+        });
+        match try_short_circuit(&body, &only("suggestion")) {
+            ShortCircuitOutcome::Match(msg) => {
+                assert_eq!(msg["content"][0]["text"], "");
+                assert_eq!(msg["usage"]["output_tokens"], 1);
+            }
+            _ => panic!("expected Match"),
+        }
+    }
+
+    #[test]
+    fn test_short_circuit_filepath_extraction_enabled() {
+        let body = json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Command: cat foo.txt\nOutput: contents\n<filepaths>"}],
+            "system": "extract any file paths"
+        });
+        match try_short_circuit(&body, &only("filepath")) {
+            ShortCircuitOutcome::Match(msg) => {
+                assert_eq!(
+                    msg["content"][0]["text"],
+                    "<filepaths>\nfoo.txt\n</filepaths>"
+                );
+                assert_eq!(msg["usage"]["output_tokens"], 10);
             }
             _ => panic!("expected Match"),
         }

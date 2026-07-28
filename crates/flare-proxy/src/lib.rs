@@ -24,6 +24,7 @@ pub fn router() -> Router {
         .route("/proxy/v1/messages", post(v1_messages_handler))
         .with_state(AppState {
             config: ProviderConfig::from_env(),
+            sc_config: shortcircuit::ShortCircuitConfig::from_env(),
             client,
         })
 }
@@ -54,8 +55,7 @@ async fn v1_messages_handler(
             return (StatusCode::UNAUTHORIZED, "invalid or missing proxy token").into_response();
         }
     }
-    let sc_config = shortcircuit::ShortCircuitConfig::from_env();
-    match shortcircuit::try_short_circuit(&body, &sc_config) {
+    match shortcircuit::try_short_circuit(&body, &state.sc_config) {
         shortcircuit::ShortCircuitOutcome::Match(message) => {
             // Internal CLI bookkeeping calls (quota probe, prefix/title/
             // suggestion/filepath detection) are sent non-streaming and
@@ -71,5 +71,6 @@ async fn v1_messages_handler(
 #[derive(Clone)]
 struct AppState {
     config: ProviderConfig,
+    sc_config: shortcircuit::ShortCircuitConfig,
     client: reqwest::Client,
 }
