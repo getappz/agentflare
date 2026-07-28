@@ -17,6 +17,13 @@ const MAX_GROOM_LIMIT: i64 = 200;
 /// holding the backend DB lock.
 const MAX_WINDOW_WEEKS: i64 = 52;
 
+/// Default/max page size for `list` — omitting `limit` used to return every
+/// matching item unbounded, which can blow past the MCP response token cap
+/// on large projects (155 items / 52k chars observed). Mirrors the
+/// `unwrap_or`+`clamp` pattern already used by `search`/`groom` below.
+const DEFAULT_LIST_LIMIT: i64 = 50;
+const MAX_LIST_LIMIT: i64 = 500;
+
 fn priority_rank(p: &str) -> u8 {
     match p {
         "urgent" => 5,
@@ -258,14 +265,15 @@ impl AgentflareMcp {
                 });
             }
 
+            let total = items.len();
             let offset = req.offset.unwrap_or(0) as usize;
-            let items = items.into_iter().skip(offset);
-            let items: Vec<_> = match req.limit {
-                Some(limit) => items.take(limit as usize).collect(),
-                None => items.collect(),
-            };
+            let limit = req
+                .limit
+                .unwrap_or(DEFAULT_LIST_LIMIT)
+                .clamp(0, MAX_LIST_LIMIT) as usize;
+            let page: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
 
-            let summaries: Vec<ItemSummary> = items
+            let summaries: Vec<ItemSummary> = page
                 .into_iter()
                 .map(|i| {
                     let state = state_by_id.get(i.state_id.as_str());
@@ -282,7 +290,21 @@ impl AgentflareMcp {
                     }
                 })
                 .collect();
-            Ok(serde_json::to_string_pretty(&summaries).unwrap_or_default())
+
+            let next_offset = (offset.saturating_add(summaries.len()) < total && limit > 0)
+                .then_some(offset.saturating_add(limit));
+            let prev_offset = (limit > 0 && offset > 0 && total > 0)
+                .then_some(offset.min(total).saturating_sub(limit));
+
+            let page = ItemListPage {
+                items: summaries,
+                total,
+                offset,
+                limit,
+                next_offset,
+                prev_offset,
+            };
+            Ok(serde_json::to_string_pretty(&page).unwrap_or_default())
         })?
     }
 
