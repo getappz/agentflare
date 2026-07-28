@@ -600,8 +600,15 @@ mod tests {
     fn cooldown_secs_defaults_to_none_when_absent() {
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
-            crate::coaching::apply_rule("hygiene", "Title", "Body", None, RuleTier::Override, vec![])
-                .unwrap();
+            crate::coaching::apply_rule(
+                "hygiene",
+                "Title",
+                "Body",
+                None,
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
             let rules = crate::coaching::list_rules();
             assert_eq!(rules[0].cooldown_secs, None);
         });

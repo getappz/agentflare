@@ -138,8 +138,12 @@ fn apply_rule_inner(
     // apply_rule refresh, which always passes None here, must not silently
     // wipe a cooldown that was set earlier — mirrors how `enforced` is
     // preserved above).
-    let cooldown_secs =
-        cooldown_secs.or_else(|| existing.iter().find(|r| r.id == id).and_then(|r| r.cooldown_secs));
+    let cooldown_secs = cooldown_secs.or_else(|| {
+        existing
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.cooldown_secs)
+    });
     if !is_overwrite && existing.len() >= MAX_RULES {
         return Err(format!(
             "maximum {MAX_RULES} coaching rules reached, remove one first"
