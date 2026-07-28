@@ -5,7 +5,7 @@
 // redirect rule that needs IO (e.g. a backend DB lookup) can never wedge the
 // host's tool call — it just falls through to allow instead.
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -23,7 +23,7 @@ const GATING_TIMEOUT: Duration = Duration::from_millis(2000);
 /// `multiedit` are opencode-specific) — the opencode branch-guard plugin
 /// (`~/.config/opencode/plugin/branch-guard.js`) calls this same classifier
 /// via `agentflare hook pre-tool-use` instead of duplicating branch logic.
-const MUTATING_TOOLS: &[&str] = &[
+pub(crate) const MUTATING_TOOLS: &[&str] = &[
     "Write",
     "write",
     "Edit",
@@ -134,6 +134,66 @@ fn default_branch(start_path: Option<&Path>) -> Option<String> {
     }
 }
 
+/// Where a mutating tool's edit will actually land, for any guard that
+/// needs "target isn't in a repo at all" to differ from "tool gave no path,
+/// fall back to cwd" -- conflating the two is exactly the AGENTFLARE-6 bug
+/// (a file's own repo/branch silently swapped for the host cwd's).
+pub(crate) enum TargetRepo {
+    /// Repo resolved -- from the tool's target path, or cwd when the tool
+    /// gave no path at all (e.g. MultiEdit).
+    Found(PathBuf),
+    /// Tool gave an explicit path that isn't inside ANY git repo -- callers
+    /// must not fall back to cwd's repo/branch instead.
+    Outside,
+}
+
+/// Resolves the repo a mutating tool's edit targets. Walks up from the
+/// target path to the first ancestor that actually exists on disk before
+/// asking git for its toplevel -- a bare filename's parent is "" (no such
+/// dir) and a new file's parent may not exist yet, either of which would
+/// otherwise make the git subprocess fail and silently skip whichever guard
+/// calls this. `git rev-parse --show-toplevel` already walks up from its
+/// start dir looking for `.git`, so only the FIRST existing ancestor needs
+/// to actually be handed to it.
+pub(crate) fn resolve_mutating_target_repo(tool_input: Option<&Value>) -> TargetRepo {
+    let target_path = tool_input.and_then(|ti| {
+        // opencode's native tools send camelCase `filePath`.
+        ti.get("file_path")
+            .or_else(|| ti.get("path"))
+            .or_else(|| ti.get("filePath"))
+            .and_then(Value::as_str)
+            .map(Path::new)
+    });
+    let Some(p) = target_path else {
+        let Ok(cwd) = std::env::current_dir() else {
+            return TargetRepo::Outside;
+        };
+        return match flare_git_core::branch::repo_toplevel(&cwd) {
+            Some(repo) => TargetRepo::Found(repo),
+            None => TargetRepo::Outside,
+        };
+    };
+    let Some(first_existing) = p.ancestors().skip(1).find(|ancestor| {
+        let check = if *ancestor == Path::new("") {
+            Path::new(".")
+        } else {
+            *ancestor
+        };
+        check.exists()
+    }) else {
+        return TargetRepo::Outside;
+    };
+    let check = if first_existing == Path::new("") {
+        Path::new(".")
+    } else {
+        first_existing
+    };
+    match flare_git_core::branch::repo_toplevel(check) {
+        Some(repo) => TargetRepo::Found(repo),
+        None => TargetRepo::Outside,
+    }
+}
+
 /// Pure decision core for the branch guard — no git process spawned here, so
 /// it's unit-testable with fake branch names regardless of which branch this
 /// actual repo happens to be on when `cargo test` runs (same reason
@@ -221,51 +281,13 @@ pub fn redirect_decision(tool_name: &str, tool_input: Option<&Value>) -> Option<
         // need it. When we do check, resolve the target file's repo, not
         // host cwd.
         let (current, default) = if MUTATING_TOOLS.contains(&tool_name.as_str()) {
-            let target_path = tool_input.as_ref().and_then(|ti| {
-                // opencode's native tools send camelCase `filePath`; without
-                // it here the target repo resolves to None and the branch
-                // guard silently allows the edit.
-                ti.get("file_path")
-                    .or_else(|| ti.get("path"))
-                    .or_else(|| ti.get("filePath"))
-                    .and_then(Value::as_str)
-                    .map(Path::new)
-            });
-            // Walk up from the target to the first ancestor that actually
-            // exists on disk before asking git for its toplevel -- a bare
-            // filename's parent is "" (no such dir) and a new file's parent
-            // may not exist yet, either of which would otherwise make the
-            // git subprocess fail and silently skip the guard.
-            // `git rev-parse --show-toplevel` already walks up from its
-            // start dir looking for `.git`, so only the FIRST existing
-            // ancestor needs to actually be handed to it -- every higher
-            // ancestor is already covered by that walk, and re-spawning git
-            // per ancestor just burns time against GATING_TIMEOUT.
-            let target_repo = target_path.and_then(|p| {
-                let first_existing = p.ancestors().skip(1).find(|ancestor| {
-                    let check = if *ancestor == Path::new("") {
-                        Path::new(".")
-                    } else {
-                        *ancestor
-                    };
-                    check.exists()
-                })?;
-                let check = if first_existing == Path::new("") {
-                    Path::new(".")
-                } else {
-                    first_existing
-                };
-                flare_git_core::branch::repo_toplevel(check)
-            });
-            match (target_path, target_repo) {
-                // Path was extracted but isn't in any git repo -- no guard.
-                (Some(_), None) => (None, None),
-                // Path couldn't be extracted (tool has no file_path/path,
-                // e.g. MultiEdit) -- fall back to cwd; repo found -- use it.
-                (_, repo) => (
-                    current_branch(repo.as_deref()),
-                    default_branch(repo.as_deref()),
-                ),
+            match resolve_mutating_target_repo(tool_input.as_ref()) {
+                // Target isn't in any git repo (or has no path at all and
+                // cwd isn't one either) -- no guard.
+                TargetRepo::Outside => (None, None),
+                TargetRepo::Found(repo) => {
+                    (current_branch(Some(&repo)), default_branch(Some(&repo)))
+                }
             }
         } else {
             (None, None)

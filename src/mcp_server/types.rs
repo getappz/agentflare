@@ -727,11 +727,13 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) state_group: Option<String>,
     #[schemars(
-        description = "Max items to return (list: omit for no limit; search: omit for 20, capped at 1000; groom: omit for 15, capped at 200)"
+        description = "Max items to return (list: omit for 50, capped at 500; search: omit for 20, capped at 1000; groom: omit for 15, capped at 200)"
     )]
     #[serde(default)]
     pub(crate) limit: Option<i64>,
-    #[schemars(description = "Items to skip before applying limit (list); default 0")]
+    #[schemars(
+        description = "Items to skip before applying limit (list); default 0. `list`'s response includes `next_offset`/`prev_offset` — pass those back here to page forward/backward"
+    )]
     #[serde(default)]
     pub(crate) offset: Option<i64>,
     #[schemars(description = "FTS5 search query (search)")]
@@ -771,6 +773,22 @@ pub(crate) struct ItemSummary {
     pub(crate) parent_id: Option<String>,
     pub(crate) sequence_id: i64,
     pub(crate) updated_at: i64,
+}
+
+/// `item(list)`'s response envelope — carries `next_offset`/`prev_offset` so
+/// a caller paging through a large project can navigate by re-sending the
+/// given offset as-is, rather than re-deriving it from `total`/`limit`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ItemListPage {
+    pub(crate) items: Vec<ItemSummary>,
+    /// Count matching the filters, before this page's offset/limit were applied.
+    pub(crate) total: usize,
+    pub(crate) offset: usize,
+    pub(crate) limit: usize,
+    /// Pass as `offset` on the next call for the next page; `null` on the last page.
+    pub(crate) next_offset: Option<usize>,
+    /// Pass as `offset` on the next call for the previous page; `null` on the first page.
+    pub(crate) prev_offset: Option<usize>,
 }
 
 /// One shortlisted item plus the decision-support signals `groom` computes
