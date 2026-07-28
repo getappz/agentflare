@@ -2,6 +2,7 @@ mod forward;
 pub mod heuristic;
 pub mod providers;
 pub mod shape_xlat;
+pub mod shortcircuit;
 pub mod think;
 
 use axum::{
@@ -52,6 +53,17 @@ async fn v1_messages_handler(
         if provided != expected {
             return (StatusCode::UNAUTHORIZED, "invalid or missing proxy token").into_response();
         }
+    }
+    let sc_config = shortcircuit::ShortCircuitConfig::from_env();
+    match shortcircuit::try_short_circuit(&body, &sc_config) {
+        shortcircuit::ShortCircuitOutcome::Match(message) => {
+            // Internal CLI bookkeeping calls (quota probe, prefix/title/
+            // suggestion/filepath detection) are sent non-streaming and
+            // expect a plain Messages JSON body, unlike every other request
+            // this proxy handles.
+            return axum::Json(message).into_response();
+        }
+        shortcircuit::ShortCircuitOutcome::NoMatch => {}
     }
     forward::proxy_request(body, &state.config, &state.client).await
 }
