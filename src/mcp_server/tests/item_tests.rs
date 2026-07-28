@@ -331,7 +331,7 @@ fn item_list_filters_by_assignee_or_unassigned_and_sorts_open_first() {
         .unwrap(),
     )
     .unwrap();
-    let names: Vec<&str> = listed
+    let names: Vec<&str> = listed["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -386,7 +386,7 @@ fn item_list_defaults_assignee_filter_to_server_identity() {
         .unwrap(),
     )
     .unwrap();
-    let mut names: Vec<&str> = defaulted
+    let mut names: Vec<&str> = defaulted["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -405,7 +405,7 @@ fn item_list_defaults_assignee_filter_to_server_identity() {
         .unwrap(),
     )
     .unwrap();
-    let mut names2: Vec<&str> = explicit
+    let mut names2: Vec<&str> = explicit["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -466,7 +466,7 @@ fn item_list_state_group_filter_accepts_comma_separated_groups() {
         .unwrap(),
     )
     .unwrap();
-    let names: Vec<&str> = listed
+    let names: Vec<&str> = listed["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -1206,7 +1206,7 @@ fn item_groom_benchmark() {
         .unwrap(),
     )
     .unwrap();
-    let shortlist_ids: Vec<String> = listed
+    let shortlist_ids: Vec<String> = listed["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -1247,13 +1247,18 @@ fn item_list_respects_limit_and_offset() {
         .unwrap(),
     )
     .unwrap();
-    let names: Vec<&str> = listed
+    let names: Vec<&str> = listed["items"]
         .as_array()
         .unwrap()
         .iter()
         .map(|i| i["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, vec!["B"]);
+    assert_eq!(listed["total"], 3);
+    assert_eq!(listed["offset"], 1);
+    assert_eq!(listed["limit"], 1);
+    assert_eq!(listed["next_offset"], 2);
+    assert_eq!(listed["prev_offset"], 0);
 }
 
 #[test]
@@ -1268,11 +1273,13 @@ fn item_list_returns_lean_projection_with_readable_state() {
         .unwrap(),
     )
     .unwrap();
-    let first = &listed.as_array().unwrap()[0];
+    let first = &listed["items"].as_array().unwrap()[0];
     assert_eq!(first["state"], "Backlog");
     assert_eq!(first["state_group"], "backlog");
     assert!(first.get("description").is_none());
     assert!(first.get("metadata").is_none());
+    assert_eq!(listed["next_offset"], serde_json::Value::Null);
+    assert_eq!(listed["prev_offset"], serde_json::Value::Null);
 }
 
 #[test]
