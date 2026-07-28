@@ -31,6 +31,13 @@ pub enum CoachingAction {
     Remove {
         id: String,
     },
+    /// Mark a rule MANDATORY (hard-denied by the PreToolUse hook when
+    /// violated) or, with --off, demote it back to advisory.
+    Enforce {
+        id: String,
+        #[arg(long)]
+        off: bool,
+    },
     /// Regenerate every synced rule file for one host, or all of them.
     Sync {
         /// Agent host to sync rules for (default: all known hosts).
@@ -67,6 +74,7 @@ impl CoachingArgs {
                 sync,
             ),
             CoachingAction::Remove { id } => crate::coaching::cli_remove(&id),
+            CoachingAction::Enforce { id, off } => crate::coaching::cli_enforce(&id, !off),
             CoachingAction::Sync { agent } => crate::coaching::cli_sync(agent.as_deref()),
         }
     }

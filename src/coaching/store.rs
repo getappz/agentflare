@@ -101,6 +101,11 @@ pub fn apply_rule(
 
     let existing = list_rules();
     let is_overwrite = existing.iter().any(|r| r.id == id);
+    let enforced = existing
+        .iter()
+        .find(|r| r.id == id)
+        .map(|r| r.enforced)
+        .unwrap_or(false);
     if !is_overwrite && existing.len() >= MAX_RULES {
         return Err(format!(
             "maximum {MAX_RULES} coaching rules reached, remove one first"
@@ -124,6 +129,48 @@ pub fn apply_rule(
         trigger.as_ref(),
         tier.clone(),
         &sync,
+        enforced,
+    )
+    .map_err(|e| format!("failed to write rule file: {e}"))?;
+
+    list_rules()
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| "rule written but could not be re-read".to_string())
+}
+
+/// Flip a rule's `enforced` (MANDATORY) flag without touching its other
+/// fields. Only meaningful for rules with a tool trigger — an enforced
+/// rule with no tools would never match any PreToolUse call, silently
+/// doing nothing, so that combination is rejected rather than allowed to
+/// look like it's doing something it isn't.
+pub fn set_enforced(id: &str, enforced: bool) -> Result<CoachingRule, String> {
+    if !rule::is_valid_rule_id(id) {
+        return Err(format!("invalid rule id '{id}'"));
+    }
+    let _lock = RulesLock::acquire(&rules_dir())
+        .map_err(|e| format!("failed to acquire rules lock: {e}"))?;
+
+    let existing = list_rules();
+    let target = existing
+        .iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| format!("rule not found: {id}"))?;
+    if enforced && target.trigger.as_ref().map(|t| t.tools.is_empty()).unwrap_or(true) {
+        return Err(format!(
+            "rule '{id}' has no tool trigger \u{2014} enforced rules must declare a tool trigger so the hook knows which calls to block"
+        ));
+    }
+
+    rule::write_rule_file(
+        &rules_dir(),
+        id,
+        &target.title,
+        &target.body,
+        target.trigger.as_ref(),
+        target.tier.clone(),
+        &target.sync,
+        enforced,
     )
     .map_err(|e| format!("failed to write rule file: {e}"))?;
 
@@ -217,6 +264,27 @@ pub fn rule_bodies_for_tool(tool_name: &str) -> Vec<String> {
         })
         .map(|r| r.body)
         .collect()
+}
+
+/// Redirect-framed deny reason for the first MANDATORY (enforced) rule
+/// whose trigger declares `tool_name`, if any. Distinct from
+/// `rule_bodies_for_tool`'s advisory nudges: this is consulted by the
+/// PreToolUse hook to block the call outright, not just remind about it.
+pub fn enforced_rule_reason_for_tool(tool_name: &str) -> Option<String> {
+    list_rules()
+        .into_iter()
+        .find(|r| {
+            r.enforced
+                && r.trigger
+                    .as_ref()
+                    .is_some_and(|trigger| trigger.tools.iter().any(|t| t == tool_name))
+        })
+        .map(|r| {
+            format!(
+                "MANDATORY coaching rule '{}' redirects {tool_name} \u{2014} {}",
+                r.title, r.body
+            )
+        })
 }
 
 /// Bodies of rules with auto_match true whose title+body BM25-matches
@@ -704,6 +772,111 @@ mod tests {
             )
             .unwrap();
             assert!(!rules_dir().join("superseded-search17.json").exists());
+        });
+    }
+
+    #[test]
+    fn set_enforced_flips_flag_on_existing_rule() {
+        with_temp_home(|| {
+            apply_rule(
+                "revfix",
+                "T",
+                "Body",
+                Some(rule::RuleTrigger {
+                    tools: vec!["mcp__flare__review".to_string()],
+                    auto_match: false,
+                }),
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
+
+            let updated = set_enforced("revfix", true).unwrap();
+            assert!(updated.enforced);
+
+            let rules = list_rules();
+            assert!(rules[0].enforced);
+        });
+    }
+
+    #[test]
+    fn set_enforced_rejects_rule_without_tool_trigger() {
+        with_temp_home(|| {
+            apply_rule("hygiene", "T", "Body", None, RuleTier::Override, vec![]).unwrap();
+
+            let err = set_enforced("hygiene", true).unwrap_err();
+            assert!(err.contains("no tool trigger"));
+        });
+    }
+
+    #[test]
+    fn set_enforced_errors_when_rule_not_found() {
+        with_temp_home(|| {
+            let err = set_enforced("missing", true).unwrap_err();
+            assert!(err.contains("not found"));
+        });
+    }
+
+    #[test]
+    fn apply_rule_preserves_enforced_flag_across_body_refresh() {
+        with_temp_home(|| {
+            apply_rule(
+                "revfix",
+                "T",
+                "Old body",
+                Some(rule::RuleTrigger {
+                    tools: vec!["mcp__flare__review".to_string()],
+                    auto_match: false,
+                }),
+                RuleTier::Builtin,
+                vec![],
+            )
+            .unwrap();
+            set_enforced("revfix", true).unwrap();
+
+            apply_rule(
+                "revfix",
+                "T",
+                "New body",
+                Some(rule::RuleTrigger {
+                    tools: vec!["mcp__flare__review".to_string()],
+                    auto_match: false,
+                }),
+                RuleTier::Builtin,
+                vec![],
+            )
+            .unwrap();
+
+            let rules = list_rules();
+            assert_eq!(rules[0].body, "New body");
+            assert!(rules[0].enforced, "enforced flag must survive a body refresh");
+        });
+    }
+
+    #[test]
+    fn enforced_rule_reason_for_tool_only_fires_for_enforced_rules() {
+        with_temp_home(|| {
+            apply_rule(
+                "revfix",
+                "Reviews ship with fixes",
+                "Every finding needs a diff.",
+                Some(rule::RuleTrigger {
+                    tools: vec!["mcp__flare__review".to_string()],
+                    auto_match: false,
+                }),
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
+
+            assert!(enforced_rule_reason_for_tool("mcp__flare__review").is_none());
+
+            set_enforced("revfix", true).unwrap();
+            let reason = enforced_rule_reason_for_tool("mcp__flare__review").unwrap();
+            assert!(reason.contains("MANDATORY"));
+            assert!(reason.contains("Every finding needs a diff."));
+
+            assert!(enforced_rule_reason_for_tool("mcp__flare__comment").is_none());
         });
     }
 }
