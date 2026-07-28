@@ -187,29 +187,49 @@ pub fn model_routing_nudge(prompt: &str) -> Option<&'static str> {
 pub const BATCHABLE_TOOLS: &[&str] = &["Read", "Bash", "ctx_read", "ctx_shell"];
 const BATCH_WINDOW: usize = 3;
 
-/// Flags when the last BATCH_WINDOW calls (including the one about to run)
-/// are all solo calls to the same batch-eligible tool — a sign a batch form
-/// should have been used instead.
+/// Length of the run of consecutive identical calls to `next_tool` that
+/// would end at the newest entry if it ran next — 1 if the last recorded
+/// call was some other tool (or there's no history yet).
+fn trailing_streak_len(recent_calls: &[ToolCallRecord], next_tool: &str) -> usize {
+    recent_calls
+        .iter()
+        .rev()
+        .take_while(|c| c.name == next_tool)
+        .count()
+        + 1
+}
+
+/// True at the doubling milestones a streak length lands on: BATCH_WINDOW,
+/// 2x that, 4x that, .... Firing at every one of these (not every call past
+/// the threshold) means a burst gets nudged once, and a pathologically long
+/// streak still gets occasional reminders instead of either going silent
+/// forever or repeating on every single call.
+fn is_batch_nudge_milestone(streak_len: usize) -> bool {
+    if streak_len < BATCH_WINDOW {
+        return false;
+    }
+    let mut milestone = BATCH_WINDOW;
+    while milestone < streak_len {
+        milestone *= 2;
+    }
+    milestone == streak_len
+}
+
+/// Flags a run of solo calls to the same batch-eligible tool — a sign a
+/// batch/list form should have been used instead. Paced by
+/// [`is_batch_nudge_milestone`] rather than firing on every call once a
+/// streak crosses the threshold.
 pub fn batching_nudge(recent_calls: &[ToolCallRecord], next_tool: &str) -> Option<String> {
     if !BATCHABLE_TOOLS.contains(&next_tool) {
         return None;
     }
-    let tail: Vec<&str> = recent_calls
-        .iter()
-        .rev()
-        .take(BATCH_WINDOW - 1)
-        .map(|c| c.name.as_str())
-        .collect();
-    if tail.len() < BATCH_WINDOW - 1 {
+    let streak_len = trailing_streak_len(recent_calls, next_tool);
+    if !is_batch_nudge_milestone(streak_len) {
         return None;
     }
-    if tail.iter().all(|&name| name == next_tool) {
-        return Some(format!(
-            "That's {} consecutive solo calls to {next_tool} — check if it accepts a batch/list form instead.",
-            BATCH_WINDOW
-        ));
-    }
-    None
+    Some(format!(
+        "That's {streak_len} consecutive solo calls to {next_tool} — check if it accepts a batch/list form instead."
+    ))
 }
 
 pub fn schedule_wakeup_nudge(delay_seconds: u64) -> Option<&'static str> {
@@ -402,6 +422,70 @@ mod tests {
             ts: 1,
         }];
         assert!(batching_nudge(&recent, "Read").is_none());
+    }
+
+    #[test]
+    fn batching_stays_silent_between_milestones() {
+        // A streak that's already crossed the first milestone (3) must not
+        // fire again on every subsequent call -- only at the next doubling
+        // milestone (6). This is the bug report: it was firing on every
+        // call once a streak passed the threshold.
+        let make_recent = |n: usize| {
+            (0..n)
+                .map(|i| ToolCallRecord {
+                    name: "Bash".to_string(),
+                    ts: i as u64,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Streak lengths 4 and 5 (2 and 3 prior Bash calls respectively)
+        // must be silent -- 3 already fired, 6 hasn't arrived yet.
+        assert!(batching_nudge(&make_recent(3), "Bash").is_none(), "streak len 4");
+        assert!(batching_nudge(&make_recent(4), "Bash").is_none(), "streak len 5");
+        // Streak length 6 (5 prior calls) is the next milestone.
+        assert!(batching_nudge(&make_recent(5), "Bash").is_some(), "streak len 6");
+    }
+
+    #[test]
+    fn batching_milestones_double_for_long_streaks() {
+        let make_recent = |n: usize| {
+            (0..n)
+                .map(|i| ToolCallRecord {
+                    name: "Bash".to_string(),
+                    ts: i as u64,
+                })
+                .collect::<Vec<_>>()
+        };
+        for milestone in [3, 6, 12, 24] {
+            let recent = make_recent(milestone - 1);
+            assert!(
+                batching_nudge(&recent, "Bash").is_some(),
+                "milestone {milestone} should have fired"
+            );
+        }
+        // Non-milestone lengths in between stay silent.
+        for streak_len in [4, 5, 7, 10, 13, 20] {
+            let recent = make_recent(streak_len - 1);
+            assert!(
+                batching_nudge(&recent, "Bash").is_none(),
+                "streak len {streak_len} should be silent"
+            );
+        }
+    }
+
+    #[test]
+    fn batching_streak_resets_when_a_different_tool_interrupts() {
+        let mut recent = vec![
+            ToolCallRecord { name: "Bash".to_string(), ts: 1 },
+            ToolCallRecord { name: "Bash".to_string(), ts: 2 },
+        ];
+        // 3rd Bash call -> milestone.
+        assert!(batching_nudge(&recent, "Bash").is_some());
+        recent.push(ToolCallRecord { name: "Bash".to_string(), ts: 3 });
+        // A different tool breaks the streak entirely.
+        recent.push(ToolCallRecord { name: "Read".to_string(), ts: 4 });
+        // Back to Bash: streak restarts at 1, well under the next milestone.
+        assert!(batching_nudge(&recent, "Bash").is_none());
     }
 
     #[test]
