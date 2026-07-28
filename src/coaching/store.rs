@@ -133,6 +133,13 @@ fn apply_rule_inner(
         .find(|r| r.id == id)
         .map(|r| r.enforced)
         .unwrap_or(false);
+    // Preserve the existing rule's cooldown_secs unless the caller explicitly
+    // passed one (apply_rule_with_cooldown's Some(n) always wins; a plain
+    // apply_rule refresh, which always passes None here, must not silently
+    // wipe a cooldown that was set earlier — mirrors how `enforced` is
+    // preserved above).
+    let cooldown_secs =
+        cooldown_secs.or_else(|| existing.iter().find(|r| r.id == id).and_then(|r| r.cooldown_secs));
     if !is_overwrite && existing.len() >= MAX_RULES {
         return Err(format!(
             "maximum {MAX_RULES} coaching rules reached, remove one first"
@@ -887,6 +894,32 @@ mod tests {
             assert!(
                 rules[0].enforced,
                 "enforced flag must survive a body refresh"
+            );
+        });
+    }
+
+    #[test]
+    fn apply_rule_preserves_cooldown_secs_across_plain_refresh() {
+        with_temp_home(|| {
+            apply_rule_with_cooldown(
+                "hygiene",
+                "T",
+                "Old body",
+                None,
+                RuleTier::Override,
+                vec![],
+                Some(600),
+            )
+            .unwrap();
+
+            apply_rule("hygiene", "T", "New body", None, RuleTier::Override, vec![]).unwrap();
+
+            let rules = list_rules();
+            assert_eq!(rules[0].body, "New body");
+            assert_eq!(
+                rules[0].cooldown_secs,
+                Some(600),
+                "cooldown_secs must survive a plain apply_rule refresh, same as enforced does"
             );
         });
     }
