@@ -258,6 +258,18 @@ pub fn pre_tool_use(_agent: &str) {
         return;
     }
 
+    if let Some(reason) = crate::coaching::enforced_rule_reason_for_tool(&parsed.tool_name) {
+        let decision = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        });
+        println!("{decision}");
+        return;
+    }
+
     let mut runtime = crate::optimize::load_runtime();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

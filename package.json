@@ -1,0 +1,11 @@
+{
+  "name": "agentflare-web-monorepo",
+  "private": true,
+  "version": "0.0.0",
+  "description": "JS workspace root for agentflare.dev — links site/ (landing page + Worker) and docs-site/ (flare-docs documentation) under one aube install, each still independently runnable.",
+  "scripts": {
+    "dev:site": "aube run dev --filter agentflare-web",
+    "dev:docs": "aube run dev --filter agentflare-docs",
+    "deploy": "aube run deploy --filter agentflare-web"
+  }
+}

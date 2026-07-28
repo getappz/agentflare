@@ -1,0 +1,42 @@
+---
+title: flare-docs
+description: Always-current package documentation for your AI coding agent — built into agentflare, no setup required.
+---
+
+If you've ever watched your AI coding agent confidently write code against a library
+version that doesn't exist anymore, `flare-docs` is the fix. It's a built-in part of
+agentflare that fetches the **real, current documentation** for a package the moment
+your agent needs it — instead of relying on whatever the model happened to memorize
+during training, which goes stale the day a library ships a new version.
+
+It works the same way tools like [Context7](https://context7.com) do — see
+[how it compares](/docs/compare/) — except it's already part of agentflare, so there's
+nothing extra to install or configure.
+
+## What's supported
+
+- **Rust crates**, pulled straight from [docs.rs](https://docs.rs).
+- **npm packages**, pulled from their published TypeScript types (with a fallback for
+  packages that don't ship their own types).
+- **Python packages**, pulled from their type stubs (with the same kind of fallback).
+
+See [Supported languages](/docs/how-it-works/) for details.
+
+## Do you need to do anything?
+
+No. If you're using agentflare, your agent already has this available and will reach
+for it on its own when it's about to write code against a library. You don't need to
+run any commands yourself for it to work.
+
+That said, two things are worth knowing:
+
+- **You can look things up yourself too**, straight from the terminal — see the
+  [CLI reference](/docs/cli/).
+- **After upgrading a dependency**, it's worth telling your agent to refresh its cached
+  copy so it isn't working from the old version — see [Examples](/docs/examples/).
+
+## Why it's fast
+
+The first time a package is looked up, `flare-docs` fetches and caches it. Every lookup
+after that — by you or your agent — is instant and works offline, because it's reading
+from that local cache instead of making a network call.

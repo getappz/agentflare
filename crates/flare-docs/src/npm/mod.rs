@@ -12,10 +12,11 @@ pub mod fetch;
 
 use crate::FetchOutcome;
 use crate::fetch::{ClientError, FetchError, Fetcher};
+use crate::readme;
 use crate::store::{BatchItem, DocsStore, Error as StoreError};
 use agentflare_store::documents::DocUpsertOpts;
 pub use extract::{ApiItem, ExtractError, extract, relative_imports};
-pub use fetch::{DtsFile, NpmFetchError, PackageManifest, types_package_name};
+pub use fetch::{DtsFile, MarkdownFile, NpmFetchError, PackageManifest, types_package_name};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NpmError {
@@ -61,6 +62,14 @@ pub fn docs_id_path(package: &str, version: &str) -> String {
     format!("npm/{package}/{version}")
 }
 
+/// A usage example recovered from one of the package's markdown files.
+#[derive(Debug, Clone)]
+pub struct DocExample {
+    /// The markdown file it came from, e.g. `README.md` or `docs/quickstart.md`.
+    pub source_path: String,
+    pub example: readme::ReadmeExample,
+}
+
 /// Everything the network step produced, ready for local indexing.
 #[derive(Debug, Clone)]
 pub struct FetchedPackage {
@@ -72,6 +81,9 @@ pub struct FetchedPackage {
     pub dts: Vec<DtsFile>,
     /// Set when declarations came from DefinitelyTyped rather than the package.
     pub types_from: Option<String>,
+    /// Usage examples pulled from the package's own README/guides — verbatim
+    /// code the maintainer wrote, never LLM-generated.
+    pub examples: Vec<DocExample>,
 }
 
 /// Resolves a package to its declaration files, following the DefinitelyTyped
@@ -116,6 +128,20 @@ pub fn fetch_package(
         .unwrap_or_else(|| fetch::tarball_url(&source_manifest.name, &source_manifest.version));
     let tarball = fetcher.fetch(&url)?;
     let dts = fetch::extract_dts(&tarball.bytes)?;
+    // Same already-downloaded tarball, no extra fetch -- the README and any
+    // bundled guides are just more files in it.
+    let markdown = fetch::extract_markdown(&tarball.bytes)?;
+    let examples = markdown
+        .iter()
+        .flat_map(|file| {
+            readme::extract_readme_examples(&file.source)
+                .into_iter()
+                .map(move |example| DocExample {
+                    source_path: file.path.clone(),
+                    example,
+                })
+        })
+        .collect();
 
     Ok(FetchedPackage {
         package: package.to_string(),
@@ -123,6 +149,7 @@ pub fn fetch_package(
         manifest,
         dts,
         types_from,
+        examples,
     })
 }
 
@@ -177,10 +204,18 @@ pub fn store_package(
         Ok(n) => (n, None),
         Err(e) => (0, Some(e.to_string())),
     };
+    let (examples_indexed, examples_error) = match index_examples(store, fetched, &id_path) {
+        Ok(n) => (n, None),
+        Err(e) => (0, Some(e.to_string())),
+    };
     Ok(FetchOutcome {
         doc: overview_doc,
-        items_indexed,
-        items_error,
+        items_indexed: items_indexed + examples_indexed,
+        items_error: match (items_error, examples_error) {
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        },
     })
 }
 
@@ -235,6 +270,67 @@ fn index_items(
         }
     }
     Ok(store.upsert_batch_reconciled(&item_prefix, &batch)?)
+}
+
+/// Lowercase, hyphen-joined form of a title, for a stable, readable path
+/// segment ("Quick Start!" -> "quick-start").
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "example".to_string()
+    } else {
+        out
+    }
+}
+
+fn index_examples(
+    store: &DocsStore,
+    fetched: &FetchedPackage,
+    package_id_path: &str,
+) -> Result<usize, NpmError> {
+    let example_prefix = format!("{package_id_path}/example/");
+    let batch: Vec<BatchItem> = fetched
+        .examples
+        .iter()
+        .enumerate()
+        .map(|(i, doc_example)| {
+            let title = if doc_example.source_path == "README.md" {
+                doc_example.example.title.clone()
+            } else {
+                format!("{}: {}", doc_example.source_path, doc_example.example.title)
+            };
+            BatchItem {
+                path: format!(
+                    "{example_prefix}{i:03}-{}",
+                    slugify(&doc_example.example.title)
+                ),
+                content: doc_example.example.code.clone(),
+                title,
+                doc_type: "npm-example".to_string(),
+                tags: vec![
+                    fetched.package.clone(),
+                    "npm".to_string(),
+                    "node".to_string(),
+                    "example".to_string(),
+                ],
+                source: "npm".to_string(),
+            }
+        })
+        .collect();
+    Ok(store.upsert_batch_reconciled(&example_prefix, &batch)?)
 }
 
 #[cfg(test)]

@@ -36,6 +36,7 @@ pub struct CoachingRule {
     pub trigger: Option<RuleTrigger>,
     pub tier: RuleTier,
     pub sync: Vec<String>,
+    pub enforced: bool,
 }
 
 /// Declares when a rule should fire contextually instead of at every
@@ -181,6 +182,7 @@ pub(super) fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
     let mut trigger = None;
     let mut tier = RuleTier::Override;
     let mut sync = Vec::new();
+    let mut enforced = false;
     let mut in_header = false;
     let mut header_done = false;
     let mut body_lines = Vec::new();
@@ -217,6 +219,8 @@ pub(super) fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
+            } else if let Some(rest) = line.strip_prefix("# Enforce:") {
+                enforced = rest.trim().eq_ignore_ascii_case("true");
             }
         } else if !line.is_empty() {
             body_lines.push(line);
@@ -235,9 +239,11 @@ pub(super) fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
         trigger,
         tier,
         sync,
+        enforced,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn write_rule_file(
     dir: &std::path::Path,
     id: &str,
@@ -246,6 +252,7 @@ pub(super) fn write_rule_file(
     trigger: Option<&RuleTrigger>,
     tier: RuleTier,
     sync: &[String],
+    enforced: bool,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let date = chrono::Local::now().date_naive();
@@ -258,8 +265,13 @@ pub(super) fn write_rule_file(
     } else {
         format!("\n# Sync: {}", sync.join(", "))
     };
+    let enforce_line = if enforced {
+        "\n# Enforce: true".to_string()
+    } else {
+        String::new()
+    };
     let content = format!(
-        "---\n# Pattern: {id} \u{2014} {title}\n# Applied: {date}{trigger_line}\n# Tier: {}{sync_line}\n---\n\n{body}\n",
+        "---\n# Pattern: {id} \u{2014} {title}\n# Applied: {date}{trigger_line}\n# Tier: {}{sync_line}{enforce_line}\n---\n\n{body}\n",
         tier.as_str()
     );
     let final_path = dir.join(format!("coaching-{id}.md"));
@@ -413,6 +425,7 @@ mod tests {
             Some(&trigger),
             RuleTier::Override,
             &[],
+            false,
         )
         .unwrap();
 
@@ -435,6 +448,7 @@ mod tests {
             None,
             RuleTier::Override,
             &[],
+            false,
         )
         .unwrap();
 
@@ -455,6 +469,7 @@ mod tests {
             None,
             RuleTier::Builtin,
             &["claude-code".to_string(), "opencode".to_string()],
+            false,
         )
         .unwrap();
 
@@ -495,6 +510,7 @@ mod tests {
             None,
             RuleTier::Override,
             &[],
+            false,
         )
         .unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -506,6 +522,42 @@ mod tests {
 
         assert!(parse_rule_file(&dir.join("coaching-not a valid id.md")).is_none());
         assert!(parse_rule_file(&dir.join("coaching-hygiene.md")).is_some());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_then_parse_roundtrips_enforced_flag() {
+        let dir = temp_dir_for_test();
+        write_rule_file(
+            &dir,
+            "search17",
+            "Search",
+            "Body",
+            None,
+            RuleTier::Builtin,
+            &[],
+            true,
+        )
+        .unwrap();
+
+        let rule = parse_rule_file(&dir.join("coaching-search17.md")).unwrap();
+        assert!(rule.enforced);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_old_file_without_enforce_line_defaults_to_false() {
+        let dir = temp_dir_for_test();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("coaching-old.md"),
+            "---\n# Pattern: old \u{2014} Old\n# Applied: 2026-01-01\n---\n\nBody\n",
+        )
+        .unwrap();
+        let rule = parse_rule_file(&dir.join("coaching-old.md")).unwrap();
+        assert!(!rule.enforced);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
