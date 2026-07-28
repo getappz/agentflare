@@ -50,6 +50,16 @@ impl AgentflareMcp {
                             None,
                         ));
                     }
+                    // Reject FIFOs/devices/sockets too: opening one and
+                    // blocking on read_to_end below would hang the calling
+                    // thread waiting for a writer that may never come — same
+                    // malicious-staged-file threat model as the symlink check.
+                    Ok(m) if !m.file_type().is_file() => {
+                        return Err(ErrorData::invalid_params(
+                            format!("staged file '{fn_val}' is not a regular file — not allowed"),
+                            None,
+                        ));
+                    }
                     Ok(_) => {}
                     Err(_) => {
                         return Err(ErrorData::invalid_params(
