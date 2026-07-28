@@ -7,6 +7,11 @@ use std::path::PathBuf;
 pub struct RuntimeState {
     #[serde(default)]
     pub sessions: HashMap<String, SessionRecord>,
+    /// Session ids the freshness guard (item #7) has already run for --
+    /// the guard does a bounded `git fetch`, so it must only run once per
+    /// session (on the first mutating-tool call), not on every edit.
+    #[serde(default)]
+    pub staleness_checked_sessions: std::collections::HashSet<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -48,6 +53,10 @@ pub fn prune_stale_sessions(state: &mut RuntimeState, now: u64) {
     state
         .sessions
         .retain(|_, record| now.saturating_sub(record.start_ts) < STALE_SESSION_SECS);
+    let live_sessions = &state.sessions;
+    state
+        .staleness_checked_sessions
+        .retain(|id| live_sessions.contains_key(id));
 }
 
 pub const SESSION_HYGIENE_TURN_THRESHOLD: u32 = 80;

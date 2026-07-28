@@ -375,7 +375,7 @@ fn kill_tree(child: &mut std::process::Child) {
 /// running and the process genuinely un-reaped, not just "late". Stdout/
 /// stderr are drained on separate threads so a child that fills an OS pipe
 /// buffer can't deadlock the wait loop.
-fn run_output_timeout(
+pub(crate) fn run_output_timeout(
     program: impl AsRef<std::ffi::OsStr>,
     args: &[&str],
     cwd: &Path,
