@@ -43,6 +43,7 @@ mod mcp_server;
 mod memory;
 mod mentions;
 mod mise_install;
+mod nudge_pace;
 mod optimize;
 mod paths;
 mod pricing;
