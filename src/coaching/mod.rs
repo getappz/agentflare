@@ -16,15 +16,15 @@ pub(crate) mod rule;
 mod store;
 
 pub use cli::{cli_apply, cli_remove, cli_sync, print_list};
+pub(crate) use store::list_rules;
 pub use store::{
     rule_bodies_for_prompt, rule_bodies_for_tool, superseded_bodies, sync_targets_for_host,
     untriggered_rule_bodies,
 };
 
-// Only reached from hook.rs's SessionStart test (#[cfg(test)]), to seed a
-// rule before asserting it appears in the printed message — a plain,
-// non-test build has no caller for it.
-#[allow(unused_imports)]
+// Also used by components.rs to seed/refresh the built-in core-module
+// coaching rules (flare-docs, flare-search, lean-ctx, tool-search) on every
+// `agentflare init` and SessionStart.
 pub use store::apply_rule;
 
 #[cfg(test)]
