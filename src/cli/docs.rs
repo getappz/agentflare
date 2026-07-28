@@ -48,6 +48,25 @@ pub enum DocsCmd {
 }
 
 pub fn run(args: DocsArgs) {
+    // Dispatched before the store is opened, unlike every other command:
+    // opening it creates and migrates a database in the very directory the
+    // sweep treats as its evidence, so a home with legacy blobs but no store
+    // left would gain a fresh empty one -- turning the sweep's "nothing to
+    // consult" refusal into a sweep with an empty reference set, which deletes
+    // every legacy blob.
+    if let DocsCmd::SweepLegacyBlobs { dry_run } = &args.cmd {
+        let root = flare_docs::DocsStore::default_db_path();
+        let root = root.parent().unwrap_or(std::path::Path::new("."));
+        match agentflare_store::maintenance::sweep_legacy_blobs(root, *dry_run) {
+            Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
+            Err(e) => {
+                eprintln!("flare-docs: legacy blob sweep failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let store = match flare_docs::DocsStore::open_default() {
         Ok(s) => s,
         Err(e) => {
@@ -93,20 +112,8 @@ pub fn run(args: DocsArgs) {
                 None => fetch_and_print(&store, eco, &package, &version, false),
             }
         }
-        DocsCmd::SweepLegacyBlobs { dry_run } => {
-            // The docs database and store.db share this directory, and the
-            // sweep consults both -- opening the store above also guarantees
-            // there is at least one database for it to consult.
-            let root = flare_docs::DocsStore::default_db_path();
-            let root = root.parent().unwrap_or(std::path::Path::new("."));
-            match agentflare_store::maintenance::sweep_legacy_blobs(root, dry_run) {
-                Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
-                Err(e) => {
-                    eprintln!("flare-docs: legacy blob sweep failed: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
+        // Handled above, before the store is opened.
+        DocsCmd::SweepLegacyBlobs { .. } => unreachable!(),
         DocsCmd::Refresh {
             package,
             version,

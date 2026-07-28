@@ -321,21 +321,29 @@ pub fn sweep_legacy_blobs(root: &Path, dry_run: bool) -> Result<LegacySweepRepor
         return Ok(report);
     }
 
-    let mut dbs: Vec<PathBuf> = std::fs::read_dir(root)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|ext| ext == "db"))
-        .collect();
+    // An entry that fails to read is propagated rather than skipped: it could
+    // be a store database, and silently dropping one from the reference set is
+    // what turns another store's live content into apparent garbage.
+    let mut dbs: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "db") {
+            dbs.push(path);
+        }
+    }
     dbs.sort();
 
-    // With no database to consult, every file would look unreferenced.
-    if dbs.is_empty() {
+    let referenced = collect_referenced_hashes(&dbs, &mut report.databases)?;
+
+    // With no *store* database consulted, every file would look unreferenced.
+    // `.db` files that turned out not to be stores prove nothing, so this is
+    // checked after the collect rather than on the raw `.db` count.
+    if report.databases.is_empty() {
         return Err(crate::Error::NotFound(format!(
             "no store databases in {} — refusing to sweep",
             root.display()
         )));
     }
-
-    let referenced = collect_referenced_hashes(&dbs, &mut report.databases)?;
 
     for shard in std::fs::read_dir(&legacy)? {
         let shard = shard?.path();
@@ -482,6 +490,22 @@ mod tests {
     #[test]
     fn the_sweep_refuses_to_run_with_no_database_to_consult() {
         let dir = tempfile::tempdir().unwrap();
+        let orphan = legacy_file(dir.path(), DEAD, b"unprovable");
+
+        assert!(sweep_legacy_blobs(dir.path(), false).is_err());
+        assert!(orphan.exists(), "a refused sweep must delete nothing");
+    }
+
+    // A directory full of `.db` files none of which is a store is the same
+    // evidential hole as an empty one: the reference set is empty either way.
+    #[test]
+    fn the_sweep_refuses_when_no_database_present_is_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = rusqlite::Connection::open(dir.path().join("unrelated.db")).unwrap();
+        other
+            .execute_batch("CREATE TABLE notes (id INTEGER)")
+            .unwrap();
+        drop(other);
         let orphan = legacy_file(dir.path(), DEAD, b"unprovable");
 
         assert!(sweep_legacy_blobs(dir.path(), false).is_err());
