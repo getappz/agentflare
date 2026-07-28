@@ -455,6 +455,31 @@ fn asset_attach_rejects_oversized_file() {
 }
 
 #[test]
+#[cfg(unix)]
+fn asset_attach_rejects_symlink() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let home = crate::paths::home();
+        let staging = home.join(".agentflare").join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let outside = home.join("outside-secret.txt");
+        std::fs::write(&outside, b"not for attaching").unwrap();
+        std::os::unix::fs::symlink(&outside, staging.join("link.txt")).unwrap();
+        let err = s
+            .asset(Parameters(AssetRequest {
+                action: "attach".into(),
+                id: None,
+                item_id: Some("item-1".into()),
+                project_id: None,
+                filename: Some("link.txt".into()),
+                metadata: None,
+            }))
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    });
+}
+
+#[test]
 fn asset_get_over_max_inline_omits_content() {
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();
