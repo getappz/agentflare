@@ -75,7 +75,19 @@ fn decompress_if_gzip(data: Vec<u8>) -> std::io::Result<Vec<u8>> {
 /// deleting one another store needs is not.
 fn delete_disk_blob(dir: &Path, hash: &str) {
     let path = blob_disk_path(dir, hash);
-    let _ = std::fs::remove_file(&path);
+    // The row is already gone (blob_unref) or was never inserted (blob_store,
+    // cleaning up after a failed metadata insert) by the time this runs, so a
+    // failure here can't be retried through the database — log it (unless the
+    // file was simply already absent) so an orphaned file is at least
+    // discoverable instead of silently unaccounted for.
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "[store] failed to reclaim blob file {}: {e}",
+            path.display()
+        );
+    }
 }
 
 use std::path::PathBuf;
