@@ -78,7 +78,11 @@ pub fn commits_behind_origin_default(
     let merge_base = run_in_opt(repo_root, &["merge-base", "HEAD", &remote_ref])?;
     let commits_behind = run_in_opt(
         repo_root,
-        &["rev-list", "--count", &format!("{merge_base}..{remote_ref}")],
+        &[
+            "rev-list",
+            "--count",
+            &format!("{merge_base}..{remote_ref}"),
+        ],
     )?
     .parse()
     .ok()?;
@@ -283,7 +287,8 @@ mod tests {
         assert!(is_linked_worktree(&wt_path));
     }
 
-    fn init_remote_and_stale_local_clone() -> (crate::shell::test_support::Repo, PathBuf, tempfile::TempDir) {
+    fn init_remote_and_stale_local_clone()
+    -> (crate::shell::test_support::Repo, PathBuf, tempfile::TempDir) {
         let remote = init_repo_with_branch("master");
         let local_container = tempfile::TempDir::new().unwrap();
         let local_path = local_container.path().join("local");
@@ -305,11 +310,7 @@ mod tests {
     #[test]
     fn commits_behind_origin_default_reports_missed_remote_commits() {
         let (remote, local_path, _container) = init_remote_and_stale_local_clone();
-        crate::shell::run_in(
-            &remote.path,
-            &["commit", "--allow-empty", "-m", "new work"],
-        )
-        .unwrap();
+        crate::shell::run_in(&remote.path, &["commit", "--allow-empty", "-m", "new work"]).unwrap();
 
         let (default_branch, behind) = commits_behind_origin_default(&local_path, 10).unwrap();
         assert_eq!(default_branch, "master");
