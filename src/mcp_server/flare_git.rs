@@ -79,6 +79,39 @@ impl AgentflareMcp {
                     &comments,
                 )
             }
+            "pr_wait" => {
+                // Bounded server-side poll loop: collapses the "for n in ...;
+                // do gh pr checks; sleep; done" pattern (fragile against the
+                // lean-ctx shell allowlist, noisy in the transcript) into one
+                // call. Capped well under typical MCP client/tool timeouts —
+                // if still pending when the cap hits, the caller just calls
+                // pr_wait again instead of the whole thing blocking for the
+                // length of a CI run.
+                const MAX_WAIT_SECS: u64 = 120;
+                const MIN_POLL_INTERVAL_SECS: u64 = 3;
+                let n = req
+                    .number
+                    .ok_or_else(|| ErrorData::invalid_params("number is required", None))?;
+                let wait_secs = req.wait_secs.unwrap_or(60).min(MAX_WAIT_SECS);
+                let poll_interval_secs = req
+                    .poll_interval_secs
+                    .unwrap_or(10)
+                    .max(MIN_POLL_INTERVAL_SECS);
+                let pr = pulls::get(&client, &repo, n).map_err(to_mcp_error)?;
+                let sha = pr.head.as_ref().map(|h| h.sha.as_str()).unwrap_or_default();
+                let start = std::time::Instant::now();
+                let mut checks =
+                    actions::list_check_runs(&client, &repo, sha).map_err(to_mcp_error)?;
+                while checks.iter().any(|c| c.status != "completed")
+                    && start.elapsed().as_secs() < wait_secs
+                {
+                    std::thread::sleep(std::time::Duration::from_secs(poll_interval_secs));
+                    checks = actions::list_check_runs(&client, &repo, sha).map_err(to_mcp_error)?;
+                }
+                let mut summary = mcp::checks_wait_summary(&checks, start.elapsed().as_secs());
+                summary["n"] = serde_json::json!(n);
+                summary.to_string()
+            }
             "pr_merge" => {
                 let n = req
                     .number

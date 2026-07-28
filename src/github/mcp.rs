@@ -103,6 +103,37 @@ pub fn pr_status_json(
     serde_json::to_string(&value).unwrap_or_default()
 }
 
+/// Summarizes a `CheckRun` snapshot for `pr_wait`. `status` is `"completed"`
+/// only once GitHub has a final verdict; `conclusion` is only set then, so
+/// pending checks and their eventual pass/fail state are distinguished by
+/// checking `status` first, `conclusion` second — mirrors `pr_status_json`'s
+/// same distinction but as a standalone, non-network-dependent function so
+/// `pr_wait`'s poll-loop-termination logic is testable without a live token.
+pub fn checks_wait_summary(checks: &[CheckRun], elapsed_secs: u64) -> serde_json::Value {
+    let pending: Vec<&str> = checks
+        .iter()
+        .filter(|c| c.status != "completed")
+        .map(|c| c.name.as_str())
+        .collect();
+    let failed: Vec<&str> = checks
+        .iter()
+        .filter(|c| {
+            c.conclusion
+                .as_deref()
+                .is_some_and(|concl| !matches!(concl, "success" | "neutral" | "skipped"))
+        })
+        .map(|c| c.name.as_str())
+        .collect();
+    serde_json::json!({
+        "pending": !pending.is_empty(),
+        "pending_checks": pending,
+        "failed_checks": failed,
+        "checks_ok": checks.iter().filter(|c| c.conclusion.as_deref() == Some("success")).count(),
+        "total_checks": checks.len(),
+        "elapsed_secs": elapsed_secs,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +216,49 @@ mod tests {
         assert!(!out.contains("submitted_at"));
         assert!(!out.contains("created_at"));
         assert!(!out.contains("html_url"));
+    }
+
+    fn check(name: &str, status: &str, conclusion: Option<&str>) -> CheckRun {
+        serde_json::from_value(serde_json::json!({
+            "name": name, "status": status, "conclusion": conclusion,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn checks_wait_summary_pending_when_any_check_not_completed() {
+        let checks = [
+            check("build", "completed", Some("success")),
+            check("clippy", "in_progress", None),
+        ];
+        let out = checks_wait_summary(&checks, 12);
+        assert_eq!(out["pending"], true);
+        assert_eq!(out["pending_checks"], serde_json::json!(["clippy"]));
+        assert_eq!(out["checks_ok"], 1);
+        assert_eq!(out["total_checks"], 2);
+        assert_eq!(out["elapsed_secs"], 12);
+    }
+
+    #[test]
+    fn checks_wait_summary_not_pending_once_all_completed() {
+        let checks = [
+            check("build", "completed", Some("success")),
+            check("fmt", "completed", Some("success")),
+        ];
+        let out = checks_wait_summary(&checks, 5);
+        assert_eq!(out["pending"], false);
+        assert_eq!(out["pending_checks"], serde_json::json!([] as [&str; 0]));
+    }
+
+    #[test]
+    fn checks_wait_summary_neutral_and_skipped_are_not_failures() {
+        let checks = [
+            check("build", "completed", Some("success")),
+            check("optional", "completed", Some("neutral")),
+            check("docs", "completed", Some("skipped")),
+            check("clippy", "completed", Some("failure")),
+        ];
+        let out = checks_wait_summary(&checks, 30);
+        assert_eq!(out["failed_checks"], serde_json::json!(["clippy"]));
     }
 }
