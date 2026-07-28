@@ -94,6 +94,10 @@ pub fn apply_rule(
 
 /// Same as `apply_rule`, but lets the caller set a per-rule pacing cooldown
 /// (seconds) instead of inheriting `nudge_pace::DEFAULT_COOLDOWN`.
+// flare-code: no CLI/MCP surface calls this yet (only this module's own
+// tests do) — upgrade path is a `--cooldown` flag on `agentflare coaching
+// apply` once a rule author needs a non-default pace.
+#[allow(dead_code)]
 pub fn apply_rule_with_cooldown(
     id: &str,
     title: &str,
