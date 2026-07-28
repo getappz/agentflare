@@ -211,6 +211,26 @@ fn scope_check_deny_reason(subcommand: &str) -> Option<String> {
     }
 }
 
+/// Hands off to the real git binary, first clearing `RECURSION_ENV`.
+///
+/// The depth counter must stay incremented for the remainder of *this*
+/// process (so any internal `git` shell-outs this shim's own classify/
+/// branch/snapshot logic makes still count toward the backstop) but once
+/// we've decided to exec the real binary for the caller's actual command,
+/// that subtree is a fresh, independent invocation -- e.g. an unrelated
+/// `git` call later in the same long-lived test/build process, or a git
+/// hook the real binary spawns. Without this reset those get charged
+/// against a counter left over from a previous, unrelated hop, which is
+/// exactly what tripped the guard on legitimate `cargo test --workspace`
+/// runs (item #379).
+fn exec_real(tool: &str, filtered_path: Option<&OsString>, args: &[OsString]) -> ! {
+    // SAFETY: single-threaded at this point, immediately before exec.
+    unsafe {
+        env::remove_var(RECURSION_ENV);
+    }
+    run_real(tool, filtered_path, args)
+}
+
 fn main() {
     let depth: u32 = env::var(RECURSION_ENV)
         .ok()
@@ -246,14 +266,14 @@ fn main() {
     // hardlinked/copied under another name (it shouldn't be), fall
     // straight through rather than guessing at a policy for it.
     if tool != "git" {
-        run_real(&tool, filtered_path.as_ref(), &args);
+        exec_real(&tool, filtered_path.as_ref(), &args);
     }
 
     let cwd = env::current_dir().unwrap_or_default();
     let Some(repo_root) = branch::repo_toplevel(&cwd) else {
         // Not inside a git repo at all -- nothing to classify (e.g. `git
         // init`, `git clone` into a fresh directory, `git --version`).
-        run_real(&tool, filtered_path.as_ref(), &args);
+        exec_real(&tool, filtered_path.as_ref(), &args);
     };
 
     if bypass_active() {
@@ -268,7 +288,7 @@ fn main() {
             };
             let _ = audit::log_event(&audit_path, &bypass_event);
         }
-        run_real(&tool, filtered_path.as_ref(), &args);
+        exec_real(&tool, filtered_path.as_ref(), &args);
     }
 
     let str_args: Vec<String> = args
@@ -285,7 +305,7 @@ fn main() {
     }
 
     let Some(idx) = subcommand_idx else {
-        run_real(&tool, filtered_path.as_ref(), &args); // e.g. bare `git --version`
+        exec_real(&tool, filtered_path.as_ref(), &args); // e.g. bare `git --version`
     };
     let subcommand = str_args[idx].clone();
     let rest: Vec<String> = str_args[idx + 1..].to_vec();
@@ -355,7 +375,7 @@ fn main() {
                     ),
                 }
             }
-            run_real(&tool, filtered_path.as_ref(), &args);
+            exec_real(&tool, filtered_path.as_ref(), &args);
         }
     }
 }
