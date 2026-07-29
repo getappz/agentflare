@@ -71,7 +71,7 @@ Your team (or your other agents) track work as items in agentflare's built-in pr
 tracker. Before starting on one, claim it so a second agent doesn't pick up the same
 work:
 
-```
+```text
 item(action="claim", id="42")
 ```
 
@@ -92,7 +92,7 @@ Design docs and implementation plans are working documents, not files you necess
 want committed to the repo. Publish one as an artifact instead — it gets its own URL you
 can share, and later revisions update the same URL rather than minting a new one:
 
-```
+```text
 artifact(action="publish", session_id="my-project-specs", name="2026-07-29-flare-docs-restructure",
          type="markdown", label="draft", content="...")
 ```
@@ -100,7 +100,7 @@ artifact(action="publish", session_id="my-project-specs", name="2026-07-29-flare
 To revise it later without changing the link, pass `update_id` (the id `publish`
 returned) plus `base_version` for an optimistic-concurrency check:
 
-```
+```text
 artifact(action="publish", update_id="<id-from-first-publish>", base_version=1,
          content="...", label="reviewed")
 ```

@@ -22,7 +22,7 @@ Manage work items in the repo's linked project (auto-created/linked on first use
 `heartbeat`, `release`, `done`, `cancel`, `add_label`, `remove_label`, `groom`,
 `standup`, `health`.
 
-```
+```text
 mcp__flare__item(action="list", state_group="backlog,unstarted,started")
 mcp__flare__item(action="claim", id="42")
 ```
@@ -33,7 +33,7 @@ Threaded comments on an item.
 
 `action`: `create`, `edit`, `delete`, `list`.
 
-```
+```text
 mcp__flare__comment(action="create", item_id="<id>", body="left a note for the next pass")
 ```
 
@@ -43,7 +43,7 @@ Labels in the repo's linked project.
 
 `action`: `create`, `list`, `update`, `delete`.
 
-```
+```text
 mcp__flare__label(action="list")
 ```
 
@@ -52,7 +52,7 @@ mcp__flare__label(action="list")
 Attach, get, list, or delete file assets on items/projects. Attaching requires the file
 to already exist under `~/.agentflare/staging/<filename>`.
 
-```
+```text
 mcp__flare__asset(action="attach", item_id="<id>", filename="report.md")
 mcp__flare__asset(action="list", item_id="<id>")
 ```
@@ -64,7 +64,7 @@ don't duplicate work. Backs `agentflare claim` on the CLI.
 
 `action`: `acquire`, `heartbeat`, `release`, `done`, `list`.
 
-```
+```text
 mcp__flare__claim(action="acquire", target="issue#42", scope=["crates/foo/"])
 ```
 
@@ -74,7 +74,7 @@ Assigns/creates an item for a recipient agent and attaches content to it as a ve
 asset — the recommended path for agent-to-agent work products (prefer this over
 `artifact` for handoffs).
 
-```
+```text
 mcp__flare__handoff(recipient="opencode", name="review-notes", content="please check the API design above")
 ```
 
@@ -82,7 +82,7 @@ mcp__flare__handoff(recipient="opencode", name="review-notes", content="please c
 
 Register, list, or delete webhooks on the repo's linked workspace.
 
-```
+```text
 mcp__flare__webhook(action="list")
 ```
 
@@ -92,7 +92,7 @@ Info about the workspace/project this repo is currently linked to.
 
 `action`: `info` (only one for now).
 
-```
+```text
 mcp__flare__project(action="info")
 ```
 
@@ -103,7 +103,7 @@ dedup, and tag CONFIRMED/UNIQUE/DISPUTED/UNVERIFIED; track per-agent accuracy ov
 
 `action`: `submit`, `consensus`, `list`, `clear`, `record`, `scores`.
 
-```
+```text
 mcp__flare__review(action="submit", pr="123", findings=[{"file":"src/lib.rs","line":42,"message":"unwrap on user input"}])
 mcp__flare__review(action="consensus", pr="123")
 ```
@@ -116,7 +116,7 @@ standalone shareable pages (dashboards, reports) — for agent-to-agent handoffs
 
 `action`: `publish`, `list`, `get`, `diff`, `search`, `delete`.
 
-```
+```text
 mcp__flare__artifact(action="publish", name="usage-report", type="markdown", content="...")
 ```
 
@@ -132,7 +132,7 @@ npm via npmjs.org (`ecosystem="npm"`), Python via PyPI (`ecosystem="python"`).
 
 `action`: `search`, `get`, `list`, `refresh`.
 
-```
+```text
 mcp__flare__docs(action="get", package="serde", ecosystem="rust")
 mcp__flare__docs(action="search", query="hono routing")
 ```
@@ -144,7 +144,7 @@ observations, curate what's kept, relate entries, and hand memory off across ses
 
 `action`: `compact`, `context`, `curate`, `handoff`, `recall`, `relate`, `remember`.
 
-```
+```text
 mcp__flare__memory(action="remember", title="db choice", content="chose sqlite over postgres for single-writer simplicity")
 mcp__flare__memory(action="recall", query="why did we pick sqlite")
 ```
@@ -156,7 +156,7 @@ observations), `code` (leanctx), `web`, `social`, `news`, `github`, `academic`,
 `datasets`, `websites`, `weather`, `financial`, `crypto`, `fx`, `indicators`, `youtube`,
 `bluesky`.
 
-```
+```text
 mcp__flare__search(type="github", query="open issues labeled good-first-issue in getappz/agentflare")
 mcp__flare__search(type="web", query="astro starlight sidebar config")
 ```
@@ -167,7 +167,7 @@ Search or load a skill from the installed registry (BM25-ranked).
 
 `action`: `search`, `load`.
 
-```
+```text
 mcp__flare__skill(action="search", query="code review")
 mcp__flare__skill(action="load", name="code-review")
 ```
@@ -177,7 +177,7 @@ mcp__flare__skill(action="load", name="code-review")
 Classify a prompt's intent and return ranked skill matches — the mechanism behind
 proactive skill suggestions.
 
-```
+```text
 mcp__flare__skill_detect(prompt="my disk is full, need to clean up")
 ```
 
@@ -191,7 +191,7 @@ reversible-compression retrieval layer.
 A model-routing suggestion for a given prompt (e.g. "this looks judgment-heavy, use a
 premium model").
 
-```
+```text
 mcp__flare__get_routing_suggestion(prompt="design the auth token rotation strategy")
 ```
 
@@ -201,7 +201,7 @@ Read-only: the flare-code (code-minimalism / lazy-senior-dev) instructions for a
 as `{mode, instructions}`. Does not change the active mode — omit `mode` for the
 active/default one.
 
-```
+```text
 mcp__flare__optimize_instructions(mode="ultra")
 ```
 
@@ -213,7 +213,7 @@ compressed away.
 `action`: `retrieve` (returns the original for a registered id), `list` (enumerates live
 entries).
 
-```
+```text
 mcp__flare__optimize(action="retrieve", id="r-a1b2c3")
 ```
 
@@ -222,7 +222,7 @@ mcp__flare__optimize(action="retrieve", id="r-a1b2c3")
 Whether a session should be refreshed, based on turn count and elapsed time — the
 signal behind the "close the session, start fresh" guidance in long-running work.
 
-```
+```text
 mcp__flare__check_session_health()
 ```
 
@@ -238,7 +238,7 @@ GitHub repo operations — PRs, issues, releases, and Actions runs.
 `release_get`, `release_latest`, `release_create`, `run_list`, `run_get`, `run_rerun`,
 `workflow_dispatch`.
 
-```
+```text
 mcp__flare__flare_git(action="pr_create", title="fix: handle empty query", body="...")
 mcp__flare__flare_git(action="pr_status", pr=42)
 ```
@@ -253,7 +253,7 @@ downstream one.
 
 `action`: `search`, `execute`.
 
-```
+```text
 mcp__flare__tool(action="search", query="ctx_shell")
 mcp__flare__tool(action="execute", server="leanctx", tool="ctx_read", args={"path":"src/main.rs"})
 ```
@@ -264,7 +264,7 @@ Send a text message to Telegram, Slack, or Discord. The bot token must already b
 stored as the gateway secret `<platform>_bot_token` (see `agentflare gateway secret
 set`).
 
-```
+```text
 mcp__flare__channel_send(platform="slack", target="C0123456", message="build is green")
 ```
 
@@ -273,7 +273,7 @@ mcp__flare__channel_send(platform="slack", target="C0123456", message="build is 
 Log tooling friction when the TOOLING blocks you — not the task itself: a wrong or
 missing tool, a fabricated assumption, an environment gap.
 
-```
+```text
 mcp__flare__vent(message="ctx_patch corrupted a large file", severity="high", tags=["ctx-patch"])
 ```
 
@@ -282,7 +282,7 @@ mcp__flare__vent(message="ctx_patch corrupted a large file", severity="high", ta
 List, or file, agentflare's own tooling bugs (git shim, af-guard, item-tracker friction)
 as one batched GitHub issue on getappz/agentflare.
 
-```
+```text
 mcp__flare__vent_file(action="list")
 mcp__flare__vent_file(action="file", title="...", body="...")
 ```

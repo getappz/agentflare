@@ -79,8 +79,11 @@ front of alternate/free OpenAI-style providers — useful for routing an agent
 through a different backend without changing its client code; it isn't wired
 into `agentflare init` yet.
 
-Everything above is local-first (SQLite-backed), no daemon, reachable over the
-same stdio MCP transport agentflare already exposes for the optimization layer.
+Everything above is local-first (SQLite-backed) and reachable over the same
+stdio MCP transport agentflare already exposes for the optimization layer, with
+no daemon required. The `daemon` and `serve` dashboard are opt-in — background
+lifecycle and a read-only HTTP view over the same store, not requirements for
+MCP tool use.
 
 lean-ctx and the built-in memory aren't substitutes for each other — one saves
 tokens inside a session, the other saves the re-explaining tax across sessions.
@@ -120,7 +123,7 @@ comparable benchmark suite yet (see [STATUS.md](STATUS.md)).
 Not a demo — pulled live from the maintainer's own project while building this repo,
 for a sense of scale. Not a controlled benchmark; one data point, your mileage varies.
 
-```
+```text
 lean-ctx         34.2M tokens saved   92% compression   $88.45 saved   (lifetime; lean-ctx gain)
 optimize output  1.16M tokens saved (~65%)                              (single session; via `agentflare cost`)
 optimize code    code-minimalism markers logged, no token figure        (agentflare optimize code doesn't measure per-repo savings)

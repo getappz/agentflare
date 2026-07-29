@@ -19,7 +19,9 @@ install: no doc cache, no work-item tracker, no coordination layer to think abou
 What agentflare adds on top is everything lean-ctx doesn't try to do: `flare-docs`
 (always-current per-package documentation), a local work-item tracker with
 claims/handoffs, review consensus across multiple agents, artifact publishing, and the
-`optimize output`/`optimize code` compaction commands. If you're running one agent on
+`agentflare optimize output`/`agentflare optimize code` compaction commands (`flare` and
+`opt` are backward-compatible aliases for `agentflare optimize`; `caveman` and `ponytail`
+are not live aliases). If you're running one agent on
 one small project, lean-ctx alone may be all you need. Once you're running more than
 one agent, or picking a project back up across sessions, the coordination layer is the
 part lean-ctx doesn't cover at all.

@@ -43,7 +43,7 @@ Most of the time, `flare-docs` figures out the right registry on its own:
 Looking up a package under the wrong ecosystem doesn't just fail silently — the error
 tells you which one to try instead, for example:
 
-```
+```text
 "express" was not found on docs.rs — if it is a Node package, retry with ecosystem="npm";
 if it is a Python package, retry with ecosystem="python"
 ```

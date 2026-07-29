@@ -19,8 +19,9 @@ the [CLI reference](/docs/cli/) once it's installed.
 
 ## Wire it into your agent
 
-`agentflare init --agent <host>` — one command per tool, run once. Running it is the
-consent: it installs immediately, no separate confirmation step.
+`agentflare init --agent <host>` — one command per tool, run once. It installs
+immediately; a few secondary steps (rule refresh, gateway registration) still prompt for
+confirmation unless you pass `-y`/`--yes` to run it unattended.
 
 ```bash
 agentflare init --agent claude-code
