@@ -7,10 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0](https://github.com/getappz/agentflare/compare/v1.6.0...v1.7.0) - 2026-07-29
+
 ### Added
 
-- `flare-vault` crate + `agentflare vault` CLI — local secrets vault with Argon2id/AES-256-GCM envelope encryption, OS-keyring session cache, and global/project scoping; replaces the sqlite-backed `gateway_secrets` store used by `agentflare gateway secret`, channel bot tokens, and GitHub auth (#405)
-- `flare_git` `pr_wait` action — bounded server-side poll loop for PR checks (default 60s, capped 120s per call), replacing manual `gh pr checks` polling loops (#118)
+- `flare-vault` crate + `agentflare vault` CLI — local secrets vault with Argon2id/AES-256-GCM envelope encryption, OS-keyring session cache, and global/project scoping; replaces the sqlite-backed `gateway_secrets` store used by `agentflare gateway secret`, channel bot tokens, and GitHub auth (#370)
+- agentflare-jobs crate — background job queue + process supervisor for agent CLIs (#298)
+- auto-enforce core-module usage via init/SessionStart (#352)
+- auto-release claim on cross-agent reassignment (#296)
+- bound artifact version history and audit log growth (#289)
+- bound the docs cache with retention, eviction, and page reclaim (#348)
+- build and install PATH shims alongside the main binary (#301)
+- CI paths in trust-root baseline + /flare:git slash command (#367)
+- close 3 ponytail parity gaps (#310)
+- core-module auto-enforcement, docs-site, flare-docs Python/npm examples, coaching MANDATORY tier (#361)
+- cover the shell layer in agentflare init (bashenv guard, opencode branch-guard, config split) (#324)
+- deny pushing the default branch (PR-only enforcement) (#312)
+- finish EPIC #272 — Task 6 snooze/dismiss write-path + Task 9 provisioning (#354)
+- flare doctor — claim-worktree health sweep + safe reclaim (#235) (#305)
+- index per-item rustdoc docs, not just the crate overview (#323)
+- intent-to-skill injection + skill install CLI (#231, #233) (#290)
+- manage a flare-docs usage rule + add `agentflare doctor` (#325)
+- npm/TypeScript ecosystem support; rename tool to `docs` (#342)
+- on-demand third-party docs — flare-docs crate + flare_docs MCP tool + agentflare docs CLI (#316)
+- only block trust-root pushes to the default branch (#317)
+- path-scope enforcement for claims (QuorumGit adoption) (#303)
+- Python ecosystem, README usage examples, and the docs site
+- regex pre-filter for ponytail over-engineering checks (#293)
+- repo-local verify gate + `pr_wait` action — bounded server-side poll loop for PR checks (default 60s, capped 120s per call), replacing manual `gh pr checks` polling loops (#118, #362)
+- request-optimization short-circuits for CLI bookkeeping calls (#355)
+- restyle statusline badge to Claude Code native hint style (#311)
+- retire OpenResearch, fold 17-source search into flare_search (#326)
+- share sccache across worktrees when available (#133) (#299)
+- shared nudge-pacing primitive for coaching rules + PostToolUseFailure hook (#364)
+- skill routing/management epic — FTS5, negation, bandit ranking, pack/hub lifecycle (#302)
+- sweep to reclaim orphaned legacy shared blobs (#353)
+- unified config.toml git-shim policy slice (#331) (#336)
+- vent: origin routing, throttle, batched filing, judge-prompt hook (#331)
+- verified continuation commit, structured payload, duplicate-item reuse, assignee freeze (#365)
+- warn when editing on a branch stale vs origin/default (#360)
+- worktree orphan audit + fix git_binary shims-dir self-deny (#304)
+
+### Fixed
+
+- caller-vs-service error mapping, search limit cap, non-blocking-fetch test (#344)
+- case-insensitive + SQL-style SPDX in pre_filter noise patterns (#307)
+- clear genuine ACL denials on orphaned worktree cleanup (#322)
+- close branch-guard bypasses for bare filenames, new dirs, missing path fields (#291)
+- close staging symlink/TOCTOU bypass, log swallowed blob-reclaim errors (#357)
+- dedup documents before creating the unique index (#346)
+- default-limit and paginate item(list) (#358)
+- don't open a redundant PR when item done runs after the PR already merged (#329)
+- flare-docs stale-item reconciliation + doc history-skip check (#337)
+- give each db its own blob dir so GC can't delete a neighbour's content (#351)
+- guard agentflare db files from agent deletion + fix artifact store history tracking (#335)
+- log DB errors, validate cost by=, gate non-local bind, add HTTP tests (#369)
+- never let doctor reclaim delete the main worktree (#327)
+- release blob refs when documents are deleted (#343)
+- reset recursion depth before exec'ing real git (#359)
+- resilient worktree removal on Windows file-lock (#302) (#308)
+- reuse an existing branch that owns no worktree instead of failing (#321)
+- rivalsearch param name + store FTS query sanitization (#288)
+- scope all classify.rs denials to agentflare-tracked projects (#320)
+- stop `list` returning every cached document in full (#345)
+- stop usetsearch blocking every native ToolSearch call (#368)
+- surface worktree creation failure reason in claim response (#318)
+- use plain tag ref for SLSA provenance reusable workflow (#314, #315)
+- v1.6.0 verification bugs — opencode filePath guard hole, search web/store arms (#287)
+- validate action before repo/client setup; resolve default branch via API (#363)
+- vent tag union + flare-docs fetch-outcome observability (#338)
+
+### Changed
+
+- apply ponytail-audit findings (9 unused deps + 11 dead functions) (#330)
+- cut the Windows build's redundant pass, Defender scanning, and PDB cost (#349)
+- decouple agent-registry dependency (#297)
+- drive every FTS5 index from triggers, not hand-written sync (#347)
+- drop the Windows Defender exclusion step, it bought nothing (#350)
+- flare-git-core: name touched trust-root paths in push deny message (#313)
+- rename ponytail_engineering_check_internal to over_engineering_check_internal (#300)
+- scoop manifest automation for release publishing (#286)
+- split skill tool handler into its own module (#319)
+- tune .coderabbit.yaml to reduce review rate-limit hits (#309)
 
 ## [1.6.0](https://github.com/getappz/agentflare/compare/v1.5.0...v1.6.0) - 2026-07-21
 

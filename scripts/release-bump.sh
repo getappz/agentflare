@@ -42,39 +42,48 @@ sed -i "0,/^version = \"$current_version\"/s//version = \"$new_version\"/" Cargo
 cargo check --quiet
 
 # Draft changelog: group conventional-commit subjects since the last tag by
-# type. This is a starting point for the PR, not a final answer — review and
-# edit it before merging, same as any other PR.
-draft=$(mktemp)
-{
-  for type_label in "feat:Added" "fix:Fixed" "chore:Changed" "ci:Changed" "refactor:Changed" "docs:Changed"; do
-    type="${type_label%%:*}"
-    label="${type_label#*:}"
-    git log --no-merges --pretty=format:"%s" "$last_tag..HEAD" \
-      | grep -E "^${type}(\(|:)" \
-      | sed -E "s/^${type}(\([^)]*\))?: /- /" || true
-  done
-} | sort -u >"$draft"
-
-if [[ ! -s "$draft" ]]; then
-  echo "- (no conventional-commit feat/fix/chore/ci/refactor/docs subjects found since $last_tag — fill in manually)" >"$draft"
-fi
-
+# type, one section per label (Added/Fixed/Changed). This is a starting point
+# for the PR, not a final answer — review and edit it before merging, same as
+# any other PR.
 changelog_entry=$(mktemp)
 {
   echo "## [Unreleased]"
   echo
   echo "## [$new_version](https://github.com/getappz/agentflare/compare/$last_tag...v$new_version) - $(date +%Y-%m-%d)"
-  echo
-  echo "### Added"
-  echo
-  cat "$draft"
+
+  any_commits=false
+  for label in Added Fixed Changed; do
+    case "$label" in
+      Added) types="feat" ;;
+      Fixed) types="fix" ;;
+      Changed) types="chore|ci|refactor|docs" ;;
+    esac
+    section=$(git log --no-merges --pretty=format:"%s" "$last_tag..HEAD" \
+      | grep -E "^(${types})(\(|:)" \
+      | sed -E "s/^(${types})(\([^)]*\))?: /- /" \
+      | sort -u || true)
+    if [[ -n "$section" ]]; then
+      any_commits=true
+      echo
+      echo "### $label"
+      echo
+      echo "$section"
+    fi
+  done
+
+  if [[ "$any_commits" == false ]]; then
+    echo
+    echo "### Added"
+    echo
+    echo "- (no conventional-commit feat/fix/chore/ci/refactor/docs subjects found since $last_tag — fill in manually)"
+  fi
 } >"$changelog_entry"
 
 sed -i "/^## \[Unreleased\]$/{
 r $changelog_entry
 d
 }" CHANGELOG.md
-rm -f "$draft" "$changelog_entry"
+rm -f "$changelog_entry"
 
 git add Cargo.toml Cargo.lock CHANGELOG.md
 git commit -m "chore(release): agentflare v$new_version"
