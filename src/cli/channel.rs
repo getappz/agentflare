@@ -37,14 +37,7 @@ impl ChannelArgs {
                     );
                     std::process::exit(1);
                 };
-                let conn = match crate::db::open() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        crate::ui::error(&format!("channel: cannot open database: {e}"));
-                        std::process::exit(1);
-                    }
-                };
-                match crate::channels::send_message(&conn, platform, &target, &message) {
+                match crate::channels::send_message(platform, &target, &message) {
                     Ok(()) => println!("sent to {to}:{target}"),
                     Err(e) => {
                         crate::ui::error(&e.to_string());

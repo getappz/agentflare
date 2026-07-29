@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs"]
+members = ["crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault"]
 resolver = "2"
 
 [package]
@@ -81,6 +81,7 @@ agentflare-store = { path = "crates/agentflare-store" }
 flare-docs = { path = "crates/flare-docs" }
 flare-git-core = { path = "crates/flare-git-core" }
 flare-proxy = { path = "crates/flare-proxy" }
+flare-vault = { path = "crates/flare-vault" }
 skill = { version = "0.8", default-features = false, features = ["network"] }
 
 [target.'cfg(unix)'.dependencies]

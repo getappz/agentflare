@@ -167,14 +167,9 @@ fn send(platform: Platform, req: &OutboundRequest) -> Result<(), String> {
 
 /// Resolve the platform's bot token from the encrypted `gateway_secrets` store
 /// and send `text` to `target`. The one entry point CLI and MCP both call.
-pub fn send_message(
-    conn: &rusqlite::Connection,
-    platform: Platform,
-    target: &str,
-    text: &str,
-) -> Result<(), String> {
+pub fn send_message(platform: Platform, target: &str, text: &str) -> Result<(), String> {
     let name = platform.secret_name();
-    let token = crate::gateway_secrets::get_secret(conn, name)
+    let token = crate::vault::get_secret(name)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| {
             format!(
@@ -293,9 +288,7 @@ mod tests {
 
     #[test]
     fn send_message_without_a_configured_token_errors_clearly() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::gateway_secrets::migrate(&conn).unwrap();
-        let err = send_message(&conn, Platform::Telegram, "123", "hi").unwrap_err();
+        let err = send_message(Platform::Telegram, "123", "hi").unwrap_err();
         assert!(
             err.contains("telegram_bot_token"),
             "should name the missing secret: {err}"

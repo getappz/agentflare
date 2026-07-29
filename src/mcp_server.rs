@@ -917,9 +917,7 @@ impl AgentflareMcp {
                 None,
             )
         })?;
-        let conn = crate::db::open()
-            .map_err(|e| ErrorData::internal_error(format!("cannot open database: {e}"), None))?;
-        crate::channels::send_message(&conn, plat, &target, &message)
+        crate::channels::send_message(plat, &target, &message)
             .map_err(|e| ErrorData::internal_error(e, None))?;
         Ok(serde_json::json!({ "sent": true, "platform": platform, "target": target }).to_string())
     }
@@ -1016,14 +1014,7 @@ impl AgentflareMcp {
     }
 
     fn resolve_gateway_secrets() -> std::collections::HashMap<String, String> {
-        let conn = match crate::db::open() {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("agentflare: failed to open agentflare.db for gateway secrets: {e}");
-                return std::collections::HashMap::new();
-            }
-        };
-        let names = match crate::gateway_secrets::list_secrets(&conn) {
+        let names = match crate::vault::list_secrets() {
             Ok(names) => names,
             Err(e) => {
                 eprintln!("agentflare: failed to list gateway secrets: {e}");
@@ -1032,21 +1023,14 @@ impl AgentflareMcp {
         };
         names
             .into_iter()
-            .filter_map(
-                |name| match crate::gateway_secrets::get_secret(&conn, &name) {
-                    Ok(Some(v)) => Some((name, v)),
-                    Ok(None) => None,
-                    Err(e) => {
-                        // A wrong/missing vault passphrase used to look
-                        // identical to "no secret configured" — `.ok().flatten()`
-                        // discarded the `Err` entirely. Surface it so a wrong
-                        // passphrase is at least visible in stderr instead of
-                        // silently leaving downstream backends uncredentialed.
-                        eprintln!("agentflare: failed to resolve gateway secret '{name}': {e}");
-                        None
-                    }
-                },
-            )
+            .filter_map(|name| match crate::vault::get_secret(&name) {
+                Ok(Some(v)) => Some((name, v)),
+                Ok(None) => None,
+                Err(e) => {
+                    eprintln!("agentflare: failed to resolve gateway secret '{name}': {e}");
+                    None
+                }
+            })
             .collect()
     }
 
