@@ -394,7 +394,7 @@ impl AgentflareMcp {
             let item_id = self.resolve_item_id(conn, &raw)?;
             let outcome = agentflare_backend::item::claim(conn, &item_id, &owner, now, ttl)
                 .map_err(map_backend_err)?;
-            let (item, target_branch) = if outcome == agentflare_backend::claim::Acquire::Acquired {
+            let (item, target_branch) = if outcome == agentflare_backend::item::ClaimOutcome::Acquired {
                 let item = agentflare_backend::item::get(conn, &item_id).ok();
                 let target_branch = item
                     .as_ref()
@@ -418,7 +418,7 @@ impl AgentflareMcp {
             _ => None,
         };
         Ok(match outcome {
-            agentflare_backend::claim::Acquire::Acquired => {
+            agentflare_backend::item::ClaimOutcome::Acquired => {
                 let mut resp = serde_json::json!({
                     "status": "acquired",
                     "item_id": item_id,
@@ -441,10 +441,19 @@ impl AgentflareMcp {
                 }
                 resp.to_string()
             }
-            agentflare_backend::claim::Acquire::Held {
+            agentflare_backend::item::ClaimOutcome::Held {
                 owner: holder,
                 age_secs,
             } => serde_json::json!({"status": "held", "item_id": item_id, "owner": holder, "age_secs": age_secs}).to_string(),
+            agentflare_backend::item::ClaimOutcome::BlockedByAssignee { assignee } => {
+                serde_json::json!({
+                    "status": "blocked",
+                    "item_id": item_id,
+                    "assignee": assignee,
+                    "reason": format!("this item was handed off to '{assignee}' and hasn't been accepted yet — only {assignee} can claim it until they accept, decline, or the handoff is cancelled"),
+                })
+                .to_string()
+            }
         })
     }
 

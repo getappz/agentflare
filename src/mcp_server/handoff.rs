@@ -18,6 +18,10 @@ impl AgentflareMcp {
             decisions,
             files_touched,
             evidence,
+            last_commit,
+            completed,
+            remaining,
+            blockers,
         }: HandoffRequest,
     ) -> Result<String, ErrorData> {
         if recipient.trim().is_empty() {
@@ -45,6 +49,10 @@ impl AgentflareMcp {
             let project = self.resolve_project(conn)?;
             let ws_id = Self::resolve_workspace_id(conn)?;
 
+            if let Some(oid) = &last_commit {
+                self.verify_continuation_commit(conn, oid, item_id.as_deref())?;
+            }
+
             let item = match &item_id {
                 Some(id) => {
                     let input = agentflare_backend::item::UpdateItem {
@@ -54,34 +62,67 @@ impl AgentflareMcp {
                     agentflare_backend::item::update(conn, id, input).map_err(map_backend_err)?
                 }
                 None => {
-                    let state_id = agentflare_backend::state::list_by_project(conn, &project.id)
-                        .map_err(map_backend_err)?
-                        .into_iter()
-                        .find(|s| s.is_default)
-                        .ok_or_else(|| {
-                            ErrorData::internal_error("project has no default state", None)
-                        })?
-                        .id;
-                    let metadata = thread_id
-                        .as_ref()
-                        .map(|t| serde_json::json!({ "thread": t }).to_string());
-                    let input = agentflare_backend::item::CreateItem {
-                        project_id: project.id.clone(),
-                        state_id,
-                        name: name.clone(),
-                        description: description.clone().or_else(|| Some(content.clone())),
-                        priority: None,
-                        parent_id: None,
-                        assignee_agent: Some(recipient.clone()),
-                        sort_order: None,
-                        external_source: None,
-                        external_id: None,
-                        metadata,
-                        label_ids: vec![],
-                        assignee_ids: vec![],
-                        dependency_ids: vec![],
-                    };
-                    agentflare_backend::item::create(conn, input).map_err(map_backend_err)?
+                    // Reuse an existing open item already assigned to the
+                    // recipient with a matching name or thread, instead of
+                    // blindly creating a duplicate — the actual fix for the
+                    // "handoff creates a duplicate item" bug on the
+                    // reply/continuation path. Genuinely new work (no match)
+                    // still auto-creates, unchanged.
+                    let canonical_recipient = agent_registry::canonicalize(&recipient);
+                    let reusable = agentflare_backend::item::list_by_assignee_agent(
+                        conn,
+                        &project.id,
+                        &canonical_recipient,
+                    )
+                    .map_err(map_backend_err)?
+                    .into_iter()
+                    .find(|i| {
+                        i.name == name
+                            || thread_id.as_ref().is_some_and(|t| {
+                                serde_json::from_str::<serde_json::Value>(&i.metadata)
+                                    .ok()
+                                    .and_then(|m| {
+                                        m.get("thread")
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_string)
+                                    })
+                                    .as_deref()
+                                    == Some(t.as_str())
+                            })
+                    });
+                    if let Some(item) = reusable {
+                        item
+                    } else {
+                        let state_id =
+                            agentflare_backend::state::list_by_project(conn, &project.id)
+                                .map_err(map_backend_err)?
+                                .into_iter()
+                                .find(|s| s.is_default)
+                                .ok_or_else(|| {
+                                    ErrorData::internal_error("project has no default state", None)
+                                })?
+                                .id;
+                        let metadata = thread_id
+                            .as_ref()
+                            .map(|t| serde_json::json!({ "thread": t }).to_string());
+                        let input = agentflare_backend::item::CreateItem {
+                            project_id: project.id.clone(),
+                            state_id,
+                            name: name.clone(),
+                            description: description.clone().or_else(|| Some(content.clone())),
+                            priority: None,
+                            parent_id: None,
+                            assignee_agent: Some(recipient.clone()),
+                            sort_order: None,
+                            external_source: None,
+                            external_id: None,
+                            metadata,
+                            label_ids: vec![],
+                            assignee_ids: vec![],
+                            dependency_ids: vec![],
+                        };
+                        agentflare_backend::item::create(conn, input).map_err(map_backend_err)?
+                    }
                 }
             };
 
@@ -91,12 +132,23 @@ impl AgentflareMcp {
             let filename = format!("{safe_stem}-{asset_id}.{ext}");
             let entity_path =
                 crate::asset_store::entity_path("item_attachment", &item.id, &filename);
-            let mut meta = serde_json::json!({ "sender": self.agent, "recipient": recipient });
+            let mut meta = serde_json::json!({
+                "sender": self.agent,
+                "recipient": recipient,
+                "completed": completed,
+                "remaining": remaining,
+            });
             if let Some(t) = &thread_id {
                 meta["thread_id"] = serde_json::json!(t);
             }
             if let Some(r) = &reply_to {
                 meta["reply_to"] = serde_json::json!(r);
+            }
+            if let Some(oid) = &last_commit {
+                meta["last_commit"] = serde_json::json!(oid);
+            }
+            if let Some(b) = blockers {
+                meta["blockers"] = serde_json::json!(b);
             }
             if let Some(s) = summary {
                 meta["session_summary"] = serde_json::json!(s);
@@ -195,5 +247,47 @@ impl AgentflareMcp {
 
             Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
         })?
+    }
+
+    /// Verified, not trusted: rejects a fabricated or typo'd continuation
+    /// OID rather than recording it as-is. `oid` must exist in the repo;
+    /// when the target item's own `task/<seq>` branch already exists
+    /// locally, `oid` must additionally be reachable from it — a handoff
+    /// can't claim to continue from a commit that branch never saw.
+    fn verify_continuation_commit(
+        &self,
+        conn: &rusqlite::Connection,
+        oid: &str,
+        item_id: Option<&str>,
+    ) -> Result<(), ErrorData> {
+        let repo_root = self.worktree_repo_root();
+        if !flare_git_core::shell::run_in_ok(&repo_root, &["cat-file", "-e", oid]) {
+            return Err(ErrorData::invalid_params(
+                format!("last_commit '{oid}' does not exist in this repo — verified, not trusted"),
+                None,
+            ));
+        }
+        let Some(id) = item_id else {
+            return Ok(());
+        };
+        let Ok(item) = agentflare_backend::item::get(conn, id) else {
+            return Ok(()); // item resolution/existence is checked separately below
+        };
+        let branch = format!("task/{}", item.sequence_id);
+        let branch_exists = flare_git_core::shell::run_in_ok(
+            &repo_root,
+            &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+        );
+        if branch_exists
+            && !flare_git_core::shell::run_in_ok(&repo_root, &["merge-base", "--is-ancestor", oid, &branch])
+        {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "last_commit '{oid}' is not reachable from '{branch}' — verified, not trusted"
+                ),
+                None,
+            ));
+        }
+        Ok(())
     }
 }
