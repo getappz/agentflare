@@ -230,6 +230,18 @@ pub(crate) struct HandoffRequest {
     #[schemars(description = "Evidence array [{kind, action, detail}] — session snapshot.")]
     #[serde(default)]
     pub(crate) evidence: Option<Vec<serde_json::Value>>,
+    #[schemars(
+        description = "Continuation commit OID the recipient should build on. Verified before being accepted: must exist in the repo, and (when the item's own task/<seq> branch already exists) be reachable from it. A fabricated or unreachable OID is rejected, not silently trusted."
+    )]
+    #[serde(default)]
+    pub(crate) last_commit: Option<String>,
+    #[schemars(description = "What's done so far — required, part of the structured payload.")]
+    pub(crate) completed: String,
+    #[schemars(description = "What's left to do — required, part of the structured payload.")]
+    pub(crate) remaining: String,
+    #[schemars(description = "Known blockers, if any.")]
+    #[serde(default)]
+    pub(crate) blockers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]

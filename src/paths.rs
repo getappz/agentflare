@@ -217,6 +217,15 @@ mod tests {
     #[test]
     fn with_temp_home_clears_the_override_env_var_after_returning() {
         with_temp_home(|| {});
+        // Read the var only while holding the same lock with_temp_home uses to
+        // serialize all env mutation in this binary. Without it, this check
+        // races a concurrent thread's own (correctly scoped) with_temp_home
+        // call: that thread may be transiently holding the var set for its own
+        // closure at the exact moment this assertion reads it, which isn't a
+        // leak on our part — it's a var we were never entitled to observe.
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert!(
             std::env::var("AGENTFLARE_HOME_OVERRIDE").is_err(),
             "AGENTFLARE_HOME_OVERRIDE must not remain set once with_temp_home returns"
