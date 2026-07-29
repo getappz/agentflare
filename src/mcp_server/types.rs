@@ -457,14 +457,14 @@ pub(crate) struct FlareDocsRequest {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GitHubRequest {
     #[schemars(
-        description = "Action: pr_create|pr_list|pr_get|pr_status|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|release_list|release_get|release_latest|release_create|run_list|run_get|run_rerun|workflow_dispatch"
+        description = "Action: pr_create|pr_list|pr_get|pr_status|pr_wait|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|release_list|release_get|release_latest|release_create|run_list|run_get|run_rerun|workflow_dispatch"
     )]
     pub(crate) action: String,
     #[schemars(description = "owner/repo (default: resolved from the current repo's origin)")]
     #[serde(default)]
     pub(crate) repo: Option<String>,
     #[schemars(
-        description = "PR number (pr_get, pr_status, pr_merge, pr_comment, pr_request_review)"
+        description = "PR number (pr_get, pr_status, pr_wait, pr_merge, pr_comment, pr_request_review)"
     )]
     #[serde(default)]
     pub(crate) number: Option<u64>,
@@ -532,6 +532,14 @@ pub(crate) struct GitHubRequest {
     )]
     #[serde(default)]
     pub(crate) since: Option<String>,
+    #[schemars(
+        description = "pr_wait: max seconds to block polling checks before returning (default 60, capped at 120) — if still pending, call pr_wait again"
+    )]
+    #[serde(default)]
+    pub(crate) wait_secs: Option<u64>,
+    #[schemars(description = "pr_wait: seconds between check polls (default 10, min 3)")]
+    #[serde(default)]
+    pub(crate) poll_interval_secs: Option<u64>,
 }
 
 /// All local artifact backends (flared, another session, or our own

@@ -28,3 +28,7 @@ run = "aube run deploy --filter agentflare-web"
 [tasks.tail]
 description = "Tail live Cloudflare Worker logs for agentflare.dev"
 run = "aube run tail --filter agentflare-web"
+
+[tasks.verify]
+description = "Local gate mirroring CI (fmt, clippy -D warnings, full workspace test suite) — run before pushing"
+run = "cargo fmt --check && cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -A unsafe_code -A clippy::pedantic && cargo test --workspace"
