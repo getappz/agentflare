@@ -245,15 +245,19 @@ fn get_handoff_command(request: &GetPromptRequestParams, agent: Option<&str>) ->
     ))
 }
 
-/// (Internal/hidden `agentflare git` subcommands — `trailer-inject`,
-/// `ref-transaction-log`, `scope-check` — are called automatically by git
-/// hooks/the shim itself and are deliberately not surfaced here; they take
-/// no useful direct input from a human or agent invocation. Ordinary git
-/// commands (status/log/diff/commit/push/branch/...) and other agentflare
-/// CLI/MCP surfaces like pr_check are deliberately NOT duplicated here
-/// either — those already run via the `!` shell-escape or their own MCP
-/// tool; this prompt only covers the agentflare-specific git-shim admin
-/// subcommands that have no other entrypoint.)
+/// Called automatically by git hooks/the shim itself; take no useful direct
+/// input from a human or agent invocation, so `get_git_command` refuses to
+/// echo a run instruction for them even if typed in directly.
+const HIDDEN_GIT_SUBCOMMANDS: &[&str] = &["trailer-inject", "ref-transaction-log", "scope-check"];
+
+/// (Internal/hidden `agentflare git` subcommands — see
+/// `HIDDEN_GIT_SUBCOMMANDS` — are deliberately not surfaced in the usage
+/// card and rejected below if typed directly. Ordinary git commands
+/// (status/log/diff/commit/push/branch/...) and other agentflare CLI/MCP
+/// surfaces like pr_check are deliberately NOT duplicated here either —
+/// those already run via the `!` shell-escape or their own MCP tool; this
+/// prompt only covers the agentflare-specific git-shim admin subcommands
+/// that have no other entrypoint.)
 fn get_git_command(request: &GetPromptRequestParams) -> GetPromptResult {
     let command = request
         .arguments
@@ -277,6 +281,16 @@ fn get_git_command(request: &GetPromptRequestParams) -> GetPromptResult {
              audit prune <names...|--all> — remove orphaned worktree directories (snapshots taken first)\n\
              doctor [--format text|json|markdown] [--reclaim] [--force] [--staleness-days N] — health sweep over all claim worktrees",
         );
+    }
+
+    let first_word = command.split_whitespace().next().unwrap_or("");
+    if HIDDEN_GIT_SUBCOMMANDS.contains(&first_word) {
+        return assistant_text(format!(
+            "`{first_word}` is an internal agentflare git-shim subcommand invoked automatically \
+             by git hooks/the shim itself — it isn't meant for direct human or agent invocation, \
+             so it won't be run from here. See the bare `/git` usage card for the supported \
+             subcommands."
+        ));
     }
 
     assistant_text(format!(
@@ -463,15 +477,26 @@ mod tests {
     fn git_prompt_embeds_command_and_shell_instruction() {
         use rmcp::model::JsonObject;
         let mut args = JsonObject::new();
-        args.insert(
-            "command".to_string(),
-            serde_json::json!("snapshot list"),
-        );
+        args.insert("command".to_string(), serde_json::json!("snapshot list"));
         let params = GetPromptRequestParams::new("git").with_arguments(args);
         let result = get_prompt(&params, None).unwrap();
         let text = format!("{:?}", result.messages[0].content);
         assert!(text.contains("snapshot list"), "{text}");
         assert!(text.contains("agentflare git snapshot list"), "{text}");
+    }
+
+    #[test]
+    fn git_prompt_rejects_hidden_subcommands() {
+        use rmcp::model::JsonObject;
+        for hidden in ["scope-check", "trailer-inject", "ref-transaction-log"] {
+            let mut args = JsonObject::new();
+            args.insert("command".to_string(), serde_json::json!(hidden));
+            let params = GetPromptRequestParams::new("git").with_arguments(args);
+            let result = get_prompt(&params, None).unwrap();
+            let text = format!("{:?}", result.messages[0].content);
+            assert!(text.contains("isn't meant for direct"), "{text}");
+            assert!(!text.contains("Run it as"), "{text}");
+        }
     }
 
     #[test]

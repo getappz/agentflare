@@ -322,7 +322,8 @@ pub fn classify_pure(
             TrustRootTouch::Touched(_) => Disposition::Passthrough,
             TrustRootTouch::Unknown if push_targets_default_branch => Disposition::Deny {
                 reason: format!(
-                    "this push's diff against trust-root paths (.githooks/, .agentflare/, Cargo.toml) could not be verified, and it targets the repo's default branch '{default_branch}' — blocked by the agentflare git shim as a precaution."
+                    "this push's diff against trust-root paths ({}) could not be verified, and it targets the repo's default branch '{default_branch}' — blocked by the agentflare git shim as a precaution.",
+                    policy.trust_root_paths.join(", ")
                 ),
             },
             TrustRootTouch::Unknown => Disposition::Passthrough,
