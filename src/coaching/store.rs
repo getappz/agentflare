@@ -89,6 +89,37 @@ pub fn apply_rule(
     tier: RuleTier,
     sync: Vec<String>,
 ) -> Result<CoachingRule, String> {
+    apply_rule_inner(id, title, body, trigger, tier, sync, None)
+}
+
+/// Same as `apply_rule`, but lets the caller set a per-rule pacing cooldown
+/// (seconds) instead of inheriting `nudge_pace::DEFAULT_COOLDOWN`.
+// flare-code: no CLI/MCP surface calls this yet (only this module's own
+// tests do) — upgrade path is a `--cooldown` flag on `agentflare coaching
+// apply` once a rule author needs a non-default pace.
+#[allow(dead_code)]
+pub fn apply_rule_with_cooldown(
+    id: &str,
+    title: &str,
+    body: &str,
+    trigger: Option<rule::RuleTrigger>,
+    tier: RuleTier,
+    sync: Vec<String>,
+    cooldown_secs: Option<u64>,
+) -> Result<CoachingRule, String> {
+    apply_rule_inner(id, title, body, trigger, tier, sync, cooldown_secs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_rule_inner(
+    id: &str,
+    title: &str,
+    body: &str,
+    trigger: Option<rule::RuleTrigger>,
+    tier: RuleTier,
+    sync: Vec<String>,
+    cooldown_secs: Option<u64>,
+) -> Result<CoachingRule, String> {
     if !rule::is_valid_rule_id(id) {
         return Err(format!(
             "invalid rule id '{id}': must be 1-10 chars, start with a letter, and contain only letters, digits, or hyphens"
@@ -106,6 +137,17 @@ pub fn apply_rule(
         .find(|r| r.id == id)
         .map(|r| r.enforced)
         .unwrap_or(false);
+    // Preserve the existing rule's cooldown_secs unless the caller explicitly
+    // passed one (apply_rule_with_cooldown's Some(n) always wins; a plain
+    // apply_rule refresh, which always passes None here, must not silently
+    // wipe a cooldown that was set earlier — mirrors how `enforced` is
+    // preserved above).
+    let cooldown_secs = cooldown_secs.or_else(|| {
+        existing
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.cooldown_secs)
+    });
     if !is_overwrite && existing.len() >= MAX_RULES {
         return Err(format!(
             "maximum {MAX_RULES} coaching rules reached, remove one first"
@@ -130,6 +172,7 @@ pub fn apply_rule(
         tier.clone(),
         &sync,
         enforced,
+        cooldown_secs,
     )
     .map_err(|e| format!("failed to write rule file: {e}"))?;
 
@@ -177,6 +220,7 @@ pub fn set_enforced(id: &str, enforced: bool) -> Result<CoachingRule, String> {
         target.tier.clone(),
         &target.sync,
         enforced,
+        target.cooldown_secs,
     )
     .map_err(|e| format!("failed to write rule file: {e}"))?;
 
@@ -259,7 +303,9 @@ pub fn untriggered_rule_bodies() -> Vec<String> {
         .collect()
 }
 
-/// Bodies of rules whose trigger declares this exact tool name.
+/// Bodies of rules whose trigger declares this exact tool name, paced so a
+/// rule that already fired within its cooldown window is suppressed rather
+/// than returned again.
 pub fn rule_bodies_for_tool(tool_name: &str) -> Vec<String> {
     list_rules()
         .into_iter()
@@ -268,7 +314,19 @@ pub fn rule_bodies_for_tool(tool_name: &str) -> Vec<String> {
                 .as_ref()
                 .is_some_and(|trigger| trigger.tools.iter().any(|t| t == tool_name))
         })
-        .map(|r| r.body)
+        .filter_map(|r| {
+            let cooldown = r
+                .cooldown_secs
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(crate::nudge_pace::DEFAULT_COOLDOWN);
+            let key = format!("coaching:{}", r.id);
+            if crate::nudge_pace::should_fire(&key, cooldown) {
+                crate::nudge_pace::mark_fired(&key);
+                Some(r.body)
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
@@ -296,7 +354,9 @@ pub fn enforced_rule_reason_for_tool(tool_name: &str) -> Option<String> {
 /// Bodies of rules with auto_match true whose title+body BM25-matches
 /// prompt, via the same ephemeral FTS5 scorer crate::compact already
 /// built for the PreCompact hook. No numeric threshold: appearing in
-/// score_lines's result set is itself the fire or no-fire decision.
+/// score_lines's result set is itself the fire or no-fire decision. Paced
+/// so a rule that already fired within its cooldown window is suppressed
+/// rather than returned again.
 pub fn rule_bodies_for_prompt(prompt: &str) -> Vec<String> {
     let candidates: Vec<CoachingRule> = list_rules()
         .into_iter()
@@ -315,13 +375,28 @@ pub fn rule_bodies_for_prompt(prompt: &str) -> Vec<String> {
         })
         .collect();
 
-    match crate::compact::score_lines(&entries, prompt) {
-        Ok(scored) => scored
-            .into_iter()
-            .map(|s| candidates[s.index].body.clone())
-            .collect(),
-        Err(_) => vec![],
-    }
+    let scored = match crate::compact::score_lines(&entries, prompt) {
+        Ok(scored) => scored,
+        Err(_) => return vec![],
+    };
+
+    scored
+        .into_iter()
+        .filter_map(|s| {
+            let r = &candidates[s.index];
+            let cooldown = r
+                .cooldown_secs
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(crate::nudge_pace::DEFAULT_COOLDOWN);
+            let key = format!("coaching:{}", r.id);
+            if crate::nudge_pace::should_fire(&key, cooldown) {
+                crate::nudge_pace::mark_fired(&key);
+                Some(r.body.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -863,6 +938,32 @@ mod tests {
     }
 
     #[test]
+    fn apply_rule_preserves_cooldown_secs_across_plain_refresh() {
+        with_temp_home(|| {
+            apply_rule_with_cooldown(
+                "hygiene",
+                "T",
+                "Old body",
+                None,
+                RuleTier::Override,
+                vec![],
+                Some(600),
+            )
+            .unwrap();
+
+            apply_rule("hygiene", "T", "New body", None, RuleTier::Override, vec![]).unwrap();
+
+            let rules = list_rules();
+            assert_eq!(rules[0].body, "New body");
+            assert_eq!(
+                rules[0].cooldown_secs,
+                Some(600),
+                "cooldown_secs must survive a plain apply_rule refresh, same as enforced does"
+            );
+        });
+    }
+
+    #[test]
     fn enforced_rule_reason_for_tool_only_fires_for_enforced_rules() {
         with_temp_home(|| {
             apply_rule(
@@ -886,6 +987,118 @@ mod tests {
             assert!(reason.contains("Every finding needs a diff."));
 
             assert!(enforced_rule_reason_for_tool("mcp__flare__comment").is_none());
+        });
+    }
+
+    #[test]
+    fn rule_bodies_for_tool_is_suppressed_on_an_immediate_second_call() {
+        with_temp_home(|| {
+            apply_rule(
+                "scoped",
+                "T",
+                "Scoped body",
+                Some(rule::RuleTrigger {
+                    tools: vec!["mcp__flare__review".to_string()],
+                    auto_match: false,
+                }),
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
+
+            assert_eq!(
+                rule_bodies_for_tool("mcp__flare__review"),
+                vec!["Scoped body".to_string()]
+            );
+            assert!(
+                rule_bodies_for_tool("mcp__flare__review").is_empty(),
+                "second call within the cooldown must be paced"
+            );
+        });
+    }
+
+    #[test]
+    fn rule_bodies_for_tool_honors_a_custom_cooldown_not_just_the_default() {
+        with_temp_home(|| {
+            apply_rule_with_cooldown(
+                "scoped",
+                "T",
+                "Scoped body",
+                Some(rule::RuleTrigger {
+                    tools: vec!["mcp__flare__review".to_string()],
+                    auto_match: false,
+                }),
+                RuleTier::Override,
+                vec![],
+                Some(0),
+            )
+            .unwrap();
+
+            // cooldown_secs = 0 opts a rule out of pacing entirely -- if
+            // rule_bodies_for_tool ignored per-rule cooldown_secs and always
+            // used DEFAULT_COOLDOWN (300s), the second call below would
+            // wrongly come back empty.
+            assert_eq!(
+                rule_bodies_for_tool("mcp__flare__review"),
+                vec!["Scoped body".to_string()]
+            );
+            assert_eq!(
+                rule_bodies_for_tool("mcp__flare__review"),
+                vec!["Scoped body".to_string()],
+                "an explicit 0s cooldown must not be overridden by DEFAULT_COOLDOWN"
+            );
+        });
+    }
+
+    #[test]
+    fn rule_bodies_for_prompt_is_suppressed_on_an_immediate_second_call() {
+        with_temp_home(|| {
+            apply_rule(
+                "revfix",
+                "Reviews ship with fixes",
+                "Every review finding needs a diff.",
+                Some(rule::RuleTrigger {
+                    tools: vec![],
+                    auto_match: true,
+                }),
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
+
+            assert_eq!(
+                rule_bodies_for_prompt("please review this change"),
+                vec!["Every review finding needs a diff.".to_string()]
+            );
+            assert!(
+                rule_bodies_for_prompt("please review this change").is_empty(),
+                "second call within the cooldown must be paced"
+            );
+        });
+    }
+
+    #[test]
+    fn enforced_rule_reason_for_tool_is_never_paced() {
+        with_temp_home(|| {
+            apply_rule(
+                "revfix",
+                "T",
+                "Body",
+                Some(rule::RuleTrigger {
+                    tools: vec!["mcp__flare__review".to_string()],
+                    auto_match: false,
+                }),
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
+            set_enforced("revfix", true).unwrap();
+
+            assert!(enforced_rule_reason_for_tool("mcp__flare__review").is_some());
+            assert!(
+                enforced_rule_reason_for_tool("mcp__flare__review").is_some(),
+                "enforced rules must fire on every matching call, never paced"
+            );
         });
     }
 }

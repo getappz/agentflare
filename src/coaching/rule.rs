@@ -37,6 +37,7 @@ pub struct CoachingRule {
     pub tier: RuleTier,
     pub sync: Vec<String>,
     pub enforced: bool,
+    pub cooldown_secs: Option<u64>,
 }
 
 /// Declares when a rule should fire contextually instead of at every
@@ -183,6 +184,7 @@ pub(super) fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
     let mut tier = RuleTier::Override;
     let mut sync = Vec::new();
     let mut enforced = false;
+    let mut cooldown_secs = None;
     let mut in_header = false;
     let mut header_done = false;
     let mut body_lines = Vec::new();
@@ -221,6 +223,8 @@ pub(super) fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
                     .collect();
             } else if let Some(rest) = line.strip_prefix("# Enforce:") {
                 enforced = rest.trim().eq_ignore_ascii_case("true");
+            } else if let Some(rest) = line.strip_prefix("# Cooldown: ") {
+                cooldown_secs = rest.trim().parse().ok();
             }
         } else if !line.is_empty() {
             body_lines.push(line);
@@ -240,6 +244,7 @@ pub(super) fn parse_rule_file(path: &std::path::Path) -> Option<CoachingRule> {
         tier,
         sync,
         enforced,
+        cooldown_secs,
     })
 }
 
@@ -253,6 +258,7 @@ pub(super) fn write_rule_file(
     tier: RuleTier,
     sync: &[String],
     enforced: bool,
+    cooldown_secs: Option<u64>,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let date = chrono::Local::now().date_naive();
@@ -270,8 +276,12 @@ pub(super) fn write_rule_file(
     } else {
         String::new()
     };
+    let cooldown_line = match cooldown_secs {
+        Some(v) => format!("\n# Cooldown: {v}"),
+        None => String::new(),
+    };
     let content = format!(
-        "---\n# Pattern: {id} \u{2014} {title}\n# Applied: {date}{trigger_line}\n# Tier: {}{sync_line}{enforce_line}\n---\n\n{body}\n",
+        "---\n# Pattern: {id} \u{2014} {title}\n# Applied: {date}{trigger_line}\n# Tier: {}{sync_line}{enforce_line}{cooldown_line}\n---\n\n{body}\n",
         tier.as_str()
     );
     let final_path = dir.join(format!("coaching-{id}.md"));
@@ -426,6 +436,7 @@ mod tests {
             RuleTier::Override,
             &[],
             false,
+            None,
         )
         .unwrap();
 
@@ -449,6 +460,7 @@ mod tests {
             RuleTier::Override,
             &[],
             false,
+            None,
         )
         .unwrap();
 
@@ -470,6 +482,7 @@ mod tests {
             RuleTier::Builtin,
             &["claude-code".to_string(), "opencode".to_string()],
             false,
+            None,
         )
         .unwrap();
 
@@ -511,6 +524,7 @@ mod tests {
             RuleTier::Override,
             &[],
             false,
+            None,
         )
         .unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -538,6 +552,7 @@ mod tests {
             RuleTier::Builtin,
             &[],
             true,
+            None,
         )
         .unwrap();
 
@@ -560,5 +575,42 @@ mod tests {
         assert!(!rule.enforced);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cooldown_secs_round_trips_through_write_and_parse() {
+        use crate::paths::test_support::with_temp_home;
+        with_temp_home(|| {
+            crate::coaching::apply_rule_with_cooldown(
+                "hygiene",
+                "Title",
+                "Body",
+                None,
+                RuleTier::Override,
+                vec![],
+                Some(600),
+            )
+            .unwrap();
+            let rules = crate::coaching::list_rules();
+            assert_eq!(rules[0].cooldown_secs, Some(600));
+        });
+    }
+
+    #[test]
+    fn cooldown_secs_defaults_to_none_when_absent() {
+        use crate::paths::test_support::with_temp_home;
+        with_temp_home(|| {
+            crate::coaching::apply_rule(
+                "hygiene",
+                "Title",
+                "Body",
+                None,
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
+            let rules = crate::coaching::list_rules();
+            assert_eq!(rules[0].cooldown_secs, None);
+        });
     }
 }

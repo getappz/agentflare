@@ -316,6 +316,8 @@ fn handoff_tool_requires_recipient_and_assigns_item() {
                 recipient: "opencode".into(),
                 name: "review-packet".into(),
                 content: "please review".into(),
+                completed: "wrote the parser".into(),
+                remaining: "wire up the CLI".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -364,6 +366,8 @@ fn handoff_trims_whitespace_padded_recipient() {
                 recipient: "  opencode  ".into(),
                 name: "review-packet".into(),
                 content: "please review".into(),
+                completed: "wrote the parser".into(),
+                remaining: "wire up the CLI".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -402,6 +406,8 @@ fn handoff_with_item_id_assigns_existing_item_and_versions_the_asset() {
                 name: "Existing task".into(),
                 content: "v1 content".into(),
                 item_id: Some(item_id.clone()),
+                completed: "wrote v1".into(),
+                remaining: "get feedback".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -418,6 +424,8 @@ fn handoff_with_item_id_assigns_existing_item_and_versions_the_asset() {
                 name: "Addressed feedback".into(),
                 content: "v2 content".into(),
                 item_id: Some(item_id.clone()),
+                completed: "addressed feedback".into(),
+                remaining: "ship it".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -437,6 +445,192 @@ fn handoff_with_item_id_assigns_existing_item_and_versions_the_asset() {
         .unwrap();
         assert_eq!(item["assignee_agent"], "opencode");
         assert_eq!(item_assets(&s, &item_id).as_array().unwrap().len(), 2);
+    });
+}
+
+#[test]
+fn handoff_without_item_id_reuses_an_existing_open_item_with_matching_name() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = handoff_harness();
+
+        let first: serde_json::Value = serde_json::from_str(
+            &s.handoff(Parameters(HandoffRequest {
+                recipient: "opencode".into(),
+                name: "Feature X".into(),
+                content: "v1 content".into(),
+                completed: "wrote v1".into(),
+                remaining: "get feedback".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let item_id = first["item_id"].as_str().unwrap().to_string();
+
+        // Same recipient + name, no item_id — must reuse the existing item
+        // rather than creating a duplicate (the actual fix for the
+        // documented "handoff creates a duplicate item" bug).
+        let second: serde_json::Value = serde_json::from_str(
+            &s.handoff(Parameters(HandoffRequest {
+                recipient: "opencode".into(),
+                name: "Feature X".into(),
+                content: "v2 content".into(),
+                completed: "addressed feedback".into(),
+                remaining: "ship it".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second["item_id"], item_id);
+        assert_eq!(second["asset_version"], 2);
+        assert_eq!(item_assets(&s, &item_id).as_array().unwrap().len(), 2);
+    });
+}
+
+#[test]
+fn handoff_without_item_id_reuses_by_matching_thread_id() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = handoff_harness();
+
+        let first: serde_json::Value = serde_json::from_str(
+            &s.handoff(Parameters(HandoffRequest {
+                recipient: "opencode".into(),
+                name: "Initial brief".into(),
+                content: "v1 content".into(),
+                thread_id: Some("t-abc".into()),
+                completed: "wrote v1".into(),
+                remaining: "get feedback".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let item_id = first["item_id"].as_str().unwrap().to_string();
+
+        // Different name, same thread — still reused, not duplicated.
+        let second: serde_json::Value = serde_json::from_str(
+            &s.handoff(Parameters(HandoffRequest {
+                recipient: "opencode".into(),
+                name: "Follow-up".into(),
+                content: "v2 content".into(),
+                thread_id: Some("t-abc".into()),
+                completed: "addressed feedback".into(),
+                remaining: "ship it".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second["item_id"], item_id);
+    });
+}
+
+#[test]
+fn handoff_without_item_id_still_creates_when_no_existing_item_matches() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = handoff_harness();
+
+        let first: serde_json::Value = serde_json::from_str(
+            &s.handoff(Parameters(HandoffRequest {
+                recipient: "opencode".into(),
+                name: "Feature X".into(),
+                content: "v1 content".into(),
+                completed: "wrote v1".into(),
+                remaining: "get feedback".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Different name, no thread match — genuinely new work still
+        // auto-creates.
+        let second: serde_json::Value = serde_json::from_str(
+            &s.handoff(Parameters(HandoffRequest {
+                recipient: "opencode".into(),
+                name: "Unrelated Feature Y".into(),
+                content: "v1 content".into(),
+                completed: "wrote v1".into(),
+                remaining: "get feedback".into(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(first["item_id"], second["item_id"]);
+    });
+}
+
+#[test]
+fn handoff_stores_structured_payload_in_asset_metadata() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = handoff_harness();
+        let result: serde_json::Value = serde_json::from_str(
+            &s.handoff(Parameters(HandoffRequest {
+                recipient: "opencode".into(),
+                name: "review-packet".into(),
+                content: "please review".into(),
+                completed: "wrote the parser".into(),
+                remaining: "wire up the CLI".into(),
+                blockers: Some(vec!["needs review of #42".into()]),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let item_id = result["item_id"].as_str().unwrap().to_string();
+        let assets = item_assets(&s, &item_id);
+        let meta = &assets[0]["metadata"];
+        assert_eq!(meta["completed"], "wrote the parser");
+        assert_eq!(meta["remaining"], "wire up the CLI");
+        assert_eq!(meta["blockers"][0], "needs review of #42");
+    });
+}
+
+#[test]
+fn handoff_rejects_a_fabricated_last_commit_oid() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = handoff_harness();
+        let err = s
+            .handoff(Parameters(HandoffRequest {
+                recipient: "opencode".into(),
+                name: "review-packet".into(),
+                content: "please review".into(),
+                completed: "wrote the parser".into(),
+                remaining: "wire up the CLI".into(),
+                last_commit: Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into()),
+                ..Default::default()
+            }))
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("does not exist"), "{}", err.message);
+    });
+}
+
+#[test]
+fn handoff_accepts_an_existing_last_commit_oid() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = handoff_harness();
+        let repo_root = s.worktree_repo_root();
+        let head = flare_git_core::shell::run_in(&repo_root, &["rev-parse", "HEAD"])
+            .expect("this test must run inside a git checkout");
+        let result: serde_json::Value = serde_json::from_str(
+            &s.handoff(Parameters(HandoffRequest {
+                recipient: "opencode".into(),
+                name: "review-packet".into(),
+                content: "please review".into(),
+                completed: "wrote the parser".into(),
+                remaining: "wire up the CLI".into(),
+                last_commit: Some(head.clone()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let item_id = result["item_id"].as_str().unwrap().to_string();
+        let assets = item_assets(&s, &item_id);
+        assert_eq!(assets[0]["metadata"]["last_commit"], head);
     });
 }
 

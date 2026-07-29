@@ -617,37 +617,79 @@ pub fn search(
     Ok(like_rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// Outcome of a claim attempt — the raw lease `Acquire` plus the handoff
+/// freeze rule: while an item carries an `assignee_agent` that nobody has
+/// claimed yet (a handoff sitting unaccepted), only that assignee may
+/// acquire it. Once any claim has ever been taken (even a since-stale one),
+/// the ordinary `Acquired`/`Held` staleness rules take back over — this
+/// variant only covers the fresh, never-claimed window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    Acquired,
+    Held { owner: String, age_secs: i64 },
+    BlockedByAssignee { assignee: String },
+}
+
+/// Canonical agent identity of an owner id (`<agent>:<instance>` ->
+/// canonical `<agent>`), matching `assignee_agent`'s canonical form —
+/// `assignee_agent` is canonicalized on write (see `create`/`update`), but
+/// `owner` is the raw caller-supplied id, so an alias like `claude:1` must
+/// be canonicalized here too or it won't match `claude-code`.
+fn agent_part(owner: &str) -> String {
+    agent_registry::canonicalize(owner.split(':').next().unwrap_or(owner))
+}
+
 /// Claims an item so other agents don't duplicate the work: on a fresh
 /// acquire, sets the assignee and moves state into the project's "started"
 /// group (which sets `started_at`, via `update_state`). A live claim held by
-/// someone else returns `Held` and leaves the item untouched. Acquisition,
-/// the state transition, and the assignee update are one transaction — a
-/// mid-sequence failure can't leave `item_claims` saying "claimed" while the
-/// item itself never reflects it.
+/// someone else returns `Held` and leaves the item untouched. An item
+/// freshly handed off (assignee set, never yet claimed) to a *different*
+/// agent than the caller returns `BlockedByAssignee` instead of letting the
+/// caller silently steal it. Acquisition, the state transition, and the
+/// assignee update are one transaction — a mid-sequence failure can't leave
+/// `item_claims` saying "claimed" while the item itself never reflects it.
 pub fn claim(
     conn: &Connection,
     item_id: &str,
     owner: &str,
     now: i64,
     ttl_secs: i64,
-) -> Result<crate::claim::Acquire> {
+) -> Result<ClaimOutcome> {
     let tx = conn.unchecked_transaction()?;
-    let outcome = crate::claim::acquire(&tx, item_id, owner, now, ttl_secs)?;
-    if outcome == crate::claim::Acquire::Acquired {
-        let item = get(&tx, item_id)?;
-        let started_state = crate::state::first_in_group(&tx, &item.project_id, "started")?;
-        update_state(&tx, item_id, &started_state.id)?;
-        update(
-            &tx,
-            item_id,
-            UpdateItem {
-                assignee_agent: Some(owner.to_string()),
-                ..Default::default()
-            },
-        )?;
+    let item = get(&tx, item_id)?;
+    if let Some(assignee) = &item.assignee_agent
+        && agent_part(assignee) != agent_part(owner)
+        && crate::claim::current_owner(&tx, item_id).is_none()
+    {
+        // Excludes completed/cancelled items: a done-and-released item is
+        // fair game for anyone to re-claim (e.g. reopened follow-up work) —
+        // the freeze only protects a handoff that's still open.
+        let state = crate::state::get(&tx, &item.state_id)?;
+        if !matches!(state.group_name.as_str(), "completed" | "cancelled") {
+            return Ok(ClaimOutcome::BlockedByAssignee {
+                assignee: assignee.clone(),
+            });
+        }
     }
+    let outcome = crate::claim::acquire(&tx, item_id, owner, now, ttl_secs)?;
+    let result = match outcome {
+        crate::claim::Acquire::Acquired => {
+            let started_state = crate::state::first_in_group(&tx, &item.project_id, "started")?;
+            update_state(&tx, item_id, &started_state.id)?;
+            update(
+                &tx,
+                item_id,
+                UpdateItem {
+                    assignee_agent: Some(owner.to_string()),
+                    ..Default::default()
+                },
+            )?;
+            ClaimOutcome::Acquired
+        }
+        crate::claim::Acquire::Held { owner, age_secs } => ClaimOutcome::Held { owner, age_secs },
+    };
     tx.commit()?;
-    Ok(outcome)
+    Ok(result)
 }
 
 /// Moves a claimed item into the project's "completed" group WITHOUT
@@ -1366,7 +1408,7 @@ mod tests {
         let (pid, sid) = seed_project(&conn, "");
         let item = make_item(&conn, &pid, &sid);
         let outcome = claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
-        assert_eq!(outcome, crate::claim::Acquire::Acquired);
+        assert_eq!(outcome, ClaimOutcome::Acquired);
         let updated = get(&conn, &item.id).unwrap();
         assert_eq!(updated.assignee_agent.as_deref(), Some("agent:1"));
         assert_eq!(updated.state_id, state_in_group(&conn, &pid, "started"));
@@ -1382,7 +1424,7 @@ mod tests {
         let outcome = claim(&conn, &item.id, "agent:2", 1001, TTL).unwrap();
         assert!(matches!(
             outcome,
-            crate::claim::Acquire::Held { ref owner, .. } if owner == "agent:1"
+            ClaimOutcome::Held { ref owner, .. } if owner == "agent:1"
         ));
         let unchanged = get(&conn, &item.id).unwrap();
         assert_eq!(unchanged.assignee_agent.as_deref(), Some("agent:1"));
@@ -1395,9 +1437,79 @@ mod tests {
         let item = make_item(&conn, &pid, &sid);
         claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
         let outcome = claim(&conn, &item.id, "agent:2", 1000 + TTL + 1, TTL).unwrap();
-        assert_eq!(outcome, crate::claim::Acquire::Acquired);
+        assert_eq!(outcome, ClaimOutcome::Acquired);
         let updated = get(&conn, &item.id).unwrap();
         assert_eq!(updated.assignee_agent.as_deref(), Some("agent:2"));
+    }
+
+    #[test]
+    fn claim_by_a_different_agent_than_the_handoff_assignee_is_blocked() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        // Simulate a handoff: assignee set, never claimed yet.
+        update(
+            &conn,
+            &item.id,
+            UpdateItem {
+                assignee_agent: Some("opencode".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let outcome = claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
+        assert_eq!(
+            outcome,
+            ClaimOutcome::BlockedByAssignee {
+                assignee: "opencode".to_string()
+            }
+        );
+        let unchanged = get(&conn, &item.id).unwrap();
+        assert_eq!(unchanged.assignee_agent.as_deref(), Some("opencode"));
+        assert!(crate::claim::current_owner(&conn, &item.id).is_none());
+    }
+
+    #[test]
+    fn claim_by_the_handoff_assignee_itself_succeeds() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        update(
+            &conn,
+            &item.id,
+            UpdateItem {
+                assignee_agent: Some("opencode".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let outcome = claim(&conn, &item.id, "opencode:1", 1000, TTL).unwrap();
+        assert_eq!(outcome, ClaimOutcome::Acquired);
+    }
+
+    #[test]
+    fn claim_by_the_handoff_assignee_via_an_alias_succeeds() {
+        // assignee_agent is canonicalized on write ("claude" -> "claude-code"),
+        // but `owner` is the raw caller-supplied id — an alias owner must
+        // still be recognized as the assignee, not blocked as an impostor.
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        update(
+            &conn,
+            &item.id,
+            UpdateItem {
+                assignee_agent: Some("claude".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            get(&conn, &item.id).unwrap().assignee_agent.as_deref(),
+            Some("claude-code")
+        );
+        let outcome = claim(&conn, &item.id, "claude:1", 1000, TTL).unwrap();
+        assert_eq!(outcome, ClaimOutcome::Acquired);
     }
 
     #[test]
@@ -1436,14 +1548,14 @@ mod tests {
 
         // Lease is still held — concurrent claim must be rejected.
         match claim(&conn, &item.id, "agent:2", 1200, TTL).unwrap() {
-            crate::claim::Acquire::Held { .. } => {}
+            ClaimOutcome::Held { .. } => {}
             other => panic!("expected Held after mark_completed, got {other:?}"),
         }
 
         // Release the lease, now re-acquirable.
         assert!(crate::claim::done(&conn, &item.id, "agent:1", 1300).unwrap());
         let outcome = claim(&conn, &item.id, "agent:2", 1400, TTL).unwrap();
-        assert_eq!(outcome, crate::claim::Acquire::Acquired);
+        assert_eq!(outcome, ClaimOutcome::Acquired);
     }
 
     #[test]
