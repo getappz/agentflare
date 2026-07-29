@@ -27,7 +27,14 @@ fn save(map: &HashMap<String, String>) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(json) = serde_json::to_string(map) {
-        let _ = std::fs::write(path, json);
+        // Atomic replace: this file is written from short-lived hook
+        // processes that run under a few seconds' timeout and can be killed
+        // mid-write, and parallel tool calls invoke them concurrently. A pid
+        // suffix keeps two concurrent writers from sharing one tmp path.
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 

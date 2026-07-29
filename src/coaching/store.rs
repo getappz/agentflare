@@ -1018,6 +1018,39 @@ mod tests {
     }
 
     #[test]
+    fn rule_bodies_for_tool_honors_a_custom_cooldown_not_just_the_default() {
+        with_temp_home(|| {
+            apply_rule_with_cooldown(
+                "scoped",
+                "T",
+                "Scoped body",
+                Some(rule::RuleTrigger {
+                    tools: vec!["mcp__flare__review".to_string()],
+                    auto_match: false,
+                }),
+                RuleTier::Override,
+                vec![],
+                Some(0),
+            )
+            .unwrap();
+
+            // cooldown_secs = 0 opts a rule out of pacing entirely -- if
+            // rule_bodies_for_tool ignored per-rule cooldown_secs and always
+            // used DEFAULT_COOLDOWN (300s), the second call below would
+            // wrongly come back empty.
+            assert_eq!(
+                rule_bodies_for_tool("mcp__flare__review"),
+                vec!["Scoped body".to_string()]
+            );
+            assert_eq!(
+                rule_bodies_for_tool("mcp__flare__review"),
+                vec!["Scoped body".to_string()],
+                "an explicit 0s cooldown must not be overridden by DEFAULT_COOLDOWN"
+            );
+        });
+    }
+
+    #[test]
     fn rule_bodies_for_prompt_is_suppressed_on_an_immediate_second_call() {
         with_temp_home(|| {
             apply_rule(
