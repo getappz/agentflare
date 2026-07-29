@@ -14,8 +14,8 @@ the README. If something here looks wrong, check the code and open an issue.
   compression). CI-gated, benchmarked, in daily use.
 - **Built-in memory** (`agentflare memory ...` CLI, the underlying SQLite/FTS5
   store). Storage format and CLI surface are settled.
-- **Caveman / Ponytail wiring** for Claude Code. The companion plugins
-  themselves version independently; agentflare's wiring of them is stable.
+- **`agentflare optimize output`/`code`** (formerly the separate Caveman/Ponytail
+  plugins, now built into the binary) for Claude Code. Stable.
 - **`agentflare init --agent <X>` / `agentflare update` / `agentflare
   uninstall`** — the cross-tool setup commands themselves (not everything
   they wire up, see below).
@@ -46,10 +46,10 @@ the README. If something here looks wrong, check the code and open an issue.
   There's no protection today against a misconfigured "latest" GitHub
   release causing an accidental downgrade. Fix tracked separately from any
   version-scheme change.
-- No daemon/long-running process exists (by design, see `SECURITY.md`) —
-  anything that reads like it wants one (real-time coaching triggers off the
-  work-item backend, a web dashboard) is explicitly out of scope until a
-  dedicated design lands for it.
+- `agentflare daemon` (background lifecycle: start/stop/status, autostart) now
+  exists — it backs `agentflare serve`'s dashboard and is opt-in (`daemon
+  enable`), not started by `init`. Real-time coaching triggers off the
+  work-item backend are still out of scope until a dedicated design lands.
 - Auto-generated coaching-rule suggestions (from usage patterns/insights) are
   proposed but not implemented; adopting that depends on the contextual
   coaching-trigger work landing first, so growing rule counts don't blow the
