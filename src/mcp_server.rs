@@ -4,6 +4,7 @@
 
 mod artifact;
 mod asset;
+mod builtin_tools;
 mod claim;
 mod comment;
 mod flare_docs;
@@ -1113,17 +1114,24 @@ impl AgentflareMcp {
                     reg.search(&query, limit, mode)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
                 };
-                let hits = if local.len() < limit {
-                    let remaining = limit - local.len();
+                // Downstream gateway servers (leanctx, ...) first, then
+                // agentflare's own first-party tools (item/asset/handoff/...
+                // -- never part of the downstream index, see
+                // builtin_tools.rs), then the public MCP Registry fallback
+                // only if slots remain after both.
+                let builtin = builtin_tools::search_builtin_tools(&query, limit);
+                let with_builtin = builtin_tools::merge_builtin_hits(local, limit, builtin);
+                let hits = if with_builtin.len() < limit {
+                    let remaining = limit - with_builtin.len();
                     let query_owned = query.clone();
                     let registry = tokio::task::spawn_blocking(move || {
                         gateway_registry::registry_search::search_registry(&query_owned, remaining)
                     })
                     .await
                     .unwrap_or_default();
-                    gateway_registry::merge_registry_hits(local, limit, registry)
+                    gateway_registry::merge_registry_hits(with_builtin, limit, registry)
                 } else {
-                    local
+                    with_builtin
                 };
                 Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
             }

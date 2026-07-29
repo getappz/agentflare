@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+use serde_json::Value;
+
 use super::rule::{self, CoachingRule, RuleTier};
 
 pub(super) const MAX_RULES: usize = 8;
@@ -272,18 +274,53 @@ pub fn rule_bodies_for_tool(tool_name: &str) -> Vec<String> {
         .collect()
 }
 
+/// The "usetsearch" rule's own body says native ToolSearch is still right
+/// for tools outside the flare gateway (WebFetch, EnterPlanMode,
+/// mcp__claude-in-chrome__*, and agentflare's own first-party
+/// `mcp__flare__*` tools, which are already in the deferred-tool list and
+/// need no gateway detour) -- but until this check existed,
+/// `enforced_rule_reason_for_tool` matched on tool_name alone and blocked
+/// *every* ToolSearch call, contradicting that fallback. Only a query that's
+/// actually hunting for a leanctx/`ctx_*` tool -- the one case genuinely
+/// absent from the deferred-tool list, see CLAUDE.md's "mcp__lean-ctx__* is
+/// not a tool namespace this session ever sees listed" -- gets redirected.
+fn toolsearch_query_is_gateway_shaped(tool_input: Option<&Value>) -> bool {
+    let query = tool_input
+        .and_then(|v| v.get("query"))
+        .and_then(|q| q.as_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    ["ctx_", "leanctx", "lean-ctx", "mcp__lean-ctx__"]
+        .iter()
+        .any(|kw| query.contains(kw))
+}
+
 /// Redirect-framed deny reason for the first MANDATORY (enforced) rule
 /// whose trigger declares `tool_name`, if any. Distinct from
 /// `rule_bodies_for_tool`'s advisory nudges: this is consulted by the
 /// PreToolUse hook to block the call outright, not just remind about it.
-pub fn enforced_rule_reason_for_tool(tool_name: &str) -> Option<String> {
+/// `tool_input` lets rule-specific checks look past the tool name at what's
+/// actually being asked for -- currently only "usetsearch" uses it (see
+/// `toolsearch_query_is_gateway_shaped`); other enforced rules match on
+/// tool_name alone, same as before.
+pub fn enforced_rule_reason_for_tool(tool_name: &str, tool_input: Option<&Value>) -> Option<String> {
     list_rules()
         .into_iter()
         .find(|r| {
-            r.enforced
-                && r.trigger
-                    .as_ref()
-                    .is_some_and(|trigger| trigger.tools.iter().any(|t| t == tool_name))
+            if !r.enforced {
+                return false;
+            }
+            if !r
+                .trigger
+                .as_ref()
+                .is_some_and(|trigger| trigger.tools.iter().any(|t| t == tool_name))
+            {
+                return false;
+            }
+            if r.id == "usetsearch" {
+                return toolsearch_query_is_gateway_shaped(tool_input);
+            }
+            true
         })
         .map(|r| {
             format!(
@@ -878,14 +915,56 @@ mod tests {
             )
             .unwrap();
 
-            assert!(enforced_rule_reason_for_tool("mcp__flare__review").is_none());
+            assert!(enforced_rule_reason_for_tool("mcp__flare__review", None).is_none());
 
             set_enforced("revfix", true).unwrap();
-            let reason = enforced_rule_reason_for_tool("mcp__flare__review").unwrap();
+            let reason = enforced_rule_reason_for_tool("mcp__flare__review", None).unwrap();
             assert!(reason.contains("MANDATORY"));
             assert!(reason.contains("Every finding needs a diff."));
 
-            assert!(enforced_rule_reason_for_tool("mcp__flare__comment").is_none());
+            assert!(enforced_rule_reason_for_tool("mcp__flare__comment", None).is_none());
+        });
+    }
+
+    #[test]
+    fn toolsearch_only_enforces_for_gateway_shaped_queries() {
+        with_temp_home(|| {
+            apply_rule(
+                "usetsearch",
+                "flare tool-search over native ToolSearch for gateway tools",
+                "Use the gateway search instead.",
+                Some(rule::RuleTrigger {
+                    tools: vec!["ToolSearch".to_string()],
+                    auto_match: false,
+                }),
+                RuleTier::Builtin,
+                vec![],
+            )
+            .unwrap();
+            set_enforced("usetsearch", true).unwrap();
+
+            // A leanctx/ctx_* lookup is the one case genuinely missing from
+            // the deferred-tool list -- still blocked and redirected.
+            let leanctx_query = serde_json::json!({"query": "ctx_read"});
+            assert!(
+                enforced_rule_reason_for_tool("ToolSearch", Some(&leanctx_query)).is_some()
+            );
+
+            // First-party mcp__flare__* tools are already in the deferred
+            // list -- native ToolSearch must be allowed through untouched.
+            let flare_query = serde_json::json!({"query": "select:mcp__flare__item"});
+            assert!(enforced_rule_reason_for_tool("ToolSearch", Some(&flare_query)).is_none());
+
+            // Tools entirely outside the gateway (WebFetch, etc.) must also
+            // pass through unblocked.
+            let webfetch_query = serde_json::json!({"query": "select:WebFetch"});
+            assert!(
+                enforced_rule_reason_for_tool("ToolSearch", Some(&webfetch_query)).is_none()
+            );
+
+            // No query at all (malformed input) fails closed to "allow" --
+            // never blocks based on absent data.
+            assert!(enforced_rule_reason_for_tool("ToolSearch", None).is_none());
         });
     }
 }
