@@ -394,15 +394,16 @@ impl AgentflareMcp {
             let item_id = self.resolve_item_id(conn, &raw)?;
             let outcome = agentflare_backend::item::claim(conn, &item_id, &owner, now, ttl)
                 .map_err(map_backend_err)?;
-            let (item, target_branch) = if outcome == agentflare_backend::item::ClaimOutcome::Acquired {
-                let item = agentflare_backend::item::get(conn, &item_id).ok();
-                let target_branch = item
-                    .as_ref()
-                    .map(|i| crate::worktree::resolve_target_branch(conn, i, &repo_root));
-                (item, target_branch)
-            } else {
-                (None, None)
-            };
+            let (item, target_branch) =
+                if outcome == agentflare_backend::item::ClaimOutcome::Acquired {
+                    let item = agentflare_backend::item::get(conn, &item_id).ok();
+                    let target_branch = item
+                        .as_ref()
+                        .map(|i| crate::worktree::resolve_target_branch(conn, i, &repo_root));
+                    (item, target_branch)
+                } else {
+                    (None, None)
+                };
             Ok::<_, ErrorData>((outcome, item_id, item, target_branch))
         })??;
         let worktree_result = match (&item, &target_branch) {

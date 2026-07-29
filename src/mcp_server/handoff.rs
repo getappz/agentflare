@@ -36,6 +36,12 @@ impl AgentflareMcp {
         if content.is_empty() {
             return Err(ErrorData::invalid_params("content is required", None));
         }
+        if completed.trim().is_empty() || remaining.trim().is_empty() {
+            return Err(ErrorData::invalid_params(
+                "completed and remaining are required — an empty structured payload tells the recipient nothing",
+                None,
+            ));
+        }
         let recipient = recipient.trim().to_string();
         let name = name.trim().to_string();
         let ext = match r#type.as_deref() {
@@ -45,13 +51,26 @@ impl AgentflareMcp {
             _ => "md",
         };
 
+        // Resolve just the target branch (a DB read) under the backend
+        // lock, then run the blocking git subprocess checks below it —
+        // `verify_continuation_commit` has no business running while the
+        // shared DB mutex is held (same reasoning as `item_claim`'s split
+        // of DB resolution from `git worktree add`).
+        if let Some(oid) = &last_commit {
+            let branch = match &item_id {
+                Some(id) => self.with_backend_db(|conn| {
+                    agentflare_backend::item::get(conn, id)
+                        .ok()
+                        .map(|item| format!("task/{}", item.sequence_id))
+                })?,
+                None => None,
+            };
+            self.verify_continuation_commit(oid, branch.as_deref())?;
+        }
+
         self.with_backend_db(|conn| {
             let project = self.resolve_project(conn)?;
             let ws_id = Self::resolve_workspace_id(conn)?;
-
-            if let Some(oid) = &last_commit {
-                self.verify_continuation_commit(conn, oid, item_id.as_deref())?;
-            }
 
             let item = match &item_id {
                 Some(id) => {
@@ -82,9 +101,7 @@ impl AgentflareMcp {
                                 serde_json::from_str::<serde_json::Value>(&i.metadata)
                                     .ok()
                                     .and_then(|m| {
-                                        m.get("thread")
-                                            .and_then(|v| v.as_str())
-                                            .map(str::to_string)
+                                        m.get("thread").and_then(|v| v.as_str()).map(str::to_string)
                                     })
                                     .as_deref()
                                     == Some(t.as_str())
@@ -250,36 +267,48 @@ impl AgentflareMcp {
     }
 
     /// Verified, not trusted: rejects a fabricated or typo'd continuation
-    /// OID rather than recording it as-is. `oid` must exist in the repo;
-    /// when the target item's own `task/<seq>` branch already exists
-    /// locally, `oid` must additionally be reachable from it — a handoff
-    /// can't claim to continue from a commit that branch never saw.
-    fn verify_continuation_commit(
-        &self,
-        conn: &rusqlite::Connection,
-        oid: &str,
-        item_id: Option<&str>,
-    ) -> Result<(), ErrorData> {
+    /// OID rather than recording it as-is. `oid` must exist in the repo as
+    /// a commit (not just any object); when `branch` is given and exists,
+    /// `oid` must additionally be reachable from it — a handoff can't claim
+    /// to continue from a commit that branch never saw. `branch` must be
+    /// resolved by the caller *before* calling this and outside
+    /// `with_backend_db` — this is pure git subprocess work (up to three
+    /// blocking calls) that has no business running while the shared
+    /// backend DB mutex is held.
+    fn verify_continuation_commit(&self, oid: &str, branch: Option<&str>) -> Result<(), ErrorData> {
+        // Reject anything that isn't a plain hex OID before it ever reaches
+        // git: a leading '-' would otherwise be parsed as an option by
+        // `cat-file`/`merge-base` rather than as a rev.
+        if oid.len() < 7 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ErrorData::invalid_params(
+                format!("last_commit '{oid}' is not a valid object id"),
+                None,
+            ));
+        }
         let repo_root = self.worktree_repo_root();
-        if !flare_git_core::shell::run_in_ok(&repo_root, &["cat-file", "-e", oid]) {
+        // `^{commit}` forces commit-type resolution — plain `cat-file -e`
+        // also succeeds for blobs/trees/tags, which aren't valid
+        // continuation points.
+        let commit_ref = format!("{oid}^{{commit}}");
+        if !flare_git_core::shell::run_in_ok(&repo_root, &["cat-file", "-e", &commit_ref]) {
             return Err(ErrorData::invalid_params(
                 format!("last_commit '{oid}' does not exist in this repo — verified, not trusted"),
                 None,
             ));
         }
-        let Some(id) = item_id else {
+        let Some(branch) = branch else {
             return Ok(());
         };
-        let Ok(item) = agentflare_backend::item::get(conn, id) else {
-            return Ok(()); // item resolution/existence is checked separately below
-        };
-        let branch = format!("task/{}", item.sequence_id);
+        let branch_ref = format!("refs/heads/{branch}");
         let branch_exists = flare_git_core::shell::run_in_ok(
             &repo_root,
-            &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+            &["show-ref", "--verify", "--quiet", &branch_ref],
         );
         if branch_exists
-            && !flare_git_core::shell::run_in_ok(&repo_root, &["merge-base", "--is-ancestor", oid, &branch])
+            && !flare_git_core::shell::run_in_ok(
+                &repo_root,
+                &["merge-base", "--is-ancestor", oid, branch],
+            )
         {
             return Err(ErrorData::invalid_params(
                 format!(

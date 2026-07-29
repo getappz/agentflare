@@ -316,6 +316,8 @@ fn handoff_tool_requires_recipient_and_assigns_item() {
                 recipient: "opencode".into(),
                 name: "review-packet".into(),
                 content: "please review".into(),
+                completed: "wrote the parser".into(),
+                remaining: "wire up the CLI".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -364,6 +366,8 @@ fn handoff_trims_whitespace_padded_recipient() {
                 recipient: "  opencode  ".into(),
                 name: "review-packet".into(),
                 content: "please review".into(),
+                completed: "wrote the parser".into(),
+                remaining: "wire up the CLI".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -402,6 +406,8 @@ fn handoff_with_item_id_assigns_existing_item_and_versions_the_asset() {
                 name: "Existing task".into(),
                 content: "v1 content".into(),
                 item_id: Some(item_id.clone()),
+                completed: "wrote v1".into(),
+                remaining: "get feedback".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -418,6 +424,8 @@ fn handoff_with_item_id_assigns_existing_item_and_versions_the_asset() {
                 name: "Addressed feedback".into(),
                 content: "v2 content".into(),
                 item_id: Some(item_id.clone()),
+                completed: "addressed feedback".into(),
+                remaining: "ship it".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -450,6 +458,8 @@ fn handoff_without_item_id_reuses_an_existing_open_item_with_matching_name() {
                 recipient: "opencode".into(),
                 name: "Feature X".into(),
                 content: "v1 content".into(),
+                completed: "wrote v1".into(),
+                remaining: "get feedback".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -465,6 +475,8 @@ fn handoff_without_item_id_reuses_an_existing_open_item_with_matching_name() {
                 recipient: "opencode".into(),
                 name: "Feature X".into(),
                 content: "v2 content".into(),
+                completed: "addressed feedback".into(),
+                remaining: "ship it".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -487,6 +499,8 @@ fn handoff_without_item_id_reuses_by_matching_thread_id() {
                 name: "Initial brief".into(),
                 content: "v1 content".into(),
                 thread_id: Some("t-abc".into()),
+                completed: "wrote v1".into(),
+                remaining: "get feedback".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -501,6 +515,8 @@ fn handoff_without_item_id_reuses_by_matching_thread_id() {
                 name: "Follow-up".into(),
                 content: "v2 content".into(),
                 thread_id: Some("t-abc".into()),
+                completed: "addressed feedback".into(),
+                remaining: "ship it".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -520,6 +536,8 @@ fn handoff_without_item_id_still_creates_when_no_existing_item_matches() {
                 recipient: "opencode".into(),
                 name: "Feature X".into(),
                 content: "v1 content".into(),
+                completed: "wrote v1".into(),
+                remaining: "get feedback".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -533,6 +551,8 @@ fn handoff_without_item_id_still_creates_when_no_existing_item_matches() {
                 recipient: "opencode".into(),
                 name: "Unrelated Feature Y".into(),
                 content: "v1 content".into(),
+                completed: "wrote v1".into(),
+                remaining: "get feedback".into(),
                 ..Default::default()
             }))
             .unwrap(),
@@ -577,6 +597,8 @@ fn handoff_rejects_a_fabricated_last_commit_oid() {
                 recipient: "opencode".into(),
                 name: "review-packet".into(),
                 content: "please review".into(),
+                completed: "wrote the parser".into(),
+                remaining: "wire up the CLI".into(),
                 last_commit: Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into()),
                 ..Default::default()
             }))
@@ -598,6 +620,8 @@ fn handoff_accepts_an_existing_last_commit_oid() {
                 recipient: "opencode".into(),
                 name: "review-packet".into(),
                 content: "please review".into(),
+                completed: "wrote the parser".into(),
+                remaining: "wire up the CLI".into(),
                 last_commit: Some(head.clone()),
                 ..Default::default()
             }))

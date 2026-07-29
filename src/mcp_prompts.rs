@@ -206,6 +206,8 @@ fn get_handoff_command(request: &GetPromptRequestParams, agent: Option<&str>) ->
          - `<recipient> <brief>` → call the `handoff` tool with recipient=<recipient>, \
          name from the brief, content = the work product the brief points at (the preceding \
          conversation content, diff, review, or document — ask only if genuinely ambiguous), \
+         completed and remaining (both required — what's done, what's left), blockers if any, \
+         last_commit=<continuation commit oid> when handing off in-progress work, \
          and a thread_id when continuing an exchange. This assigns/creates an item for the \
          recipient and attaches the content to it as a versioned asset — prepend the brief to \
          the content so the recipient knows what is being asked (sender is set to your \

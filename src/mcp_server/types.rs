@@ -237,9 +237,7 @@ pub(crate) struct HandoffRequest {
     pub(crate) last_commit: Option<String>,
     #[schemars(description = "What's done so far — required, part of the structured payload.")]
     pub(crate) completed: String,
-    #[schemars(
-        description = "What's left to do — required, part of the structured payload."
-    )]
+    #[schemars(description = "What's left to do — required, part of the structured payload.")]
     pub(crate) remaining: String,
     #[schemars(description = "Known blockers, if any.")]
     #[serde(default)]
