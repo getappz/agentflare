@@ -4,7 +4,40 @@ use super::*;
 
 impl AgentflareMcp {
     pub fn flare_git_impl(&self, req: GitHubRequest) -> Result<String, ErrorData> {
-        use crate::github::{Client, RepoId, actions, issues, mcp, pulls, releases};
+        use crate::github::{Client, RepoId, actions, issues, mcp, pulls, releases, repos};
+
+        // Keep in sync with the action names matched below — validating
+        // first means an unknown action fails before repo/client setup
+        // (and credentials) rather than surfacing as an unrelated error.
+        const KNOWN_ACTIONS: &[&str] = &[
+            "pr_create",
+            "pr_list",
+            "pr_get",
+            "pr_status",
+            "pr_merge",
+            "pr_comment",
+            "pr_request_review",
+            "issue_create",
+            "issue_list",
+            "issue_get",
+            "issue_comment",
+            "issue_close",
+            "issue_label",
+            "release_list",
+            "release_get",
+            "release_latest",
+            "release_create",
+            "run_list",
+            "run_get",
+            "run_rerun",
+            "workflow_dispatch",
+        ];
+        if !KNOWN_ACTIONS.contains(&req.action.as_str()) {
+            return Err(ErrorData::invalid_params(
+                format!("unknown action: {}", req.action),
+                None,
+            ));
+        }
 
         let repo = match &req.repo {
             Some(r) => RepoId::parse(r)
@@ -286,20 +319,17 @@ impl AgentflareMcp {
                         None,
                     ));
                 }
-                let git_ref = match req.git_ref.as_deref() {
-                    Some(r) => r.to_string(),
-                    None => {
-                        if req.repo.is_some() {
-                            return Err(ErrorData::invalid_params(
-                                "git_ref is required when repo is overridden (cannot infer the target repo default branch)",
-                                None,
-                            ));
-                        }
+                let git_ref = resolve_workflow_git_ref(
+                    req.git_ref.as_deref(),
+                    req.repo.is_some(),
+                    || repos::get_default_branch(&client, &repo),
+                    || {
                         flare_git_core::branch::resolve_default_branch(
                             &std::env::current_dir().unwrap_or_default(),
                         )
-                    }
-                };
+                    },
+                )
+                .map_err(to_mcp_error)?;
                 actions::dispatch(&client, &repo, wf, &git_ref, req.inputs.as_ref())
                     .map_err(to_mcp_error)?;
                 format!("Dispatched {wf} on {git_ref}")
@@ -312,5 +342,74 @@ impl AgentflareMcp {
             }
         };
         Ok(out)
+    }
+}
+
+/// Decides the git ref for `workflow_dispatch`: an explicit `git_ref` wins;
+/// otherwise an overridden `repo` resolves its default branch via
+/// `remote_default` (a GitHub API call), and the no-override case via
+/// `local_default` (the checkout's origin). Pulled out standalone so both
+/// paths are unit-testable without a network-backed `Client`.
+fn resolve_workflow_git_ref(
+    explicit: Option<&str>,
+    repo_overridden: bool,
+    remote_default: impl FnOnce() -> Result<String, crate::github::GitHubError>,
+    local_default: impl FnOnce() -> String,
+) -> Result<String, crate::github::GitHubError> {
+    match explicit {
+        Some(r) => Ok(r.to_string()),
+        None if repo_overridden => remote_default(),
+        None => Ok(local_default()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_workflow_git_ref_prefers_the_explicit_ref() {
+        let r = resolve_workflow_git_ref(
+            Some("refs/heads/explicit"),
+            true,
+            || panic!("must not resolve a default when a ref is given"),
+            || panic!("must not resolve a default when a ref is given"),
+        );
+        assert_eq!(r.unwrap(), "refs/heads/explicit");
+    }
+
+    #[test]
+    fn resolve_workflow_git_ref_uses_the_remote_api_when_repo_is_overridden() {
+        let r = resolve_workflow_git_ref(
+            None,
+            true,
+            || Ok("main".to_string()),
+            || panic!("an overridden repo must resolve via the API, not local git"),
+        );
+        assert_eq!(r.unwrap(), "main");
+    }
+
+    #[test]
+    fn resolve_workflow_git_ref_uses_local_resolution_without_a_repo_override() {
+        let r = resolve_workflow_git_ref(
+            None,
+            false,
+            || panic!("no repo override must not hit the GitHub API"),
+            || "develop".to_string(),
+        );
+        assert_eq!(r.unwrap(), "develop");
+    }
+
+    #[test]
+    fn unknown_action_is_rejected_before_repo_or_client_setup() {
+        // Credential-independent: an unknown action must fail on its own
+        // merits, not because there's no repo/token in the test environment.
+        let mcp = AgentflareMcp::default();
+        let req = GitHubRequest {
+            action: "bogus".to_string(),
+            ..Default::default()
+        };
+        let err = mcp.flare_git_impl(req).unwrap_err();
+        assert!(err.to_string().contains("unknown action: bogus"), "{err}");
     }
 }
