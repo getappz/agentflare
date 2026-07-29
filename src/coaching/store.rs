@@ -1219,9 +1219,9 @@ mod tests {
             .unwrap();
             set_enforced("revfix", true).unwrap();
 
-            assert!(enforced_rule_reason_for_tool("mcp__flare__review").is_some());
+            assert!(enforced_rule_reason_for_tool("mcp__flare__review", None).is_some());
             assert!(
-                enforced_rule_reason_for_tool("mcp__flare__review").is_some(),
+                enforced_rule_reason_for_tool("mcp__flare__review", None).is_some(),
                 "enforced rules must fire on every matching call, never paced"
             );
         });
