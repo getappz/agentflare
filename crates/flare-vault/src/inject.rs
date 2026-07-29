@@ -18,7 +18,7 @@ pub fn load_vault_env(app_name: &str, working_dir: &Path) -> VaultResult<HashMap
             let names = list_secret_names(&body);
             for name in names {
                 if let Ok(Some(val)) = get_secret_value(&body, &dek.dek, &name) {
-                    env.insert(name, val);
+                    env.insert(name, val.to_string());
                 }
             }
         }
@@ -30,7 +30,7 @@ pub fn load_vault_env(app_name: &str, working_dir: &Path) -> VaultResult<HashMap
                 let names = list_secret_names(&body);
                 for name in names {
                     if let Ok(Some(val)) = get_secret_value(&body, &dek.dek, &name) {
-                        env.insert(name, val);
+                        env.insert(name, val.to_string());
                     }
                 }
             }
@@ -43,22 +43,28 @@ pub fn load_vault_env(app_name: &str, working_dir: &Path) -> VaultResult<HashMap
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::test_support::with_temp_home;
     use crate::vault::manager::{create_vault, open_vault, set_secret_value, write_vault_body};
     use tempfile::TempDir;
 
     #[test]
     fn load_from_global_vault() {
-        let app = "flare-vault-test";
-        let dir = TempDir::new().unwrap();
-        let vault_path = dir.path().join(".flare-vault-test").join("vault.json");
+        with_temp_home(|| {
+            let app = "flare-vault-test";
+            let vault_path = VaultPaths::global(app).global_vault_path();
 
-        create_vault(&vault_path, "pw").unwrap();
-        let dek = open_vault(&vault_path, "pw").unwrap();
-        let mut body = read_vault_body(&vault_path).unwrap();
-        set_secret_value(&mut body, &dek.dek, "MY_SECRET", "test-value").unwrap();
-        write_vault_body(&vault_path, &body).unwrap();
+            create_vault(&vault_path, "pw").unwrap();
+            let dek = open_vault(&vault_path, "pw").unwrap();
+            let mut body = read_vault_body(&vault_path).unwrap();
+            set_secret_value(&mut body, &dek.dek, "MY_SECRET", "test-value").unwrap();
+            write_vault_body(&vault_path, &body).unwrap();
+            crate::session::store_session(app, &vault_path, &dek.dek);
 
-        let result = load_vault_env(app, dir.path());
-        assert!(result.is_ok());
+            // A working dir with no .git/.agentflare/Cargo.toml marker, so
+            // this only exercises the global vault, not project scoping.
+            let cwd = TempDir::new().unwrap();
+            let env = load_vault_env(app, cwd.path()).unwrap();
+            assert_eq!(env.get("MY_SECRET").map(String::as_str), Some("test-value"));
+        });
     }
 }

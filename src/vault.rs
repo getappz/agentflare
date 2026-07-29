@@ -8,16 +8,25 @@ use flare_vault::vault::manager::{
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
+use zeroize::Zeroizing;
 
 const APP_NAME: &str = "agentflare";
 
-static PASSPHRASE_CACHE: Mutex<Option<String>> = Mutex::new(None);
+static PASSPHRASE_CACHE: Mutex<Option<Zeroizing<String>>> = Mutex::new(None);
+static LEGACY_MIGRATION_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-pub fn get_passphrase() -> Option<String> {
+// Deliberately independent of `auth_crypt::get_passphrase()` (used by the
+// legacy `gateway_secrets` store): that one also falls back to an
+// interactive prompt, this one doesn't -- unattended callers (MCP server,
+// background CLI commands) should fail fast rather than block on a prompt
+// nobody's there to answer. They share the same env var by design so a
+// passphrase set once works for both during the migration window.
+pub fn get_passphrase() -> Option<Zeroizing<String>> {
     if let Ok(pw) = std::env::var("AGENTFLARE_VAULT_PASSPHRASE")
         && !pw.is_empty()
     {
-        return Some(pw);
+        return Some(Zeroizing::new(pw));
     }
     PASSPHRASE_CACHE
         .lock()
@@ -27,13 +36,12 @@ pub fn get_passphrase() -> Option<String> {
 
 pub fn cache_passphrase(passphrase: &str) {
     if let Ok(mut cache) = PASSPHRASE_CACHE.lock() {
-        *cache = Some(passphrase.to_string());
+        *cache = Some(Zeroizing::new(passphrase.to_string()));
     }
 }
 
 fn vault_path() -> std::path::PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    home.join(".agentflare").join("vault.json")
+    crate::paths::home().join(".agentflare").join("vault.json")
 }
 
 pub fn ensure_vault() -> Result<(), String> {
@@ -71,9 +79,8 @@ fn open_vault_with_passphrase() -> Result<VaultDek, String> {
 /// fails the caller — migration failures just leave the legacy value in
 /// place for a future attempt.
 fn migrate_legacy_secrets(path: &Path, dek: &VaultDek, passphrase: &str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.swap(true, Ordering::SeqCst) {
+    use std::sync::atomic::Ordering;
+    if LEGACY_MIGRATION_DONE.swap(true, Ordering::SeqCst) {
         return;
     }
 
@@ -155,7 +162,7 @@ fn unseal_vault_with_dek() -> Result<VaultDek, String> {
     open_vault_with_passphrase()
 }
 
-pub fn get_secret(name: &str) -> Result<Option<String>, String> {
+pub fn get_secret(name: &str) -> Result<Option<Zeroizing<String>>, String> {
     let path = vault_path();
     if !path.exists() {
         return Ok(None);
@@ -190,4 +197,112 @@ pub fn remove_secret(name: &str) -> Result<bool, String> {
 
 pub fn vault_env(working_dir: &Path) -> HashMap<String, String> {
     load_vault_env(APP_NAME, working_dir).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paths::test_support::with_temp_home;
+
+    // AGENTFLARE_VAULT_PASSPHRASE is process-global; with_temp_home already
+    // holds the process-wide env-mutation lock for its whole call, so it's
+    // safe to set/clear it here without a second lock (see src/paths.rs).
+    fn set_passphrase(value: &str) {
+        unsafe { std::env::set_var("AGENTFLARE_VAULT_PASSPHRASE", value) };
+    }
+
+    fn clear_passphrase() {
+        unsafe { std::env::remove_var("AGENTFLARE_VAULT_PASSPHRASE") };
+    }
+
+    #[test]
+    fn unlock_then_set_get_roundtrip() {
+        with_temp_home(|| {
+            set_passphrase("test-pass");
+            unlock("test-pass").unwrap();
+            set_secret("MY_KEY", "my-value").unwrap();
+
+            let val = get_secret("MY_KEY").unwrap();
+            assert_eq!(val.as_ref().map(|s| s.as_str()), Some("my-value"));
+
+            lock().unwrap();
+            clear_passphrase();
+        });
+    }
+
+    /// Regression test: `get_secret` must propagate a real unseal failure
+    /// (wrong/missing passphrase) as `Err`, not collapse it into `Ok(None)`
+    /// -- which would be indistinguishable from "no secret configured" and
+    /// defeats `mcp_server::resolve_gateway_secrets`'s error surfacing one
+    /// layer up.
+    #[test]
+    fn get_secret_surfaces_wrong_passphrase_instead_of_returning_none() {
+        with_temp_home(|| {
+            set_passphrase("correct-pass");
+            unlock("correct-pass").unwrap();
+            set_secret("SOME_KEY", "value").unwrap();
+            lock().unwrap(); // drop the cached passphrase + session DEK
+
+            set_passphrase("wrong-pass");
+            let err = get_secret("SOME_KEY").unwrap_err();
+            assert!(
+                err.contains("passphrase"),
+                "expected a passphrase-related error, got: {err}"
+            );
+
+            clear_passphrase();
+        });
+    }
+
+    /// Regression test: secrets previously stored via the old sqlite
+    /// `gateway_secrets` table must survive the switch to the vault instead
+    /// of silently disappearing on first unlock.
+    #[test]
+    fn migrates_legacy_gateway_secret_on_first_unlock() {
+        with_temp_home(|| {
+            LEGACY_MIGRATION_DONE.store(false, std::sync::atomic::Ordering::SeqCst);
+            set_passphrase("shared-pass");
+
+            let conn = crate::db::open().unwrap();
+            crate::gateway_secrets::set_secret(&conn, "github_token", "legacy-token-value")
+                .unwrap();
+            drop(conn);
+
+            unlock("shared-pass").unwrap();
+            let migrated = get_secret("github_token").unwrap();
+            assert_eq!(
+                migrated.as_ref().map(|s| s.as_str()),
+                Some("legacy-token-value")
+            );
+
+            lock().unwrap();
+            clear_passphrase();
+        });
+    }
+
+    /// Migration must never clobber a value the user already set directly
+    /// in the new vault under the same name.
+    #[test]
+    fn migration_does_not_overwrite_an_existing_vault_secret() {
+        with_temp_home(|| {
+            set_passphrase("shared-pass");
+            unlock("shared-pass").unwrap();
+            set_secret("github_token", "new-vault-value").unwrap();
+
+            let conn = crate::db::open().unwrap();
+            crate::gateway_secrets::set_secret(&conn, "github_token", "legacy-token-value")
+                .unwrap();
+            drop(conn);
+
+            LEGACY_MIGRATION_DONE.store(false, std::sync::atomic::Ordering::SeqCst);
+            lock().unwrap();
+            unlock("shared-pass").unwrap();
+
+            let val = get_secret("github_token").unwrap();
+            assert_eq!(val.as_ref().map(|s| s.as_str()), Some("new-vault-value"));
+
+            lock().unwrap();
+            clear_passphrase();
+        });
+    }
 }

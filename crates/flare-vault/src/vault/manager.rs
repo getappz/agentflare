@@ -7,7 +7,7 @@ use crate::vault::model::{SecretEntry, VaultBody, VaultFile};
 use chrono::Utc;
 use rand::RngCore;
 use std::path::{Path, PathBuf};
-use zeroize::ZeroizeOnDrop;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 const SALT_SIZE: usize = 32;
 const DEK_SIZE: usize = 32;
@@ -24,7 +24,7 @@ pub struct VaultPaths {
 
 impl VaultPaths {
     pub fn global(app_name: &str) -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let home = crate::paths::home_dir();
         Self {
             global_dir: home.join(format!(".{app_name}")),
             project_dir: None,
@@ -35,7 +35,7 @@ impl VaultPaths {
     where
         F: Fn(&Path) -> bool,
     {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let home = crate::paths::home_dir();
         let global_dir = home.join(format!(".{app_name}"));
         let project_dir = resolve_project_dir(start, &home, is_project_root);
         Self {
@@ -141,11 +141,14 @@ pub fn write_vault_body(path: &Path, body: &VaultBody) -> VaultResult<()> {
     write_vault_file(path, json.as_bytes())
 }
 
+/// Returns the decrypted secret wrapped in `Zeroizing` so the plaintext is
+/// wiped from memory as soon as the caller is done with it, rather than
+/// lingering in the heap for the rest of the process's life.
 pub fn get_secret_value(
     body: &VaultBody,
     dek: &[u8; 32],
     name: &str,
-) -> VaultResult<Option<String>> {
+) -> VaultResult<Option<Zeroizing<String>>> {
     let entry = match body.get(name) {
         Some(e) => e,
         None => return Ok(None),
@@ -153,7 +156,7 @@ pub fn get_secret_value(
     let plaintext = decrypt_value(&entry.value, dek).map_err(|_| VaultError::WrongPassphrase)?;
     let s = String::from_utf8(plaintext)
         .map_err(|_| VaultError::Crypto("invalid UTF-8 in secret".into()))?;
-    Ok(Some(s))
+    Ok(Some(Zeroizing::new(s)))
 }
 
 pub fn set_secret_value(
@@ -231,7 +234,7 @@ mod tests {
         let mut body = VaultBody::default();
         set_secret_value(&mut body, &dek.dek, "api_key", "sk-12345").unwrap();
         let val = get_secret_value(&body, &dek.dek, "api_key").unwrap();
-        assert_eq!(val, Some("sk-12345".into()));
+        assert_eq!(val.unwrap().as_str(), "sk-12345");
     }
 
     #[test]
@@ -261,7 +264,7 @@ mod tests {
 
         let body2 = read_vault_body(&path).unwrap();
         let val = get_secret_value(&body2, &dek.dek, "key").unwrap();
-        assert_eq!(val, Some("value".into()));
+        assert_eq!(val.unwrap().as_str(), "value");
     }
 
     #[test]

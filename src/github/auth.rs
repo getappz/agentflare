@@ -27,6 +27,7 @@ fn secret_token() -> Option<String> {
     crate::vault::get_secret("github_token")
         .ok()
         .flatten()
+        .map(|s| s.to_string())
         .and_then(nonempty)
 }
 

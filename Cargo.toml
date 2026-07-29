@@ -60,6 +60,7 @@ pbkdf2 = { version = "0.12", features = ["simple"] }
 rpassword = "7"
 cliclack = "0.3"
 thiserror = "2"
+zeroize = "1"
 eyre = "0.6"
 color-eyre = "0.6"
 flare-code = { package = "agentflare-flare-code", path = "crates/flare-code" }

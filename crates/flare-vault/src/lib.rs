@@ -3,6 +3,7 @@
 pub mod crypto;
 pub mod error;
 pub mod inject;
+pub mod paths;
 pub mod session;
 pub mod vault;
 

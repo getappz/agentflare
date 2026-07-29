@@ -1024,7 +1024,7 @@ impl AgentflareMcp {
         names
             .into_iter()
             .filter_map(|name| match crate::vault::get_secret(&name) {
-                Ok(Some(v)) => Some((name, v)),
+                Ok(Some(v)) => Some((name, v.to_string())),
                 Ok(None) => None,
                 Err(e) => {
                     eprintln!("agentflare: failed to resolve gateway secret '{name}': {e}");

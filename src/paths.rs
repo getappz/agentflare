@@ -107,11 +107,11 @@ pub(crate) mod test_support {
     use agent_registry::detect::PATH_LOCK as GLOBAL_STATE_LOCK;
     use std::path::PathBuf;
 
-    // Removes AGENTFLARE_HOME_OVERRIDE on drop -- including on unwind, so a
-    // panicking assertion inside `f()` can't leave the override set for
-    // whatever test runs next on another thread once GLOBAL_STATE_LOCK is
-    // released (poisoned-mutex recovery only protects the lock itself, not
-    // env state a previous holder forgot to restore).
+    // Removes AGENTFLARE_HOME_OVERRIDE/FLARE_VAULT_HOME_OVERRIDE on drop --
+    // including on unwind, so a panicking assertion inside `f()` can't leave
+    // the override set for whatever test runs next on another thread once
+    // GLOBAL_STATE_LOCK is released (poisoned-mutex recovery only protects
+    // the lock itself, not env state a previous holder forgot to restore).
     struct ResetHomeOverrideOnDrop;
     impl Drop for ResetHomeOverrideOnDrop {
         fn drop(&mut self) {
@@ -119,6 +119,7 @@ pub(crate) mod test_support {
                 // SAFETY: still under GLOBAL_STATE_LOCK for the duration of
                 // this guard's life.
                 std::env::remove_var("AGENTFLARE_HOME_OVERRIDE");
+                std::env::remove_var("FLARE_VAULT_HOME_OVERRIDE");
             }
         }
     }
@@ -135,8 +136,13 @@ pub(crate) mod test_support {
         let dir = tempfile::tempdir().unwrap();
         unsafe {
             // SAFETY: GLOBAL_STATE_LOCK mutex serializes all env mutations;
-            // no other thread can read or write AGENTFLARE_HOME_OVERRIDE concurrently.
-            std::env::set_var("AGENTFLARE_HOME_OVERRIDE", dir.path())
+            // no other thread can read or write these vars concurrently.
+            // FLARE_VAULT_HOME_OVERRIDE is flare-vault's own escape hatch
+            // (crates/flare-vault/src/paths.rs) -- set alongside
+            // AGENTFLARE_HOME_OVERRIDE so vault.rs tests get one isolated
+            // home for both the vault file and flare-vault's session cache.
+            std::env::set_var("AGENTFLARE_HOME_OVERRIDE", dir.path());
+            std::env::set_var("FLARE_VAULT_HOME_OVERRIDE", dir.path());
         };
         let _reset = ResetHomeOverrideOnDrop;
         f()

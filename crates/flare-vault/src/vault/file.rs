@@ -3,6 +3,15 @@ use fs2::FileExt;
 use std::io::{Read, Write};
 use std::path::Path;
 
+// File locking here only prevents torn reads/writes of a single file
+// operation (and `write_vault_file`'s atomic rename means concurrent writers
+// never corrupt the file). It does NOT make a read-modify-write cycle
+// (read body, mutate, write body) atomic across processes -- two processes
+// racing a `set_secret`/`remove_secret` at the same time can still lose one
+// update. Acceptable for a local single-user CLI vault; would need real
+// cross-process locking (held for the whole cycle) if this ever grows a
+// concurrent-writer use case.
+
 pub fn read_vault_file(path: &Path) -> VaultResult<Vec<u8>> {
     let file = std::fs::File::open(path)
         .map_err(|e| crate::error::VaultError::Other(format!("open vault for read: {e}")))?;

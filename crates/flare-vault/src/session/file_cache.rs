@@ -2,8 +2,8 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 fn cache_dir(app_name: &str) -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(format!(".{app_name}"))
+    crate::paths::home_dir()
+        .join(format!(".{app_name}"))
         .join("cache")
         .join("vault-sessions")
 }
@@ -18,9 +18,7 @@ fn derive_cache_key(app_name: &str) -> Vec<u8> {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown".into());
-    let home = dirs::home_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "/unknown".into());
+    let home = crate::paths::home_dir().display().to_string();
     let hostname = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "unknown".into());
@@ -77,27 +75,32 @@ fn xor_decrypt(data: &[u8], key: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::test_support::with_temp_home;
 
     #[test]
     fn store_and_load() {
-        let app = "flare-vault-test";
-        let entry_key = "test-key";
-        let dek = [0xABu8; 32];
+        with_temp_home(|| {
+            let app = "flare-vault-test";
+            let entry_key = "test-key";
+            let dek = [0xABu8; 32];
 
-        store_in_file_cache(app, entry_key, &dek);
-        let loaded = load_from_file_cache(app, entry_key);
-        assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap(), dek);
+            store_in_file_cache(app, entry_key, &dek);
+            let loaded = load_from_file_cache(app, entry_key);
+            assert!(loaded.is_some());
+            assert_eq!(loaded.unwrap(), dek);
+        });
     }
 
     #[test]
     fn clear() {
-        let app = "flare-vault-test";
-        let entry_key = "test-key";
-        let dek = [0xABu8; 32];
+        with_temp_home(|| {
+            let app = "flare-vault-test";
+            let entry_key = "test-key";
+            let dek = [0xABu8; 32];
 
-        store_in_file_cache(app, entry_key, &dek);
-        clear_file_cache(app, entry_key);
-        assert!(load_from_file_cache(app, entry_key).is_none());
+            store_in_file_cache(app, entry_key, &dek);
+            clear_file_cache(app, entry_key);
+            assert!(load_from_file_cache(app, entry_key).is_none());
+        });
     }
 }
