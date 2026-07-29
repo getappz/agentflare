@@ -416,7 +416,7 @@ const DEFAULT_COACHING_RULES: &[DefaultCoachingRule] = &[
     DefaultCoachingRule {
         id: "usetsearch",
         title: "flare tool-search over native ToolSearch for gateway tools",
-        body: "@use: for MCP tools behind the flare gateway (leanctx, docs, search, memory, review, etc.), prefer mcp__flare__tool(action=\"search\", query=\"<what you need>\") over native ToolSearch \u{2014} it searches downstream servers directly instead of the static deferred-tool list @fallback: native ToolSearch is still right for first-party deferred tools not behind the gateway (WebFetch, EnterPlanMode, mcp__claude-in-chrome__*, etc.)",
+        body: "@use: for leanctx's ctx_* tools \u{2014} the one namespace never in the deferred-tool list \u{2014} prefer mcp__flare__tool(action=\"search\", query=\"<what you need>\") over native ToolSearch. @note: agentflare's own first-party mcp__flare__* tools (item, asset, handoff, docs, search, memory, review, etc.) are already in the deferred-tool list \u{2014} just call them directly, no search step needed; mcp__flare__tool(action=\"search\") now finds them too as a fallback. @fallback: native ToolSearch is still right for everything else outside the gateway (WebFetch, EnterPlanMode, mcp__claude-in-chrome__*, etc.) \u{2014} this rule only blocks a ToolSearch query that actually looks like a leanctx/ctx_* lookup, not every ToolSearch call.",
         tools: &["ToolSearch"],
         sync: &["claude-code"],
         enforced: true,
