@@ -116,6 +116,20 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Score assigned to every builtin-catalog hit. `gateway_registry`'s local
+/// FTS5 `search()` scores via SQLite's `bm25()`, which is always negative
+/// (lower/more-negative = better match — see that crate's
+/// `REGISTRY_FALLBACK_SCORE` doc comment for the same ascending convention).
+/// `0.0` is not a value `bm25()` ever produces for an actual match, so it's
+/// guaranteed worse than every real local FTS hit, while still far smaller
+/// than `gateway_registry::REGISTRY_FALLBACK_SCORE` (`f64::MAX`) — builtin
+/// hits sort strictly between "real downstream-server match" and "public
+/// registry fallback" if the merged list is ever re-sorted by score using
+/// that same convention. An arbitrary small negative (e.g. `-1.0`) would
+/// carry no such guarantee, since a real bm25 score can land anywhere in
+/// negative space depending on match quality.
+const BUILTIN_HIT_SCORE: f64 = 0.0;
+
 /// Case-insensitive, whitespace-tokenized overlap scoring — the catalog is
 /// tiny (~24 entries), so a real BM25 index would be pure overhead. Ties
 /// keep `BUILTIN_TOOLS` declaration order (stable sort), which is fine at
@@ -149,7 +163,7 @@ pub(crate) fn search_builtin_tools(query: &str, limit: usize) -> Vec<gateway_reg
             tool: format!("mcp__flare__{name}"),
             description: desc.to_string(),
             input_schema: serde_json::Value::Null,
-            score: -1.0,
+            score: BUILTIN_HIT_SCORE,
             source: gateway_registry::HitSource::Local,
             install_hint: None,
             remote_url: None,
@@ -218,5 +232,31 @@ mod tests {
         let builtin = search_builtin_tools("item asset handoff", 5);
         let merged = merge_builtin_hits(local, 2, builtin);
         assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[0].server, "leanctx",
+            "the original local hit stays first"
+        );
+        assert_eq!(
+            merged[1].server, "agentflare",
+            "builtin fills the one remaining slot"
+        );
+    }
+
+    #[test]
+    fn merge_builtin_hits_skips_builtin_when_local_already_meets_limit() {
+        let local = vec![gateway_registry::ToolHit {
+            server: "leanctx".to_string(),
+            tool: "ctx_read".to_string(),
+            description: "read".to_string(),
+            input_schema: serde_json::Value::Null,
+            score: -5.0,
+            source: gateway_registry::HitSource::Local,
+            install_hint: None,
+            remote_url: None,
+        }];
+        let builtin = search_builtin_tools("item", 5);
+        let merged = merge_builtin_hits(local.clone(), local.len(), builtin);
+        assert_eq!(merged.len(), local.len());
+        assert!(merged.iter().all(|h| h.server == "leanctx"));
     }
 }
