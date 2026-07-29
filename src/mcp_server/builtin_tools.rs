@@ -133,7 +133,10 @@ pub(crate) fn search_builtin_tools(query: &str, limit: usize) -> Vec<gateway_reg
         .iter()
         .filter_map(|&(name, desc)| {
             let haystack = format!("{name} {desc}").to_lowercase();
-            let matched = terms.iter().filter(|t| haystack.contains(t.as_str())).count();
+            let matched = terms
+                .iter()
+                .filter(|t| haystack.contains(t.as_str()))
+                .count();
             (matched > 0).then_some((matched, name, desc))
         })
         .collect();

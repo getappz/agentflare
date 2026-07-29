@@ -303,7 +303,10 @@ fn toolsearch_query_is_gateway_shaped(tool_input: Option<&Value>) -> bool {
 /// actually being asked for -- currently only "usetsearch" uses it (see
 /// `toolsearch_query_is_gateway_shaped`); other enforced rules match on
 /// tool_name alone, same as before.
-pub fn enforced_rule_reason_for_tool(tool_name: &str, tool_input: Option<&Value>) -> Option<String> {
+pub fn enforced_rule_reason_for_tool(
+    tool_name: &str,
+    tool_input: Option<&Value>,
+) -> Option<String> {
     list_rules()
         .into_iter()
         .find(|r| {
@@ -946,9 +949,7 @@ mod tests {
             // A leanctx/ctx_* lookup is the one case genuinely missing from
             // the deferred-tool list -- still blocked and redirected.
             let leanctx_query = serde_json::json!({"query": "ctx_read"});
-            assert!(
-                enforced_rule_reason_for_tool("ToolSearch", Some(&leanctx_query)).is_some()
-            );
+            assert!(enforced_rule_reason_for_tool("ToolSearch", Some(&leanctx_query)).is_some());
 
             // First-party mcp__flare__* tools are already in the deferred
             // list -- native ToolSearch must be allowed through untouched.
@@ -958,9 +959,7 @@ mod tests {
             // Tools entirely outside the gateway (WebFetch, etc.) must also
             // pass through unblocked.
             let webfetch_query = serde_json::json!({"query": "select:WebFetch"});
-            assert!(
-                enforced_rule_reason_for_tool("ToolSearch", Some(&webfetch_query)).is_none()
-            );
+            assert!(enforced_rule_reason_for_tool("ToolSearch", Some(&webfetch_query)).is_none());
 
             // No query at all (malformed input) fails closed to "allow" --
             // never blocks based on absent data.
