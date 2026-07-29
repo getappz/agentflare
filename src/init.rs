@@ -219,6 +219,24 @@ fn add_hook_entry(
     true
 }
 
+/// Removes any existing `event` entries containing `marker` — used to retire
+/// a hook a wiring change replaces (the old `PostToolUseFailure` prompt
+/// hook), so an install upgrading from an older agentflare version doesn't
+/// end up running both the retired and replacement form side by side.
+/// Returns whether anything was actually removed.
+fn remove_hook_entries_matching(
+    hooks_obj: &mut Map<String, Value>,
+    event: &str,
+    marker: &str,
+) -> bool {
+    let Some(arr) = hooks_obj.get_mut(event).and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    let before = arr.len();
+    arr.retain(|v| !v.to_string().contains(marker));
+    arr.len() != before
+}
+
 fn wire_claude_code() {
     let path = claude_settings_path();
     let mut settings = read_json_object(&path, || json!({}));
@@ -261,6 +279,11 @@ fn wire_claude_code() {
         format!("\"{bin}\" hook pre-compact"),
         5,
     );
+    // Retire the old prompt-type PostToolUseFailure hook (identified by its
+    // "genuine FRICTION" judge-prompt marker) before wiring the deterministic
+    // command hook that replaces it, so an upgraded install doesn't end up
+    // running both.
+    added |= remove_hook_entries_matching(hooks_obj, "PostToolUseFailure", "genuine FRICTION");
     added |= add_hook_entry(
         hooks_obj,
         "PostToolUseFailure",
@@ -876,6 +899,50 @@ mod tests {
                 first, second,
                 "second run must not duplicate PostToolUseFailure"
             );
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_replaces_the_legacy_post_tool_use_failure_prompt_hook() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("settings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Simulates an install wired by an older agentflare version, back
+            // when PostToolUseFailure was a "type": "prompt" hook.
+            fs::write(
+                &path,
+                serde_json::to_string_pretty(&json!({
+                    "hooks": {
+                        "PostToolUseFailure": [{
+                            "matcher": "Bash|Edit|Write",
+                            "hooks": [{
+                                "type": "prompt",
+                                "prompt": "... genuine FRICTION ...",
+                                "timeout": 15,
+                                "continueOnBlock": true
+                            }]
+                        }]
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            wire_claude_code();
+
+            let content = fs::read_to_string(&path).unwrap();
+            let parsed: Value = serde_json::from_str(&content).unwrap();
+            assert!(
+                !content.contains("genuine FRICTION"),
+                "the legacy prompt hook must be removed, not left running alongside the new one"
+            );
+            let entries = parsed["hooks"]["PostToolUseFailure"].as_array().unwrap();
+            assert_eq!(
+                entries.len(),
+                1,
+                "an upgraded install must end up with exactly one PostToolUseFailure hook"
+            );
+            assert!(content.contains("hook post-tool-failure"));
         });
     }
 
