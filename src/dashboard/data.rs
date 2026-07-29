@@ -26,7 +26,10 @@ pub fn claims_json() -> String {
     });
     match result {
         Ok(claims) => serde_json::to_string(&claims).unwrap_or_else(|_| "[]".into()),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] claims_json: {e}");
+            "[]".into()
+        }
     }
 }
 
@@ -35,14 +38,20 @@ pub fn claims_json() -> String {
 pub fn workspaces_json() -> String {
     match pm_db_readonly() {
         Ok(conn) => workspaces_json_from(&conn),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] workspaces_json: {e}");
+            "[]".into()
+        }
     }
 }
 
 fn workspaces_json_from(conn: &Connection) -> String {
     match agentflare_backend::workspace::list(conn) {
         Ok(rows) => serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] workspaces_json_from: {e}");
+            "[]".into()
+        }
     }
 }
 
@@ -51,14 +60,20 @@ fn workspaces_json_from(conn: &Connection) -> String {
 pub fn projects_json(workspace_id: &str) -> String {
     match pm_db_readonly() {
         Ok(conn) => projects_json_from(&conn, workspace_id),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] projects_json: {e}");
+            "[]".into()
+        }
     }
 }
 
 fn projects_json_from(conn: &Connection, workspace_id: &str) -> String {
     match agentflare_backend::project::list_by_workspace(conn, workspace_id) {
         Ok(rows) => serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] projects_json_from: {e}");
+            "[]".into()
+        }
     }
 }
 
@@ -67,14 +82,20 @@ fn projects_json_from(conn: &Connection, workspace_id: &str) -> String {
 pub fn items_json(project_id: &str) -> String {
     match pm_db_readonly() {
         Ok(conn) => items_json_from(&conn, project_id),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] items_json: {e}");
+            "[]".into()
+        }
     }
 }
 
 fn items_json_from(conn: &Connection, project_id: &str) -> String {
     match agentflare_backend::item::list_by_project(conn, project_id) {
         Ok(rows) => serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] items_json_from: {e}");
+            "[]".into()
+        }
     }
 }
 
@@ -83,14 +104,20 @@ fn items_json_from(conn: &Connection, project_id: &str) -> String {
 pub fn states_json(project_id: &str) -> String {
     match pm_db_readonly() {
         Ok(conn) => states_json_from(&conn, project_id),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] states_json: {e}");
+            "[]".into()
+        }
     }
 }
 
 fn states_json_from(conn: &Connection, project_id: &str) -> String {
     match agentflare_backend::state::list_by_project(conn, project_id) {
         Ok(rows) => serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] states_json_from: {e}");
+            "[]".into()
+        }
     }
 }
 
@@ -99,14 +126,20 @@ fn states_json_from(conn: &Connection, project_id: &str) -> String {
 pub fn comments_json(item_id: &str) -> String {
     match pm_db_readonly() {
         Ok(conn) => comments_json_from(&conn, item_id),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] comments_json: {e}");
+            "[]".into()
+        }
     }
 }
 
 fn comments_json_from(conn: &Connection, item_id: &str) -> String {
     match agentflare_backend::comment::list_by_item(conn, item_id) {
         Ok(rows) => serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] comments_json_from: {e}");
+            "[]".into()
+        }
     }
 }
 
@@ -117,7 +150,10 @@ fn comments_json_from(conn: &Connection, item_id: &str) -> String {
 pub fn labels_json(workspace_id: Option<&str>, project_id: Option<&str>) -> String {
     match pm_db_readonly() {
         Ok(conn) => labels_json_from(&conn, workspace_id, project_id),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] labels_json: {e}");
+            "[]".into()
+        }
     }
 }
 
@@ -133,7 +169,10 @@ fn labels_json_from(
     };
     match result {
         Ok(rows) => serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] labels_json_from: {e}");
+            "[]".into()
+        }
     }
 }
 
@@ -143,14 +182,20 @@ fn labels_json_from(
 pub fn webhooks_json(workspace_id: &str) -> String {
     match pm_db_readonly() {
         Ok(conn) => webhooks_json_from(&conn, workspace_id),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] webhooks_json: {e}");
+            "[]".into()
+        }
     }
 }
 
 fn webhooks_json_from(conn: &Connection, workspace_id: &str) -> String {
     match agentflare_backend::webhook::list_logs_by_workspace(conn, workspace_id) {
         Ok(rows) => serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()),
-        Err(_) => "[]".into(),
+        Err(e) => {
+            eprintln!("[dashboard/data] webhooks_json_from: {e}");
+            "[]".into()
+        }
     }
 }
 

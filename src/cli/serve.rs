@@ -12,10 +12,14 @@ pub struct ServeArgs {
     /// Open the dashboard in your browser once the server is up.
     #[arg(long)]
     pub open: bool,
+    /// Acknowledge exposing all PM/cost/webhook data with no authentication.
+    /// Required whenever --host is not 127.0.0.1/localhost/::1.
+    #[arg(long)]
+    pub yes_expose: bool,
 }
 
 impl ServeArgs {
     pub fn run(self) {
-        crate::dashboard::serve(&self.host, self.port, self.open);
+        crate::dashboard::serve(&self.host, self.port, self.open, self.yes_expose);
     }
 }

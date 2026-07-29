@@ -2,9 +2,9 @@ mod artifacts;
 mod data;
 mod server;
 
-pub fn serve(host: &str, port: u16, open: bool) {
+pub fn serve(host: &str, port: u16, open: bool, yes_expose: bool) {
     let runtime = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
-    runtime.block_on(server::run(host, port, open));
+    runtime.block_on(server::run(host, port, open, yes_expose));
 }
 
 /// Best-effort: open a URL in the default browser. Never panics.
