@@ -400,4 +400,36 @@ mod tests {
             "expected cost_today field in {v}"
         );
     }
+
+    #[tokio::test]
+    async fn run_serves_normally_on_local_bind_without_yes_expose() {
+        // Probe an ephemeral port, then hand that exact port to `run()` —
+        // `run()` takes a fixed port rather than returning the bound address,
+        // so this is the only way to know where to connect afterward. Only
+        // the local-bind path is exercised here; the non-local refusal path
+        // calls `std::process::exit`, which isn't safe to trigger in-process
+        // inside the test binary.
+        let port = {
+            let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        tokio::spawn(run("127.0.0.1", port, false, false));
+        let mut started = false;
+        for _ in 0..50 {
+            if reqwest::get(format!("http://127.0.0.1:{port}/api/claims"))
+                .await
+                .is_ok()
+            {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            started,
+            "expected dashboard to serve on a local bind without --yes-expose"
+        );
+    }
 }
