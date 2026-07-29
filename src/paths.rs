@@ -236,5 +236,9 @@ mod tests {
             std::env::var("AGENTFLARE_HOME_OVERRIDE").is_err(),
             "AGENTFLARE_HOME_OVERRIDE must not remain set once with_temp_home returns"
         );
+        assert!(
+            std::env::var("FLARE_VAULT_HOME_OVERRIDE").is_err(),
+            "FLARE_VAULT_HOME_OVERRIDE must not remain set once with_temp_home returns"
+        );
     }
 }

@@ -71,24 +71,23 @@ pub fn encrypt_value(plaintext: &[u8], dek: &[u8; 32]) -> Result<Vec<u8>, String
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
         .map_err(|e| format!("AES-GCM encrypt value: {e}"))?;
-    let mut out = MAGIC.to_vec();
-    out.extend_from_slice(&nonce_bytes);
-    out.extend(ciphertext);
-    Ok(out)
+    Ok(EncryptedBlob {
+        magic: *b"FLVT",
+        nonce: nonce_bytes,
+        ciphertext,
+    }
+    .to_bytes())
 }
 
 pub fn decrypt_value(data: &[u8], dek: &[u8; 32]) -> Result<Vec<u8>, String> {
-    if data.len() < MAGIC.len() + NONCE_SIZE + 16 {
-        return Err("data too short".into());
-    }
-    if &data[..MAGIC.len()] != MAGIC {
+    let blob = EncryptedBlob::from_bytes(data)?;
+    if blob.magic != MAGIC {
         return Err("invalid magic".into());
     }
-    let nonce = Nonce::from_slice(&data[MAGIC.len()..MAGIC.len() + NONCE_SIZE]);
-    let ciphertext = &data[MAGIC.len() + NONCE_SIZE..];
+    let nonce = Nonce::from_slice(&blob.nonce);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek));
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(nonce, blob.ciphertext.as_slice())
         .map_err(|_| "AES-GCM decrypt failed".into())
 }
 

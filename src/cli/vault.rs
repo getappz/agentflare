@@ -38,7 +38,10 @@ fn run_unlock(stdin: bool) {
             crate::ui::error("failed to read passphrase from stdin");
             std::process::exit(1);
         }
-        pw.trim().to_string()
+        // Strip only the trailing line ending (how a piped passphrase
+        // usually arrives), not surrounding whitespace that could be part
+        // of the intended passphrase.
+        pw.trim_end_matches(['\r', '\n']).to_string()
     } else {
         rpassword::prompt_password("vault passphrase: ").unwrap_or_default()
     };

@@ -7,7 +7,7 @@ use crate::vault::model::{SecretEntry, VaultBody, VaultFile};
 use chrono::Utc;
 use rand::RngCore;
 use std::path::{Path, PathBuf};
-use zeroize::{ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const SALT_SIZE: usize = 32;
 const DEK_SIZE: usize = 32;
@@ -113,9 +113,10 @@ pub fn open_vault(path: &Path, passphrase: &str) -> VaultResult<VaultDek> {
     let blob = crate::crypto::aead::EncryptedBlob::from_bytes(&vault.encrypted_dek)
         .map_err(VaultError::Crypto)?;
 
-    let dek_bytes = decrypt_dek(&blob, &kek.key).map_err(|_| VaultError::WrongPassphrase)?;
+    let mut dek_bytes = decrypt_dek(&blob, &kek.key).map_err(|_| VaultError::WrongPassphrase)?;
     let mut dek = [0u8; DEK_SIZE];
     dek.copy_from_slice(&dek_bytes);
+    dek_bytes.zeroize();
 
     Ok(VaultDek { dek })
 }

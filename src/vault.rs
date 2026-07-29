@@ -111,6 +111,7 @@ fn migrate_legacy_secrets(path: &Path, dek: &VaultDek, passphrase: &str) {
             .as_deref()
             .and_then(|ct| crate::auth_crypt::decrypt(ct, passphrase))
             .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(Zeroizing::new)
         else {
             continue;
         };
@@ -182,6 +183,9 @@ pub fn set_secret(name: &str, value: &str) -> Result<(), String> {
 
 pub fn list_secrets() -> Result<Vec<String>, String> {
     let path = vault_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
     let body = read_vault_body(&path).map_err(|e| e.to_string())?;
     Ok(list_secret_names(&body))
 }
@@ -196,7 +200,13 @@ pub fn remove_secret(name: &str) -> Result<bool, String> {
 }
 
 pub fn vault_env(working_dir: &Path) -> HashMap<String, String> {
-    load_vault_env(APP_NAME, working_dir).unwrap_or_default()
+    match load_vault_env(APP_NAME, working_dir) {
+        Ok(env) => env,
+        Err(e) => {
+            crate::ui::warning(&format!("agentflare: failed to load vault env: {e}"));
+            HashMap::new()
+        }
+    }
 }
 
 #[cfg(test)]

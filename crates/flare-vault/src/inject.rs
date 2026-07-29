@@ -1,4 +1,4 @@
-use crate::error::VaultResult;
+use crate::error::{VaultError, VaultResult};
 use crate::vault::manager::{
     get_secret_value, list_secret_names, open_vault_with_dek, read_vault_body, VaultPaths,
 };
@@ -11,33 +11,31 @@ pub fn load_vault_env(app_name: &str, working_dir: &Path) -> VaultResult<HashMap
     });
 
     let mut env = HashMap::new();
-
-    let global_path = paths.global_vault_path();
-    if let Ok(dek) = open_vault_with_dek(&global_path, app_name) {
-        if let Ok(body) = read_vault_body(&global_path) {
-            let names = list_secret_names(&body);
-            for name in names {
-                if let Ok(Some(val)) = get_secret_value(&body, &dek.dek, &name) {
-                    env.insert(name, val.to_string());
-                }
-            }
-        }
-    }
-
+    load_one(&paths.global_vault_path(), app_name, &mut env)?;
     if let Some(project_path) = paths.project_vault_path() {
-        if let Ok(dek) = open_vault_with_dek(&project_path, app_name) {
-            if let Ok(body) = read_vault_body(&project_path) {
-                let names = list_secret_names(&body);
-                for name in names {
-                    if let Ok(Some(val)) = get_secret_value(&body, &dek.dek, &name) {
-                        env.insert(name, val.to_string());
-                    }
-                }
-            }
+        load_one(&project_path, app_name, &mut env)?;
+    }
+    Ok(env)
+}
+
+/// Merges one vault's secrets into `env`. A vault that's missing or simply
+/// not unlocked in this process (no cached session) is a normal, silent
+/// no-op -- but once we DO have a session DEK for it, a read or decrypt
+/// failure is unexpected (corrupt file, stale DEK) and gets surfaced rather
+/// than swallowed.
+fn load_one(path: &Path, app_name: &str, env: &mut HashMap<String, String>) -> VaultResult<()> {
+    let dek = match open_vault_with_dek(path, app_name) {
+        Ok(dek) => dek,
+        Err(VaultError::Locked) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let body = read_vault_body(path)?;
+    for name in list_secret_names(&body) {
+        if let Some(val) = get_secret_value(&body, &dek.dek, &name)? {
+            env.insert(name, val.to_string());
         }
     }
-
-    Ok(env)
+    Ok(())
 }
 
 #[cfg(test)]

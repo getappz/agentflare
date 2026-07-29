@@ -288,10 +288,15 @@ mod tests {
 
     #[test]
     fn send_message_without_a_configured_token_errors_clearly() {
-        let err = send_message(Platform::Telegram, "123", "hi").unwrap_err();
-        assert!(
-            err.contains("telegram_bot_token"),
-            "should name the missing secret: {err}"
-        );
+        // Isolated home dir so this can't read the developer's real vault --
+        // without it, a configured+unlocked telegram_bot_token would make
+        // this test send a real Telegram message using real credentials.
+        crate::paths::test_support::with_temp_home(|| {
+            let err = send_message(Platform::Telegram, "123", "hi").unwrap_err();
+            assert!(
+                err.contains("telegram_bot_token"),
+                "should name the missing secret: {err}"
+            );
+        });
     }
 }
