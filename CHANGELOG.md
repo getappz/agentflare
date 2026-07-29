@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `flare_git` `pr_wait` action — bounded server-side poll loop for PR checks (default 60s, capped 120s per call), replacing manual `gh pr checks` polling loops (#118)
+
 ## [1.6.0](https://github.com/getappz/agentflare/compare/v1.5.0...v1.6.0) - 2026-07-21
 
 ### Added

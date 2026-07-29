@@ -21,11 +21,21 @@ cargo test
 
 ### Quality bar (required)
 
+Run the local gate before pushing — it mirrors CI (`.github/workflows/ci.yml`) exactly:
+
+```bash
+mise run verify
+```
+
+Equivalent without mise:
+
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -A unsafe_code -A clippy::pedantic
+cargo test --workspace
 ```
+
+CI also runs `cargo-deny` (dependency licensing/advisories) and a target-dir guard; those aren't part of the local gate since they need network access or are CI-environment-specific.
 
 ## Repo structure
 
