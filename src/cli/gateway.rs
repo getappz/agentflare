@@ -34,13 +34,6 @@ impl GatewayArgs {
 }
 
 fn run_secret(action: GatewaySecretAction) {
-    let conn = match crate::db::open() {
-        Ok(c) => c,
-        Err(e) => {
-            crate::ui::error(&format!("failed to open agentflare.db: {e}"));
-            std::process::exit(1);
-        }
-    };
     match action {
         GatewaySecretAction::Set { name } => {
             use std::io::Read;
@@ -54,7 +47,7 @@ fn run_secret(action: GatewaySecretAction) {
                 crate::ui::error("secret value must not be empty");
                 std::process::exit(1);
             }
-            match crate::gateway_secrets::set_secret(&conn, &name, value) {
+            match crate::vault::set_secret(&name, value) {
                 Ok(()) => println!("stored secret '{name}'"),
                 Err(e) => {
                     crate::ui::error(&format!("failed to store secret: {e}"));
@@ -62,7 +55,7 @@ fn run_secret(action: GatewaySecretAction) {
                 }
             }
         }
-        GatewaySecretAction::List => match crate::gateway_secrets::list_secrets(&conn) {
+        GatewaySecretAction::List => match crate::vault::list_secrets() {
             Ok(names) if names.is_empty() => println!("no secrets stored"),
             Ok(names) => {
                 for n in names {
@@ -74,18 +67,16 @@ fn run_secret(action: GatewaySecretAction) {
                 std::process::exit(1);
             }
         },
-        GatewaySecretAction::Remove { name } => {
-            match crate::gateway_secrets::remove_secret(&conn, &name) {
-                Ok(true) => println!("removed secret '{name}'"),
-                Ok(false) => {
-                    crate::ui::error(&format!("no secret named '{name}'"));
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    crate::ui::error(&format!("failed to remove secret: {e}"));
-                    std::process::exit(1);
-                }
+        GatewaySecretAction::Remove { name } => match crate::vault::remove_secret(&name) {
+            Ok(true) => println!("removed secret '{name}'"),
+            Ok(false) => {
+                crate::ui::error(&format!("no secret named '{name}'"));
+                std::process::exit(1);
             }
-        }
+            Err(e) => {
+                crate::ui::error(&format!("failed to remove secret: {e}"));
+                std::process::exit(1);
+            }
+        },
     }
 }

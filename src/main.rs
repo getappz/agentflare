@@ -61,6 +61,7 @@ mod tool_install;
 mod ui;
 mod uninstall;
 mod update;
+mod vault;
 mod vent;
 mod worktree;
 

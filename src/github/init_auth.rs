@@ -35,13 +35,9 @@ fn gh_present() -> bool {
 }
 
 fn secret_present() -> bool {
-    crate::db::open()
+    crate::vault::get_secret("github_token")
         .ok()
-        .and_then(|conn| {
-            crate::gateway_secrets::get_secret(&conn, "github_token")
-                .ok()
-                .flatten()
-        })
+        .flatten()
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false)
 }
@@ -53,8 +49,7 @@ pub fn is_github_repo(repo_root: &std::path::Path) -> bool {
 }
 
 fn store_token(token: &str) -> Result<(), String> {
-    let conn = crate::db::open().map_err(|e| e.to_string())?;
-    crate::gateway_secrets::set_secret(&conn, "github_token", token).map_err(|e| e.to_string())
+    crate::vault::set_secret("github_token", token)
 }
 
 /// Ensure a GitHub credential exists for a github repo. Never blocks under
