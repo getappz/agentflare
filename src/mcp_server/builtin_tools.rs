@@ -60,7 +60,7 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "tool",
-        "Tool operations — search downstream MCP servers' tools by task description or execute one. Single consolidated tool with `action` field (search|execute).",
+        "Tool operations — search both agentflare's own first-party tools and downstream MCP servers' tools by task description, or execute a downstream one. Single consolidated tool with `action` field (search|execute).",
     ),
     (
         "memory",
@@ -133,8 +133,17 @@ const BUILTIN_HIT_SCORE: f64 = 0.0;
 /// Case-insensitive, whitespace-tokenized overlap scoring — the catalog is
 /// tiny (~24 entries), so a real BM25 index would be pure overhead. Ties
 /// keep `BUILTIN_TOOLS` declaration order (stable sort), which is fine at
-/// this scale.
-pub(crate) fn search_builtin_tools(query: &str, limit: usize) -> Vec<gateway_registry::ToolHit> {
+/// this scale. `mode` mirrors `gateway_registry::MatchMode`'s contract for
+/// the downstream FTS5 search this sits beside: `All` requires every query
+/// term to appear, `Any` requires at least one -- without this, `mode="all"`
+/// (the tool's own default) would still surface a builtin hit on a single
+/// overlapping term, e.g. `item nonexistent` wrongly returning
+/// `mcp__flare__item`.
+pub(crate) fn search_builtin_tools(
+    query: &str,
+    limit: usize,
+    mode: gateway_registry::MatchMode,
+) -> Vec<gateway_registry::ToolHit> {
     let terms: Vec<String> = query
         .to_lowercase()
         .split_whitespace()
@@ -151,7 +160,11 @@ pub(crate) fn search_builtin_tools(query: &str, limit: usize) -> Vec<gateway_reg
                 .iter()
                 .filter(|t| haystack.contains(t.as_str()))
                 .count();
-            (matched > 0).then_some((matched, name, desc))
+            let hit = match mode {
+                gateway_registry::MatchMode::All => matched == terms.len(),
+                gateway_registry::MatchMode::Any => matched > 0,
+            };
+            hit.then_some((matched, name, desc))
         })
         .collect();
     scored.sort_by_key(|s| std::cmp::Reverse(s.0));
@@ -191,30 +204,52 @@ mod tests {
 
     #[test]
     fn finds_item_tool_by_bare_name() {
-        let hits = search_builtin_tools("item", 5);
+        let hits = search_builtin_tools("item", 5, gateway_registry::MatchMode::Any);
         assert!(hits.iter().any(|h| h.tool == "mcp__flare__item"));
     }
 
     #[test]
     fn finds_handoff_tool_by_bare_name() {
-        let hits = search_builtin_tools("handoff", 5);
+        let hits = search_builtin_tools("handoff", 5, gateway_registry::MatchMode::Any);
         assert!(hits.iter().any(|h| h.tool == "mcp__flare__handoff"));
     }
 
     #[test]
     fn respects_limit() {
-        let hits = search_builtin_tools("action field", 3);
+        let hits = search_builtin_tools("action field", 3, gateway_registry::MatchMode::Any);
         assert!(hits.len() <= 3);
     }
 
     #[test]
     fn empty_query_returns_no_hits() {
-        assert!(search_builtin_tools("   ", 5).is_empty());
+        assert!(search_builtin_tools("   ", 5, gateway_registry::MatchMode::Any).is_empty());
     }
 
     #[test]
     fn unrelated_query_returns_no_hits() {
-        assert!(search_builtin_tools("zzznonexistentzzz", 5).is_empty());
+        let hits = search_builtin_tools("zzznonexistentzzz", 5, gateway_registry::MatchMode::Any);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn all_mode_requires_every_term_any_mode_requires_one() {
+        // Regression for the exact scenario CodeRabbit flagged: with the
+        // tool's own default mode ("all"), a query mixing a real term with
+        // a nonsense one must NOT surface a hit on the real term alone --
+        // that's Any-mode behavior masquerading as All.
+        let all_hits =
+            search_builtin_tools("item nonexistentxyz", 5, gateway_registry::MatchMode::All);
+        assert!(
+            all_hits.is_empty(),
+            "All mode must require every term to match"
+        );
+
+        let any_hits =
+            search_builtin_tools("item nonexistentxyz", 5, gateway_registry::MatchMode::Any);
+        assert!(
+            any_hits.iter().any(|h| h.tool == "mcp__flare__item"),
+            "Any mode still matches on the one overlapping term"
+        );
     }
 
     #[test]
@@ -229,7 +264,8 @@ mod tests {
             install_hint: None,
             remote_url: None,
         }];
-        let builtin = search_builtin_tools("item asset handoff", 5);
+        let builtin =
+            search_builtin_tools("item asset handoff", 5, gateway_registry::MatchMode::Any);
         let merged = merge_builtin_hits(local, 2, builtin);
         assert_eq!(merged.len(), 2);
         assert_eq!(
@@ -254,7 +290,7 @@ mod tests {
             install_hint: None,
             remote_url: None,
         }];
-        let builtin = search_builtin_tools("item", 5);
+        let builtin = search_builtin_tools("item", 5, gateway_registry::MatchMode::Any);
         let merged = merge_builtin_hits(local.clone(), local.len(), builtin);
         assert_eq!(merged.len(), local.len());
         assert!(merged.iter().all(|h| h.server == "leanctx"));

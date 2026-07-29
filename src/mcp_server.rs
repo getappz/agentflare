@@ -1086,7 +1086,7 @@ impl AgentflareMcp {
         Ok(guard)
     }
     #[tool(
-        description = "Tool operations — search downstream MCP servers' tools by task description or execute one. Single consolidated tool with `action` field (search|execute)."
+        description = "Tool operations — search both agentflare's own first-party tools and downstream MCP servers' tools by task description, or execute a downstream one. Single consolidated tool with `action` field (search|execute)."
     )]
     async fn tool(&self, Parameters(req): Parameters<ToolRequest>) -> Result<String, ErrorData> {
         match req.action.as_str() {
@@ -1119,7 +1119,7 @@ impl AgentflareMcp {
                 // -- never part of the downstream index, see
                 // builtin_tools.rs), then the public MCP Registry fallback
                 // only if slots remain after both.
-                let builtin = builtin_tools::search_builtin_tools(&query, limit);
+                let builtin = builtin_tools::search_builtin_tools(&query, limit, mode);
                 let with_builtin = builtin_tools::merge_builtin_hits(local, limit, builtin);
                 let hits = if with_builtin.len() < limit {
                     let remaining = limit - with_builtin.len();
