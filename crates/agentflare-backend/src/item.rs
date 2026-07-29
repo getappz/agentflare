@@ -630,10 +630,13 @@ pub enum ClaimOutcome {
     BlockedByAssignee { assignee: String },
 }
 
-/// Agent identity part of an owner id (`<agent>:<instance>` -> `<agent>`),
-/// matching `assignee_agent`'s canonical (instance-less) form.
-fn agent_part(owner: &str) -> &str {
-    owner.split(':').next().unwrap_or(owner)
+/// Canonical agent identity of an owner id (`<agent>:<instance>` ->
+/// canonical `<agent>`), matching `assignee_agent`'s canonical form —
+/// `assignee_agent` is canonicalized on write (see `create`/`update`), but
+/// `owner` is the raw caller-supplied id, so an alias like `claude:1` must
+/// be canonicalized here too or it won't match `claude-code`.
+fn agent_part(owner: &str) -> String {
+    agent_registry::canonicalize(owner.split(':').next().unwrap_or(owner))
 }
 
 /// Claims an item so other agents don't duplicate the work: on a fresh
@@ -1481,6 +1484,31 @@ mod tests {
         )
         .unwrap();
         let outcome = claim(&conn, &item.id, "opencode:1", 1000, TTL).unwrap();
+        assert_eq!(outcome, ClaimOutcome::Acquired);
+    }
+
+    #[test]
+    fn claim_by_the_handoff_assignee_via_an_alias_succeeds() {
+        // assignee_agent is canonicalized on write ("claude" -> "claude-code"),
+        // but `owner` is the raw caller-supplied id — an alias owner must
+        // still be recognized as the assignee, not blocked as an impostor.
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        update(
+            &conn,
+            &item.id,
+            UpdateItem {
+                assignee_agent: Some("claude".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            get(&conn, &item.id).unwrap().assignee_agent.as_deref(),
+            Some("claude-code")
+        );
+        let outcome = claim(&conn, &item.id, "claude:1", 1000, TTL).unwrap();
         assert_eq!(outcome, ClaimOutcome::Acquired);
     }
 
