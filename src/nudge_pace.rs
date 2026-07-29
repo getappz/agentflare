@@ -10,8 +10,63 @@ use std::time::Duration;
 
 pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(300);
 
+/// Comfortably larger than any `cooldown_secs` a coaching rule is expected to
+/// configure, so `mark_fired`'s opportunistic pruning never erases a key
+/// before its own (possibly custom, unbounded) cooldown has elapsed.
+const MAX_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+
 fn state_path() -> PathBuf {
     crate::state::state_dir().join("nudge-pace.json")
+}
+
+fn lock_path() -> PathBuf {
+    crate::state::state_dir().join(".nudge-pace.lock")
+}
+
+/// A cross-process advisory lock over the load-mutate-save sequence in
+/// `mark_fired`, same pattern as coaching's `RulesLock`
+/// (src/coaching/store.rs): `create_new` on a sentinel file fails if another
+/// process already holds it. Without this, two hook processes racing on
+/// `mark_fired` — even for different keys — can each `load()` before the
+/// other's `save()` lands, silently dropping one process's fired-timestamp.
+struct PaceLock {
+    path: PathBuf,
+}
+
+impl PaceLock {
+    fn acquire() -> std::io::Result<Self> {
+        let path = lock_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        for _ in 0..200 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // A holder that crashed without cleaning up must never wedge nudge
+        // pacing shut: a lock held for ~2s is treated as stale and broken.
+        let _ = std::fs::remove_file(&path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for PaceLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn load() -> HashMap<String, String> {
@@ -53,16 +108,20 @@ pub fn should_fire(key: &str, cooldown: Duration) -> bool {
     now < last || (now - last).num_seconds() as u64 >= cooldown.as_secs()
 }
 
-/// Records `key` as having fired now. Best-effort: write failures are
-/// swallowed, never surfaced as an error to the caller. Opportunistically
-/// prunes entries older than 24h so the file never grows past the number of
-/// recently distinct keys.
+/// Records `key` as having fired now. Best-effort: write failures (including
+/// a failure to acquire `PaceLock`) are swallowed, never surfaced as an error
+/// to the caller. Opportunistically prunes entries older than
+/// `MAX_RETENTION_SECS` so the file never grows past the number of recently
+/// distinct keys.
 pub fn mark_fired(key: &str) {
+    let Ok(_lock) = PaceLock::acquire() else {
+        return;
+    };
     let mut map = load();
     let now = chrono::Utc::now();
     map.retain(|_, ts| {
         chrono::DateTime::parse_from_rfc3339(ts)
-            .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds() < 86_400)
+            .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds() < MAX_RETENTION_SECS)
             .unwrap_or(false)
     });
     map.insert(key.to_string(), now.to_rfc3339());
@@ -121,6 +180,51 @@ mod tests {
             mark_fired("coaching:hygiene");
             assert!(should_fire("coaching:other-rule", Duration::from_secs(300)));
             assert!(!should_fire("coaching:hygiene", Duration::from_secs(300)));
+        });
+    }
+
+    #[test]
+    fn mark_fired_survives_concurrent_writers_for_different_keys() {
+        // Without PaceLock serializing the load-mutate-save sequence, two
+        // processes racing on mark_fired can each load() before the other's
+        // save() lands, silently dropping one's fired-timestamp.
+        with_temp_home(|| {
+            std::thread::scope(|scope| {
+                for i in 0..8 {
+                    scope.spawn(move || {
+                        mark_fired(&format!("key-{i}"));
+                    });
+                }
+            });
+            for i in 0..8 {
+                assert!(
+                    !should_fire(&format!("key-{i}"), Duration::from_secs(300)),
+                    "key-{i}'s fired timestamp was lost to a concurrent writer"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn mark_fired_does_not_prune_an_entry_younger_than_max_retention() {
+        with_temp_home(|| {
+            let path = state_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut map = HashMap::new();
+            // Older than the previous hardcoded 24h prune window, but well
+            // within a rule's allowed cooldown_secs (unbounded u64).
+            map.insert(
+                "coaching:long-cooldown".to_string(),
+                (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339(),
+            );
+            std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+
+            mark_fired("coaching:other-rule");
+
+            assert!(
+                load().contains_key("coaching:long-cooldown"),
+                "an entry younger than MAX_RETENTION_SECS must survive an unrelated mark_fired call"
+            );
         });
     }
 }
