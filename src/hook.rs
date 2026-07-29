@@ -249,14 +249,10 @@ struct PostToolFailureInput {
 }
 
 /// Extracts the tool name and a best-effort failure-text field from a
-/// PostToolUseFailure stdin payload. The exact field name Claude Code uses
-/// for the failure text was not confirmable against the primary hooks
-/// reference at the time this was written (only the common envelope and
-/// the tool_name/tool_input fields shared with PreToolUse/PostToolUse were
-/// confirmed) -- so this tries "error" first (the name given by a
-/// third-party schema reference for this specific event), then falls back
-/// to "tool_response" (confirmed as PostToolUse's own result field, in case
-/// PostToolUseFailure reuses it) and "reason", in that order.
+/// PostToolUseFailure stdin payload. Live-verified (2026-07-29, real Claude
+/// Code session): the failure text is carried in "error". "tool_response"
+/// and "reason" are kept as defensive fallbacks in case a future payload
+/// shape omits "error", but are not currently exercised by real traffic.
 fn parse_post_tool_failure(input: &str) -> Option<PostToolFailureInput> {
     let v: serde_json::Value = serde_json::from_str(input).ok()?;
     let tool_name = v.get("tool_name")?.as_str()?.to_string();
