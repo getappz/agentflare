@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod models;
 pub mod pulls;
 pub mod releases;
+pub mod repos;
 
 #[cfg(test)]
 pub(crate) mod test_support;

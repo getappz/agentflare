@@ -195,6 +195,7 @@ fn add_hook_entry(
     hooks_obj: &mut Map<String, Value>,
     event: &str,
     marker: &str,
+    matcher: Option<&str>,
     command: String,
     timeout: u64,
 ) -> bool {
@@ -206,34 +207,34 @@ fn add_hook_entry(
     if arr.iter().any(|v| v.to_string().contains(marker)) {
         return false;
     }
-    arr.push(json!({ "hooks": [{ "type": "command", "command": command, "timeout": timeout }] }));
+    let mut entry =
+        json!({ "hooks": [{ "type": "command", "command": command, "timeout": timeout }] });
+    if let Some(m) = matcher {
+        entry
+            .as_object_mut()
+            .unwrap()
+            .insert("matcher".to_string(), json!(m));
+    }
+    arr.push(entry);
     true
 }
 
-/// Adds one prompt-type hook entry for `event` unless an entry containing
-/// `marker` is already present. Same idempotency pattern as `add_hook_entry`
-/// but for `"type": "prompt"` hooks (used for PostToolUseFailure judge).
-fn add_prompt_hook_entry(
+/// Removes any existing `event` entries containing `marker` — used to retire
+/// a hook a wiring change replaces (the old `PostToolUseFailure` prompt
+/// hook), so an install upgrading from an older agentflare version doesn't
+/// end up running both the retired and replacement form side by side.
+/// Returns whether anything was actually removed.
+fn remove_hook_entries_matching(
     hooks_obj: &mut Map<String, Value>,
     event: &str,
     marker: &str,
-    matcher: &str,
-    prompt: &str,
-    timeout: u64,
 ) -> bool {
-    let arr = hooks_obj
-        .entry(event)
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .unwrap();
-    if arr.iter().any(|v| v.to_string().contains(marker)) {
+    let Some(arr) = hooks_obj.get_mut(event).and_then(|v| v.as_array_mut()) else {
         return false;
-    }
-    arr.push(json!({
-        "matcher": matcher,
-        "hooks": [{ "type": "prompt", "prompt": prompt, "timeout": timeout, "continueOnBlock": true }]
-    }));
-    true
+    };
+    let before = arr.len();
+    arr.retain(|v| !v.to_string().contains(marker));
+    arr.len() != before
 }
 
 fn wire_claude_code() {
@@ -250,6 +251,7 @@ fn wire_claude_code() {
         hooks_obj,
         "SessionStart",
         "hook session-start",
+        None,
         format!("\"{bin}\" hook session-start"),
         10,
     );
@@ -257,6 +259,7 @@ fn wire_claude_code() {
         hooks_obj,
         "UserPromptSubmit",
         "hook prompt-submit",
+        None,
         format!("\"{bin}\" hook prompt-submit"),
         5,
     );
@@ -264,6 +267,7 @@ fn wire_claude_code() {
         hooks_obj,
         "PreToolUse",
         "hook pre-tool-use",
+        None,
         format!("\"{bin}\" hook pre-tool-use"),
         5,
     );
@@ -271,16 +275,22 @@ fn wire_claude_code() {
         hooks_obj,
         "PreCompact",
         "hook pre-compact",
+        None,
         format!("\"{bin}\" hook pre-compact"),
         5,
     );
-    added |= add_prompt_hook_entry(
+    // Retire the old prompt-type PostToolUseFailure hook (identified by its
+    // "genuine FRICTION" judge-prompt marker) before wiring the deterministic
+    // command hook that replaces it, so an upgraded install doesn't end up
+    // running both.
+    added |= remove_hook_entries_matching(hooks_obj, "PostToolUseFailure", "genuine FRICTION");
+    added |= add_hook_entry(
         hooks_obj,
         "PostToolUseFailure",
-        "genuine FRICTION",
-        "Bash|Edit|Write",
-        crate::rule_text::VENT_JUDGE_PROMPT,
-        15,
+        "hook post-tool-failure",
+        Some("Bash|Edit|Write"),
+        format!("\"{bin}\" hook post-tool-failure"),
+        5,
     );
 
     if !added {
@@ -390,6 +400,7 @@ fn wire_codex_hooks() {
         hooks_obj,
         "PreToolUse",
         "hook pre-tool-use",
+        None,
         format!("\"{bin}\" hook pre-tool-use"),
         5,
     );
@@ -866,13 +877,13 @@ mod tests {
     }
 
     #[test]
-    fn wire_claude_code_wires_post_tool_use_failure_judge_prompt() {
+    fn wire_claude_code_wires_post_tool_use_failure_command_hook() {
         with_temp_home(|| {
             wire_claude_code();
             let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
             assert!(
-                content.contains("genuine FRICTION"),
-                "expected the judge-prompt marker in PostToolUseFailure hooks"
+                content.contains("hook post-tool-failure"),
+                "expected the command-hook marker in PostToolUseFailure hooks"
             );
         });
     }
@@ -888,6 +899,50 @@ mod tests {
                 first, second,
                 "second run must not duplicate PostToolUseFailure"
             );
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_replaces_the_legacy_post_tool_use_failure_prompt_hook() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("settings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Simulates an install wired by an older agentflare version, back
+            // when PostToolUseFailure was a "type": "prompt" hook.
+            fs::write(
+                &path,
+                serde_json::to_string_pretty(&json!({
+                    "hooks": {
+                        "PostToolUseFailure": [{
+                            "matcher": "Bash|Edit|Write",
+                            "hooks": [{
+                                "type": "prompt",
+                                "prompt": "... genuine FRICTION ...",
+                                "timeout": 15,
+                                "continueOnBlock": true
+                            }]
+                        }]
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            wire_claude_code();
+
+            let content = fs::read_to_string(&path).unwrap();
+            let parsed: Value = serde_json::from_str(&content).unwrap();
+            assert!(
+                !content.contains("genuine FRICTION"),
+                "the legacy prompt hook must be removed, not left running alongside the new one"
+            );
+            let entries = parsed["hooks"]["PostToolUseFailure"].as_array().unwrap();
+            assert_eq!(
+                entries.len(),
+                1,
+                "an upgraded install must end up with exactly one PostToolUseFailure hook"
+            );
+            assert!(content.contains("hook post-tool-failure"));
         });
     }
 

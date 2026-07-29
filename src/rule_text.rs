@@ -61,27 +61,6 @@ pub fn all() -> Vec<&'static str> {
 /// config registration needed). Shells out to the same `agentflare hook
 /// pre-tool-use` classifier Claude Code's PreToolUse hook already uses, so
 /// there's one branch-guard decision, not a JS reimplementation of it.
-/// PostToolUseFailure judge prompt: decides whether a tool failure is
-/// genuine friction worth a vent call. Explicitly separates "a guard blocked
-/// exactly what it exists to block, cleanly" (not friction) from "a guard
-/// blocked me in a confusing or undocumented way" (friction).
-pub const VENT_JUDGE_PROMPT: &str = r#"A tool call just failed. Tool call details:
-$ARGUMENTS
-
-Judge whether this is genuine FRICTION worth logging via agentflare's vent tool (mcp__flare__vent), using the SAME broad definition its own classifier uses -- not just "wrong/missing tool":
-- severity is high / this genuinely blocked progress, OR
-- the situation involves a pattern like broke/broken/fails/failing/wrong/should/missing/can't/cannot/error/panic/crash/hang/stuck/fabricated, OR
-- this is a repeat of a problem that already happened earlier this session.
-
-This covers a wrong or missing tool, a fabricated assumption about the environment, an environment/tooling gap, a confusing or misleading error message, or a tool silently doing the wrong thing -- not just outright blocking failures.
-
-NOT friction: an ordinary expected failure (a grep with no matches, a file legitimately absent during exploration, a normal retry, slow builds, a routine denied permission), OR a guard/hook that blocked exactly the thing it exists to block, with a clear reason and a discoverable next step (e.g. a branch-protection guard refusing a write to main, or a destructive-command guard refusing rm -rf) -- that guard did its job; it is not a bug.
-
-Friction IS still the right call when a guard's block is confusing or its workaround is undocumented -- e.g. it names an alternative that doesn't exist, or leaves you guessing which action it actually wants.
-
-If this is genuine friction: respond NOT ok, with a reason that nudges calling mcp__flare__vent with a concise, specific message (state the actual wrong tool/assumption/gap, not a vague complaint) and an appropriate severity.
-If this is an ordinary failure or a guard working as intended: respond ok."#;
-
 pub const OPENCODE_BRANCH_GUARD_JS: &str = r#"// opencode has no PreToolUse hook wired to agentflare's own PreToolUse guard
 // (that's Claude-Code-only, ~/.claude/settings.json), and opencode's own
 // permission config isn't branch-aware -- so write/edit/patch tools went
