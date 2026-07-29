@@ -93,10 +93,12 @@ impl AgentflareMcp {
                     .number
                     .ok_or_else(|| ErrorData::invalid_params("number is required", None))?;
                 let wait_secs = req.wait_secs.unwrap_or(60).min(MAX_WAIT_SECS);
-                let poll_interval_secs = req
-                    .poll_interval_secs
-                    .unwrap_or(10)
-                    .max(MIN_POLL_INTERVAL_SECS);
+                // Clamp to wait_secs too: an unbounded interval would let a
+                // single sleep() overshoot the documented wait cap.
+                let poll_interval_secs = req.poll_interval_secs.unwrap_or(10).clamp(
+                    MIN_POLL_INTERVAL_SECS,
+                    wait_secs.max(MIN_POLL_INTERVAL_SECS),
+                );
                 let pr = pulls::get(&client, &repo, n).map_err(to_mcp_error)?;
                 let sha = pr.head.as_ref().map(|h| h.sha.as_str()).unwrap_or_default();
                 let start = std::time::Instant::now();
