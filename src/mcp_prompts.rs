@@ -62,6 +62,13 @@ pub fn list_prompts() -> Vec<Prompt> {
                 "`<recipient> <brief>` to send (e.g. `codex review the API design above`), `inbox [me]`, or `thread <id>` (omit for usage)",
             )]),
         ),
+        Prompt::new(
+            "git",
+            Some("Recovery snapshots, worktree audit, and health checks from the agentflare git shim"),
+            Some(vec![PromptArgument::new("command").with_description(
+                "install-hooks|install-shim|uninstall-shim|snapshot <list|restore|prune>|audit <preview|prune>|doctor plus options (omit for usage)",
+            )]),
+        ),
     ];
     prompts.extend(
         SUB_SKILLS
@@ -80,6 +87,9 @@ pub fn get_prompt(
     }
     if request.name == "handoff" {
         return Some(get_handoff_command(request, agent));
+    }
+    if request.name == "git" {
+        return Some(get_git_command(request));
     }
     if request.name == "optimize" {
         return Some(get_optimize_mode(request));
@@ -235,6 +245,52 @@ fn get_handoff_command(request: &GetPromptRequestParams, agent: Option<&str>) ->
     ))
 }
 
+/// (Internal/hidden `agentflare git` subcommands — `trailer-inject`,
+/// `ref-transaction-log`, `scope-check` — are called automatically by git
+/// hooks/the shim itself and are deliberately not surfaced here; they take
+/// no useful direct input from a human or agent invocation. Ordinary git
+/// commands (status/log/diff/commit/push/branch/...) and other agentflare
+/// CLI/MCP surfaces like pr_check are deliberately NOT duplicated here
+/// either — those already run via the `!` shell-escape or their own MCP
+/// tool; this prompt only covers the agentflare-specific git-shim admin
+/// subcommands that have no other entrypoint.)
+fn get_git_command(request: &GetPromptRequestParams) -> GetPromptResult {
+    let command = request
+        .arguments
+        .as_ref()
+        .and_then(|a| a.get("command"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if command.is_empty() {
+        return assistant_text(
+            "agentflare git-shim commands — pass as this command's argument.\n\
+             install-hooks [--yes] — install branch-protection/provenance git hooks into this repo\n\
+             install-shim --binary <path> — install the flare-git-shim binary as `git` on PATH (dogfooding/local use)\n\
+             uninstall-shim — remove a previously installed git shim\n\
+             snapshot list — list recovery snapshots for this repo, newest first\n\
+             snapshot restore [<id>] [--yes] — restore a snapshot's files into the working tree (non-destructive)\n\
+             snapshot prune [--keep N] — delete all but the N most recent snapshots (default 5)\n\
+             audit preview — list orphaned worktree directories\n\
+             audit prune <names...|--all> — remove orphaned worktree directories (snapshots taken first)\n\
+             doctor [--format text|json|markdown] [--reclaim] [--force] [--staleness-days N] — health sweep over all claim worktrees",
+        );
+    }
+
+    assistant_text(format!(
+        "agentflare git command requested: `{command}`\n\n\
+         Run it as `agentflare git {command}` via the project's shell tool (ctx_shell if \
+         lean-ctx is available through the flare gateway, else Bash), then report its output \
+         to the user. These are the underlying git-shim CLI subcommands directly — install-hooks, \
+         install-shim, uninstall-shim, snapshot list/restore/prune, audit preview/prune, and doctor \
+         (see the bare `/git` usage card for each one's options). `doctor --reclaim` and \
+         `audit prune`/`snapshot prune` mutate local state (worktrees/snapshots) — confirm with \
+         the user before running those if it wasn't clearly what they asked for."
+    ))
+}
+
 fn get_optimize_skill(skill: &str) -> GetPromptResult {
     if let Err(e) = crate::optimize::code::set_active(skill) {
         return assistant_text(format!("Failed to persist flare code mode: {e}"));
@@ -254,8 +310,8 @@ mod tests {
         assert!(names.contains(&"optimize"));
         assert!(names.contains(&"optimize-review"));
         assert!(names.contains(&"optimize-no-hallucination"));
-        // optimize + artifact + handoff + one per sub-skill
-        assert_eq!(names.len(), 3 + SUB_SKILLS.len());
+        // optimize + artifact + handoff + git + one per sub-skill
+        assert_eq!(names.len(), 4 + SUB_SKILLS.len());
     }
 
     #[test]
@@ -383,6 +439,39 @@ mod tests {
         let text = format!("{:?}", result.messages[0].content);
         assert!(text.contains("backlog,unstarted,started"), "{text}");
         assert!(text.contains("`all`"), "{text}");
+    }
+
+    #[test]
+    fn lists_git_prompt() {
+        let prompts = list_prompts();
+        assert!(prompts.iter().any(|p| p.name == "git"));
+    }
+
+    #[test]
+    fn bare_git_prompt_returns_usage() {
+        let result = get_prompt(&GetPromptRequestParams::new("git"), None).unwrap();
+        let text = format!("{:?}", result.messages[0].content);
+        assert!(text.contains("install-hooks"), "{text}");
+        assert!(text.contains("snapshot"), "{text}");
+        assert!(text.contains("doctor"), "{text}");
+        // Internal/hidden subcommands must never be surfaced to a user.
+        assert!(!text.contains("scope-check"), "{text}");
+        assert!(!text.contains("trailer-inject"), "{text}");
+    }
+
+    #[test]
+    fn git_prompt_embeds_command_and_shell_instruction() {
+        use rmcp::model::JsonObject;
+        let mut args = JsonObject::new();
+        args.insert(
+            "command".to_string(),
+            serde_json::json!("snapshot list"),
+        );
+        let params = GetPromptRequestParams::new("git").with_arguments(args);
+        let result = get_prompt(&params, None).unwrap();
+        let text = format!("{:?}", result.messages[0].content);
+        assert!(text.contains("snapshot list"), "{text}");
+        assert!(text.contains("agentflare git snapshot list"), "{text}");
     }
 
     #[test]

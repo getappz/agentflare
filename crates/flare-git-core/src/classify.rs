@@ -51,8 +51,30 @@ pub struct Event {
 
 /// Trust-root paths a `push` must never carry changes to — agentflare's own
 /// enforcement config, not something an agent should be able to push a
-/// change to and quietly weaken.
-pub(crate) const TRUST_ROOT_PATHS: &[&str] = &[".githooks/", ".agentflare/", "Cargo.toml"];
+/// change to and quietly weaken. CI workflow config is included for the same
+/// reason as `.githooks/`/`.agentflare/`: an agent that can silently rewrite
+/// the pipeline that's supposed to catch its own mistakes has defeated that
+/// check before it ever runs (the "wipes CI" scenario named in the
+/// competitor audit that led to this addition).
+///
+/// Known limitation (confirmed empirically 2026-07-29, see item #321):
+/// `resolve_trust_root_touch` diffs the pushed branch against the default
+/// branch by NAME — when both are literally "master" (the ordinary bare
+/// `git push`/`git push origin master` case), that's a self-diff and always
+/// resolves `Clean`, so a direct push of the default branch is denied by the
+/// blanket "can't push the default branch" rule regardless of what changed,
+/// never by this list. This entry only changes the deny *message* once a
+/// pushed branch legitimately diverges under a different name (feature
+/// branch, or after #321's src:dest refspec fix) — it doesn't add new
+/// protection against the direct-push case, which was already fully blocked.
+pub(crate) const TRUST_ROOT_PATHS: &[&str] = &[
+    ".githooks/",
+    ".agentflare/",
+    "Cargo.toml",
+    ".github/workflows/",
+    ".gitlab-ci.yml",
+    ".circleci/",
+];
 
 /// `AGENTFLARE_GIT_TRUST_ROOT_PATHS`, comma-separated, appended to
 /// `TRUST_ROOT_PATHS` -- e.g. `".githooks/,policy.toml"`. Empty/unset ->
