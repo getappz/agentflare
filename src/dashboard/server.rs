@@ -106,7 +106,17 @@ struct CostQuery {
 
 async fn cost_handler(Query(q): Query<CostQuery>) -> Response {
     let days = q.days.unwrap_or(1);
-    let by = q.by.as_deref().unwrap_or("model");
+    let by = match q.by.as_deref() {
+        None | Some("model") => "model",
+        Some("project") => "project",
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid `by` value {other:?}; expected \"model\" or \"project\""),
+            )
+                .into_response();
+        }
+    };
     (
         [(header::CONTENT_TYPE, "application/json")],
         crate::dashboard::data::cost_json(days, by),
@@ -232,14 +242,25 @@ pub fn router() -> Router {
         .fallback(static_handler)
 }
 
-pub async fn run(host: &str, port: u16, open: bool) {
+fn is_local_bind(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
+    if !is_local_bind(host) && !yes_expose {
+        eprintln!(
+            "refusing to bind to {host}: this would expose all PM/cost/webhook data with no authentication."
+        );
+        eprintln!("pass --yes-expose to bind anyway (trusted networks only).");
+        std::process::exit(1);
+    }
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .expect("failed to bind dashboard server");
     let addr = listener.local_addr().expect("no local addr");
     let url = format!("http://{addr}");
     eprintln!("agentflare dashboard listening on {url}");
-    if host != "127.0.0.1" && host != "localhost" {
+    if !is_local_bind(host) {
         eprintln!("  warning: bound to {host} — anyone on your network can view this");
     }
     if open {
@@ -270,5 +291,145 @@ mod tests {
             .await
             .unwrap();
         assert!(body.starts_with('['), "expected JSON array, got: {body}");
+    }
+
+    #[test]
+    fn is_local_bind_recognizes_loopback_only() {
+        assert!(is_local_bind("127.0.0.1"));
+        assert!(is_local_bind("localhost"));
+        assert!(is_local_bind("::1"));
+        assert!(!is_local_bind("0.0.0.0"));
+        assert!(!is_local_bind("192.168.1.5"));
+    }
+
+    #[test]
+    fn mime_for_maps_known_extensions() {
+        assert_eq!(mime_for("index.html"), "text/html; charset=utf-8");
+        assert_eq!(mime_for("app.js"), "text/javascript; charset=utf-8");
+        assert_eq!(mime_for("app.css"), "text/css; charset=utf-8");
+        assert_eq!(mime_for("logo.png"), "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn static_handler_serves_index_at_root() {
+        let resp = static_handler(Uri::from_static("/")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_handler_404s_unknown_path() {
+        let resp = static_handler(Uri::from_static("/does-not-exist.xyz")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn static_handler_404s_dot_dot_path_instead_of_escaping_assets() {
+        // Embedded assets have no ".." keys, so a literal ".." in the path can
+        // never escape `dashboard/web/` — it just misses the lookup.
+        let resp = static_handler(Uri::from_static("/../Cargo.toml")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cost_handler_defaults_to_one_day_grouped_by_model() {
+        let resp = cost_handler(Query(CostQuery {
+            days: None,
+            by: None,
+        }))
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // Live analytics data (this machine's own ~/.claude/projects usage)
+        // can change between calls, so assert on shape rather than an exact
+        // second snapshot — this still proves the days=1/by=model defaults
+        // reached `cost_json` without a 400/500.
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.get("groups").is_some(), "expected groups in {v}");
+        assert!(
+            v.get("total_cost_usd").is_some(),
+            "expected total_cost_usd in {v}"
+        );
+        assert!(
+            v.get("any_unpriced").is_some(),
+            "expected any_unpriced in {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_handler_rejects_unknown_by_value() {
+        let resp = cost_handler(Query(CostQuery {
+            days: None,
+            by: Some("projct".into()),
+        }))
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_streams_claims_and_cost_snapshot() {
+        use tokio_stream::StreamExt as _;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router()).await.unwrap();
+        });
+        let resp = reqwest::get(format!("http://{addr}/events")).await.unwrap();
+        let mut stream = resp.bytes_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("first SSE frame within 10s")
+            .expect("stream item")
+            .unwrap();
+        let text = String::from_utf8(first.to_vec()).unwrap();
+        let data_line = text
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .expect("SSE data line");
+        let v: serde_json::Value = serde_json::from_str(data_line).unwrap();
+        assert!(v.get("claims").is_some(), "expected claims field in {v}");
+        assert!(
+            v.get("cost_today").is_some(),
+            "expected cost_today field in {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_serves_normally_on_local_bind_without_yes_expose() {
+        // Probe an ephemeral port, then hand that exact port to `run()` —
+        // `run()` takes a fixed port rather than returning the bound address,
+        // so this is the only way to know where to connect afterward. Only
+        // the local-bind path is exercised here; the non-local refusal path
+        // calls `std::process::exit`, which isn't safe to trigger in-process
+        // inside the test binary.
+        let port = {
+            let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        tokio::spawn(run("127.0.0.1", port, false, false));
+        let mut started = false;
+        for _ in 0..50 {
+            if reqwest::get(format!("http://127.0.0.1:{port}/api/claims"))
+                .await
+                .is_ok()
+            {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            started,
+            "expected dashboard to serve on a local bind without --yes-expose"
+        );
     }
 }
