@@ -82,6 +82,7 @@ flare-docs = { path = "crates/flare-docs" }
 flare-git-core = { path = "crates/flare-git-core" }
 flare-proxy = { path = "crates/flare-proxy" }
 skill = { version = "0.8", default-features = false, features = ["network"] }
+agentflare-jobs = { path = "crates/agentflare-jobs" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -108,7 +109,7 @@ built = { version = "0.8", features = ["chrono"] }
 insta = { version = "1", features = ["json"] }
 tempfile = "3"
 pretty_assertions = "1"
-reqwest = { version = "0.12", default-features = false, features = ["stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
 
 [lints.rust]
 unsafe_code = "warn"

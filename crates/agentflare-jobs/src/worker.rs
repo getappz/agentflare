@@ -33,6 +33,9 @@ impl WorkerPool {
 
     pub fn shutdown(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        // Workers may be parked in `wait_for_work` for up to its timeout —
+        // wake them immediately so shutdown doesn't wait that out.
+        self.queue.wake_workers();
         let handles = std::mem::take(&mut self.handles);
         for h in handles {
             let _ = h.join();
@@ -68,7 +71,9 @@ fn worker_loop(queue: &Queue, running: &AtomicBool) {
                 }
             }
             Ok(None) => {
-                std::thread::sleep(Duration::from_millis(200));
+                // Woken immediately by `wake_workers` (enqueue/retry/shutdown);
+                // the timeout is only a safety net against a missed wakeup.
+                queue.wait_for_work(Duration::from_secs(1));
             }
             Err(e) => {
                 eprintln!("agentflare-jobs: dequeue error: {e}");
