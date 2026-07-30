@@ -197,6 +197,13 @@
         },
 
         selectJob(id) {
+          // Close any stream from a previously selected job before starting
+          // a new one, so its events can't keep appending into this job's
+          // detailOutput.
+          if (this.detailSource) {
+            this.detailSource.close();
+            this.detailSource = null;
+          }
           this.selectedId = id;
           this.detailState = '';
           this.detailCreated = null;
