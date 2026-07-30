@@ -10,6 +10,7 @@ fn sup(
 ) -> (TempDir, Supervisor) {
     let log_tmp = tempfile::tempdir().unwrap();
     let supervisor = Supervisor::new(
+        "test-job".to_string(),
         command.to_string(),
         args.iter().map(|s| s.to_string()).collect(),
         vec![],
@@ -82,6 +83,7 @@ fn env_vars_are_propagated_to_child() {
     };
     let log_tmp = tempfile::tempdir().unwrap();
     let mut supervisor = Supervisor::new(
+        "test-job".to_string(),
         cmd.to_string(),
         args.iter().map(|s| s.to_string()).collect(),
         vec![("SUPERVISOR_TEST_VAR".to_string(), "hello-env".to_string())],
@@ -108,6 +110,7 @@ fn cwd_is_applied_to_child() {
     };
     let log_tmp = tempfile::tempdir().unwrap();
     let mut supervisor = Supervisor::new(
+        "test-job".to_string(),
         cmd.to_string(),
         args.iter().map(|s| s.to_string()).collect(),
         vec![],

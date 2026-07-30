@@ -1,8 +1,10 @@
 use agentflare_jobs::{AgentJob, JobState, Queue};
 
 fn test_queue() -> Queue {
-    let dir = tempfile::tempdir().unwrap();
-    Queue::open_memory(dir.path().join("logs")).unwrap()
+    // `.keep()` so the dir outlives this function — otherwise the returned
+    // `Queue`'s `log_dir` would point at an already-deleted path.
+    let dir = tempfile::tempdir().unwrap().keep();
+    Queue::open_memory(dir.join("logs")).unwrap()
 }
 
 fn true_cmd() -> (&'static str, Vec<&'static str>) {
@@ -47,6 +49,7 @@ fn complete_sets_exited() {
     q.enqueue(&AgentJob::new(cmd).args(args)).unwrap();
     let (id, job) = q.dequeue().unwrap().unwrap();
     let sup = agentflare_jobs::Supervisor::new(
+        id.clone(),
         job.command.clone(),
         job.args.clone(),
         vec![],
@@ -76,6 +79,7 @@ fn complete_persists_stdout_and_stderr_byte_counts() {
     q.enqueue(&AgentJob::new(cmd).args(args)).unwrap();
     let (id, job) = q.dequeue().unwrap().unwrap();
     let mut supervisor = agentflare_jobs::Supervisor::new(
+        id.clone(),
         job.command.clone(),
         job.args.clone(),
         vec![],
@@ -189,6 +193,7 @@ fn cleanup_removes_old_jobs_and_their_log_files() {
     q.enqueue(&AgentJob::new(cmd).args(args)).unwrap();
     let (id, job) = q.dequeue().unwrap().unwrap();
     let mut supervisor = agentflare_jobs::Supervisor::new(
+        id.clone(),
         job.command.clone(),
         job.args.clone(),
         vec![],

@@ -305,11 +305,25 @@ struct JobsQuery {
 
 /// `GET /api/jobs?id=<id>` fetches one job; `GET /api/jobs[?state=<state>]`
 /// lists the most recent 100, optionally filtered by state.
+///
+/// `queue.get`/`queue.list` hit SQLite synchronously, so both go through
+/// `spawn_blocking` rather than running inline on the async request path —
+/// matching the SSE handlers below, which do the same for identical calls.
 async fn jobs_handler(State(queue): State<Queue>, Query(q): Query<JobsQuery>) -> Response {
     if let Some(id) = q.id {
-        return match queue.get(&id) {
-            Ok(info) => Json(info).into_response(),
-            Err(_) => (StatusCode::NOT_FOUND, "job not found").into_response(),
+        let got = tokio::task::spawn_blocking({
+            let queue = queue.clone();
+            move || queue.get(&id)
+        })
+        .await;
+        return match got {
+            Ok(Ok(info)) => Json(info).into_response(),
+            Ok(Err(_)) => (StatusCode::NOT_FOUND, "job not found").into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("job lookup task failed: {e}"),
+            )
+                .into_response(),
         };
     }
     let state_filter = match q.state.as_deref() {
@@ -327,11 +341,17 @@ async fn jobs_handler(State(queue): State<Queue>, Query(q): Query<JobsQuery>) ->
                 .into_response();
         }
     };
-    match queue.list(state_filter) {
-        Ok(jobs) => Json(jobs).into_response(),
-        Err(e) => (
+    let listed = tokio::task::spawn_blocking(move || queue.list(state_filter)).await;
+    match listed {
+        Ok(Ok(jobs)) => Json(jobs).into_response(),
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to list jobs: {e}"),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("job list task failed: {e}"),
         )
             .into_response(),
     }
@@ -351,13 +371,22 @@ async fn jobs_events_handler(
         let mut ticker = tokio::time::interval(TICK);
         loop {
             ticker.tick().await;
-            let list = tokio::task::spawn_blocking({
+            let listed = tokio::task::spawn_blocking({
                 let queue = queue.clone();
                 move || queue.list(None)
             })
-            .await
-            .unwrap_or(Ok(vec![]))
-            .unwrap_or(vec![]);
+            .await;
+            let list = match listed {
+                Ok(Ok(list)) => list,
+                Ok(Err(e)) => {
+                    eprintln!("[dashboard/server] jobs_events: list failed: {e}");
+                    vec![]
+                }
+                Err(e) => {
+                    eprintln!("[dashboard/server] jobs_events: task failed: {e}");
+                    vec![]
+                }
+            };
             let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
             if tx.send(Ok(Event::default().data(json))).is_err() {
                 break;
@@ -371,20 +400,35 @@ async fn jobs_events_handler(
 /// `GET /api/jobs/:id/stream` — SSE stream that tails the job's stdout log
 /// file incrementally.
 ///
+/// The stdout path is derived directly from `queue.log_dir()` and the job's
+/// own id (`Supervisor` names its log files `{id}.stdout`/`{id}.stderr` for
+/// exactly this reason) rather than read from `JobInfo.output`, which is
+/// only populated once the job reaches a terminal state — waiting on it
+/// would mean this stream never emits anything until the job is already
+/// finished, defeating the point of a *live* tail.
+///
 /// While the job is queued or running, we poll every 300ms: check the
 /// current job state (`queue.get(id)`), read any new bytes from the stdout
-/// file, and push them as SSE `data:` events. Once the job reaches a
-/// terminal state (exited/failed/killed), any remaining buffered content is
-/// flushed, a final `event: done\ndata:` frame is sent, and the stream
-/// closes.
+/// file (which may not exist yet if the job is still queued), and push them
+/// as SSE `data:` events. Once the job reaches a terminal state
+/// (exited/failed/killed), any remaining buffered content is flushed, a
+/// final `event: done\ndata:` frame is sent, and the stream closes.
 async fn jobs_stream_handler(
     State(queue): State<Queue>,
     Path(id): Path<String>,
 ) -> Response {
     // 404 on unknown id before spawning anything.
-    if queue.get(&id).is_err() {
+    let exists = tokio::task::spawn_blocking({
+        let queue = queue.clone();
+        let id = id.clone();
+        move || queue.get(&id).is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    if !exists {
         return (StatusCode::NOT_FOUND, "job not found").into_response();
     }
+    let stdout_path = queue.log_dir().join(format!("{id}.stdout"));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
         Result<Event, std::convert::Infallible>,
     >();
@@ -409,18 +453,14 @@ async fn jobs_stream_handler(
             };
             let terminal = info.state.is_terminal();
             if file.is_none() {
-                if let Some(ref out) = info.output {
-                    let p = &out.stdout_path;
-                    if p.exists() {
-                        match std::fs::File::open(p) {
-                            Ok(f) => file = Some(f),
-                            Err(_) => {
-                                if terminal {
-                                    let _ = tx
-                                        .send(Ok(Event::default().data("").event("done")));
-                                }
-                                break;
+                if stdout_path.exists() {
+                    match std::fs::File::open(&stdout_path) {
+                        Ok(f) => file = Some(f),
+                        Err(_) => {
+                            if terminal {
+                                let _ = tx.send(Ok(Event::default().data("").event("done")));
                             }
+                            break;
                         }
                     }
                 }
@@ -545,8 +585,12 @@ mod tests {
     use super::*;
 
     fn test_queue() -> Queue {
-        let dir = tempfile::tempdir().unwrap();
-        Queue::open_memory(dir.path().join("logs")).unwrap()
+        // `.keep()` so the dir outlives this function — otherwise the
+        // returned `Queue`'s `log_dir` would point at an already-deleted
+        // path (harmless for tests that never touch logs, but a footgun for
+        // ones that do).
+        let dir = tempfile::tempdir().unwrap().keep();
+        Queue::open_memory(dir.join("logs")).unwrap()
     }
 
     #[tokio::test]
@@ -826,6 +870,83 @@ mod tests {
         assert!(
             all_text.contains("hello from job"),
             "expected stdout content in stream, got: {all_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jobs_stream_endpoint_tails_output_of_a_still_running_job() {
+        // Regression: the stream used to key off `JobInfo.output`, which is
+        // only populated once the job is already terminal — so it emitted
+        // nothing at all until the job finished, then dumped everything in
+        // one lump. This drives a real job through a real `WorkerPool` and
+        // asserts the first chunk arrives (and the job is still `running`)
+        // well before the job's own sleep would let it finish.
+        use tokio_stream::StreamExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::open_memory(dir.path().join("logs")).unwrap();
+        let mut pool = agentflare_jobs::WorkerPool::new(queue.clone());
+        pool.start(1);
+
+        let (cmd, args): (&str, Vec<&str>) = if cfg!(windows) {
+            ("cmd", vec!["/c", "echo tick1 & timeout /t 2 & echo tick2"])
+        } else {
+            ("sh", vec!["-c", "echo tick1; sleep 2; echo tick2"])
+        };
+        let info = queue.enqueue(&agentflare_jobs::AgentJob::new(cmd).args(args)).unwrap();
+        let id = info.id.clone();
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let queue_for_router = queue.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, router(queue_for_router)).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let resp = reqwest::get(format!("http://{addr}/api/jobs/{id}/stream"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut stream = resp.bytes_stream();
+
+        let mut all_text = String::new();
+        let mut state_at_first_tick: Option<String> = None;
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    all_text.push_str(&String::from_utf8_lossy(&chunk));
+                    if state_at_first_tick.is_none() && all_text.contains("tick1") {
+                        let fetched: serde_json::Value =
+                            reqwest::get(format!("http://{addr}/api/jobs?id={id}"))
+                                .await
+                                .unwrap()
+                                .json()
+                                .await
+                                .unwrap();
+                        state_at_first_tick =
+                            Some(fetched["state"].as_str().unwrap_or("").to_string());
+                    }
+                    if all_text.contains("event: done") {
+                        break;
+                    }
+                }
+                Ok(Some(Err(_))) => break,
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        pool.shutdown();
+
+        assert_eq!(
+            state_at_first_tick.as_deref(),
+            Some("running"),
+            "expected the job to still be running when the first chunk arrived, got: {state_at_first_tick:?}"
+        );
+        assert!(
+            all_text.contains("tick1") && all_text.contains("tick2"),
+            "expected both ticks in stream, got: {all_text}"
         );
     }
 

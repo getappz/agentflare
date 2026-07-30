@@ -48,6 +48,7 @@ fn worker_loop(queue: &Queue, running: &AtomicBool) {
         match queue.dequeue() {
             Ok(Some((id, job))) => {
                 let mut sup = Supervisor::new(
+                    id.clone(),
                     job.command.clone(),
                     job.args.clone(),
                     job.env.clone(),
