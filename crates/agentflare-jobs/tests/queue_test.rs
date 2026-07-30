@@ -1,8 +1,10 @@
 use agentflare_jobs::{AgentJob, JobState, Queue};
 
 fn test_queue() -> Queue {
-    let dir = tempfile::tempdir().unwrap();
-    Queue::open_memory(dir.path().join("logs")).unwrap()
+    // `.keep()` so the dir outlives this function — otherwise the returned
+    // `Queue`'s `log_dir` would point at an already-deleted path.
+    let dir = tempfile::tempdir().unwrap().keep();
+    Queue::open_memory(dir.join("logs")).unwrap()
 }
 
 fn true_cmd() -> (&'static str, Vec<&'static str>) {
@@ -47,6 +49,7 @@ fn complete_sets_exited() {
     q.enqueue(&AgentJob::new(cmd).args(args)).unwrap();
     let (id, job) = q.dequeue().unwrap().unwrap();
     let sup = agentflare_jobs::Supervisor::new(
+        id.clone(),
         job.command.clone(),
         job.args.clone(),
         vec![],
@@ -63,6 +66,52 @@ fn complete_sets_exited() {
     let info = q.get(&id).unwrap();
     assert_eq!(info.state, JobState::Exited);
     assert_eq!(info.output.as_ref().unwrap().exit_code, Some(0));
+}
+
+#[test]
+fn complete_persists_stdout_and_stderr_byte_counts() {
+    let q = test_queue();
+    let (cmd, args) = if cfg!(windows) {
+        ("cmd", vec!["/c", "echo hello & echo world 1>&2"])
+    } else {
+        ("sh", vec!["-c", "echo hello; echo world 1>&2"])
+    };
+    q.enqueue(&AgentJob::new(cmd).args(args)).unwrap();
+    let (id, job) = q.dequeue().unwrap().unwrap();
+    let mut supervisor = agentflare_jobs::Supervisor::new(
+        id.clone(),
+        job.command.clone(),
+        job.args.clone(),
+        vec![],
+        None,
+        10,
+        2,
+        q.log_dir().to_path_buf(),
+    );
+    let (output, _) = supervisor.spawn().unwrap();
+    assert!(output.stdout_total_bytes > 0);
+    assert!(output.stderr_total_bytes > 0);
+    q.complete(&id, &output, true).unwrap();
+
+    // Regression: `get`/`list` used to always report 0 for these two fields
+    // regardless of what `Supervisor` actually captured, because the
+    // columns didn't exist in the schema and `complete` silently dropped
+    // them on write.
+    let info = q.get(&id).unwrap();
+    let persisted = info.output.as_ref().unwrap();
+    assert_eq!(persisted.stdout_total_bytes, output.stdout_total_bytes);
+    assert_eq!(persisted.stderr_total_bytes, output.stderr_total_bytes);
+
+    let listed = q.list(None).unwrap();
+    let listed_output = listed
+        .iter()
+        .find(|j| j.id == id)
+        .unwrap()
+        .output
+        .as_ref()
+        .unwrap();
+    assert_eq!(listed_output.stdout_total_bytes, output.stdout_total_bytes);
+    assert_eq!(listed_output.stderr_total_bytes, output.stderr_total_bytes);
 }
 
 #[test]
@@ -135,4 +184,36 @@ fn cleanup_removes_old_jobs() {
     // a huge positive number won't match. Instead: verify no deletion.
     let count = q.cleanup(1_000_000_000).unwrap();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn cleanup_removes_old_jobs_and_their_log_files() {
+    let q = test_queue();
+    let (cmd, args) = true_cmd();
+    q.enqueue(&AgentJob::new(cmd).args(args)).unwrap();
+    let (id, job) = q.dequeue().unwrap().unwrap();
+    let mut supervisor = agentflare_jobs::Supervisor::new(
+        id.clone(),
+        job.command.clone(),
+        job.args.clone(),
+        vec![],
+        None,
+        10,
+        2,
+        q.log_dir().to_path_buf(),
+    );
+    let (output, _) = supervisor.spawn().unwrap();
+    let stdout_path = output.stdout_path.clone();
+    let stderr_path = output.stderr_path.clone();
+    q.complete(&id, &output, true).unwrap();
+    assert!(stdout_path.exists());
+    assert!(stderr_path.exists());
+
+    // -1 => cutoff is 1s in the future, so "finished before cutoff" matches
+    // everything already finished, deterministically, without a real sleep.
+    let count = q.cleanup(-1).unwrap();
+    assert_eq!(count, 1);
+    assert!(q.get(&id).is_err(), "job row should be gone");
+    assert!(!stdout_path.exists(), "stdout log should be removed");
+    assert!(!stderr_path.exists(), "stderr log should be removed");
 }

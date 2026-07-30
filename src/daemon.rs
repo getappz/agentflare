@@ -16,6 +16,12 @@ pub fn daemon_start_lock_path() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("agentflare-daemon.start.lock"))
 }
 
+fn daemon_singleton_lock_path() -> PathBuf {
+    dirs::runtime_dir()
+        .map(|d| d.join("agentflare").join("daemon.singleton.lock"))
+        .unwrap_or_else(|| std::env::temp_dir().join("agentflare-daemon.singleton.lock"))
+}
+
 pub fn cleanup_daemon_files() {
     let pid_path = daemon_pid_path();
     let _ = std::fs::remove_file(&pid_path);
@@ -37,7 +43,25 @@ impl Drop for LockGuard {
 }
 
 pub fn acquire_start_lock() -> Result<LockGuard, String> {
-    let lock_path = daemon_start_lock_path();
+    acquire_lock(daemon_start_lock_path(), Duration::from_secs(5))
+}
+
+/// Serializes the is_daemon_running-check + write_pid_file critical section
+/// in `ServeArgs::run()`, so two `agentflare serve` invocations racing each
+/// other (e.g. on different `--port`s, started within moments of each other)
+/// can't both pass the check before either has written its pid file.
+///
+/// Deliberately a *different* lock file from `daemon_start_lock_path()`:
+/// `start_daemon()` holds that lock for its whole ~5s spawn-and-poll window,
+/// and the process it spawns calls back into this same check via
+/// `serve --_foreground-daemon` — sharing one lock would deadlock the two
+/// (parent waiting on the child's pid file while holding the lock the child
+/// needs to write it).
+pub fn acquire_singleton_lock() -> Result<LockGuard, String> {
+    acquire_lock(daemon_singleton_lock_path(), Duration::from_secs(2))
+}
+
+fn acquire_lock(lock_path: PathBuf, timeout: Duration) -> Result<LockGuard, String> {
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create lock dir {parent:?}: {e}"))?;
     }
@@ -47,7 +71,7 @@ pub fn acquire_start_lock() -> Result<LockGuard, String> {
         .truncate(false)
         .open(&lock_path)
         .map_err(|e| format!("open lock file: {e}"))?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         if file.try_lock_exclusive().is_ok() {
             return Ok(LockGuard {
@@ -56,9 +80,9 @@ pub fn acquire_start_lock() -> Result<LockGuard, String> {
             });
         }
         if std::time::Instant::now() >= deadline {
-            return Err("could not acquire daemon start lock within 5s".to_string());
+            return Err(format!("could not acquire lock within {timeout:?}"));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -77,6 +101,19 @@ fn read_pid_from_file() -> Option<u32> {
     content.trim().parse::<u32>().ok()
 }
 
+/// Records the calling process's own pid as the running daemon, so a later
+/// `is_daemon_running`/`daemon status`/`daemon stop` (possibly from a
+/// different process) can find it. Called by the `serve` foreground process
+/// itself once it starts, not just by `start_daemon`'s spawner.
+pub fn write_pid_file() -> Result<(), String> {
+    let path = daemon_pid_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create pid dir {parent:?}: {e}"))?;
+    }
+    std::fs::write(&path, std::process::id().to_string())
+        .map_err(|e| format!("write pid file: {e}"))
+}
+
 pub fn start_daemon() -> Result<u32, String> {
     let _guard = acquire_start_lock()?;
 
@@ -85,7 +122,13 @@ pub fn start_daemon() -> Result<u32, String> {
     }
 
     let binary = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let _pid = process::spawn_detached(&binary.to_string_lossy(), &["--_foreground-daemon"])?;
+    // Must match the `ExecStart`/`ProgramArguments` invocation the installed
+    // systemd/launchd units use (see `daemon_autostart.rs`) — both spawn
+    // `serve --_foreground-daemon`, not just the bare flag.
+    let _pid = process::spawn_detached(
+        &binary.to_string_lossy(),
+        &["serve", "--_foreground-daemon"],
+    )?;
 
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(250));

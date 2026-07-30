@@ -74,6 +74,7 @@ dependencies = [
  "agentflare-flare-code",
  "agentflare-flare-output",
  "agentflare-gateway-registry",
+ "agentflare-jobs",
  "agentflare-skill-registry",
  "agentflare-store",
  "axum",

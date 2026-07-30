@@ -104,6 +104,8 @@ pub struct JobOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobInfo {
     pub id: String,
+    pub command: String,
+    pub args: Vec<String>,
     pub state: JobState,
     pub retries: u32,
     pub max_retries: u32,
