@@ -77,6 +77,19 @@ fn read_pid_from_file() -> Option<u32> {
     content.trim().parse::<u32>().ok()
 }
 
+/// Records the calling process's own pid as the running daemon, so a later
+/// `is_daemon_running`/`daemon status`/`daemon stop` (possibly from a
+/// different process) can find it. Called by the `serve` foreground process
+/// itself once it starts, not just by `start_daemon`'s spawner.
+pub fn write_pid_file() -> Result<(), String> {
+    let path = daemon_pid_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create pid dir {parent:?}: {e}"))?;
+    }
+    std::fs::write(&path, std::process::id().to_string())
+        .map_err(|e| format!("write pid file: {e}"))
+}
+
 pub fn start_daemon() -> Result<u32, String> {
     let _guard = acquire_start_lock()?;
 
@@ -85,7 +98,13 @@ pub fn start_daemon() -> Result<u32, String> {
     }
 
     let binary = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let _pid = process::spawn_detached(&binary.to_string_lossy(), &["--_foreground-daemon"])?;
+    // Must match the `ExecStart`/`ProgramArguments` invocation the installed
+    // systemd/launchd units use (see `daemon_autostart.rs`) — both spawn
+    // `serve --_foreground-daemon`, not just the bare flag.
+    let _pid = process::spawn_detached(
+        &binary.to_string_lossy(),
+        &["serve", "--_foreground-daemon"],
+    )?;
 
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(250));
