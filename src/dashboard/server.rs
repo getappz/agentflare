@@ -881,7 +881,14 @@ mod tests {
         pool.start(1);
 
         let (cmd, args): (&str, Vec<&str>) = if cfg!(windows) {
-            ("cmd", vec!["/c", "echo tick1 & timeout /t 2 & echo tick2"])
+            // `timeout /t` refuses to run with redirected stdin ("INPUT
+            // REDIRECTION IS NOT SUPPORTED") and exits instantly instead of
+            // sleeping — `ping` against loopback is the standard
+            // redirection-safe stand-in for a ~2s delay on Windows.
+            (
+                "cmd",
+                vec!["/c", "echo tick1 & ping -n 3 127.0.0.1 >nul & echo tick2"],
+            )
         } else {
             ("sh", vec!["-c", "echo tick1; sleep 2; echo tick2"])
         };

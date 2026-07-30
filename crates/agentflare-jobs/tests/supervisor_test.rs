@@ -55,7 +55,11 @@ fn exit_failure_reports_nonzero_code() {
 #[test]
 fn timeout_kills_long_running_process() {
     let (cmd, args) = if cfg!(windows) {
-        ("cmd", vec!["/c", "timeout /t 30"])
+        // `timeout /t` refuses to run with redirected stdin ("INPUT
+        // REDIRECTION IS NOT SUPPORTED") and exits instantly instead of
+        // sleeping — `ping` against loopback is the standard
+        // redirection-safe stand-in for a long delay on Windows.
+        ("cmd", vec!["/c", "ping -n 31 127.0.0.1 >nul"])
     } else {
         ("sleep", vec!["30"])
     };
