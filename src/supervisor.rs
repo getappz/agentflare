@@ -2,8 +2,8 @@
 //! dispatches an `agentflare work` job for each one whose assignee is a
 //! confirmed-autonomous agent (skips the rest with a comment).
 
-use crate::mcp_server::types::{CommentRequest, ItemRequest};
 use crate::mcp_server::AgentflareMcp;
+use crate::mcp_server::types::{CommentRequest, ItemRequest};
 
 const READY_LABEL: &str = "ready-for-work";
 const DISPATCHED_LABEL: &str = "dispatched";
@@ -58,7 +58,11 @@ pub(crate) fn run_discovery_tick(
     };
 
     for item in items {
-        match item.assignee_agent.as_deref().and_then(resolve_confirmed_agent) {
+        match item
+            .assignee_agent
+            .as_deref()
+            .and_then(resolve_confirmed_agent)
+        {
             None => {
                 skip_item(mcp, &item, &label_id_by_name, &ready_id);
                 result.skipped += 1;
@@ -224,7 +228,11 @@ mod tests {
             )
             .unwrap();
             let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
-            let ready_id = &labels.iter().find(|l| l.name == "ready-for-work").unwrap().id;
+            let ready_id = &labels
+                .iter()
+                .find(|l| l.name == "ready-for-work")
+                .unwrap()
+                .id;
             agentflare_backend::item::add_label(conn, &item.id, ready_id).unwrap();
             item.id
         })
