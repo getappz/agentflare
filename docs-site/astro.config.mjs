@@ -12,7 +12,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: "agentflare docs",
-      description: "Documentation for agentflare's flare-docs — always-current package docs for your AI coding agent.",
+      description: "Documentation for agentflare — optimize a single AI coding agent session and coordinate more than one of them.",
       logo: {
         src: "./src/assets/logo.svg",
         alt: "agentflare",
@@ -26,14 +26,21 @@ export default defineConfig({
       },
       sidebar: [
         {
-          label: "flare-docs",
+          label: "Guide",
           items: [
             { label: "Overview", slug: "index" },
-            { label: "Compare", slug: "compare" },
-            { label: "Supported languages", slug: "how-it-works" },
-            { label: "Using it from your agent", slug: "mcp-tool" },
+            { label: "Getting started", slug: "getting-started" },
+            { label: "Concepts", slug: "concepts" },
+            { label: "Guides", slug: "guides" },
+          ],
+        },
+        {
+          label: "Reference",
+          items: [
             { label: "CLI reference", slug: "cli" },
-            { label: "Examples", slug: "examples" },
+            { label: "MCP tools reference", slug: "mcp-tools" },
+            { label: "flare-docs", slug: "flare-docs" },
+            { label: "How it compares", slug: "compare" },
           ],
         },
       ],
