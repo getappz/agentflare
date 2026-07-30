@@ -11,10 +11,13 @@ pub struct Queue {
     log_dir: PathBuf,
     // Wakes idle workers the moment a job becomes available (fresh enqueue,
     // or a retry going back to 'queued'), instead of them finding out only
-    // on their next poll. The paired Mutex<()> exists only because
-    // Condvar::wait_for needs a guard to attach to — there's no shared Rust
-    // state to protect, the real "state" lives in SQLite.
-    notify: Arc<(Mutex<()>, Condvar)>,
+    // on their next poll. The bool is a pending-signal flag, not app state:
+    // `notify_all()` alone only wakes threads already parked in `wait_for`,
+    // so a wake that lands between a worker's dequeue-check and its call to
+    // `wait_for_work` would otherwise be lost until the fallback timeout —
+    // the flag makes the signal durable across that race by having
+    // `wait_for_work` check it (under the same lock) before ever blocking.
+    notify: Arc<(Mutex<bool>, Condvar)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -65,7 +68,7 @@ impl Queue {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             log_dir,
-            notify: Arc::new((Mutex::new(()), Condvar::new())),
+            notify: Arc::new((Mutex::new(false), Condvar::new())),
         })
     }
 
@@ -74,7 +77,7 @@ impl Queue {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             log_dir,
-            notify: Arc::new((Mutex::new(()), Condvar::new())),
+            notify: Arc::new((Mutex::new(false), Condvar::new())),
         })
     }
 
@@ -83,23 +86,32 @@ impl Queue {
     }
 
     /// Blocks the calling (worker) thread until a job becomes available or
-    /// `timeout` elapses, whichever comes first. The timeout is a safety net
-    /// against a missed wakeup (e.g. a notify firing just before this call
-    /// starts waiting) — normal pickup is near-instant via `notify`, not the
-    /// timeout.
+    /// `timeout` elapses, whichever comes first. Checks the pending-signal
+    /// flag before blocking, so a `wake_workers` call that landed just
+    /// before this one (e.g. between this worker's dequeue-check and this
+    /// call) is still observed immediately instead of being lost until
+    /// `timeout` — normal pickup is near-instant via `notify`, not the
+    /// timeout, in either ordering.
     pub fn wait_for_work(&self, timeout: Duration) {
         let (lock, cvar) = &*self.notify;
-        let mut guard = lock.lock();
-        cvar.wait_for(&mut guard, timeout);
+        let mut signaled = lock.lock();
+        if !*signaled {
+            cvar.wait_for(&mut signaled, timeout);
+        }
+        *signaled = false;
     }
 
-    /// Wakes every thread parked in `wait_for_work`, whether or not there's
-    /// actually a job for them (they just re-check `dequeue` either way).
-    /// Called after enqueueing/re-queueing a job, and by `WorkerPool::shutdown`
-    /// so workers notice a stop request immediately rather than up to
+    /// Wakes every thread parked in `wait_for_work` (or the next one to call
+    /// it, per the flag above), whether or not there's actually a job for
+    /// them — they just re-check `dequeue` either way. Called after
+    /// enqueueing/re-queueing a job, and by `WorkerPool::shutdown` so
+    /// workers notice a stop request immediately rather than up to
     /// `timeout` later.
     pub fn wake_workers(&self) {
-        self.notify.1.notify_all();
+        let (lock, cvar) = &*self.notify;
+        let mut signaled = lock.lock();
+        *signaled = true;
+        cvar.notify_all();
     }
 
     pub fn enqueue(&self, job: &crate::types::AgentJob) -> Result<JobInfo, Error> {
