@@ -233,6 +233,18 @@ pub fn list_by_project(conn: &Connection, project_id: &str) -> Result<Vec<Item>>
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+pub fn list_by_label(conn: &Connection, project_id: &str, label_id: &str) -> Result<Vec<Item>> {
+    let mut stmt = conn.prepare(
+        "SELECT items.id, items.project_id, items.state_id, items.name, items.description, items.priority, items.parent_id, items.assignee_agent, items.sequence_id, items.sort_order, items.started_at, items.completed_at, items.archived_at, items.external_source, items.external_id, items.metadata, items.created_at, items.updated_at, items.deleted_at
+         FROM items
+         INNER JOIN item_labels ON item_labels.item_id = items.id
+         WHERE item_labels.label_id = ?1 AND items.project_id = ?2 AND items.deleted_at IS NULL
+         ORDER BY items.sort_order",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![label_id, project_id], row_to_item)?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 /// List non-deleted items assigned to an agent (excludes completed/cancelled).
 pub fn list_by_assignee_agent(
     conn: &Connection,
@@ -1899,5 +1911,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(updated.assignee_agent.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn list_by_label_returns_only_items_carrying_that_label() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "label");
+        let ws_id = crate::project::get(&conn, &pid).unwrap().workspace_id;
+        let label = crate::label::create(
+            &conn,
+            crate::label::CreateLabel {
+                project_id: Some(pid.clone()),
+                workspace_id: ws_id,
+                name: "ready-for-work".into(),
+                color: None,
+                parent_id: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+
+        let labeled = create(
+            &conn,
+            CreateItem {
+                project_id: pid.clone(),
+                state_id: sid.clone(),
+                name: "Labeled".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        create(
+            &conn,
+            CreateItem {
+                project_id: pid.clone(),
+                state_id: sid,
+                name: "Unlabeled".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        add_label(&conn, &labeled.id, &label.id).unwrap();
+
+        let found = list_by_label(&conn, &pid, &label.id).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, labeled.id);
     }
 }

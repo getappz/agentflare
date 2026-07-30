@@ -57,6 +57,7 @@ mod skill_detect;
 mod skill_proactive;
 mod state;
 mod store;
+mod supervisor;
 mod tool_install;
 mod ui;
 mod uninstall;

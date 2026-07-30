@@ -142,6 +142,7 @@ const COST_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 /// nothing else ever calls `Queue::cleanup`.
 const JOB_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 const JOB_RETENTION_SECS: i64 = 7 * 24 * 3600;
+const SUPERVISOR_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// Runs for the lifetime of the process (like `snapshot_broadcaster`'s
 /// producer task): wakes on `JOB_CLEANUP_INTERVAL`, deletes finished jobs
@@ -160,6 +161,39 @@ fn spawn_job_cleanup(queue: agentflare_jobs::Queue) {
                 Ok(Ok(deleted)) => eprintln!("agentflare-jobs: cleaned up {deleted} old job(s)"),
                 Ok(Err(e)) => eprintln!("agentflare-jobs: cleanup failed: {e}"),
                 Err(e) => eprintln!("agentflare-jobs: cleanup task panicked: {e}"),
+            }
+        }
+    });
+}
+
+/// Runs for the lifetime of the process: wakes on `SUPERVISOR_DISCOVERY_INTERVAL`,
+/// lists items labeled `ready-for-work` and dispatches an `agentflare work` job
+/// for each confirmed-autonomous assignee. The blocking SQLite work happens off
+/// the async worker threads via `spawn_blocking`, same as `spawn_job_cleanup`.
+fn spawn_supervisor_discovery(
+    queue: agentflare_jobs::Queue,
+    mcp: std::sync::Arc<crate::mcp_server::AgentflareMcp>,
+    interval: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            let queue = queue.clone();
+            let mcp = mcp.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::supervisor::run_discovery_tick(&mcp, &queue)
+            })
+            .await;
+            match result {
+                Ok(summary) if summary.dispatched > 0 || summary.skipped > 0 => {
+                    eprintln!(
+                        "agentflare-supervisor: dispatched {}, skipped {}",
+                        summary.dispatched, summary.skipped
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("agentflare-supervisor: tick task panicked: {e}"),
             }
         }
     });
@@ -557,6 +591,11 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
     let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone());
     worker_pool.start(2);
     spawn_job_cleanup(queue.clone());
+    spawn_supervisor_discovery(
+        queue.clone(),
+        std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
+        SUPERVISOR_DISCOVERY_INTERVAL,
+    );
 
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
@@ -1043,5 +1082,15 @@ mod tests {
             started,
             "expected dashboard to serve on a local bind without --yes-expose"
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_supervisor_discovery_runs_without_panicking_on_an_empty_project() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let queue = agentflare_jobs::Queue::open_memory(dir.join("logs")).unwrap();
+        let mcp = std::sync::Arc::new(crate::mcp_server::AgentflareMcp::for_test_memory());
+
+        spawn_supervisor_discovery(queue, mcp, std::time::Duration::from_millis(20));
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     }
 }
