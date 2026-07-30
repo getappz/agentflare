@@ -610,7 +610,7 @@ impl AgentflareMcp {
         })?
     }
 
-    pub(super) fn item_add_label(&self, req: ItemRequest) -> Result<String, ErrorData> {
+    pub(crate) fn item_add_label(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for add_label", None))?;
@@ -634,7 +634,7 @@ impl AgentflareMcp {
         })?
     }
 
-    pub(super) fn item_remove_label(&self, req: ItemRequest) -> Result<String, ErrorData> {
+    pub(crate) fn item_remove_label(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for remove_label", None))?;

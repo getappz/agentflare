@@ -82,7 +82,7 @@ pub struct AgentflareMcp {
     /// its own source of truth, so nothing to refresh.
     backend_db: std::sync::Mutex<Option<rusqlite::Connection>>,
     /// Tests inject a temp path here so they never touch the shared backend.db.
-    backend_db_override: Option<std::path::PathBuf>,
+    pub(crate) backend_db_override: Option<std::path::PathBuf>,
     /// Tests inject a temp file path here so project-link resolution never
     /// reads/writes this actual repo's `.agentflare/project.json`.
     backend_project_link_override: Option<std::path::PathBuf>,
@@ -576,6 +576,17 @@ impl AgentflareMcp {
             backend_project_link_override: Some(project_link),
             worktree_repo_root_override: Some(worktree_repo_root),
             store_override: Some(store_dir.join("store.db")),
+            ..Default::default()
+        }
+    }
+
+    /// Create an in-memory backend for tests that don't need a real repo/disk.
+    /// The other fields (skills, gateway, store, etc.) stay defaulted so they
+    /// lazily open `:memory:` SQLite connections or no-ops — no I/O to ~/.
+    #[cfg(test)]
+    pub(crate) fn for_test_memory() -> Self {
+        Self {
+            backend_db_override: Some(std::path::PathBuf::from(":memory:")),
             ..Default::default()
         }
     }
