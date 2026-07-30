@@ -1,0 +1,282 @@
+<!-- @dsCard group="Runtime" -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>agentflare dashboard — jobs</title>
+  <link rel="stylesheet" href="/tokens.css" />
+  <script defer src="/shell.js"></script>
+  <script defer src="/vendor/alpine.js"></script>
+</head>
+<body>
+  <div class="af-app">
+    <aside class="af-sidebar" x-data="shellNav()" x-init="init()">
+      <div class="af-sidebar-header"><span class="af-logo-mark"></span>agentflare</div>
+
+      <div class="af-nav-section">
+        <label class="af-nav-section-label" for="af-workspace-select">Workspace</label>
+        <select
+          id="af-workspace-select"
+          class="af-select"
+          x-model="workspaceId"
+          @change="onWorkspaceChange()"
+        >
+          <template x-if="!loading && workspaces.length === 0">
+            <option value="">No workspaces</option>
+          </template>
+          <template x-for="w in workspaces" :key="w.id">
+            <option :value="w.id" x-text="w.name"></option>
+          </template>
+        </select>
+      </div>
+
+      <div class="af-nav-section">
+        <label class="af-nav-section-label" for="af-project-select">Project</label>
+        <select
+          id="af-project-select"
+          class="af-select"
+          x-model="projectId"
+          @change="onProjectChange()"
+        >
+          <template x-if="!loading && projects.length === 0">
+            <option value="">No projects</option>
+          </template>
+          <template x-for="p in projects" :key="p.id">
+            <option :value="p.id" x-text="p.identifier + ' — ' + p.name"></option>
+          </template>
+        </select>
+      </div>
+
+      <nav class="af-nav-links">
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/board.html') }" :href="navHref('/board.html')">Board</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/list.html') }" :href="navHref('/list.html')">List</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/webhooks.html') }" :href="navHref('/webhooks.html')">Webhooks</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/claims.html') }" :href="navHref('/claims.html')">Claims</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/jobs.html') }" :href="navHref('/jobs.html')">Jobs</a>
+        <a class="af-nav-link" :class="{ 'is-active': isActive('/cost.html') }" :href="navHref('/cost.html')">Cost</a>
+      </nav>
+    </aside>
+
+    <div class="af-main-col" x-data="jobsView()" x-init="init()">
+      <header class="af-topbar">
+        <h1 x-show="!selectedId">Jobs</h1>
+        <h1 x-show="selectedId">Job <span class="af-mono" x-text="selectedId.substring(0, 12) + '…'"></span></h1>
+        <span class="af-topbar-meta" x-show="!selectedId">
+          <span class="af-live" :class="{ 'is-on': connected }"></span>
+          <span x-text="connected ? 'live' : 'connecting…'"></span>
+        </span>
+        <button class="af-back-btn" x-show="selectedId" @click="backToList()">Back to list</button>
+      </header>
+      <main class="af-content">
+        <!-- Empty state -->
+        <template x-if="!loading && !selectedId && jobs.length === 0">
+          <p class="af-empty">No jobs yet. Submit one via <code>POST /api/jobs</code>.</p>
+        </template>
+
+        <!-- Job list table -->
+        <div class="af-table-wrap" x-show="!selectedId && jobs.length > 0">
+          <table class="af-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Command</th>
+                <th>State</th>
+                <th>Created</th>
+                <th>Started</th>
+                <th>Finished</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="job in jobs" :key="job.id">
+                <tr class="af-clickable-row" @click="selectJob(job.id)">
+                  <td class="af-mono" x-text="job.id.substring(0, 12) + '…'"></td>
+                  <td class="af-mono af-truncate" x-text="jobCommand(job)"></td>
+                  <td>
+                    <span class="af-badge" :class="stateClass(job.state)" x-text="job.state"></span>
+                  </td>
+                  <td x-text="afFormatTime(job.created_at)"></td>
+                  <td x-text="afFormatTime(job.started_at)"></td>
+                  <td x-text="afFormatTime(job.finished_at)"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Job detail view -->
+        <template x-if="selectedId">
+          <div>
+            <div class="af-item-header">
+              <div class="af-item-meta">
+                <span>State: <strong :class="stateClass(detailState)" x-text="detailState"></strong></span>
+                <span>ID: <strong class="af-mono" x-text="selectedId"></strong></span>
+                <span>Created: <strong x-text="afFormatTime(detailCreated)"></strong></span>
+                <span x-show="detailStarted">Started: <strong x-text="afFormatTime(detailStarted)"></strong></span>
+                <span x-show="detailFinished">Finished: <strong x-text="afFormatTime(detailFinished)"></strong></span>
+                <span x-show="detailExitCode !== null">Exit code: <strong x-text="detailExitCode"></strong></span>
+              </div>
+            </div>
+            <div class="af-section-title" style="margin-top: var(--af-space-5)">Output</div>
+            <pre class="af-log-output" x-text="detailOutput"></pre>
+            <p class="af-empty" x-show="!detailOutput && !detailStreaming">No output captured.</p>
+            <p class="af-empty" x-show="detailStreaming">Waiting for output…</p>
+          </div>
+        </template>
+      </main>
+    </div>
+  </div>
+
+  <style>
+    .af-clickable-row { cursor: pointer; }
+    .af-clickable-row:hover { background: var(--af-bg-hover, rgba(128,128,128,0.08)); }
+    .af-back-btn {
+      background: none;
+      border: 1px solid var(--af-border, #ddd);
+      border-radius: 6px;
+      padding: 4px 12px;
+      cursor: pointer;
+      font-size: 0.875rem;
+      margin-left: var(--af-space-3);
+    }
+    .af-log-output {
+      background: var(--af-bg-code, #111);
+      color: #0f0;
+      font-family: var(--af-font-mono, monospace);
+      font-size: 0.8125rem;
+      padding: var(--af-space-3);
+      border-radius: 6px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      min-height: 60px;
+      max-height: 70vh;
+      overflow-y: auto;
+    }
+  </style>
+
+  <script>
+    function jobsView() {
+      return {
+        jobs: [],
+        connected: false,
+        source: null,
+        loading: true,
+
+        selectedId: '',
+        detailState: '',
+        detailCreated: null,
+        detailStarted: null,
+        detailFinished: null,
+        detailExitCode: null,
+        detailOutput: '',
+        detailStreaming: false,
+        detailSource: null,
+
+        init() {
+          this.source = new EventSource('/api/jobs/events');
+          this.source.onmessage = (e) => {
+            try {
+              const list = JSON.parse(e.data);
+              if (Array.isArray(list)) {
+                this.jobs = list;
+              }
+              this.connected = true;
+            } catch (_e) { /* ignore malformed frame */ }
+          };
+          this.source.onerror = () => {
+            this.connected = false;
+          };
+          this.loading = false;
+
+          const params = afParams();
+          const jobId = params.get('id');
+          if (jobId) {
+            this.selectJob(jobId);
+          }
+        },
+
+        selectJob(id) {
+          this.selectedId = id;
+          this.detailState = '';
+          this.detailCreated = null;
+          this.detailStarted = null;
+          this.detailFinished = null;
+          this.detailExitCode = null;
+          this.detailOutput = '';
+          this.detailStreaming = true;
+
+          // Update URL.
+          const url = new URL(window.location);
+          url.searchParams.set('id', id);
+          window.history.replaceState({}, '', url);
+
+          // Fetch initial job info so we show metadata immediately even if
+          // the stream has already ended (job finished before page opened).
+          fetch('/api/jobs?id=' + encodeURIComponent(id))
+            .then((r) => r.json())
+            .then((info) => {
+              this.detailState = info.state || '';
+              this.detailCreated = info.created_at;
+              this.detailStarted = info.started_at;
+              this.detailFinished = info.finished_at;
+              if (info.output) {
+                this.detailExitCode = info.output.exit_code;
+              }
+            })
+            .catch(() => {});
+
+          // Open the SSE stream for live log tailing.
+          this.detailSource = new EventSource('/api/jobs/' + encodeURIComponent(id) + '/stream');
+          this.detailSource.onmessage = (e) => {
+            if (e.data) {
+              this.detailOutput += e.data;
+            }
+            this.detailStreaming = true;
+          };
+          this.detailSource.addEventListener('done', () => {
+            this.detailStreaming = false;
+            this.detailSource.close();
+            // Re-fetch job info to get final state.
+            fetch('/api/jobs?id=' + encodeURIComponent(id))
+              .then((r) => r.json())
+              .then((info) => {
+                this.detailState = info.state || '';
+                if (info.output) {
+                  this.detailExitCode = info.output.exit_code;
+                }
+              })
+              .catch(() => {});
+          });
+          this.detailSource.onerror = () => {
+            this.detailStreaming = false;
+          };
+        },
+
+        backToList() {
+          this.selectedId = '';
+          if (this.detailSource) {
+            this.detailSource.close();
+            this.detailSource = null;
+          }
+          const url = new URL(window.location);
+          url.searchParams.delete('id');
+          window.history.replaceState({}, '', url);
+        },
+
+        jobCommand(job) {
+          return 'command' in job ? job.command : (job.id || '');
+        },
+
+        stateClass(state) {
+          if (state === 'running') return 'af-prio af-prio-urgent';
+          if (state === 'queued') return 'af-prio af-prio-medium';
+          if (state === 'exited') return 'af-prio af-prio-low';
+          if (state === 'failed' || state === 'killed') return 'af-prio af-prio-urgent';
+          return '';
+        },
+      };
+    }
+  </script>
+</body>
+</html>
