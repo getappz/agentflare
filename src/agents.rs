@@ -193,24 +193,20 @@ pub fn cli_run(
     args: &[String],
 ) {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let env = match crate::dev_vars::load(&cwd, stage) {
-        Some((path, vars)) => {
-            eprintln!(
-                "agentflare run: injecting {} var(s) from {}",
-                vars.len(),
-                path.display()
-            );
-            vars
-        }
-        None => {
-            if let Some(s) = stage {
-                crate::ui::warning(&format!(
-                    "agentflare run: no .dev.vars.{s} or .dev.vars found"
-                ));
-            }
-            Vec::new()
-        }
-    };
+    let vault_env = crate::vault::vault_env(&cwd);
+    let mut env: Vec<(String, String)> = vault_env.into_iter().collect();
+    if let Some((path, vars)) = crate::dev_vars::load(&cwd, stage) {
+        eprintln!(
+            "agentflare run: injecting {} var(s) from {}",
+            vars.len(),
+            path.display()
+        );
+        env.extend(vars);
+    } else if let Some(s) = stage {
+        crate::ui::warning(&format!(
+            "agentflare run: no .dev.vars.{s} or .dev.vars found"
+        ));
+    }
     match agent_launch::run_launch_env(
         agent_registry::REGISTRY,
         agent,

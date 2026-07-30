@@ -4,6 +4,7 @@
 
 mod artifact;
 mod asset;
+mod builtin_tools;
 mod claim;
 mod comment;
 mod flare_docs;
@@ -916,9 +917,7 @@ impl AgentflareMcp {
                 None,
             )
         })?;
-        let conn = crate::db::open()
-            .map_err(|e| ErrorData::internal_error(format!("cannot open database: {e}"), None))?;
-        crate::channels::send_message(&conn, plat, &target, &message)
+        crate::channels::send_message(plat, &target, &message)
             .map_err(|e| ErrorData::internal_error(e, None))?;
         Ok(serde_json::json!({ "sent": true, "platform": platform, "target": target }).to_string())
     }
@@ -1015,14 +1014,7 @@ impl AgentflareMcp {
     }
 
     fn resolve_gateway_secrets() -> std::collections::HashMap<String, String> {
-        let conn = match crate::db::open() {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("agentflare: failed to open agentflare.db for gateway secrets: {e}");
-                return std::collections::HashMap::new();
-            }
-        };
-        let names = match crate::gateway_secrets::list_secrets(&conn) {
+        let names = match crate::vault::list_secrets() {
             Ok(names) => names,
             Err(e) => {
                 eprintln!("agentflare: failed to list gateway secrets: {e}");
@@ -1031,21 +1023,14 @@ impl AgentflareMcp {
         };
         names
             .into_iter()
-            .filter_map(
-                |name| match crate::gateway_secrets::get_secret(&conn, &name) {
-                    Ok(Some(v)) => Some((name, v)),
-                    Ok(None) => None,
-                    Err(e) => {
-                        // A wrong/missing vault passphrase used to look
-                        // identical to "no secret configured" — `.ok().flatten()`
-                        // discarded the `Err` entirely. Surface it so a wrong
-                        // passphrase is at least visible in stderr instead of
-                        // silently leaving downstream backends uncredentialed.
-                        eprintln!("agentflare: failed to resolve gateway secret '{name}': {e}");
-                        None
-                    }
-                },
-            )
+            .filter_map(|name| match crate::vault::get_secret(&name) {
+                Ok(Some(v)) => Some((name, v.to_string())),
+                Ok(None) => None,
+                Err(e) => {
+                    eprintln!("agentflare: failed to resolve gateway secret '{name}': {e}");
+                    None
+                }
+            })
             .collect()
     }
 
@@ -1085,7 +1070,7 @@ impl AgentflareMcp {
         Ok(guard)
     }
     #[tool(
-        description = "Tool operations — search downstream MCP servers' tools by task description or execute one. Single consolidated tool with `action` field (search|execute)."
+        description = "Tool operations — search both agentflare's own first-party tools and downstream MCP servers' tools by task description, or execute a downstream one. Single consolidated tool with `action` field (search|execute)."
     )]
     async fn tool(&self, Parameters(req): Parameters<ToolRequest>) -> Result<String, ErrorData> {
         match req.action.as_str() {
@@ -1113,17 +1098,24 @@ impl AgentflareMcp {
                     reg.search(&query, limit, mode)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
                 };
-                let hits = if local.len() < limit {
-                    let remaining = limit - local.len();
+                // Downstream gateway servers (leanctx, ...) first, then
+                // agentflare's own first-party tools (item/asset/handoff/...
+                // -- never part of the downstream index, see
+                // builtin_tools.rs), then the public MCP Registry fallback
+                // only if slots remain after both.
+                let builtin = builtin_tools::search_builtin_tools(&query, limit, mode);
+                let with_builtin = builtin_tools::merge_builtin_hits(local, limit, builtin);
+                let hits = if with_builtin.len() < limit {
+                    let remaining = limit - with_builtin.len();
                     let query_owned = query.clone();
                     let registry = tokio::task::spawn_blocking(move || {
                         gateway_registry::registry_search::search_registry(&query_owned, remaining)
                     })
                     .await
                     .unwrap_or_default();
-                    gateway_registry::merge_registry_hits(local, limit, registry)
+                    gateway_registry::merge_registry_hits(with_builtin, limit, registry)
                 } else {
-                    local
+                    with_builtin
                 };
                 Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
             }

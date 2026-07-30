@@ -1,0 +1,37 @@
+[package]
+name = "flare-vault"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "Local secrets vault with envelope encryption (Argon2id KEK / AES-256-GCM DEK), OS-keyring session cache, and global/project scoping"
+license = "Apache-2.0"
+repository = "https://github.com/getappz/agentflare"
+
+[dependencies]
+argon2 = "0.5"
+aes-gcm = "0.10"
+keyring = { version = "3", default-features = false, features = ["windows-native", "apple-native", "linux-native"] }
+zeroize = { version = "1", features = ["zeroize_derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+fs2 = "0.4"
+tempfile = "3"
+thiserror = "2"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+default = []
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "warn"

@@ -354,7 +354,10 @@ pub fn pre_tool_use(_agent: &str) {
         return;
     }
 
-    if let Some(reason) = crate::coaching::enforced_rule_reason_for_tool(&parsed.tool_name) {
+    if let Some(reason) = crate::coaching::enforced_rule_reason_for_tool(
+        &parsed.tool_name,
+        parsed.tool_input.as_ref(),
+    ) {
         let decision = json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",

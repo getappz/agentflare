@@ -24,10 +24,10 @@ fn env_token() -> Option<String> {
 }
 
 fn secret_token() -> Option<String> {
-    let conn = crate::db::open().ok()?;
-    crate::gateway_secrets::get_secret(&conn, "github_token")
+    crate::vault::get_secret("github_token")
         .ok()
         .flatten()
+        .map(|s| s.to_string())
         .and_then(nonempty)
 }
 
