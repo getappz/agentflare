@@ -72,7 +72,7 @@ fn complete_sets_exited() {
 fn complete_persists_stdout_and_stderr_byte_counts() {
     let q = test_queue();
     let (cmd, args) = if cfg!(windows) {
-        ("cmd", vec!["/c", "echo hello 1>&1 & echo world 1>&2"])
+        ("cmd", vec!["/c", "echo hello & echo world 1>&2"])
     } else {
         ("sh", vec!["-c", "echo hello; echo world 1>&2"])
     };

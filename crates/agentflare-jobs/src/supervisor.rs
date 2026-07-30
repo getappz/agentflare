@@ -23,6 +23,7 @@ impl Supervisor {
     /// queue id, not a fresh one, so a running job's log path is derivable
     /// from its id alone (`queue.log_dir().join(format!("{id}.stdout"))`)
     /// without waiting for the job to finish and report it back.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         command: String,

@@ -131,7 +131,7 @@ fn cwd_is_applied_to_child() {
 #[test]
 fn stdout_and_stderr_are_captured_separately() {
     let (cmd, args) = if cfg!(windows) {
-        ("cmd", vec!["/c", "echo out-line 1>&1 & echo err-line 1>&2"])
+        ("cmd", vec!["/c", "echo out-line & echo err-line 1>&2"])
     } else {
         ("sh", vec!["-c", "echo out-line; echo err-line 1>&2"])
     };

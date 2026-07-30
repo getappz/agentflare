@@ -7,9 +7,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use std::io::Read;
 use rust_embed::RustEmbed;
 use serde::Deserialize;
+use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(RustEmbed)]
@@ -364,9 +364,8 @@ async fn jobs_handler(State(queue): State<Queue>, Query(q): Query<JobsQuery>) ->
 async fn jobs_events_handler(
     State(queue): State<Queue>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
-        Result<Event, std::convert::Infallible>,
-    >();
+    let (tx, rx) =
+        tokio::sync::mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(TICK);
         loop {
@@ -413,10 +412,7 @@ async fn jobs_events_handler(
 /// as SSE `data:` events. Once the job reaches a terminal state
 /// (exited/failed/killed), any remaining buffered content is flushed, a
 /// final `event: done\ndata:` frame is sent, and the stream closes.
-async fn jobs_stream_handler(
-    State(queue): State<Queue>,
-    Path(id): Path<String>,
-) -> Response {
+async fn jobs_stream_handler(State(queue): State<Queue>, Path(id): Path<String>) -> Response {
     // 404 on unknown id before spawning anything.
     let exists = tokio::task::spawn_blocking({
         let queue = queue.clone();
@@ -429,9 +425,8 @@ async fn jobs_stream_handler(
         return (StatusCode::NOT_FOUND, "job not found").into_response();
     }
     let stdout_path = queue.log_dir().join(format!("{id}.stdout"));
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
-        Result<Event, std::convert::Infallible>,
-    >();
+    let (tx, rx) =
+        tokio::sync::mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
         let mut offset: u64 = 0;
@@ -793,7 +788,10 @@ mod tests {
             .expect("SSE data line");
         let v: serde_json::Value = serde_json::from_str(data_line).unwrap();
         assert!(v.is_array(), "expected JSON array, got: {v}");
-        assert!(!v.as_array().unwrap().is_empty(), "expected at least one job");
+        assert!(
+            !v.as_array().unwrap().is_empty(),
+            "expected at least one job"
+        );
     }
 
     #[tokio::test]
@@ -850,12 +848,7 @@ mod tests {
         // Collect all SSE frames with a timeout.
         let mut all_text = String::new();
         loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                stream.next(),
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
                 Ok(Some(Ok(chunk))) => {
                     all_text.push_str(&String::from_utf8_lossy(&chunk));
                     if all_text.contains("event: done") {
@@ -892,7 +885,9 @@ mod tests {
         } else {
             ("sh", vec!["-c", "echo tick1; sleep 2; echo tick2"])
         };
-        let info = queue.enqueue(&agentflare_jobs::AgentJob::new(cmd).args(args)).unwrap();
+        let info = queue
+            .enqueue(&agentflare_jobs::AgentJob::new(cmd).args(args))
+            .unwrap();
         let id = info.id.clone();
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -901,7 +896,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let queue_for_router = queue.clone();
         tokio::spawn(async move {
-            axum::serve(listener, router(queue_for_router)).await.unwrap();
+            axum::serve(listener, router(queue_for_router))
+                .await
+                .unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
