@@ -912,7 +912,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Send a text message out to a chat platform (telegram, slack, or discord). The bot token must already be stored as the vault secret '<platform>_bot_token' (agentflare vault set). target is the Telegram chat_id or Slack/Discord channel id."
+        description = "Send a text message out to a chat platform (telegram, slack, or discord). The bot token must already be stored as the vault secret '<platform>_bot_token' (agentflare vault set <platform>_bot_token). target is the Telegram chat_id or Slack/Discord channel id."
     )]
     fn channel_send(
         &self,

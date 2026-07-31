@@ -261,7 +261,7 @@ mcp__flare__tool(action="execute", server="leanctx", tool="ctx_read", args={"pat
 ### `channel_send`
 
 Send a text message to Telegram, Slack, or Discord. The bot token must already be
-stored as the vault secret `<platform>_bot_token` (see `agentflare vault set`).
+stored as the vault secret `<platform>_bot_token` (see `agentflare vault set <platform>_bot_token`).
 
 ```text
 mcp__flare__channel_send(platform="slack", target="C0123456", message="build is green")

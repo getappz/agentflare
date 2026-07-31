@@ -1,7 +1,7 @@
 use clap::{Args, Subcommand};
 
 /// Send messages out to chat platforms (Telegram / Slack / Discord). Bot tokens
-/// are read from the encrypted vault (`agentflare vault set`).
+/// are read from the encrypted vault (`agentflare vault set <platform>_bot_token`).
 #[derive(Args)]
 pub struct ChannelArgs {
     #[command(subcommand)]
