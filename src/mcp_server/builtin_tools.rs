@@ -48,7 +48,7 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "channel_send",
-        "Send a text message out to a chat platform (telegram, slack, or discord). The bot token must already be stored as the gateway secret '<platform>_bot_token'.",
+        "Send a text message out to a chat platform (telegram, slack, or discord). The bot token must already be stored as the vault secret '<platform>_bot_token' (agentflare vault set).",
     ),
     (
         "claim",

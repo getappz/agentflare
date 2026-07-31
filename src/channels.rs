@@ -173,7 +173,7 @@ pub fn send_message(platform: Platform, target: &str, text: &str) -> Result<(), 
         .map_err(|e| e.to_string())?
         .ok_or_else(|| {
             format!(
-                "no {name} configured — store the bot token as the gateway secret '{name}' first"
+                "no {name} configured — store the bot token with 'agentflare vault set {name}' first"
             )
         })?;
     let req = build_request(platform, target, text, &token);

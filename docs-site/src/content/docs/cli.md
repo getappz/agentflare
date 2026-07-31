@@ -373,22 +373,27 @@ Actions: `backup`, `activate [--reload-daemon]`, `status [agent]`, `catalog`, `l
 ### `agentflare vault <action>`
 
 Local encrypted secret vault (separate from `auth`'s per-agent profile store) — used to
-unlock a session passphrase and cache the derived key.
+unlock a session passphrase, cache the derived key, and manage stored secrets (e.g. bot
+tokens for `channel send`). Values for `set` are always read from stdin, never a CLI
+argument, so they never land in shell history; `list` only ever prints names.
 
 ```bash
 agentflare vault unlock
 agentflare vault lock
 agentflare vault env
+echo "$SLACK_BOT_TOKEN" | agentflare vault set slack_bot_token
+agentflare vault list
+agentflare vault remove slack_bot_token
 ```
 
 Actions: `unlock [--stdin]`, `lock`, `env` (prints vault env vars for the current
-project).
+project), `set <name>`, `list`, `remove <name>`.
 
-### `agentflare gateway secret <action>`
+### `agentflare gateway secret <action>` (deprecated)
 
-Manage secrets in the flare gateway's downstream MCP server registry (e.g. bot tokens
-for `channel send`). Values are always read from stdin, never a CLI argument, so they
-never land in shell history.
+Alias for `agentflare vault set|list|remove`, kept for backward compatibility. Prefer
+`agentflare vault` directly — secret management lives there now so there's one place to
+manage vault secrets instead of two.
 
 ```bash
 echo "$SLACK_BOT_TOKEN" | agentflare gateway secret set slack_bot_token
