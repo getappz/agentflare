@@ -446,7 +446,11 @@ async fn jobs_events_handler(
 /// as SSE `data:` events. Once the job reaches a terminal state
 /// (exited/failed/killed), any remaining buffered content is flushed, a
 /// final `event: done\ndata:` frame is sent, and the stream closes.
-async fn jobs_stream_handler(State(queue): State<Queue>, Path(id): Path<String>) -> Response {
+async fn jobs_stream_handler(
+    State(queue): State<Queue>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     // 404 on unknown id before spawning anything.
     let exists = tokio::task::spawn_blocking({
         let queue = queue.clone();
@@ -459,11 +463,21 @@ async fn jobs_stream_handler(State(queue): State<Queue>, Path(id): Path<String>)
         return (StatusCode::NOT_FOUND, "job not found").into_response();
     }
     let stdout_path = queue.log_dir().join(format!("{id}.stdout"));
+    // Browsers auto-reconnect a dropped EventSource and resend the last
+    // `Last-Event-ID` header; without honoring it, a reconnect (idle proxy
+    // timeout, tab suspend, network blip) restarts the tail at byte 0 and
+    // the client's `detailOutput += e.data` re-appends the whole log,
+    // making it look like the full log streaming in a loop.
+    let initial_offset: u64 = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
     let (tx, rx) =
         tokio::sync::mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
-        let mut offset: u64 = 0;
+        let mut offset: u64 = initial_offset;
         let mut file: Option<std::fs::File> = None;
         loop {
             interval.tick().await;
@@ -515,7 +529,10 @@ async fn jobs_stream_handler(State(queue): State<Queue>, Path(id): Path<String>)
                         // from the live view instead of showing a stray
                         // replacement char at the boundary.
                         let text = String::from_utf8_lossy(&buf).into_owned();
-                        if tx.send(Ok(Event::default().data(text))).is_err() {
+                        if tx
+                            .send(Ok(Event::default().data(text).id(offset.to_string())))
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -902,6 +919,81 @@ mod tests {
         assert!(
             all_text.contains("hello from job"),
             "expected stdout content in stream, got: {all_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jobs_stream_endpoint_resumes_from_last_event_id() {
+        // Regression: a browser's EventSource auto-reconnects a dropped
+        // stream and resends the last `Last-Event-ID` it saw. Before this
+        // fix the handler always started tailing at byte 0 on every new
+        // connection, so a reconnect (idle proxy timeout, tab suspend, a
+        // brief network blip) re-streamed the entire log from the start —
+        // and since the client appends rather than replaces, it looked
+        // like the log was replaying in a loop. Honoring `Last-Event-ID`
+        // as a starting byte offset means a reconnect only receives bytes
+        // after that offset.
+        use tokio_stream::StreamExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::open_memory(dir.path().join("logs")).unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let job = agentflare_jobs::AgentJob::new("echo").arg("hello from job");
+        let info = queue.enqueue(&job).unwrap();
+        let id = info.id.clone();
+        let log_dir = queue.log_dir().to_path_buf();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let stdout_path = log_dir.join(format!("{id}.stdout"));
+        let content = b"hello from job\n";
+        std::fs::write(&stdout_path, content).unwrap();
+        let output = agentflare_jobs::JobOutput {
+            exit_code: Some(0),
+            timed_out: false,
+            stdout_path: stdout_path.clone(),
+            stderr_path: log_dir.join(format!("{id}.stderr")),
+            stdout_total_bytes: content.len() as u64,
+            stderr_total_bytes: 0,
+        };
+        queue.complete(&id, &output, true).unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router(queue)).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Simulate a browser reconnect after it already saw the first 6
+        // bytes ("hello ").
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/api/jobs/{id}/stream"))
+            .header("Last-Event-ID", "6")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut stream = resp.bytes_stream();
+        let mut all_text = String::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    all_text.push_str(&String::from_utf8_lossy(&chunk));
+                    if all_text.contains("event: done") {
+                        break;
+                    }
+                }
+                Ok(Some(Err(_))) => break,
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            all_text.contains("from job"),
+            "expected the remaining stdout content in stream, got: {all_text}"
+        );
+        assert!(
+            !all_text.contains("hello from job"),
+            "resumed stream should not re-send bytes already covered by Last-Event-ID, got: {all_text}"
         );
     }
 
