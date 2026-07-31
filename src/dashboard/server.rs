@@ -995,6 +995,14 @@ mod tests {
             !all_text.contains("hello from job"),
             "resumed stream should not re-send bytes already covered by Last-Event-ID, got: {all_text}"
         );
+        assert!(
+            all_text.contains(&format!("id: {}", content.len())),
+            "expected the resumed event to publish its cumulative byte offset, got: {all_text}"
+        );
+        assert!(
+            all_text.contains("data: from job") && !all_text.contains("data:  from job"),
+            "expected stdout to resume exactly at byte offset 6, not one byte early/late, got: {all_text}"
+        );
     }
 
     #[tokio::test]
