@@ -39,7 +39,7 @@ const GITHUB: GatewayIntegration = GatewayIntegration {
 fn github_post_note() -> Vec<String> {
     let bin = crate::paths::agentflare_binary();
     vec![
-        format!("  next  store your token:  {bin} gateway secret set github_token"),
+        format!("  next  store your token:  {bin} vault set github_token"),
         "  next    then paste:  Bearer ghp_<your-token>   ('Bearer ' prefix required)".to_string(),
     ]
 }
