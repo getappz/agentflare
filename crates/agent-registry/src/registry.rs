@@ -72,6 +72,20 @@ pub fn canonicalize(name: &str) -> String {
     }
 }
 
+/// Resolves a user-typed agent name to its canonical `Agent`, accepting the
+/// same aliases `canonicalize` does (e.g. `"claude"` -> `ClaudeCode`). The
+/// one place every agent-name-string entry point (`--agent`, an item's
+/// `assignee_agent`, a router config's `default`/`use`) should resolve
+/// through, so an alias behaves identically no matter which one it came in.
+#[must_use]
+pub fn agent_by_name(name: &str) -> Option<Agent> {
+    let canonical = canonicalize(name);
+    REGISTRY
+        .iter()
+        .find(|s| s.id.as_str() == canonical)
+        .map(|s| s.id)
+}
+
 /// `Cli`-tier agents ship a standalone binary and are eligible for
 /// PATH-based detection (this ticket) and, later, install/launch.
 /// `Extension`-tier agents are editor-embedded (VS Code extensions) with no
@@ -421,5 +435,13 @@ mod tests {
         assert_eq!(canonicalize("  CLAUDE-CODE-CLI  "), "claude-code");
         assert_eq!(canonicalize("codex"), "codex");
         assert_eq!(canonicalize("some-unknown-agent"), "some-unknown-agent");
+    }
+
+    #[test]
+    fn agent_by_name_resolves_aliases_same_as_canonicalize() {
+        assert_eq!(agent_by_name("claude"), Some(Agent::ClaudeCode));
+        assert_eq!(agent_by_name("Claude Code"), Some(Agent::ClaudeCode));
+        assert_eq!(agent_by_name("codex"), Some(Agent::Codex));
+        assert_eq!(agent_by_name("not-a-real-agent"), None);
     }
 }

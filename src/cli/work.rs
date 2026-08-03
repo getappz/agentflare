@@ -12,9 +12,8 @@ pub struct WorkArgs {
     /// Item UUID or numeric sequence id.
     pub target: String,
     /// Agent to run (e.g. claude-code, codex, gemini-cli). Omit to let
-    /// agentflare route automatically from the claimed item — today that
-    /// only means "use the item's own assignee_agent, if it names one";
-    /// user-configured rules land once #331's config surface exists.
+    /// agentflare route automatically from the claimed item's assignee_agent
+    /// and any `~/.agentflare/config.toml` `[router]` rules.
     #[arg(long)]
     pub agent: Option<String>,
     /// Headless run timeout in seconds (default 1800 = 30 min).
@@ -142,23 +141,27 @@ fn build_extra_args(
     args
 }
 
-fn agent_by_name(name: &str) -> Option<agent_registry::Agent> {
-    agent_registry::REGISTRY
-        .iter()
-        .find(|s| s.id.as_str() == name)
-        .map(|s| s.id)
-}
-
 /// `~/.agentflare/config.toml`'s `[router]` table, or the empty config
 /// (no rules, no default) when the file is missing — the common case until
-/// #331 (unified config) lands and someone actually writes one. A file that
-/// exists but fails to parse is a real misconfiguration, so that one prints
-/// a warning rather than staying silent; either way `agentflare work`
-/// degrades to requiring `--agent` instead of crashing over a bad file.
+/// someone actually writes one. A file that exists but can't be read (e.g.
+/// a permission error) or fails to parse is a real misconfiguration, so
+/// those print a warning rather than staying silent; either way
+/// `agentflare work` degrades to requiring `--agent` instead of crashing
+/// over a bad file.
 fn load_router_config() -> agent_registry::RouterConfig {
     let path = crate::paths::home().join(".agentflare").join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return agent_registry::RouterConfig::default();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return agent_registry::RouterConfig::default();
+        }
+        Err(e) => {
+            crate::ui::warning(&format!(
+                "{}: could not read config ({e}) — ignoring, pass --agent explicitly",
+                path.display()
+            ));
+            return agent_registry::RouterConfig::default();
+        }
     };
     match agent_registry::parse_router_config(&text) {
         Ok(config) => config,
@@ -172,9 +175,11 @@ fn load_router_config() -> agent_registry::RouterConfig {
     }
 }
 
-/// Resolves which agent runs this item. An explicit `--agent` always wins;
-/// otherwise `agent_registry::route` decides from the item's own attributes
-/// against `config` (`~/.agentflare/config.toml`'s `[router]` table, via
+/// Resolves which agent runs this item, and why — the reason is printed so
+/// an unexpected pick is self-explaining rather than just a bare agent
+/// name. An explicit `--agent` always wins; otherwise `agent_registry::route`
+/// decides from the item's own attributes against `config`
+/// (`~/.agentflare/config.toml`'s `[router]` table, via
 /// [`load_router_config`] — empty until that file exists). Even with no
 /// rules configured, the item's own `assignee_agent` can still produce a
 /// decision — a human already named one; everything else falls through to
@@ -185,17 +190,17 @@ fn resolve_agent(
     labels: &[String],
     config: &agent_registry::RouterConfig,
     installed: &[agent_registry::Agent],
-) -> Result<agent_registry::Agent, String> {
+) -> Result<(agent_registry::Agent, String), String> {
     if let Some(name) = explicit {
-        return agent_by_name(name)
+        return agent_registry::agent_by_name(name)
+            .map(|agent| (agent, "explicit --agent flag".to_string()))
             .ok_or_else(|| format!("unknown agent: {name} — use `agentflare agents list`"));
     }
 
     let assigned_agent = item
         .assignee_agent
         .as_deref()
-        .map(agent_registry::canonicalize)
-        .and_then(|name| agent_by_name(&name));
+        .and_then(agent_registry::agent_by_name);
     let task = agent_registry::TaskContext {
         labels: labels.to_vec(),
         kind: crate::mcp_server::item::parsed_kind(&item.metadata),
@@ -204,7 +209,7 @@ fn resolve_agent(
         assigned_agent,
     };
     agent_registry::route(&task, config, installed)
-        .map(|decision| decision.agent)
+        .map(|decision| (decision.agent, decision.reason))
         .ok_or_else(|| {
             "no --agent given, and no route decision (item has no assignee and no router \
              rule matched) — pass --agent explicitly"
@@ -267,10 +272,12 @@ fn run_work(args: WorkArgs) -> i32 {
     let mcp = AgentflareMcp::default();
     let timeout = Duration::from_secs(args.timeout);
 
-    // An explicit --agent fails fast, before claiming anything. Auto-routing
-    // needs the claimed item's own attributes, so it's resolved further down.
+    // An explicit --agent fails fast, before claiming anything, through the
+    // same resolver `resolve_agent` uses further down post-claim — so this
+    // check and the real resolution can never diverge. Auto-routing needs
+    // the claimed item's own attributes, so it's resolved further down.
     if let Some(explicit) = args.agent.as_deref()
-        && agent_by_name(explicit).is_none()
+        && agent_registry::agent_by_name(explicit).is_none()
     {
         crate::ui::error(&format!(
             "unknown agent: {explicit} — use `agentflare agents list`"
@@ -342,9 +349,9 @@ fn run_work(args: WorkArgs) -> i32 {
     };
 
     // --- Resolve agent (explicit flag, else route from the item) ---
-    let agent_enum = if let Some(explicit) = args.agent.as_deref() {
-        agent_by_name(explicit).expect("checked above before claiming")
-    } else {
+    // Only pay for detecting installed agents / loading the router config
+    // when there's no explicit --agent to short-circuit resolve_agent with.
+    let (installed, router_config) = if args.agent.is_none() {
         let mut state = crate::state::load();
         let installed: Vec<agent_registry::Agent> = agent_registry::detect_all_with(
             agent_registry::REGISTRY,
@@ -352,17 +359,25 @@ fn run_work(args: WorkArgs) -> i32 {
             &agent_registry::RealVersionRunner,
         )
         .iter()
-        .filter_map(|d| agent_by_name(d.id))
+        .filter_map(|d| agent_registry::agent_by_name(d.id))
         .collect();
         crate::state::save(&state);
-        let router_config = load_router_config();
-        match resolve_agent(None, &item_detail, &labels, &router_config, &installed) {
-            Ok(a) => a,
-            Err(msg) => {
-                release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
-                crate::ui::error(&msg);
-                return 1;
-            }
+        (installed, load_router_config())
+    } else {
+        (Vec::new(), agent_registry::RouterConfig::default())
+    };
+    let (agent_enum, route_reason) = match resolve_agent(
+        args.agent.as_deref(),
+        &item_detail,
+        &labels,
+        &router_config,
+        &installed,
+    ) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
+            crate::ui::error(&msg);
+            return 1;
         }
     };
     if headless_args(agent_enum).is_none() {
@@ -371,7 +386,7 @@ fn run_work(args: WorkArgs) -> i32 {
         crate::ui::error(&msg);
         return 1;
     }
-    println!("agent: {}", agent_enum.as_str());
+    println!("agent: {} ({route_reason})", agent_enum.as_str());
 
     let prompt = build_prompt(&item_detail, &comments);
 
@@ -533,8 +548,19 @@ mod tests {
         let mut item = test_item();
         item.assignee_agent = Some("opencode".to_string());
         let config = agent_registry::RouterConfig::default();
-        let resolved = resolve_agent(Some("codex"), &item, &[], &config, &[]).unwrap();
-        assert_eq!(resolved, agent_registry::Agent::Codex);
+        let (agent, reason) = resolve_agent(Some("codex"), &item, &[], &config, &[]).unwrap();
+        assert_eq!(agent, agent_registry::Agent::Codex);
+        assert_eq!(reason, "explicit --agent flag");
+    }
+
+    #[test]
+    fn resolve_agent_explicit_flag_accepts_an_alias() {
+        // "claude" isn't a registry id, canonicalize() maps it to claude-code
+        // — the explicit path must accept it the same as assignee_agent does.
+        let item = test_item();
+        let config = agent_registry::RouterConfig::default();
+        let (agent, _) = resolve_agent(Some("claude"), &item, &[], &config, &[]).unwrap();
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
     }
 
     #[test]
@@ -548,10 +574,11 @@ mod tests {
     #[test]
     fn resolve_agent_falls_back_to_the_items_own_assignee() {
         let mut item = test_item();
-        item.assignee_agent = Some("claude".to_string()); // alias, canonicalize() maps it
+        item.assignee_agent = Some("claude".to_string()); // alias, agent_by_name() maps it
         let config = agent_registry::RouterConfig::default();
-        let resolved = resolve_agent(None, &item, &[], &config, &[]).unwrap();
-        assert_eq!(resolved, agent_registry::Agent::ClaudeCode);
+        let (agent, reason) = resolve_agent(None, &item, &[], &config, &[]).unwrap();
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+        assert_eq!(reason, "explicit assignment on task");
     }
 
     #[test]
@@ -582,7 +609,7 @@ use  = "opencode"
 "#,
         )
         .unwrap();
-        let resolved = resolve_agent(
+        let (agent, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -590,7 +617,7 @@ use  = "opencode"
             &[agent_registry::Agent::Opencode],
         )
         .unwrap();
-        assert_eq!(resolved, agent_registry::Agent::Opencode);
+        assert_eq!(agent, agent_registry::Agent::Opencode);
     }
 
     #[test]
@@ -606,7 +633,7 @@ use  = "opencode"
 "#,
         )
         .unwrap();
-        let resolved = resolve_agent(
+        let (agent, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -614,7 +641,7 @@ use  = "opencode"
             &[agent_registry::Agent::Opencode],
         )
         .unwrap();
-        assert_eq!(resolved, agent_registry::Agent::Opencode);
+        assert_eq!(agent, agent_registry::Agent::Opencode);
     }
 
     #[test]

@@ -2,11 +2,12 @@
 // (which agents exist, which are installed, how to run one) didn't have.
 //
 // Distinct from `optimize::runtime::Router` in the main crate, which returns
-// a prose nudge for a single LLM call from prompt text. This one returns a
-// `RouteDecision` for a claimed task from task attributes (labels, kind,
-// size) — durable and inspectable, unlike prompt wording. Named `TaskRouter`
-// rather than `Router` so the two don't collide.
-use crate::registry::Agent;
+// a prose nudge for a single LLM call from prompt text. This one's `route()`
+// returns a `RouteDecision` for a claimed task from task attributes (labels,
+// kind, size) — durable and inspectable, unlike prompt wording. Named
+// `TaskContext`/`RouteDecision`/`RouterConfig` rather than reusing
+// `Router`/`RouteContext` so the two don't collide.
+use crate::registry::{Agent, agent_by_name};
 
 /// Attributes of a claimed task available to route on.
 #[derive(Debug, Clone, Default)]
@@ -54,9 +55,14 @@ impl RuleMatch {
                 .iter()
                 .any(|have| have.eq_ignore_ascii_case(want))
         });
-        let kind_ok = self.kind.is_none() || self.kind.as_deref() == task.kind.as_deref();
-        let size_ok = self.size.is_none() || self.size.as_deref() == task.size.as_deref();
-        labels_ok && kind_ok && size_ok
+        let matches_field = |want: &Option<String>, have: &Option<String>| {
+            want.is_none()
+                || match (want, have) {
+                    (Some(w), Some(h)) => w.eq_ignore_ascii_case(h),
+                    _ => false,
+                }
+        };
+        labels_ok && matches_field(&self.kind, &task.kind) && matches_field(&self.size, &task.size)
     }
 }
 
@@ -72,13 +78,6 @@ pub struct RouterRule {
 pub struct RouterConfig {
     pub default: Option<Agent>,
     pub rules: Vec<RouterRule>,
-}
-
-fn agent_by_str(name: &str) -> Option<Agent> {
-    crate::registry::REGISTRY
-        .iter()
-        .find(|s| s.id.as_str() == name)
-        .map(|s| s.id)
 }
 
 /// A single string or an array of strings — TOML doesn't have a "one or
@@ -149,7 +148,7 @@ pub fn parse_router_config(text: &str) -> Result<RouterConfig, String> {
     let Some(raw) = file.router else {
         return Ok(RouterConfig::default());
     };
-    let default = raw.default.as_deref().and_then(agent_by_str);
+    let default = raw.default.as_deref().and_then(agent_by_name);
     let rules = raw
         .rule
         .into_iter()
@@ -163,7 +162,7 @@ pub fn parse_router_config(text: &str) -> Result<RouterConfig, String> {
                 .use_agents
                 .into_vec()
                 .iter()
-                .filter_map(|s| agent_by_str(s))
+                .filter_map(|s| agent_by_name(s))
                 .collect(),
         })
         .collect();
@@ -176,10 +175,16 @@ pub fn parse_router_config(text: &str) -> Result<RouterConfig, String> {
 /// Precedence, most specific first: explicit assignment on the task beats
 /// every rule; the first matching rule with an installed preference beats
 /// the default; the default only fires if it is itself installed.
-/// `installed` (`detect_all()`'s output, by agent id) is the sole authority
-/// on availability — a rule or default naming something not installed falls
-/// through rather than hard-failing or silently picking whatever the caller
-/// didn't ask for.
+/// `installed` (`detect_all()`'s output, by agent id) is the authority on
+/// availability for rules and the default — either falls through rather
+/// than hard-failing or silently picking whatever the caller didn't ask
+/// for, if the name they resolve to isn't installed. Explicit assignment is
+/// the one exception: "a human naming an agent always wins" means it is
+/// returned without an `installed` check, on the theory that a person who
+/// named an agent knows something the detector doesn't (e.g. it's about to
+/// be installed) — an assignment that's wrong instead fails downstream
+/// (e.g. `run_headless`'s `NotFound`) with a clearer error than a silent
+/// route-level `None` would give.
 #[must_use]
 pub fn route(
     task: &TaskContext,
@@ -234,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_assignment_wins_over_everything() {
+    fn explicit_assignment_wins_over_everything_even_when_not_installed() {
         let task = TaskContext {
             assigned_agent: Some(Agent::Codex),
             ..Default::default()
@@ -243,6 +248,8 @@ mod tests {
             default: Some(Agent::ClaudeCode),
             rules: vec![rule(&[], &[Agent::Opencode])],
         };
+        // Codex is deliberately absent from `installed` here: an explicit
+        // assignment is the one path that bypasses the installed check.
         let decision = route(&task, &config, &[Agent::ClaudeCode]).unwrap();
         assert_eq!(decision.agent, Agent::Codex);
         assert_eq!(decision.reason, "explicit assignment on task");

@@ -1044,4 +1044,10 @@ mod metadata_field_tests {
         assert_eq!(parsed_size(r#"{"size":"XL"}"#), None);
         assert_eq!(parsed_size(r#"{"size":"M"}"#), Some("M".to_string()));
     }
+
+    #[test]
+    fn parsed_size_survives_double_encoded_metadata() {
+        let metadata = double_encoded(serde_json::json!({"size": "S"}));
+        assert_eq!(parsed_size(&metadata), Some("S".to_string()));
+    }
 }
