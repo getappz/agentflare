@@ -28,7 +28,6 @@ pub struct Ctx {
 pub struct TickReport {
     pub claimed: Vec<u64>,
     pub ceded: Vec<u64>,
-    pub imported: Vec<u64>,
     pub exported: Vec<u64>,
 }
 
@@ -108,6 +107,12 @@ fn run_inner(
         let Some(item) = items::find_by_issue(conn, &ctx.project_id, issue.number) else {
             continue;
         };
+        // Already cancelled or completed locally: skip, or a ceded item gets
+        // re-ceded (and re-spams the issue with a "ceding this" comment)
+        // every tick, forever — nothing else claims it after we cede once.
+        if !items::is_active(conn, &item) {
+            continue;
+        }
         let comments = comment_pairs(ctx, issue.number)?;
         if claim_rules::i_hold(&comments, &ctx.config.instance_id, now, ctx.config.ttl_secs) {
             continue;
@@ -154,7 +159,10 @@ fn items_tracked(conn: &rusqlite::Connection, ctx: &Ctx) -> Vec<agentflare_backe
         .unwrap_or_default()
         .into_iter()
         .filter(|i| i.external_source.as_deref() == Some(items::EXTERNAL_SOURCE))
-        .filter(|i| i.completed_at.is_none())
+        // Not `completed_at.is_none()`: cancelling never sets `completed_at`
+        // (see `items::is_active`), so that alone would count ceded items
+        // toward capacity forever. Filter on state group instead.
+        .filter(|i| items::is_active(conn, i))
         .collect()
 }
 
@@ -522,6 +530,145 @@ mod tests {
         let report = run_once(&ctx, &conn, NOW).unwrap();
         assert!(report.claimed.is_empty());
         let _ = server.requests();
+    }
+
+    #[test]
+    fn second_tick_after_a_cede_does_not_re_cede() {
+        // Regression guard for the "ceded items are re-ceded forever" bug:
+        // step 1 must skip items already moved to the `cancelled` group, or
+        // the second tick posts a duplicate "is ceding this" comment.
+        let issue = r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}]}]"#;
+        let server = MockServer::start(vec![
+            // tick 1: queue listing
+            MockResponse::json(200, issue),
+            // tick 1: comments on #7 — nobody holds it live, so we cede
+            MockResponse::json(200, "[]"),
+            // tick 1: cede's comment post
+            MockResponse::json(201, r#"{"id":200}"#),
+            // tick 2: queue listing only — no comments GET, no cede POST
+            MockResponse::json(200, issue),
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+
+        // Seed a locally-held item already linked to issue #7, with its
+        // export hash already in sync — as if a prior tick had already
+        // exported it — so tick 2's export step is a no-op and consumes no
+        // extra mock responses, keeping this test focused on the cede path.
+        let state = items::state_id_for_group(&conn, &project_id, "started").unwrap();
+        let hash = content_hash("t", "", "open", &["agentflare".to_string()]);
+        let metadata = format!(
+            r#"{{"github_last_hash":{}}}"#,
+            serde_json::to_string(&hash).unwrap()
+        );
+        agentflare_backend::item::create(
+            &conn,
+            agentflare_backend::item::CreateItem {
+                project_id: project_id.clone(),
+                state_id: state,
+                name: "t".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: Some(items::EXTERNAL_SOURCE.to_string()),
+                external_id: Some("7".into()),
+                metadata: Some(metadata),
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        let first = run_once(&ctx, &conn, NOW).unwrap();
+        assert_eq!(first.ceded, vec![7], "first tick must cede the lost claim");
+
+        let second = run_once(&ctx, &conn, NOW).unwrap();
+        assert!(
+            second.ceded.is_empty(),
+            "a second tick must not re-cede an already-cancelled item"
+        );
+        let _ = server.requests();
+    }
+
+    #[test]
+    fn a_ceded_item_does_not_count_toward_held_capacity() {
+        // Regression guard for the "cancelled items permanently consume
+        // capacity" bug: `held_count` must exclude `cancelled`-group items,
+        // not merely filter on `completed_at` (cancelling never sets it).
+        let server = MockServer::start(vec![
+            MockResponse::json(201, r#"{"id":1}"#), // cede's comment post
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+
+        let state = items::state_id_for_group(&conn, &project_id, "started").unwrap();
+        let item = agentflare_backend::item::create(
+            &conn,
+            agentflare_backend::item::CreateItem {
+                project_id: project_id.clone(),
+                state_id: state,
+                name: "t".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: Some(items::EXTERNAL_SOURCE.to_string()),
+                external_id: Some("7".into()),
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        cede(&ctx, &conn, 7, &item, NOW).unwrap();
+
+        assert_eq!(
+            held_count(&conn, &ctx),
+            0,
+            "a ceded item must not consume claim capacity"
+        );
+        let _ = server.requests();
+    }
+
+    #[test]
+    fn a_completed_item_does_not_count_toward_held_capacity() {
+        let server = MockServer::start(vec![]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+
+        let state = items::state_id_for_group(&conn, &project_id, "completed").unwrap();
+        agentflare_backend::item::create(
+            &conn,
+            agentflare_backend::item::CreateItem {
+                project_id: project_id.clone(),
+                state_id: state,
+                name: "t".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: Some(items::EXTERNAL_SOURCE.to_string()),
+                external_id: Some("7".into()),
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            held_count(&conn, &ctx),
+            0,
+            "a completed item must not consume claim capacity"
+        );
     }
 
     fn test_ctx(server: &MockServer, max_claims: usize) -> Ctx {

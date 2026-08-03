@@ -65,6 +65,23 @@ pub fn state_id_for_group(
         .map(|s| s.id)
 }
 
+/// Whether `item` is still actively held, as opposed to locally cancelled (or
+/// completed) but still linked to its issue.
+///
+/// Moving an item to the `cancelled` state group does not set
+/// `completed_at` — only the `started`/`completed` groups touch timestamps
+/// (`agentflare_backend::item::update_state`) — so `completed_at.is_none()`
+/// alone cannot distinguish "actively held" from "ceded, still linked".
+/// This checks the item's actual state group instead, which is the only
+/// reliable signal. Unresolvable state (e.g. deleted) fails open as active,
+/// matching the pre-existing behavior of treating every linked item as live.
+#[allow(dead_code)] // consumer arrives in a later bridge task
+pub fn is_active(conn: &rusqlite::Connection, item: &Item) -> bool {
+    agentflare_backend::state::get(conn, &item.state_id)
+        .map(|s| !matches!(s.group_name.as_str(), "cancelled" | "completed"))
+        .unwrap_or(true)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
