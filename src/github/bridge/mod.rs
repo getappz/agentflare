@@ -10,5 +10,6 @@ pub mod tick;
 
 #[cfg(test)]
 mod tests {
+    mod live_github;
     mod two_instance;
 }

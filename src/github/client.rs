@@ -75,6 +75,24 @@ impl Client {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, GitHubError> {
+        self.request_with_accept(method, path, body, "application/vnd.github+json")
+    }
+
+    /// `request`, with the `Accept` media type chosen by the caller.
+    ///
+    /// GitHub uses `Accept` to select a representation, not just a format:
+    /// `application/vnd.github.html+json` adds `body_html`, the comment as it
+    /// is actually RENDERED. The live-GitHub verification test needs that to
+    /// confirm the bridge's marker stays invisible to humans — something the
+    /// default representation, which only echoes back what we wrote, cannot
+    /// answer.
+    pub fn request_with_accept(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+        accept: &str,
+    ) -> Result<serde_json::Value, GitHubError> {
         if method != "GET" && self.token.is_none() {
             return Err(GitHubError::NoAuth(
                 crate::github::auth::NO_AUTH_MSG.to_string(),
@@ -85,7 +103,7 @@ impl Client {
             .agent
             .request(method, &url)
             .set("User-Agent", "agentflare")
-            .set("Accept", "application/vnd.github+json")
+            .set("Accept", accept)
             .set("X-GitHub-Api-Version", "2022-11-28");
         if let Some(tok) = &self.token {
             req = req.set("Authorization", &format!("Bearer {tok}"));

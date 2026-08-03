@@ -174,6 +174,34 @@ pub fn add_labels(
     Ok(())
 }
 
+/// Deletes a comment. Like [`remove_label`], an already-absent target is
+/// treated as success. Repo-scoped comment id, same as [`update_comment`].
+///
+/// Test-gated: the bridge never deletes anything in production — it only
+/// appends and edits, so its history stays auditable. This exists so the
+/// live-GitHub harness can reset a scratch repo between runs. Drop the
+/// `cfg(test)` if a production caller ever needs it.
+#[cfg(test)]
+pub fn delete_comment(client: &Client, repo: &RepoId, comment_id: u64) -> Result<(), GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/issues/comments/{comment_id}",
+        repo.owner, repo.repo
+    );
+    match client.request("DELETE", &path, None) {
+        Ok(_) | Err(GitHubError::NotFound) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Reopens a closed issue — the inverse of [`close`]. Test-gated for the same
+/// reason as [`delete_comment`]: the bridge closes issues, never reopens them.
+#[cfg(test)]
+pub fn reopen(client: &Client, repo: &RepoId, number: u64) -> Result<Issue, GitHubError> {
+    let path = format!("/repos/{}/{}/issues/{number}", repo.owner, repo.repo);
+    let json = client.request("PATCH", &path, Some(serde_json::json!({ "state": "open" })))?;
+    serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
+}
+
 /// Removes one label. A label that is not on the issue answers 404, which
 /// callers generally want to treat as success — the desired end state holds
 /// either way.
@@ -278,6 +306,30 @@ mod tests {
         assert_eq!(reqs[0].path, "/repos/o/r/issues/4/comments");
         let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
         assert_eq!(sent["body"], "hi");
+    }
+
+    #[test]
+    fn delete_comment_and_reopen_hit_the_right_endpoints() {
+        let server = MockServer::start(vec![
+            MockResponse::json(204, ""),
+            MockResponse::json(404, r#"{"message":"Not Found"}"#),
+            MockResponse::json(
+                200,
+                r#"{"number":4,"html_url":"u","state":"open","title":"t"}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+
+        delete_comment(&client, &repo(), 9).unwrap();
+        delete_comment(&client, &repo(), 9).expect("an already-deleted comment is success");
+        assert_eq!(reopen(&client, &repo(), 4).unwrap().state, "open");
+
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "DELETE");
+        assert_eq!(reqs[0].path, "/repos/o/r/issues/comments/9");
+        assert_eq!(reqs[2].method, "PATCH");
+        let sent: serde_json::Value = serde_json::from_str(&reqs[2].body).unwrap();
+        assert_eq!(sent["state"], "open");
     }
 
     #[test]
