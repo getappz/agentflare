@@ -46,19 +46,33 @@ fn random_instance() -> String {
     hex::encode(bytes)
 }
 
+/// How long a loser of the create race waits for the winner to finish
+/// writing. Generously long for a few bytes to a local file; the only way to
+/// exhaust it is a process that died between creating the file and filling
+/// it, which is a real (if rare) state and reported rather than papered over.
+const INSTANCE_ID_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn stored_instance(path: &Path) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
 /// Reads the persisted instance discriminator, minting and storing one on
 /// first use. Kept pure over `path` so tests need no home override.
 ///
 /// `create_new` rather than a plain write: two agentflare processes starting
 /// at once must converge on ONE id, so the loser of the create race reads the
 /// winner's value instead of overwriting it with its own.
+///
+/// The loser then has to WAIT. `create_new` publishes the file the instant it
+/// is created, which is before the winner has written anything into it, so a
+/// loser that reads immediately sees an empty file and concludes the id is
+/// unusable. That window is microseconds wide and was duly caught by the
+/// concurrency test rather than in production, where the fallback would have
+/// been a pid-derived id and a scary warning on a perfectly healthy machine.
 fn read_or_create_instance(path: &Path) -> std::io::Result<String> {
-    let stored = |p: &Path| -> Option<String> {
-        let s = std::fs::read_to_string(p).ok()?;
-        let t = s.trim();
-        (!t.is_empty()).then(|| t.to_string())
-    };
-    if let Some(existing) = stored(path) {
+    if let Some(existing) = stored_instance(path) {
         return Ok(existing);
     }
     if let Some(parent) = path.parent() {
@@ -72,14 +86,25 @@ fn read_or_create_instance(path: &Path) -> std::io::Result<String> {
     {
         Ok(mut f) => {
             f.write_all(fresh.as_bytes())?;
+            f.sync_all()?;
             Ok(fresh)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => stored(path).ok_or_else(|| {
-            std::io::Error::other(format!(
-                "{} exists but is empty; delete it to re-mint",
-                path.display()
-            ))
-        }),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let deadline = std::time::Instant::now() + INSTANCE_ID_WRITE_WAIT;
+            loop {
+                if let Some(existing) = stored_instance(path) {
+                    return Ok(existing);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::other(format!(
+                        "{} exists but is still empty after {INSTANCE_ID_WRITE_WAIT:?} — \
+                         a process probably died mid-write; delete it to re-mint",
+                        path.display()
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
         Err(e) => Err(e),
     }
 }
@@ -240,33 +265,51 @@ mod tests {
 
     #[test]
     fn two_processes_racing_to_create_converge_on_one_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bridge-instance-id");
+        // Repeated, because the window this guards is microseconds wide:
+        // `create_new` publishes the file before the winner has written a
+        // byte into it, so a loser that reads immediately sees it empty. A
+        // single round hits that maybe one time in twenty.
+        for round in 0..25 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bridge-instance-id");
 
-        let ids: Vec<String> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..8)
-                .map(|_| scope.spawn(|| read_or_create_instance(&path).unwrap()))
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
+            let ids: Vec<String> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            read_or_create_instance(&path).unwrap_or_else(|e| {
+                                panic!("round {round}: a racing creator failed: {e}")
+                            })
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
 
-        assert!(
-            ids.windows(2).all(|w| w[0] == w[1]),
-            "concurrent creators must all end up with the file's single id, got {ids:?}"
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), ids[0]);
+            assert!(
+                ids.windows(2).all(|w| w[0] == w[1]),
+                "round {round}: concurrent creators must all end up with the \
+                 file's single id, got {ids:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), ids[0]);
+        }
     }
 
     #[test]
-    fn a_blank_or_whitespace_file_is_re_minted_rather_than_used() {
+    fn a_file_left_empty_by_a_dead_writer_is_reported_not_silently_used() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bridge-instance-id");
         // An empty instance half would render as `agent:` — a marker owner
         // that silently collides with every other blank-file workstation.
         std::fs::write(&path, "   \n").unwrap();
-        // The file exists, so `create_new` fails; with nothing readable in it
-        // this must surface as an error, not an empty owner id.
-        assert!(read_or_create_instance(&path).is_err());
+        // The file exists, so `create_new` fails. Nobody is going to fill it,
+        // so after the write-wait this must surface as an error naming the
+        // file, not an empty owner id.
+        let err = read_or_create_instance(&path).expect_err("must not yield an empty id");
+        assert!(
+            err.to_string().contains("bridge-instance-id"),
+            "the error has to name the file to delete: {err}"
+        );
     }
 
     #[test]

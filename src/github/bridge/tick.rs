@@ -399,6 +399,21 @@ fn record_claim(
         );
     }
 
+    // Seed the export latch with what we just imported. Without this the item
+    // has no stored hash, so the very NEXT tick sees "changed" and posts a
+    // "Progress from …" comment that reports nothing — the item's name and
+    // description were copied from the issue moments earlier. Live-verified:
+    // every claim produced a redundant second comment. A real local edit
+    // still changes the hash and still exports.
+    let imported = export_hash(&created, issue);
+    if let Err(e) = store_hash(conn, &created, &items::with_last_hash(&created, &imported)) {
+        // Not fatal: the cost is one redundant progress comment next tick.
+        eprintln!(
+            "github bridge: could not seed the export hash for #{}: {e}",
+            issue.number
+        );
+    }
+
     issues::add_labels(
         &ctx.client,
         &ctx.repo,
@@ -477,13 +492,51 @@ fn drop_claimed_label(ctx: &Ctx, number: u64) {
     }
 }
 
+/// The issue's labels MINUS the bridge's own `claimed:` bookkeeping.
+///
+/// The hash exists to notice that an issue's CONTENT drifted. A `claimed:`
+/// label is not content — it is something the bridge itself just wrote. Left
+/// in, the sequence is: we claim, we add `claimed:<us>`, and on the very next
+/// tick the hash has "changed", so we post a "Progress from …" comment
+/// reporting our own side effect. That is one junk comment on every issue the
+/// bridge ever claims, and it was live-verified against a real repo before
+/// this filter existed.
+fn content_labels(issue: &Issue) -> Vec<String> {
+    issue
+        .labels
+        .iter()
+        .map(|l| l.name.clone())
+        .filter(|n| !n.starts_with(CLAIMED_LABEL_PREFIX))
+        .collect()
+}
+
 fn issue_hash(issue: &Issue) -> String {
-    let labels: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
     content_hash(
         &issue.title,
         issue.body.as_deref().unwrap_or(""),
         &issue.state,
-        &labels,
+        &content_labels(issue),
+    )
+}
+
+/// The export latch's value for `item` against `issue`.
+///
+/// One definition, because two callers depend on agreeing exactly:
+/// `export_if_dirty` compares against it, and `record_claim` seeds it. If
+/// they computed it differently, every freshly claimed issue would get a
+/// spurious progress comment on its next tick — which is the bug that made
+/// this a shared function.
+fn export_hash(item: &agentflare_backend::item::Item, issue: &Issue) -> String {
+    let local_state = if item.completed_at.is_some() {
+        "closed"
+    } else {
+        "open"
+    };
+    content_hash(
+        &item.name,
+        &item.description,
+        local_state,
+        &content_labels(issue),
     )
 }
 
@@ -502,10 +555,8 @@ fn export_if_dirty(
     item: &agentflare_backend::item::Item,
     now: i64,
 ) -> Result<bool, GitHubError> {
-    let labels: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
     let completed = item.completed_at.is_some();
-    let local_state = if completed { "closed" } else { "open" };
-    let hash = content_hash(&item.name, &item.description, local_state, &labels);
+    let hash = export_hash(item, issue);
 
     if items::last_hash(item).as_deref() == Some(hash.as_str()) {
         return Ok(false);
@@ -1076,6 +1127,62 @@ mod tests {
         assert_eq!(linked[0].id, ceded.id);
         assert!(items::is_active(&conn, &linked[0]), "back to started");
         let _ = server.requests();
+    }
+
+    #[test]
+    fn our_own_claimed_label_does_not_read_as_a_content_change() {
+        // Live-verified defect: claiming adds `claimed:<us>` to the issue,
+        // labels fed the content hash, so the very next tick saw a "change"
+        // and posted "Progress from …" reporting the bridge's own side
+        // effect — one junk comment on every issue it ever claims.
+        let with_claim = r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"},{"name":"claimed:me:1"}]}]"#;
+        let server = MockServer::start(vec![
+            MockResponse::json(200, with_claim),
+            MockResponse::json(
+                200,
+                &one_comment(10, &marker_body(Action::Claim, "me:1", NOW - 10)),
+            ),
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 0), project_id.clone());
+        // Hash stored WITHOUT the claimed: label — i.e. what the claim tick
+        // recorded before the label existed.
+        seed_synced_item(&conn, &project_id, 7, "started");
+
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert!(
+            report.exported.is_empty(),
+            "a `claimed:` label is the bridge's own bookkeeping, not issue \
+             content — it must not trigger an export"
+        );
+        let reqs = server.requests();
+        assert!(
+            reqs.iter().all(|r| r.method == "GET"),
+            "and must cause no writes at all, got {reqs:?}"
+        );
+    }
+
+    #[test]
+    fn a_real_label_change_still_reads_as_a_content_change() {
+        // The guard rail: filtering `claimed:` must not make the hash blind
+        // to labels a HUMAN adds.
+        let relabelled = r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"},{"name":"urgent"}]}]"#;
+        let server = MockServer::start(vec![
+            MockResponse::json(200, relabelled),
+            MockResponse::json(
+                200,
+                &one_comment(10, &marker_body(Action::Claim, "me:1", NOW - 10)),
+            ),
+            MockResponse::json(201, r#"{"id":300}"#), // the progress export
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 0), project_id.clone());
+        seed_synced_item(&conn, &project_id, 7, "started");
+
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert_eq!(report.exported, vec![7], "a real label change must export");
     }
 
     #[test]
