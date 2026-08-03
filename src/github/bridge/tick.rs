@@ -133,15 +133,33 @@ fn run_inner(
         let Some(item) = items::find_by_issue(conn, &ctx.project_id, issue.number) else {
             continue;
         };
+        // A ceded item is still LINKED to its issue, so without this it
+        // reaches `export_if_dirty` and posts "Progress from …" on an issue
+        // another instance now owns. And it will: labels feed the hash, and
+        // the winner adds its own `claimed:` label, so the hash drifts by
+        // construction. Deliberately `is_ceded`, not `!is_active` —
+        // a completed item still owes this issue its `done` export.
+        if items::is_ceded(conn, &item) {
+            continue;
+        }
         if export_if_dirty(ctx, conn, issue, &item, now)? {
             report.exported.push(issue.number);
         }
     }
 
     // 3. Claim new work, up to remaining headroom.
+    //
+    // `remaining` counts SUCCESSES, not attempts. Bounding the loop itself
+    // (`take(headroom)`) meant a queue whose first few entries were already
+    // tracked or held by someone else consumed the whole allowance and this
+    // instance claimed nothing — every tick, for as long as the queue head
+    // stayed put, while free issues sat just below it.
     let held = held_count(conn, ctx);
-    let headroom = ctx.config.max_claims.saturating_sub(held);
-    for issue in queued.iter().take(headroom) {
+    let mut remaining = ctx.config.max_claims.saturating_sub(held);
+    for issue in &queued {
+        if remaining == 0 {
+            break;
+        }
         // Ceded THIS tick: step 1 just established a rival holds it, so
         // re-probing now would only re-read comments we already read and
         // re-learn the answer. Wait for the next tick.
@@ -162,6 +180,7 @@ fn run_inner(
         }
         if try_claim(ctx, conn, issue, now)? {
             report.claimed.push(issue.number);
+            remaining -= 1;
         }
     }
     Ok(())
@@ -268,8 +287,19 @@ fn try_claim(
     now: i64,
 ) -> Result<bool, GitHubError> {
     let before = comment_pairs(ctx, issue.number)?;
-    if claim_rules::resolve_holder(&before, now, ctx.config.ttl_secs).is_some() {
-        return Ok(false); // already held by someone live
+    match claim_rules::resolve_holder(&before, now, ctx.config.ttl_secs) {
+        // GitHub says WE hold it, but we got here — so we have no active
+        // local item for it. Adopt rather than bail: bailing meant sitting
+        // out a full TTL waiting for our OWN marker to expire. Reachable
+        // from a `Transport` blip between posting the claim and re-reading
+        // comments, from `state_id_for_group` returning None after we won,
+        // and from local db loss — which `marker.rs` advertises as
+        // recoverable precisely because the marker carries enough to rebuild.
+        Some(h) if h.marker.owner == ctx.config.instance_id => {
+            return record_claim(ctx, conn, issue, now);
+        }
+        Some(_) => return Ok(false), // held by someone else, live
+        None => {}
     }
 
     let hash = issue_hash(issue);
@@ -290,6 +320,20 @@ fn try_claim(
         return Ok(false); // lost the race; leave no local trace
     }
 
+    record_claim(ctx, conn, issue, now)
+}
+
+/// Everything that follows winning an issue: a local item in the `started`
+/// group, a ledger row, and the `claimed:` label. Shared by the ordinary
+/// claim path and by the adopt-our-own-orphan path, which must land exactly
+/// the same local state.
+#[allow(dead_code)] // consumer arrives in a later bridge task
+fn record_claim(
+    ctx: &Ctx,
+    conn: &rusqlite::Connection,
+    issue: &Issue,
+    now: i64,
+) -> Result<bool, GitHubError> {
     let Some(state_id) = items::state_id_for_group(conn, &ctx.project_id, "started") else {
         return Ok(false);
     };
@@ -950,6 +994,175 @@ mod tests {
         );
         assert_eq!(linked[0].id, ceded.id);
         assert!(items::is_active(&conn, &linked[0]), "back to started");
+        let _ = server.requests();
+    }
+
+    #[test]
+    fn headroom_counts_successful_claims_not_attempts() {
+        // I1: with `take(headroom)` the loop was bounded by ATTEMPTS, so a
+        // queue whose head was already tracked burned the whole allowance and
+        // this instance claimed nothing — every tick, while free issues sat
+        // right below the head.
+        let queue = r#"[{"number":1,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}]},
+                        {"number":2,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}]}]"#;
+        let server = MockServer::start(vec![
+            MockResponse::json(200, queue),
+            // step 1 re-verifies #1: our own fresh claim, so we keep it and
+            // the marker is too young to need a heartbeat.
+            MockResponse::json(
+                200,
+                &one_comment(10, &marker_body(Action::Claim, "me:1", NOW - 10)),
+            ),
+            // step 3 reaches #2 — free: probe, claim, re-read, label.
+            MockResponse::json(200, "[]"),
+            MockResponse::json(201, r#"{"id":100}"#),
+            MockResponse::json(
+                200,
+                &one_comment(100, &marker_body(Action::Claim, "me:1", NOW)),
+            ),
+            MockResponse::json(200, "[]"),
+        ]);
+        let (conn, project_id) = test_db();
+        // max_claims 2, one already held → exactly one claim of headroom.
+        let ctx = ctx_with_project(test_ctx(&server, 2), project_id.clone());
+        seed_synced_item(&conn, &project_id, 1, "started");
+
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert_eq!(
+            report.claimed,
+            vec![2],
+            "the one unit of headroom must reach a free issue, not be spent \
+             on the already-tracked queue head"
+        );
+        let _ = server.requests();
+    }
+
+    #[test]
+    fn a_ceded_item_is_not_exported_onto_an_issue_someone_else_now_owns() {
+        // I2: step 2 had no guard, so a cancelled-but-still-linked item
+        // reached export_if_dirty and posted "Progress from …" on an issue
+        // the winner now holds. It always drifts: labels feed the hash, and
+        // the winner adds its own `claimed:` label.
+        let server = MockServer::start(vec![MockResponse::json(200, QUEUE_ONE_ISSUE)]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 0), project_id.clone());
+        // Deliberately out of sync (no stored hash) so export WOULD fire.
+        let state = items::state_id_for_group(&conn, &project_id, "cancelled").unwrap();
+        agentflare_backend::item::create(
+            &conn,
+            agentflare_backend::item::CreateItem {
+                project_id: project_id.clone(),
+                state_id: state,
+                name: "drifted".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: Some(items::EXTERNAL_SOURCE.to_string()),
+                external_id: Some("7".into()),
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert!(report.exported.is_empty());
+        let reqs = server.requests();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "only the queue listing — a ceded item must write nothing, got {reqs:?}"
+        );
+    }
+
+    #[test]
+    fn a_completed_item_is_still_exported_after_a_cede_guard_is_added() {
+        // The other half of I2: the guard must be `is_ceded`, not
+        // `!is_active`. A completed item is also "not active", but it still
+        // owes its issue the `done` marker and the close that follows —
+        // guarding on `!is_active` would strand finished work forever.
+        let server = MockServer::start(vec![
+            MockResponse::json(200, QUEUE_ONE_ISSUE),
+            MockResponse::json(201, r#"{"id":300}"#), // the `done` comment
+            MockResponse::json(
+                200,
+                r#"{"number":7,"html_url":"u","state":"closed","title":"t","body":"","labels":[]}"#,
+            ),
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 0), project_id.clone());
+        // Via `update_state`, not `create`: only the transition sets
+        // `completed_at`, and that is what makes the export a `done`.
+        let item = seed_synced_item(&conn, &project_id, 7, "started");
+        let done_state = items::state_id_for_group(&conn, &project_id, "completed").unwrap();
+        agentflare_backend::item::update_state(&conn, &item.id, &done_state).unwrap();
+
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert_eq!(report.exported, vec![7], "finished work must still export");
+        let reqs = server.requests();
+        let posted = reqs.iter().find(|r| r.method == "POST").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&posted.body).unwrap();
+        let marker = Marker::parse(sent["body"].as_str().unwrap()).unwrap();
+        assert_eq!(marker.action, Action::Done);
+    }
+
+    #[test]
+    fn our_own_orphan_claim_is_adopted_rather_than_waited_out() {
+        // I3: `resolve_holder(...).is_some()` didn't check WHO. If GitHub
+        // said we held the issue but we had no local item — a Transport blip
+        // after posting the claim, or the db loss marker.rs advertises as
+        // recoverable — we bailed and sat out a full TTL waiting for our own
+        // marker to expire.
+        let server = MockServer::start(vec![
+            MockResponse::json(200, QUEUE_ONE_ISSUE),
+            // Our claim from a previous, half-completed attempt.
+            MockResponse::json(
+                200,
+                &one_comment(100, &marker_body(Action::Claim, "me:1", NOW - 10)),
+            ),
+            MockResponse::json(200, "[]"), // the claimed: label
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert_eq!(report.claimed, vec![7], "we already hold it — adopt it");
+        let item = items::find_by_issue(&conn, &project_id, 7).unwrap();
+        assert!(items::is_active(&conn, &item));
+        let reqs = server.requests();
+        assert!(
+            !reqs
+                .iter()
+                .any(|r| r.method == "POST" && r.path.ends_with("/comments")),
+            "adopting must not post a second claim comment, got {reqs:?}"
+        );
+    }
+
+    #[test]
+    fn a_live_claim_by_another_instance_is_still_left_alone() {
+        // The guard rail on the I3 fix: only OUR marker may be adopted.
+        let server = MockServer::start(vec![
+            MockResponse::json(200, QUEUE_ONE_ISSUE),
+            MockResponse::json(
+                200,
+                &one_comment(50, &marker_body(Action::Claim, "other:9", NOW)),
+            ),
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert!(report.claimed.is_empty());
+        assert!(items::find_by_issue(&conn, &project_id, 7).is_none());
         let _ = server.requests();
     }
 
