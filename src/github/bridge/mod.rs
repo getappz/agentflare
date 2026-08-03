@@ -7,3 +7,8 @@ pub mod items;
 pub mod marker;
 pub mod runner;
 pub mod tick;
+
+#[cfg(test)]
+mod tests {
+    mod two_instance;
+}
