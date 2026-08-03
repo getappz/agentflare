@@ -7,7 +7,6 @@
 //! pairs, so the whole race is unit-testable with no HTTP.
 
 use crate::github::bridge::marker::{Action, Marker};
-use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // consumer arrives in a later bridge task
@@ -27,22 +26,30 @@ pub fn resolve_holder(comments: &[(u64, String)], now: i64, ttl_secs: i64) -> Op
         .filter_map(|(id, body)| Marker::parse(body).map(|m| (*id, m)))
         .collect();
 
-    // A completed issue has no holder.
-    if parsed.iter().any(|(_, m)| m.action == Action::Done) {
+    // A `done` only ends the issue if its owner previously claimed it (with a
+    // lower comment id): markers are hidden HTML comments written only by
+    // agents, and the agent that completes work is by construction the one
+    // that claimed it, so a `done` from an owner who never claimed is
+    // malformed or misdirected and must not permanently end resolution.
+    let issue_done = parsed.iter().any(|(done_id, done_m)| {
+        done_m.action == Action::Done
+            && parsed.iter().any(|(claim_id, claim_m)| {
+                claim_m.action == Action::Claim
+                    && claim_m.owner == done_m.owner
+                    && claim_id < done_id
+            })
+    });
+    if issue_done {
         return None;
     }
-
-    let ceded: HashSet<&str> = parsed
-        .iter()
-        .filter(|(_, m)| m.action == Action::Cede)
-        .map(|(_, m)| m.owner.as_str())
-        .collect();
 
     parsed
         .iter()
         .filter(|(_, m)| m.action == Action::Claim)
-        .filter(|(_, m)| !ceded.contains(m.owner.as_str()))
-        .filter(|(_, m)| now - latest_ts_for(&m.owner, &parsed) <= ttl_secs)
+        .filter(|(claim_id, m)| !is_ceded(*claim_id, &m.owner, &parsed))
+        .filter(|(_, m)| {
+            latest_ts_for(&m.owner, &parsed).is_some_and(|ts| now.saturating_sub(ts) <= ttl_secs)
+        })
         .min_by_key(|(id, _)| *id)
         .map(|(id, m)| Holder {
             comment_id: *id,
@@ -50,16 +57,37 @@ pub fn resolve_holder(comments: &[(u64, String)], now: i64, ttl_secs: i64) -> Op
         })
 }
 
+/// A claim is retired only by a LATER `Cede` from the same owner — one whose
+/// comment id is higher than the claim's. `Cede` is not a permanent ban: an
+/// instance that crashes, cedes defensively, restarts, and posts a fresh
+/// `Claim` under the same owner id is a normal recovery path, and that later
+/// claim (higher comment id than the cede) must survive.
+fn is_ceded(claim_id: u64, owner: &str, parsed: &[(u64, Marker)]) -> bool {
+    parsed
+        .iter()
+        .any(|(cede_id, m)| m.action == Action::Cede && m.owner == owner && *cede_id > claim_id)
+}
+
 /// An owner's liveness is its most recent marker of ANY action, so a
 /// `progress` heartbeat keeps an old claim alive.
+///
+/// Returns `None` — never a sentinel — for an owner with no markers at all,
+/// so callers express "never seen" without doing arithmetic on a magic
+/// value. This can't happen via `resolve_holder` today, whose only caller
+/// passes an owner drawn from the parsed list, so `max()` always finds at
+/// least the marker that produced it; but returning `i64::MIN` here used to
+/// let `now - latest_ts_for(...)` panic on subtract-with-overflow (under the
+/// debug overflow checks `cargo test` uses) the moment a future caller
+/// checked an owner before it had any marker. `now.saturating_sub(ts)` at
+/// the call site is kept too, since a crafted/corrupt marker could in
+/// principle carry `ts == i64::MIN` itself.
 #[allow(dead_code)] // consumer arrives in a later bridge task
-fn latest_ts_for(owner: &str, parsed: &[(u64, Marker)]) -> i64 {
+fn latest_ts_for(owner: &str, parsed: &[(u64, Marker)]) -> Option<i64> {
     parsed
         .iter()
         .filter(|(_, m)| m.owner == owner)
         .map(|(_, m)| m.ts)
         .max()
-        .unwrap_or(i64::MIN)
 }
 
 /// Whether `me` is the current holder. Re-checked every tick, not trusted
@@ -163,6 +191,51 @@ mod tests {
             (2, mk(Action::Done, "a:1", NOW)),
         ];
         assert!(resolve_holder(&c, NOW, TTL).is_none());
+    }
+
+    #[test]
+    fn cede_then_fresh_reclaim_by_same_owner_wins() {
+        let c = vec![
+            (1, mk(Action::Claim, "a:1", NOW - 500)),
+            (2, mk(Action::Cede, "a:1", NOW - 400)),
+            (3, mk(Action::Claim, "a:1", NOW - 10)), // fresh, uncontested reclaim
+        ];
+        let h = resolve_holder(&c, NOW, TTL).unwrap();
+        assert_eq!(h.comment_id, 3, "the later reclaim, not the ceded claim");
+        assert_eq!(h.marker.owner, "a:1");
+    }
+
+    #[test]
+    fn done_from_a_never_claimant_does_not_kill_a_fresher_claim() {
+        let c = vec![
+            (1, mk(Action::Done, "c:3", NOW - 5000)), // c:3 never claimed anything
+            (2, mk(Action::Claim, "b:2", NOW - 10)),
+        ];
+        let h = resolve_holder(&c, NOW, TTL).unwrap();
+        assert_eq!(h.comment_id, 2);
+        assert_eq!(h.marker.owner, "b:2");
+    }
+
+    #[test]
+    fn ttl_boundary_exactly_at_limit_is_still_live() {
+        let c = vec![(1, mk(Action::Claim, "a:1", NOW - TTL))];
+        let h = resolve_holder(&c, NOW, TTL).unwrap();
+        assert_eq!(h.marker.owner, "a:1");
+    }
+
+    #[test]
+    fn latest_ts_for_owner_with_no_markers_does_not_panic() {
+        let parsed: Vec<(u64, Marker)> = vec![(
+            1,
+            Marker {
+                action: Action::Claim,
+                owner: "someone-else".to_string(),
+                item: "i".to_string(),
+                ts: NOW,
+                hash: "h".to_string(),
+            },
+        )];
+        assert_eq!(latest_ts_for("nobody", &parsed), None);
     }
 
     #[test]
