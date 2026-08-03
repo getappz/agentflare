@@ -34,26 +34,48 @@ fn priority_rank(p: &str) -> u8 {
     }
 }
 
+/// Parses the free-form `metadata` JSON blob and unwraps it, defensively,
+/// one extra layer if it's double-encoded (observed live — item(create)
+/// with metadata={"size":"S"} stored `"{\"size\": \"S\"}"` instead of the
+/// object). Shared by every `metadata`-blob field reader below so the
+/// double-encoding workaround lives in exactly one place.
+fn parsed_metadata(metadata: &str) -> Option<serde_json::Value> {
+    let mut value = serde_json::from_str::<serde_json::Value>(metadata).ok()?;
+    if let serde_json::Value::String(inner) = &value
+        && let Ok(reparsed) = serde_json::from_str::<serde_json::Value>(inner)
+    {
+        value = reparsed;
+    }
+    Some(value)
+}
+
 /// `size` lives in the free-form `metadata` JSON blob (`{"size": "S"|"M"|"L"}`)
 /// rather than a regex over description prose — sets via `item(update)`.
 ///
 /// `pub(crate)`: also read by `cli::work` to build a `TaskContext` for
 /// agent routing.
 pub(crate) fn parsed_size(metadata: &str) -> Option<String> {
-    let mut value = serde_json::from_str::<serde_json::Value>(metadata).ok()?;
-    // Defensive: some callers double-encode an object-typed param as a JSON
-    // string containing JSON (observed live — item(create) with
-    // metadata={"size":"S"} stored `"{\"size\": \"S\"}"` instead of the
-    // object). Unwrap one extra layer before giving up.
-    if let serde_json::Value::String(inner) = &value
-        && let Ok(reparsed) = serde_json::from_str::<serde_json::Value>(inner)
-    {
-        value = reparsed;
-    }
-    value
+    parsed_metadata(metadata)?
         .get("size")?
         .as_str()
         .filter(|s| matches!(*s, "S" | "M" | "L"))
+        .map(str::to_string)
+}
+
+/// `kind` lives in the same `metadata` JSON blob (`{"kind": "locate"}`),
+/// same convention as `size` above but free-form rather than a small fixed
+/// set — task shape ("locate", "docs", "security-review", ...) isn't
+/// enumerable the way S/M/L is. Any non-empty string is accepted.
+///
+/// `pub(crate)`: read by `cli::work` to build a `TaskContext` for agent
+/// routing; nothing sets it yet (no `kind` UI/tool surface), so a
+/// `[[router.rule]] when.kind = "..."` rule only ever matches once
+/// something writes this metadata key.
+pub(crate) fn parsed_kind(metadata: &str) -> Option<String> {
+    parsed_metadata(metadata)?
+        .get("kind")?
+        .as_str()
+        .filter(|s| !s.is_empty())
         .map(str::to_string)
 }
 
@@ -981,5 +1003,42 @@ impl AgentflareMcp {
             };
             Ok(serde_json::to_string_pretty(&resp).unwrap_or_default())
         })?
+    }
+}
+
+#[cfg(test)]
+mod metadata_field_tests {
+    use super::*;
+
+    fn double_encoded(value: serde_json::Value) -> String {
+        serde_json::Value::String(value.to_string()).to_string()
+    }
+
+    #[test]
+    fn parsed_kind_reads_a_plain_object() {
+        assert_eq!(parsed_kind(r#"{"kind":"locate"}"#), Some("locate".to_string()));
+    }
+
+    #[test]
+    fn parsed_kind_survives_double_encoded_metadata() {
+        let metadata = double_encoded(serde_json::json!({"kind": "docs"}));
+        assert_eq!(parsed_kind(&metadata), Some("docs".to_string()));
+    }
+
+    #[test]
+    fn parsed_kind_rejects_empty_string() {
+        assert_eq!(parsed_kind(r#"{"kind":""}"#), None);
+    }
+
+    #[test]
+    fn parsed_kind_none_when_absent_or_metadata_is_not_json() {
+        assert_eq!(parsed_kind("{}"), None);
+        assert_eq!(parsed_kind("not json"), None);
+    }
+
+    #[test]
+    fn parsed_size_still_rejects_values_outside_s_m_l() {
+        assert_eq!(parsed_size(r#"{"size":"XL"}"#), None);
+        assert_eq!(parsed_size(r#"{"size":"M"}"#), Some("M".to_string()));
     }
 }

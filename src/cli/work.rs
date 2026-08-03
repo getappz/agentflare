@@ -198,7 +198,7 @@ fn resolve_agent(
         .and_then(|name| agent_by_name(&name));
     let task = agent_registry::TaskContext {
         labels: labels.to_vec(),
-        kind: None,
+        kind: crate::mcp_server::item::parsed_kind(&item.metadata),
         size: crate::mcp_server::item::parsed_size(&item.metadata),
         repo: None,
         assigned_agent,
@@ -572,6 +572,24 @@ mod tests {
 [router]
 [[router.rule]]
 when = { size = "S" }
+use  = "opencode"
+"#,
+        )
+        .unwrap();
+        let resolved =
+            resolve_agent(None, &item, &[], &config, &[agent_registry::Agent::Opencode]).unwrap();
+        assert_eq!(resolved, agent_registry::Agent::Opencode);
+    }
+
+    #[test]
+    fn resolve_agent_matches_a_rule_on_the_items_kind() {
+        let mut item = test_item();
+        item.metadata = r#"{"kind":"locate"}"#.to_string();
+        let config = agent_registry::parse_router_config(
+            r#"
+[router]
+[[router.rule]]
+when = { kind = "locate" }
 use  = "opencode"
 "#,
         )
