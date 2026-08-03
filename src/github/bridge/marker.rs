@@ -1,0 +1,222 @@
+//! The hidden HTML-comment footer the bridge writes on every issue and
+//! comment it authors. Both instances authenticate to GitHub as the same
+//! user, so the GitHub actor cannot tell them apart — or tell an agent from
+//! a human. This marker carries that discriminator in-band, which also means
+//! an instance that loses its database can rebuild its view from GitHub.
+//!
+//! Parsing FAILS CLOSED: anything unparseable is `None`, i.e. treated as
+//! human-authored. The poll loop must never halt on a malformed body.
+
+use sha2::{Digest, Sha256};
+
+#[allow(dead_code)] // consumer arrives in a later bridge task
+pub const MARKER_VERSION: &str = "agentflare:v1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumer arrives in a later bridge task
+pub enum Action {
+    Claim,
+    Progress,
+    Done,
+    Cede,
+}
+
+#[allow(dead_code)] // consumer arrives in a later bridge task
+impl Action {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Action::Claim => "claim",
+            Action::Progress => "progress",
+            Action::Done => "done",
+            Action::Cede => "cede",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Action> {
+        match s {
+            "claim" => Some(Action::Claim),
+            "progress" => Some(Action::Progress),
+            "done" => Some(Action::Done),
+            "cede" => Some(Action::Cede),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumer arrives in a later bridge task
+pub struct Marker {
+    pub action: Action,
+    pub owner: String,
+    pub item: String,
+    pub ts: i64,
+    pub hash: String,
+}
+
+#[allow(dead_code)] // consumer arrives in a later bridge task
+impl Marker {
+    pub fn render(&self) -> String {
+        format!(
+            "<!-- {} action={} owner={} item={} ts={} hash={} -->",
+            MARKER_VERSION,
+            self.action.as_str(),
+            self.owner,
+            self.item,
+            self.ts,
+            self.hash
+        )
+    }
+
+    /// Parses the LAST marker in `text`, so a fresh footer appended to a body
+    /// that already carried one wins.
+    pub fn parse(text: &str) -> Option<Marker> {
+        let open = format!("<!-- {MARKER_VERSION} ");
+        let start = text.rfind(&open)?;
+        let rest = &text[start + open.len()..];
+        let end = rest.find(" -->")?;
+        let fields = &rest[..end];
+        // A nested comment delimiter means the input is malformed or crafted.
+        if fields.contains("<!--") || fields.contains("-->") {
+            return None;
+        }
+
+        let (mut action, mut owner, mut item, mut ts, mut hash) = (None, None, None, None, None);
+        for pair in fields.split_whitespace() {
+            // Any field without `=` means we are not looking at a well-formed
+            // marker — bail rather than guess.
+            let (k, v) = pair.split_once('=')?;
+            if v.is_empty() {
+                return None;
+            }
+            match k {
+                "action" => action = Action::parse(v),
+                "owner" => owner = Some(v.to_string()),
+                "item" => item = Some(v.to_string()),
+                "ts" => ts = v.parse::<i64>().ok(),
+                "hash" => hash = Some(v.to_string()),
+                _ => {}
+            }
+        }
+        Some(Marker {
+            action: action?,
+            owner: owner?,
+            item: item?,
+            ts: ts?,
+            hash: hash?,
+        })
+    }
+}
+
+/// Short digest of the semantically-meaningful content of an issue. Used both
+/// as the marker's `hash` and as the export gate (`github_last_hash`), so it
+/// MUST be stable across machines and releases — hence sha2 rather than
+/// `DefaultHasher`, whose output is explicitly not guaranteed stable.
+///
+/// Labels are sorted so ordering churn from the GitHub API is not mistaken
+/// for a real change, and fields are NUL-separated so ("ab","c") and
+/// ("a","bc") cannot collide.
+#[allow(dead_code)] // consumer arrives in a later bridge task
+pub fn content_hash(title: &str, body: &str, state: &str, labels: &[String]) -> String {
+    let mut sorted: Vec<&str> = labels.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    for field in [title, body, state] {
+        hasher.update(field.as_bytes());
+        hasher.update([0u8]);
+    }
+    for label in sorted {
+        hasher.update(label.as_bytes());
+        hasher.update([0u8]);
+    }
+    hex::encode(&hasher.finalize()[..8])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Marker {
+        Marker {
+            action: Action::Claim,
+            owner: "claude-code:desk-a".to_string(),
+            item: "3f2ab91".to_string(),
+            ts: 1_754_000_000,
+            hash: "9c7e1a2".to_string(),
+        }
+    }
+
+    #[test]
+    fn render_then_parse_round_trips() {
+        let m = sample();
+        assert_eq!(Marker::parse(&m.render()), Some(m));
+    }
+
+    #[test]
+    fn parse_finds_marker_after_human_text() {
+        let body = format!("Please look at this.\n\n{}", sample().render());
+        assert_eq!(Marker::parse(&body).unwrap().owner, "claude-code:desk-a");
+    }
+
+    #[test]
+    fn parse_takes_the_last_marker_when_several_are_present() {
+        let mut later = sample();
+        later.ts = 1_754_000_999;
+        let body = format!("{}\n{}", sample().render(), later.render());
+        assert_eq!(Marker::parse(&body).unwrap().ts, 1_754_000_999);
+    }
+
+    #[test]
+    fn malformed_input_parses_as_absent_never_errors() {
+        for bad in [
+            "",
+            "no marker here",
+            "<!-- agentflare:v1 -->",
+            "<!-- agentflare:v1 action=claim -->",
+            "<!-- agentflare:v2 action=claim owner=a item=b ts=1 hash=h -->",
+            "<!-- agentflare:v1 action=bogus owner=a item=b ts=1 hash=h -->",
+            "<!-- agentflare:v1 action=claim owner=a item=b ts=notanumber hash=h -->",
+            "<!-- agentflare:v1 action=claim owner= item=b ts=1 hash=h -->",
+            "<!-- agentflare:v1 actionclaim owner=a item=b ts=1 hash=h -->",
+            "<!-- agentflare:v1 action=claim owner=a item=b ts=1 hash=h",
+            "héllo <!-- agentflare:v1 broken",
+        ] {
+            assert_eq!(Marker::parse(bad), None, "should not parse: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn every_action_round_trips() {
+        for a in [Action::Claim, Action::Progress, Action::Done, Action::Cede] {
+            let mut m = sample();
+            m.action = a.clone();
+            assert_eq!(Marker::parse(&m.render()).unwrap().action, a);
+        }
+    }
+
+    #[test]
+    fn content_hash_is_stable_and_label_order_independent() {
+        let a = content_hash("t", "b", "open", &["x".into(), "y".into()]);
+        let b = content_hash("t", "b", "open", &["y".into(), "x".into()]);
+        assert_eq!(a, b, "label order must not change the hash");
+        assert_eq!(a, content_hash("t", "b", "open", &["x".into(), "y".into()]));
+    }
+
+    #[test]
+    fn content_hash_changes_when_any_field_changes() {
+        let base = content_hash("t", "b", "open", &["x".into()]);
+        assert_ne!(base, content_hash("T", "b", "open", &["x".into()]));
+        assert_ne!(base, content_hash("t", "B", "open", &["x".into()]));
+        assert_ne!(base, content_hash("t", "b", "closed", &["x".into()]));
+        assert_ne!(base, content_hash("t", "b", "open", &["z".into()]));
+    }
+
+    #[test]
+    fn content_hash_is_not_confused_by_field_boundaries() {
+        // Without separators, ("ab","c") and ("a","bc") would collide.
+        assert_ne!(
+            content_hash("ab", "c", "open", &[]),
+            content_hash("a", "bc", "open", &[])
+        );
+    }
+}
