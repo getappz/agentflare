@@ -327,6 +327,15 @@ fn record_claim(
     now: i64,
 ) -> Result<bool, GitHubError> {
     let Some(state_id) = items::state_id_for_group(conn, &ctx.project_id, "started") else {
+        // The claim comment is already posted by this point, so bailing
+        // silently leaves our marker on the issue with no local item behind
+        // it: step 1 skips the issue (nothing to find), so nothing
+        // heartbeats it and nothing cedes it, and it stays blocked for a
+        // full TTL with no explanation. `cede` logs the mirror of this.
+        eprintln!(
+            "github bridge: project has no `started` state; cannot record the claim on #{}",
+            issue.number
+        );
         return Ok(false);
     };
     // Re-adopt a previously ceded item rather than creating a second one:
@@ -406,7 +415,7 @@ fn record_claim(
     // every claim produced a redundant second comment. A real local edit
     // still changes the hash and still exports.
     let imported = export_hash(&created, issue);
-    if let Err(e) = store_hash(conn, &created, &items::with_last_hash(&created, &imported)) {
+    if let Err(e) = store_hash(conn, &created.id, Some(&imported)) {
         // Not fatal: the cost is one redundant progress comment next tick.
         eprintln!(
             "github bridge: could not seed the export hash for #{}: {e}",
@@ -559,6 +568,12 @@ fn export_if_dirty(
     let hash = export_hash(item, issue);
 
     if items::last_hash(item).as_deref() == Some(hash.as_str()) {
+        // Nothing new to say — but the close is tracked separately from the
+        // latch (see below), so a completed item whose issue is still open
+        // has one outstanding from an earlier tick.
+        if completed {
+            close_if_still_open(ctx, issue);
+        }
         return Ok(false);
     }
 
@@ -575,7 +590,7 @@ fn export_if_dirty(
     };
 
     // Latch first — no GitHub write without a persisted record of it.
-    if let Err(e) = store_hash(conn, item, &items::with_last_hash(item, &hash)) {
+    if let Err(e) = store_hash(conn, &item.id, Some(&hash)) {
         eprintln!(
             "github bridge: could not record the export hash for #{} ({e}); \
              skipping the export rather than risk re-posting it every tick",
@@ -584,26 +599,35 @@ fn export_if_dirty(
         return Ok(false);
     }
 
-    let written = issues::comment(
+    let posted = issues::comment(
         &ctx.client,
         &ctx.repo,
         issue.number,
         &format!("{note}\n\n{}", marker.render()),
-    )
-    .and_then(|_| {
-        if completed {
-            issues::close(&ctx.client, &ctx.repo, issue.number)?;
-        }
-        Ok(())
-    });
+    );
 
-    if let Err(e) = written {
-        // Roll the latch back to whatever it was, so this export is retried
-        // instead of being suppressed until the content happens to change.
-        if let Err(revert) = store_hash(conn, item, &item.metadata) {
+    if let Err(e) = posted {
+        // Roll the latch back so this export is retried instead of being
+        // suppressed until the content happens to change. Clearing the key
+        // rather than restoring the tick's stale snapshot: the previous
+        // value was either absent or a hash we are re-deriving anyway, and
+        // restoring the snapshot wholesale would revert anyone else's
+        // metadata written since.
+        let previous = items::last_hash(item);
+        if let Err(revert) = store_hash(conn, &item.id, previous.as_deref()) {
             eprintln!("github bridge: could not roll back the export hash: {revert}");
         }
         return Err(e);
+    }
+
+    // The comment landed, so the latch stays put even if the close fails.
+    // Sharing one latch between the two meant a failed close rolled back a
+    // comment that HAD been posted, and the next tick — seeing the same
+    // content hash as dirty again — posted a second "Completed by …". Every
+    // failed close added another duplicate, and close is the call most
+    // likely to fail on its own (a locked or already-modified issue).
+    if completed {
+        close_if_still_open(ctx, issue);
     }
 
     if completed
@@ -628,16 +652,50 @@ fn export_if_dirty(
     Ok(true)
 }
 
+/// Closes the issue behind a completed item, if it is not closed already.
+///
+/// Deliberately best-effort and NOT tied to the export latch: the `done`
+/// comment may already be recorded when the close fails, and rolling the
+/// latch back for that would repost the comment. A still-open issue is its
+/// own retry signal — it stays in the queue until the close succeeds.
+fn close_if_still_open(ctx: &Ctx, issue: &Issue) {
+    if issue.state == "closed" {
+        return;
+    }
+    if let Err(e) = issues::close(&ctx.client, &ctx.repo, issue.number) {
+        eprintln!(
+            "github bridge: could not close #{} ({e}); will retry next tick",
+            issue.number
+        );
+    }
+}
+
+/// Writes `github_last_hash` onto an item, merging into the item's CURRENT
+/// metadata rather than the snapshot the tick started with.
+///
+/// `metadata` is one JSON column and `item::update` replaces it wholesale.
+/// The tick's snapshot is read at the top of `run_inner` and written after a
+/// GitHub round trip, so it is seconds stale — and an `item(update)` through
+/// the MCP server in that window would be silently reverted. Re-reading
+/// immediately before the write narrows that to the width of a single
+/// statement.
+///
+/// `None` clears the key, which is what the rollback path wants.
 fn store_hash(
     conn: &rusqlite::Connection,
-    item: &agentflare_backend::item::Item,
-    metadata: &str,
+    item_id: &str,
+    hash: Option<&str>,
 ) -> Result<(), agentflare_backend::Error> {
+    let current = agentflare_backend::item::get(conn, item_id)?;
+    let metadata = match hash {
+        Some(h) => items::with_last_hash(&current, h),
+        None => items::without_last_hash(&current),
+    };
     agentflare_backend::item::update(
         conn,
-        &item.id,
+        item_id,
         agentflare_backend::item::UpdateItem {
-            metadata: Some(metadata.to_string()),
+            metadata: Some(metadata),
             ..Default::default()
         },
     )
@@ -1183,6 +1241,56 @@ mod tests {
         let report = run_once(&ctx, &conn, NOW).unwrap();
 
         assert_eq!(report.exported, vec![7], "a real label change must export");
+    }
+
+    #[test]
+    fn a_failed_close_retries_without_reposting_the_done_comment() {
+        // The `done` comment and the close used to share one latch, so a
+        // close that failed on its own rolled back a comment that HAD been
+        // posted — and the next tick, seeing the same hash dirty again,
+        // posted a second "Completed by …". Every failed close added another
+        // duplicate, and close is the call most likely to fail alone.
+        // A completed item is skipped by step 1 (not active), so the tick is
+        // just: queue listing, done comment, close, label removal.
+        let open = QUEUE_ONE_ISSUE;
+        let server = MockServer::start(vec![
+            MockResponse::json(200, open),
+            MockResponse::json(201, r#"{"id":300}"#), // the done comment lands
+            MockResponse::json(500, r#"{"message":"issue is locked"}"#), // close fails
+            MockResponse::json(200, "[]"),            // claimed: label removal
+            // tick 2: the issue is still open, so the close is outstanding
+            MockResponse::json(200, open),
+            MockResponse::json(
+                200,
+                r#"{"number":7,"html_url":"u","state":"closed","title":"t","body":"","labels":[]}"#,
+            ),
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 0), project_id.clone());
+        let item = seed_synced_item(&conn, &project_id, 7, "started");
+        let done = items::state_id_for_group(&conn, &project_id, "completed").unwrap();
+        agentflare_backend::item::update_state(&conn, &item.id, &done).unwrap();
+
+        let first = run_once(&ctx, &conn, NOW).unwrap();
+        assert_eq!(first.exported, vec![7], "the comment itself succeeded");
+
+        let second = run_once(&ctx, &conn, NOW).unwrap();
+        assert!(
+            second.exported.is_empty(),
+            "the second tick must NOT re-export — the comment already landed"
+        );
+
+        let reqs = server.requests();
+        let done_comments = reqs
+            .iter()
+            .filter(|r| r.method == "POST" && r.path.ends_with("/comments"))
+            .count();
+        assert_eq!(done_comments, 1, "exactly one `done` comment, got {reqs:?}");
+        let closes = reqs
+            .iter()
+            .filter(|r| r.method == "PATCH" && r.path == "/repos/o/r/issues/7")
+            .count();
+        assert_eq!(closes, 2, "but the close must be retried");
     }
 
     #[test]

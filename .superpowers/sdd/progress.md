@@ -1,6 +1,6 @@
 GitHub Coordination Bridge — SDD progress ledger
 Plan: artifact uURrhLPHQcgXmeocGrM28 (leanstack-specs)
-Local plan: C:/Users/shiva/AppData/Local/Temp/claude/C--Users-shiva-workspace-leanstack/d9d75a39-2c4e-45f1-873f-07a1db6738c6/scratchpad/2026-08-03-github-coordination-bridge-plan.md
+Local plan: .superpowers/sdd/PLAN-corrected-v2.md (the session scratchpad copy is not durable)
 Branch: feat/github-bridge (off origin/master)
 
 Pre-flight: 3 findings resolved in plan (two-DB ledger bug, capacity source, re-verify cost).

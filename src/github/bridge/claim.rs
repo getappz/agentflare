@@ -29,6 +29,15 @@ pub fn resolve_holder(comments: &[(u64, String)], now: i64, ttl_secs: i64) -> Op
     // agents, and the agent that completes work is by construction the one
     // that claimed it, so a `done` from an owner who never claimed is
     // malformed or misdirected and must not permanently end resolution.
+    //
+    // And it only ends the issue while it is the LAST word. A human can
+    // reopen a completed issue, which puts it back in the `state=open` queue
+    // with its whole marker history intact. Treating the old `done` as final
+    // forever meant `resolve_holder` answered `None` on every subsequent
+    // tick — so an instance with no local item for it posted a fresh claim
+    // comment, failed its own `i_hold` re-check because the answer was still
+    // `None`, and did it again on the next tick. One claim comment per tick,
+    // forever, and the work never started.
     let issue_done = parsed.iter().any(|(done_id, done_m)| {
         done_m.action == Action::Done
             && parsed.iter().any(|(claim_id, claim_m)| {
@@ -36,6 +45,9 @@ pub fn resolve_holder(comments: &[(u64, String)], now: i64, ttl_secs: i64) -> Op
                     && claim_m.owner == done_m.owner
                     && claim_id < done_id
             })
+            && !parsed
+                .iter()
+                .any(|(claim_id, m)| m.action == Action::Claim && claim_id > done_id)
     });
     if issue_done {
         return None;
@@ -44,9 +56,9 @@ pub fn resolve_holder(comments: &[(u64, String)], now: i64, ttl_secs: i64) -> Op
     parsed
         .iter()
         .filter(|(_, m)| m.action == Action::Claim)
-        .filter(|(claim_id, m)| !is_ceded(*claim_id, &m.owner, &parsed))
+        .filter(|(claim_id, m)| !is_retired(*claim_id, &m.owner, &parsed))
         .filter(|(_, m)| {
-            latest_ts_for(&m.owner, &parsed).is_some_and(|ts| now.saturating_sub(ts) <= ttl_secs)
+            latest_ts_for(&m.owner, &parsed).is_some_and(|ts| is_live(ts, now, ttl_secs))
         })
         .min_by_key(|(id, _)| *id)
         .map(|(id, m)| Holder {
@@ -55,15 +67,42 @@ pub fn resolve_holder(comments: &[(u64, String)], now: i64, ttl_secs: i64) -> Op
         })
 }
 
-/// A claim is retired only by a LATER `Cede` from the same owner — one whose
-/// comment id is higher than the claim's. `Cede` is not a permanent ban: an
-/// instance that crashes, cedes defensively, restarts, and posts a fresh
-/// `Claim` under the same owner id is a normal recovery path, and that later
-/// claim (higher comment id than the cede) must survive.
-fn is_ceded(claim_id: u64, owner: &str, parsed: &[(u64, Marker)]) -> bool {
-    parsed
-        .iter()
-        .any(|(cede_id, m)| m.action == Action::Cede && m.owner == owner && *cede_id > claim_id)
+/// Whether a marker timestamped `ts` still counts as live at `now`.
+///
+/// Bounded on BOTH sides. The obvious `now - ts <= ttl` is true for every
+/// future `ts`, because the difference is negative — so one machine with a
+/// clock running ahead pins its issues indefinitely, and if it dies nobody
+/// can take them until real time catches up. `ts` comes off a parsed comment
+/// body, so it is not ours to trust either way.
+///
+/// The trade-off is deliberate: skew smaller than the TTL changes nothing,
+/// and skew larger than the TTL means the two machines disagree about
+/// liveness anyway. Preferring "expired" there keeps work moving, where
+/// preferring "live" strands it.
+fn is_live(ts: i64, now: i64, ttl_secs: i64) -> bool {
+    if ts > now {
+        return ts.saturating_sub(now) <= ttl_secs;
+    }
+    now.saturating_sub(ts) <= ttl_secs
+}
+
+/// A claim is retired by a LATER `Cede` OR `Done` from the same owner — one
+/// whose comment id is higher than the claim's.
+///
+/// Neither is a permanent ban: an instance that crashes, cedes defensively,
+/// restarts, and posts a fresh `Claim` under the same owner id is a normal
+/// recovery path, and that later claim (higher comment id) must survive.
+///
+/// `Done` retires for the same reason `Cede` does — both say "I am no longer
+/// working this". It matters on a reopened issue: the original owner's
+/// claim is still the lowest id, so without this it out-ranks every later
+/// claimant while its own item sits `completed` and will never be worked
+/// again. The issue would stay pinned to an instance that has finished with
+/// it until the markers aged out.
+fn is_retired(claim_id: u64, owner: &str, parsed: &[(u64, Marker)]) -> bool {
+    parsed.iter().any(|(id, m)| {
+        matches!(m.action, Action::Cede | Action::Done) && m.owner == owner && *id > claim_id
+    })
 }
 
 /// An owner's liveness is its most recent marker of ANY action, so a
@@ -196,6 +235,23 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_after_a_done_supersedes_it_so_a_reopened_issue_is_claimable() {
+        // A human can reopen a completed issue, which puts it back in the
+        // queue with its marker history intact. Treating the old `done` as
+        // final forever made `resolve_holder` answer `None` on every tick —
+        // so an instance posted a claim comment, failed its own re-check
+        // because the answer was still `None`, and repeated that every tick.
+        let c = vec![
+            (1, mk(Action::Claim, "a:1", NOW - 100)),
+            (2, mk(Action::Done, "a:1", NOW - 50)),
+            (3, mk(Action::Claim, "b:2", NOW)),
+        ];
+        let h = resolve_holder(&c, NOW, TTL).expect("the later claim must win");
+        assert_eq!(h.marker.owner, "b:2");
+        assert_eq!(h.comment_id, 3);
+    }
+
+    #[test]
     fn done_means_no_holder() {
         let c = vec![
             (1, mk(Action::Claim, "a:1", NOW)),
@@ -225,6 +281,27 @@ mod tests {
         let h = resolve_holder(&c, NOW, TTL).unwrap();
         assert_eq!(h.comment_id, 2);
         assert_eq!(h.marker.owner, "b:2");
+    }
+
+    #[test]
+    fn a_marker_from_a_badly_skewed_clock_still_expires() {
+        // `now - ts` is NEGATIVE for a future ts, so the naive comparison
+        // against the TTL is true for every future timestamp — one machine
+        // running fast would hold its issues forever, and nobody could take
+        // them if it died.
+        let far_ahead = vec![(1, mk(Action::Claim, "a:1", NOW + TTL * 10))];
+        assert!(
+            resolve_holder(&far_ahead, NOW, TTL).is_none(),
+            "a marker dated well past the TTL into the future must not be live"
+        );
+
+        // Ordinary skew, smaller than the TTL, must still count as live —
+        // clocks are never exactly aligned.
+        let slightly_ahead = vec![(1, mk(Action::Claim, "a:1", NOW + TTL / 2))];
+        assert!(
+            resolve_holder(&slightly_ahead, NOW, TTL).is_some(),
+            "modest skew must not expire a genuinely live claim"
+        );
     }
 
     #[test]

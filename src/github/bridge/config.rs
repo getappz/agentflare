@@ -51,9 +51,37 @@ fn instance_id_path() -> PathBuf {
 /// holding. That is the C2 mass-cede all over again, just triggered by a
 /// change of launcher instead of a change of pid.
 ///
-/// The actor here is the bridge daemon. Naming it that is both stable and
-/// more accurate than naming whichever agent happened to start it.
-const OWNER_PREFIX: &str = "bridge";
+/// Nothing parses it — the colon is not load-bearing anywhere — so it earns
+/// its place purely by being readable: `claimed:flared:9f2c…` on a GitHub
+/// issue says what took the work, where a bare hex blob says nothing.
+/// `flared` after the daemon, in the `sshd`/`dockerd` tradition, since the
+/// actor is the daemon rather than the bridge subsystem inside it.
+const OWNER_PREFIX: &str = "flared";
+
+/// Characters an instance id may not contain, whatever its source.
+///
+/// Whitespace is the dangerous one. Marker fields are space-separated
+/// `key=value` pairs, so `owner=my instance` parses as two fields and the
+/// second one has no `=` — `Marker::parse` fails closed and EVERY marker
+/// that instance writes becomes invisible to `resolve_holder`. Worse, an id
+/// like `x ts=99999999999` injects a field outright and forges its own
+/// liveness. `/` is rejected too: the id goes into a `claimed:<id>` label,
+/// and a slash inside a URL path segment silently retargets the label-delete
+/// request, which then 404s and is treated as success while the stale label
+/// stays on the issue.
+fn invalid_instance_char(c: char) -> bool {
+    c.is_whitespace() || c.is_control() || c == '/'
+}
+
+fn validate_instance_id(id: &str) -> Result<(), String> {
+    match id.chars().find(|c| invalid_instance_char(*c)) {
+        Some(c) => Err(format!(
+            "instance id {id:?} contains {c:?}; whitespace, control characters \
+             and '/' would corrupt the marker format or the claim label"
+        )),
+        None => Ok(()),
+    }
+}
 
 fn random_instance() -> String {
     use rand::Rng;
@@ -174,6 +202,16 @@ impl BridgeConfig {
         let instance = get("AGENTFLARE_BRIDGE_INSTANCE_ID")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+            // A hand-set id that cannot survive the marker format or the
+            // label path is worse than no override: it does not fail, it
+            // silently breaks coordination. Say so and use the persisted one.
+            .filter(|s| match validate_instance_id(s) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("github bridge: ignoring AGENTFLARE_BRIDGE_INSTANCE_ID — {e}");
+                    false
+                }
+            })
             .unwrap_or_else(stable_instance_id);
         BridgeConfig::from_values(
             get("AGENTFLARE_BRIDGE_ENABLED").as_deref(),
@@ -344,14 +382,67 @@ mod tests {
     fn a_stored_id_is_trimmed_and_a_legacy_bare_one_gets_the_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bridge-instance-id");
-        std::fs::write(&path, "  bridge:abc123\n").unwrap();
-        assert_eq!(read_or_create_instance(&path).unwrap(), "bridge:abc123");
+        // Built from the constant, so renaming the prefix cannot leave this
+        // test asserting the old one.
+        let stored = format!("{OWNER_PREFIX}:abc123");
+        std::fs::write(&path, format!("  {stored}\n")).unwrap();
+        assert_eq!(read_or_create_instance(&path).unwrap(), stored);
 
         // Written before the prefix moved into the file: adopt it rather than
         // re-mint, so the workstation keeps one id from here on.
         let legacy = dir.path().join("legacy");
         std::fs::write(&legacy, "abc123").unwrap();
-        assert_eq!(read_or_create_instance(&legacy).unwrap(), "bridge:abc123");
+        assert_eq!(read_or_create_instance(&legacy).unwrap(), stored);
+    }
+
+    #[test]
+    fn an_instance_id_that_would_corrupt_a_marker_or_a_label_is_rejected() {
+        // Whitespace is the dangerous one: marker fields are space-separated
+        // `key=value` pairs, so a space splits `owner` into a second field
+        // with no `=`, `Marker::parse` fails closed, and every marker that
+        // instance writes becomes invisible. An id like `x ts=<huge>` forges
+        // its own liveness outright.
+        for bad in [
+            "has space",
+            "x ts=99999999999",
+            "tab\there",
+            "line\nbreak",
+            "slash/in/id",
+            "ctrl\u{7}char",
+        ] {
+            assert!(
+                validate_instance_id(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        for ok in ["flared:9f2c1a", "host-1_2.3", "AGENT:abc123"] {
+            assert!(validate_instance_id(ok).is_ok(), "{ok:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn a_minted_id_always_survives_its_own_validation() {
+        // The generated id and the validator must not be able to drift apart.
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            let path = dir.path().join(format!("id-{i}"));
+            let id = read_or_create_instance(&path).unwrap();
+            assert!(
+                validate_instance_id(&id).is_ok(),
+                "we minted an id we would reject: {id:?}"
+            );
+            // And it must round-trip through the marker format unchanged.
+            let m = crate::github::bridge::marker::Marker {
+                action: crate::github::bridge::marker::Action::Claim,
+                owner: id.clone(),
+                item: "i".into(),
+                ts: 1,
+                hash: "h".into(),
+            };
+            let parsed = crate::github::bridge::marker::Marker::parse(&m.render())
+                .expect("a minted id must produce a readable marker");
+            assert_eq!(parsed.owner, id);
+        }
     }
 
     #[test]

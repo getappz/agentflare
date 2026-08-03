@@ -49,6 +49,20 @@ pub fn with_last_hash(item: &Item, hash: &str) -> String {
     v.to_string()
 }
 
+/// This item's metadata with `github_last_hash` REMOVED, preserving every
+/// other key. Used to roll the export latch back after a failed remote write
+/// without disturbing metadata anyone else owns.
+pub fn without_last_hash(item: &Item) -> String {
+    let mut v = serde_json::from_str::<serde_json::Value>(&item.metadata)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove(LAST_HASH_KEY);
+    }
+    v.to_string()
+}
+
 /// First state in `group` (e.g. `backlog`, `started`, `completed`).
 pub fn state_id_for_group(
     conn: &rusqlite::Connection,
