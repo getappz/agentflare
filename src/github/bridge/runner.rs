@@ -9,18 +9,62 @@ pub fn should_run(config: &BridgeConfig) -> bool {
     config.enabled
 }
 
+/// `owner/repo` from `AGENTFLARE_BRIDGE_REPO`, else the `origin` remote of
+/// the current directory.
+///
+/// The env var is not a convenience: `resolve_from_remote` derives the repo
+/// from **cwd**, and neither the launchd plist nor the systemd unit
+/// (`daemon_autostart.rs`) sets a working directory. Under
+/// `agentflare daemon start` the bridge would otherwise be enabled by env
+/// var and then silently never run, because cwd is not the repo.
+fn resolve_repo() -> Option<crate::github::RepoId> {
+    if let Some(explicit) = std::env::var("AGENTFLARE_BRIDGE_REPO")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let parsed = crate::github::RepoId::parse(explicit.trim());
+        if parsed.is_none() {
+            eprintln!(
+                "github bridge: AGENTFLARE_BRIDGE_REPO={explicit:?} is not a \
+                 GitHub owner/repo; not starting"
+            );
+        }
+        return parsed;
+    }
+
+    let repo_root = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("github bridge: cannot read the working directory ({e}); not starting");
+            return None;
+        }
+    };
+    let repo = crate::github::RepoId::resolve_from_remote(&repo_root);
+    if repo.is_none() {
+        eprintln!(
+            "github bridge: no GitHub `origin` remote under {} — the daemon \
+             does not set a working directory, so set AGENTFLARE_BRIDGE_REPO=owner/repo; \
+             not starting",
+            repo_root.display()
+        );
+    }
+    repo
+}
+
 /// Starts the poll loop if the bridge is enabled AND the environment is
 /// usable (GitHub origin, resolvable credential, resolvable project).
-/// Every failure path here is a quiet no-op: a daemon must not fail to start
-/// because an optional subsystem is unconfigured.
+///
+/// Every failure path is a no-op — a daemon must not fail to start because an
+/// optional subsystem is unconfigured — but never a SILENT one. The bridge is
+/// opt-in, so anyone reaching these paths asked for it to run and needs to be
+/// told why it did not.
 pub fn spawn_if_enabled() -> Option<std::thread::JoinHandle<()>> {
     let config = BridgeConfig::from_env();
     if !should_run(&config) {
         return None;
     }
 
-    let repo_root = std::env::current_dir().ok()?;
-    let repo = crate::github::RepoId::resolve_from_remote(&repo_root)?;
+    let repo = resolve_repo()?;
     let client = match crate::github::Client::new() {
         Ok(c) => c,
         Err(e) => {
@@ -30,10 +74,17 @@ pub fn spawn_if_enabled() -> Option<std::thread::JoinHandle<()>> {
     };
 
     let mcp = crate::mcp_server::AgentflareMcp::default();
-    let project_id = mcp
-        .with_backend_db(|conn| mcp.resolve_project(conn).map(|p| p.id))
-        .ok()?
-        .ok()?;
+    let project_id = match mcp.with_backend_db(|conn| mcp.resolve_project(conn).map(|p| p.id)) {
+        Ok(Ok(id)) => id,
+        Ok(Err(e)) => {
+            eprintln!("github bridge: no project linked to this repo ({e}); not starting");
+            return None;
+        }
+        Err(e) => {
+            eprintln!("github bridge: item database unavailable ({e}); not starting");
+            return None;
+        }
+    };
 
     // The claim ledger is its own database (agentflare.db), separate from the
     // backend db that holds items.
@@ -55,6 +106,11 @@ pub fn spawn_if_enabled() -> Option<std::thread::JoinHandle<()>> {
     };
 
     Some(std::thread::spawn(move || {
+        // Soft errors repeat every tick by nature, so log a CHANGE rather
+        // than each occurrence: 1440 identical lines a day would bury the
+        // one thing worth reading, and silence would hide a `Forbidden` —
+        // a bridge that is permanently dead and never says so.
+        let mut last_soft: Option<String> = None;
         loop {
             let now = crate::claims::now();
             let outcome = mcp.with_backend_db(|conn| run_once(&ctx, conn, now));
@@ -65,6 +121,13 @@ pub fn spawn_if_enabled() -> Option<std::thread::JoinHandle<()>> {
                             "github bridge: claimed {:?} ceded {:?}",
                             report.claimed, report.ceded
                         );
+                    }
+                    if report.soft_error != last_soft {
+                        match &report.soft_error {
+                            Some(e) => eprintln!("github bridge: ticks are ending early: {e}"),
+                            None => eprintln!("github bridge: recovered; ticks completing again"),
+                        }
+                        last_soft = report.soft_error;
                     }
                 }
                 Ok(Err(e)) => eprintln!("github bridge: tick failed: {e}"),

@@ -29,6 +29,12 @@ pub struct TickReport {
     pub claimed: Vec<u64>,
     pub ceded: Vec<u64>,
     pub exported: Vec<u64>,
+    /// The soft error that ended this tick early, if one did. Soft errors
+    /// are normal operating conditions (rate limit, auth) and must not stop
+    /// the daemon — but `Forbidden` is a permanently dead bridge, and
+    /// swallowing it entirely meant nothing ever said so. Surfaced here so
+    /// the runner can report a CHANGE in state rather than log every tick.
+    pub soft_error: Option<String>,
 }
 
 /// Replaces any existing marker footer rather than stacking a new one, so an
@@ -82,7 +88,10 @@ pub fn run_once(ctx: &Ctx, conn: &rusqlite::Connection, now: i64) -> Result<Tick
     match run_inner(ctx, conn, now, &mut report) {
         Ok(()) => Ok(report),
         // Soft errors keep whatever the tick already accomplished.
-        Err(e) if is_soft(&e) => Ok(report),
+        Err(e) if is_soft(&e) => {
+            report.soft_error = Some(e.to_string());
+            Ok(report)
+        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -402,8 +411,23 @@ fn cede(
     item: &agentflare_backend::item::Item,
     now: i64,
 ) -> Result<(), GitHubError> {
+    // Cancel LOCALLY FIRST, and only announce once that stuck. This
+    // ordering is the idempotence latch: step 1 decides whether to cede from
+    // the item's state, so announcing first and then failing to persist the
+    // cancellation re-cedes the same issue every `interval_secs` — 1440
+    // identical comments a day at the defaults. `database is locked` from
+    // the dashboard or MCP server writing the same file makes that reachable.
+    let Some(cancelled) = items::state_id_for_group(conn, &ctx.project_id, "cancelled") else {
+        eprintln!("github bridge: no cancelled state in project; not ceding #{number}");
+        return Ok(());
+    };
+    if let Err(e) = agentflare_backend::item::update_state(conn, &item.id, &cancelled) {
+        eprintln!("github bridge: could not cancel item for #{number} ({e}); not ceding");
+        return Ok(());
+    }
+
     let marker = marker_for(ctx, Action::Cede, &item.id, "", now);
-    issues::comment(
+    let posted = issues::comment(
         &ctx.client,
         &ctx.repo,
         number,
@@ -412,15 +436,25 @@ fn cede(
             ctx.config.instance_id,
             marker.render()
         ),
-    )?;
-    let _ = crate::claims::release(
+    );
+    if let Err(e) = posted {
+        // Put the item back so the next tick retries the whole cede rather
+        // than leaving it cancelled with no cede marker on the issue — which
+        // would read to every other instance as "still claimed by us".
+        if let Err(revert) = agentflare_backend::item::update_state(conn, &item.id, &item.state_id)
+        {
+            eprintln!("github bridge: could not restore item after a failed cede: {revert}");
+        }
+        return Err(e);
+    }
+
+    if let Err(e) = crate::claims::release(
         &ctx.ledger,
         &ctx.repo.to_string(),
         &format!("issue#{number}"),
         &ctx.config.instance_id,
-    );
-    if let Some(state_id) = items::state_id_for_group(conn, &ctx.project_id, "cancelled") {
-        let _ = agentflare_backend::item::update_state(conn, &item.id, &state_id);
+    ) {
+        eprintln!("github bridge: ledger release failed for #{number}: {e}");
     }
     Ok(())
 }
@@ -436,9 +470,14 @@ fn issue_hash(issue: &Issue) -> String {
     )
 }
 
-/// Exports only when the local content hash differs from the last CONFIRMED
-/// successful write. The stored hash advances only after the write returns
-/// Ok, so a failed write simply retries next tick.
+/// Exports only when the local content hash differs from the last stored one.
+///
+/// The stored hash is the idempotence latch, so it is written BEFORE the
+/// GitHub call and the GitHub call is gated on it: a comment must never be
+/// posted that we could then fail to record, or the identical comment
+/// reposts every `interval_secs` forever. If the remote write then fails the
+/// latch is rolled back, so the export retries next tick rather than being
+/// silently skipped.
 #[allow(dead_code)] // consumer arrives in a later bridge task
 fn export_if_dirty(
     ctx: &Ctx,
@@ -467,34 +506,70 @@ fn export_if_dirty(
     } else {
         format!("Progress from `{}`.", ctx.config.instance_id)
     };
-    issues::comment(
+
+    // Latch first — no GitHub write without a persisted record of it.
+    if let Err(e) = store_hash(conn, item, &items::with_last_hash(item, &hash)) {
+        eprintln!(
+            "github bridge: could not record the export hash for #{} ({e}); \
+             skipping the export rather than risk re-posting it every tick",
+            issue.number
+        );
+        return Ok(false);
+    }
+
+    let written = issues::comment(
         &ctx.client,
         &ctx.repo,
         issue.number,
         &format!("{note}\n\n{}", marker.render()),
-    )?;
+    )
+    .and_then(|()| {
+        if completed {
+            issues::close(&ctx.client, &ctx.repo, issue.number)?;
+        }
+        Ok(())
+    });
 
-    if completed {
-        issues::close(&ctx.client, &ctx.repo, issue.number)?;
-        let _ = crate::claims::done(
+    if let Err(e) = written {
+        // Roll the latch back to whatever it was, so this export is retried
+        // instead of being suppressed until the content happens to change.
+        if let Err(revert) = store_hash(conn, item, &item.metadata) {
+            eprintln!("github bridge: could not roll back the export hash: {revert}");
+        }
+        return Err(e);
+    }
+
+    if completed
+        && let Err(e) = crate::claims::done(
             &ctx.ledger,
             &ctx.repo.to_string(),
             &format!("issue#{}", issue.number),
             &ctx.config.instance_id,
             now,
+        )
+    {
+        eprintln!(
+            "github bridge: ledger done failed for #{}: {e}",
+            issue.number
         );
     }
+    Ok(true)
+}
 
-    // Only now, after confirmed success, record the hash.
-    let _ = agentflare_backend::item::update(
+fn store_hash(
+    conn: &rusqlite::Connection,
+    item: &agentflare_backend::item::Item,
+    metadata: &str,
+) -> Result<(), agentflare_backend::Error> {
+    agentflare_backend::item::update(
         conn,
         &item.id,
         agentflare_backend::item::UpdateItem {
-            metadata: Some(items::with_last_hash(item, &hash)),
+            metadata: Some(metadata.to_string()),
             ..Default::default()
         },
-    );
-    Ok(true)
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -994,6 +1069,109 @@ mod tests {
         );
         assert_eq!(linked[0].id, ceded.id);
         assert!(items::is_active(&conn, &linked[0]), "back to started");
+        let _ = server.requests();
+    }
+
+    #[test]
+    fn a_failed_export_rolls_the_latch_back_so_the_next_tick_retries() {
+        // I4: the stored hash is written BEFORE the comment, so nothing can
+        // be posted that we then fail to record. The cost of that ordering is
+        // that a failed remote write must not leave the latch advanced, or
+        // the export is silently skipped until the content happens to change.
+        let ours = one_comment(10, &marker_body(Action::Claim, "me:1", NOW - 10));
+        let server = MockServer::start(vec![
+            MockResponse::json(200, QUEUE_ONE_ISSUE),
+            MockResponse::json(200, &ours), // step 1: we still hold it
+            MockResponse::json(500, r#"{"message":"boom"}"#), // the export POST
+            MockResponse::json(200, QUEUE_ONE_ISSUE),
+            MockResponse::json(200, &ours),
+            MockResponse::json(201, r#"{"id":300}"#), // the retry succeeds
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 0), project_id.clone());
+        let state = items::state_id_for_group(&conn, &project_id, "started").unwrap();
+        agentflare_backend::item::create(
+            &conn,
+            agentflare_backend::item::CreateItem {
+                project_id: project_id.clone(),
+                state_id: state,
+                name: "needs exporting".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: Some(items::EXTERNAL_SOURCE.to_string()),
+                external_id: Some("7".into()),
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        // Tick 1: the POST fails. A hard error, so run_once surfaces it.
+        assert!(run_once(&ctx, &conn, NOW).is_err());
+        let after_failure = items::find_by_issue(&conn, &project_id, 7).unwrap();
+        assert!(
+            items::last_hash(&after_failure).is_none(),
+            "a failed export must leave the latch where it was, or the retry \
+             never happens"
+        );
+
+        // Tick 2: same content, and it exports.
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+        assert_eq!(report.exported, vec![7]);
+        let after_success = items::find_by_issue(&conn, &project_id, 7).unwrap();
+        assert!(items::last_hash(&after_success).is_some(), "latch advanced");
+        let _ = server.requests();
+    }
+
+    #[test]
+    fn a_failed_cede_comment_leaves_the_item_active_for_the_next_tick() {
+        // The mirror of the export latch. Cancelling locally is what stops
+        // step 1 re-ceding, so it happens first — but if the announcement
+        // then fails, an item left cancelled with no cede marker on the issue
+        // reads to every other instance as "still claimed by us".
+        let server = MockServer::start(vec![
+            MockResponse::json(200, QUEUE_ONE_ISSUE),
+            MockResponse::json(200, "[]"), // nobody holds it, so we cede
+            MockResponse::json(500, r#"{"message":"boom"}"#), // the cede POST fails
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 0), project_id.clone());
+        seed_synced_item(&conn, &project_id, 7, "started");
+
+        assert!(run_once(&ctx, &conn, NOW).is_err());
+
+        let item = items::find_by_issue(&conn, &project_id, 7).unwrap();
+        assert!(
+            items::is_active(&conn, &item),
+            "a cede that never reached GitHub must be retried, not assumed"
+        );
+        let _ = server.requests();
+    }
+
+    #[test]
+    fn a_soft_error_is_reported_rather_than_swallowed_whole() {
+        // I5: soft errors keep the daemon looping, which is right — but
+        // `Forbidden` is a permanently dead bridge, and returning a bare
+        // empty report meant nothing ever said so.
+        let server = MockServer::start(vec![
+            MockResponse::json(403, r#"{"message":"limited"}"#)
+                .with_header("x-ratelimit-remaining", "0"),
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 3), project_id);
+
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert!(report.claimed.is_empty());
+        assert!(
+            report.soft_error.is_some(),
+            "the tick ended early — the runner has to be able to say why"
+        );
         let _ = server.requests();
     }
 
