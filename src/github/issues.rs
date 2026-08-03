@@ -54,6 +54,33 @@ pub fn list(client: &Client, repo: &RepoId, state: &str) -> Result<Vec<Issue>, G
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
+/// Like [`list`], plus GitHub's server-side `labels` and `since` filters.
+/// `since` is an ISO8601 timestamp matching `updated_at`, which keeps each
+/// bridge poll cheap.
+#[allow(dead_code)]
+pub fn list_filtered(
+    client: &Client,
+    repo: &RepoId,
+    state: &str,
+    labels: Option<&str>,
+    since: Option<&str>,
+) -> Result<Vec<Issue>, GitHubError> {
+    let mut path = format!(
+        "/repos/{}/{}/issues?state={}",
+        repo.owner,
+        repo.repo,
+        crate::github::encode_query(state)
+    );
+    if let Some(l) = labels {
+        path.push_str(&format!("&labels={}", crate::github::encode_query(l)));
+    }
+    if let Some(s) = since {
+        path.push_str(&format!("&since={}", crate::github::encode_query(s)));
+    }
+    let json = client.get_paginated(&path, crate::github::client::as_array)?;
+    serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
+}
+
 pub fn get(client: &Client, repo: &RepoId, number: u64) -> Result<Issue, GitHubError> {
     let path = format!("/repos/{}/{}/issues/{number}", repo.owner, repo.repo);
     let json = client.request("GET", &path, None)?;
@@ -199,7 +226,7 @@ mod tests {
     fn list_comments_fetches_and_parses() {
         let server = MockServer::start(vec![MockResponse::json(
             200,
-            r#"[{"user":{"login":"coderabbitai[bot]"},"body":"walkthrough...","created_at":"2026-07-19T00:00:00Z"}]"#,
+            r#"[{"id":1,"user":{"login":"coderabbitai[bot]"},"body":"walkthrough...","created_at":"2026-07-19T00:00:00Z"}]"#,
         )]);
         let client = server.client(None);
         let comments = list_comments(&client, &repo(), 4, None).unwrap();
@@ -246,5 +273,34 @@ mod tests {
         assert_eq!(reqs[0].path, "/repos/o/r/issues/2/labels");
         let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
         assert_eq!(sent["labels"][1], "b");
+    }
+
+    #[test]
+    fn list_filtered_encodes_labels_and_since() {
+        let server = MockServer::start(vec![MockResponse::json(200, "[]")]);
+        let client = server.client(None);
+        list_filtered(
+            &client,
+            &repo(),
+            "open",
+            Some("agentflare"),
+            Some("2026-08-03T00:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(
+            server.requests()[0].path,
+            "/repos/o/r/issues?state=open&labels=agentflare&since=2026-08-03T00%3A00%3A00Z&per_page=100&page=1"
+        );
+    }
+
+    #[test]
+    fn list_filtered_omits_absent_filters() {
+        let server = MockServer::start(vec![MockResponse::json(200, "[]")]);
+        let client = server.client(None);
+        list_filtered(&client, &repo(), "open", None, None).unwrap();
+        assert_eq!(
+            server.requests()[0].path,
+            "/repos/o/r/issues?state=open&per_page=100&page=1"
+        );
     }
 }
