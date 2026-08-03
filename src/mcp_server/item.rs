@@ -1016,7 +1016,10 @@ mod metadata_field_tests {
 
     #[test]
     fn parsed_kind_reads_a_plain_object() {
-        assert_eq!(parsed_kind(r#"{"kind":"locate"}"#), Some("locate".to_string()));
+        assert_eq!(
+            parsed_kind(r#"{"kind":"locate"}"#),
+            Some("locate".to_string())
+        );
     }
 
     #[test]

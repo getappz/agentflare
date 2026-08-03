@@ -558,8 +558,14 @@ mod tests {
     fn resolve_agent_errors_when_no_flag_and_no_assignment_and_no_rule() {
         let item = test_item();
         let config = agent_registry::RouterConfig::default();
-        let err = resolve_agent(None, &item, &[], &config, &[agent_registry::Agent::ClaudeCode])
-            .unwrap_err();
+        let err = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &[agent_registry::Agent::ClaudeCode],
+        )
+        .unwrap_err();
         assert!(err.contains("--agent"));
     }
 
@@ -576,8 +582,14 @@ use  = "opencode"
 "#,
         )
         .unwrap();
-        let resolved =
-            resolve_agent(None, &item, &[], &config, &[agent_registry::Agent::Opencode]).unwrap();
+        let resolved = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &[agent_registry::Agent::Opencode],
+        )
+        .unwrap();
         assert_eq!(resolved, agent_registry::Agent::Opencode);
     }
 
@@ -594,8 +606,14 @@ use  = "opencode"
 "#,
         )
         .unwrap();
-        let resolved =
-            resolve_agent(None, &item, &[], &config, &[agent_registry::Agent::Opencode]).unwrap();
+        let resolved = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &[agent_registry::Agent::Opencode],
+        )
+        .unwrap();
         assert_eq!(resolved, agent_registry::Agent::Opencode);
     }
 

@@ -181,7 +181,11 @@ pub fn parse_router_config(text: &str) -> Result<RouterConfig, String> {
 /// through rather than hard-failing or silently picking whatever the caller
 /// didn't ask for.
 #[must_use]
-pub fn route(task: &TaskContext, config: &RouterConfig, installed: &[Agent]) -> Option<RouteDecision> {
+pub fn route(
+    task: &TaskContext,
+    config: &RouterConfig,
+    installed: &[Agent],
+) -> Option<RouteDecision> {
     if let Some(agent) = task.assigned_agent {
         return Some(RouteDecision {
             agent,
@@ -262,7 +266,11 @@ mod tests {
     #[test]
     fn rule_requires_all_its_labels_present_extra_task_labels_ok() {
         let task = TaskContext {
-            labels: vec!["security".to_string(), "auth".to_string(), "urgent".to_string()],
+            labels: vec![
+                "security".to_string(),
+                "auth".to_string(),
+                "urgent".to_string(),
+            ],
             ..Default::default()
         };
         let config = RouterConfig {
@@ -420,7 +428,10 @@ when = { labels = ["docs"] }
 use  = ["not-a-real-agent", "opencode"]
 "#;
         let config = parse_router_config(text).unwrap();
-        assert!(config.default.is_none(), "unknown default is dropped, not errored");
+        assert!(
+            config.default.is_none(),
+            "unknown default is dropped, not errored"
+        );
         assert_eq!(
             config.rules[0].use_agents,
             vec![Agent::Opencode],
