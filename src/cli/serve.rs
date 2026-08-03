@@ -49,6 +49,8 @@ impl ServeArgs {
                 );
             }
         }
+        // Optional; a no-op unless AGENTFLARE_BRIDGE_ENABLED is set.
+        let _bridge = crate::github::bridge::runner::spawn_if_enabled();
         crate::dashboard::serve(&self.host, self.port, self.open, self.yes_expose);
     }
 }

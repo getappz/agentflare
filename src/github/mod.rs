@@ -5,6 +5,7 @@
 
 pub mod actions;
 pub mod auth;
+pub mod bridge;
 pub mod client;
 pub mod identity;
 pub mod init_auth;
