@@ -74,6 +74,102 @@ pub struct RouterConfig {
     pub rules: Vec<RouterRule>,
 }
 
+fn agent_by_str(name: &str) -> Option<Agent> {
+    crate::registry::REGISTRY
+        .iter()
+        .find(|s| s.id.as_str() == name)
+        .map(|s| s.id)
+}
+
+/// A single string or an array of strings — TOML doesn't have a "one or
+/// many" type, so `use = "codex"` and `use = ["codex", "opencode"]` both
+/// need to deserialize into the same `Vec<String>` preference list.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            OneOrMany::One(s) => vec![s],
+            OneOrMany::Many(v) => v,
+        }
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct RawWhen {
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    size: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawRule {
+    #[serde(default)]
+    when: RawWhen,
+    #[serde(rename = "use")]
+    use_agents: OneOrMany,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct RawRouterConfig {
+    #[serde(default)]
+    default: Option<String>,
+    #[serde(default)]
+    rule: Vec<RawRule>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct RawFile {
+    #[serde(default)]
+    router: Option<RawRouterConfig>,
+}
+
+/// Parses a `~/.agentflare/config.toml`-shaped document down to its
+/// `[router]` table, ignoring every other top-level table — the file is
+/// #331's surface, this only ever reads its own corner of it. Returns the
+/// empty (no rules, no default) `RouterConfig` when `[router]` is absent
+/// entirely, e.g. the file doesn't exist yet.
+///
+/// An agent name that doesn't resolve (typo, or an agent this build's
+/// registry doesn't know) is dropped from the preference list it appeared
+/// in rather than failing the whole parse — `route()` already treats a
+/// dropped/not-installed preference as "try the next one", so a bad name
+/// behaves exactly like one that's merely not installed. Only malformed
+/// TOML syntax is a hard `Err`.
+pub fn parse_router_config(text: &str) -> Result<RouterConfig, String> {
+    let file: RawFile = toml::from_str(text).map_err(|e| e.to_string())?;
+    let Some(raw) = file.router else {
+        return Ok(RouterConfig::default());
+    };
+    let default = raw.default.as_deref().and_then(agent_by_str);
+    let rules = raw
+        .rule
+        .into_iter()
+        .map(|r| RouterRule {
+            when: RuleMatch {
+                labels: r.when.labels,
+                kind: r.when.kind,
+                size: r.when.size,
+            },
+            use_agents: r
+                .use_agents
+                .into_vec()
+                .iter()
+                .filter_map(|s| agent_by_str(s))
+                .collect(),
+        })
+        .collect();
+    Ok(RouterConfig { default, rules })
+}
+
 /// Decides which agent should run `task`, or `None` if nothing local fits —
 /// the caller's cue to fall back (e.g. cede via the bridge).
 ///
@@ -263,5 +359,77 @@ mod tests {
         let task = TaskContext::default();
         let config = RouterConfig::default();
         assert!(route(&task, &config, &[Agent::ClaudeCode]).is_none());
+    }
+
+    // ---- parse_router_config ----
+
+    #[test]
+    fn parse_reads_default_and_rules_from_the_spec_example() {
+        let text = r#"
+[router]
+default = "claude-code"
+
+[[router.rule]]
+when = { labels = ["security", "auth"] }
+use  = "claude-code"
+
+[[router.rule]]
+when = { kind = "locate", size = "S" }
+use  = "opencode"
+
+[[router.rule]]
+when = { labels = ["docs"] }
+use  = ["codex", "opencode"]
+"#;
+        let config = parse_router_config(text).unwrap();
+        assert_eq!(config.default, Some(Agent::ClaudeCode));
+        assert_eq!(config.rules.len(), 3);
+        assert_eq!(config.rules[0].when.labels, vec!["security", "auth"]);
+        assert_eq!(config.rules[0].use_agents, vec![Agent::ClaudeCode]);
+        assert_eq!(config.rules[1].when.kind.as_deref(), Some("locate"));
+        assert_eq!(config.rules[1].when.size.as_deref(), Some("S"));
+        assert_eq!(
+            config.rules[2].use_agents,
+            vec![Agent::Codex, Agent::Opencode],
+            "a `use` array preserves preference order"
+        );
+    }
+
+    #[test]
+    fn parse_defaults_to_empty_config_when_router_table_is_absent() {
+        let config = parse_router_config("[some_other_feature]\nkey = 1\n").unwrap();
+        assert!(config.default.is_none());
+        assert!(config.rules.is_empty());
+    }
+
+    #[test]
+    fn parse_defaults_to_empty_config_on_an_empty_file() {
+        let config = parse_router_config("").unwrap();
+        assert!(config.default.is_none());
+        assert!(config.rules.is_empty());
+    }
+
+    #[test]
+    fn parse_drops_unknown_agent_names_instead_of_failing() {
+        let text = r#"
+[router]
+default = "not-a-real-agent"
+
+[[router.rule]]
+when = { labels = ["docs"] }
+use  = ["not-a-real-agent", "opencode"]
+"#;
+        let config = parse_router_config(text).unwrap();
+        assert!(config.default.is_none(), "unknown default is dropped, not errored");
+        assert_eq!(
+            config.rules[0].use_agents,
+            vec![Agent::Opencode],
+            "unknown name filtered out, known one kept"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_malformed_toml() {
+        assert!(parse_router_config("this is not [ valid toml").is_err());
     }
 }

@@ -8,4 +8,6 @@ pub use detect::{
 pub use registry::{
     Agent, AgentSpec, REGISTRY, Tier, autonomous_args, canonicalize, headless_args, spec,
 };
-pub use router::{RouteDecision, RouterConfig, RouterRule, RuleMatch, TaskContext, route};
+pub use router::{
+    RouteDecision, RouterConfig, RouterRule, RuleMatch, TaskContext, parse_router_config, route,
+};
