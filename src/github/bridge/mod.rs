@@ -2,4 +2,5 @@
 //! labelled `agentflare` form an open pull queue that any instance may claim.
 
 pub mod claim;
+pub mod config;
 pub mod marker;
