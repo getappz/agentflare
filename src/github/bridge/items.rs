@@ -60,10 +60,8 @@ pub fn state_id_for_group(
     project_id: &str,
     group: &str,
 ) -> Option<String> {
-    agentflare_backend::state::list_by_project(conn, project_id)
-        .ok()?
-        .into_iter()
-        .find(|s| s.group_name == group)
+    agentflare_backend::state::first_in_group(conn, project_id, group)
+        .ok()
         .map(|s| s.id)
 }
 
@@ -124,6 +122,40 @@ pub(crate) mod tests {
         let i = item_with_metadata("not json");
         let v: serde_json::Value = serde_json::from_str(&with_last_hash(&i, "x")).unwrap();
         assert_eq!(v["github_last_hash"], "x");
+    }
+
+    #[test]
+    fn with_last_hash_recovers_from_valid_json_that_is_not_an_object() {
+        for non_object in ["[]", "42", r#""str""#, "null", "true"] {
+            let i = item_with_metadata(non_object);
+            let updated = with_last_hash(&i, "deadbeef");
+            let v: serde_json::Value = serde_json::from_str(&updated)
+                .unwrap_or_else(|e| panic!("{non_object} produced invalid JSON: {e}"));
+            assert!(
+                v.is_object(),
+                "{non_object} must be replaced with an object, got {v}"
+            );
+            assert_eq!(
+                v["github_last_hash"], "deadbeef",
+                "{non_object} must still carry the new hash"
+            );
+        }
+    }
+
+    #[test]
+    fn last_hash_is_none_when_github_last_hash_is_not_a_string() {
+        for metadata in [
+            r#"{"github_last_hash":42}"#,
+            r#"{"github_last_hash":{"nested":true}}"#,
+            r#"{"github_last_hash":null}"#,
+            r#"{"github_last_hash":[1,2,3]}"#,
+        ] {
+            let i = item_with_metadata(metadata);
+            assert!(
+                last_hash(&i).is_none(),
+                "{metadata} must yield None, not panic"
+            );
+        }
     }
 
     // --- DB-backed ---

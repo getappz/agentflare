@@ -16,6 +16,11 @@ const DEFAULT_QUEUE_LABEL: &str = "agentflare";
 pub struct BridgeConfig {
     pub enabled: bool,
     pub interval_secs: u64,
+    /// Max issues this instance will claim per tick. `0` is LEGITIMATE and is
+    /// NOT floored: it is deliberate "drain mode" — stop claiming new work
+    /// while this instance keeps re-verifying and exporting issues it
+    /// already holds. Useful for taking an instance out of rotation without
+    /// dropping its in-flight work.
     pub max_claims: usize,
     pub ttl_secs: i64,
     pub queue_label: String,
@@ -31,7 +36,7 @@ impl BridgeConfig {
     pub fn from_env() -> BridgeConfig {
         let get = |k: &str| std::env::var(k).ok();
         let instance = get("AGENTFLARE_BRIDGE_INSTANCE_ID")
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(crate::claims::owner_id);
         BridgeConfig::from_values(
             get("AGENTFLARE_BRIDGE_ENABLED").as_deref(),
@@ -130,5 +135,16 @@ mod tests {
     fn interval_has_a_floor_so_a_typo_cannot_hammer_github() {
         let c = BridgeConfig::from_values(Some("1"), Some("0"), None, None, "a".to_string());
         assert_eq!(c.interval_secs, MIN_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn max_claims_zero_is_legal_drain_mode_not_a_floor_violation() {
+        let c = BridgeConfig::from_values(Some("1"), None, Some("0"), None, "a".to_string());
+        assert_eq!(
+            c.max_claims, 0,
+            "0 must pass through unfloored: it means drain mode (stop claiming \
+             new work, keep re-verifying/exporting what's already held), not \
+             a mistyped value to correct"
+        );
     }
 }
