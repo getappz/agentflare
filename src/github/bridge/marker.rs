@@ -53,6 +53,20 @@ pub struct Marker {
     pub hash: String,
 }
 
+/// Stands in for a field with nothing to say — a `cede` has no content hash.
+///
+/// `parse` fails closed on an empty value, so a field rendered as `hash=`
+/// makes the WHOLE marker unparseable. That is not hypothetical: `cede` wrote
+/// exactly that, so every cede the bridge posted was invisible to the parser
+/// and no other instance could see a claim being given up. The substitution
+/// lives in `render` rather than at the call sites so a future field with an
+/// empty value cannot reintroduce it.
+const EMPTY_FIELD: &str = "-";
+
+fn field(value: &str) -> &str {
+    if value.is_empty() { EMPTY_FIELD } else { value }
+}
+
 #[allow(dead_code)] // consumer arrives in a later bridge task
 impl Marker {
     pub fn render(&self) -> String {
@@ -60,10 +74,10 @@ impl Marker {
             "<!-- {} action={} owner={} item={} ts={} hash={} -->",
             MARKER_VERSION,
             self.action.as_str(),
-            self.owner,
-            self.item,
+            field(&self.owner),
+            field(&self.item),
             self.ts,
-            self.hash
+            field(&self.hash)
         )
     }
 
@@ -150,6 +164,45 @@ mod tests {
     fn render_then_parse_round_trips() {
         let m = sample();
         assert_eq!(Marker::parse(&m.render()), Some(m));
+    }
+
+    #[test]
+    fn anything_render_writes_is_something_parse_can_read_back() {
+        // The bug this guards: `cede` built its marker with `hash: ""`, which
+        // rendered as `hash=` — and `parse` fails closed on an empty value,
+        // so the entire marker was unparseable. Every cede the bridge ever
+        // posted was invisible to the parser, meaning no other instance could
+        // see a claim being given up. The unit tests all missed it because
+        // their fixtures used a non-empty hash the production code never
+        // wrote. Nothing `render` emits may be unreadable, whatever the input.
+        for empty in ["owner", "item", "hash"] {
+            let mut m = sample();
+            match empty {
+                "owner" => m.owner = String::new(),
+                "item" => m.item = String::new(),
+                _ => m.hash = String::new(),
+            }
+            let rendered = m.render();
+            let parsed = Marker::parse(&rendered)
+                .unwrap_or_else(|| panic!("empty {empty} made the marker unreadable: {rendered}"));
+            assert_eq!(parsed.action, m.action);
+            assert_eq!(parsed.ts, m.ts);
+        }
+    }
+
+    #[test]
+    fn a_cede_marker_as_the_bridge_actually_builds_it_round_trips() {
+        // `tick::cede` has no content hash to report, so it passes "".
+        let cede = Marker {
+            action: Action::Cede,
+            owner: "a:1".to_string(),
+            item: "item-id".to_string(),
+            ts: 1_754_000_000,
+            hash: String::new(),
+        };
+        let parsed = Marker::parse(&cede.render()).expect("a cede must be readable");
+        assert_eq!(parsed.action, Action::Cede);
+        assert_eq!(parsed.owner, "a:1");
     }
 
     #[test]
