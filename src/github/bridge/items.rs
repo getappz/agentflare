@@ -82,6 +82,22 @@ pub fn is_active(conn: &rusqlite::Connection, item: &Item) -> bool {
         .unwrap_or(true)
 }
 
+/// Whether `item` was CEDED — locally cancelled, but still linked to its
+/// issue and therefore re-adoptable if we win the claim again.
+///
+/// Deliberately narrower than `!is_active`, which is also false for
+/// `completed`: a completed item still owes its issue a `done` export (and
+/// the close that follows), so treating it as re-claimable would have us
+/// re-open work we had just finished. Only `cancelled` is recoverable.
+/// Unresolvable state fails closed as NOT ceded, matching `is_active`'s
+/// fail-open-as-live direction.
+#[allow(dead_code)] // consumer arrives in a later bridge task
+pub fn is_ceded(conn: &rusqlite::Connection, item: &Item) -> bool {
+    agentflare_backend::state::get(conn, &item.state_id)
+        .map(|s| s.group_name == "cancelled")
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

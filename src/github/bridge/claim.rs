@@ -90,6 +90,22 @@ fn latest_ts_for(owner: &str, parsed: &[(u64, Marker)]) -> Option<i64> {
         .max()
 }
 
+/// The timestamp `owner`'s liveness is currently judged from — the same
+/// value `resolve_holder` compares against the TTL — or `None` if this owner
+/// has written no marker on the issue at all.
+///
+/// The bridge's heartbeat reads this to decide whether a refresh is due, so
+/// the two agree by construction: anything that would keep `resolve_holder`
+/// from expiring us also stops the heartbeat firing, and nothing else can.
+#[allow(dead_code)] // consumer arrives in a later bridge task
+pub fn owner_liveness(comments: &[(u64, String)], owner: &str) -> Option<i64> {
+    let parsed: Vec<(u64, Marker)> = comments
+        .iter()
+        .filter_map(|(id, body)| Marker::parse(body).map(|m| (*id, m)))
+        .collect();
+    latest_ts_for(owner, &parsed)
+}
+
 /// Whether `me` is the current holder. Re-checked every tick, not trusted
 /// once: GitHub comment listing is not instantly consistent, so two instances
 /// can each briefly believe they won.

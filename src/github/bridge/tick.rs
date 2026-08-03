@@ -102,7 +102,8 @@ fn run_inner(
         None,
     )?;
 
-    // 1. Re-verify claims we believe we hold; cede any we actually lost.
+    // 1. Re-verify claims we believe we hold; heartbeat the ones we still
+    //    hold, cede any we actually lost.
     for issue in &queued {
         let Some(item) = items::find_by_issue(conn, &ctx.project_id, issue.number) else {
             continue;
@@ -114,7 +115,10 @@ fn run_inner(
             continue;
         }
         let comments = comment_pairs(ctx, issue.number)?;
-        if claim_rules::i_hold(&comments, &ctx.config.instance_id, now, ctx.config.ttl_secs) {
+        let ours = claim_rules::resolve_holder(&comments, now, ctx.config.ttl_secs)
+            .filter(|h| h.marker.owner == ctx.config.instance_id);
+        if let Some(held) = ours {
+            heartbeat(ctx, &comments, issue.number, &held, &item, now)?;
             continue;
         }
         cede(ctx, conn, issue.number, &item, now)?;
@@ -138,7 +142,22 @@ fn run_inner(
     let held = held_count(conn, ctx);
     let headroom = ctx.config.max_claims.saturating_sub(held);
     for issue in queued.iter().take(headroom) {
-        if items::find_by_issue(conn, &ctx.project_id, issue.number).is_some() {
+        // Ceded THIS tick: step 1 just established a rival holds it, so
+        // re-probing now would only re-read comments we already read and
+        // re-learn the answer. Wait for the next tick.
+        if report.ceded.contains(&issue.number) {
+            continue;
+        }
+        // Otherwise a linked item's mere existence is NOT a reason to skip:
+        // an item ceded on an EARLIER tick is `cancelled`, and treating that
+        // as "already tracked" made every cede permanent — the issue could
+        // never be picked up by this instance again, even once the contention
+        // that caused the cede was long gone. Ceded items are re-adoptable;
+        // active and completed ones are not (a completed one still owes its
+        // issue a `done` export).
+        if items::find_by_issue(conn, &ctx.project_id, issue.number)
+            .is_some_and(|item| !items::is_ceded(conn, &item))
+        {
             continue;
         }
         if try_claim(ctx, conn, issue, now)? {
@@ -146,6 +165,78 @@ fn run_inner(
         }
     }
     Ok(())
+}
+
+/// How stale our own marker may get before the heartbeat refreshes it.
+///
+/// Half the TTL, so one lost or failed refresh still leaves a full half-TTL
+/// of ticks to recover in before `resolve_holder` would expire us.
+fn heartbeat_due_after(ttl_secs: i64) -> i64 {
+    (ttl_secs / 2).max(1)
+}
+
+/// Keeps a claim we still hold alive, on both layers.
+///
+/// Without this the bridge cedes its OWN live work on a wall-clock timer:
+/// `resolve_holder` expires an owner whose newest marker is older than the
+/// TTL, and before this existed the only thing that ever wrote a marker was
+/// `export_if_dirty` — which fires solely on a content-hash change. An issue
+/// being *worked* rather than *edited* therefore went quiet, aged past the
+/// TTL, and got ceded to nobody.
+///
+/// The remote refresh EDITS the comment that already carries our claim
+/// marker rather than posting a new one: same comment id, so
+/// `resolve_holder`'s lowest-id-wins ordering and `is_ceded`'s id comparison
+/// are both untouched, and the issue does not accumulate a bookkeeping
+/// comment every half-TTL. It also rewrites `item=` with the real item id,
+/// which is not known yet when the claim is first posted.
+#[allow(dead_code)] // consumer arrives in a later bridge task
+fn heartbeat(
+    ctx: &Ctx,
+    comments: &[(u64, String)],
+    number: u64,
+    held: &claim_rules::Holder,
+    item: &agentflare_backend::item::Item,
+    now: i64,
+) -> Result<bool, GitHubError> {
+    // The local ledger is cheap and purely local — refresh it every tick we
+    // hold, regardless of whether the remote marker is due.
+    if let Err(e) = crate::claims::heartbeat(
+        &ctx.ledger,
+        &ctx.repo.to_string(),
+        &format!("issue#{number}"),
+        &ctx.config.instance_id,
+        now,
+    ) {
+        eprintln!("github bridge: ledger heartbeat failed: {e}");
+    }
+
+    // Liveness is judged from our NEWEST marker of any action, so a recent
+    // export already covers us and no write is needed.
+    let due = claim_rules::owner_liveness(comments, &ctx.config.instance_id)
+        .is_none_or(|ts| now.saturating_sub(ts) >= heartbeat_due_after(ctx.config.ttl_secs));
+    if !due {
+        return Ok(false);
+    }
+
+    let refreshed = Marker {
+        action: Action::Claim,
+        owner: ctx.config.instance_id.clone(),
+        item: item.id.clone(),
+        ts: now,
+        hash: held.marker.hash.clone(),
+    };
+    issues::update_comment(
+        &ctx.client,
+        &ctx.repo,
+        held.comment_id,
+        &format!(
+            "Claiming this for `{}`.\n\n{}",
+            ctx.config.instance_id,
+            refreshed.render()
+        ),
+    )?;
+    Ok(true)
 }
 
 #[allow(dead_code)] // consumer arrives in a later bridge task
@@ -202,26 +293,36 @@ fn try_claim(
     let Some(state_id) = items::state_id_for_group(conn, &ctx.project_id, "started") else {
         return Ok(false);
     };
-    let created = agentflare_backend::item::create(
-        conn,
-        agentflare_backend::item::CreateItem {
-            project_id: ctx.project_id.clone(),
-            state_id,
-            name: issue.title.clone(),
-            description: issue.body.clone(),
-            priority: None,
-            parent_id: None,
-            assignee_agent: Some(ctx.config.instance_id.clone()),
-            sort_order: None,
-            external_source: Some(items::EXTERNAL_SOURCE.to_string()),
-            external_id: Some(issue.number.to_string()),
-            metadata: None,
-            label_ids: vec![],
-            assignee_ids: vec![],
-            dependency_ids: vec![],
-        },
-    )
-    .map_err(|e| GitHubError::Parse(e.to_string()))?;
+    // Re-adopt a previously ceded item rather than creating a second one:
+    // `find_by_issue` returns the FIRST match, so a duplicate would leave the
+    // bridge permanently updating one row while reading another.
+    let created = match items::find_by_issue(conn, &ctx.project_id, issue.number) {
+        Some(existing) => {
+            agentflare_backend::item::update_state(conn, &existing.id, &state_id)
+                .map_err(|e| GitHubError::Parse(e.to_string()))?;
+            existing
+        }
+        None => agentflare_backend::item::create(
+            conn,
+            agentflare_backend::item::CreateItem {
+                project_id: ctx.project_id.clone(),
+                state_id,
+                name: issue.title.clone(),
+                description: issue.body.clone(),
+                priority: None,
+                parent_id: None,
+                assignee_agent: Some(ctx.config.instance_id.clone()),
+                sort_order: None,
+                external_source: Some(items::EXTERNAL_SOURCE.to_string()),
+                external_id: Some(issue.number.to_string()),
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .map_err(|e| GitHubError::Parse(e.to_string()))?,
+    };
 
     // Local ledger too, so this instance's OWN agents do not double-claim.
     // NOTE: `&ctx.ledger`, NOT `conn` — separate databases.
@@ -537,50 +638,26 @@ mod tests {
         // Regression guard for the "ceded items are re-ceded forever" bug:
         // step 1 must skip items already moved to the `cancelled` group, or
         // the second tick posts a duplicate "is ceding this" comment.
-        let issue = r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}]}]"#;
+        //
+        // Tick 2 DOES re-probe the issue — a cede is recoverable, not
+        // terminal — so it reads the comments again; what it must not do is
+        // cede a second time.
+        let rival = marker_body(Action::Claim, "other:9", NOW);
         let server = MockServer::start(vec![
             // tick 1: queue listing
-            MockResponse::json(200, issue),
+            MockResponse::json(200, QUEUE_ONE_ISSUE),
             // tick 1: comments on #7 — nobody holds it live, so we cede
             MockResponse::json(200, "[]"),
             // tick 1: cede's comment post
             MockResponse::json(201, r#"{"id":200}"#),
-            // tick 2: queue listing only — no comments GET, no cede POST
-            MockResponse::json(200, issue),
+            // tick 2: queue listing
+            MockResponse::json(200, QUEUE_ONE_ISSUE),
+            // tick 2: the reclaim probe finds a live rival, so it stops there
+            MockResponse::json(200, &one_comment(50, &rival)),
         ]);
         let (conn, project_id) = test_db();
         let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
-
-        // Seed a locally-held item already linked to issue #7, with its
-        // export hash already in sync — as if a prior tick had already
-        // exported it — so tick 2's export step is a no-op and consumes no
-        // extra mock responses, keeping this test focused on the cede path.
-        let state = items::state_id_for_group(&conn, &project_id, "started").unwrap();
-        let hash = content_hash("t", "", "open", &["agentflare".to_string()]);
-        let metadata = format!(
-            r#"{{"github_last_hash":{}}}"#,
-            serde_json::to_string(&hash).unwrap()
-        );
-        agentflare_backend::item::create(
-            &conn,
-            agentflare_backend::item::CreateItem {
-                project_id: project_id.clone(),
-                state_id: state,
-                name: "t".into(),
-                description: None,
-                priority: None,
-                parent_id: None,
-                assignee_agent: None,
-                sort_order: None,
-                external_source: Some(items::EXTERNAL_SOURCE.to_string()),
-                external_id: Some("7".into()),
-                metadata: Some(metadata),
-                label_ids: vec![],
-                assignee_ids: vec![],
-                dependency_ids: vec![],
-            },
-        )
-        .unwrap();
+        seed_synced_item(&conn, &project_id, 7, "started");
 
         let first = run_once(&ctx, &conn, NOW).unwrap();
         assert_eq!(first.ceded, vec![7], "first tick must cede the lost claim");
@@ -590,7 +667,16 @@ mod tests {
             second.ceded.is_empty(),
             "a second tick must not re-cede an already-cancelled item"
         );
-        let _ = server.requests();
+        assert!(
+            second.claimed.is_empty(),
+            "and must not take an issue a live rival holds"
+        );
+        let posts = server
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST")
+            .count();
+        assert_eq!(posts, 1, "exactly one cede comment across both ticks");
     }
 
     #[test]
@@ -669,6 +755,220 @@ mod tests {
             0,
             "a completed item must not consume claim capacity"
         );
+    }
+
+    /// A locally-tracked item linked to `number`, in `group`, whose export
+    /// hash is already in sync with `issue_json`'s content — so the export
+    /// step is a guaranteed no-op and consumes no mock response. Tests that
+    /// want to focus on one step of the tick can then queue exactly the
+    /// responses that step needs.
+    fn seed_synced_item(
+        conn: &rusqlite::Connection,
+        project_id: &str,
+        number: u64,
+        group: &str,
+    ) -> agentflare_backend::item::Item {
+        let state = items::state_id_for_group(conn, project_id, group).unwrap();
+        let hash = content_hash("t", "", "open", &["agentflare".to_string()]);
+        let metadata = format!(
+            r#"{{"github_last_hash":{}}}"#,
+            serde_json::to_string(&hash).unwrap()
+        );
+        agentflare_backend::item::create(
+            conn,
+            agentflare_backend::item::CreateItem {
+                project_id: project_id.to_string(),
+                state_id: state,
+                name: "t".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: Some("me:1".into()),
+                sort_order: None,
+                external_source: Some(items::EXTERNAL_SOURCE.to_string()),
+                external_id: Some(number.to_string()),
+                metadata: Some(metadata),
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap()
+    }
+
+    const QUEUE_ONE_ISSUE: &str = r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}]}]"#;
+
+    fn one_comment(id: u64, body: &str) -> String {
+        format!(
+            r#"[{{"id":{id},"user":{{"login":"u"}},"body":{}}}]"#,
+            serde_json::to_string(body).unwrap()
+        )
+    }
+
+    #[test]
+    fn an_idle_holder_refreshes_its_marker_instead_of_ceding_its_own_work() {
+        // THE regression guard for the self-cede treadmill. Before the
+        // heartbeat existed, the only thing that ever wrote a marker was
+        // `export_if_dirty` — which fires on a content-hash change. An issue
+        // being worked rather than edited went quiet, aged past the TTL, and
+        // the instance ceded its own live work to nobody, cancelled the item,
+        // and could never reclaim it.
+        let ttl = crate::claims::ttl_secs();
+        let stale = NOW - (ttl / 2) - 1;
+        let server = MockServer::start(vec![
+            MockResponse::json(200, QUEUE_ONE_ISSUE),
+            MockResponse::json(
+                200,
+                &one_comment(100, &marker_body(Action::Claim, "me:1", stale)),
+            ),
+            MockResponse::json(200, r#"{"id":100}"#), // the heartbeat PATCH
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+        seed_synced_item(&conn, &project_id, 7, "started");
+
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert!(
+            report.ceded.is_empty(),
+            "an instance that still holds the issue must never cede to itself"
+        );
+        let reqs = server.requests();
+        let patch = reqs
+            .iter()
+            .find(|r| r.method == "PATCH")
+            .expect("a stale marker must be refreshed");
+        assert_eq!(
+            patch.path, "/repos/o/r/issues/comments/100",
+            "the refresh must EDIT the existing claim comment, not post a new one"
+        );
+        let sent: serde_json::Value = serde_json::from_str(&patch.body).unwrap();
+        let refreshed = Marker::parse(sent["body"].as_str().unwrap()).unwrap();
+        assert_eq!(refreshed.ts, NOW, "the marker must carry the current time");
+        assert_eq!(refreshed.action, Action::Claim);
+        assert!(
+            !reqs.iter().any(|r| r.method == "POST"),
+            "refreshing must not add a comment: at half-TTL that is a new \
+             bookkeeping comment every 15 minutes, forever"
+        );
+    }
+
+    #[test]
+    fn a_marker_still_well_inside_the_ttl_is_left_alone() {
+        // The heartbeat must be due-driven, not every-tick: at the default
+        // 60s interval an unconditional refresh would be 1440 writes a day
+        // per held issue.
+        let server = MockServer::start(vec![
+            MockResponse::json(200, QUEUE_ONE_ISSUE),
+            MockResponse::json(
+                200,
+                &one_comment(100, &marker_body(Action::Claim, "me:1", NOW - 10)),
+            ),
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+        seed_synced_item(&conn, &project_id, 7, "started");
+
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert!(report.ceded.is_empty());
+        let reqs = server.requests();
+        assert!(
+            reqs.iter().all(|r| r.method == "GET"),
+            "a fresh marker needs no write, got {reqs:?}"
+        );
+    }
+
+    #[test]
+    fn holding_an_issue_also_refreshes_the_local_ledger_lease() {
+        // Two layers expire independently: refreshing only the GitHub marker
+        // would leave this instance's OWN agents seeing a stale ledger row
+        // and double-claiming work the bridge is still holding.
+        let server = MockServer::start(vec![
+            MockResponse::json(200, QUEUE_ONE_ISSUE),
+            MockResponse::json(
+                200,
+                &one_comment(100, &marker_body(Action::Claim, "me:1", NOW - 10)),
+            ),
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+        seed_synced_item(&conn, &project_id, 7, "started");
+        crate::claims::acquire(
+            &ctx.ledger,
+            &ctx.repo.to_string(),
+            "issue#7",
+            "me:1",
+            None,
+            None,
+            NOW - 500,
+            1800,
+        )
+        .unwrap();
+
+        run_once(&ctx, &conn, NOW).unwrap();
+
+        let claims = crate::claims::list(&ctx.ledger, None, true, NOW, 1800).unwrap();
+        assert_eq!(claims[0].heartbeat_at, NOW, "the lease must be renewed");
+        let _ = server.requests();
+    }
+
+    #[test]
+    fn a_ceded_issue_can_be_reclaimed_later_and_reuses_its_existing_item() {
+        // A cede must be recoverable, not terminal. Step 3 used to skip on
+        // the mere existence of a linked item, so the cancelled row left
+        // behind by a cede locked this instance out of that issue forever —
+        // even once the contention that caused the cede was long gone.
+        let server = MockServer::start(vec![
+            MockResponse::json(200, QUEUE_ONE_ISSUE),
+            MockResponse::json(200, "[]"), // nobody holds it now
+            MockResponse::json(201, r#"{"id":100}"#), // our claim comment
+            MockResponse::json(
+                200,
+                &one_comment(100, &marker_body(Action::Claim, "me:1", NOW)),
+            ),
+            MockResponse::json(200, "[]"), // the claimed: label
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+        let ceded = seed_synced_item(&conn, &project_id, 7, "cancelled");
+
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert_eq!(report.claimed, vec![7], "a ceded issue must be reclaimable");
+        let linked: Vec<_> = agentflare_backend::item::list_by_project(&conn, &project_id)
+            .unwrap()
+            .into_iter()
+            .filter(|i| i.external_id.as_deref() == Some("7"))
+            .collect();
+        assert_eq!(
+            linked.len(),
+            1,
+            "reclaiming must re-adopt the existing item, not create a second \
+             one — find_by_issue returns the first match, so a duplicate would \
+             have the bridge writing one row and reading another"
+        );
+        assert_eq!(linked[0].id, ceded.id);
+        assert!(items::is_active(&conn, &linked[0]), "back to started");
+        let _ = server.requests();
+    }
+
+    #[test]
+    fn a_completed_item_is_not_reclaimed_while_its_done_export_is_pending() {
+        // `is_ceded` is deliberately narrower than `!is_active`: between
+        // completing an item and exporting its `done`, the issue is still
+        // open and still in the queue. Treating "not active" as "re-claimable"
+        // would re-open work we had just finished.
+        let server = MockServer::start(vec![MockResponse::json(200, QUEUE_ONE_ISSUE)]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+        seed_synced_item(&conn, &project_id, 7, "completed");
+
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert!(report.claimed.is_empty(), "must not re-claim finished work");
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 1, "only the queue listing, got {reqs:?}");
     }
 
     fn test_ctx(server: &MockServer, max_claims: usize) -> Ctx {

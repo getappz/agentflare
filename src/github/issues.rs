@@ -96,6 +96,27 @@ pub fn comment(client: &Client, repo: &RepoId, number: u64, body: &str) -> Resul
     Ok(())
 }
 
+/// Rewrites an existing comment in place. The comment id is repo-scoped, not
+/// issue-scoped, so no issue number is needed.
+///
+/// The bridge's heartbeat depends on this: refreshing a claim's marker by
+/// editing the comment that carries it keeps exactly one marker per claim,
+/// where posting a fresh one every half-TTL would bury the issue under
+/// dozens of bookkeeping comments a human then has to scroll past.
+pub fn update_comment(
+    client: &Client,
+    repo: &RepoId,
+    comment_id: u64,
+    body: &str,
+) -> Result<(), GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/issues/comments/{comment_id}",
+        repo.owner, repo.repo
+    );
+    client.request("PATCH", &path, Some(serde_json::json!({ "body": body })))?;
+    Ok(())
+}
+
 /// General (non-line-anchored) comments — where bots like CodeRabbit post
 /// their PR summary/walkthrough (a PR is also an issue on this endpoint).
 /// `since` (ISO8601) filters server-side, same as `pulls::list_review_comments`.
@@ -220,6 +241,19 @@ mod tests {
         assert_eq!(reqs[0].path, "/repos/o/r/issues/4/comments");
         let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
         assert_eq!(sent["body"], "hi");
+    }
+
+    #[test]
+    fn update_comment_patches_the_repo_scoped_comment_endpoint() {
+        let server = MockServer::start(vec![MockResponse::json(200, r#"{"id":9}"#)]);
+        let client = server.client(Some("tok"));
+        update_comment(&client, &repo(), 9, "refreshed").unwrap();
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        // Note: `/issues/comments/{id}`, NOT `/issues/{number}/comments/{id}`.
+        assert_eq!(reqs[0].path, "/repos/o/r/issues/comments/9");
+        let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        assert_eq!(sent["body"], "refreshed");
     }
 
     #[test]
