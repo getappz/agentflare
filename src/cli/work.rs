@@ -11,9 +11,12 @@ use std::time::Duration;
 pub struct WorkArgs {
     /// Item UUID or numeric sequence id.
     pub target: String,
-    /// Agent to run (e.g. claude-code, codex, gemini-cli).
+    /// Agent to run (e.g. claude-code, codex, gemini-cli). Omit to let
+    /// agentflare route automatically from the claimed item — today that
+    /// only means "use the item's own assignee_agent, if it names one";
+    /// user-configured rules land once #331's config surface exists.
     #[arg(long)]
-    pub agent: String,
+    pub agent: Option<String>,
     /// Headless run timeout in seconds (default 1800 = 30 min).
     #[arg(long, default_value_t = 1800)]
     pub timeout: u64,
@@ -139,6 +142,52 @@ fn build_extra_args(
     args
 }
 
+fn agent_by_name(name: &str) -> Option<agent_registry::Agent> {
+    agent_registry::REGISTRY
+        .iter()
+        .find(|s| s.id.as_str() == name)
+        .map(|s| s.id)
+}
+
+/// Resolves which agent runs this item. An explicit `--agent` always wins;
+/// otherwise `agent_registry::route` decides from the item's own attributes.
+/// `RouterConfig::default()` carries no rules today (that surface is #331's,
+/// still in progress), so the only thing that can currently produce a
+/// decision here is the item's own `assignee_agent` — a human already named
+/// one — everything else falls through to the `Err` telling the caller to
+/// pass `--agent` explicitly.
+fn resolve_agent(
+    explicit: Option<&str>,
+    item: &agentflare_backend::item::Item,
+    labels: &[String],
+    installed: &[agent_registry::Agent],
+) -> Result<agent_registry::Agent, String> {
+    if let Some(name) = explicit {
+        return agent_by_name(name)
+            .ok_or_else(|| format!("unknown agent: {name} — use `agentflare agents list`"));
+    }
+
+    let assigned_agent = item
+        .assignee_agent
+        .as_deref()
+        .map(agent_registry::canonicalize)
+        .and_then(|name| agent_by_name(&name));
+    let task = agent_registry::TaskContext {
+        labels: labels.to_vec(),
+        kind: None,
+        size: crate::mcp_server::item::parsed_size(&item.metadata),
+        repo: None,
+        assigned_agent,
+    };
+    agent_registry::route(&task, &agent_registry::RouterConfig::default(), installed)
+        .map(|decision| decision.agent)
+        .ok_or_else(|| {
+            "no --agent given, and no route decision (item has no assignee and no router \
+             rule matched) — pass --agent explicitly"
+                .to_string()
+        })
+}
+
 /// Releases the claim and posts a failure comment (+ optional handoff
 /// notify) — the single path every early-exit and headless-failure branch
 /// in `run_work` routes through, so a claimed item never dead-ends silently
@@ -193,21 +242,15 @@ impl WorkArgs {
 fn run_work(args: WorkArgs) -> i32 {
     let mcp = AgentflareMcp::default();
     let timeout = Duration::from_secs(args.timeout);
-    let agent = &args.agent;
 
-    // Validate agent has headless support before claiming anything.
-    let agent_enum = agent_registry::REGISTRY
-        .iter()
-        .find(|s| s.id.as_str() == agent)
-        .map(|s| s.id);
-    let Some(agent_enum) = agent_enum else {
+    // An explicit --agent fails fast, before claiming anything. Auto-routing
+    // needs the claimed item's own attributes, so it's resolved further down.
+    if let Some(explicit) = args.agent.as_deref()
+        && agent_by_name(explicit).is_none()
+    {
         crate::ui::error(&format!(
-            "unknown agent: {agent} — use `agentflare agents list`"
+            "unknown agent: {explicit} — use `agentflare agents list`"
         ));
-        return 1;
-    };
-    if headless_args(agent_enum).is_none() {
-        crate::ui::error(&format!("agent {agent} has no headless print mode"));
         return 1;
     }
 
@@ -251,15 +294,21 @@ fn run_work(args: WorkArgs) -> i32 {
     };
     println!("worktree: {}", wpath.display());
 
-    // --- Build prompt (item + prior discussion) ---
+    // --- Fetch item + prior discussion + labels ---
     let fetched = mcp.with_backend_db(|conn| {
         let resolved = mcp.resolve_item_id(conn, item_id).ok()?;
         let item = agentflare_backend::item::get(conn, &resolved).ok()?;
         let comments = agentflare_backend::comment::list_by_item(conn, &resolved).ok()?;
-        Some((item, comments))
+        let label_ids = agentflare_backend::item::list_labels(conn, &resolved).unwrap_or_default();
+        let labels = label_ids
+            .iter()
+            .filter_map(|id| agentflare_backend::label::get(conn, id).ok())
+            .map(|l| l.name)
+            .collect::<Vec<_>>();
+        Some((item, comments, labels))
     });
-    let (item_detail, comments) = match fetched {
-        Ok(Some(pair)) => pair,
+    let (item_detail, comments, labels) = match fetched {
+        Ok(Some(triple)) => triple,
         _ => {
             let msg = "failed to read item details after claim";
             release_and_comment(&mcp, item_id, msg, args.notify.as_deref());
@@ -267,6 +316,38 @@ fn run_work(args: WorkArgs) -> i32 {
             return 1;
         }
     };
+
+    // --- Resolve agent (explicit flag, else route from the item) ---
+    let agent_enum = if let Some(explicit) = args.agent.as_deref() {
+        agent_by_name(explicit).expect("checked above before claiming")
+    } else {
+        let mut state = crate::state::load();
+        let installed: Vec<agent_registry::Agent> = agent_registry::detect_all_with(
+            agent_registry::REGISTRY,
+            &mut state.version_cache,
+            &agent_registry::RealVersionRunner,
+        )
+        .iter()
+        .filter_map(|d| agent_by_name(d.id))
+        .collect();
+        crate::state::save(&state);
+        match resolve_agent(None, &item_detail, &labels, &installed) {
+            Ok(a) => a,
+            Err(msg) => {
+                release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
+                crate::ui::error(&msg);
+                return 1;
+            }
+        }
+    };
+    if headless_args(agent_enum).is_none() {
+        let msg = format!("agent {} has no headless print mode", agent_enum.as_str());
+        release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
+        crate::ui::error(&msg);
+        return 1;
+    }
+    println!("agent: {}", agent_enum.as_str());
+
     let prompt = build_prompt(&item_detail, &comments);
 
     // --- Extra args ---
@@ -283,7 +364,7 @@ fn run_work(args: WorkArgs) -> i32 {
 
     let outcome = agent_launch::run_headless(
         agent_registry::REGISTRY,
-        agent,
+        agent_enum.as_str(),
         &prompt,
         timeout,
         &extra_args,
@@ -420,6 +501,36 @@ mod tests {
         assert_eq!(text, raw);
         assert!(session_id.is_none());
         assert!(cost.is_none());
+    }
+
+    #[test]
+    fn resolve_agent_explicit_flag_wins_even_over_item_assignment() {
+        let mut item = test_item();
+        item.assignee_agent = Some("opencode".to_string());
+        let resolved = resolve_agent(Some("codex"), &item, &[], &[]).unwrap();
+        assert_eq!(resolved, agent_registry::Agent::Codex);
+    }
+
+    #[test]
+    fn resolve_agent_explicit_flag_rejects_unknown_agent_name() {
+        let item = test_item();
+        let err = resolve_agent(Some("not-a-real-agent"), &item, &[], &[]).unwrap_err();
+        assert!(err.contains("unknown agent"));
+    }
+
+    #[test]
+    fn resolve_agent_falls_back_to_the_items_own_assignee() {
+        let mut item = test_item();
+        item.assignee_agent = Some("claude".to_string()); // alias, canonicalize() maps it
+        let resolved = resolve_agent(None, &item, &[], &[]).unwrap();
+        assert_eq!(resolved, agent_registry::Agent::ClaudeCode);
+    }
+
+    #[test]
+    fn resolve_agent_errors_when_no_flag_and_no_assignment_and_no_rule() {
+        let item = test_item();
+        let err = resolve_agent(None, &item, &[], &[agent_registry::Agent::ClaudeCode]).unwrap_err();
+        assert!(err.contains("--agent"));
     }
 
     #[test]

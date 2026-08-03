@@ -36,7 +36,10 @@ fn priority_rank(p: &str) -> u8 {
 
 /// `size` lives in the free-form `metadata` JSON blob (`{"size": "S"|"M"|"L"}`)
 /// rather than a regex over description prose — sets via `item(update)`.
-fn parsed_size(metadata: &str) -> Option<String> {
+///
+/// `pub(crate)`: also read by `cli::work` to build a `TaskContext` for
+/// agent routing.
+pub(crate) fn parsed_size(metadata: &str) -> Option<String> {
     let mut value = serde_json::from_str::<serde_json::Value>(metadata).ok()?;
     // Defensive: some callers double-encode an object-typed param as a JSON
     // string containing JSON (observed live — item(create) with
