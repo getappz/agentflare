@@ -40,10 +40,25 @@ fn instance_id_path() -> PathBuf {
         .join("bridge-instance-id")
 }
 
+/// Owner-id prefix, in place of the `<agent>` half `claims::owner_id()` uses.
+///
+/// Deliberately a CONSTANT rather than the detected agent name. The agent is
+/// a property of whatever launched the daemon, not of the daemon: started
+/// from a Claude Code session it detects `claude-code`, started by launchd or
+/// systemd it detects nothing and falls back to `cli`. Same machine, same
+/// persisted file, two different owner ids — and since marker liveness is
+/// judged per owner id, the second one cedes everything the first was
+/// holding. That is the C2 mass-cede all over again, just triggered by a
+/// change of launcher instead of a change of pid.
+///
+/// The actor here is the bridge daemon. Naming it that is both stable and
+/// more accurate than naming whichever agent happened to start it.
+const OWNER_PREFIX: &str = "bridge";
+
 fn random_instance() -> String {
     use rand::Rng;
     let bytes: [u8; 6] = rand::thread_rng().r#gen();
-    hex::encode(bytes)
+    format!("{OWNER_PREFIX}:{}", hex::encode(bytes))
 }
 
 /// How long a loser of the create race waits for the winner to finish
@@ -55,7 +70,17 @@ const INSTANCE_ID_WRITE_WAIT: std::time::Duration = std::time::Duration::from_se
 fn stored_instance(path: &Path) -> Option<String> {
     let s = std::fs::read_to_string(path).ok()?;
     let t = s.trim();
-    (!t.is_empty()).then(|| t.to_string())
+    if t.is_empty() {
+        return None;
+    }
+    // A file written before the prefix moved into the stored value holds a
+    // bare discriminator. Prefix it rather than re-minting, so an existing
+    // workstation keeps an id that is at least stable from here on.
+    Some(if t.contains(':') {
+        t.to_string()
+    } else {
+        format!("{OWNER_PREFIX}:{t}")
+    })
 }
 
 /// Reads the persisted instance discriminator, minting and storing one on
@@ -109,24 +134,27 @@ fn read_or_create_instance(path: &Path) -> std::io::Result<String> {
     }
 }
 
-/// `<agent>:<persisted-id>` — the bridge's owner identity.
+/// `bridge:<persisted-id>` — the bridge's owner identity.
 ///
-/// Deliberately NOT `claims::owner_id()`, whose instance half is
-/// `AGENTFLARE_SESSION` or the **pid**. Marker liveness is judged per owner
-/// id, so a pid-derived id means every daemon restart is a brand-new owner:
-/// `i_hold` goes false against the markers the previous process wrote, and
-/// the bridge cedes and cancels every in-flight item it was actually still
-/// working. The discriminator therefore has to outlive the process, so it is
-/// persisted on disk.
+/// Read WHOLE from disk. Nothing about it is derived from the environment at
+/// startup, which is the point: marker liveness is judged per owner id, so
+/// any part of the id that can change between runs mass-cedes everything the
+/// previous run was holding.
 ///
-/// The persisted half identifies the WORKSTATION, not the process. Running
-/// two bridge daemons against one home directory would make them a single
-/// owner in each other's eyes; set `AGENTFLARE_BRIDGE_INSTANCE_ID`
-/// explicitly to keep them distinct.
+/// Deliberately NOT `claims::owner_id()`, which fails that test twice over —
+/// its instance half is `AGENTFLARE_SESSION` or the **pid**, and its agent
+/// half is whatever agent happens to be detected (see [`OWNER_PREFIX`]).
+///
+/// The persisted id identifies the WORKSTATION, not the process. Running two
+/// bridge daemons against one home directory would make them a single owner
+/// in each other's eyes; set `AGENTFLARE_BRIDGE_INSTANCE_ID` explicitly to
+/// keep them distinct. It survives restarts, and survives reinstalling the
+/// binary — it lives under `~/.agentflare/`, not next to the executable. It
+/// does NOT survive deleting that directory or moving to a new machine,
+/// which is correct: that is a different workstation.
 pub fn stable_instance_id() -> String {
-    let agent = crate::claims::agent_of(&crate::claims::owner_id()).to_string();
     match read_or_create_instance(&instance_id_path()) {
-        Ok(instance) => format!("{agent}:{instance}"),
+        Ok(id) => id,
         Err(e) => {
             // Falling back to the pid keeps this tick working but makes the
             // NEXT restart cede everything — say so rather than fail silently.
@@ -313,11 +341,51 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_id_is_trimmed_not_taken_verbatim() {
+    fn a_stored_id_is_trimmed_and_a_legacy_bare_one_gets_the_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bridge-instance-id");
-        std::fs::write(&path, "  abc123\n").unwrap();
-        assert_eq!(read_or_create_instance(&path).unwrap(), "abc123");
+        std::fs::write(&path, "  bridge:abc123\n").unwrap();
+        assert_eq!(read_or_create_instance(&path).unwrap(), "bridge:abc123");
+
+        // Written before the prefix moved into the file: adopt it rather than
+        // re-mint, so the workstation keeps one id from here on.
+        let legacy = dir.path().join("legacy");
+        std::fs::write(&legacy, "abc123").unwrap();
+        assert_eq!(read_or_create_instance(&legacy).unwrap(), "bridge:abc123");
+    }
+
+    #[test]
+    fn the_whole_owner_id_comes_from_disk_not_from_the_environment() {
+        // The bug this pins, found by running two daemons on one machine:
+        // the id used to be `<detected-agent>:<persisted>`. Started from a
+        // Claude Code session the agent detects as `claude-code`; started by
+        // launchd or systemd it detects nothing and falls back to `cli`. Same
+        // machine, same file, two owner ids — so the second run ceded
+        // everything the first was holding. Exactly the C2 mass-cede, just
+        // triggered by a change of launcher rather than a change of pid.
+        //
+        // Asserted structurally rather than by mutating process-global env:
+        // nothing in the returned id may come from anywhere but the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge-instance-id");
+        let id = read_or_create_instance(&path).unwrap();
+
+        assert_eq!(
+            id,
+            std::fs::read_to_string(&path).unwrap().trim(),
+            "the id must be exactly what is on disk, with nothing spliced in"
+        );
+        assert!(
+            id.starts_with(&format!("{OWNER_PREFIX}:")),
+            "and must carry the constant prefix, not a detected agent name: {id}"
+        );
+        // The detected agent must not appear anywhere in it.
+        let detected = crate::claims::agent_of(&crate::claims::owner_id()).to_string();
+        assert!(
+            detected.is_empty() || !id.contains(&detected) || detected == OWNER_PREFIX,
+            "the detected agent {detected:?} leaked into the owner id {id:?} — \
+             it would change the moment the daemon is started by something else"
+        );
     }
 
     #[test]
