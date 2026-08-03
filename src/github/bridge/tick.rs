@@ -9,7 +9,6 @@ use crate::github::bridge::marker::{Action, Marker, content_hash};
 use crate::github::models::Issue;
 use crate::github::{Client, GitHubError, RepoId, issues};
 
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub struct Ctx {
     pub client: Client,
     pub repo: RepoId,
@@ -24,7 +23,6 @@ pub struct Ctx {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub struct TickReport {
     pub claimed: Vec<u64>,
     pub ceded: Vec<u64>,
@@ -37,25 +35,13 @@ pub struct TickReport {
     pub soft_error: Option<String>,
 }
 
-/// Replaces any existing marker footer rather than stacking a new one, so an
-/// issue body never accumulates markers across ticks.
-#[allow(dead_code)] // consumer arrives in a later bridge task
-pub fn issue_body_with_marker(body: &str, marker: &Marker) -> String {
-    let open = format!("<!-- {} ", crate::github::bridge::marker::MARKER_VERSION);
-    let base = match body.rfind(&open) {
-        Some(i) => body[..i].trim_end(),
-        None => body.trim_end(),
-    };
-    if base.is_empty() {
-        marker.render()
-    } else {
-        format!("{base}\n\n{}", marker.render())
-    }
-}
+// NOTE: markers live only in COMMENTS, never in the issue body. An earlier
+// `issue_body_with_marker` helper existed for a body-marker design that was
+// abandoned — editing the body would fight with humans editing the same
+// field, whereas a comment is unambiguously the bridge's own.
 
 /// Rate limiting and auth failure are expected operating conditions, not bugs:
 /// they end the tick quietly so the daemon keeps looping and retries later.
-#[allow(dead_code)] // consumer arrives in a later bridge task
 fn is_soft(err: &GitHubError) -> bool {
     matches!(
         err,
@@ -63,7 +49,6 @@ fn is_soft(err: &GitHubError) -> bool {
     )
 }
 
-#[allow(dead_code)] // consumer arrives in a later bridge task
 fn comment_pairs(ctx: &Ctx, number: u64) -> Result<Vec<(u64, String)>, GitHubError> {
     Ok(issues::list_comments(&ctx.client, &ctx.repo, number, None)?
         .into_iter()
@@ -71,7 +56,6 @@ fn comment_pairs(ctx: &Ctx, number: u64) -> Result<Vec<(u64, String)>, GitHubErr
         .collect())
 }
 
-#[allow(dead_code)] // consumer arrives in a later bridge task
 fn marker_for(ctx: &Ctx, action: Action, item_id: &str, hash: &str, now: i64) -> Marker {
     Marker {
         action,
@@ -82,7 +66,6 @@ fn marker_for(ctx: &Ctx, action: Action, item_id: &str, hash: &str, now: i64) ->
     }
 }
 
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub fn run_once(ctx: &Ctx, conn: &rusqlite::Connection, now: i64) -> Result<TickReport, String> {
     let mut report = TickReport::default();
     match run_inner(ctx, conn, now, &mut report) {
@@ -96,7 +79,6 @@ pub fn run_once(ctx: &Ctx, conn: &rusqlite::Connection, now: i64) -> Result<Tick
     }
 }
 
-#[allow(dead_code)] // consumer arrives in a later bridge task
 fn run_inner(
     ctx: &Ctx,
     conn: &rusqlite::Connection,
@@ -218,7 +200,6 @@ fn heartbeat_due_after(ttl_secs: i64) -> i64 {
 /// are both untouched, and the issue does not accumulate a bookkeeping
 /// comment every half-TTL. It also rewrites `item=` with the real item id,
 /// which is not known yet when the claim is first posted.
-#[allow(dead_code)] // consumer arrives in a later bridge task
 fn heartbeat(
     ctx: &Ctx,
     comments: &[(u64, String)],
@@ -267,12 +248,10 @@ fn heartbeat(
     Ok(true)
 }
 
-#[allow(dead_code)] // consumer arrives in a later bridge task
 fn held_count(conn: &rusqlite::Connection, ctx: &Ctx) -> usize {
     items_tracked(conn, ctx).len()
 }
 
-#[allow(dead_code)] // consumer arrives in a later bridge task
 fn items_tracked(conn: &rusqlite::Connection, ctx: &Ctx) -> Vec<agentflare_backend::item::Item> {
     agentflare_backend::item::list_by_project(conn, &ctx.project_id)
         .unwrap_or_default()
@@ -288,7 +267,6 @@ fn items_tracked(conn: &rusqlite::Connection, ctx: &Ctx) -> Vec<agentflare_backe
 /// Optimistic two-step claim: post our marker, then re-read and check we are
 /// the earliest. GitHub offers no compare-and-swap on labels or comments, so
 /// this is the closest available approximation.
-#[allow(dead_code)] // consumer arrives in a later bridge task
 fn try_claim(
     ctx: &Ctx,
     conn: &rusqlite::Connection,
@@ -305,15 +283,19 @@ fn try_claim(
         // and from local db loss — which `marker.rs` advertises as
         // recoverable precisely because the marker carries enough to rebuild.
         Some(h) if h.marker.owner == ctx.config.instance_id => {
-            return record_claim(ctx, conn, issue, now);
+            return record_claim(ctx, conn, issue, Some(h.comment_id), now);
         }
         Some(_) => return Ok(false), // held by someone else, live
         None => {}
     }
 
     let hash = issue_hash(issue);
+    // The item does not exist yet — it is only created once we know we won
+    // the race — so the marker cannot name it. `record_claim` rewrites this
+    // comment with the real id rather than leaving `item=pending` on the
+    // issue for the rest of the claim's life.
     let marker = marker_for(ctx, Action::Claim, "pending", &hash, now);
-    issues::comment(
+    let comment_id = issues::comment(
         &ctx.client,
         &ctx.repo,
         issue.number,
@@ -329,18 +311,19 @@ fn try_claim(
         return Ok(false); // lost the race; leave no local trace
     }
 
-    record_claim(ctx, conn, issue, now)
+    record_claim(ctx, conn, issue, Some(comment_id), now)
 }
 
 /// Everything that follows winning an issue: a local item in the `started`
-/// group, a ledger row, and the `claimed:` label. Shared by the ordinary
-/// claim path and by the adopt-our-own-orphan path, which must land exactly
-/// the same local state.
-#[allow(dead_code)] // consumer arrives in a later bridge task
+/// group, a ledger row, the `claimed:` label, and — given
+/// `claim_comment_id` — a rewrite of the claim marker to name the item.
+/// Shared by the ordinary claim path and by the adopt-our-own-orphan path,
+/// which must land exactly the same local state.
 fn record_claim(
     ctx: &Ctx,
     conn: &rusqlite::Connection,
     issue: &Issue,
+    claim_comment_id: Option<u64>,
     now: i64,
 ) -> Result<bool, GitHubError> {
     let Some(state_id) = items::state_id_for_group(conn, &ctx.project_id, "started") else {
@@ -379,7 +362,7 @@ fn record_claim(
 
     // Local ledger too, so this instance's OWN agents do not double-claim.
     // NOTE: `&ctx.ledger`, NOT `conn` — separate databases.
-    let _ = crate::claims::acquire(
+    if let Err(e) = crate::claims::acquire(
         &ctx.ledger,
         &ctx.repo.to_string(),
         &format!("issue#{}", issue.number),
@@ -388,12 +371,34 @@ fn record_claim(
         None,
         now,
         ctx.config.ttl_secs,
-    );
+    ) {
+        eprintln!(
+            "github bridge: ledger acquire failed for #{}: {e}",
+            issue.number
+        );
+    }
 
-    debug_assert_eq!(
-        created.external_id.as_deref(),
-        Some(issue.number.to_string().as_str())
-    );
+    // Name the item in the marker now that it exists. Best-effort: the claim
+    // is already valid without it, and the next heartbeat rewrites the same
+    // comment anyway.
+    if let Some(comment_id) = claim_comment_id
+        && let Err(e) = issues::update_comment(
+            &ctx.client,
+            &ctx.repo,
+            comment_id,
+            &format!(
+                "Claiming this for `{}`.\n\n{}",
+                ctx.config.instance_id,
+                marker_for(ctx, Action::Claim, &created.id, &issue_hash(issue), now).render()
+            ),
+        )
+    {
+        eprintln!(
+            "github bridge: could not name the item in #{}'s claim marker: {e}",
+            issue.number
+        );
+    }
+
     issues::add_labels(
         &ctx.client,
         &ctx.repo,
@@ -403,7 +408,6 @@ fn record_claim(
     Ok(true)
 }
 
-#[allow(dead_code)] // consumer arrives in a later bridge task
 fn cede(
     ctx: &Ctx,
     conn: &rusqlite::Connection,
@@ -436,7 +440,8 @@ fn cede(
             ctx.config.instance_id,
             marker.render()
         ),
-    );
+    )
+    .map(|_| ());
     if let Err(e) = posted {
         // Put the item back so the next tick retries the whole cede rather
         // than leaving it cancelled with no cede marker on the issue — which
@@ -456,10 +461,22 @@ fn cede(
     ) {
         eprintln!("github bridge: ledger release failed for #{number}: {e}");
     }
+    drop_claimed_label(ctx, number);
     Ok(())
 }
 
-#[allow(dead_code)] // consumer arrives in a later bridge task
+/// Takes this instance's `claimed:` label back off an issue it no longer
+/// holds. Best-effort — the marker, not the label, is what the protocol
+/// decides on — but without it every issue accumulates a `claimed:` label
+/// per instance that ever touched it, and a human reading the issue list
+/// sees work claimed by nobody.
+fn drop_claimed_label(ctx: &Ctx, number: u64) {
+    let label = format!("{CLAIMED_LABEL_PREFIX}{}", ctx.config.instance_id);
+    if let Err(e) = issues::remove_label(&ctx.client, &ctx.repo, number, &label) {
+        eprintln!("github bridge: could not remove {label} from #{number}: {e}");
+    }
+}
+
 fn issue_hash(issue: &Issue) -> String {
     let labels: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
     content_hash(
@@ -478,7 +495,6 @@ fn issue_hash(issue: &Issue) -> String {
 /// reposts every `interval_secs` forever. If the remote write then fails the
 /// latch is rolled back, so the export retries next tick rather than being
 /// silently skipped.
-#[allow(dead_code)] // consumer arrives in a later bridge task
 fn export_if_dirty(
     ctx: &Ctx,
     conn: &rusqlite::Connection,
@@ -523,7 +539,7 @@ fn export_if_dirty(
         issue.number,
         &format!("{note}\n\n{}", marker.render()),
     )
-    .and_then(|()| {
+    .and_then(|_| {
         if completed {
             issues::close(&ctx.client, &ctx.repo, issue.number)?;
         }
@@ -552,6 +568,11 @@ fn export_if_dirty(
             "github bridge: ledger done failed for #{}: {e}",
             issue.number
         );
+    }
+    if completed {
+        // The work is finished, so the claim is over — take our label back
+        // off before the issue closes.
+        drop_claimed_label(ctx, issue.number);
     }
     Ok(true)
 }
@@ -592,39 +613,6 @@ mod tests {
     }
 
     #[test]
-    fn issue_body_with_marker_appends_when_absent() {
-        let m = Marker {
-            action: Action::Claim,
-            owner: "a:1".into(),
-            item: "i".into(),
-            ts: NOW,
-            hash: "h".into(),
-        };
-        let out = issue_body_with_marker("hello", &m);
-        assert!(out.starts_with("hello"));
-        assert_eq!(Marker::parse(&out).unwrap().owner, "a:1");
-    }
-
-    #[test]
-    fn issue_body_with_marker_replaces_a_previous_marker_rather_than_stacking() {
-        let old = Marker {
-            action: Action::Claim,
-            owner: "a:1".into(),
-            item: "i".into(),
-            ts: 1,
-            hash: "h".into(),
-        };
-        let new = Marker {
-            ts: 2,
-            ..old.clone()
-        };
-        let once = issue_body_with_marker("body", &old);
-        let twice = issue_body_with_marker(&once, &new);
-        assert_eq!(twice.matches("agentflare:v1").count(), 1);
-        assert_eq!(Marker::parse(&twice).unwrap().ts, 2);
-    }
-
-    #[test]
     fn capacity_zero_claims_nothing_and_makes_no_write_calls() {
         // One response: the queue listing. Any claim attempt would need more.
         let server = MockServer::start(vec![MockResponse::json(
@@ -662,7 +650,9 @@ mod tests {
                     serde_json::to_string(&marker_body(Action::Claim, "me:1", NOW)).unwrap()
                 ),
             ),
-            // 5. apply the claimed: label
+            // 5. rewrite the marker now the item id is known
+            MockResponse::json(200, r#"{"id":100}"#),
+            // 6. apply the claimed: label
             MockResponse::json(200, "[]"),
         ]);
         let (conn, project_id) = test_db();
@@ -672,7 +662,18 @@ mod tests {
         assert_eq!(report.claimed, vec![7]);
         let item = crate::github::bridge::items::find_by_issue(&conn, &project_id, 7).unwrap();
         assert_eq!(item.name, "Do the thing");
-        let _ = server.requests();
+
+        // The claim marker is posted before the item exists, so it goes out
+        // as `item=pending`. It must not STAY that way for the life of the
+        // claim — the rewrite names the item the moment there is one.
+        let reqs = server.requests();
+        let rewrite = reqs
+            .iter()
+            .find(|r| r.method == "PATCH")
+            .expect("the claim marker must be amended with the item id");
+        let sent: serde_json::Value = serde_json::from_str(&rewrite.body).unwrap();
+        let marker = Marker::parse(sent["body"].as_str().unwrap()).unwrap();
+        assert_eq!(marker.item, item.id);
     }
 
     #[test]
@@ -695,7 +696,8 @@ mod tests {
                     serde_json::to_string(&marker_body(Action::Claim, "me:1", NOW)).unwrap()
                 ),
             ),
-            MockResponse::json(200, "[]"),
+            MockResponse::json(200, r#"{"id":100}"#), // marker rewrite
+            MockResponse::json(200, "[]"),            // claimed: label
         ]);
         let (conn, project_id) = test_db();
         let ctx = ctx_with_project(test_ctx(&server, 3), project_id);
@@ -769,6 +771,8 @@ mod tests {
             MockResponse::json(200, "[]"),
             // tick 1: cede's comment post
             MockResponse::json(201, r#"{"id":200}"#),
+            // tick 1: and the claimed: label comes back off
+            MockResponse::json(200, "[]"),
             // tick 2: queue listing
             MockResponse::json(200, QUEUE_ONE_ISSUE),
             // tick 2: the reclaim probe finds a live rival, so it stops there
@@ -805,6 +809,7 @@ mod tests {
         // not merely filter on `completed_at` (cancelling never sets it).
         let server = MockServer::start(vec![
             MockResponse::json(201, r#"{"id":1}"#), // cede's comment post
+            MockResponse::json(200, "[]"),          // the claimed: label removal
         ]);
         let (conn, project_id) = test_db();
         let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
@@ -1046,7 +1051,8 @@ mod tests {
                 200,
                 &one_comment(100, &marker_body(Action::Claim, "me:1", NOW)),
             ),
-            MockResponse::json(200, "[]"), // the claimed: label
+            MockResponse::json(200, r#"{"id":100}"#), // marker rewrite
+            MockResponse::json(200, "[]"),            // the claimed: label
         ]);
         let (conn, project_id) = test_db();
         let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
@@ -1191,13 +1197,14 @@ mod tests {
                 200,
                 &one_comment(10, &marker_body(Action::Claim, "me:1", NOW - 10)),
             ),
-            // step 3 reaches #2 — free: probe, claim, re-read, label.
+            // step 3 reaches #2 — free: probe, claim, re-read, name, label.
             MockResponse::json(200, "[]"),
             MockResponse::json(201, r#"{"id":100}"#),
             MockResponse::json(
                 200,
                 &one_comment(100, &marker_body(Action::Claim, "me:1", NOW)),
             ),
+            MockResponse::json(200, r#"{"id":100}"#),
             MockResponse::json(200, "[]"),
         ]);
         let (conn, project_id) = test_db();
@@ -1305,7 +1312,8 @@ mod tests {
                 200,
                 &one_comment(100, &marker_body(Action::Claim, "me:1", NOW - 10)),
             ),
-            MockResponse::json(200, "[]"), // the claimed: label
+            MockResponse::json(200, r#"{"id":100}"#), // marker rewrite
+            MockResponse::json(200, "[]"),            // the claimed: label
         ]);
         let (conn, project_id) = test_db();
         let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());

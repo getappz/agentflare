@@ -5,7 +5,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[allow(dead_code)]
 pub const CLAIMED_LABEL_PREFIX: &str = "claimed:";
 
 const DEFAULT_INTERVAL_SECS: u64 = 60;
@@ -15,7 +14,6 @@ const DEFAULT_MAX_CLAIMS: usize = 3;
 const DEFAULT_QUEUE_LABEL: &str = "agentflare";
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct BridgeConfig {
     pub enabled: bool,
     pub interval_secs: u64,
@@ -117,7 +115,6 @@ pub fn stable_instance_id() -> String {
     }
 }
 
-#[allow(dead_code)]
 impl BridgeConfig {
     pub fn from_env() -> BridgeConfig {
         let get = |k: &str| std::env::var(k).ok();

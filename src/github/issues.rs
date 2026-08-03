@@ -55,8 +55,14 @@ pub fn list(client: &Client, repo: &RepoId, state: &str) -> Result<Vec<Issue>, G
 }
 
 /// Like [`list`], plus GitHub's server-side `labels` and `since` filters.
-/// `since` is an ISO8601 timestamp matching `updated_at`, which keeps each
-/// bridge poll cheap.
+/// `since` is an ISO8601 timestamp compared against each issue's
+/// `updated_at`.
+///
+/// The bridge deliberately passes `None`: it needs the WHOLE queue every
+/// tick to decide what is claimable, and a `since`-filtered listing would
+/// hide exactly the untouched issues that are most available. The parameter
+/// stays for callers that want a delta, not as an optimization this one is
+/// missing out on.
 #[allow(dead_code)]
 pub fn list_filtered(
     client: &Client,
@@ -87,13 +93,23 @@ pub fn get(client: &Client, repo: &RepoId, number: u64) -> Result<Issue, GitHubE
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
-pub fn comment(client: &Client, repo: &RepoId, number: u64, body: &str) -> Result<(), GitHubError> {
+/// Posts a comment and returns its id, so a caller that needs to amend what
+/// it just wrote (the bridge rewrites its claim marker with the item id it
+/// only learns after the post) can do so without re-listing every comment.
+pub fn comment(
+    client: &Client,
+    repo: &RepoId,
+    number: u64,
+    body: &str,
+) -> Result<u64, GitHubError> {
     let path = format!(
         "/repos/{}/{}/issues/{number}/comments",
         repo.owner, repo.repo
     );
-    client.request("POST", &path, Some(serde_json::json!({ "body": body })))?;
-    Ok(())
+    let json = client.request("POST", &path, Some(serde_json::json!({ "body": body })))?;
+    json["id"]
+        .as_u64()
+        .ok_or_else(|| GitHubError::Parse("comment response had no id".to_string()))
 }
 
 /// Rewrites an existing comment in place. The comment id is repo-scoped, not
@@ -156,6 +172,27 @@ pub fn add_labels(
     let path = format!("/repos/{}/{}/issues/{number}/labels", repo.owner, repo.repo);
     client.request("POST", &path, Some(serde_json::json!({ "labels": labels })))?;
     Ok(())
+}
+
+/// Removes one label. A label that is not on the issue answers 404, which
+/// callers generally want to treat as success — the desired end state holds
+/// either way.
+pub fn remove_label(
+    client: &Client,
+    repo: &RepoId,
+    number: u64,
+    label: &str,
+) -> Result<(), GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/issues/{number}/labels/{}",
+        repo.owner,
+        repo.repo,
+        crate::github::encode_query(label)
+    );
+    match client.request("DELETE", &path, None) {
+        Ok(_) | Err(GitHubError::NotFound) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -233,14 +270,33 @@ mod tests {
     }
 
     #[test]
-    fn comment_posts_body() {
-        let server = MockServer::start(vec![MockResponse::json(201, r#"{"id":1}"#)]);
+    fn comment_posts_body_and_returns_the_new_comment_id() {
+        let server = MockServer::start(vec![MockResponse::json(201, r#"{"id":42}"#)]);
         let client = server.client(Some("tok"));
-        comment(&client, &repo(), 4, "hi").unwrap();
+        assert_eq!(comment(&client, &repo(), 4, "hi").unwrap(), 42);
         let reqs = server.requests();
         assert_eq!(reqs[0].path, "/repos/o/r/issues/4/comments");
         let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
         assert_eq!(sent["body"], "hi");
+    }
+
+    #[test]
+    fn remove_label_deletes_the_encoded_label_and_tolerates_absence() {
+        // The label carries an instance id (`claimed:agent:host`), so the
+        // colons must survive as path-safe encoding rather than as separators.
+        let server = MockServer::start(vec![
+            MockResponse::json(200, "[]"),
+            MockResponse::json(404, r#"{"message":"Label does not exist"}"#),
+        ]);
+        let client = server.client(Some("tok"));
+
+        remove_label(&client, &repo(), 4, "claimed:a:1").unwrap();
+        remove_label(&client, &repo(), 4, "claimed:a:1")
+            .expect("a label that is already gone is the desired end state");
+
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "DELETE");
+        assert_eq!(reqs[0].path, "/repos/o/r/issues/4/labels/claimed%3Aa%3A1");
     }
 
     #[test]

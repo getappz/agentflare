@@ -9,11 +9,9 @@
 
 use sha2::{Digest, Sha256};
 
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub const MARKER_VERSION: &str = "agentflare:v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub enum Action {
     Claim,
     Progress,
@@ -21,7 +19,6 @@ pub enum Action {
     Cede,
 }
 
-#[allow(dead_code)] // consumer arrives in a later bridge task
 impl Action {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -44,7 +41,6 @@ impl Action {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub struct Marker {
     pub action: Action,
     pub owner: String,
@@ -67,7 +63,6 @@ fn field(value: &str) -> &str {
     if value.is_empty() { EMPTY_FIELD } else { value }
 }
 
-#[allow(dead_code)] // consumer arrives in a later bridge task
 impl Marker {
     pub fn render(&self) -> String {
         format!(
@@ -129,7 +124,6 @@ impl Marker {
 /// Labels are sorted so ordering churn from the GitHub API is not mistaken
 /// for a real change, and fields are NUL-separated so ("ab","c") and
 /// ("a","bc") cannot collide.
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub fn content_hash(title: &str, body: &str, state: &str, labels: &[String]) -> String {
     let mut sorted: Vec<&str> = labels.iter().map(String::as_str).collect();
     sorted.sort_unstable();

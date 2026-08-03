@@ -58,12 +58,41 @@ fn resolve_repo() -> Option<crate::github::RepoId> {
 /// optional subsystem is unconfigured — but never a SILENT one. The bridge is
 /// opt-in, so anyone reaching these paths asked for it to run and needs to be
 /// told why it did not.
+/// Nothing here touches the network or the filesystem, so the caller — the
+/// daemon, on its way to binding the dashboard port — returns immediately.
+/// Everything that can block (shelling out to `git remote`, and to
+/// `gh auth token` for a credential) happens on the spawned thread.
 pub fn spawn_if_enabled() -> Option<std::thread::JoinHandle<()>> {
     let config = BridgeConfig::from_env();
     if !should_run(&config) {
         return None;
     }
+    Some(std::thread::spawn(move || run_forever(config)))
+}
 
+/// The bridge's own item-database connection.
+///
+/// Deliberately NOT `AgentflareMcp::with_backend_db`: that holds a mutex for
+/// the duration of the closure, and a whole tick's worth of GitHub round
+/// trips runs inside it — so every MCP tool call and dashboard read would
+/// block behind the bridge's network latency. A second SQLite connection to
+/// the same file is the normal way to give a background thread its own
+/// handle.
+fn open_items_db() -> Option<rusqlite::Connection> {
+    let path = crate::paths::home().join(".agentflare").join("backend.db");
+    match agentflare_backend::db::open_db(&path) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!(
+                "github bridge: item database unavailable at {} ({e}); not starting",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+fn build_ctx(config: BridgeConfig, conn: &rusqlite::Connection) -> Option<Ctx> {
     let repo = resolve_repo()?;
     let client = match crate::github::Client::new() {
         Ok(c) => c,
@@ -72,20 +101,14 @@ pub fn spawn_if_enabled() -> Option<std::thread::JoinHandle<()>> {
             return None;
         }
     };
-
     let mcp = crate::mcp_server::AgentflareMcp::default();
-    let project_id = match mcp.with_backend_db(|conn| mcp.resolve_project(conn).map(|p| p.id)) {
-        Ok(Ok(id)) => id,
-        Ok(Err(e)) => {
+    let project_id = match mcp.resolve_project(conn) {
+        Ok(p) => p.id,
+        Err(e) => {
             eprintln!("github bridge: no project linked to this repo ({e}); not starting");
             return None;
         }
-        Err(e) => {
-            eprintln!("github bridge: item database unavailable ({e}); not starting");
-            return None;
-        }
     };
-
     // The claim ledger is its own database (agentflare.db), separate from the
     // backend db that holds items.
     let ledger = match crate::db::open() {
@@ -95,47 +118,49 @@ pub fn spawn_if_enabled() -> Option<std::thread::JoinHandle<()>> {
             return None;
         }
     };
-
-    let interval = std::time::Duration::from_secs(config.interval_secs);
-    let ctx = Ctx {
+    Some(Ctx {
         client,
         repo,
         config,
         project_id,
         ledger,
+    })
+}
+
+fn run_forever(config: BridgeConfig) {
+    let interval = std::time::Duration::from_secs(config.interval_secs);
+    let Some(conn) = open_items_db() else { return };
+    let Some(ctx) = build_ctx(config, &conn) else {
+        return;
     };
 
-    Some(std::thread::spawn(move || {
-        // Soft errors repeat every tick by nature, so log a CHANGE rather
-        // than each occurrence: 1440 identical lines a day would bury the
-        // one thing worth reading, and silence would hide a `Forbidden` —
-        // a bridge that is permanently dead and never says so.
-        let mut last_soft: Option<String> = None;
-        loop {
-            let now = crate::claims::now();
-            let outcome = mcp.with_backend_db(|conn| run_once(&ctx, conn, now));
-            match outcome {
-                Ok(Ok(report)) => {
-                    if !report.claimed.is_empty() || !report.ceded.is_empty() {
-                        eprintln!(
-                            "github bridge: claimed {:?} ceded {:?}",
-                            report.claimed, report.ceded
-                        );
-                    }
-                    if report.soft_error != last_soft {
-                        match &report.soft_error {
-                            Some(e) => eprintln!("github bridge: ticks are ending early: {e}"),
-                            None => eprintln!("github bridge: recovered; ticks completing again"),
-                        }
-                        last_soft = report.soft_error;
-                    }
+    // Soft errors repeat every tick by nature, so log a CHANGE rather than
+    // each occurrence: 1440 identical lines a day would bury the one thing
+    // worth reading, and silence would hide a `Forbidden` — a bridge that is
+    // permanently dead and never says so.
+    let mut last_soft: Option<String> = None;
+    loop {
+        let now = crate::claims::now();
+        match run_once(&ctx, &conn, now) {
+            Ok(report) => {
+                if !report.claimed.is_empty() || !report.ceded.is_empty() {
+                    eprintln!(
+                        "github bridge: claimed {:?} ceded {:?}",
+                        report.claimed, report.ceded
+                    );
                 }
-                Ok(Err(e)) => eprintln!("github bridge: tick failed: {e}"),
-                Err(e) => eprintln!("github bridge: backend unavailable: {e}"),
+                if report.soft_error != last_soft {
+                    match &report.soft_error {
+                        Some(e) => eprintln!("github bridge: ticks are ending early: {e}"),
+                        None => eprintln!("github bridge: recovered; ticks completing again"),
+                    }
+                    last_soft = report.soft_error;
+                }
             }
-            std::thread::sleep(interval);
+            Err(e) => eprintln!("github bridge: tick failed: {e}"),
         }
-    }))
+        std::thread::sleep(interval);
+    }
 }
 
 #[cfg(test)]

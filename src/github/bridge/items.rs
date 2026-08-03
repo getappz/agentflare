@@ -7,9 +7,8 @@
 
 use agentflare_backend::item::Item;
 
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub const EXTERNAL_SOURCE: &str = "github";
-#[allow(dead_code)] // consumer arrives in a later bridge task
+
 const LAST_HASH_KEY: &str = "github_last_hash";
 
 /// The item linked to `number`, if this instance tracks it.
@@ -17,7 +16,6 @@ const LAST_HASH_KEY: &str = "github_last_hash";
 /// A full scan rather than an indexed lookup: the backend exposes no
 /// by-external-id query, and at this project's item volume a scan is
 /// sub-millisecond (the same reasoning `item_health` documents).
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub fn find_by_issue(conn: &rusqlite::Connection, project_id: &str, number: u64) -> Option<Item> {
     let wanted = number.to_string();
     agentflare_backend::item::list_by_project(conn, project_id)
@@ -32,7 +30,6 @@ pub fn find_by_issue(conn: &rusqlite::Connection, project_id: &str, number: u64)
 /// The content hash of this item's last CONFIRMED successful export.
 /// `None` (including for malformed metadata) means "never exported", which
 /// makes the next tick re-export — the safe direction to fail.
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub fn last_hash(item: &Item) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(&item.metadata)
         .ok()?
@@ -43,7 +40,6 @@ pub fn last_hash(item: &Item) -> Option<String> {
 
 /// This item's metadata with `github_last_hash` set, preserving every other
 /// key. Malformed existing metadata is replaced rather than propagated.
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub fn with_last_hash(item: &Item, hash: &str) -> String {
     let mut v = serde_json::from_str::<serde_json::Value>(&item.metadata)
         .ok()
@@ -54,7 +50,6 @@ pub fn with_last_hash(item: &Item, hash: &str) -> String {
 }
 
 /// First state in `group` (e.g. `backlog`, `started`, `completed`).
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub fn state_id_for_group(
     conn: &rusqlite::Connection,
     project_id: &str,
@@ -75,7 +70,6 @@ pub fn state_id_for_group(
 /// This checks the item's actual state group instead, which is the only
 /// reliable signal. Unresolvable state (e.g. deleted) fails open as active,
 /// matching the pre-existing behavior of treating every linked item as live.
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub fn is_active(conn: &rusqlite::Connection, item: &Item) -> bool {
     agentflare_backend::state::get(conn, &item.state_id)
         .map(|s| !matches!(s.group_name.as_str(), "cancelled" | "completed"))
@@ -91,7 +85,6 @@ pub fn is_active(conn: &rusqlite::Connection, item: &Item) -> bool {
 /// re-open work we had just finished. Only `cancelled` is recoverable.
 /// Unresolvable state fails closed as NOT ceded, matching `is_active`'s
 /// fail-open-as-live direction.
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub fn is_ceded(conn: &rusqlite::Connection, item: &Item) -> bool {
     agentflare_backend::state::get(conn, &item.state_id)
         .map(|s| s.group_name == "cancelled")

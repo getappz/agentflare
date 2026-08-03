@@ -120,6 +120,16 @@ fn shared_github(state: &Arc<Mutex<SharedIssue>>) -> MockServer {
                 }
                 MockResponse::json(200, "[]")
             }
+            ("DELETE", p) if p.starts_with("/repos/o/r/issues/7/labels/") => {
+                let name = p.rsplit('/').next().unwrap_or_default().replace("%3A", ":");
+                let had = issue.labels.contains(&name);
+                issue.labels.retain(|l| *l != name);
+                if had {
+                    MockResponse::json(200, "[]")
+                } else {
+                    MockResponse::json(404, r#"{"message":"Label does not exist"}"#)
+                }
+            }
             ("PATCH", "/repos/o/r/issues/7") => {
                 issue.closed = body["state"] == "closed";
                 MockResponse::json(200, &issue.issue_json())
@@ -236,6 +246,14 @@ fn a_stalled_holder_loses_the_issue_after_the_ttl_and_cedes_on_its_next_tick() {
 
     a.tick(NOW);
     assert!(a.holds());
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .labels
+            .contains(&"claimed:a:1".to_string()),
+        "claiming labels the issue for a human scanning the list"
+    );
 
     // `a` stops ticking entirely — a crashed or wedged instance. Once its
     // marker ages past the TTL the issue is free again.
@@ -256,6 +274,13 @@ fn a_stalled_holder_loses_the_issue_after_the_ttl_and_cedes_on_its_next_tick() {
     );
     assert!(b.holds());
     let issue = state.lock().unwrap();
+    assert!(
+        !issue.labels.contains(&"claimed:a:1".to_string()),
+        "and takes its `claimed:` label back off — otherwise every issue \
+         accumulates one label per instance that ever touched it, and the \
+         issue list shows work claimed by nobody"
+    );
+    assert!(issue.labels.contains(&"claimed:b:2".to_string()));
     assert_eq!(
         issue.markers_by("a:1", &Action::Cede),
         1,

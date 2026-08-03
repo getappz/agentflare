@@ -9,7 +9,6 @@
 use crate::github::bridge::marker::{Action, Marker};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub struct Holder {
     pub comment_id: u64,
     pub marker: Marker,
@@ -19,7 +18,6 @@ pub struct Holder {
 ///
 /// Lowest comment id wins: ids are monotonic, whereas `created_at` is
 /// second-granular and subject to cross-machine clock skew.
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub fn resolve_holder(comments: &[(u64, String)], now: i64, ttl_secs: i64) -> Option<Holder> {
     let parsed: Vec<(u64, Marker)> = comments
         .iter()
@@ -81,7 +79,6 @@ fn is_ceded(claim_id: u64, owner: &str, parsed: &[(u64, Marker)]) -> bool {
 /// checked an owner before it had any marker. `now.saturating_sub(ts)` at
 /// the call site is kept too, since a crafted/corrupt marker could in
 /// principle carry `ts == i64::MIN` itself.
-#[allow(dead_code)] // consumer arrives in a later bridge task
 fn latest_ts_for(owner: &str, parsed: &[(u64, Marker)]) -> Option<i64> {
     parsed
         .iter()
@@ -97,7 +94,6 @@ fn latest_ts_for(owner: &str, parsed: &[(u64, Marker)]) -> Option<i64> {
 /// The bridge's heartbeat reads this to decide whether a refresh is due, so
 /// the two agree by construction: anything that would keep `resolve_holder`
 /// from expiring us also stops the heartbeat firing, and nothing else can.
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub fn owner_liveness(comments: &[(u64, String)], owner: &str) -> Option<i64> {
     let parsed: Vec<(u64, Marker)> = comments
         .iter()
@@ -109,7 +105,6 @@ pub fn owner_liveness(comments: &[(u64, String)], owner: &str) -> Option<i64> {
 /// Whether `me` is the current holder. Re-checked every tick, not trusted
 /// once: GitHub comment listing is not instantly consistent, so two instances
 /// can each briefly believe they won.
-#[allow(dead_code)] // consumer arrives in a later bridge task
 pub fn i_hold(comments: &[(u64, String)], me: &str, now: i64, ttl_secs: i64) -> bool {
     resolve_holder(comments, now, ttl_secs).is_some_and(|h| h.marker.owner == me)
 }
