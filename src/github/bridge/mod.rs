@@ -5,3 +5,4 @@ pub mod claim;
 pub mod config;
 pub mod items;
 pub mod marker;
+pub mod tick;
