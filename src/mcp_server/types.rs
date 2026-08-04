@@ -777,6 +777,11 @@ pub(crate) struct ItemRequest {
     #[schemars(description = "Trailing weekly windows for velocity (health); default 4, max 52")]
     #[serde(default)]
     pub(crate) window_weeks: Option<i64>,
+    #[schemars(
+        description = "done only: push the branch and open a PR (default true, matching prior behavior). Set false to mark the item done without publishing anything — e.g. when the fix isn't ready to ship yet."
+    )]
+    #[serde(default)]
+    pub(crate) push: Option<bool>,
 }
 
 /// Lean per-item projection for `item(list)` — the raw 19-field `Item` (full

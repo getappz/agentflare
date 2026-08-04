@@ -551,8 +551,9 @@ impl AgentflareMcp {
             };
             Ok::<_, ErrorData>((done, item_id, item, target_branch))
         })??;
+        let should_push = req.push.unwrap_or(true);
         let pr_url = match (&item, &target_branch) {
-            (Some(item), Some(target)) => PROGRESS_SENDER
+            (Some(item), Some(target)) if should_push => PROGRESS_SENDER
                 .try_with(|ps| {
                     crate::worktree::push_and_open_pr(item, &repo_root, target, ps.as_ref())
                 })
@@ -567,6 +568,20 @@ impl AgentflareMcp {
         // the race where a concurrent claim() could grab the item
         // while its PR was still being opened (item #37).
         if done {
+            // Worktree cleanup: `create_worktree` provisions one on claim
+            // but nothing ever removed it, leaving orphaned directories
+            // behind after every `done` (the git shim then blocks removing
+            // them by hand too — see item #420). Committed work is never at
+            // risk here: deleting a linked worktree's directory only drops
+            // the checkout, not the branch or its commits, which live in
+            // the shared object store. What COULD be lost is uncommitted
+            // changes sitting only in that checkout, so `cleanup_worktree`
+            // itself checks for a clean tree and no-ops (logging, never
+            // failing `done`) rather than trusting push/PR success as a
+            // proxy for "safe to delete".
+            if let Some(item) = &item {
+                crate::worktree::cleanup_worktree(item, &repo_root);
+            }
             match self.with_backend_db(|conn| {
                 agentflare_backend::claim::done(conn, &item_id, &owner, now)
             }) {

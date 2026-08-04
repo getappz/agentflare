@@ -31,6 +31,13 @@ pub fn create_worktree(
     flare_git_core::worktree::create_worktree(item, repo_root, target_branch, as_progress(progress))
 }
 
+/// The `done`-side counterpart to `create_worktree`: removes it now that the
+/// item is finished, if its tree is clean. Best-effort like
+/// `push_and_open_pr` — never blocks `done` on a cleanup failure.
+pub fn cleanup_worktree(item: &agentflare_backend::item::Item, repo_root: &Path) {
+    flare_git_core::worktree::cleanup_item_worktree(item, repo_root);
+}
+
 /// Pushes `item`'s isolated worktree branch and opens a PR against
 /// `target_branch` — the `done`-side counterpart to `create_worktree`.
 /// Deliberately never merges: unreviewed code should never land on the
