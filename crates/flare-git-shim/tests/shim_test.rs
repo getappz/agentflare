@@ -364,8 +364,8 @@ fn canonical_repo_detach_is_denied_for_agent_invocation_but_not_human() {
     // No agent marker -- ordinary human usage, passes through. This test
     // process itself may be running under an agent-marked environment (it
     // is, under Claude Code -- CLAUDECODE=1), so use `human_shim`, which
-    // clears the whole child environment rather than relying on ambient
-    // absence of whichever agent marker happens not to be set.
+    // inherits the environment but strips every known agent marker, rather
+    // than relying on ambient absence of whichever one happens not to be set.
     let out = human_shim(repo.path(), home.path(), &["checkout", &sha]);
     assert!(out.status.success(), "{out:?}");
 }
