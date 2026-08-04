@@ -508,12 +508,27 @@ impl AgentflareMcp {
             return Err(ErrorData::invalid_params("id is required", None));
         }
         let owner = crate::claims::owner_id();
-        self.with_backend_db(|conn| {
+        let repo_root = self.worktree_repo_root();
+        // DB reads/writes under the backend lock, then the (possibly slow --
+        // git status on the worktree) cleanup outside it, same split as
+        // `item_done` uses for its own push/PR step.
+        let (ok, item_id, item) = self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
+            let item = agentflare_backend::item::get(conn, &item_id).ok();
             let ok = agentflare_backend::claim::release(conn, &item_id, &owner)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            Ok(serde_json::json!({"released": ok, "item_id": item_id}).to_string())
-        })?
+            Ok::<_, ErrorData>((ok, item_id, item))
+        })??;
+        // A plain `release` used to leave the worktree behind unconditionally
+        // -- `done`/`check_merge` were the only paths that ever cleaned one
+        // up, so an item released without going through either (abandoned,
+        // or completed by hand) orphaned its `.worktrees/task/<id>` forever
+        // (item #335). `cleanup_worktree` itself still refuses a dirty tree,
+        // so this is safe to attempt unconditionally on a successful release.
+        if ok && let Some(item) = &item {
+            crate::worktree::cleanup_worktree(item, &repo_root);
+        }
+        Ok(serde_json::json!({"released": ok, "item_id": item_id}).to_string())
     }
 
     pub(crate) fn item_done(&self, req: ItemRequest) -> Result<String, ErrorData> {
