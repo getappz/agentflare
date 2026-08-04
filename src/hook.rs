@@ -51,16 +51,16 @@ pub fn session_start(agent: &str) {
     let msg = session_start_message(agent);
 
     // Flush any vents buffered since the last turn/session (best-effort;
-    // never blocks the hook or surfaces errors to the agent).
-    let _ = std::panic::catch_unwind(|| {
-        let r = crate::vent::consolidate::consolidate();
-        if !r.items_created.is_empty() {
-            eprintln!(
-                "[agentflare] vent: filed {} item(s) from friction",
-                r.items_created.len()
-            );
-        }
-    });
+    // never blocks the hook or surfaces errors to the agent). Always report
+    // the outcome to stderr — including "0 filed" and a caught panic — so a
+    // dead capture pipeline isn't indistinguishable from an idle one.
+    match std::panic::catch_unwind(crate::vent::consolidate::consolidate) {
+        Ok(r) => eprintln!(
+            "[agentflare] vent: consolidate ran, {} item(s) filed",
+            r.items_created.len()
+        ),
+        Err(_) => eprintln!("[agentflare] vent: consolidate panicked — skipping this turn"),
+    }
 
     // Plain stdout reaches Claude's context for this event (see module
     // comment) but is NOT shown to the user in the terminal. `systemMessage`
@@ -571,16 +571,16 @@ pub fn prompt_submit(agent: &str) {
     }
 
     // Triage the previous turn's buffered vents once per turn (best-effort;
-    // never blocks the hook or surfaces errors to the agent).
-    let _ = std::panic::catch_unwind(|| {
-        let r = crate::vent::consolidate::consolidate();
-        if !r.items_created.is_empty() {
-            eprintln!(
-                "[agentflare] vent: filed {} item(s) from friction",
-                r.items_created.len()
-            );
-        }
-    });
+    // never blocks the hook or surfaces errors to the agent). Always report
+    // the outcome to stderr — including "0 filed" and a caught panic — so a
+    // dead capture pipeline isn't indistinguishable from an idle one.
+    match std::panic::catch_unwind(crate::vent::consolidate::consolidate) {
+        Ok(r) => eprintln!(
+            "[agentflare] vent: consolidate ran, {} item(s) filed",
+            r.items_created.len()
+        ),
+        Err(_) => eprintln!("[agentflare] vent: consolidate panicked — skipping this turn"),
+    }
 
     let router = crate::optimize::active_router();
     let mut session_bits = vec![];
