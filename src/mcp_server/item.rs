@@ -509,25 +509,33 @@ impl AgentflareMcp {
         }
         let owner = crate::claims::owner_id();
         let repo_root = self.worktree_repo_root();
-        // DB reads/writes under the backend lock, then the (possibly slow --
-        // git status on the worktree) cleanup outside it, same split as
-        // `item_done` uses for its own push/PR step.
-        let (ok, item_id, item) = self.with_backend_db(|conn| {
+        // Confirm we still hold the claim, and clean up the worktree,
+        // *before* actually releasing -- releasing first (as this used to)
+        // opens a window where a concurrent `claim` grabs the item and
+        // starts working in the worktree just before `cleanup_worktree`
+        // deletes it out from under them. Same ordering `done`'s no-PR
+        // path uses (cleanup, then release the claim last).
+        let (item_id, item, owns_claim) = self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
             let item = agentflare_backend::item::get(conn, &item_id).ok();
-            let ok = agentflare_backend::claim::release(conn, &item_id, &owner)
+            let owns_claim = agentflare_backend::claim::is_owner(conn, &item_id, &owner)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            Ok::<_, ErrorData>((ok, item_id, item))
+            Ok::<_, ErrorData>((item_id, item, owns_claim))
         })??;
         // A plain `release` used to leave the worktree behind unconditionally
         // -- `done`/`check_merge` were the only paths that ever cleaned one
         // up, so an item released without going through either (abandoned,
         // or completed by hand) orphaned its `.worktrees/task/<id>` forever
         // (item #335). `cleanup_worktree` itself still refuses a dirty tree,
-        // so this is safe to attempt unconditionally on a successful release.
-        if ok && let Some(item) = &item {
+        // so this is safe to attempt unconditionally here, before the claim
+        // is actually given up.
+        if owns_claim && let Some(item) = &item {
             crate::worktree::cleanup_worktree(item, &repo_root);
         }
+        let ok = self.with_backend_db(|conn| {
+            agentflare_backend::claim::release(conn, &item_id, &owner)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+        })??;
         Ok(serde_json::json!({"released": ok, "item_id": item_id}).to_string())
     }
 
