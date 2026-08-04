@@ -2,6 +2,7 @@
 //! practice; item #331 (unified `~/.agentflare/config.toml`) should absorb
 //! these later.
 
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -89,6 +90,40 @@ fn random_instance() -> String {
     format!("{OWNER_PREFIX}:{}", hex::encode(bytes))
 }
 
+/// Domain separation for the machine-id hash below, so this application's id
+/// doesn't equal whatever value another tool derives from the same machine
+/// id, and so a future bridge protocol version can mint a disjoint id space
+/// without touching the source machine id at all.
+const MACHINE_ID_DOMAIN: &[u8] = b"agentflare-bridge-v1";
+
+/// `flared:<12 hex>`, derived from the OS-native machine id (`/etc/machine-id`,
+/// `IOPlatformUUID`, the Windows `MachineGuid`, …) when one is readable.
+/// Falls back to [`random_instance`] otherwise — sandboxes and some
+/// containers built from one image don't expose a usable machine id; set
+/// `AGENTFLARE_BRIDGE_INSTANCE_ID` explicitly there.
+///
+/// This is identification, not licensing: nobody is trying to evade it, so
+/// no hardware binding beyond what `machine_uid` already does. The one
+/// property that matters is determinism — same machine in, same id out —
+/// which is what lets a wiped `~/.agentflare/` recover its own claims
+/// instead of coming back as a stranger (#418).
+///
+/// Hashed rather than stored raw: the machine id is documented as not for
+/// public exposure, and this id ends up in `claimed:<id>` GitHub labels and
+/// marker comments on potentially public issues.
+fn mint_instance() -> String {
+    match machine_uid::get() {
+        Ok(uid) => {
+            let mut hasher = Sha256::new();
+            hasher.update(MACHINE_ID_DOMAIN);
+            hasher.update(b"\0");
+            hasher.update(uid.as_bytes());
+            format!("{OWNER_PREFIX}:{}", &hex::encode(hasher.finalize())[..12])
+        }
+        Err(_) => random_instance(),
+    }
+}
+
 /// How long a loser of the create race waits for the winner to finish
 /// writing. Generously long for a few bytes to a local file; the only way to
 /// exhaust it is a process that died between creating the file and filling
@@ -131,7 +166,7 @@ fn read_or_create_instance(path: &Path) -> std::io::Result<String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let fresh = random_instance();
+    let fresh = mint_instance();
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -178,8 +213,11 @@ fn read_or_create_instance(path: &Path) -> std::io::Result<String> {
 /// in each other's eyes; set `AGENTFLARE_BRIDGE_INSTANCE_ID` explicitly to
 /// keep them distinct. It survives restarts, and survives reinstalling the
 /// binary — it lives under `~/.agentflare/`, not next to the executable. It
-/// does NOT survive deleting that directory or moving to a new machine,
-/// which is correct: that is a different workstation.
+/// also survives deleting that directory: [`mint_instance`] derives the id
+/// from the OS-native machine id when one is readable, so a wiped home
+/// re-mints the SAME id rather than a stranger's (#418). It does NOT survive
+/// moving to a new machine, which is correct: that is a different
+/// workstation.
 pub fn stable_instance_id() -> String {
     match read_or_create_instance(&instance_id_path()) {
         Ok(id) => id,
@@ -477,6 +515,37 @@ mod tests {
             "the detected agent {detected:?} leaked into the owner id {id:?} — \
              it would change the moment the daemon is started by something else"
         );
+    }
+
+    #[test]
+    fn mint_instance_is_deterministic_for_this_machine() {
+        // The property a random mint cannot satisfy — see the next test.
+        // Guarded like it: without a readable machine id, mint_instance falls
+        // back to random_instance and two calls legitimately differ.
+        if machine_uid::get().is_err() {
+            return;
+        }
+        assert_eq!(mint_instance(), mint_instance());
+    }
+
+    #[test]
+    fn deleting_the_id_file_remints_the_same_id() {
+        // #418: a wiped ~/.agentflare/ must come back as the SAME
+        // workstation, not a stranger. When no machine id is readable
+        // (sandboxes, some containers) this degrades to the old random
+        // behavior and the two ids legitimately differ — still assert the
+        // deterministic case, since that's what CI and real workstations get.
+        if machine_uid::get().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge-instance-id");
+
+        let first = read_or_create_instance(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let second = read_or_create_instance(&path).unwrap();
+
+        assert_eq!(first, second, "wiping the id file must remint the same id");
     }
 
     #[test]

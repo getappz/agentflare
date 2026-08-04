@@ -85,6 +85,7 @@ flare-proxy = { path = "crates/flare-proxy" }
 flare-vault = { path = "crates/flare-vault" }
 skill = { version = "0.8", default-features = false, features = ["network"] }
 agentflare-jobs = { path = "crates/agentflare-jobs" }
+machine-uid = "0.6.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
