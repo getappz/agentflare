@@ -28,13 +28,85 @@ fn init_repo() -> tempfile::TempDir {
 /// Runs the compiled shim binary (built by this crate as `git`/`git.exe`)
 /// against `repo`, with a scratch `AGENTFLARE_HOME_OVERRIDE` so the audit
 /// log doesn't land in the developer's real `~/.agentflare/`.
+///
+/// Sets `CLAUDECODE=1` so every test below exercises the shim's actual
+/// policy path deterministically, regardless of whether the test process
+/// itself happens to inherit an ambient agent marker (it does, running
+/// under Claude Code) -- without this, these tests would silently start
+/// passing for the wrong reason (the agent-only gate short-circuiting to
+/// real git) instead of testing the classify/deny logic they claim to.
+/// Tests that specifically want to exercise *human* (non-agent) behavior
+/// use `human_shim` below instead of this helper.
 fn shim(repo: &Path, home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_git"))
         .args(args)
         .current_dir(repo)
         .env("AGENTFLARE_HOME_OVERRIDE", home)
+        .env("CLAUDECODE", "1")
         .output()
         .unwrap()
+}
+
+/// Every env var `agent-detector` 0.2.1 recognizes (`crates/flare-git-core`'s
+/// pinned version) -- kept in sync manually since the crate doesn't expose
+/// its catalog publicly (`agents` is a private module). `human_shim` strips
+/// all of these rather than clearing the whole environment: an `env_clear`
+/// attempt broke real-git resolution (`which_in`'s path filtering needs more
+/// of the ambient environment than just `PATH`), and stripping only the
+/// small legacy hardcoded list this crate used to check would silently miss
+/// whichever of `agent-detector`'s much wider catalog (`COPILOT_*`,
+/// `REPL_ID`, `CURSOR_TRACE_ID`, `CODEX_SANDBOX`, ...) happens to already be
+/// set in a given CI runner, making these tests flaky for the wrong reason
+/// instead of proving human passthrough actually holds. Includes both of
+/// `agent-detector`'s "standard" tier vars (`AI_AGENT`, `AGENT`) -- this
+/// process is itself running under Claude Code, which sets `AI_AGENT`
+/// ambiently, so omitting these caused these exact tests to fail here.
+const AGENT_DETECTOR_ENV_VARS: &[&str] = &[
+    "AI_AGENT",
+    "AGENT",
+    "CURSOR_TRACE_ID",
+    "CURSOR_AGENT",
+    "CURSOR_EXTENSION_HOST_ROLE",
+    "GEMINI_CLI",
+    "CODEX_SANDBOX",
+    "CODEX_CI",
+    "CODEX_THREAD_ID",
+    "ANTIGRAVITY_AGENT",
+    "AUGMENT_AGENT",
+    "OPENCODE_CLIENT",
+    "CLAUDECODE",
+    "CLAUDE_CODE",
+    "CLINE_ACTIVE",
+    "GOOSE_TERMINAL",
+    "OPENCLAW_SHELL",
+    "PI_CODING_AGENT",
+    "ROO_ACTIVE",
+    "TRAE_AI_SHELL_ID",
+    "REPL_ID",
+    "COPILOT_MODEL",
+    "COPILOT_ALLOW_ALL",
+    "COPILOT_GITHUB_TOKEN",
+    "ASTRBOT_CLI",
+    "AUTOHAND_CLI",
+    "BASH_AGENT_HOME",
+    "CLAWHUB_WORKDIR",
+];
+
+/// Same as `shim`, but for tests exercising *human* (non-agent) behavior:
+/// strips every `AGENT_DETECTOR_ENV_VARS` entry plus `AGENTFLARE_AGENT`
+/// (agentflare's own marker, which `agent-detector` doesn't know about) from
+/// the inherited environment, rather than relying on ambient absence of
+/// whichever one happens not to be set.
+fn human_shim(repo: &Path, home: &Path, args: &[&str]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_git"));
+    cmd.args(args)
+        .current_dir(repo)
+        .env("AGENTFLARE_HOME_OVERRIDE", home);
+    for var in AGENT_DETECTOR_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd.env_remove("AGENTFLARE_AGENT");
+    cmd.output().unwrap()
 }
 
 #[test]
@@ -134,6 +206,7 @@ fn bypass_env_var_skips_classification_even_for_a_denied_command() {
         .args(["checkout", "master"])
         .current_dir(repo.path())
         .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("CLAUDECODE", "1")
         .env("AGENTFLARE_GIT_BYPASS", "1")
         .output()
         .unwrap();
@@ -217,6 +290,7 @@ fn bypass_until_env_var_respects_the_deadline() {
         .args(["checkout", "master"])
         .current_dir(repo.path())
         .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("CLAUDECODE", "1")
         .env("AGENTFLARE_GIT_BYPASS_UNTIL", (now - 60).to_string())
         .output()
         .unwrap();
@@ -227,6 +301,7 @@ fn bypass_until_env_var_respects_the_deadline() {
         .args(["checkout", "master"])
         .current_dir(repo.path())
         .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("CLAUDECODE", "1")
         .env("AGENTFLARE_GIT_BYPASS_UNTIL", (now + 3600).to_string())
         .output()
         .unwrap();
@@ -243,6 +318,7 @@ fn snapshots_disabled_env_var_skips_the_pre_destructive_snapshot() {
         .args(["reset", "--hard"])
         .current_dir(repo.path())
         .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("CLAUDECODE", "1")
         .env("AGENTFLARE_GIT_SNAPSHOTS", "0")
         .output()
         .unwrap();
@@ -287,20 +363,10 @@ fn canonical_repo_detach_is_denied_for_agent_invocation_but_not_human() {
 
     // No agent marker -- ordinary human usage, passes through. This test
     // process itself may be running under an agent-marked environment (it
-    // is, under Claude Code -- CLAUDECODE=1), so explicitly strip every
-    // agent marker rather than relying on ambient absence.
-    let out = Command::new(env!("CARGO_BIN_EXE_git"))
-        .args(["checkout", &sha])
-        .current_dir(repo.path())
-        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
-        .env_remove("CLAUDECODE")
-        .env_remove("CURSOR_AGENT")
-        .env_remove("CODEX_CLI_SESSION")
-        .env_remove("GEMINI_SESSION")
-        .env_remove("CODEBUDDY")
-        .env_remove("AGENTFLARE_AGENT")
-        .output()
-        .unwrap();
+    // is, under Claude Code -- CLAUDECODE=1), so use `human_shim`, which
+    // inherits the environment but strips every known agent marker, rather
+    // than relying on ambient absence of whichever one happens not to be set.
+    let out = human_shim(repo.path(), home.path(), &["checkout", &sha]);
     assert!(out.status.success(), "{out:?}");
 }
 
@@ -319,4 +385,54 @@ fn canonical_repo_detach_allowed_with_escape_hatch() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
+}
+
+/// The fix this test file's `CLAUDECODE=1` additions exist to guard: every
+/// deny `classify()` can produce (not just the narrower canonical-detach
+/// guard) must be a no-op for a regular interactive human, not just for an
+/// untracked repo. Uses `human_shim` for the human half, same reasoning as
+/// `canonical_repo_detach_is_denied_for_agent_invocation_but_not_human`.
+#[test]
+fn protected_branch_checkout_is_denied_for_agent_but_passes_through_for_a_human() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    assert!(flare_git_core::shell::run_in_ok(
+        repo.path(),
+        &["checkout", "-b", "feature/x"]
+    ));
+
+    // Agent-invoked -- denied (same assertion as
+    // checkout_to_protected_branch_is_denied_and_real_git_never_runs, via
+    // the shim() helper's CLAUDECODE=1).
+    let out = shim(repo.path(), home.path(), &["checkout", "master"]);
+    assert!(!out.status.success(), "{out:?}");
+
+    // No agent marker at all -- ordinary human usage must pass straight
+    // through to real git, unrestricted.
+    let out = human_shim(repo.path(), home.path(), &["checkout", "master"]);
+    assert!(out.status.success(), "{out:?}");
+    let branch = flare_git_core::shell::run_in(repo.path(), &["branch", "--show-current"]).unwrap();
+    assert_eq!(branch.trim(), "master");
+}
+
+/// Same distinction for the other major deny path: pushing the default
+/// branch straight to a remote.
+#[test]
+fn push_of_default_branch_is_denied_for_agent_but_passes_through_for_a_human() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+
+    // Agent-invoked -- denied.
+    let out = shim(repo.path(), home.path(), &["push", "origin", "master"]);
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("denied"), "{stderr}");
+
+    // No agent marker -- passes the shim through untouched. (The push
+    // itself still fails, since `origin` isn't a real remote in this test
+    // fixture -- what matters is that real git actually ran, i.e. the
+    // failure is git's own "no such remote", not this shim's "denied".)
+    let out = human_shim(repo.path(), home.path(), &["push", "origin", "master"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("denied"), "{stderr}");
 }
