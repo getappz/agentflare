@@ -933,7 +933,7 @@ impl AgentflareMcp {
         Ok(serde_json::json!({ "sent": true, "platform": platform, "target": target }).to_string())
     }
     #[tool(
-        description = "Manage work claims — acquire, heartbeat, release, done, or list. Single consolidated tool with `action` field (acquire|done|heartbeat|list|release)."
+        description = "Records a path-scoped write lock in the claim ledger so the git shim's scope-check can tell concurrent agents' edits apart -- it does NOT provision a worktree, a branch, or a directory of any kind. Single consolidated tool with `action` field (acquire|done|heartbeat|list|release). If you need an isolated worktree to actually do file edits in, use the `item` tool's own `claim` action instead (`item(action=\"claim\", id=<item>)`) -- that is the one that creates the worktree; this `claim` tool and that one share a name but do different things."
     )]
     fn claim(&self, Parameters(req): Parameters<ClaimRequest>) -> Result<String, ErrorData> {
         self.claim_impl(req)

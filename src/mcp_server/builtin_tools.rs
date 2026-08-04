@@ -52,7 +52,7 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "claim",
-        "Manage work claims — acquire, heartbeat, release, done, or list. Single consolidated tool with `action` field (acquire|done|heartbeat|list|release).",
+        "Records a path-scoped write lock in the claim ledger for the git shim's scope-check -- does NOT provision a worktree. For an isolated worktree, use `item(action=\"claim\", id=<item>)` instead. Single consolidated tool with `action` field (acquire|done|heartbeat|list|release).",
     ),
     (
         "review",
