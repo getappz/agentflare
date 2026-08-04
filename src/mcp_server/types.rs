@@ -697,11 +697,11 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ItemRequest {
     #[schemars(
-        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|cancel|add_label|remove_label|groom|standup|health"
+        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health"
     )]
     pub(crate) action: String,
     #[schemars(
-        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, add_label, remove_label"
+        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label"
     )]
     #[serde(default)]
     pub(crate) id: Option<String>,
@@ -742,7 +742,7 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) label_id: Option<String>,
     #[schemars(
-        description = "Filter by state group (list); one of backlog|unstarted|started|completed|cancelled|triage, or a comma-separated list (e.g. \"backlog,unstarted,started\") to match any"
+        description = "Filter by state group (list); one of backlog|unstarted|started|in_review|completed|cancelled|triage, or a comma-separated list (e.g. \"backlog,unstarted,started\") to match any"
     )]
     #[serde(default)]
     pub(crate) state_group: Option<String>,

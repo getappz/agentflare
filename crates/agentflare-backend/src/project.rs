@@ -220,7 +220,7 @@ mod tests {
         )
         .unwrap();
         let states = crate::state::list_by_project(&conn, &proj.id).unwrap();
-        assert_eq!(states.len(), 6);
+        assert_eq!(states.len(), 7);
     }
 
     #[test]

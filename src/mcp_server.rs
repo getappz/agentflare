@@ -1340,6 +1340,7 @@ impl AgentflareMcp {
             "heartbeat" => self.item_heartbeat(req),
             "release" => self.item_release(req),
             "done" => self.item_done(req),
+            "check_merge" => self.item_check_merge(req),
             "cancel" => self.item_cancel(req),
             "search" => self.item_search(req),
             "add_label" => self.item_add_label(req),
@@ -1349,7 +1350,7 @@ impl AgentflareMcp {
             "health" => self.item_health(req),
             other => Err(ErrorData::invalid_params(
                 format!(
-                    "unknown item action: '{other}' — expected create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|cancel|add_label|remove_label|groom|standup|health"
+                    "unknown item action: '{other}' — expected create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health"
                 ),
                 None,
             )),
@@ -1357,7 +1358,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|cancel|add_label|remove_label|groom|standup|health). `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck scorecard; `bottlenecks` is currently always empty — no handoff log is persisted yet, see `bottleneck_note`. See each field's description for when it's required."
+        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health). `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck scorecard; `bottlenecks` is currently always empty — no handoff log is persisted yet, see `bottleneck_note`. `done` moves an item to \"in_review\" (not \"completed\") when it results in an open PR, and leaves the worktree in place for follow-up commits; call `check_merge` once the PR is confirmed merged to promote it to \"completed\" and clean up the worktree."
     )]
     fn item(&self, Parameters(req): Parameters<ItemRequest>) -> Result<String, ErrorData> {
         self.item_inner(req)

@@ -21,6 +21,12 @@ pub struct PullRequest {
     pub title: String,
     #[serde(default)]
     pub draft: bool,
+    // Present (non-null) on both the list and single-PR endpoints, unlike
+    // `merged: bool` which the GitHub API only returns from the single-PR
+    // endpoint — using this instead lets `check_merge` (item #420) read
+    // merge status straight off `find_existing`'s list call.
+    #[serde(default)]
+    pub merged_at: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
     pub mergeable: Option<bool>,

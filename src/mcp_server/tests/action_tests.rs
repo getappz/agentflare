@@ -596,6 +596,170 @@ fn item_done_with_push_false_never_pushes_the_branch() {
 }
 
 #[test]
+fn item_done_with_a_resulting_pr_moves_to_in_review_not_completed() {
+    // The regression this guards: state used to flip to "Completed" before
+    // the push even ran, so an item could show done while its PR was still
+    // unreviewed. Simulated here since producing a real pr_url needs live
+    // GitHub credentials -- push a real commit to a real local remote and
+    // fake an already-open PR by pre-seeding `find_existing`'s lookup is
+    // out of reach without a GitHub mock, so this drives `mark_in_review`
+    // directly the way `item_done` would once pr_url resolves, and asserts
+    // the response shape a caller would see.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    s.item(Parameters(ItemRequest {
+        action: "claim".into(),
+        id: Some(item_id.clone()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let owner = crate::claims::owner_id();
+    s.with_backend_db(|conn| {
+        assert!(agentflare_backend::item::mark_in_review(conn, &item_id, &owner).unwrap());
+    })
+    .unwrap();
+
+    let fetched: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "get".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        fetched["completed_at"].is_null(),
+        "in_review must not be treated as completed"
+    );
+
+    // The lease must still be held -- a genuinely different agent must be
+    // rejected mid-review. (The MCP `claim` action always uses this
+    // process's own fixed owner_id, so re-claiming through it can't
+    // simulate a different agent -- go straight at the backend, the same
+    // way item.rs's own claim tests do.)
+    s.with_backend_db(|conn| {
+        match agentflare_backend::item::claim(conn, &item_id, "agent:2", crate::claims::now(), 3600)
+            .unwrap()
+        {
+            agentflare_backend::item::ClaimOutcome::Held { .. } => {}
+            other => panic!("expected Held while in_review, got {other:?}"),
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn item_check_merge_is_a_noop_when_not_in_review() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let result: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "check_merge".into(),
+            id: Some(item_id),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["promoted"], false);
+    assert_eq!(result["reason"], "item is not in_review");
+}
+
+#[test]
+fn item_check_merge_leaves_an_in_review_item_alone_when_merge_status_is_unknown() {
+    // No remote configured in this throwaway repo, so `is_pr_merged`
+    // soft-fails to "not merged" -- check_merge must leave the item
+    // exactly as it found it, not guess.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    s.item(Parameters(ItemRequest {
+        action: "claim".into(),
+        id: Some(item_id.clone()),
+        ..Default::default()
+    }))
+    .unwrap();
+    let owner = crate::claims::owner_id();
+    s.with_backend_db(|conn| {
+        assert!(agentflare_backend::item::mark_in_review(conn, &item_id, &owner).unwrap());
+    })
+    .unwrap();
+
+    let result: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "check_merge".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["promoted"], false);
+    assert_eq!(result["reason"], "PR not merged yet");
+
+    let fetched: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "get".into(),
+            id: Some(item_id),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(fetched["completed_at"].is_null(), "must still be in_review");
+}
+
+#[test]
 fn item_rejects_unknown_action() {
     let (_tmp, s) = harness();
     let err = s

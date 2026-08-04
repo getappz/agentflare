@@ -39,10 +39,20 @@ const DEFAULT_STATES: &[(&str, &str, f64, &str)] = &[
     ("Backlog", "backlog", 15000.0, "#60646C"),
     ("Todo", "unstarted", 25000.0, "#60646C"),
     ("In Progress", "started", 35000.0, "#F59E0B"),
+    ("In Review", "in_review", 40000.0, "#818CF8"),
     ("Done", "completed", 45000.0, "#46A758"),
     ("Cancelled", "cancelled", 55000.0, "#9AA4BC"),
     ("Triage", "triage", 65000.0, "#4E5355"),
 ];
+
+/// Name/color for the "in_review" state auto-created (see
+/// `item::mark_in_review`) on a project seeded before this group existed —
+/// every project created via `seed_defaults` after item #420 already has
+/// one from the table above, so `create`'s writes here are idempotent
+/// backfill, not the common path.
+pub const IN_REVIEW_STATE_NAME: &str = "In Review";
+pub const IN_REVIEW_STATE_COLOR: &str = "#818CF8";
+pub const IN_REVIEW_STATE_SEQUENCE: f64 = 40000.0;
 
 fn workspace_id_for_project(conn: &Connection, project_id: &str) -> Result<String> {
     conn.query_row(
@@ -260,16 +270,21 @@ mod tests {
     }
 
     #[test]
-    fn seed_defaults_creates_six_states() {
+    fn seed_defaults_creates_seven_states() {
         let conn = db::open_in_memory().unwrap();
         let pid = seed_project(&conn);
         let states = list_by_project(&conn, &pid).unwrap();
-        assert_eq!(states.len(), 6);
+        assert_eq!(states.len(), 7);
         assert!(states.iter().any(|s| s.name == "Backlog" && s.is_default));
         assert!(
             states
                 .iter()
                 .any(|s| s.name == "Done" && s.group_name == "completed")
+        );
+        assert!(
+            states
+                .iter()
+                .any(|s| s.name == "In Review" && s.group_name == "in_review")
         );
     }
 
@@ -340,8 +355,8 @@ mod tests {
             .unwrap()
             .id
         };
-        assert_eq!(list_by_project(&conn, &pid1).unwrap().len(), 6);
-        assert_eq!(list_by_project(&conn, &pid2).unwrap().len(), 6);
+        assert_eq!(list_by_project(&conn, &pid1).unwrap().len(), 7);
+        assert_eq!(list_by_project(&conn, &pid2).unwrap().len(), 7);
     }
 
     #[test]
