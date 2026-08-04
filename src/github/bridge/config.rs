@@ -520,6 +520,11 @@ mod tests {
     #[test]
     fn mint_instance_is_deterministic_for_this_machine() {
         // The property a random mint cannot satisfy — see the next test.
+        // Guarded like it: without a readable machine id, mint_instance falls
+        // back to random_instance and two calls legitimately differ.
+        if machine_uid::get().is_err() {
+            return;
+        }
         assert_eq!(mint_instance(), mint_instance());
     }
 
