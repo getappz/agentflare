@@ -731,6 +731,73 @@ pub fn mark_completed(conn: &Connection, item_id: &str, owner: &str) -> Result<b
     Ok(true)
 }
 
+/// Moves a claimed item into the project's "in_review" group, same shape and
+/// same claim-lease-stays-held contract as `mark_completed` above — used
+/// instead of it when `done` results in an open PR (item #420). The work
+/// isn't actually finished until that PR merges: landing straight on
+/// "completed" would show the item as done while its PR is still red or
+/// under review, which is the state-side half of the bug `mark_completed`
+/// alone had (the other half was deleting the worktree too, fixed in
+/// `mcp_server::item::item_done` by only cleaning up when no PR resulted).
+///
+/// Auto-creates the "in_review" state on first use per project: it's in
+/// `state::DEFAULT_STATES` for every project seeded after item #420, but
+/// existing projects were seeded before it existed and have no such state
+/// to find.
+pub fn mark_in_review(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    if !crate::claim::is_owner(&tx, item_id, owner)? {
+        return Ok(false);
+    }
+    let item = get(&tx, item_id)?;
+    let review_state = match crate::state::first_in_group(&tx, &item.project_id, "in_review") {
+        Ok(s) => s,
+        Err(crate::error::Error::NotFound(_)) => crate::state::create(
+            &tx,
+            crate::state::CreateState {
+                project_id: item.project_id.clone(),
+                name: crate::state::IN_REVIEW_STATE_NAME.into(),
+                group_name: "in_review".into(),
+                sequence: crate::state::IN_REVIEW_STATE_SEQUENCE,
+                is_default: None,
+                color: Some(crate::state::IN_REVIEW_STATE_COLOR.into()),
+            },
+        )?,
+        Err(e) => return Err(e),
+    };
+    update_state(&tx, item_id, &review_state.id)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Promotes an item from "in_review" to "completed" once its PR is
+/// confirmed merged (`item_check_merge`, item #420). Unlike
+/// `mark_completed`/`mark_in_review`, this is deliberately NOT owner-scoped:
+/// `item_done` leaves the claim lease held (not released) when it moves an
+/// item into "in_review" specifically so nobody else can claim it out from
+/// under the pending review, so by the time anything reaches this function
+/// no other owner could legally exist — whoever notices the merge and calls
+/// `check_merge`, possibly a different session than the one that opened the
+/// PR, is allowed to finish the transition. Releases whatever lease is
+/// still held as part of the same commit. Returns `Ok(false)` (a no-op,
+/// not an error) when the item isn't currently in "in_review" — callers
+/// can call this speculatively without checking state first.
+pub fn promote_in_review_to_completed(conn: &Connection, item_id: &str) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let item = get(&tx, item_id)?;
+    let state = crate::state::get(&tx, &item.state_id)?;
+    if state.group_name != "in_review" {
+        return Ok(false);
+    }
+    let completed_state = crate::state::first_in_group(&tx, &item.project_id, "completed")?;
+    update_state(&tx, item_id, &completed_state.id)?;
+    if let Some(owner) = crate::claim::current_owner(&tx, item_id) {
+        crate::claim::done(&tx, item_id, &owner, now())?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1577,6 +1644,89 @@ mod tests {
         let item = make_item(&conn, &pid, &sid);
         claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
         assert!(!mark_completed(&conn, &item.id, "agent:2").unwrap());
+    }
+
+    #[test]
+    fn mark_in_review_moves_to_in_review_state_and_lease_stays_held() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+        assert!(mark_in_review(&conn, &item.id, "agent:1").unwrap());
+        let reviewed = get(&conn, &item.id).unwrap();
+        assert_eq!(reviewed.state_id, state_in_group(&conn, &pid, "in_review"));
+        // Not actually finished yet -- completed_at must stay unset.
+        assert!(reviewed.completed_at.is_none());
+
+        // Lease is still held, same contract as mark_completed.
+        match claim(&conn, &item.id, "agent:2", 1200, TTL).unwrap() {
+            ClaimOutcome::Held { .. } => {}
+            other => panic!("expected Held after mark_in_review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mark_in_review_noop_for_non_owner() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+        assert!(!mark_in_review(&conn, &item.id, "agent:2").unwrap());
+    }
+
+    #[test]
+    fn mark_in_review_backfills_the_state_for_a_project_seeded_before_it_existed() {
+        // Simulates a project created before item #420: delete the
+        // "in_review" state seed_defaults would otherwise have created, and
+        // confirm mark_in_review heals it instead of erroring.
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let old_review_state_id = state_in_group(&conn, &pid, "in_review");
+        conn.execute(
+            "UPDATE states SET deleted_at = 1 WHERE id = ?1",
+            rusqlite::params![old_review_state_id],
+        )
+        .unwrap();
+        assert!(crate::state::first_in_group(&conn, &pid, "in_review").is_err());
+
+        let item = make_item(&conn, &pid, &sid);
+        claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+        assert!(mark_in_review(&conn, &item.id, "agent:1").unwrap());
+
+        let reviewed = get(&conn, &item.id).unwrap();
+        let healed = crate::state::first_in_group(&conn, &pid, "in_review").unwrap();
+        assert_eq!(reviewed.state_id, healed.id);
+        assert_ne!(healed.id, old_review_state_id);
+    }
+
+    #[test]
+    fn promote_in_review_to_completed_moves_state_and_releases_the_lease() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+        assert!(mark_in_review(&conn, &item.id, "agent:1").unwrap());
+
+        assert!(promote_in_review_to_completed(&conn, &item.id).unwrap());
+        let done_item = get(&conn, &item.id).unwrap();
+        assert_eq!(done_item.state_id, state_in_group(&conn, &pid, "completed"));
+        assert!(done_item.completed_at.is_some());
+
+        // Lease was released -- a different agent can claim it now.
+        let outcome = claim(&conn, &item.id, "agent:2", 1200, TTL).unwrap();
+        assert_eq!(outcome, ClaimOutcome::Acquired);
+    }
+
+    #[test]
+    fn promote_in_review_to_completed_is_a_noop_when_not_in_review() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+        // Still "started", never moved to in_review.
+        assert!(!promote_in_review_to_completed(&conn, &item.id).unwrap());
+        let unchanged = get(&conn, &item.id).unwrap();
+        assert_eq!(unchanged.state_id, state_in_group(&conn, &pid, "started"));
     }
 
     #[test]

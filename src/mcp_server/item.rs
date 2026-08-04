@@ -526,15 +526,19 @@ impl AgentflareMcp {
         let owner = crate::claims::owner_id();
         let now = crate::claims::now();
         let repo_root = self.worktree_repo_root();
-        // Same split as `claim`: resolve (DB reads) under the
-        // backend lock, then run the blocking git/gh push+PR outside
-        // it — `git push`/`gh pr create` have no business running
-        // while the shared DB mutex is held.
-        let (done, item_id, item, target_branch) = self.with_backend_db(|conn| {
+        // Resolve + authorize (DB reads) under the backend lock, then run
+        // the blocking git/gh push+PR outside it — `git push`/`gh pr
+        // create` have no business running while the shared DB mutex is
+        // held. Unlike before, the state transition itself (completed vs
+        // in_review) is decided AFTER the push below, since it depends on
+        // whether a PR actually results — deciding it up front showed the
+        // item as "Completed" for the entire push/PR network round trip
+        // even when a PR ends up open and unreviewed (item #420).
+        let (item_id, owns_claim, item, target_branch) = self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
-            let done = agentflare_backend::item::mark_completed(conn, &item_id, &owner)
-                .map_err(map_backend_err)?;
-            let (item, target_branch) = if done {
+            let owns_claim = agentflare_backend::claim::is_owner(conn, &item_id, &owner)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            let (item, target_branch) = if owns_claim {
                 // Refresh the lease's heartbeat right before the
                 // potentially long push/PR publish step below, so a
                 // short custom AGENTFLARE_BACKEND_CLAIM_TTL_SECS
@@ -549,10 +553,11 @@ impl AgentflareMcp {
             } else {
                 (None, None)
             };
-            Ok::<_, ErrorData>((done, item_id, item, target_branch))
+            Ok::<_, ErrorData>((item_id, owns_claim, item, target_branch))
         })??;
+        let should_push = req.push.unwrap_or(true);
         let pr_url = match (&item, &target_branch) {
-            (Some(item), Some(target)) => PROGRESS_SENDER
+            (Some(item), Some(target)) if should_push => PROGRESS_SENDER
                 .try_with(|ps| {
                     crate::worktree::push_and_open_pr(item, &repo_root, target, ps.as_ref())
                 })
@@ -561,32 +566,117 @@ impl AgentflareMcp {
                 }),
             _ => None,
         };
-        // Only now — after push_and_open_pr has been attempted
-        // (success or soft-fail, it never blocks) — actually release
-        // the claim lease. Keeping it held until this point closes
-        // the race where a concurrent claim() could grab the item
-        // while its PR was still being opened (item #37).
-        if done {
-            match self.with_backend_db(|conn| {
-                agentflare_backend::claim::done(conn, &item_id, &owner, now)
-            }) {
-                Ok(Ok(true)) => {}
-                Ok(Ok(false)) => eprintln!(
-                    "worktree: releasing claim for item {item_id} affected no rows (owner mismatch or already released)"
-                ),
-                Ok(Err(e)) => {
-                    eprintln!("worktree: failed to release claim for item {item_id}: {e}")
+        // An open PR (freshly created, or already existed) means the work
+        // isn't actually finished: move to "in_review" instead of
+        // "completed", leave the claim lease held (so nobody else can
+        // claim it out from under the pending review), and leave the
+        // worktree in place — follow-up commits (review comments, CI
+        // fixes) may still need to land on this exact branch, which is
+        // impossible once the worktree is gone. We nearly hit this
+        // ourselves fixing #381/#382's own CodeRabbit findings. Promotion
+        // to "completed" (and the worktree cleanup that comes with it)
+        // happens once `check_merge` confirms the PR actually merged.
+        //
+        // No PR resulting means there's nothing pending: go straight to
+        // "completed", release the lease, and it's safe to clean up now.
+        // `cleanup_worktree` itself still checks for a clean tree and
+        // no-ops (logging) rather than trusting push/PR success alone as
+        // proof nothing would be lost.
+        let in_review = owns_claim && pr_url.is_some();
+        let done = if !owns_claim {
+            false
+        } else if in_review {
+            self.with_backend_db(|conn| {
+                agentflare_backend::item::mark_in_review(conn, &item_id, &owner)
+                    .map_err(map_backend_err)
+            })??
+        } else {
+            let moved = self.with_backend_db(|conn| {
+                agentflare_backend::item::mark_completed(conn, &item_id, &owner)
+                    .map_err(map_backend_err)
+            })??;
+            if moved {
+                if let Some(item) = &item {
+                    crate::worktree::cleanup_worktree(item, &repo_root);
                 }
-                Err(e) => {
-                    eprintln!("worktree: failed to release claim for item {item_id}: {e:?}")
+                match self.with_backend_db(|conn| {
+                    agentflare_backend::claim::done(conn, &item_id, &owner, now)
+                }) {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => eprintln!(
+                        "worktree: releasing claim for item {item_id} affected no rows (owner mismatch or already released)"
+                    ),
+                    Ok(Err(e)) => {
+                        eprintln!("worktree: failed to release claim for item {item_id}: {e}")
+                    }
+                    Err(e) => {
+                        eprintln!("worktree: failed to release claim for item {item_id}: {e:?}")
+                    }
                 }
             }
-        }
-        let mut resp = serde_json::json!({"done": done, "item_id": item_id});
+            moved
+        };
+        let status = if in_review {
+            "in_review"
+        } else if done {
+            "completed"
+        } else {
+            "unchanged"
+        };
+        let mut resp = serde_json::json!({"done": done, "item_id": item_id, "status": status});
         if let Some(url) = pr_url {
             resp["pr_url"] = serde_json::Value::String(url.clone());
         }
         Ok(resp.to_string())
+    }
+
+    /// Promotes an item sitting in "in_review" to "completed" once its PR
+    /// is confirmed merged — the other half of `done`'s split (item #420).
+    /// Idempotent and cheap to call speculatively: a no-op (not an error)
+    /// when the item isn't currently in_review, and soft-fails (never
+    /// errors) when GitHub can't be reached, same as `push_and_open_pr`.
+    /// Also removes the item's worktree once promoted, same safety check
+    /// (`cleanup_worktree`) as `done`'s no-PR path uses.
+    pub(super) fn item_check_merge(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for check_merge", None))?;
+        if raw.trim().is_empty() {
+            return Err(ErrorData::invalid_params("id is required", None));
+        }
+        let repo_root = self.worktree_repo_root();
+        let (item_id, item, in_review) = self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
+            let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
+            let state =
+                agentflare_backend::state::get(conn, &item.state_id).map_err(map_backend_err)?;
+            let in_review = state.group_name == "in_review";
+            Ok::<_, ErrorData>((item_id, item, in_review))
+        })??;
+        if !in_review {
+            return Ok(serde_json::json!({
+                "item_id": item_id,
+                "promoted": false,
+                "reason": "item is not in_review",
+            })
+            .to_string());
+        }
+        if !crate::worktree::is_pr_merged(&item, &repo_root) {
+            return Ok(serde_json::json!({
+                "item_id": item_id,
+                "promoted": false,
+                "reason": "PR not merged yet",
+            })
+            .to_string());
+        }
+        let promoted = self.with_backend_db(|conn| {
+            agentflare_backend::item::promote_in_review_to_completed(conn, &item_id)
+                .map_err(map_backend_err)
+        })??;
+        if promoted {
+            crate::worktree::cleanup_worktree(&item, &repo_root);
+        }
+        Ok(serde_json::json!({"item_id": item_id, "promoted": promoted}).to_string())
     }
 
     pub(super) fn item_cancel(&self, req: ItemRequest) -> Result<String, ErrorData> {
