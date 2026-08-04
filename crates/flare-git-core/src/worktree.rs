@@ -66,31 +66,39 @@ pub fn already_isolated_for(branch: &str, repo_root: &Path) -> bool {
     }
 }
 
-/// Adds `.worktrees/` to this repo's LOCAL, untracked ignore rules
-/// (`.git/info/exclude`) rather than the tracked `.gitignore` — a claim
-/// should never create a commit in the caller's repository (would sweep up
-/// any unrelated staged files, and any pre-existing uncommitted `.gitignore`
-/// edits, into a commit the agent didn't ask for).
+/// Adds `.worktrees/` and `.cargo/` to this repo's LOCAL, untracked ignore
+/// rules (`.git/info/exclude`) rather than the tracked `.gitignore` — a
+/// claim should never create a commit in the caller's repository (would
+/// sweep up any unrelated staged files, and any pre-existing uncommitted
+/// `.gitignore` edits, into a commit the agent didn't ask for).
+///
+/// `.cargo/` joined `.worktrees/` here because `isolate_worktree_target_dir`
+/// writes an untracked `.cargo/config.toml` into every worktree it creates;
+/// left unignored, `git status --porcelain` reports every freshly-created
+/// worktree as dirty before any real work happens in it, which is exactly
+/// the signal `cleanup_item_worktree` uses to decide it's unsafe to remove
+/// (item #420).
 pub fn ensure_worktrees_ignored(repo_root: &Path) {
     let Ok(common_dir) = run_git_in(repo_root, &["rev-parse", "--git-common-dir"]) else {
         return;
     };
     let exclude_path = repo_root.join(common_dir).join("info").join("exclude");
-    if let Ok(existing) = std::fs::read_to_string(&exclude_path)
-        && existing
-            .lines()
-            .any(|l| l.trim() == ".worktrees/" || l.trim() == ".worktrees")
-    {
+    let mut content = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    let mut changed = false;
+    for pat in [".worktrees/", ".cargo/"] {
+        if content.lines().any(|l| l.trim() == pat) {
+            continue;
+        }
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(pat);
+        content.push('\n');
+        changed = true;
+    }
+    if !changed {
         return;
     }
-    let mut content = String::new();
-    if let Ok(existing) = std::fs::read_to_string(&exclude_path) {
-        content = existing;
-    }
-    if !content.ends_with('\n') && !content.is_empty() {
-        content.push('\n');
-    }
-    content.push_str(".worktrees/\n");
     if let Some(parent) = exclude_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -375,7 +383,7 @@ fn kill_tree(child: &mut std::process::Child) {
 /// running and the process genuinely un-reaped, not just "late". Stdout/
 /// stderr are drained on separate threads so a child that fills an OS pipe
 /// buffer can't deadlock the wait loop.
-fn run_output_timeout(
+pub(crate) fn run_output_timeout(
     program: impl AsRef<std::ffi::OsStr>,
     args: &[&str],
     cwd: &Path,
@@ -622,6 +630,44 @@ pub fn gc_orphans(repo_root: &Path, names: &[String]) -> Vec<String> {
     deleted
 }
 
+/// Removes `item`'s own worktree once its work is done, if it's safe to.
+///
+/// `create_worktree` provisions a directory per item but nothing ever
+/// removed it (item #420) — every completed item left an orphaned
+/// `.worktrees/task/<id>` behind, and the git shim blocks removing one by
+/// hand. Deleting a linked worktree's directory only drops the checkout,
+/// never the branch or its commits (those live in the shared object store),
+/// so the one real risk is uncommitted changes that exist only in that
+/// checkout. Refuses (logs, returns `false`) on a dirty tree or a failed
+/// status check rather than guessing from push/PR outcome — a caller can
+/// mark an item done without ever pushing, and deleting then would be
+/// destructive.
+pub fn cleanup_item_worktree(item: &Item, repo_root: &Path) -> bool {
+    let name = item.sequence_id.to_string();
+    let worktree_path = repo_root.join(".worktrees").join("task").join(&name);
+    if !worktree_path.exists() {
+        return false;
+    }
+    match run_git_in(&worktree_path, &["status", "--porcelain"]) {
+        Ok(out) if out.trim().is_empty() => {}
+        Ok(_) => {
+            eprintln!(
+                "worktree: leaving {} in place — it has uncommitted changes",
+                worktree_path.display()
+            );
+            return false;
+        }
+        Err(e) => {
+            eprintln!(
+                "worktree: leaving {} in place — could not check its status: {e}",
+                worktree_path.display()
+            );
+            return false;
+        }
+    }
+    !gc_orphans(repo_root, &[name]).is_empty()
+}
+
 /// Remove a worktree directory, with retry + Windows fallback.
 ///
 /// On Windows, background processes (rust-analyzer, proc-macro-srv) may
@@ -824,11 +870,25 @@ mod tests {
         let repo = init_repo();
         let exclude_path = repo.path.join(".git").join("info").join("exclude");
         std::fs::create_dir_all(exclude_path.parent().unwrap()).unwrap();
-        std::fs::write(&exclude_path, ".worktrees/\n").unwrap();
+        std::fs::write(&exclude_path, ".worktrees/\n.cargo/\n").unwrap();
         let before = std::fs::read_to_string(&exclude_path).unwrap();
         ensure_worktrees_ignored(&repo.path);
         let after = std::fs::read_to_string(&exclude_path).unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn ensure_worktrees_ignored_adds_only_the_missing_pattern() {
+        // A file that already has one pattern but not the other must gain
+        // only what's missing, not duplicate the one already present.
+        let repo = init_repo();
+        let exclude_path = repo.path.join(".git").join("info").join("exclude");
+        std::fs::create_dir_all(exclude_path.parent().unwrap()).unwrap();
+        std::fs::write(&exclude_path, ".worktrees/\n").unwrap();
+        ensure_worktrees_ignored(&repo.path);
+        let content = std::fs::read_to_string(&exclude_path).unwrap();
+        assert_eq!(content.matches(".worktrees/").count(), 1);
+        assert_eq!(content.matches(".cargo/").count(), 1);
     }
 
     #[test]
@@ -838,6 +898,7 @@ mod tests {
         let exclude_path = repo.path.join(".git").join("info").join("exclude");
         let content = std::fs::read_to_string(&exclude_path).unwrap();
         assert!(content.contains(".worktrees/"));
+        assert!(content.contains(".cargo/"));
         // Must never touch the tracked .gitignore or create a commit.
         assert!(!repo.path.join(".gitignore").exists());
         let log = run_git_in(&repo.path, &["log", "--oneline"]).unwrap();
@@ -957,6 +1018,38 @@ mod tests {
         let result = create_worktree(&item, &repo.path, &target, None);
         assert!(result.is_ok());
         assert!(worktree_path.exists());
+    }
+
+    #[test]
+    fn cleanup_item_worktree_removes_a_clean_one() {
+        let repo = init_repo();
+        let item = test_item(1);
+        let target = resolve_default_branch(&repo.path);
+        let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+        assert!(worktree_path.exists());
+
+        assert!(cleanup_item_worktree(&item, &repo.path));
+        assert!(!worktree_path.exists());
+    }
+
+    #[test]
+    fn cleanup_item_worktree_refuses_a_dirty_one() {
+        let repo = init_repo();
+        let item = test_item(1);
+        let target = resolve_default_branch(&repo.path);
+        let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+        std::fs::write(worktree_path.join("uncommitted.txt"), "x").unwrap();
+
+        assert!(!cleanup_item_worktree(&item, &repo.path));
+        assert!(worktree_path.exists());
+        assert!(worktree_path.join("uncommitted.txt").exists());
+    }
+
+    #[test]
+    fn cleanup_item_worktree_is_a_noop_when_none_exists() {
+        let repo = init_repo();
+        let item = test_item(1);
+        assert!(!cleanup_item_worktree(&item, &repo.path));
     }
 
     #[test]

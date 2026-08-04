@@ -167,18 +167,13 @@ fn send(platform: Platform, req: &OutboundRequest) -> Result<(), String> {
 
 /// Resolve the platform's bot token from the encrypted `gateway_secrets` store
 /// and send `text` to `target`. The one entry point CLI and MCP both call.
-pub fn send_message(
-    conn: &rusqlite::Connection,
-    platform: Platform,
-    target: &str,
-    text: &str,
-) -> Result<(), String> {
+pub fn send_message(platform: Platform, target: &str, text: &str) -> Result<(), String> {
     let name = platform.secret_name();
-    let token = crate::gateway_secrets::get_secret(conn, name)
+    let token = crate::vault::get_secret(name)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| {
             format!(
-                "no {name} configured — store the bot token as the gateway secret '{name}' first"
+                "no {name} configured — store the bot token with 'agentflare vault set {name}' first"
             )
         })?;
     let req = build_request(platform, target, text, &token);
@@ -293,12 +288,15 @@ mod tests {
 
     #[test]
     fn send_message_without_a_configured_token_errors_clearly() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::gateway_secrets::migrate(&conn).unwrap();
-        let err = send_message(&conn, Platform::Telegram, "123", "hi").unwrap_err();
-        assert!(
-            err.contains("telegram_bot_token"),
-            "should name the missing secret: {err}"
-        );
+        // Isolated home dir so this can't read the developer's real vault --
+        // without it, a configured+unlocked telegram_bot_token would make
+        // this test send a real Telegram message using real credentials.
+        crate::paths::test_support::with_temp_home(|| {
+            let err = send_message(Platform::Telegram, "123", "hi").unwrap_err();
+            assert!(
+                err.contains("telegram_bot_token"),
+                "should name the missing secret: {err}"
+            );
+        });
     }
 }

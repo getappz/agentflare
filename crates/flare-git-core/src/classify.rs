@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::branch::{current_branch, is_protected_branch, resolve_default_branch};
+use crate::policy_config::ResolvedGitShimPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Disposition {
@@ -50,8 +51,30 @@ pub struct Event {
 
 /// Trust-root paths a `push` must never carry changes to — agentflare's own
 /// enforcement config, not something an agent should be able to push a
-/// change to and quietly weaken.
-const TRUST_ROOT_PATHS: &[&str] = &[".githooks/", ".agentflare/", "Cargo.toml"];
+/// change to and quietly weaken. CI workflow config is included for the same
+/// reason as `.githooks/`/`.agentflare/`: an agent that can silently rewrite
+/// the pipeline that's supposed to catch its own mistakes has defeated that
+/// check before it ever runs (the "wipes CI" scenario named in the
+/// competitor audit that led to this addition).
+///
+/// Known limitation (confirmed empirically 2026-07-29, see item #321):
+/// `resolve_trust_root_touch` diffs the pushed branch against the default
+/// branch by NAME — when both are literally "master" (the ordinary bare
+/// `git push`/`git push origin master` case), that's a self-diff and always
+/// resolves `Clean`, so a direct push of the default branch is denied by the
+/// blanket "can't push the default branch" rule regardless of what changed,
+/// never by this list. This entry only changes the deny *message* once a
+/// pushed branch legitimately diverges under a different name (feature
+/// branch, or after #321's src:dest refspec fix) — it doesn't add new
+/// protection against the direct-push case, which was already fully blocked.
+pub(crate) const TRUST_ROOT_PATHS: &[&str] = &[
+    ".githooks/",
+    ".agentflare/",
+    "Cargo.toml",
+    ".github/workflows/",
+    ".gitlab-ci.yml",
+    ".circleci/",
+];
 
 /// `AGENTFLARE_GIT_TRUST_ROOT_PATHS`, comma-separated, appended to
 /// `TRUST_ROOT_PATHS` -- e.g. `".githooks/,policy.toml"`. Empty/unset ->
@@ -153,7 +176,7 @@ const READ_ONLY_SUBCOMMANDS: &[&str] = &[
 /// Ordinary mutating workflow commands, allowed by default — none of these
 /// are individually dangerous the way `reset --hard`/`clean -f`/protected-
 /// branch checkout/trust-root push are.
-const ALLOWED_MUTATING_SUBCOMMANDS: &[&str] = &[
+pub(crate) const ALLOWED_MUTATING_SUBCOMMANDS: &[&str] = &[
     "add",
     "commit",
     "merge",
@@ -170,7 +193,7 @@ const ALLOWED_MUTATING_SUBCOMMANDS: &[&str] = &[
 
 /// Low-level plumbing that can bypass the higher-level checks above —
 /// denied outright rather than reasoned about case by case.
-const DENIED_PLUMBING_SUBCOMMANDS: &[&str] = &[
+pub(crate) const DENIED_PLUMBING_SUBCOMMANDS: &[&str] = &[
     "read-tree",
     "update-index",
     "apply",
@@ -211,13 +234,21 @@ pub fn classify_pure(
     default_branch: &str,
     trust_root_touch: &TrustRootTouch,
     push_targets_default_branch: bool,
+    policy: &ResolvedGitShimPolicy,
 ) -> Disposition {
     if READ_ONLY_SUBCOMMANDS.contains(&subcommand)
-        || ALLOWED_MUTATING_SUBCOMMANDS.contains(&subcommand)
+        || policy
+            .allowed_mutating_subcommands
+            .iter()
+            .any(|s| s.as_str() == subcommand)
     {
         return Disposition::Passthrough;
     }
-    if DENIED_PLUMBING_SUBCOMMANDS.contains(&subcommand) {
+    if policy
+        .denied_plumbing_subcommands
+        .iter()
+        .any(|s| s.as_str() == subcommand)
+    {
         return Disposition::Deny {
             reason: format!(
                 "'git {subcommand}' is a low-level plumbing command blocked by the agentflare git shim — it can bypass the checks this shim applies to higher-level commands."
@@ -263,7 +294,7 @@ pub fn classify_pure(
             if is_protected_branch(target, Some(default_branch)) {
                 Disposition::Deny {
                     reason: format!(
-                        "'{target}' is this repo's default branch — direct checkout/switch is blocked by the agentflare git shim. Create an isolated worktree first."
+                        "'{target}' is this repo's default branch — direct checkout/switch is blocked by the agentflare git shim. Call `item(action=\"claim\", id=<item>)` to get an isolated worktree instead (not the standalone `claim`/`mcp__flare__claim` tool, which only takes a scope lock)."
                     ),
                 }
             } else {
@@ -288,7 +319,8 @@ pub fn classify_pure(
             TrustRootTouch::Touched(_) => Disposition::Passthrough,
             TrustRootTouch::Unknown if push_targets_default_branch => Disposition::Deny {
                 reason: format!(
-                    "this push's diff against trust-root paths (.githooks/, .agentflare/, Cargo.toml) could not be verified, and it targets the repo's default branch '{default_branch}' — blocked by the agentflare git shim as a precaution."
+                    "this push's diff against trust-root paths ({}) could not be verified, and it targets the repo's default branch '{default_branch}' — blocked by the agentflare git shim as a precaution.",
+                    policy.trust_root_paths.join(", ")
                 ),
             },
             TrustRootTouch::Unknown => Disposition::Passthrough,
@@ -309,7 +341,7 @@ pub fn classify_pure(
                 Disposition::Passthrough
             } else {
                 Disposition::Deny {
-                    reason: "'git worktree' is orchestrator-managed by agentflare — use the `item` MCP tool's claim flow instead of calling it directly.".to_string(),
+                    reason: "'git worktree' is orchestrator-managed by agentflare — call `item(action=\"claim\", id=<item>)` to provision one. (Not the standalone `claim`/`mcp__flare__claim` tool -- that only takes a scope lock and does not create a worktree.)".to_string(),
                 }
             }
         }
@@ -341,17 +373,18 @@ pub enum TrustRootTouch {
 /// default to let through, but the caller shouldn't claim to know which
 /// path caused it.
 #[must_use]
-pub fn resolve_trust_root_touch(repo_root: &Path, branch: &str, target: &str) -> TrustRootTouch {
-    let extra = extra_trust_root_paths_from_env();
+pub fn resolve_trust_root_touch(
+    repo_root: &Path,
+    branch: &str,
+    target: &str,
+    trust_root_paths: &[String],
+) -> TrustRootTouch {
     let range = format!("{target}...{branch}");
     match crate::shell::run_in(repo_root, &["diff", "--name-only", &range]) {
         Ok(names) => {
             let mut matched: Vec<String> = names
                 .lines()
-                .filter(|f| {
-                    TRUST_ROOT_PATHS.iter().any(|p| f.starts_with(p))
-                        || extra.iter().any(|p| f.starts_with(p.as_str()))
-                })
+                .filter(|f| trust_root_paths.iter().any(|p| f.starts_with(p.as_str())))
                 .map(str::to_string)
                 .collect();
             matched.sort();
@@ -366,29 +399,195 @@ pub fn resolve_trust_root_touch(repo_root: &Path, branch: &str, target: &str) ->
     }
 }
 
-/// Resolves which local branch/ref a `push` invocation would actually
-/// push, skipping flags positionally (`-u`, `--force`, `--force-with-lease`,
-/// `--tags`, ...) rather than assuming `args[1]` -- a flag before the
-/// remote/refspec (e.g. `git push -u origin feature/x`) previously threw
-/// off a fixed-index read, misreading the remote name (`"origin"`) as the
-/// branch being pushed and either mis-diffing or spuriously denying. Falls
-/// back to the current checked-out branch when the refspec is omitted
-/// entirely (bare `git push`, or `git push <remote>` with no explicit ref
-/// -- both push the current/tracked branch, not something namable from
-/// `args` alone) -- this also closes the gap where the single most common
-/// push form (`git push`) skipped the trust-root check entirely.
-fn pushed_branch(repo_root: &Path, args: &[String]) -> Option<String> {
-    let non_flags: Vec<&str> = args
-        .iter()
-        .filter(|a| !a.starts_with('-'))
-        .map(String::as_str)
-        .collect();
-    let raw = match non_flags.len() {
-        0 | 1 => current_branch(repo_root),
-        _ => Some(non_flags[1].to_string()),
-    }?;
-    let branch = raw.split(':').next().unwrap_or(&raw);
-    Some(branch.trim_start_matches("refs/heads/").to_string())
+/// One ref a `push` invocation would actually write, split into the two
+/// halves classification needs separately: `source` is the local content
+/// being pushed (what a trust-root diff runs against), `destination` is the
+/// remote ref name being written to (what `is_protected_branch` gates on).
+/// For a plain (no-colon) refspec, or the no-refspec fallback, the two are
+/// the same branch name; a `src:dest` refspec is the one case they diverge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PushRef {
+    source: String,
+    destination: String,
+}
+
+fn strip_ref_prefix(name: &str) -> String {
+    name.strip_prefix("refs/heads/").unwrap_or(name).to_string()
+}
+
+/// Every local branch name, for `--all`/`--mirror` (which push every local
+/// branch to its identically-named remote ref, not something namable from
+/// `args` alone). `None` if the listing itself fails -- callers must treat
+/// that as an unresolvable push, not as "no branches to worry about".
+fn local_branches(repo_root: &Path) -> Option<Vec<String>> {
+    crate::shell::run_in(
+        repo_root,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    )
+    .ok()
+    .map(|out| {
+        out.lines()
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+}
+
+/// One refspec argument (e.g. `feature/x`, `feature/x:master`, `:master` for
+/// a remote-delete) into its source/destination pair. A bare name with no
+/// colon pushes to a remote ref of the same name. An empty source half
+/// (delete form) has no local content to diff -- `destination` doubles as
+/// `source` so the trust-root diff below self-diffs to `Clean` (nothing was
+/// pushed), while `is_protected_branch` on `destination` still catches
+/// "this deletes the default branch remotely".
+fn parse_refspec(spec: &str) -> PushRef {
+    // A leading `+` force-marks the whole refspec (`+master`,
+    // `+feature/x:master`) -- strip it before parsing. Left in place, the
+    // no-colon case below carries it straight into `source`/`destination`
+    // (`"+master"`), which then silently fails to match the default branch
+    // name and lets a force push of the default branch slip the
+    // direct-push guard entirely.
+    let spec = spec.strip_prefix('+').unwrap_or(spec);
+    match spec.split_once(':') {
+        Some((src, dst)) if !dst.is_empty() => {
+            let dst = strip_ref_prefix(dst);
+            PushRef {
+                source: if src.is_empty() {
+                    dst.clone()
+                } else {
+                    strip_ref_prefix(src)
+                },
+                destination: dst,
+            }
+        }
+        _ => {
+            let name = strip_ref_prefix(spec.split(':').next().unwrap_or(spec));
+            PushRef {
+                source: name.clone(),
+                destination: name,
+            }
+        }
+    }
+}
+
+/// `git push` flags that consume a separate following argument (as opposed
+/// to the `--flag=value` form, which already reads as one token starting
+/// with `-` and is dropped whole by the flag filter below). Left
+/// unhandled, the value token (e.g. the `myrepo.git` in `--repo myrepo.git
+/// feature/x`) reads as an ordinary positional and throws off the
+/// `non_flags[0]` = remote / `non_flags[1..]` = refspecs split -- in the
+/// worst case (no explicit refspec) shifting a real branch name out of
+/// position and silently swapping in the flag's value as the "branch"
+/// being pushed, which then never matches the default branch name.
+const VALUE_TAKING_PUSH_FLAGS: &[&str] =
+    &["-o", "--push-option", "--receive-pack", "--repo", "--exec"];
+
+/// Positional (non-flag) arguments, with the value token following any
+/// `VALUE_TAKING_PUSH_FLAGS` entry dropped alongside the flag itself.
+fn non_flag_args(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut skip_next = false;
+    for a in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a.starts_with('-') {
+            if VALUE_TAKING_PUSH_FLAGS.contains(&a.as_str()) {
+                skip_next = true;
+            }
+            continue;
+        }
+        out.push(a.as_str());
+    }
+    out
+}
+
+/// Resolves every ref a `push` invocation would actually write, skipping
+/// flags positionally (`-u`, `--force`, `--force-with-lease`, ...) rather
+/// than assuming fixed indices -- a flag before the remote/refspec (e.g.
+/// `git push -u origin feature/x`) previously threw off a fixed-index read,
+/// misreading the remote name (`"origin"`) as the branch being pushed.
+/// Models the push shapes agentflare's own audit found `pushed_branch`
+/// collapsing into a single (wrong) branch name (item #321):
+/// - an explicit `src:dest` refspec (or several) -- each pair kept separate,
+///   so e.g. `git push origin feature/x:master` is judged on `master` (the
+///   actual write target), not `feature/x` (what was previously read as the
+///   pushed branch, silently bypassing default-branch protection).
+/// - `--all` -- every local branch, each to its same-named remote ref, not
+///   just the one branch a positional read would find.
+/// - `--mirror` -- pushes every ref (branches, tags, and deletes anything
+///   present remotely but not locally), a strictly larger surface than
+///   `local_branches` enumerates. Approximating it as "every local branch"
+///   could miss exactly the kind of write this exists to catch, so it's
+///   treated as unresolvable rather than under-approximated.
+/// - `--tags` with no explicit refspec -- pushes every tag, not a branch;
+///   there's nothing here for branch-protection/trust-root checks to
+///   inspect, so no ref (not even a current-branch fallback) applies.
+/// - no refspec at all (bare `git push`, or `git push <remote>`) -- falls
+///   back to the current checked-out branch, pushed to itself.
+///
+/// `None` means the push's targets couldn't be resolved at all (branch
+/// enumeration failed, or there's no current branch to fall back to) --
+/// callers must fail closed rather than assume nothing risky is being
+/// pushed.
+fn pushed_refs(repo_root: &Path, args: &[String]) -> Option<Vec<PushRef>> {
+    if args.iter().any(|a| a == "--mirror") {
+        return None;
+    }
+    if args.iter().any(|a| a == "--all") {
+        return local_branches(repo_root).map(|branches| {
+            branches
+                .into_iter()
+                .map(|b| PushRef {
+                    source: b.clone(),
+                    destination: b,
+                })
+                .collect()
+        });
+    }
+    let non_flags = non_flag_args(args);
+    if args.iter().any(|a| a == "--tags") && non_flags.len() <= 1 {
+        return Some(Vec::new());
+    }
+    if non_flags.len() <= 1 {
+        let branch = current_branch(repo_root)?;
+        return Some(vec![PushRef {
+            source: branch.clone(),
+            destination: branch,
+        }]);
+    }
+    Some(non_flags[1..].iter().map(|r| parse_refspec(r)).collect())
+}
+
+/// Folds `resolve_trust_root_touch` over every pushed ref's `source` --
+/// `Touched` wins over `Unknown` wins over `Clean`, and matched paths union
+/// across refs, so a trust-root change on ANY pushed ref is caught rather
+/// than only the first/only one a single-branch read would have inspected.
+fn combined_trust_root_touch(
+    repo_root: &Path,
+    refs: &[PushRef],
+    default_branch: &str,
+    trust_root_paths: &[String],
+) -> TrustRootTouch {
+    let mut touched: Vec<String> = Vec::new();
+    let mut saw_unknown = false;
+    for r in refs {
+        match resolve_trust_root_touch(repo_root, &r.source, default_branch, trust_root_paths) {
+            TrustRootTouch::Touched(paths) => touched.extend(paths),
+            TrustRootTouch::Unknown => saw_unknown = true,
+            TrustRootTouch::Clean => {}
+        }
+    }
+    if !touched.is_empty() {
+        touched.sort();
+        touched.dedup();
+        TrustRootTouch::Touched(touched)
+    } else if saw_unknown {
+        TrustRootTouch::Unknown
+    } else {
+        TrustRootTouch::Clean
+    }
 }
 
 /// I/O-resolving entry point: resolves the default branch and (for `push`
@@ -412,26 +611,62 @@ pub fn classify_with_home(
     args: &[String],
     home: Option<&Path>,
 ) -> Event {
+    let policy = crate::policy_config::resolve(repo_root, home).unwrap_or_else(|e| {
+        eprintln!(
+            "WARNING: agentflare git-shim config at {} is invalid ({}) -- \
+             using baseline policy only, no config-sourced additions applied. \
+             Git operations are not blocked by this; fix the file to restore \
+             your customizations.",
+            e.path.display(),
+            e.source
+        );
+        ResolvedGitShimPolicy::baseline()
+    });
     let default_branch = resolve_default_branch(repo_root);
-    // Resolve the actual pushed branch once, then derive both push facts from
-    // it: whether it carries trust-root changes and whether it *is* the
-    // default branch (direct push blocked in favour of a PR).
-    let pushed = (subcommand == "push")
-        .then(|| pushed_branch(repo_root, args))
-        .flatten();
-    let trust_root_touch = pushed
-        .as_deref()
-        .map(|b| resolve_trust_root_touch(repo_root, b, &default_branch))
-        .unwrap_or(TrustRootTouch::Clean);
-    let targets_default_branch = pushed
-        .as_deref()
-        .is_some_and(|b| is_protected_branch(b, Some(&default_branch)));
+    // Resolve every ref the push actually writes, then derive both push
+    // facts from the full set: whether ANY destination *is* the default
+    // branch (direct push blocked in favour of a PR), and -- only then --
+    // whether ANY of them carries trust-root changes. `classify_pure`
+    // never looks at `trust_root_touch` unless `targets_default_branch` is
+    // true (every match arm below it is gated on that), so checking it
+    // first skips `combined_trust_root_touch`'s `git diff` subprocesses
+    // entirely for the common case of a push that isn't touching the
+    // default branch. An unresolvable push mode/refspec (`pushed_refs`
+    // returning `None`) fails closed -- forcing `targets_default_branch`
+    // true regardless of `trust_root_touch` is what actually makes that
+    // closed: `classify_pure`'s `Unknown` arm only denies when paired with
+    // `targets_default_branch`, so leaving it `false` here would let an
+    // unresolvable push straight through.
+    let (trust_root_touch, targets_default_branch) = if subcommand == "push" {
+        match pushed_refs(repo_root, args) {
+            Some(refs) => {
+                let targets_default_branch = refs
+                    .iter()
+                    .any(|r| is_protected_branch(&r.destination, Some(&default_branch)));
+                let trust_root_touch = if targets_default_branch {
+                    combined_trust_root_touch(
+                        repo_root,
+                        &refs,
+                        &default_branch,
+                        &policy.trust_root_paths,
+                    )
+                } else {
+                    TrustRootTouch::Clean
+                };
+                (trust_root_touch, targets_default_branch)
+            }
+            None => (TrustRootTouch::Unknown, true),
+        }
+    } else {
+        (TrustRootTouch::Clean, false)
+    };
     let mut disposition = classify_pure(
         subcommand,
         args,
         &default_branch,
         &trust_root_touch,
         targets_default_branch,
+        &policy,
     );
     // Every deny above (protected-branch checkout/switch/delete/rename,
     // trust-root push, plumbing block, worktree) exists to protect agentflare's
@@ -463,8 +698,16 @@ mod tests {
 
     #[test]
     fn read_only_subcommands_pass_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
-            classify_pure("status", &[], "master", &TrustRootTouch::Clean, false),
+            classify_pure(
+                "status",
+                &[],
+                "master",
+                &TrustRootTouch::Clean,
+                false,
+                &policy
+            ),
             Disposition::Passthrough
         );
         assert_eq!(
@@ -473,7 +716,8 @@ mod tests {
                 &args(&["-5"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -481,13 +725,15 @@ mod tests {
 
     #[test]
     fn ordinary_mutating_subcommands_pass_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "commit",
                 &args(&["-m", "x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -497,7 +743,8 @@ mod tests {
                 &args(&["HEAD~1"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -505,6 +752,7 @@ mod tests {
 
     #[test]
     fn unknown_subcommand_passes_through_by_default() {
+        let policy = ResolvedGitShimPolicy::baseline();
         // Fail-open: this shim must never block a subcommand it hasn't
         // been explicitly taught to deny.
         assert_eq!(
@@ -513,7 +761,8 @@ mod tests {
                 &[],
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -523,7 +772,8 @@ mod tests {
                 &args(&["update"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -533,7 +783,8 @@ mod tests {
                 &args(&["start"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -543,7 +794,8 @@ mod tests {
                 &args(&["pull"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -551,25 +803,42 @@ mod tests {
 
     #[test]
     fn plumbing_commands_are_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
-            classify_pure("update-index", &[], "master", &TrustRootTouch::Clean, false),
+            classify_pure(
+                "update-index",
+                &[],
+                "master",
+                &TrustRootTouch::Clean,
+                false,
+                &policy
+            ),
             Disposition::Deny { .. }
         ));
         assert!(matches!(
-            classify_pure("apply", &[], "master", &TrustRootTouch::Clean, false),
+            classify_pure(
+                "apply",
+                &[],
+                "master",
+                &TrustRootTouch::Clean,
+                false,
+                &policy
+            ),
             Disposition::Deny { .. }
         ));
     }
 
     #[test]
     fn worktree_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
             classify_pure(
                 "worktree",
                 &args(&["add", "../x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -577,13 +846,15 @@ mod tests {
 
     #[test]
     fn worktree_remove_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
             classify_pure(
                 "worktree",
                 &args(&["remove", "../x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -591,13 +862,15 @@ mod tests {
 
     #[test]
     fn worktree_list_is_passthrough() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "worktree",
                 &args(&["list"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -605,13 +878,15 @@ mod tests {
 
     #[test]
     fn worktree_prune_dry_run_is_passthrough() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "worktree",
                 &args(&["prune", "--dry-run"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -619,13 +894,15 @@ mod tests {
 
     #[test]
     fn worktree_prune_without_dry_run_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
             classify_pure(
                 "worktree",
                 &args(&["prune"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -633,25 +910,29 @@ mod tests {
 
     #[test]
     fn checkout_to_protected_branch_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         let d = classify_pure(
             "checkout",
             &args(&["master"]),
             "master",
             &TrustRootTouch::Clean,
             false,
+            &policy,
         );
         assert!(matches!(d, Disposition::Deny { .. }));
     }
 
     #[test]
     fn switch_to_feature_branch_passes_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "switch",
                 &args(&["feature/x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -659,6 +940,7 @@ mod tests {
 
     #[test]
     fn checkout_with_no_target_arg_passes_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         // `git switch -` (previous branch) — nothing to protect against.
         assert_eq!(
             classify_pure(
@@ -666,7 +948,8 @@ mod tests {
                 &args(&["-"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -674,6 +957,7 @@ mod tests {
 
     #[test]
     fn push_touching_trust_root_on_feature_branch_passes_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         // A PR-review gate still applies before this reaches the default
         // branch — same reasoning as any other feature-branch push.
         assert_eq!(
@@ -682,7 +966,8 @@ mod tests {
                 &args(&["origin", "feature/x"]),
                 "master",
                 &TrustRootTouch::Touched(vec!["Cargo.toml".to_string()]),
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -690,13 +975,15 @@ mod tests {
 
     #[test]
     fn push_touching_trust_root_on_default_branch_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
             classify_pure(
                 "push",
                 &args(&["origin", "master"]),
                 "master",
                 &TrustRootTouch::Touched(vec!["Cargo.toml".to_string()]),
-                true
+                true,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -704,13 +991,15 @@ mod tests {
 
     #[test]
     fn push_not_touching_trust_root_passes_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "push",
                 &args(&["origin", "feature/x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -718,6 +1007,7 @@ mod tests {
 
     #[test]
     fn push_of_default_branch_is_denied_even_without_trust_root_changes() {
+        let policy = ResolvedGitShimPolicy::baseline();
         // Enforce PR-only: pushing the default branch straight to a remote is
         // blocked regardless of what the diff touches.
         assert!(matches!(
@@ -726,7 +1016,8 @@ mod tests {
                 &args(&["origin", "master"]),
                 "master",
                 &TrustRootTouch::Clean,
-                true
+                true,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -734,13 +1025,15 @@ mod tests {
 
     #[test]
     fn push_of_feature_branch_is_not_a_default_branch_push() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "push",
                 &args(&["origin", "feature/x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -748,13 +1041,15 @@ mod tests {
 
     #[test]
     fn branch_delete_of_protected_branch_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
             classify_pure(
                 "branch",
                 &args(&["-D", "master"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -764,7 +1059,8 @@ mod tests {
                 &args(&["--delete", "master"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -772,13 +1068,15 @@ mod tests {
 
     #[test]
     fn branch_rename_of_protected_branch_is_denied() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert!(matches!(
             classify_pure(
                 "branch",
                 &args(&["-M", "master", "renamed"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Deny { .. }
         ));
@@ -786,13 +1084,15 @@ mod tests {
 
     #[test]
     fn branch_delete_of_feature_branch_passes_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "branch",
                 &args(&["-D", "feature/x"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -800,8 +1100,16 @@ mod tests {
 
     #[test]
     fn branch_listing_and_creation_pass_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
-            classify_pure("branch", &[], "master", &TrustRootTouch::Clean, false),
+            classify_pure(
+                "branch",
+                &[],
+                "master",
+                &TrustRootTouch::Clean,
+                false,
+                &policy
+            ),
             Disposition::Passthrough
         );
         assert_eq!(
@@ -810,7 +1118,8 @@ mod tests {
                 &args(&["feature/new"]),
                 "master",
                 &TrustRootTouch::Clean,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
         );
@@ -902,35 +1211,220 @@ mod tests {
         assert!(!is_destructive("clean", &args(&["--dry-run"])));
     }
 
+    fn single_ref(refs: Option<Vec<PushRef>>) -> PushRef {
+        let mut refs = refs.expect("push targets must resolve");
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        refs.remove(0)
+    }
+
     #[test]
-    fn pushed_branch_reads_the_refspec_positionally_skipping_leading_flags() {
+    fn pushed_refs_reads_the_refspec_positionally_skipping_leading_flags() {
         // `-u` before remote/refspec previously threw off a fixed-index
         // `args[1]` read, misreading "origin" as the branch being pushed.
         let repo = crate::shell::test_support::init_repo_with_branch("master");
+        let expect_feature_x = PushRef {
+            source: "feature/x".to_string(),
+            destination: "feature/x".to_string(),
+        };
         assert_eq!(
-            pushed_branch(&repo.path, &args(&["-u", "origin", "feature/x"])).as_deref(),
-            Some("feature/x")
+            single_ref(pushed_refs(
+                &repo.path,
+                &args(&["-u", "origin", "feature/x"])
+            )),
+            expect_feature_x
         );
         assert_eq!(
-            pushed_branch(&repo.path, &args(&["--force", "origin", "feature/x"])).as_deref(),
-            Some("feature/x")
+            single_ref(pushed_refs(
+                &repo.path,
+                &args(&["--force", "origin", "feature/x"])
+            )),
+            expect_feature_x
         );
         assert_eq!(
-            pushed_branch(&repo.path, &args(&["origin", "feature/x"])).as_deref(),
-            Some("feature/x")
+            single_ref(pushed_refs(&repo.path, &args(&["origin", "feature/x"]))),
+            expect_feature_x
         );
     }
 
     #[test]
-    fn pushed_branch_falls_back_to_current_branch_when_refspec_omitted() {
+    fn pushed_refs_falls_back_to_current_branch_when_refspec_omitted() {
         // Bare `git push` and `git push <remote>` (no explicit ref) both push
         // the current/tracked branch -- previously these skipped the
         // trust-root check entirely (args.len() >= 2 was false).
         let repo = crate::shell::test_support::init_repo_with_branch("feature/y");
-        assert_eq!(pushed_branch(&repo.path, &[]).as_deref(), Some("feature/y"));
+        let expect_feature_y = PushRef {
+            source: "feature/y".to_string(),
+            destination: "feature/y".to_string(),
+        };
+        assert_eq!(single_ref(pushed_refs(&repo.path, &[])), expect_feature_y);
         assert_eq!(
-            pushed_branch(&repo.path, &args(&["origin"])).as_deref(),
-            Some("feature/y")
+            single_ref(pushed_refs(&repo.path, &args(&["origin"]))),
+            expect_feature_y
+        );
+    }
+
+    #[test]
+    fn pushed_refs_splits_src_dest_refspecs_instead_of_reading_the_source_for_both_halves() {
+        // The item #321 bug: `pushed_branch` used to read only the refspec's
+        // source and use that single name for BOTH the trust-root diff and
+        // the "does this target the default branch" check. A `src:dest`
+        // refspec needs the two kept separate.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        assert_eq!(
+            single_ref(pushed_refs(
+                &repo.path,
+                &args(&["origin", "feature/x:master"])
+            )),
+            PushRef {
+                source: "feature/x".to_string(),
+                destination: "master".to_string(),
+            }
+        );
+        assert_eq!(
+            single_ref(pushed_refs(
+                &repo.path,
+                &args(&["origin", "master:feature/x"])
+            )),
+            PushRef {
+                source: "master".to_string(),
+                destination: "feature/x".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn pushed_refs_resolves_every_refspec_in_a_multi_ref_push() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        let refs = pushed_refs(
+            &repo.path,
+            &args(&["origin", "feature/a", "feature/b:master"]),
+        )
+        .unwrap();
+        assert_eq!(
+            refs,
+            vec![
+                PushRef {
+                    source: "feature/a".to_string(),
+                    destination: "feature/a".to_string(),
+                },
+                PushRef {
+                    source: "feature/b".to_string(),
+                    destination: "master".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pushed_refs_all_flag_resolves_every_local_branch_to_itself() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        crate::shell::run_in(&repo.path, &["branch", "feature/x"]).unwrap();
+        let mut refs = pushed_refs(&repo.path, &args(&["origin", "--all"])).unwrap();
+        refs.sort_by(|a, b| a.destination.cmp(&b.destination));
+        assert_eq!(
+            refs,
+            vec![
+                PushRef {
+                    source: "feature/x".to_string(),
+                    destination: "feature/x".to_string(),
+                },
+                PushRef {
+                    source: "master".to_string(),
+                    destination: "master".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pushed_refs_mirror_flag_is_unresolvable() {
+        // `--mirror` pushes every ref, including deletions of anything not
+        // present locally -- a strictly larger surface than `local_branches`
+        // enumerates. Approximating it the same way `--all` is handled could
+        // miss exactly the kind of write this exists to catch, so it must
+        // fail closed (`None`), not silently under-approximate.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        assert_eq!(
+            pushed_refs(&repo.path, &args(&["origin", "--mirror"])),
+            None
+        );
+    }
+
+    #[test]
+    fn pushed_refs_tags_only_push_has_no_branch_refs() {
+        // `git push origin --tags` with no explicit refspec pushes every
+        // tag, not a branch -- there's nothing here for branch-protection
+        // checks to inspect, and it must not fall back to "current branch"
+        // (which `--tags` never touches).
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        assert_eq!(
+            pushed_refs(&repo.path, &args(&["origin", "--tags"])),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn pushed_refs_skips_the_value_of_value_taking_flags() {
+        // `-o`/`--push-option`/`--receive-pack`/`--repo`/`--exec` all
+        // consume a separate following token. Left unskipped, that token
+        // reads as an ordinary positional and throws off the
+        // remote/refspec split -- in the worst case (no explicit refspec)
+        // the flag's value silently stands in for the branch actually
+        // being pushed, so a push of the real current branch (here the
+        // default branch) never gets recognized as one.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        let expect_master = PushRef {
+            source: "master".to_string(),
+            destination: "master".to_string(),
+        };
+        assert_eq!(
+            single_ref(pushed_refs(&repo.path, &args(&["-o", "ci.skip", "origin"]))),
+            expect_master
+        );
+        assert_eq!(
+            single_ref(pushed_refs(
+                &repo.path,
+                &args(&["--receive-pack", "/opt/git/git-receive-pack", "origin"])
+            )),
+            expect_master
+        );
+    }
+
+    #[test]
+    fn parse_refspec_strips_the_force_marker() {
+        // A leading `+` force-marks the whole refspec. Left in place on the
+        // no-colon form, "+master" never matches the default branch name
+        // "master", letting a force push of the default branch slip the
+        // direct-push guard entirely.
+        assert_eq!(
+            parse_refspec("+master"),
+            PushRef {
+                source: "master".to_string(),
+                destination: "master".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_refspec("+feature/x:master"),
+            PushRef {
+                source: "feature/x".to_string(),
+                destination: "master".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn force_push_of_default_branch_via_no_colon_refspec_is_denied_end_to_end() {
+        // `git push origin +master` -- a force push written in the no-colon
+        // `+branch` form rather than `--force`. Must be judged the same as
+        // an ordinary push of the default branch.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        crate::shell::run_in(&repo.path, &["commit", "--allow-empty", "-m", "init"]).unwrap();
+        let event = classify(&repo.path, "push", &args(&["origin", "+master"]));
+        assert!(
+            matches!(event.disposition, Disposition::Deny { .. }),
+            "{:?}",
+            event.disposition
         );
     }
 
@@ -960,6 +1454,57 @@ mod tests {
         std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
         crate::shell::run_in(&repo.path, &["commit", "--allow-empty", "-m", "init"]).unwrap();
         let event = classify(&repo.path, "push", &[]);
+        assert!(
+            matches!(event.disposition, Disposition::Deny { .. }),
+            "{:?}",
+            event.disposition
+        );
+    }
+
+    #[test]
+    fn push_feature_to_master_via_dest_refspec_is_denied_end_to_end() {
+        // Item #321's exact bug: `git push origin feature/x:master` writes
+        // to the default branch through a `src:dest` refspec. The old
+        // `pushed_branch` read only "feature/x" (the source) and checked
+        // *that* against the default branch name -- never matching, so this
+        // push sailed through and bypassed default-branch protection
+        // entirely. The destination, not the source, is what must be
+        // checked.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        crate::shell::run_in(&repo.path, &["checkout", "-b", "feature/x"]).unwrap();
+        crate::shell::run_in(&repo.path, &["commit", "--allow-empty", "-m", "work"]).unwrap();
+        let event = classify(&repo.path, "push", &args(&["origin", "feature/x:master"]));
+        assert!(
+            matches!(event.disposition, Disposition::Deny { .. }),
+            "{:?}",
+            event.disposition
+        );
+    }
+
+    #[test]
+    fn push_master_to_a_feature_ref_via_src_refspec_is_not_denied_end_to_end() {
+        // The flip side of the same bug: `git push origin master:feature/x`
+        // pushes master's *content* to a non-default remote ref. The old
+        // code read "master" (the source) and, since that name matches the
+        // default branch, wrongly denied this even though the actual write
+        // destination isn't protected at all.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        let event = classify(&repo.path, "push", &args(&["origin", "master:feature/x"]));
+        assert_eq!(event.disposition, Disposition::Passthrough, "{event:?}");
+    }
+
+    #[test]
+    fn push_all_denied_when_any_local_branch_maps_to_the_default_branch() {
+        // `--all` pushes every local branch to its same-named remote ref --
+        // if one of those local branches happens to be named the same as
+        // the default branch, that ref-pair must be caught too, not just
+        // whichever single branch a positional read would have picked up.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        crate::shell::run_in(&repo.path, &["branch", "feature/x"]).unwrap();
+        let event = classify(&repo.path, "push", &args(&["origin", "--all"]));
         assert!(
             matches!(event.disposition, Disposition::Deny { .. }),
             "{:?}",
@@ -1032,8 +1577,16 @@ mod tests {
 
     #[test]
     fn push_trust_root_deny_message_names_only_the_touched_path() {
+        let policy = ResolvedGitShimPolicy::baseline();
         let touch = TrustRootTouch::Touched(vec!["Cargo.toml".to_string()]);
-        let d = classify_pure("push", &args(&["origin", "master"]), "master", &touch, true);
+        let d = classify_pure(
+            "push",
+            &args(&["origin", "master"]),
+            "master",
+            &touch,
+            true,
+            &policy,
+        );
         let Disposition::Deny { reason } = d else {
             panic!("expected Deny, got {d:?}");
         };
@@ -1050,12 +1603,14 @@ mod tests {
 
     #[test]
     fn push_with_unreadable_diff_on_default_branch_denies_with_unknown_message() {
+        let policy = ResolvedGitShimPolicy::baseline();
         let d = classify_pure(
             "push",
             &args(&["origin", "master"]),
             "master",
             &TrustRootTouch::Unknown,
             true,
+            &policy,
         );
         let Disposition::Deny { reason } = d else {
             panic!("expected Deny, got {d:?}");
@@ -1065,15 +1620,70 @@ mod tests {
 
     #[test]
     fn push_with_unreadable_diff_on_feature_branch_passes_through() {
+        let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
             classify_pure(
                 "push",
                 &args(&["origin", "feature/x"]),
                 "master",
                 &TrustRootTouch::Unknown,
-                false
+                false,
+                &policy
             ),
             Disposition::Passthrough
+        );
+    }
+
+    #[test]
+    fn malformed_project_local_config_falls_back_to_baseline_without_blocking_git() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        std::fs::write(repo.path.join(".agentflare").join("project.json"), "{}").unwrap();
+        std::fs::write(
+            repo.path.join(".agentflare").join("config.toml"),
+            "this is not valid toml [[[",
+        )
+        .unwrap();
+
+        // An ordinary read-only command must still pass through -- a broken
+        // config file must never block git operations.
+        let event = classify(&repo.path, "status", &[]);
+        assert_eq!(
+            event.disposition,
+            Disposition::Passthrough,
+            "{:?}",
+            event.disposition
+        );
+    }
+
+    #[test]
+    fn project_local_config_can_relax_a_denied_plumbing_subcommand() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        std::fs::write(repo.path.join(".agentflare").join("project.json"), "{}").unwrap();
+
+        // Baseline: "apply" is in DENIED_PLUMBING_SUBCOMMANDS.
+        let before = classify(&repo.path, "apply", &["patch.diff".to_string()]);
+        assert!(
+            matches!(before.disposition, Disposition::Deny { .. }),
+            "{:?}",
+            before.disposition
+        );
+
+        // Project-local config explicitly allows it. ALLOWED_MUTATING is
+        // checked before DENIED_PLUMBING in classify_pure, so this relaxes it.
+        std::fs::write(
+            repo.path.join(".agentflare").join("config.toml"),
+            "[git_shim]\nextra_allowed_mutating_subcommands = [\"apply\"]\n",
+        )
+        .unwrap();
+
+        let after = classify(&repo.path, "apply", &["patch.diff".to_string()]);
+        assert_eq!(
+            after.disposition,
+            Disposition::Passthrough,
+            "{:?}",
+            after.disposition
         );
     }
 }

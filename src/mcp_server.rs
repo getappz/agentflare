@@ -4,6 +4,7 @@
 
 mod artifact;
 mod asset;
+mod builtin_tools;
 mod claim;
 mod comment;
 mod flare_docs;
@@ -81,7 +82,7 @@ pub struct AgentflareMcp {
     /// its own source of truth, so nothing to refresh.
     backend_db: std::sync::Mutex<Option<rusqlite::Connection>>,
     /// Tests inject a temp path here so they never touch the shared backend.db.
-    backend_db_override: Option<std::path::PathBuf>,
+    pub(crate) backend_db_override: Option<std::path::PathBuf>,
     /// Tests inject a temp file path here so project-link resolution never
     /// reads/writes this actual repo's `.agentflare/project.json`.
     backend_project_link_override: Option<std::path::PathBuf>,
@@ -103,7 +104,11 @@ pub struct AgentflareMcp {
     /// Lazily-opened flare-docs store (separate file from `store`, see
     /// crates/flare-docs — third-party package docs must not share a
     /// table/file with project docs; different lifecycle/eviction policy).
-    flare_docs_store: std::sync::Mutex<Option<flare_docs::DocsStore>>,
+    /// `Arc` so cache maintenance can be handed to `spawn_blocking` without
+    /// borrowing `self`, and a `tokio` mutex so a request that arrives while
+    /// maintenance holds it awaits rather than parking the runtime thread —
+    /// see `flare_docs::gc_docs_cache`.
+    flare_docs_store: std::sync::Arc<tokio::sync::Mutex<Option<flare_docs::DocsStore>>>,
     /// Tests inject a temp path or ":memory:" so they never touch
     /// ~/.agentflare/flare-docs.db.
     flare_docs_store_override: Option<std::path::PathBuf>,
@@ -416,8 +421,16 @@ impl AgentflareMcp {
                     (store, ArtifactBackend::Owned(server))
                 }
                 None => {
-                    let dir = crate::paths::home().join(".agentflare").join("artifacts");
-                    let store = std::sync::Arc::new(agentflare_artifacts::ArtifactStore::new(dir));
+                    let store = match crate::store::open() {
+                        Ok(s) => {
+                            std::sync::Arc::new(agentflare_artifacts::ArtifactStore::with_store(s))
+                        }
+                        Err(e) => {
+                            eprintln!("[artifacts] fallback to flat-file store: {e}");
+                            let dir = crate::paths::home().join(".agentflare").join("artifacts");
+                            std::sync::Arc::new(agentflare_artifacts::ArtifactStore::new(dir))
+                        }
+                    };
                     let backend = Self::shared_backend(&store)?;
                     (store, backend)
                 }
@@ -563,6 +576,17 @@ impl AgentflareMcp {
             backend_project_link_override: Some(project_link),
             worktree_repo_root_override: Some(worktree_repo_root),
             store_override: Some(store_dir.join("store.db")),
+            ..Default::default()
+        }
+    }
+
+    /// Create an in-memory backend for tests that don't need a real repo/disk.
+    /// The other fields (skills, gateway, store, etc.) stay defaulted so they
+    /// lazily open `:memory:` SQLite connections or no-ops — no I/O to ~/.
+    #[cfg(test)]
+    pub(crate) fn for_test_memory() -> Self {
+        Self {
+            backend_db_override: Some(std::path::PathBuf::from(":memory:")),
             ..Default::default()
         }
     }
@@ -713,11 +737,8 @@ impl AgentflareMcp {
         Ok(f(guard.as_ref().expect("ensure_store just initialized it")))
     }
 
-    fn ensure_flare_docs_store(&self) -> Result<(), ErrorData> {
-        let mut guard = self
-            .flare_docs_store
-            .lock()
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+    async fn ensure_flare_docs_store(&self) -> Result<(), ErrorData> {
+        let mut guard = self.flare_docs_store.lock().await;
         if guard.is_some() {
             return Ok(());
         }
@@ -733,15 +754,19 @@ impl AgentflareMcp {
         Ok(())
     }
 
-    fn with_flare_docs_store<T>(
+    /// Awaits the docs-store lock instead of blocking on it.
+    ///
+    /// A `std::sync::Mutex` here would park the MCP runtime's only thread
+    /// whenever the store is busy — and since cache maintenance can hold it
+    /// for as long as a purge or a full `VACUUM` takes, that would stall
+    /// every other tool call, not just the docs ones. Awaiting lets the
+    /// runtime run something else while it waits.
+    async fn with_flare_docs_store<T>(
         &self,
         f: impl FnOnce(&flare_docs::DocsStore) -> T,
     ) -> Result<T, ErrorData> {
-        self.ensure_flare_docs_store()?;
-        let guard = self
-            .flare_docs_store
-            .lock()
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        self.ensure_flare_docs_store().await?;
+        let guard = self.flare_docs_store.lock().await;
         Ok(f(guard
             .as_ref()
             .expect("ensure_flare_docs_store just initialized it")))
@@ -887,7 +912,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Send a text message out to a chat platform (telegram, slack, or discord). The bot token must already be stored as the gateway secret '<platform>_bot_token'. target is the Telegram chat_id or Slack/Discord channel id."
+        description = "Send a text message out to a chat platform (telegram, slack, or discord). The bot token must already be stored as the vault secret '<platform>_bot_token' (agentflare vault set <platform>_bot_token). target is the Telegram chat_id or Slack/Discord channel id."
     )]
     fn channel_send(
         &self,
@@ -903,14 +928,12 @@ impl AgentflareMcp {
                 None,
             )
         })?;
-        let conn = crate::db::open()
-            .map_err(|e| ErrorData::internal_error(format!("cannot open database: {e}"), None))?;
-        crate::channels::send_message(&conn, plat, &target, &message)
+        crate::channels::send_message(plat, &target, &message)
             .map_err(|e| ErrorData::internal_error(e, None))?;
         Ok(serde_json::json!({ "sent": true, "platform": platform, "target": target }).to_string())
     }
     #[tool(
-        description = "Manage work claims — acquire, heartbeat, release, done, or list. Single consolidated tool with `action` field (acquire|done|heartbeat|list|release)."
+        description = "Records a path-scoped write lock in the claim ledger so the git shim's scope-check can tell concurrent agents' edits apart -- it does NOT provision a worktree, a branch, or a directory of any kind. Single consolidated tool with `action` field (acquire|done|heartbeat|list|release). If you need an isolated worktree to actually do file edits in, use the `item` tool's own `claim` action instead (`item(action=\"claim\", id=<item>)`) -- that is the one that creates the worktree; this `claim` tool and that one share a name but do different things."
     )]
     fn claim(&self, Parameters(req): Parameters<ClaimRequest>) -> Result<String, ErrorData> {
         self.claim_impl(req)
@@ -1002,14 +1025,7 @@ impl AgentflareMcp {
     }
 
     fn resolve_gateway_secrets() -> std::collections::HashMap<String, String> {
-        let conn = match crate::db::open() {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("agentflare: failed to open agentflare.db for gateway secrets: {e}");
-                return std::collections::HashMap::new();
-            }
-        };
-        let names = match crate::gateway_secrets::list_secrets(&conn) {
+        let names = match crate::vault::list_secrets() {
             Ok(names) => names,
             Err(e) => {
                 eprintln!("agentflare: failed to list gateway secrets: {e}");
@@ -1018,21 +1034,14 @@ impl AgentflareMcp {
         };
         names
             .into_iter()
-            .filter_map(
-                |name| match crate::gateway_secrets::get_secret(&conn, &name) {
-                    Ok(Some(v)) => Some((name, v)),
-                    Ok(None) => None,
-                    Err(e) => {
-                        // A wrong/missing vault passphrase used to look
-                        // identical to "no secret configured" — `.ok().flatten()`
-                        // discarded the `Err` entirely. Surface it so a wrong
-                        // passphrase is at least visible in stderr instead of
-                        // silently leaving downstream backends uncredentialed.
-                        eprintln!("agentflare: failed to resolve gateway secret '{name}': {e}");
-                        None
-                    }
-                },
-            )
+            .filter_map(|name| match crate::vault::get_secret(&name) {
+                Ok(Some(v)) => Some((name, v.to_string())),
+                Ok(None) => None,
+                Err(e) => {
+                    eprintln!("agentflare: failed to resolve gateway secret '{name}': {e}");
+                    None
+                }
+            })
             .collect()
     }
 
@@ -1072,7 +1081,7 @@ impl AgentflareMcp {
         Ok(guard)
     }
     #[tool(
-        description = "Tool operations — search downstream MCP servers' tools by task description or execute one. Single consolidated tool with `action` field (search|execute)."
+        description = "Tool operations — search both agentflare's own first-party tools and downstream MCP servers' tools by task description, or execute a downstream one. Single consolidated tool with `action` field (search|execute)."
     )]
     async fn tool(&self, Parameters(req): Parameters<ToolRequest>) -> Result<String, ErrorData> {
         match req.action.as_str() {
@@ -1100,17 +1109,24 @@ impl AgentflareMcp {
                     reg.search(&query, limit, mode)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
                 };
-                let hits = if local.len() < limit {
-                    let remaining = limit - local.len();
+                // Downstream gateway servers (leanctx, ...) first, then
+                // agentflare's own first-party tools (item/asset/handoff/...
+                // -- never part of the downstream index, see
+                // builtin_tools.rs), then the public MCP Registry fallback
+                // only if slots remain after both.
+                let builtin = builtin_tools::search_builtin_tools(&query, limit, mode);
+                let with_builtin = builtin_tools::merge_builtin_hits(local, limit, builtin);
+                let hits = if with_builtin.len() < limit {
+                    let remaining = limit - with_builtin.len();
                     let query_owned = query.clone();
                     let registry = tokio::task::spawn_blocking(move || {
                         gateway_registry::registry_search::search_registry(&query_owned, remaining)
                     })
                     .await
                     .unwrap_or_default();
-                    gateway_registry::merge_registry_hits(local, limit, registry)
+                    gateway_registry::merge_registry_hits(with_builtin, limit, registry)
                 } else {
-                    local
+                    with_builtin
                 };
                 Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
             }
@@ -1165,11 +1181,11 @@ impl AgentflareMcp {
         self.memory_impl(req)
     }
 
-    // --- flare_docs tool ---
+    // --- docs tool ---
     #[tool(
-        description = "On-demand third-party package/API documentation — search|get|list|refresh. Fetches and caches docs (Rust crates via docs.rs today) in a global store shared across all projects, separate from project-scoped documents."
+        description = "On-demand third-party package/API documentation — search|get|list|refresh. Fetches and caches docs in a global store shared across all projects, separate from project-scoped documents. Rust crates via docs.rs (ecosystem=\"rust\", the default); npm packages via npmjs.org, indexed per exported symbol from their TypeScript declarations with a DefinitelyTyped fallback for untyped packages (ecosystem=\"npm\"; scoped names like \"@types/node\" are detected automatically); Python packages via PyPI, indexed from their PEP 561 .pyi type stubs with a typeshed fallback for untyped packages (ecosystem=\"python\")."
     )]
-    async fn flare_docs(
+    async fn docs(
         &self,
         Parameters(req): Parameters<FlareDocsRequest>,
     ) -> Result<String, ErrorData> {
@@ -1324,6 +1340,7 @@ impl AgentflareMcp {
             "heartbeat" => self.item_heartbeat(req),
             "release" => self.item_release(req),
             "done" => self.item_done(req),
+            "check_merge" => self.item_check_merge(req),
             "cancel" => self.item_cancel(req),
             "search" => self.item_search(req),
             "add_label" => self.item_add_label(req),
@@ -1333,7 +1350,7 @@ impl AgentflareMcp {
             "health" => self.item_health(req),
             other => Err(ErrorData::invalid_params(
                 format!(
-                    "unknown item action: '{other}' — expected create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|cancel|add_label|remove_label|groom|standup|health"
+                    "unknown item action: '{other}' — expected create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health"
                 ),
                 None,
             )),
@@ -1341,7 +1358,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|cancel|add_label|remove_label|groom|standup|health). `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck scorecard; `bottlenecks` is currently always empty — no handoff log is persisted yet, see `bottleneck_note`. See each field's description for when it's required."
+        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health). `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck scorecard; `bottlenecks` is currently always empty — no handoff log is persisted yet, see `bottleneck_note`. `done` moves an item to \"in_review\" (not \"completed\") when it results in an open PR, and leaves the worktree in place for follow-up commits; call `check_merge` once the PR is confirmed merged to promote it to \"completed\" and clean up the worktree."
     )]
     fn item(&self, Parameters(req): Parameters<ItemRequest>) -> Result<String, ErrorData> {
         self.item_inner(req)

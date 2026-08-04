@@ -1,3 +1,4 @@
+use crate::coaching::rule::RuleTier;
 use clap::{Args, Subcommand};
 
 #[derive(Subcommand)]
@@ -18,9 +19,30 @@ pub enum CoachingAction {
         /// to maintain.
         #[arg(long = "trigger-auto")]
         trigger_auto: bool,
+        /// Rule tier: override (default) or builtin. Builtin rules are
+        /// re-materialized by `agentflare init` so user edits are not lost.
+        #[arg(long)]
+        tier: Option<RuleTier>,
+        /// Host to sync/coach this rule to (comma- or repeatable). Known values:
+        /// claude-code, opencode, cursor, codex, windsurf, vscode-copilot, cline.
+        #[arg(long, value_delimiter = ',')]
+        sync: Vec<String>,
     },
     Remove {
         id: String,
+    },
+    /// Mark a rule MANDATORY (hard-denied by the PreToolUse hook when
+    /// violated) or, with --off, demote it back to advisory.
+    Enforce {
+        id: String,
+        #[arg(long)]
+        off: bool,
+    },
+    /// Regenerate every synced rule file for one host, or all of them.
+    Sync {
+        /// Agent host to sync rules for (default: all known hosts).
+        #[arg(long)]
+        agent: Option<String>,
     },
 }
 
@@ -40,8 +62,20 @@ impl CoachingArgs {
                 body,
                 trigger_tool,
                 trigger_auto,
-            } => crate::coaching::cli_apply(&id, &title, &body, trigger_tool, trigger_auto),
+                tier,
+                sync,
+            } => crate::coaching::cli_apply(
+                &id,
+                &title,
+                &body,
+                trigger_tool,
+                trigger_auto,
+                tier,
+                sync,
+            ),
             CoachingAction::Remove { id } => crate::coaching::cli_remove(&id),
+            CoachingAction::Enforce { id, off } => crate::coaching::cli_enforce(&id, !off),
+            CoachingAction::Sync { agent } => crate::coaching::cli_sync(agent.as_deref()),
         }
     }
 }

@@ -18,8 +18,9 @@ with four layers:
 | context | `agentflare optimize context` | Session transcript compaction via BM25 |
 | runtime | (automatic via hooks)         | Session hygiene, model routing nudges  |
 
-Legacy commands (`agentflare flare`, `agentflare caveman`, `agentflare ponytail`)
-still work as backward-compatible aliases.
+`agentflare flare` / `agentflare opt` still work as backward-compatible aliases for
+`agentflare optimize`. `caveman`/`ponytail` are not live command aliases — only
+legacy `~/.config/{caveman,ponytail}/` cleanup on uninstall.
 
 `agentflare optimize retrieve <id>` (and MCP `mcp__flare__optimize
 action=retrieve`) recovers an original that the output layer compressed away

@@ -15,6 +15,10 @@ pub enum HookEvent {
         #[arg(long, value_enum)]
         agent: Option<agent_registry::Agent>,
     },
+    PostToolFailure {
+        #[arg(long, value_enum)]
+        agent: Option<agent_registry::Agent>,
+    },
     /// No-op — kept only so an old settings.json entry from a prior
     /// agentflare version doesn't start erroring after an upgrade. New
     /// installs never wire this (see init.rs).
@@ -54,6 +58,9 @@ impl HookArgs {
             HookEvent::SessionStart { agent } => crate::hook::session_start(&resolve_agent(agent)),
             HookEvent::PromptSubmit { agent } => crate::hook::prompt_submit(&resolve_agent(agent)),
             HookEvent::PreToolUse { agent } => crate::hook::pre_tool_use(&resolve_agent(agent)),
+            HookEvent::PostToolFailure { agent } => {
+                crate::hook::post_tool_failure(&resolve_agent(agent))
+            }
             HookEvent::SessionEnd { agent } => crate::hook::session_end(&resolve_agent(agent)),
             HookEvent::PreCompact { agent } => crate::hook::pre_compact(&resolve_agent(agent)),
         }

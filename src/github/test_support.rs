@@ -1,12 +1,21 @@
 //! Test-only HTTP mock for exercising the GitHub client and resource
 //! functions without touching the network. A `MockServer` binds to an
-//! ephemeral localhost port, serves a fixed queue of canned responses, and
-//! records the requests it received so tests can assert on method, path, and
-//! body.
+//! ephemeral localhost port, answers requests, and records what it received
+//! so tests can assert on method, path, and body.
+//!
+//! Two flavors: `start` replays a fixed queue of canned responses, and
+//! `start_with` answers from a handler closure. The handler form exists for
+//! tests where the server must model STATE rather than a script — an issue's
+//! comment list that two bridge instances both read from and write to cannot
+//! be expressed as a fixed sequence, because what the second instance sees
+//! depends on what the first one did.
 
 use super::Client;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 /// One canned response the mock server will hand out, in order.
@@ -42,6 +51,7 @@ pub struct RecordedRequest {
 pub struct MockServer {
     pub base_url: String,
     handle: Option<JoinHandle<Vec<RecordedRequest>>>,
+    stop: Arc<AtomicBool>,
 }
 
 fn reason(status: u16) -> &'static str {
@@ -58,24 +68,58 @@ fn reason(status: u16) -> &'static str {
 }
 
 impl MockServer {
-    /// Start a server that will serve exactly `responses.len()` requests, one
-    /// per queued response, then stop.
+    /// Start a server that hands out `responses` in order.
+    ///
+    /// An extra request past the end of the queue gets a 500 naming the
+    /// offending method and path. That is deliberately a loud failure rather
+    /// than the silent one it replaced: with nothing left to write, the
+    /// server used to leave the connection open and the client blocked on a
+    /// read that never came, so a test that under-queued by one response hung
+    /// until the harness timed it out instead of saying what was missing.
     pub fn start(responses: Vec<MockResponse>) -> MockServer {
+        let queue = Mutex::new(responses.into_iter());
+        MockServer::start_with(move |req| {
+            queue.lock().unwrap().next().unwrap_or_else(|| {
+                MockResponse::json(
+                    500,
+                    &format!(
+                        r#"{{"message":"mock server: no canned response left for {} {}"}}"#,
+                        req.method, req.path
+                    ),
+                )
+            })
+        })
+    }
+
+    /// Start a server that answers each request from `handler`.
+    ///
+    /// Unlike `start`, this serves an unbounded number of requests and lets
+    /// the handler close over shared mutable state, so a test can model a
+    /// resource that changes as clients act on it.
+    pub fn start_with<F>(handler: F) -> MockServer
+    where
+        F: Fn(&RecordedRequest) -> MockResponse + Send + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let port = listener.local_addr().unwrap().port();
         let base_url = format!("http://127.0.0.1:{port}");
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
 
         let handle = std::thread::spawn(move || {
             let mut recorded = Vec::new();
-            for response in responses {
-                let (stream, _) = match listener.accept() {
-                    Ok(pair) => pair,
-                    Err(_) => break,
+            loop {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
                 };
-                let mut stream = stream;
-                let recorded_req = handle_connection(&mut stream);
-                write_response(&mut stream, &response);
-                if let Some(req) = recorded_req {
+                // `requests()` wakes this blocking accept with a throwaway
+                // connection; that one carries no request to answer.
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Some(req) = handle_connection(&mut stream) {
+                    let response = handler(&req);
+                    write_response(&mut stream, &response);
                     recorded.push(req);
                 }
             }
@@ -85,6 +129,7 @@ impl MockServer {
         MockServer {
             base_url,
             handle: Some(handle),
+            stop,
         }
     }
 
@@ -96,11 +141,35 @@ impl MockServer {
 
     /// Stop the server and return every request it saw, in order.
     pub fn requests(mut self) -> Vec<RecordedRequest> {
+        self.stop.store(true, Ordering::SeqCst);
+        // Unblock the accept: the loop only re-checks `stop` once a
+        // connection arrives, and no client is going to send another.
+        let _ = std::net::TcpStream::connect(
+            self.base_url
+                .strip_prefix("http://")
+                .unwrap_or(&self.base_url),
+        );
         self.handle
             .take()
             .expect("server already joined")
             .join()
             .expect("mock server thread panicked")
+    }
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        // A server the test never called `requests()` on would otherwise
+        // leave its thread parked in `accept` for the life of the test
+        // binary. Signal and wake it; don't join, since a drop must not block.
+        if self.handle.is_some() {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(
+                self.base_url
+                    .strip_prefix("http://")
+                    .unwrap_or(&self.base_url),
+            );
+        }
     }
 }
 

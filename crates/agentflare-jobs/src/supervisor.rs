@@ -18,7 +18,14 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
+    /// `id` names the log files (`{id}.stdout`/`{id}.stderr`) — callers
+    /// running this under `agentflare-jobs::Queue` must pass the job's own
+    /// queue id, not a fresh one, so a running job's log path is derivable
+    /// from its id alone (`queue.log_dir().join(format!("{id}.stdout"))`)
+    /// without waiting for the job to finish and report it back.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        id: String,
         command: String,
         args: Vec<String>,
         env: Vec<(String, String)>,
@@ -27,7 +34,6 @@ impl Supervisor {
         kill_after_secs: u64,
         log_dir: PathBuf,
     ) -> Self {
-        let id = db_kit::ids::new_id();
         let stdout_path = log_dir.join(format!("{id}.stdout"));
         let stderr_path = log_dir.join(format!("{id}.stderr"));
         Self {

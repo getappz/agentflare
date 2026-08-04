@@ -1,11 +1,11 @@
-//! Credential resolution for the GitHub client. Order: env → agentflare gateway
+//! Credential resolution for the GitHub client. Order: env → agentflare vault
 //! secret (`github_token`) → `gh auth token`. A missing credential is a hard,
 //! actionable error — GitHub allows no anonymous writes.
 
 use crate::github::GitHubError;
 
 pub(crate) const NO_AUTH_MSG: &str = "No GitHub credentials. Set GITHUB_TOKEN, run \
-'gh auth login', or store one with 'agentflare gateway secret set github_token'.";
+'gh auth login', or store one with 'agentflare vault set github_token'.";
 
 fn nonempty(s: String) -> Option<String> {
     let t = s.trim();
@@ -24,10 +24,10 @@ fn env_token() -> Option<String> {
 }
 
 fn secret_token() -> Option<String> {
-    let conn = crate::db::open().ok()?;
-    crate::gateway_secrets::get_secret(&conn, "github_token")
+    crate::vault::get_secret("github_token")
         .ok()
         .flatten()
+        .map(|s| s.to_string())
         .and_then(nonempty)
 }
 

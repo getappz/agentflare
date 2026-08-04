@@ -15,14 +15,19 @@ mod cli;
 pub(crate) mod rule;
 mod store;
 
-pub use cli::{cli_apply, cli_remove, print_list};
-pub use store::{rule_bodies_for_prompt, rule_bodies_for_tool, untriggered_rule_bodies};
+pub use cli::{cli_apply, cli_enforce, cli_remove, cli_sync, print_list};
+pub(crate) use store::list_rules;
+pub use store::{
+    enforced_rule_reason_for_tool, rule_bodies_for_prompt, rule_bodies_for_tool, set_enforced,
+    superseded_bodies, sync_targets_for_host, untriggered_rule_bodies,
+};
 
-// Only reached from hook.rs's SessionStart test (#[cfg(test)]), to seed a
-// rule before asserting it appears in the printed message — a plain,
-// non-test build has no caller for it.
-#[allow(unused_imports)]
+// Also used by components.rs to seed/refresh the built-in core-module
+// coaching rules (flare-docs, flare-search, lean-ctx, tool-search) on every
+// `agentflare init` and SessionStart.
 pub use store::apply_rule;
+#[allow(unused_imports)] // see flare-code note on apply_rule_with_cooldown's definition
+pub use store::apply_rule_with_cooldown;
 
 #[cfg(test)]
 pub(crate) mod test_support {

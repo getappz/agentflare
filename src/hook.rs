@@ -51,16 +51,16 @@ pub fn session_start(agent: &str) {
     let msg = session_start_message(agent);
 
     // Flush any vents buffered since the last turn/session (best-effort;
-    // never blocks the hook or surfaces errors to the agent).
-    let _ = std::panic::catch_unwind(|| {
-        let r = crate::vent::consolidate::consolidate();
-        if !r.items_created.is_empty() {
-            eprintln!(
-                "[agentflare] vent: filed {} item(s) from friction",
-                r.items_created.len()
-            );
-        }
-    });
+    // never blocks the hook or surfaces errors to the agent). Always report
+    // the outcome to stderr — including "0 filed" and a caught panic — so a
+    // dead capture pipeline isn't indistinguishable from an idle one.
+    match std::panic::catch_unwind(crate::vent::consolidate::consolidate) {
+        Ok(r) => eprintln!(
+            "[agentflare] vent: consolidate ran, {} item(s) filed",
+            r.items_created.len()
+        ),
+        Err(_) => eprintln!("[agentflare] vent: consolidate panicked — skipping this turn"),
+    }
 
     // Plain stdout reaches Claude's context for this event (see module
     // comment) but is NOT shown to the user in the terminal. `systemMessage`
@@ -243,6 +243,102 @@ fn parse_pre_tool_use(input: &str) -> Option<PreToolUseInput> {
     })
 }
 
+struct PostToolFailureInput {
+    tool_name: String,
+    failure_text: String,
+    is_interrupt: bool,
+}
+
+/// Extracts the tool name and a best-effort failure-text field from a
+/// PostToolUseFailure stdin payload. Live-verified (2026-07-29, real Claude
+/// Code session): the failure text is carried in "error". "tool_response"
+/// and "reason" are kept as defensive fallbacks in case a future payload
+/// shape omits "error", but are not currently exercised by real traffic.
+fn parse_post_tool_failure(input: &str) -> Option<PostToolFailureInput> {
+    let v: serde_json::Value = serde_json::from_str(input).ok()?;
+    let tool_name = v.get("tool_name")?.as_str()?.to_string();
+    let failure_text = ["error", "tool_response", "reason"]
+        .iter()
+        .find_map(|key| v.get(key))
+        .map(|val| {
+            val.as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| val.to_string())
+        })
+        .unwrap_or_default();
+    let is_interrupt = v
+        .get("is_interrupt")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    Some(PostToolFailureInput {
+        tool_name,
+        failure_text,
+        is_interrupt,
+    })
+}
+
+fn build_failure_message(tool_name: &str, failure_text: &str) -> String {
+    format!("{tool_name} failed: {failure_text}")
+}
+
+/// The PostToolUseFailure JSON decision: unlike PreToolUse, this event has
+/// nothing left to permission-decide (the tool already ran and failed), so
+/// its only event-specific output field is `additionalContext` -- NOT
+/// `permissionDecision`/`permissionDecisionReason`, which the hooks
+/// reference assigns exclusively to PreToolUse.
+fn build_failure_decision(message: &str, severity: &str) -> serde_json::Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUseFailure",
+            "additionalContext": format!(
+                "Possible friction: {message}. If this is genuine friction (not an ordinary expected failure), call mcp__flare__vent with a concise, specific message and severity={severity}."
+            ),
+        }
+    })
+}
+
+/// PostToolUseFailure command hook: classifies the failure with
+/// vent::classify::classify() directly (no model call -- see the module
+/// doc comment on parse_post_tool_failure for why this is a net
+/// simplification, not a downgrade), gates on nudge_pace so a repeat of
+/// the same topic within DEFAULT_COOLDOWN doesn't re-nudge, and only then
+/// emits a context nudge pointing at mcp__flare__vent.
+pub fn post_tool_failure(_agent: &str) {
+    let Some(input) = read_stdin_or_skip("PostToolUseFailure") else {
+        return;
+    };
+    let Some(parsed) = parse_post_tool_failure(&input) else {
+        return;
+    };
+    // A user-initiated interrupt (e.g. Esc during a long Bash call) is not
+    // friction -- nudging on it would also burn the topic's cooldown for a
+    // real failure later.
+    if parsed.is_interrupt {
+        return;
+    }
+
+    let message = build_failure_message(&parsed.tool_name, &parsed.failure_text);
+    let topic_key = crate::vent::classify::topic_key(&message);
+    let severity = if crate::vent::classify::origin(&message) == "agentflare-core" {
+        "high"
+    } else {
+        "medium"
+    };
+    let seen_count = crate::vent::capture::recent_count_for_topic(&topic_key);
+
+    if !crate::vent::classify::classify(severity, seen_count, &message) {
+        return;
+    }
+
+    let pace_key = format!("vent-nudge:{topic_key}");
+    if !crate::nudge_pace::should_fire(&pace_key, crate::nudge_pace::DEFAULT_COOLDOWN) {
+        return;
+    }
+    crate::nudge_pace::mark_fired(&pace_key);
+
+    println!("{}", build_failure_decision(&message, severity));
+}
+
 pub fn pre_tool_use(_agent: &str) {
     let Some(input) = read_stdin_or_skip("PreToolUse") else {
         return;
@@ -254,6 +350,21 @@ pub fn pre_tool_use(_agent: &str) {
     if let Some(decision) =
         crate::hook_redirect::redirect_decision(&parsed.tool_name, parsed.tool_input.as_ref())
     {
+        println!("{decision}");
+        return;
+    }
+
+    if let Some(reason) = crate::coaching::enforced_rule_reason_for_tool(
+        &parsed.tool_name,
+        parsed.tool_input.as_ref(),
+    ) {
+        let decision = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        });
         println!("{decision}");
         return;
     }
@@ -275,6 +386,30 @@ pub fn pre_tool_use(_agent: &str) {
         });
 
     let mut nudges: Vec<String> = vec![];
+
+    // Freshness guard (item #7): on a session's first mutating-tool call,
+    // warn if the target repo's branch has fallen behind a freshly-fetched
+    // origin/<default> -- the no-worktree gap `create_worktree`'s own
+    // fetch-before-branch behavior doesn't cover (that only runs at claim
+    // time, for the worktree path). `insert` returning `true` doubles as
+    // the "haven't checked this session yet" gate, so this only ever fires
+    // once per session -- a bounded `git fetch` on every edit would burn
+    // into PreToolUse's 5s hook budget for no added benefit. A short 1s
+    // fetch timeout leaves headroom in that budget; soft-fails (no nudge)
+    // rather than risk overrunning it.
+    if crate::hook_redirect::MUTATING_TOOLS.contains(&parsed.tool_name.as_str())
+        && runtime
+            .staleness_checked_sessions
+            .insert(parsed.session_id.clone())
+        && let crate::hook_redirect::TargetRepo::Found(repo) =
+            crate::hook_redirect::resolve_mutating_target_repo(parsed.tool_input.as_ref())
+        && let Some((default_branch, commits_behind)) =
+            flare_git_core::branch::commits_behind_origin_default(&repo, 1)
+        && let Some(reason) =
+            flare_git_core::branch::staleness_reason(&default_branch, commits_behind)
+    {
+        nudges.push(reason);
+    }
 
     if let Some(nudge) =
         crate::optimize::batching_nudge(&record.recent_tool_calls, &parsed.tool_name)
@@ -436,16 +571,16 @@ pub fn prompt_submit(agent: &str) {
     }
 
     // Triage the previous turn's buffered vents once per turn (best-effort;
-    // never blocks the hook or surfaces errors to the agent).
-    let _ = std::panic::catch_unwind(|| {
-        let r = crate::vent::consolidate::consolidate();
-        if !r.items_created.is_empty() {
-            eprintln!(
-                "[agentflare] vent: filed {} item(s) from friction",
-                r.items_created.len()
-            );
-        }
-    });
+    // never blocks the hook or surfaces errors to the agent). Always report
+    // the outcome to stderr — including "0 filed" and a caught panic — so a
+    // dead capture pipeline isn't indistinguishable from an idle one.
+    match std::panic::catch_unwind(crate::vent::consolidate::consolidate) {
+        Ok(r) => eprintln!(
+            "[agentflare] vent: consolidate ran, {} item(s) filed",
+            r.items_created.len()
+        ),
+        Err(_) => eprintln!("[agentflare] vent: consolidate panicked — skipping this turn"),
+    }
 
     let router = crate::optimize::active_router();
     let mut session_bits = vec![];
@@ -633,6 +768,72 @@ mod tests {
     }
 
     #[test]
+    fn parse_post_tool_failure_extracts_tool_name_and_error_text() {
+        let input = r#"{
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git worktree add x"},
+            "error": "agentflare git shim: denied -- use item tool's claim flow"
+        }"#;
+        let parsed = parse_post_tool_failure(input).unwrap();
+        assert_eq!(parsed.tool_name, "Bash");
+        assert!(parsed.failure_text.contains("denied"));
+    }
+
+    #[test]
+    fn parse_post_tool_failure_falls_back_across_plausible_field_names() {
+        // Some hook payload shapes may carry the failure text under a
+        // different key than "error" -- tool_response (posttoolusefailure's
+        // sibling event uses tool_response) or reason are tried in order if
+        // "error" is absent.
+        let input = r#"{"session_id":"s1","tool_name":"Edit","tool_response":"parse error: unexpected EOF"}"#;
+        let parsed = parse_post_tool_failure(input).unwrap();
+        assert!(parsed.failure_text.contains("unexpected EOF"));
+    }
+
+    #[test]
+    fn parse_post_tool_failure_returns_none_on_malformed_json() {
+        assert!(parse_post_tool_failure("not json").is_none());
+    }
+
+    #[test]
+    fn post_tool_failure_message_build_includes_tool_name_and_text() {
+        let msg = build_failure_message("Bash", "agentflare git shim: denied");
+        assert!(msg.contains("Bash"));
+        assert!(msg.contains("denied"));
+    }
+
+    #[test]
+    fn parse_post_tool_failure_reads_is_interrupt() {
+        let input = r#"{"session_id":"s1","tool_name":"Bash","error":"boom","is_interrupt":true}"#;
+        let parsed = parse_post_tool_failure(input).unwrap();
+        assert!(parsed.is_interrupt);
+    }
+
+    #[test]
+    fn parse_post_tool_failure_defaults_is_interrupt_to_false() {
+        let input = r#"{"session_id":"s1","tool_name":"Bash","error":"boom"}"#;
+        let parsed = parse_post_tool_failure(input).unwrap();
+        assert!(!parsed.is_interrupt);
+    }
+
+    #[test]
+    fn failure_decision_uses_additional_context_for_post_tool_use_failure() {
+        let d = build_failure_decision("Bash failed: boom", "medium");
+        assert_eq!(
+            d["hookSpecificOutput"]["hookEventName"],
+            "PostToolUseFailure"
+        );
+        assert!(
+            d["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("mcp__flare__vent")
+        );
+        assert!(d["hookSpecificOutput"]["permissionDecisionReason"].is_null());
+    }
+
+    #[test]
     fn parse_pre_compact_reads_session_and_trigger() {
         let input = r#"{"session_id": "abc", "transcript_path": "/x.jsonl", "hook_event_name": "PreCompact", "trigger": "auto"}"#;
         let parsed = parse_pre_compact(input).unwrap();
@@ -693,6 +894,7 @@ second line
 
     #[test]
     fn session_start_includes_untriggered_coaching_rule_bodies() {
+        use crate::coaching::rule::RuleTier;
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
             crate::coaching::apply_rule(
@@ -700,6 +902,8 @@ second line
                 "Close sessions promptly",
                 "Wrap up each phase before starting the next.",
                 None,
+                RuleTier::Override,
+                vec![],
             )
             .unwrap();
 
@@ -748,6 +952,7 @@ second line
 
     #[test]
     fn pre_tool_use_surfaces_tool_triggered_coaching_rule() {
+        use crate::coaching::rule::RuleTier;
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
             crate::coaching::apply_rule(
@@ -758,6 +963,8 @@ second line
                     vec!["mcp__flare__review".to_string()],
                     false,
                 )),
+                RuleTier::Override,
+                vec![],
             )
             .unwrap();
 
@@ -769,6 +976,7 @@ second line
 
     #[test]
     fn prompt_submit_surfaces_auto_match_coaching_rule() {
+        use crate::coaching::rule::RuleTier;
         use crate::paths::test_support::with_temp_home;
         with_temp_home(|| {
             crate::coaching::apply_rule(
@@ -776,6 +984,8 @@ second line
                 "Reviews ship with fixes",
                 "Every review finding needs a diff.",
                 Some(crate::coaching::test_support::trigger(vec![], true)),
+                RuleTier::Override,
+                vec![],
             )
             .unwrap();
 

@@ -233,6 +233,18 @@ pub fn list_by_project(conn: &Connection, project_id: &str) -> Result<Vec<Item>>
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+pub fn list_by_label(conn: &Connection, project_id: &str, label_id: &str) -> Result<Vec<Item>> {
+    let mut stmt = conn.prepare(
+        "SELECT items.id, items.project_id, items.state_id, items.name, items.description, items.priority, items.parent_id, items.assignee_agent, items.sequence_id, items.sort_order, items.started_at, items.completed_at, items.archived_at, items.external_source, items.external_id, items.metadata, items.created_at, items.updated_at, items.deleted_at
+         FROM items
+         INNER JOIN item_labels ON item_labels.item_id = items.id
+         WHERE item_labels.label_id = ?1 AND items.project_id = ?2 AND items.deleted_at IS NULL
+         ORDER BY items.sort_order",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![label_id, project_id], row_to_item)?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 /// List non-deleted items assigned to an agent (excludes completed/cancelled).
 pub fn list_by_assignee_agent(
     conn: &Connection,
@@ -617,37 +629,79 @@ pub fn search(
     Ok(like_rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// Outcome of a claim attempt — the raw lease `Acquire` plus the handoff
+/// freeze rule: while an item carries an `assignee_agent` that nobody has
+/// claimed yet (a handoff sitting unaccepted), only that assignee may
+/// acquire it. Once any claim has ever been taken (even a since-stale one),
+/// the ordinary `Acquired`/`Held` staleness rules take back over — this
+/// variant only covers the fresh, never-claimed window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    Acquired,
+    Held { owner: String, age_secs: i64 },
+    BlockedByAssignee { assignee: String },
+}
+
+/// Canonical agent identity of an owner id (`<agent>:<instance>` ->
+/// canonical `<agent>`), matching `assignee_agent`'s canonical form —
+/// `assignee_agent` is canonicalized on write (see `create`/`update`), but
+/// `owner` is the raw caller-supplied id, so an alias like `claude:1` must
+/// be canonicalized here too or it won't match `claude-code`.
+fn agent_part(owner: &str) -> String {
+    agent_registry::canonicalize(owner.split(':').next().unwrap_or(owner))
+}
+
 /// Claims an item so other agents don't duplicate the work: on a fresh
 /// acquire, sets the assignee and moves state into the project's "started"
 /// group (which sets `started_at`, via `update_state`). A live claim held by
-/// someone else returns `Held` and leaves the item untouched. Acquisition,
-/// the state transition, and the assignee update are one transaction — a
-/// mid-sequence failure can't leave `item_claims` saying "claimed" while the
-/// item itself never reflects it.
+/// someone else returns `Held` and leaves the item untouched. An item
+/// freshly handed off (assignee set, never yet claimed) to a *different*
+/// agent than the caller returns `BlockedByAssignee` instead of letting the
+/// caller silently steal it. Acquisition, the state transition, and the
+/// assignee update are one transaction — a mid-sequence failure can't leave
+/// `item_claims` saying "claimed" while the item itself never reflects it.
 pub fn claim(
     conn: &Connection,
     item_id: &str,
     owner: &str,
     now: i64,
     ttl_secs: i64,
-) -> Result<crate::claim::Acquire> {
+) -> Result<ClaimOutcome> {
     let tx = conn.unchecked_transaction()?;
-    let outcome = crate::claim::acquire(&tx, item_id, owner, now, ttl_secs)?;
-    if outcome == crate::claim::Acquire::Acquired {
-        let item = get(&tx, item_id)?;
-        let started_state = crate::state::first_in_group(&tx, &item.project_id, "started")?;
-        update_state(&tx, item_id, &started_state.id)?;
-        update(
-            &tx,
-            item_id,
-            UpdateItem {
-                assignee_agent: Some(owner.to_string()),
-                ..Default::default()
-            },
-        )?;
+    let item = get(&tx, item_id)?;
+    if let Some(assignee) = &item.assignee_agent
+        && agent_part(assignee) != agent_part(owner)
+        && crate::claim::current_owner(&tx, item_id).is_none()
+    {
+        // Excludes completed/cancelled items: a done-and-released item is
+        // fair game for anyone to re-claim (e.g. reopened follow-up work) —
+        // the freeze only protects a handoff that's still open.
+        let state = crate::state::get(&tx, &item.state_id)?;
+        if !matches!(state.group_name.as_str(), "completed" | "cancelled") {
+            return Ok(ClaimOutcome::BlockedByAssignee {
+                assignee: assignee.clone(),
+            });
+        }
     }
+    let outcome = crate::claim::acquire(&tx, item_id, owner, now, ttl_secs)?;
+    let result = match outcome {
+        crate::claim::Acquire::Acquired => {
+            let started_state = crate::state::first_in_group(&tx, &item.project_id, "started")?;
+            update_state(&tx, item_id, &started_state.id)?;
+            update(
+                &tx,
+                item_id,
+                UpdateItem {
+                    assignee_agent: Some(owner.to_string()),
+                    ..Default::default()
+                },
+            )?;
+            ClaimOutcome::Acquired
+        }
+        crate::claim::Acquire::Held { owner, age_secs } => ClaimOutcome::Held { owner, age_secs },
+    };
     tx.commit()?;
-    Ok(outcome)
+    Ok(result)
 }
 
 /// Moves a claimed item into the project's "completed" group WITHOUT
@@ -674,6 +728,73 @@ pub fn mark_completed(conn: &Connection, item_id: &str, owner: &str) -> Result<b
     update_state(&tx, item_id, &completed_state.id)?;
     tx.commit()?;
     // Keep the claim lease held for the MCP caller's deferred release.
+    Ok(true)
+}
+
+/// Moves a claimed item into the project's "in_review" group, same shape and
+/// same claim-lease-stays-held contract as `mark_completed` above — used
+/// instead of it when `done` results in an open PR (item #420). The work
+/// isn't actually finished until that PR merges: landing straight on
+/// "completed" would show the item as done while its PR is still red or
+/// under review, which is the state-side half of the bug `mark_completed`
+/// alone had (the other half was deleting the worktree too, fixed in
+/// `mcp_server::item::item_done` by only cleaning up when no PR resulted).
+///
+/// Auto-creates the "in_review" state on first use per project: it's in
+/// `state::DEFAULT_STATES` for every project seeded after item #420, but
+/// existing projects were seeded before it existed and have no such state
+/// to find.
+pub fn mark_in_review(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    if !crate::claim::is_owner(&tx, item_id, owner)? {
+        return Ok(false);
+    }
+    let item = get(&tx, item_id)?;
+    let review_state = match crate::state::first_in_group(&tx, &item.project_id, "in_review") {
+        Ok(s) => s,
+        Err(crate::error::Error::NotFound(_)) => crate::state::create(
+            &tx,
+            crate::state::CreateState {
+                project_id: item.project_id.clone(),
+                name: crate::state::IN_REVIEW_STATE_NAME.into(),
+                group_name: "in_review".into(),
+                sequence: crate::state::IN_REVIEW_STATE_SEQUENCE,
+                is_default: None,
+                color: Some(crate::state::IN_REVIEW_STATE_COLOR.into()),
+            },
+        )?,
+        Err(e) => return Err(e),
+    };
+    update_state(&tx, item_id, &review_state.id)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Promotes an item from "in_review" to "completed" once its PR is
+/// confirmed merged (`item_check_merge`, item #420). Unlike
+/// `mark_completed`/`mark_in_review`, this is deliberately NOT owner-scoped:
+/// `item_done` leaves the claim lease held (not released) when it moves an
+/// item into "in_review" specifically so nobody else can claim it out from
+/// under the pending review, so by the time anything reaches this function
+/// no other owner could legally exist — whoever notices the merge and calls
+/// `check_merge`, possibly a different session than the one that opened the
+/// PR, is allowed to finish the transition. Releases whatever lease is
+/// still held as part of the same commit. Returns `Ok(false)` (a no-op,
+/// not an error) when the item isn't currently in "in_review" — callers
+/// can call this speculatively without checking state first.
+pub fn promote_in_review_to_completed(conn: &Connection, item_id: &str) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let item = get(&tx, item_id)?;
+    let state = crate::state::get(&tx, &item.state_id)?;
+    if state.group_name != "in_review" {
+        return Ok(false);
+    }
+    let completed_state = crate::state::first_in_group(&tx, &item.project_id, "completed")?;
+    update_state(&tx, item_id, &completed_state.id)?;
+    if let Some(owner) = crate::claim::current_owner(&tx, item_id) {
+        crate::claim::done(&tx, item_id, &owner, now())?;
+    }
+    tx.commit()?;
     Ok(true)
 }
 
@@ -1366,7 +1487,7 @@ mod tests {
         let (pid, sid) = seed_project(&conn, "");
         let item = make_item(&conn, &pid, &sid);
         let outcome = claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
-        assert_eq!(outcome, crate::claim::Acquire::Acquired);
+        assert_eq!(outcome, ClaimOutcome::Acquired);
         let updated = get(&conn, &item.id).unwrap();
         assert_eq!(updated.assignee_agent.as_deref(), Some("agent:1"));
         assert_eq!(updated.state_id, state_in_group(&conn, &pid, "started"));
@@ -1382,7 +1503,7 @@ mod tests {
         let outcome = claim(&conn, &item.id, "agent:2", 1001, TTL).unwrap();
         assert!(matches!(
             outcome,
-            crate::claim::Acquire::Held { ref owner, .. } if owner == "agent:1"
+            ClaimOutcome::Held { ref owner, .. } if owner == "agent:1"
         ));
         let unchanged = get(&conn, &item.id).unwrap();
         assert_eq!(unchanged.assignee_agent.as_deref(), Some("agent:1"));
@@ -1395,9 +1516,79 @@ mod tests {
         let item = make_item(&conn, &pid, &sid);
         claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
         let outcome = claim(&conn, &item.id, "agent:2", 1000 + TTL + 1, TTL).unwrap();
-        assert_eq!(outcome, crate::claim::Acquire::Acquired);
+        assert_eq!(outcome, ClaimOutcome::Acquired);
         let updated = get(&conn, &item.id).unwrap();
         assert_eq!(updated.assignee_agent.as_deref(), Some("agent:2"));
+    }
+
+    #[test]
+    fn claim_by_a_different_agent_than_the_handoff_assignee_is_blocked() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        // Simulate a handoff: assignee set, never claimed yet.
+        update(
+            &conn,
+            &item.id,
+            UpdateItem {
+                assignee_agent: Some("opencode".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let outcome = claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
+        assert_eq!(
+            outcome,
+            ClaimOutcome::BlockedByAssignee {
+                assignee: "opencode".to_string()
+            }
+        );
+        let unchanged = get(&conn, &item.id).unwrap();
+        assert_eq!(unchanged.assignee_agent.as_deref(), Some("opencode"));
+        assert!(crate::claim::current_owner(&conn, &item.id).is_none());
+    }
+
+    #[test]
+    fn claim_by_the_handoff_assignee_itself_succeeds() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        update(
+            &conn,
+            &item.id,
+            UpdateItem {
+                assignee_agent: Some("opencode".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let outcome = claim(&conn, &item.id, "opencode:1", 1000, TTL).unwrap();
+        assert_eq!(outcome, ClaimOutcome::Acquired);
+    }
+
+    #[test]
+    fn claim_by_the_handoff_assignee_via_an_alias_succeeds() {
+        // assignee_agent is canonicalized on write ("claude" -> "claude-code"),
+        // but `owner` is the raw caller-supplied id — an alias owner must
+        // still be recognized as the assignee, not blocked as an impostor.
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        update(
+            &conn,
+            &item.id,
+            UpdateItem {
+                assignee_agent: Some("claude".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            get(&conn, &item.id).unwrap().assignee_agent.as_deref(),
+            Some("claude-code")
+        );
+        let outcome = claim(&conn, &item.id, "claude:1", 1000, TTL).unwrap();
+        assert_eq!(outcome, ClaimOutcome::Acquired);
     }
 
     #[test]
@@ -1436,14 +1627,14 @@ mod tests {
 
         // Lease is still held — concurrent claim must be rejected.
         match claim(&conn, &item.id, "agent:2", 1200, TTL).unwrap() {
-            crate::claim::Acquire::Held { .. } => {}
+            ClaimOutcome::Held { .. } => {}
             other => panic!("expected Held after mark_completed, got {other:?}"),
         }
 
         // Release the lease, now re-acquirable.
         assert!(crate::claim::done(&conn, &item.id, "agent:1", 1300).unwrap());
         let outcome = claim(&conn, &item.id, "agent:2", 1400, TTL).unwrap();
-        assert_eq!(outcome, crate::claim::Acquire::Acquired);
+        assert_eq!(outcome, ClaimOutcome::Acquired);
     }
 
     #[test]
@@ -1453,6 +1644,89 @@ mod tests {
         let item = make_item(&conn, &pid, &sid);
         claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
         assert!(!mark_completed(&conn, &item.id, "agent:2").unwrap());
+    }
+
+    #[test]
+    fn mark_in_review_moves_to_in_review_state_and_lease_stays_held() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+        assert!(mark_in_review(&conn, &item.id, "agent:1").unwrap());
+        let reviewed = get(&conn, &item.id).unwrap();
+        assert_eq!(reviewed.state_id, state_in_group(&conn, &pid, "in_review"));
+        // Not actually finished yet -- completed_at must stay unset.
+        assert!(reviewed.completed_at.is_none());
+
+        // Lease is still held, same contract as mark_completed.
+        match claim(&conn, &item.id, "agent:2", 1200, TTL).unwrap() {
+            ClaimOutcome::Held { .. } => {}
+            other => panic!("expected Held after mark_in_review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mark_in_review_noop_for_non_owner() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+        assert!(!mark_in_review(&conn, &item.id, "agent:2").unwrap());
+    }
+
+    #[test]
+    fn mark_in_review_backfills_the_state_for_a_project_seeded_before_it_existed() {
+        // Simulates a project created before item #420: delete the
+        // "in_review" state seed_defaults would otherwise have created, and
+        // confirm mark_in_review heals it instead of erroring.
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let old_review_state_id = state_in_group(&conn, &pid, "in_review");
+        conn.execute(
+            "UPDATE states SET deleted_at = 1 WHERE id = ?1",
+            rusqlite::params![old_review_state_id],
+        )
+        .unwrap();
+        assert!(crate::state::first_in_group(&conn, &pid, "in_review").is_err());
+
+        let item = make_item(&conn, &pid, &sid);
+        claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+        assert!(mark_in_review(&conn, &item.id, "agent:1").unwrap());
+
+        let reviewed = get(&conn, &item.id).unwrap();
+        let healed = crate::state::first_in_group(&conn, &pid, "in_review").unwrap();
+        assert_eq!(reviewed.state_id, healed.id);
+        assert_ne!(healed.id, old_review_state_id);
+    }
+
+    #[test]
+    fn promote_in_review_to_completed_moves_state_and_releases_the_lease() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+        assert!(mark_in_review(&conn, &item.id, "agent:1").unwrap());
+
+        assert!(promote_in_review_to_completed(&conn, &item.id).unwrap());
+        let done_item = get(&conn, &item.id).unwrap();
+        assert_eq!(done_item.state_id, state_in_group(&conn, &pid, "completed"));
+        assert!(done_item.completed_at.is_some());
+
+        // Lease was released -- a different agent can claim it now.
+        let outcome = claim(&conn, &item.id, "agent:2", 1200, TTL).unwrap();
+        assert_eq!(outcome, ClaimOutcome::Acquired);
+    }
+
+    #[test]
+    fn promote_in_review_to_completed_is_a_noop_when_not_in_review() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "");
+        let item = make_item(&conn, &pid, &sid);
+        claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+        // Still "started", never moved to in_review.
+        assert!(!promote_in_review_to_completed(&conn, &item.id).unwrap());
+        let unchanged = get(&conn, &item.id).unwrap();
+        assert_eq!(unchanged.state_id, state_in_group(&conn, &pid, "started"));
     }
 
     #[test]
@@ -1787,5 +2061,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(updated.assignee_agent.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn list_by_label_returns_only_items_carrying_that_label() {
+        let conn = db::open_in_memory().unwrap();
+        let (pid, sid) = seed_project(&conn, "label");
+        let ws_id = crate::project::get(&conn, &pid).unwrap().workspace_id;
+        let label = crate::label::create(
+            &conn,
+            crate::label::CreateLabel {
+                project_id: Some(pid.clone()),
+                workspace_id: ws_id,
+                name: "ready-for-work".into(),
+                color: None,
+                parent_id: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+
+        let labeled = create(
+            &conn,
+            CreateItem {
+                project_id: pid.clone(),
+                state_id: sid.clone(),
+                name: "Labeled".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        create(
+            &conn,
+            CreateItem {
+                project_id: pid.clone(),
+                state_id: sid,
+                name: "Unlabeled".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        add_label(&conn, &labeled.id, &label.id).unwrap();
+
+        let found = list_by_label(&conn, &pid, &label.id).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, labeled.id);
     }
 }

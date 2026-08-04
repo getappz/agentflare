@@ -2,6 +2,7 @@ mod forward;
 pub mod heuristic;
 pub mod providers;
 pub mod shape_xlat;
+pub mod shortcircuit;
 pub mod think;
 
 use axum::{
@@ -23,6 +24,7 @@ pub fn router() -> Router {
         .route("/proxy/v1/messages", post(v1_messages_handler))
         .with_state(AppState {
             config: ProviderConfig::from_env(),
+            sc_config: shortcircuit::ShortCircuitConfig::from_env(),
             client,
         })
 }
@@ -53,11 +55,22 @@ async fn v1_messages_handler(
             return (StatusCode::UNAUTHORIZED, "invalid or missing proxy token").into_response();
         }
     }
+    match shortcircuit::try_short_circuit(&body, &state.sc_config) {
+        shortcircuit::ShortCircuitOutcome::Match(message) => {
+            // Internal CLI bookkeeping calls (quota probe, prefix/title/
+            // suggestion/filepath detection) are sent non-streaming and
+            // expect a plain Messages JSON body, unlike every other request
+            // this proxy handles.
+            return axum::Json(message).into_response();
+        }
+        shortcircuit::ShortCircuitOutcome::NoMatch => {}
+    }
     forward::proxy_request(body, &state.config, &state.client).await
 }
 
 #[derive(Clone)]
 struct AppState {
     config: ProviderConfig,
+    sc_config: shortcircuit::ShortCircuitConfig,
     client: reqwest::Client,
 }

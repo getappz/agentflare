@@ -1,12 +1,23 @@
 use crate::types::{JobInfo, JobOutput, JobState};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use rusqlite::params;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
+#[derive(Clone)]
 pub struct Queue {
     conn: Arc<Mutex<rusqlite::Connection>>,
     log_dir: PathBuf,
+    // Wakes idle workers the moment a job becomes available (fresh enqueue,
+    // or a retry going back to 'queued'), instead of them finding out only
+    // on their next poll. The bool is a pending-signal flag, not app state:
+    // `notify_all()` alone only wakes threads already parked in `wait_for`,
+    // so a wake that lands between a worker's dequeue-check and its call to
+    // `wait_for_work` would otherwise be lost until the fallback timeout —
+    // the flag makes the signal durable across that race by having
+    // `wait_for_work` check it (under the same lock) before ever blocking.
+    notify: Arc<(Mutex<bool>, Condvar)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -24,25 +35,31 @@ pub enum Error {
 }
 
 pub fn migrations() -> rusqlite_migration::Migrations<'static> {
-    rusqlite_migration::Migrations::new(vec![rusqlite_migration::M::up(
-        "CREATE TABLE IF NOT EXISTS agent_jobs (
-            id              TEXT PRIMARY KEY NOT NULL,
-            state           TEXT NOT NULL DEFAULT 'queued',
-            payload         TEXT NOT NULL,
-            retries         INTEGER NOT NULL DEFAULT 0,
-            max_retries     INTEGER NOT NULL DEFAULT 3,
-            error           TEXT,
-            stdout_log_path TEXT,
-            stderr_log_path TEXT,
-            exit_code       INTEGER,
-            timed_out       INTEGER NOT NULL DEFAULT 0,
-            created_at      INTEGER NOT NULL,
-            started_at      INTEGER,
-            finished_at     INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS idx_agent_jobs_state ON agent_jobs(state);
-        CREATE INDEX IF NOT EXISTS idx_agent_jobs_created ON agent_jobs(created_at);",
-    )])
+    rusqlite_migration::Migrations::new(vec![
+        rusqlite_migration::M::up(
+            "CREATE TABLE IF NOT EXISTS agent_jobs (
+                id              TEXT PRIMARY KEY NOT NULL,
+                state           TEXT NOT NULL DEFAULT 'queued',
+                payload         TEXT NOT NULL,
+                retries         INTEGER NOT NULL DEFAULT 0,
+                max_retries     INTEGER NOT NULL DEFAULT 3,
+                error           TEXT,
+                stdout_log_path TEXT,
+                stderr_log_path TEXT,
+                exit_code       INTEGER,
+                timed_out       INTEGER NOT NULL DEFAULT 0,
+                created_at      INTEGER NOT NULL,
+                started_at      INTEGER,
+                finished_at     INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_jobs_state ON agent_jobs(state);
+            CREATE INDEX IF NOT EXISTS idx_agent_jobs_created ON agent_jobs(created_at);",
+        ),
+        rusqlite_migration::M::up(
+            "ALTER TABLE agent_jobs ADD COLUMN stdout_bytes INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE agent_jobs ADD COLUMN stderr_bytes INTEGER NOT NULL DEFAULT 0;",
+        ),
+    ])
 }
 
 impl Queue {
@@ -51,6 +68,7 @@ impl Queue {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             log_dir,
+            notify: Arc::new((Mutex::new(false), Condvar::new())),
         })
     }
 
@@ -59,11 +77,41 @@ impl Queue {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             log_dir,
+            notify: Arc::new((Mutex::new(false), Condvar::new())),
         })
     }
 
     pub fn log_dir(&self) -> &Path {
         &self.log_dir
+    }
+
+    /// Blocks the calling (worker) thread until a job becomes available or
+    /// `timeout` elapses, whichever comes first. Checks the pending-signal
+    /// flag before blocking, so a `wake_workers` call that landed just
+    /// before this one (e.g. between this worker's dequeue-check and this
+    /// call) is still observed immediately instead of being lost until
+    /// `timeout` — normal pickup is near-instant via `notify`, not the
+    /// timeout, in either ordering.
+    pub fn wait_for_work(&self, timeout: Duration) {
+        let (lock, cvar) = &*self.notify;
+        let mut signaled = lock.lock();
+        if !*signaled {
+            cvar.wait_for(&mut signaled, timeout);
+        }
+        *signaled = false;
+    }
+
+    /// Wakes every thread parked in `wait_for_work` (or the next one to call
+    /// it, per the flag above), whether or not there's actually a job for
+    /// them — they just re-check `dequeue` either way. Called after
+    /// enqueueing/re-queueing a job, and by `WorkerPool::shutdown` so
+    /// workers notice a stop request immediately rather than up to
+    /// `timeout` later.
+    pub fn wake_workers(&self) {
+        let (lock, cvar) = &*self.notify;
+        let mut signaled = lock.lock();
+        *signaled = true;
+        cvar.notify_all();
     }
 
     pub fn enqueue(&self, job: &crate::types::AgentJob) -> Result<JobInfo, Error> {
@@ -76,8 +124,12 @@ impl Queue {
              VALUES (?1, 'queued', ?2, ?3, ?4)",
             params![id, payload, job.max_retries, now],
         )?;
+        drop(conn);
+        self.wake_workers();
         Ok(JobInfo {
             id,
+            command: job.command.clone(),
+            args: job.args.clone(),
             state: JobState::Queued,
             retries: 0,
             max_retries: job.max_retries,
@@ -127,14 +179,18 @@ impl Queue {
                  timed_out = ?3,
                  stdout_log_path = ?4,
                  stderr_log_path = ?5,
-                 finished_at = ?6
-             WHERE id = ?7",
+                 stdout_bytes = ?6,
+                 stderr_bytes = ?7,
+                 finished_at = ?8
+             WHERE id = ?9",
             params![
                 state,
                 output.exit_code,
                 output.timed_out as i32,
                 output.stdout_path.to_string_lossy().as_ref(),
                 output.stderr_path.to_string_lossy().as_ref(),
+                output.stdout_total_bytes as i64,
+                output.stderr_total_bytes as i64,
                 now,
                 id
             ],
@@ -150,7 +206,8 @@ impl Queue {
             params![id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        if retries < max_retries {
+        let retried = retries < max_retries;
+        if retried {
             conn.execute(
                 "UPDATE agent_jobs
                  SET state = 'queued', retries = retries + 1, error = ?1, started_at = NULL
@@ -165,6 +222,12 @@ impl Queue {
                 params![error, now, id],
             )?;
         }
+        drop(conn);
+        // A retry goes back to 'queued' — wake workers so it's picked up
+        // promptly instead of waiting out the fallback poll interval.
+        if retried {
+            self.wake_workers();
+        }
         Ok(())
     }
 
@@ -176,7 +239,8 @@ impl Queue {
         };
         let sql = format!(
             "SELECT id, state, retries, max_retries, error, created_at, started_at,
-                    finished_at, exit_code, timed_out, stdout_log_path, stderr_log_path
+                    finished_at, exit_code, timed_out, stdout_log_path, stderr_log_path,
+                    stdout_bytes, stderr_bytes, payload
              FROM agent_jobs {where_clause}
              ORDER BY created_at DESC
              LIMIT 100"
@@ -197,7 +261,8 @@ impl Queue {
         let conn = self.conn.lock();
         let row = conn.query_row(
             "SELECT id, state, retries, max_retries, error, created_at, started_at,
-                    finished_at, exit_code, timed_out, stdout_log_path, stderr_log_path
+                    finished_at, exit_code, timed_out, stdout_log_path, stderr_log_path,
+                    stdout_bytes, stderr_bytes, payload
              FROM agent_jobs WHERE id = ?1",
             params![id],
             map_job_row,
@@ -219,13 +284,34 @@ impl Queue {
         Ok(())
     }
 
+    /// Deletes finished jobs older than `older_than_secs`, including their
+    /// stdout/stderr log files on disk — those aren't tracked anywhere else,
+    /// so leaving them behind here would mean disk usage grows forever even
+    /// as the DB rows are reclaimed.
     pub fn cleanup(&self, older_than_secs: i64) -> Result<u64, Error> {
         let cutoff = db_kit::ids::now() - older_than_secs;
         let conn = self.conn.lock();
+        let log_paths: Vec<(Option<String>, Option<String>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT stdout_log_path, stderr_log_path FROM agent_jobs
+                 WHERE finished_at IS NOT NULL AND finished_at < ?1",
+            )?;
+            stmt.query_map(params![cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let deleted = conn.execute(
             "DELETE FROM agent_jobs WHERE finished_at IS NOT NULL AND finished_at < ?1",
             params![cutoff],
         )?;
+        drop(conn);
+        for (stdout_path, stderr_path) in log_paths {
+            if let Some(p) = stdout_path {
+                let _ = std::fs::remove_file(p);
+            }
+            if let Some(p) = stderr_path {
+                let _ = std::fs::remove_file(p);
+            }
+        }
         Ok(deleted as u64)
     }
 }
@@ -236,8 +322,19 @@ fn map_job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobInfo> {
     let timed_out: bool = r.get::<_, i32>(9)? != 0;
     let stdout_path: Option<String> = r.get(10)?;
     let stderr_path: Option<String> = r.get(11)?;
+    let stdout_bytes: i64 = r.get(12)?;
+    let stderr_bytes: i64 = r.get(13)?;
+    let payload_json: String = r.get(14)?;
+    // `payload` is our own `serde_json::to_string(&AgentJob)` from `enqueue`,
+    // so a parse failure here would mean on-disk corruption, not bad input —
+    // fall back to an empty command/args rather than failing the whole read.
+    let (command, args) = serde_json::from_str::<crate::types::AgentJob>(&payload_json)
+        .map(|job| (job.command, job.args))
+        .unwrap_or_default();
     Ok(JobInfo {
         id: r.get(0)?,
+        command,
+        args,
         state: match state_str.as_str() {
             "running" => JobState::Running,
             "exited" => JobState::Exited,
@@ -256,8 +353,8 @@ fn map_job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobInfo> {
             timed_out,
             stdout_path: stdout_path.map(Into::into).unwrap_or_default(),
             stderr_path: stderr_path.map(Into::into).unwrap_or_default(),
-            stdout_total_bytes: 0,
-            stderr_total_bytes: 0,
+            stdout_total_bytes: stdout_bytes as u64,
+            stderr_total_bytes: stderr_bytes as u64,
         }),
     })
 }

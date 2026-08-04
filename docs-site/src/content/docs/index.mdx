@@ -1,0 +1,74 @@
+---
+title: agentflare
+description: A single Rust binary that cuts the token/cost overhead of AI coding agents and coordinates more than one of them.
+---
+
+agentflare is a single Rust binary — no Node, no runtime dependencies — that plugs into
+Claude Code, Codex, Cursor, Windsurf, VS Code, Cline, Continue, and opencode. It does two
+things: it cuts the token and cost overhead of a single agent session, and it lets you run
+more than one agent (or agent session) against the same body of work without them
+colliding.
+
+## Optimization
+
+Cuts the token/cost overhead of a single session. Several independent layers, each
+attacking a different source of waste:
+
+| Layer | What it compresses |
+|---|---|
+| **lean-ctx** (companion, separate install) | tool I/O within a session — reads, shell output, search — up to ~99% |
+| **memory** (built-in) | knowledge across sessions — decisions, facts, preferences that would otherwise be re-explained every time |
+| **`agentflare optimize output`** (formerly Caveman) | conversation verbosity, ~65% |
+| **`agentflare optimize code`** (formerly Ponytail) | code-writing over-engineering |
+| **`agentflare optimize context`** | session transcript compaction (BM25) |
+| **runtime** (automatic) | session hygiene and model-routing nudges |
+
+`flare-docs` — always-current package documentation, so your agent isn't writing code
+against a library version it only remembers from training — is one of these, covered on
+its own page: see [flare-docs](/docs/flare-docs/).
+
+## Coordination
+
+A lightweight, local-first backend (SQLite, no daemon required for the core pieces) for
+running more than one agent against the same work, exposed as MCP tools any MCP-capable
+agent can call directly:
+
+| Capability | What it's for |
+|---|---|
+| Work items & claiming (`item`, `claim`) | A shared backlog — claim an item before working it so two agents don't collide |
+| Review (`review`) | Submit findings against a diff/PR, run consensus across reviewers, track scores over time |
+| Artifacts (`artifact`) | Versioned, shareable specs/plans/docs — a durable handoff surface instead of scratch files |
+| Handoffs (`handoff`) | Pass context to a specific agent/runtime when work moves between them |
+| Coaching nudges | Persistent reminders surfaced to an agent, session over session |
+| Comments, labels, projects, webhooks, `channel_send` | Discussion, categorization, cross-project views, outbound notifications |
+| `agentflare daemon` | Background process for the coordination layer's async pieces |
+| `agentflare work` | Autonomous execution: claim → worktree → headless agent → report back |
+| `vent` | Friction logging — capture what's slowing an agent down as structured data |
+| `agentflare serve` | Read-only dashboard over items, agents, and activity |
+| `search` | One MCP tool across 17 sources — store, memory, code, web, social, news, GitHub, academic, datasets, websites, weather, financial, crypto, FX, indicators, YouTube, Bluesky |
+| Git-aware PATH shim | Blocks direct writes to `master`/`main` across every agent using it |
+| Auth vault | Encrypted storage for provider credentials/profiles |
+| `flare-proxy` | Anthropic → OpenAI proxy, for routing through free model providers |
+
+## Why both
+
+A single agent session wastes tokens re-reading its own tool output and re-explaining
+context it already had last week — that's the optimization layer's problem. Running
+several agents (or several sessions of the same agent, over time) against the same
+codebase is a different problem entirely: nothing stops two of them from editing the same
+file, redoing finished work, or losing context when a task moves from one agent to
+another — that's what the coordination layer exists for. See [Concepts](/docs/concepts/)
+for the full mental model.
+
+## Where to go next
+
+- **[Getting started](/docs/getting-started/)** — install agentflare and wire it into
+  your agent.
+- **[Concepts](/docs/concepts/)** — the mental model: optimization vs. coordination, and
+  what "local-first, no daemon" actually means.
+- **[CLI reference](/docs/cli/)** — every command, flag by flag.
+- **[MCP tools reference](/docs/mcp-tools/)** — every tool your agent can call.
+- **[Guides](/docs/guides/)** — task-oriented walkthroughs.
+- **[How it compares](/docs/compare/)** — vs. Context7 and other adjacent tools.
+- **[flare-docs](/docs/flare-docs/)** — one of the built-in optimization features:
+  always-current package docs, no setup required.

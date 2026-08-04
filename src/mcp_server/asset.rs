@@ -39,30 +39,76 @@ impl AgentflareMcp {
                 }
                 let staging_dir = crate::paths::home().join(".agentflare").join("staging");
                 let staged = staging_dir.join(&fn_val);
-                if !staged.exists() {
-                    return Err(ErrorData::invalid_params(
-                        format!(
-                            "file not found at staging path: {} — write the file there before calling attach",
-                            staged.display()
-                        ),
-                        None,
-                    ));
+
+                // symlink_metadata (not metadata) never follows the link, so a
+                // symlink dropped into staging pointing outside it is rejected
+                // here rather than silently read through.
+                match std::fs::symlink_metadata(&staged) {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        return Err(ErrorData::invalid_params(
+                            format!("staged file '{fn_val}' is a symlink — not allowed"),
+                            None,
+                        ));
+                    }
+                    // Reject FIFOs/devices/sockets too: opening one and
+                    // blocking on read_to_end below would hang the calling
+                    // thread waiting for a writer that may never come — same
+                    // malicious-staged-file threat model as the symlink check.
+                    Ok(m) if !m.file_type().is_file() => {
+                        return Err(ErrorData::invalid_params(
+                            format!("staged file '{fn_val}' is not a regular file — not allowed"),
+                            None,
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        return Err(ErrorData::invalid_params(
+                            format!(
+                                "file not found at staging path: {} — write the file there before calling attach",
+                                staged.display()
+                            ),
+                            None,
+                        ));
+                    }
                 }
-                let size = std::fs::metadata(&staged)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-                    .len();
+
                 let max_attach = Self::asset_max_attach_bytes();
+                let mut open_opts = std::fs::OpenOptions::new();
+                open_opts.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    // O_NOFOLLOW: a symlink swapped in between the
+                    // symlink_metadata check above and this open must never be
+                    // followed (TOCTOU). flare-code: no Windows-side reparse-point
+                    // guard yet — Windows symlink creation needs an elevated
+                    // privilege the staging dir's normal writers won't have.
+                    open_opts.custom_flags(libc::O_NOFOLLOW);
+                }
+                let mut file = open_opts.open(&staged).map_err(|e| {
+                    ErrorData::internal_error(format!("opening staged file: {e}"), None)
+                })?;
+
+                // Size and content come from the same handle now, capped at
+                // max_attach+1: a file grown after the open (instead of
+                // symlink-swapped) is caught by the length check below instead
+                // of being read unbounded.
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                (&mut file)
+                    .take(max_attach + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let size = bytes.len() as u64;
                 if size > max_attach {
                     return Err(ErrorData::invalid_params(
                         format!(
-                            "file is {} bytes, exceeds the {} byte attach limit",
+                            "file is at least {} bytes, exceeds the {} byte attach limit",
                             size, max_attach
                         ),
                         None,
                     ));
                 }
-                let bytes = std::fs::read(&staged)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 let meta = metadata.unwrap_or_else(|| "{}".to_string());
 
                 // attach always nests with_store inside with_backend_db below, which
@@ -216,23 +262,19 @@ impl AgentflareMcp {
                 let id =
                     id.ok_or_else(|| ErrorData::invalid_params("id is required for delete", None))?;
                 self.with_store(|store| -> Result<String, ErrorData> {
-                    let doc = store
+                    store
                         .doc_get(&id)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
                         .ok_or_else(|| ErrorData::invalid_params("asset not found", None))?;
 
-                    // Delete the document row before releasing the blob ref: if
-                    // blob_unref ran first and doc_delete then failed, the last
-                    // reference's content would already be gone while the asset
-                    // still showed up as live (not soft-deleted).
+                    // doc_delete releases the blob reference itself (after the
+                    // row is soft-deleted, so a failure can't strand a live
+                    // asset with reclaimed content). Unreffing again here would
+                    // drop two references for one delete and reclaim a blob
+                    // another asset still shares.
                     store
                         .doc_delete(&id)
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                    if let Some(ref hash) = doc.blob_hash {
-                        store
-                            .blob_unref(hash)
-                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                    }
 
                     Ok(serde_json::json!({"deleted": true, "id": id}).to_string())
                 })?

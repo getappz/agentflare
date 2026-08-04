@@ -40,3 +40,7 @@
 # mise tasks are personal dev-workflow shortcuts, not shared project config
 /.mise.toml
 /.mise/
+
+# aube workspace (site/ + docs-site/) — installed deps, not source.
+# aube-lock.yaml IS committed (reproducible installs); node_modules isn't.
+node_modules/

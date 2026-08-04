@@ -21,31 +21,64 @@ cargo test
 
 ### Quality bar (required)
 
+Run the local gate before pushing — it mirrors CI (`.github/workflows/ci.yml`) exactly:
+
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+mise run verify
 ```
 
+Equivalent without mise:
+
+```bash
+cargo fmt --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -A unsafe_code -A clippy::pedantic
+cargo test --workspace
+```
+
+CI also runs `cargo-deny` (dependency licensing/advisories) and a target-dir guard; those aren't part of the local gate since they need network access or are CI-environment-specific.
+
 ## Repo structure
+
+Same source of truth as the README's [Architecture](README.md#architecture) section —
+keep the two in sync if you add or move a module.
 
 ```text
 agentflare/
 ├── src/
-│   ├── main.rs              # clap CLI, dispatch
-│   ├── init.rs              # `agentflare init --agent X` — runs every component
-│   ├── hook.rs              # `agentflare hook session-start|prompt-submit --agent X`
-│   ├── components.rs        # registry: each entry checks + fixes itself, host-aware
-│   ├── paths.rs             # home-dir resolution
-│   ├── state.rs             # ~/.agentflare/state.json — on/off flag for hooks
-│   ├── rule_text.rs         # shared rule copy (Exa, git, lean-ctx usage)
-│   ├── memory/              # built-in persistent memory (SQLite + FTS5)
-│   ├── cost.rs              # cost tracking
-│   ├── optimize.rs          # optimization logic
-│   └── pricing.rs           # model pricing data
-├── data/                    # static data files
+│   ├── main.rs                  # clap CLI, dispatch
+│   ├── cli/                     # one file per top-level subcommand (init, hook, optimize,
+│   │                            # work, vent, auth, vault, git, review, skill, memory, ...) —
+│   │                            # thin clap wiring; real logic lives in the modules it calls
+│   ├── mcp_server/               # one file per mcp__flare__* MCP tool, + tests/
+│   ├── optimize/                  # optimize output/code/context/retrieve/runtime — see README
+│   ├── coaching/                   # session nudges: rule storage, CRUD, CLI presentation
+│   ├── memory/                      # built-in persistent memory (SQLite + FTS5)
+│   ├── github/                       # GitHub API client backing `flare_git`/`git`
+│   ├── dashboard/                      # `agentflare serve` dashboard backend
+│   ├── vent/                            # friction capture + auto-classification
+│   ├── mentions/                         # @mention parsing/resolution
+│   ├── ipc/                               # daemon transport (Unix socket / named pipe)
+│   ├── dev_install/                        # `agentflare dev-install` — self-upgrade from a checkout
+│   ├── update/                              # self-update check + binary swap
+│   ├── ui/                                   # terminal UI helpers (cliclack-based)
+│   ├── core/                                  # small shared primitives
+│   ├── init.rs, hook.rs, components.rs          # component registry: init/hook wiring, host-aware
+│   ├── paths.rs, state.rs, rule_text.rs           # home-dir resolution, on/off state, shared rule copy
+│   ├── claims.rs, review.rs, artifacts.rs,
+│   │   channels.rs                                 # coordination-layer core logic
+│   ├── auth.rs, auth_crypt.rs, auth_db.rs,
+│   │   auth_runner.rs, vault.rs                      # auth-profile vault + per-project secrets vault
+│   ├── daemon.rs, daemon_autostart.rs,
+│   │   daemon_client.rs                                # daemon lifecycle
+│   ├── cost.rs, pricing.rs                               # cost/pricing tracking
+│   └── mcp_server.rs, mcp_prompts.rs                       # MCP stdio server wiring
+├── crates/                  # 17-member Cargo workspace (flare-code, flare-output,
+│                            # agentflare-store, agentflare-backend, gateway-registry, ...)
+├── dashboard/web/           # static frontend served by `agentflare serve`
+├── data/                    # static data files (e.g. anthropic-pricing.json)
 ├── install.sh               # Linux/macOS installer
 ├── install.ps1              # Windows installer
+├── .codex-plugin/           # Codex plugin manifest (its hooks require the plugin loader)
 └── .github/                 # CI, templates, workflows
 ```
 
@@ -67,11 +100,12 @@ CLA Assistant bot comments on your PR, and you sign by replying:
 
 > I have read the CLA Document and I hereby sign the CLA
 
-The CLA keeps agentflare MIT-licensed for everyone while allowing the maintainer
+The CLA keeps agentflare openly licensed for everyone while allowing the maintainer
 to relicense (e.g. for a hosted/commercial offering).
 
 ## License
 
-agentflare is distributed under the MIT License; by contributing, your
-contributions are licensed to the public under the same terms (see the [CLA](CLA.md)
-for the full grant).
+agentflare is distributed under the Apache License 2.0 (see [LICENSE](LICENSE) and
+[NOTICE](NOTICE) for third-party attributions); by contributing, your contributions
+are licensed to the public under the same terms (see the [CLA](CLA.md) for the full
+grant).

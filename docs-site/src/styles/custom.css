@@ -1,0 +1,121 @@
+/*
+ * agentflare design system, ported from site/public/index.html — same tokens,
+ * same dark/light convention. Starlight and agentflare's landing page both
+ * key off [data-theme="dark"|"light"] on :root, so Starlight's built-in theme
+ * toggle flips both var sets at once with no extra JS.
+ */
+
+/* Commit Mono (OFL) — self-hosted, same font as the landing page */
+@font-face {
+  font-family: "Commit Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../fonts/commit-mono-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Commit Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("../fonts/commit-mono-700.woff2") format("woff2");
+}
+
+:root {
+  color-scheme: light dark;
+  --bg: #0b0d12;
+  --bg-2: #0e1119;
+  --surface: #14171f;
+  --surface-2: #1a1e29;
+  --line: #232838;
+  --line-soft: #1c202c;
+  --ink: #edeef2;
+  --ink-dim: #c3c8d4;
+  --muted: #8a90a0;
+  --faint: #5a6072;
+  --flare-warm: #ffb020;
+  --flare-hot: #ff5e3a;
+  --flare-soft: #ffd37a;
+  --good: #4ade80;
+  --code-bg: #0a0c11;
+  --r: 14px;
+  --r-sm: 10px;
+  --mono: "Commit Mono", ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f5f8;
+  --bg-2: #eef0f4;
+  --surface: #ffffff;
+  --surface-2: #f7f8fb;
+  --line: #e1e4ec;
+  --line-soft: #eaecf2;
+  --ink: #141720;
+  --ink-dim: #333a49;
+  --muted: #5c6478;
+  --faint: #8a91a2;
+  --flare-warm: #c2760a;
+  --flare-hot: #e14a22;
+  --flare-soft: #b96a0a;
+  --code-bg: #0b0d12;
+}
+
+/* ---- Map agentflare's tokens onto Starlight's theme variables ---- */
+:root {
+  --sl-color-bg: var(--bg);
+  --sl-color-bg-nav: var(--bg-2);
+  --sl-color-bg-sidebar: var(--bg-2);
+  --sl-color-bg-inline-code: var(--surface-2);
+  --sl-color-bg-accent: var(--flare-warm);
+  --sl-color-white: var(--ink);
+  --sl-color-text: var(--ink-dim);
+  --sl-color-text-accent: var(--flare-soft);
+  --sl-color-text-invert: #160a02;
+  --sl-color-gray-1: var(--ink-dim);
+  --sl-color-gray-2: var(--muted);
+  --sl-color-gray-3: var(--muted);
+  --sl-color-gray-4: var(--faint);
+  --sl-color-gray-5: var(--line);
+  --sl-color-gray-6: var(--surface);
+  --sl-color-black: var(--bg);
+  --sl-color-accent-low: color-mix(in srgb, var(--flare-warm) 22%, var(--bg));
+  --sl-color-accent: var(--flare-warm);
+  --sl-color-accent-high: var(--flare-soft);
+  --sl-color-hairline-light: var(--line);
+  --sl-color-hairline: var(--line-soft);
+  --sl-color-hairline-shade: var(--line);
+  --sl-font: var(--sans);
+  --sl-font-mono: var(--mono);
+  --sl-shadow-sm: 0 1px 1px rgba(0, 0, 0, 0.24);
+  --sl-shadow-md: 0 8px 24px -8px rgba(0, 0, 0, 0.4);
+  --sl-shadow-lg: var(--shadow, 0 24px 60px -20px rgba(0, 0, 0, 0.6));
+}
+:root[data-theme="light"] {
+  --sl-color-gray-6: var(--surface);
+  --sl-color-gray-7: var(--bg-2);
+  --sl-color-black: var(--ink);
+  --sl-color-accent-low: color-mix(in srgb, var(--flare-warm) 14%, var(--bg));
+}
+
+/* ---- agentflare's signature: mono headings, tight tracking ---- */
+.sl-markdown-content :is(h1, h2, h3, h4, h5, h6),
+.site-title,
+[class^="hero"] h1 {
+  font-family: var(--mono);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+/* Same flare gradient used for the landing page's accent text/rules */
+.sl-markdown-content a {
+  text-decoration-color: color-mix(in srgb, var(--flare-warm) 50%, transparent);
+}
+.sl-markdown-content code:not(pre code) {
+  border-radius: var(--r-sm);
+}
+.sl-markdown-content pre,
+.expressive-code {
+  border-radius: var(--r);
+}

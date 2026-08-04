@@ -24,6 +24,7 @@ mod serve;
 mod skill;
 mod uninstall;
 mod update;
+mod vault;
 mod vent;
 mod work;
 
@@ -62,6 +63,7 @@ pub enum Commands {
     Alias(alias::AliasArgs),
     Update(update::UpdateArgs),
     Uninstall(uninstall::UninstallArgs),
+    Vault(vault::VaultArgs),
     Auth(auth::AuthArgs),
     Artifacts(artifacts::ArtifactsArgs),
     Handoff(handoff::HandoffArgs),
@@ -98,6 +100,7 @@ impl Commands {
             Self::Alias(cmd) => cmd.run(),
             Self::Update(cmd) => cmd.run(),
             Self::Uninstall(cmd) => cmd.run(),
+            Self::Vault(cmd) => cmd.run(),
             Self::Auth(cmd) => cmd.run(),
             Self::Artifacts(cmd) => cmd.run(),
             Self::Handoff(cmd) => cmd.run(),

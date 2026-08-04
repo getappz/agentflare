@@ -21,6 +21,12 @@ pub struct PullRequest {
     pub title: String,
     #[serde(default)]
     pub draft: bool,
+    // Present (non-null) on both the list and single-PR endpoints, unlike
+    // `merged: bool` which the GitHub API only returns from the single-PR
+    // endpoint — using this instead lets `check_merge` (item #420) read
+    // merge status straight off `find_existing`'s list call.
+    #[serde(default)]
+    pub merged_at: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
     pub mergeable: Option<bool>,
@@ -39,11 +45,26 @@ pub struct PullRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct Label {
+    #[allow(dead_code)]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Issue {
     pub number: u64,
     pub html_url: String,
     pub state: String,
     pub title: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub body: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub labels: Vec<Label>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,6 +129,11 @@ pub struct ReviewComment {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Comment {
+    /// Monotonic GitHub comment id. Deliberately NOT `#[serde(default)]`:
+    /// the bridge's claim race resolves on the lowest id, and a silently
+    /// defaulted `0` would make every comment tie.
+    #[allow(dead_code)]
+    pub id: u64,
     pub user: User,
     pub body: String,
     #[serde(default)]
@@ -141,6 +167,45 @@ mod tests {
         assert_eq!(issue.number, 42);
         assert_eq!(issue.state, "open");
         assert_eq!(issue.title, "Bug");
+    }
+
+    #[test]
+    fn issue_deserializes_body_labels_and_updated_at() {
+        let json = serde_json::json!({
+            "number": 42, "html_url": "u", "state": "open", "title": "Bug",
+            "body": "text <!-- marker -->",
+            "labels": [{"name": "agentflare"}, {"name": "bug"}],
+            "updated_at": "2026-08-03T00:00:00Z"
+        });
+        let issue: Issue = serde_json::from_value(json).unwrap();
+        assert_eq!(issue.body.as_deref(), Some("text <!-- marker -->"));
+        assert_eq!(issue.labels.len(), 2);
+        assert_eq!(issue.labels[0].name, "agentflare");
+        assert_eq!(issue.updated_at.as_deref(), Some("2026-08-03T00:00:00Z"));
+    }
+
+    #[test]
+    fn issue_tolerates_absent_body_and_labels() {
+        let json = serde_json::json!({
+            "number": 1, "html_url": "u", "state": "open", "title": "t"
+        });
+        let issue: Issue = serde_json::from_value(json).unwrap();
+        assert_eq!(issue.body, None);
+        assert!(issue.labels.is_empty());
+    }
+
+    #[test]
+    fn comment_id_is_required_not_defaulted() {
+        let with_id = serde_json::json!({
+            "id": 900, "user": {"login": "a"}, "body": "hi"
+        });
+        let c: Comment = serde_json::from_value(with_id).unwrap();
+        assert_eq!(c.id, 900);
+
+        // A missing id must FAIL, not silently become 0 — the claim race
+        // resolves on this value.
+        let without_id = serde_json::json!({ "user": {"login": "a"}, "body": "hi" });
+        assert!(serde_json::from_value::<Comment>(without_id).is_err());
     }
 }
 

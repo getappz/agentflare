@@ -3,3 +3,7 @@
 
 # deps
 node_modules/
+
+# Generated Starlight build output for agentflare.dev/docs — built fresh by
+# `aube deploy` (`aube run build:docs` + `aube run copy:docs`), not committed.
+/public/docs/

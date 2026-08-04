@@ -23,6 +23,28 @@ pub struct Document {
     pub deleted_at: Option<i64>,
 }
 
+/// A document without its body.
+///
+/// Exists because enumerating a store and reading a store are different
+/// questions, and only one of them needs the text. A caching store can hold
+/// tens of thousands of documents whose bodies run to megabytes in total;
+/// serializing all of that to answer "what is in here?" is pure waste, and
+/// for an MCP caller it is worse than waste — the response does not fit.
+/// `content_bytes` is kept so a caller can still distinguish an empty
+/// placeholder from a real page without being handed the page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentSummary {
+    pub id: String,
+    pub path: String,
+    pub title: String,
+    pub doc_type: String,
+    pub source: String,
+    pub version: i32,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub content_bytes: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DocVersion {
     pub id: String,
@@ -83,20 +105,22 @@ impl Default for DocUpsertOpts {
 }
 
 impl Store {
-    fn doc_sync_fts(
-        conn: &rusqlite::Connection,
-        row_id: i64,
-        content: &str,
-    ) -> rusqlite::Result<()> {
-        conn.execute(
-            "DELETE FROM store_docs_fts WHERE rowid = ?1",
-            params![row_id],
-        )?;
-        conn.execute(
-            "INSERT INTO store_docs_fts(rowid, content) VALUES (?1, ?2)",
-            params![row_id, content],
-        )?;
-        Ok(())
+    /// Repopulates the document search index from `store_documents`.
+    ///
+    /// `store_docs_fts` is an external-content fts5 table kept in sync by
+    /// triggers (see `migrations::EXTERNAL_CONTENT_FTS_MIGRATION`), so this
+    /// is only needed after something rewrites the base table behind the
+    /// triggers' back -- notably `VACUUM`, which may renumber the implicit
+    /// rowids the index is keyed on.
+    ///
+    /// Transactional: the clear and the refill are two statements, and
+    /// stopping between them would leave the index empty rather than stale.
+    pub fn doc_fts_rebuild(&self) -> rusqlite::Result<()> {
+        let conn = self.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(crate::migrations::FTS_REBUILD_SQL)?;
+        tx.commit()
     }
 
     fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
@@ -151,19 +175,25 @@ impl Store {
 
         let existing = tx
             .query_row(
-                "SELECT id, rowid, content, version, blob_hash, mime, metadata, size FROM store_documents
+                "SELECT id, content, version, blob_hash, mime, metadata, size,
+                        title, doc_type, tags, session_id, source
+                 FROM store_documents
                  WHERE project_id = ?1 AND path = ?2",
                 params![project_id, path],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i32>(3)?,
-                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i32>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, String>(11)?,
                     ))
                 },
             )
@@ -171,22 +201,61 @@ impl Store {
 
         if let Some((
             existing_id,
-            rowid,
             old_content,
             old_version,
             old_blob_hash,
             old_mime,
             old_metadata,
             old_size,
+            old_title,
+            old_doc_type,
+            old_tags_json,
+            old_session_id,
+            old_source,
         )) = existing
         {
             let new_version = old_version + 1;
 
             // Snapshot current version to history, unless the caller opted
-            // out (cache-type documents) or content is byte-identical to
-            // what's already stored (a no-op re-upsert has nothing to
-            // snapshot).
-            if opts.track_history && old_content != content {
+            // out (cache-type documents) or nothing actually changed. Blob-
+            // backed callers (e.g. agentflare-artifacts) always pass an
+            // empty `content` string here -- the real payload lives in
+            // `blob_hash` -- so comparing inline `content` alone would never
+            // detect a change and history would never record; also check
+            // `blob_hash` so a no-op re-upsert still skips (both unchanged)
+            // while a genuine new blob still snapshots (content stays "").
+            //
+            // A caller can also re-upsert with unchanged content/blob_hash
+            // but a different title/doc_type/tags/mime/metadata/size --
+            // that's still a real change to the document's persisted state,
+            // so every `Some(...)`-provided opts field must match its
+            // stored value too, not just content, for this to count as a
+            // true no-op. `blob_hash` follows the same Some(...)-provided
+            // rule as the rest: a caller that omits it (None) makes no claim
+            // about it, so it must not force `unchanged` to false just
+            // because the stored value happens to already be Some(...).
+            let old_tags: Vec<String> = serde_json::from_str(&old_tags_json).unwrap_or_default();
+            let unchanged = old_content == content
+                && opts
+                    .blob_hash
+                    .as_deref()
+                    .is_none_or(|v| old_blob_hash.as_deref() == Some(v))
+                && opts.title.as_deref().is_none_or(|v| v == old_title)
+                && opts.doc_type.as_deref().is_none_or(|v| v == old_doc_type)
+                && opts.mime.as_deref().is_none_or(|v| v == old_mime)
+                && opts.metadata.as_deref().is_none_or(|v| v == old_metadata)
+                && opts.size.is_none_or(|v| v == old_size)
+                && opts
+                    .session_id
+                    .as_deref()
+                    .is_none_or(|v| old_session_id.as_deref() == Some(v))
+                && opts.source.as_deref().is_none_or(|v| v == old_source)
+                && opts.tags.as_ref().is_none_or(|v| *v == old_tags);
+            // Bound once because the blob-release decision below depends on
+            // it: a snapshot row is what keeps a superseded blob referenced,
+            // so the two must never disagree about whether one was written.
+            let snapshots_previous_version = opts.track_history && !unchanged;
+            if snapshots_previous_version {
                 let history_id = db_kit::ids::new_id();
                 tx.execute(
                     "INSERT INTO store_doc_history (id, doc_id, version, content, blob_hash, mime, title, metadata, size, created_at)
@@ -216,6 +285,21 @@ impl Store {
                     params![doc_type, existing_id],
                 )?;
             }
+            // A replaced blob loses its last reference here, the same way a
+            // deleted document's does -- but only when nothing else kept it.
+            // A history-tracking upsert has just snapshotted `old_blob_hash`
+            // into store_doc_history, and that row is what `doc_history` and
+            // `diff` read the previous version's bytes back through, so
+            // reclaiming it would silently empty the document's own history.
+            // Cache-type callers (track_history = false) write no snapshot, so
+            // for them the old blob really is orphaned. Released after the
+            // commit below, once the row no longer points at it.
+            let superseded_blob = match (&opts.blob_hash, &old_blob_hash) {
+                (Some(new), Some(old)) if new != old && !snapshots_previous_version => {
+                    Some(old.clone())
+                }
+                _ => None,
+            };
             if opts.blob_hash.is_some() {
                 tx.execute(
                     "UPDATE store_documents SET blob_hash = ?1 WHERE id = ?2",
@@ -260,9 +344,11 @@ impl Store {
                 )?;
             }
 
-            Self::doc_sync_fts(&tx, rowid, content)?;
             tx.commit()?;
             drop(conn);
+            if let Some(old) = superseded_blob {
+                self.blob_unref(&old)?;
+            }
             self.doc_get(&existing_id).map(|o| o.unwrap())
         } else {
             let id = db_kit::ids::new_id();
@@ -275,8 +361,6 @@ impl Store {
             let metadata = opts.metadata.unwrap_or_else(|| "{}".to_string());
             let size = opts.size.unwrap_or(0);
 
-            // Insert + FTS sync share this transaction so a failure between
-            // the two can't leave a document without its search index row.
             tx.execute(
                 "INSERT INTO store_documents
                  (id, project_id, path, content, title, doc_type, blob_hash, mime, tags, session_id, source, metadata, size, version, created_at, updated_at)
@@ -286,8 +370,6 @@ impl Store {
                     mime, tags_json, opts.session_id, source, metadata, size, now
                 ],
             )?;
-            let rowid = tx.last_insert_rowid();
-            Self::doc_sync_fts(&tx, rowid, content)?;
             tx.commit()?;
             Ok(Document {
                 id,
@@ -340,28 +422,47 @@ impl Store {
     }
 
     pub fn doc_delete(&self, id: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn();
-        let now = db_kit::ids::now();
-        if let Some(rowid) = conn
-            .query_row(
-                "SELECT rowid FROM store_documents WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-        {
+        // Scoped so the connection guard is released before blob_unref, which
+        // takes the same non-reentrant mutex and opens its own transaction.
+        let (found, release_blob) = {
+            let conn = self.conn();
+            let now = db_kit::ids::now();
+            let Some((blob_hash, already_deleted)) = conn
+                .query_row(
+                    "SELECT blob_hash, deleted_at IS NOT NULL FROM store_documents WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(1)?)),
+                )
+                .optional()?
+            else {
+                return Ok(false);
+            };
+            // Dropping the row out of store_docs_fts is the AFTER UPDATE
+            // trigger's job now -- see migrations::EXTERNAL_CONTENT_FTS_MIGRATION.
             conn.execute(
                 "UPDATE store_documents SET deleted_at = ?1 WHERE id = ?2",
                 params![now, id],
             )?;
-            conn.execute(
-                "DELETE FROM store_docs_fts WHERE rowid = ?1",
-                params![rowid],
-            )?;
-            Ok(true)
-        } else {
-            Ok(false)
+            // Only the delete that actually transitions live -> deleted owns a
+            // reference. Re-deleting an already soft-deleted row must not
+            // decrement again, or a blob shared with a live document loses its
+            // content while that document still looks intact.
+            (true, if already_deleted { None } else { blob_hash })
+        };
+
+        // Releasing the blob after the row is soft-deleted, not before: if the
+        // order were reversed and the row update failed, the last reference's
+        // content would already be gone while the document still read as live.
+        // Same ordering as the asset MCP tool's delete path.
+        //
+        // A caller that later resurrects this row via doc_upsert_with_opts
+        // without supplying a fresh blob_hash would be left pointing at
+        // reclaimed bytes; every blob-backed caller today (assets, artifacts,
+        // flare-docs rustdoc) always passes one on upsert.
+        if let Some(hash) = release_blob {
+            self.blob_unref(&hash)?;
         }
+        Ok(found)
     }
 
     pub fn doc_history(&self, doc_id: &str) -> rusqlite::Result<Vec<DocVersion>> {
@@ -567,6 +668,68 @@ impl Store {
         let rows = stmt.query_map(params![project_id], Self::row_to_document)?;
         rows.collect()
     }
+
+    /// Live documents in a project, without their bodies.
+    ///
+    /// `LIMIT`/`OFFSET` are pushed into SQL rather than applied to a fetched
+    /// `Vec`: truncating in Rust still makes SQLite read and allocate every
+    /// row's `content` first, which is the cost this projection exists to
+    /// avoid. `content_bytes` casts to BLOB before measuring because
+    /// SQLite's `LENGTH()` counts characters on TEXT, and a byte count is
+    /// what a caller sizing a response actually needs.
+    pub fn doc_list_summaries(
+        &self,
+        project_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> rusqlite::Result<Vec<DocumentSummary>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, title, doc_type, source, version, created_at, updated_at,
+                    LENGTH(CAST(content AS BLOB))
+             FROM store_documents
+             WHERE project_id = ?1 AND deleted_at IS NULL
+             ORDER BY path
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                i64::try_from(limit).unwrap_or(i64::MAX),
+                i64::try_from(offset).unwrap_or(i64::MAX),
+            ],
+            |row| {
+                Ok(DocumentSummary {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    title: row.get(2)?,
+                    doc_type: row.get(3)?,
+                    source: row.get(4)?,
+                    version: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    content_bytes: row.get(8)?,
+                })
+            },
+        )?;
+        rows.collect()
+    }
+
+    /// How many live documents a project holds.
+    ///
+    /// Separate from [`Self::doc_list_summaries`] so a capped listing can
+    /// report the size of the set it was drawn from — a truncated page that
+    /// cannot say how much it left behind reads exactly like a complete one.
+    pub fn doc_count(&self, project_id: &str) -> rusqlite::Result<usize> {
+        let conn = self.conn();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM store_documents
+             WHERE project_id = ?1 AND deleted_at IS NULL",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
 }
 
 #[cfg(test)]
@@ -575,6 +738,197 @@ mod tests {
 
     fn store() -> Store {
         Store::open_memory().unwrap()
+    }
+
+    /// Rows matchable through `store_docs_fts` directly, with no
+    /// `deleted_at` guard layered on top. `doc_search` filters deleted rows
+    /// itself, so it cannot tell a correctly-maintained index from one full
+    /// of stale entries -- these assertions have to bypass it.
+    fn fts_hits(s: &Store, term: &str) -> i64 {
+        s.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM store_docs_fts WHERE store_docs_fts MATCH ?1",
+                params![term],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn soft_deleting_a_document_drops_its_fts_entry() {
+        let s = store();
+        let doc = s.doc_upsert("p", "/gone.md", "loquacious").unwrap();
+        assert_eq!(fts_hits(&s, "loquacious"), 1);
+
+        s.doc_delete(&doc.id).unwrap();
+
+        assert_eq!(
+            fts_hits(&s, "loquacious"),
+            0,
+            "a soft-deleted document must leave no directly matchable index row"
+        );
+    }
+
+    #[test]
+    fn resurrecting_a_soft_deleted_document_indexes_it_exactly_once() {
+        // The failure mode the guarded triggers exist for: on an
+        // external-content table, a `'delete'` naming a row that is not in
+        // the index corrupts it. A resurrecting upsert is an UPDATE whose
+        // `old` row was soft-deleted (and so already unindexed), which an
+        // unguarded AFTER UPDATE trigger would happily try to delete again.
+        let s = store();
+        let doc = s.doc_upsert("p", "/back.md", "phoenix").unwrap();
+        s.doc_delete(&doc.id).unwrap();
+        assert_eq!(fts_hits(&s, "phoenix"), 0);
+
+        s.doc_upsert("p", "/back.md", "phoenix").unwrap();
+
+        assert_eq!(fts_hits(&s, "phoenix"), 1);
+        assert_eq!(s.doc_search("p", "phoenix", 10).unwrap().len(), 1);
+        // fts5's own verdict on whether the delete/insert bookkeeping stayed
+        // consistent -- an unguarded trigger fails here, not on the counts.
+        s.conn()
+            .execute_batch("INSERT INTO store_docs_fts(store_docs_fts) VALUES('integrity-check');")
+            .expect("index must survive a delete/resurrect cycle intact");
+    }
+
+    #[test]
+    fn hard_deleting_a_row_drops_its_fts_entry() {
+        // Nothing in the crate hard-deletes documents today, but the
+        // cache-eviction work (#339) will. With the index trigger-driven,
+        // that purge gets the FTS delete for free instead of having to
+        // remember it -- which is the class of bug #334/#337 was.
+        let s = store();
+        s.doc_upsert("p", "/purge.md", "ephemeral").unwrap();
+        s.conn()
+            .execute("DELETE FROM store_documents WHERE path = '/purge.md'", [])
+            .unwrap();
+
+        assert_eq!(fts_hits(&s, "ephemeral"), 0);
+    }
+
+    #[test]
+    fn editing_a_document_leaves_only_the_new_content_matchable() {
+        let s = store();
+        s.doc_upsert("p", "/edit.md", "before").unwrap();
+        s.doc_upsert("p", "/edit.md", "after").unwrap();
+
+        assert_eq!(fts_hits(&s, "before"), 0, "superseded text must not match");
+        assert_eq!(fts_hits(&s, "after"), 1);
+    }
+
+    #[test]
+    fn the_update_trigger_is_scoped_to_the_indexed_columns() {
+        // doc_upsert_with_opts writes content, then up to nine more
+        // single-column UPDATEs for the optional fields. None of them can
+        // change what is indexed, so none should re-tokenize the body. This
+        // has to be asserted on the trigger definition: an unscoped
+        // AFTER UPDATE produces an identical index, just nine times over.
+        let s = store();
+        let sql: String = s
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'store_docs_fts_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("UPDATE OF content, deleted_at"),
+            "update trigger must not fire for columns the index ignores: {sql}"
+        );
+    }
+
+    #[test]
+    fn optional_field_updates_leave_the_document_indexed() {
+        let s = store();
+        s.doc_upsert_with_opts(
+            "p",
+            "/opts.md",
+            "indexable",
+            DocUpsertOpts {
+                title: Some("t".into()),
+                mime: Some("text/plain".into()),
+                tags: Some(vec!["a".into()]),
+                source: Some("src".into()),
+                size: Some(9),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fts_hits(&s, "indexable"), 1);
+    }
+
+    #[test]
+    fn doc_fts_rebuild_restores_the_index_and_still_skips_deleted_rows() {
+        let s = store();
+        s.doc_upsert("p", "/live.md", "kept").unwrap();
+        let gone = s.doc_upsert("p", "/dead.md", "dropped").unwrap();
+        s.doc_delete(&gone.id).unwrap();
+
+        // Stand in for whatever desyncs the index behind the triggers' back
+        // -- a VACUUM renumbering store_documents' implicit rowids being the
+        // case doc_fts_rebuild exists for.
+        s.conn()
+            .execute_batch("INSERT INTO store_docs_fts(store_docs_fts) VALUES('delete-all');")
+            .unwrap();
+        assert_eq!(fts_hits(&s, "kept"), 0);
+
+        s.doc_fts_rebuild().unwrap();
+
+        assert_eq!(fts_hits(&s, "kept"), 1);
+        assert_eq!(
+            fts_hits(&s, "dropped"),
+            0,
+            "a rebuild must not resurrect soft-deleted rows the triggers keep out"
+        );
+    }
+
+    #[test]
+    fn summaries_page_without_carrying_bodies() {
+        let s = store();
+        let big = "x".repeat(50_000);
+        for i in 0..5 {
+            s.doc_upsert("proj-1", &format!("/doc{i}.md"), &big)
+                .unwrap();
+        }
+
+        let page = s.doc_list_summaries("proj-1", 2, 0).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].path, "/doc0.md");
+        // A byte count, not the bytes: the whole point of the projection.
+        assert_eq!(page[0].content_bytes, 50_000);
+
+        let next = s.doc_list_summaries("proj-1", 2, 2).unwrap();
+        assert_eq!(next[0].path, "/doc2.md");
+
+        assert_eq!(s.doc_count("proj-1").unwrap(), 5);
+    }
+
+    #[test]
+    fn summaries_and_count_skip_deleted_and_other_projects() {
+        let s = store();
+        let keep = s.doc_upsert("proj-1", "/keep.md", "keep").unwrap();
+        let gone = s.doc_upsert("proj-1", "/gone.md", "gone").unwrap();
+        s.doc_upsert("proj-2", "/other.md", "other").unwrap();
+        s.doc_delete(&gone.id).unwrap();
+
+        let page = s.doc_list_summaries("proj-1", 10, 0).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, keep.id);
+        assert_eq!(s.doc_count("proj-1").unwrap(), 1);
+    }
+
+    #[test]
+    fn content_bytes_counts_bytes_not_characters() {
+        // SQLite's LENGTH() counts characters on TEXT; a caller sizing a
+        // response needs bytes, so the projection casts to BLOB first. Without
+        // that cast this doc reports 2, not 6.
+        let s = store();
+        s.doc_upsert("proj-1", "/utf8.md", "日本").unwrap();
+        let page = s.doc_list_summaries("proj-1", 10, 0).unwrap();
+        assert_eq!(page[0].content_bytes, 6);
     }
 
     #[test]
@@ -831,6 +1185,145 @@ mod tests {
         assert!(
             s.doc_history(&updated.id).unwrap().is_empty(),
             "no history row should be written when content is unchanged"
+        );
+    }
+
+    #[test]
+    fn unchanged_content_with_changed_title_still_writes_history() {
+        let s = store();
+        let doc = s
+            .doc_upsert_with_opts(
+                "p",
+                "/title-change.md",
+                "same content",
+                DocUpsertOpts {
+                    title: Some("Old Title".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let updated = s
+            .doc_upsert_with_opts(
+                "p",
+                "/title-change.md",
+                "same content",
+                DocUpsertOpts {
+                    title: Some("New Title".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.id, doc.id);
+        assert_eq!(updated.title, "New Title");
+        let history = s.doc_history(&updated.id).unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "a title-only change must still write a history row even though content didn't change"
+        );
+        assert_eq!(history[0].title, "Old Title");
+    }
+
+    #[test]
+    fn identical_content_and_opts_reupsert_skips_history_row() {
+        let s = store();
+        let opts = || DocUpsertOpts {
+            title: Some("Same Title".into()),
+            tags: Some(vec!["rust".into()]),
+            ..Default::default()
+        };
+        let doc = s
+            .doc_upsert_with_opts("p", "/no-op.md", "same content", opts())
+            .unwrap();
+        let updated = s
+            .doc_upsert_with_opts("p", "/no-op.md", "same content", opts())
+            .unwrap();
+        assert_eq!(updated.id, doc.id);
+        assert!(
+            s.doc_history(&updated.id).unwrap().is_empty(),
+            "a true no-op re-upsert (same content and same opts) must not write history"
+        );
+    }
+
+    #[test]
+    fn omitted_blob_hash_does_not_force_a_history_write() {
+        let s = store();
+        let doc = s
+            .doc_upsert_with_opts(
+                "p",
+                "/blob.md",
+                "same content",
+                DocUpsertOpts {
+                    blob_hash: Some("hash-v1".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Re-upsert with identical content and blob_hash omitted (None) --
+        // omitting a field makes no claim about it, so it must not be
+        // treated as "the blob_hash changed" just because the stored value
+        // happens to already be Some(...).
+        let updated = s
+            .doc_upsert_with_opts("p", "/blob.md", "same content", DocUpsertOpts::default())
+            .unwrap();
+        assert_eq!(updated.id, doc.id);
+        assert_eq!(updated.blob_hash.as_deref(), Some("hash-v1"));
+        assert!(
+            s.doc_history(&updated.id).unwrap().is_empty(),
+            "omitting blob_hash on an otherwise-unchanged re-upsert must not write history"
+        );
+    }
+
+    #[test]
+    fn unchanged_content_with_changed_metadata_still_writes_history() {
+        let s = store();
+        let doc = s
+            .doc_upsert_with_opts(
+                "p",
+                "/meta-change.md",
+                "same content",
+                DocUpsertOpts {
+                    metadata: Some(r#"{"v":1}"#.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let updated = s
+            .doc_upsert_with_opts(
+                "p",
+                "/meta-change.md",
+                "same content",
+                DocUpsertOpts {
+                    metadata: Some(r#"{"v":2}"#.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.id, doc.id);
+        assert_eq!(updated.metadata, r#"{"v":2}"#);
+        let history = s.doc_history(&updated.id).unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "a metadata-only change must still write a history row"
+        );
+        assert_eq!(history[0].metadata, r#"{"v":1}"#);
+
+        // A second re-upsert with identical metadata must be a true no-op.
+        s.doc_upsert_with_opts(
+            "p",
+            "/meta-change.md",
+            "same content",
+            DocUpsertOpts {
+                metadata: Some(r#"{"v":2}"#.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.doc_history(&updated.id).unwrap().len(),
+            1,
+            "identical metadata must not add another history row"
         );
     }
 

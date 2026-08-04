@@ -5,6 +5,7 @@
 
 pub mod actions;
 pub mod auth;
+pub mod bridge;
 pub mod client;
 pub mod identity;
 pub mod init_auth;
@@ -13,6 +14,7 @@ pub mod mcp;
 pub mod models;
 pub mod pulls;
 pub mod releases;
+pub mod repos;
 
 #[cfg(test)]
 pub(crate) mod test_support;

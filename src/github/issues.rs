@@ -54,18 +54,82 @@ pub fn list(client: &Client, repo: &RepoId, state: &str) -> Result<Vec<Issue>, G
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
+/// Like [`list`], plus GitHub's server-side `labels` and `since` filters.
+/// `since` is an ISO8601 timestamp compared against each issue's
+/// `updated_at`.
+///
+/// The bridge deliberately passes `None`: it needs the WHOLE queue every
+/// tick to decide what is claimable, and a `since`-filtered listing would
+/// hide exactly the untouched issues that are most available. The parameter
+/// stays for callers that want a delta, not as an optimization this one is
+/// missing out on.
+#[allow(dead_code)]
+pub fn list_filtered(
+    client: &Client,
+    repo: &RepoId,
+    state: &str,
+    labels: Option<&str>,
+    since: Option<&str>,
+) -> Result<Vec<Issue>, GitHubError> {
+    let mut path = format!(
+        "/repos/{}/{}/issues?state={}",
+        repo.owner,
+        repo.repo,
+        crate::github::encode_query(state)
+    );
+    if let Some(l) = labels {
+        path.push_str(&format!("&labels={}", crate::github::encode_query(l)));
+    }
+    if let Some(s) = since {
+        path.push_str(&format!("&since={}", crate::github::encode_query(s)));
+    }
+    let json = client.get_paginated(&path, crate::github::client::as_array)?;
+    serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
+}
+
 pub fn get(client: &Client, repo: &RepoId, number: u64) -> Result<Issue, GitHubError> {
     let path = format!("/repos/{}/{}/issues/{number}", repo.owner, repo.repo);
     let json = client.request("GET", &path, None)?;
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
-pub fn comment(client: &Client, repo: &RepoId, number: u64, body: &str) -> Result<(), GitHubError> {
+/// Posts a comment and returns its id, so a caller that needs to amend what
+/// it just wrote (the bridge rewrites its claim marker with the item id it
+/// only learns after the post) can do so without re-listing every comment.
+pub fn comment(
+    client: &Client,
+    repo: &RepoId,
+    number: u64,
+    body: &str,
+) -> Result<u64, GitHubError> {
     let path = format!(
         "/repos/{}/{}/issues/{number}/comments",
         repo.owner, repo.repo
     );
-    client.request("POST", &path, Some(serde_json::json!({ "body": body })))?;
+    let json = client.request("POST", &path, Some(serde_json::json!({ "body": body })))?;
+    json["id"]
+        .as_u64()
+        .ok_or_else(|| GitHubError::Parse("comment response had no id".to_string()))
+}
+
+/// Rewrites an existing comment in place. The comment id is repo-scoped, not
+/// issue-scoped, so no issue number is needed.
+///
+/// The bridge's heartbeat depends on this: refreshing a claim's marker by
+/// editing the comment that carries it keeps exactly one marker per claim,
+/// where posting a fresh one every half-TTL would bury the issue under
+/// dozens of bookkeeping comments a human then has to scroll past.
+pub fn update_comment(
+    client: &Client,
+    repo: &RepoId,
+    comment_id: u64,
+    body: &str,
+) -> Result<(), GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/issues/comments/{comment_id}",
+        repo.owner, repo.repo
+    );
+    client.request("PATCH", &path, Some(serde_json::json!({ "body": body })))?;
     Ok(())
 }
 
@@ -108,6 +172,55 @@ pub fn add_labels(
     let path = format!("/repos/{}/{}/issues/{number}/labels", repo.owner, repo.repo);
     client.request("POST", &path, Some(serde_json::json!({ "labels": labels })))?;
     Ok(())
+}
+
+/// Deletes a comment. Like [`remove_label`], an already-absent target is
+/// treated as success. Repo-scoped comment id, same as [`update_comment`].
+///
+/// Test-gated: the bridge never deletes anything in production — it only
+/// appends and edits, so its history stays auditable. This exists so the
+/// live-GitHub harness can reset a scratch repo between runs. Drop the
+/// `cfg(test)` if a production caller ever needs it.
+#[cfg(test)]
+pub fn delete_comment(client: &Client, repo: &RepoId, comment_id: u64) -> Result<(), GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/issues/comments/{comment_id}",
+        repo.owner, repo.repo
+    );
+    match client.request("DELETE", &path, None) {
+        Ok(_) | Err(GitHubError::NotFound) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Reopens a closed issue — the inverse of [`close`]. Test-gated for the same
+/// reason as [`delete_comment`]: the bridge closes issues, never reopens them.
+#[cfg(test)]
+pub fn reopen(client: &Client, repo: &RepoId, number: u64) -> Result<Issue, GitHubError> {
+    let path = format!("/repos/{}/{}/issues/{number}", repo.owner, repo.repo);
+    let json = client.request("PATCH", &path, Some(serde_json::json!({ "state": "open" })))?;
+    serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
+}
+
+/// Removes one label. A label that is not on the issue answers 404, which
+/// callers generally want to treat as success — the desired end state holds
+/// either way.
+pub fn remove_label(
+    client: &Client,
+    repo: &RepoId,
+    number: u64,
+    label: &str,
+) -> Result<(), GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/issues/{number}/labels/{}",
+        repo.owner,
+        repo.repo,
+        crate::github::encode_query(label)
+    );
+    match client.request("DELETE", &path, None) {
+        Ok(_) | Err(GitHubError::NotFound) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -185,10 +298,10 @@ mod tests {
     }
 
     #[test]
-    fn comment_posts_body() {
-        let server = MockServer::start(vec![MockResponse::json(201, r#"{"id":1}"#)]);
+    fn comment_posts_body_and_returns_the_new_comment_id() {
+        let server = MockServer::start(vec![MockResponse::json(201, r#"{"id":42}"#)]);
         let client = server.client(Some("tok"));
-        comment(&client, &repo(), 4, "hi").unwrap();
+        assert_eq!(comment(&client, &repo(), 4, "hi").unwrap(), 42);
         let reqs = server.requests();
         assert_eq!(reqs[0].path, "/repos/o/r/issues/4/comments");
         let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
@@ -196,10 +309,66 @@ mod tests {
     }
 
     #[test]
+    fn delete_comment_and_reopen_hit_the_right_endpoints() {
+        let server = MockServer::start(vec![
+            MockResponse::json(204, ""),
+            MockResponse::json(404, r#"{"message":"Not Found"}"#),
+            MockResponse::json(
+                200,
+                r#"{"number":4,"html_url":"u","state":"open","title":"t"}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+
+        delete_comment(&client, &repo(), 9).unwrap();
+        delete_comment(&client, &repo(), 9).expect("an already-deleted comment is success");
+        assert_eq!(reopen(&client, &repo(), 4).unwrap().state, "open");
+
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "DELETE");
+        assert_eq!(reqs[0].path, "/repos/o/r/issues/comments/9");
+        assert_eq!(reqs[2].method, "PATCH");
+        let sent: serde_json::Value = serde_json::from_str(&reqs[2].body).unwrap();
+        assert_eq!(sent["state"], "open");
+    }
+
+    #[test]
+    fn remove_label_deletes_the_encoded_label_and_tolerates_absence() {
+        // The label carries an instance id (`claimed:agent:host`), so the
+        // colons must survive as path-safe encoding rather than as separators.
+        let server = MockServer::start(vec![
+            MockResponse::json(200, "[]"),
+            MockResponse::json(404, r#"{"message":"Label does not exist"}"#),
+        ]);
+        let client = server.client(Some("tok"));
+
+        remove_label(&client, &repo(), 4, "claimed:a:1").unwrap();
+        remove_label(&client, &repo(), 4, "claimed:a:1")
+            .expect("a label that is already gone is the desired end state");
+
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "DELETE");
+        assert_eq!(reqs[0].path, "/repos/o/r/issues/4/labels/claimed%3Aa%3A1");
+    }
+
+    #[test]
+    fn update_comment_patches_the_repo_scoped_comment_endpoint() {
+        let server = MockServer::start(vec![MockResponse::json(200, r#"{"id":9}"#)]);
+        let client = server.client(Some("tok"));
+        update_comment(&client, &repo(), 9, "refreshed").unwrap();
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        // Note: `/issues/comments/{id}`, NOT `/issues/{number}/comments/{id}`.
+        assert_eq!(reqs[0].path, "/repos/o/r/issues/comments/9");
+        let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        assert_eq!(sent["body"], "refreshed");
+    }
+
+    #[test]
     fn list_comments_fetches_and_parses() {
         let server = MockServer::start(vec![MockResponse::json(
             200,
-            r#"[{"user":{"login":"coderabbitai[bot]"},"body":"walkthrough...","created_at":"2026-07-19T00:00:00Z"}]"#,
+            r#"[{"id":1,"user":{"login":"coderabbitai[bot]"},"body":"walkthrough...","created_at":"2026-07-19T00:00:00Z"}]"#,
         )]);
         let client = server.client(None);
         let comments = list_comments(&client, &repo(), 4, None).unwrap();
@@ -246,5 +415,34 @@ mod tests {
         assert_eq!(reqs[0].path, "/repos/o/r/issues/2/labels");
         let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
         assert_eq!(sent["labels"][1], "b");
+    }
+
+    #[test]
+    fn list_filtered_encodes_labels_and_since() {
+        let server = MockServer::start(vec![MockResponse::json(200, "[]")]);
+        let client = server.client(None);
+        list_filtered(
+            &client,
+            &repo(),
+            "open",
+            Some("agentflare"),
+            Some("2026-08-03T00:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(
+            server.requests()[0].path,
+            "/repos/o/r/issues?state=open&labels=agentflare&since=2026-08-03T00%3A00%3A00Z&per_page=100&page=1"
+        );
+    }
+
+    #[test]
+    fn list_filtered_omits_absent_filters() {
+        let server = MockServer::start(vec![MockResponse::json(200, "[]")]);
+        let client = server.client(None);
+        list_filtered(&client, &repo(), "open", None, None).unwrap();
+        assert_eq!(
+            server.requests()[0].path,
+            "/repos/o/r/issues?state=open&per_page=100&page=1"
+        );
     }
 }

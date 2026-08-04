@@ -1,7 +1,7 @@
 use clap::{Args, Subcommand};
 
 /// Send messages out to chat platforms (Telegram / Slack / Discord). Bot tokens
-/// are read from the encrypted gateway secret store.
+/// are read from the encrypted vault (`agentflare vault set <platform>_bot_token`).
 #[derive(Args)]
 pub struct ChannelArgs {
     #[command(subcommand)]
@@ -37,14 +37,7 @@ impl ChannelArgs {
                     );
                     std::process::exit(1);
                 };
-                let conn = match crate::db::open() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        crate::ui::error(&format!("channel: cannot open database: {e}"));
-                        std::process::exit(1);
-                    }
-                };
-                match crate::channels::send_message(&conn, platform, &target, &message) {
+                match crate::channels::send_message(platform, &target, &message) {
                     Ok(()) => println!("sent to {to}:{target}"),
                     Err(e) => {
                         crate::ui::error(&e.to_string());

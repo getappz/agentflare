@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Encrypted storage for downstream gateway backend secrets (API tokens,
 //! PATs). Reuses `auth_crypt`'s AES-256-GCM/PBKDF2 primitive directly — a
 //! new table, NOT the `auth.rs`/`auth_db.rs` agent-CLI OAuth profile-

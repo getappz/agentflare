@@ -33,59 +33,17 @@ impl GatewayArgs {
     }
 }
 
+/// Deprecated: secret management moved to `agentflare vault set|list|remove`
+/// so there's a single canonical place to manage vault secrets instead of
+/// two commands fronting the same store. Kept as a forwarding alias so
+/// existing scripts keep working.
 fn run_secret(action: GatewaySecretAction) {
-    let conn = match crate::db::open() {
-        Ok(c) => c,
-        Err(e) => {
-            crate::ui::error(&format!("failed to open agentflare.db: {e}"));
-            std::process::exit(1);
-        }
-    };
+    crate::ui::warning(
+        "agentflare gateway secret is deprecated, use `agentflare vault set|list|remove` instead",
+    );
     match action {
-        GatewaySecretAction::Set { name } => {
-            use std::io::Read;
-            let mut value = String::new();
-            if std::io::stdin().read_to_string(&mut value).is_err() {
-                crate::ui::error("failed to read secret value from stdin");
-                std::process::exit(1);
-            }
-            let value = value.trim();
-            if value.is_empty() {
-                crate::ui::error("secret value must not be empty");
-                std::process::exit(1);
-            }
-            match crate::gateway_secrets::set_secret(&conn, &name, value) {
-                Ok(()) => println!("stored secret '{name}'"),
-                Err(e) => {
-                    crate::ui::error(&format!("failed to store secret: {e}"));
-                    std::process::exit(1);
-                }
-            }
-        }
-        GatewaySecretAction::List => match crate::gateway_secrets::list_secrets(&conn) {
-            Ok(names) if names.is_empty() => println!("no secrets stored"),
-            Ok(names) => {
-                for n in names {
-                    println!("{n}");
-                }
-            }
-            Err(e) => {
-                crate::ui::error(&format!("failed to list secrets: {e}"));
-                std::process::exit(1);
-            }
-        },
-        GatewaySecretAction::Remove { name } => {
-            match crate::gateway_secrets::remove_secret(&conn, &name) {
-                Ok(true) => println!("removed secret '{name}'"),
-                Ok(false) => {
-                    crate::ui::error(&format!("no secret named '{name}'"));
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    crate::ui::error(&format!("failed to remove secret: {e}"));
-                    std::process::exit(1);
-                }
-            }
-        }
+        GatewaySecretAction::Set { name } => crate::cli::vault::run_set(&name),
+        GatewaySecretAction::List => crate::cli::vault::run_list(),
+        GatewaySecretAction::Remove { name } => crate::cli::vault::run_remove(&name),
     }
 }

@@ -1,7 +1,7 @@
 use crate::fetch::{FetchError, FetchedBytes, Fetcher, decompress_zstd};
 use crate::index_types::{IndexCrate, indexed_items};
 use crate::store::{BatchItem, DocsStore, Error as StoreError};
-use agentflare_store::documents::{DocUpsertOpts, Document};
+use agentflare_store::documents::DocUpsertOpts;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RustdocError {
@@ -12,6 +12,17 @@ pub enum RustdocError {
     #[error("invalid rustdoc json: {0}")]
     InvalidJson(String),
 }
+
+/// Result of [`fetch_and_store`]/[`store_fetched`]: the crate-overview doc,
+/// plus a visible record of whether per-item indexing succeeded. Per-item
+/// indexing is best-effort on top of the overview doc (see [`store_fetched`]
+/// for why a schema-parse failure there must not fail the whole fetch), but
+/// that must not mean invisible -- previously a failure there only reached
+/// an `eprintln!` on the MCP server's own stderr, which no caller (CLI,
+/// MCP client, tests) could ever observe.
+/// Defined at the crate root because both ecosystems report fetches this way;
+/// re-exported here so existing `rustdoc::FetchOutcome` paths keep resolving.
+pub use crate::FetchOutcome;
 
 /// docs.rs's official rustdoc-JSON endpoint (RFC 2963). Verified live
 /// 2026-07-23: both `latest` and an exact semver return HTTP 200,
@@ -73,7 +84,7 @@ pub fn fetch_and_store(
     store: &DocsStore,
     crate_name: &str,
     version: &str,
-) -> Result<Document, RustdocError> {
+) -> Result<FetchOutcome, RustdocError> {
     let url = docs_rs_json_url(crate_name, version);
     let fetched = fetcher.fetch(&url)?;
     store_fetched(store, &fetched, crate_name, version)
@@ -91,7 +102,7 @@ pub fn store_fetched(
     fetched: &FetchedBytes,
     crate_name: &str,
     version: &str,
-) -> Result<Document, RustdocError> {
+) -> Result<FetchOutcome, RustdocError> {
     let decompressed = decompress_zstd(&fetched.bytes)?;
     let docstring = extract_root_docstring(&decompressed)?
         .unwrap_or_else(|| format!("(no crate-level documentation for {crate_name})"));
@@ -114,20 +125,35 @@ pub fn store_fetched(
     // this crate's pinned `rustdoc-types` version recognizes) fails
     // `IndexCrate`'s deserialization for the *entire* crate's item set --
     // that must not turn an otherwise-successful fetch into a reported
-    // failure, or mask the overview doc's success from the caller.
-    if let Err(e) = index_items(store, &decompressed, crate_name, &id_path) {
-        eprintln!("flare-docs: per-item indexing failed for {crate_name}@{version}: {e}");
-    }
+    // failure, or mask the overview doc's success from the caller. It must
+    // not be invisible either, though -- surface it in `FetchOutcome` (not
+    // an `eprintln!`, which a library shouldn't own; the CLI and MCP
+    // callers decide what to do with `items_error`) so a caller relying on
+    // per-item search results can tell "nothing changed" apart from
+    // "indexing silently failed".
+    let (items_indexed, items_error) = match index_items(store, &decompressed, crate_name, &id_path)
+    {
+        Ok(n) => (n, None),
+        Err(e) => (0, Some(e.to_string())),
+    };
 
-    Ok(overview_doc)
+    Ok(FetchOutcome {
+        doc: overview_doc,
+        items_indexed,
+        items_error,
+    })
 }
 
 /// Parses the full rustdoc-JSON `index`/`paths` maps and upserts one
 /// document per item that has both a docstring and a public path (see
 /// [`indexed_items`]). Runs as a single batched transaction via
-/// [`DocsStore::upsert_batch`] — a crate can have thousands of items, and
-/// upserting them one at a time would turn a single fetch into thousands of
-/// individual commits.
+/// [`DocsStore::upsert_batch_reconciled`] — a crate can have thousands of
+/// items, and upserting them one at a time would turn a single fetch into
+/// thousands of individual commits. Reconciling against `crate_id_path`'s
+/// existing items also soft-deletes any item that was present in a
+/// previous fetch but isn't in this one (renamed, removed, or made
+/// private), so search can't keep surfacing docs for an item that no
+/// longer exists in the crate's current index.
 fn index_items(
     store: &DocsStore,
     decompressed_json: &[u8],
@@ -137,10 +163,11 @@ fn index_items(
     let index_crate: IndexCrate = serde_json::from_slice(decompressed_json)
         .map_err(|e| RustdocError::InvalidJson(e.to_string()))?;
 
+    let item_prefix = format!("{crate_id_path}/item/");
     let batch: Vec<BatchItem> = indexed_items(&index_crate)
         .into_iter()
         .map(|item| BatchItem {
-            path: format!("{crate_id_path}/item/{}", item.fq_path),
+            path: format!("{item_prefix}{}", item.fq_path),
             content: item.docs,
             title: item.name,
             doc_type: "rust-item".to_string(),
@@ -149,7 +176,7 @@ fn index_items(
         })
         .collect();
 
-    Ok(store.upsert_batch(&batch)?)
+    Ok(store.upsert_batch_reconciled(&item_prefix, &batch)?)
 }
 
 fn store_raw_json_blob(store: &DocsStore, decompressed_json: &[u8]) -> Result<String, StoreError> {
@@ -295,8 +322,10 @@ mod tests {
         };
         let store = DocsStore::open_memory().unwrap();
 
-        let doc = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
-        assert_eq!(doc.content, "A fake crate for testing.");
+        let outcome = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
+        assert_eq!(outcome.doc.content, "A fake crate for testing.");
+        assert_eq!(outcome.items_indexed, 2, "both items should be written");
+        assert!(outcome.items_error.is_none());
 
         let state_doc = store
             .get_by_path("docsrs/fake-crate/1.0.0/item/fake_crate::extract::State")
@@ -320,11 +349,80 @@ mod tests {
     }
 
     #[test]
+    fn refetch_removes_items_no_longer_present_in_the_crate_index() {
+        // Regression for the staleness gap: item A and B are indexed by the
+        // first fetch, then a refetch of the same crate_id_path ("latest")
+        // only has item A -- B must no longer be gettable or searchable
+        // afterward, not linger from the first fetch forever.
+        let first_json = br#"{
+            "root": 0,
+            "index": {
+                "0": { "docs": "A fake crate for testing." },
+                "1": { "name": "State", "docs": "Extractor for shared state." },
+                "2": { "name": "Router", "docs": "The router type." }
+            },
+            "paths": {
+                "1": { "crate_id": 0, "path": ["fake_crate", "extract", "State"], "kind": "struct" },
+                "2": { "crate_id": 0, "path": ["fake_crate", "Router"], "kind": "struct" }
+            }
+        }"#;
+        let store = DocsStore::open_memory().unwrap();
+        let fetcher = FakeFetcher {
+            response: zstd::stream::encode_all(&first_json[..], 0).unwrap(),
+        };
+        fetch_and_store(&fetcher, &store, "fake-crate", "latest").unwrap();
+        assert!(
+            store
+                .get_by_path("docsrs/fake-crate/latest/item/fake_crate::Router")
+                .unwrap()
+                .is_some()
+        );
+
+        // "latest" moved to a new version where Router was removed.
+        let second_json = br#"{
+            "root": 0,
+            "index": {
+                "0": { "docs": "A fake crate for testing." },
+                "1": { "name": "State", "docs": "Extractor for shared state." }
+            },
+            "paths": {
+                "1": { "crate_id": 0, "path": ["fake_crate", "extract", "State"], "kind": "struct" }
+            }
+        }"#;
+        let fetcher = FakeFetcher {
+            response: zstd::stream::encode_all(&second_json[..], 0).unwrap(),
+        };
+        fetch_and_store(&fetcher, &store, "fake-crate", "latest").unwrap();
+
+        assert!(
+            store
+                .get_by_path("docsrs/fake-crate/latest/item/fake_crate::Router")
+                .unwrap()
+                .is_none(),
+            "removed item must not be gettable by path after refetch"
+        );
+        let hits = store.search("The router type", 10).unwrap();
+        assert!(
+            hits.is_empty(),
+            "removed item must not be findable via search after refetch"
+        );
+
+        // The item still present in the new fetch must be unaffected.
+        assert!(
+            store
+                .get_by_path("docsrs/fake-crate/latest/item/fake_crate::extract::State")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn fetch_and_store_survives_unparseable_item_index() {
         // Regression: an item whose "kind" is a value the pinned
         // rustdoc-types version doesn't recognize fails IndexCrate's
         // deserialization for the whole crate -- fetch_and_store must still
         // return Ok with the overview doc, not propagate that as a failure.
+        // But it must surface the failure in `items_error`, not just eat it.
         let raw_json = br#"{
             "root": 0,
             "index": {
@@ -341,8 +439,13 @@ mod tests {
         };
         let store = DocsStore::open_memory().unwrap();
 
-        let doc = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
-        assert_eq!(doc.content, "A fake crate for testing.");
+        let outcome = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
+        assert_eq!(outcome.doc.content, "A fake crate for testing.");
+        assert_eq!(outcome.items_indexed, 0);
+        assert!(
+            outcome.items_error.is_some(),
+            "the parse failure must be visible to the caller, not just eprintln'd"
+        );
 
         // The unparseable item simply wasn't indexed -- no crash, no error.
         assert!(
@@ -366,12 +469,14 @@ mod tests {
         };
         let store = DocsStore::open_memory().unwrap();
 
-        let doc = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
+        let outcome = fetch_and_store(&fetcher, &store, "fake-crate", "1.0.0").unwrap();
 
-        assert_eq!(doc.content, "A fake crate for testing.");
-        assert_eq!(doc.path, "docsrs/fake-crate/1.0.0");
-        assert_eq!(doc.doc_type, "rust-crate");
-        assert!(doc.blob_hash.is_some());
+        assert_eq!(outcome.doc.content, "A fake crate for testing.");
+        assert_eq!(outcome.doc.path, "docsrs/fake-crate/1.0.0");
+        assert_eq!(outcome.doc.doc_type, "rust-crate");
+        assert!(outcome.doc.blob_hash.is_some());
+        assert_eq!(outcome.items_indexed, 0, "no items in this fixture");
+        assert!(outcome.items_error.is_none());
 
         let hits = store.search("fake crate", 10).unwrap();
         assert_eq!(hits.len(), 1);

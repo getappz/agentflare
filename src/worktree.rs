@@ -31,6 +31,41 @@ pub fn create_worktree(
     flare_git_core::worktree::create_worktree(item, repo_root, target_branch, as_progress(progress))
 }
 
+/// The `done`-side counterpart to `create_worktree`: removes it now that the
+/// item is finished, if its tree is clean. Best-effort like
+/// `push_and_open_pr` — never blocks `done` on a cleanup failure.
+pub fn cleanup_worktree(item: &agentflare_backend::item::Item, repo_root: &Path) {
+    flare_git_core::worktree::cleanup_item_worktree(item, repo_root);
+}
+
+/// Checks whether `item`'s branch already has a merged PR — the promotion
+/// signal `check_merge` uses to move an item out of "in_review" (item
+/// #420). Soft-fails like `push_and_open_pr`: no GitHub credentials, no
+/// resolvable remote, or a lookup failure all just report "not merged yet"
+/// rather than erroring, since the caller's fallback is simply to check
+/// again later.
+pub fn is_pr_merged(item: &agentflare_backend::item::Item, repo_root: &Path) -> bool {
+    let branch = format!("task/{}", item.sequence_id);
+    let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
+        return false;
+    };
+    let client = match crate::github::Client::new() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match crate::github::pulls::find_existing(&client, &repo, &branch) {
+        Ok(Some(pr)) => pr.merged_at.is_some(),
+        Ok(None) => false,
+        Err(e) => {
+            eprintln!(
+                "worktree: could not check merge status for item {}: {e}",
+                item.id
+            );
+            false
+        }
+    }
+}
+
 /// Pushes `item`'s isolated worktree branch and opens a PR against
 /// `target_branch` — the `done`-side counterpart to `create_worktree`.
 /// Deliberately never merges: unreviewed code should never land on the

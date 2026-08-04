@@ -406,6 +406,479 @@ fn item_done_without_new_commits_omits_pr_fields() {
 }
 
 #[test]
+fn item_done_removes_its_own_clean_worktree() {
+    // #420: `claim` provisions a worktree but nothing ever removed it,
+    // leaving an orphan behind after every `done`.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let claimed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let worktree_path = std::path::PathBuf::from(claimed["worktree_path"].as_str().unwrap());
+    assert!(
+        worktree_path.exists(),
+        "claim must have created the worktree"
+    );
+
+    s.item(Parameters(ItemRequest {
+        action: "done".into(),
+        id: Some(item_id),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    assert!(
+        !worktree_path.exists(),
+        "a cleanly-finished item's worktree must be removed on done, not orphaned"
+    );
+}
+
+#[test]
+fn item_release_removes_its_own_clean_worktree() {
+    // Item #335: `done`/`check_merge` were the only paths that ever cleaned
+    // up a claimed worktree -- a plain `release` (an agent abandoning a
+    // claim, or an item completed by hand outside the `done` flow) left it
+    // orphaned forever.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let claimed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let worktree_path = std::path::PathBuf::from(claimed["worktree_path"].as_str().unwrap());
+    assert!(
+        worktree_path.exists(),
+        "claim must have created the worktree"
+    );
+
+    let released: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "release".into(),
+            id: Some(item_id),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(released["released"], true, "{released:?}");
+    assert!(
+        !worktree_path.exists(),
+        "releasing a cleanly-finished claim must remove its worktree, not orphan it"
+    );
+}
+
+#[test]
+fn item_release_leaves_a_dirty_worktree_in_place() {
+    // The same safety net `done` gets: uncommitted changes exist ONLY in
+    // that checkout, so a release must never delete them out from under
+    // whoever might resume the work.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let claimed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let worktree_path = std::path::PathBuf::from(claimed["worktree_path"].as_str().unwrap());
+    std::fs::write(worktree_path.join("uncommitted.txt"), "not yet committed").unwrap();
+
+    s.item(Parameters(ItemRequest {
+        action: "release".into(),
+        id: Some(item_id),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    assert!(
+        worktree_path.join("uncommitted.txt").exists(),
+        "a dirty worktree must be left in place, not deleted out from under uncommitted work"
+    );
+}
+
+#[test]
+fn item_done_leaves_a_dirty_worktree_in_place() {
+    // The one case cleanup must refuse: uncommitted changes exist ONLY in
+    // that checkout, so deleting it would be destructive, not tidy.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    };
+    run_git(&repo_root, &["init", "-b", "master"]);
+    run_git(&repo_root, &["config", "user.email", "test@test.com"]);
+    run_git(&repo_root, &["config", "user.name", "Test"]);
+    run_git(&repo_root, &["commit", "--allow-empty", "-m", "initial"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let claimed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let worktree_path = std::path::PathBuf::from(claimed["worktree_path"].as_str().unwrap());
+    std::fs::write(worktree_path.join("uncommitted.txt"), "not yet committed").unwrap();
+
+    s.item(Parameters(ItemRequest {
+        action: "done".into(),
+        id: Some(item_id),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    assert!(
+        worktree_path.join("uncommitted.txt").exists(),
+        "a dirty worktree must be left in place, not deleted out from under uncommitted work"
+    );
+}
+
+#[test]
+fn item_done_with_push_false_never_pushes_the_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let remote_dir = tempfile::tempdir().unwrap();
+    let run_git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    };
+    run_git(remote_dir.path(), &["init", "--bare", "-b", "master"]);
+    run_git(&repo_root, &["init", "-b", "master"]);
+    run_git(&repo_root, &["config", "user.email", "test@test.com"]);
+    run_git(&repo_root, &["config", "user.name", "Test"]);
+    run_git(&repo_root, &["commit", "--allow-empty", "-m", "initial"]);
+    run_git(
+        &repo_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &remote_dir.path().to_string_lossy(),
+        ],
+    );
+    run_git(&repo_root, &["push", "origin", "master"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    let sequence_id = created["sequence_id"].as_i64().unwrap();
+
+    let claimed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let worktree_path = std::path::PathBuf::from(claimed["worktree_path"].as_str().unwrap());
+    std::fs::write(worktree_path.join("f.txt"), "x").unwrap();
+    run_git(&worktree_path, &["add", "f.txt"]);
+    run_git(&worktree_path, &["commit", "-m", "work"]);
+
+    let result: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "done".into(),
+            id: Some(item_id),
+            push: Some(false),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(result.get("pr_url").is_none());
+
+    let branch = format!("task/{sequence_id}");
+    let remote_refs = run_git(remote_dir.path(), &["branch", "--list", &branch]);
+    assert!(
+        String::from_utf8_lossy(&remote_refs.stdout)
+            .trim()
+            .is_empty(),
+        "push: false must not push the branch to the remote"
+    );
+}
+
+#[test]
+fn item_done_with_a_resulting_pr_moves_to_in_review_not_completed() {
+    // The regression this guards: state used to flip to "Completed" before
+    // the push even ran, so an item could show done while its PR was still
+    // unreviewed. Simulated here since producing a real pr_url needs live
+    // GitHub credentials -- push a real commit to a real local remote and
+    // fake an already-open PR by pre-seeding `find_existing`'s lookup is
+    // out of reach without a GitHub mock, so this drives `mark_in_review`
+    // directly the way `item_done` would once pr_url resolves, and asserts
+    // the response shape a caller would see.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    s.item(Parameters(ItemRequest {
+        action: "claim".into(),
+        id: Some(item_id.clone()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let owner = crate::claims::owner_id();
+    s.with_backend_db(|conn| {
+        assert!(agentflare_backend::item::mark_in_review(conn, &item_id, &owner).unwrap());
+    })
+    .unwrap();
+
+    let fetched: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "get".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        fetched["completed_at"].is_null(),
+        "in_review must not be treated as completed"
+    );
+
+    // The lease must still be held -- a genuinely different agent must be
+    // rejected mid-review. (The MCP `claim` action always uses this
+    // process's own fixed owner_id, so re-claiming through it can't
+    // simulate a different agent -- go straight at the backend, the same
+    // way item.rs's own claim tests do.)
+    s.with_backend_db(|conn| {
+        match agentflare_backend::item::claim(conn, &item_id, "agent:2", crate::claims::now(), 3600)
+            .unwrap()
+        {
+            agentflare_backend::item::ClaimOutcome::Held { .. } => {}
+            other => panic!("expected Held while in_review, got {other:?}"),
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn item_check_merge_is_a_noop_when_not_in_review() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let result: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "check_merge".into(),
+            id: Some(item_id),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["promoted"], false);
+    assert_eq!(result["reason"], "item is not in_review");
+}
+
+#[test]
+fn item_check_merge_leaves_an_in_review_item_alone_when_merge_status_is_unknown() {
+    // No remote configured in this throwaway repo, so `is_pr_merged`
+    // soft-fails to "not merged" -- check_merge must leave the item
+    // exactly as it found it, not guess.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    s.item(Parameters(ItemRequest {
+        action: "claim".into(),
+        id: Some(item_id.clone()),
+        ..Default::default()
+    }))
+    .unwrap();
+    let owner = crate::claims::owner_id();
+    s.with_backend_db(|conn| {
+        assert!(agentflare_backend::item::mark_in_review(conn, &item_id, &owner).unwrap());
+    })
+    .unwrap();
+
+    let result: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "check_merge".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["promoted"], false);
+    assert_eq!(result["reason"], "PR not merged yet");
+
+    let fetched: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "get".into(),
+            id: Some(item_id),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(fetched["completed_at"].is_null(), "must still be in_review");
+}
+
+#[test]
 fn item_rejects_unknown_action() {
     let (_tmp, s) = harness();
     let err = s

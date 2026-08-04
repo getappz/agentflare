@@ -230,6 +230,18 @@ pub(crate) struct HandoffRequest {
     #[schemars(description = "Evidence array [{kind, action, detail}] — session snapshot.")]
     #[serde(default)]
     pub(crate) evidence: Option<Vec<serde_json::Value>>,
+    #[schemars(
+        description = "Continuation commit OID the recipient should build on. Verified before being accepted: must exist in the repo, and (when the item's own task/<seq> branch already exists) be reachable from it. A fabricated or unreachable OID is rejected, not silently trusted."
+    )]
+    #[serde(default)]
+    pub(crate) last_commit: Option<String>,
+    #[schemars(description = "What's done so far — required, part of the structured payload.")]
+    pub(crate) completed: String,
+    #[schemars(description = "What's left to do — required, part of the structured payload.")]
+    pub(crate) remaining: String,
+    #[schemars(description = "Known blockers, if any.")]
+    #[serde(default)]
+    pub(crate) blockers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -433,26 +445,38 @@ pub(crate) struct FlareDocsRequest {
     #[serde(default)]
     pub(crate) package: Option<String>,
     #[schemars(
+        description = "Registry to look the package up in: rust (docs.rs, default), npm (npmjs.org, with @types fallback), or python (PyPI, with typeshed fallback). Scoped names like \"@types/node\" are treated as npm automatically."
+    )]
+    #[serde(default)]
+    pub(crate) ecosystem: Option<String>,
+    #[schemars(
         description = "Version requirement, e.g. \"latest\" or an exact semver (get, refresh); defaults to \"latest\""
     )]
     #[serde(default)]
     pub(crate) version: Option<String>,
-    #[schemars(description = "Max results to return (search, list); defaults to 10")]
+    #[schemars(
+        description = "Max results to return; search caps at 50 and defaults to 10, list caps at 500 and defaults to 100"
+    )]
     #[serde(default)]
     pub(crate) limit: Option<usize>,
+    #[schemars(
+        description = "Documents to skip before the page (list); defaults to 0. Pair with `limit` and the returned `total` to walk a cache larger than one page"
+    )]
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GitHubRequest {
     #[schemars(
-        description = "Action: pr_create|pr_list|pr_get|pr_status|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|release_list|release_get|release_latest|release_create|run_list|run_get|run_rerun|workflow_dispatch"
+        description = "Action: pr_create|pr_list|pr_get|pr_status|pr_wait|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|release_list|release_get|release_latest|release_create|run_list|run_get|run_rerun|workflow_dispatch"
     )]
     pub(crate) action: String,
     #[schemars(description = "owner/repo (default: resolved from the current repo's origin)")]
     #[serde(default)]
     pub(crate) repo: Option<String>,
     #[schemars(
-        description = "PR number (pr_get, pr_status, pr_merge, pr_comment, pr_request_review)"
+        description = "PR number (pr_get, pr_status, pr_wait, pr_merge, pr_comment, pr_request_review)"
     )]
     #[serde(default)]
     pub(crate) number: Option<u64>,
@@ -520,6 +544,14 @@ pub(crate) struct GitHubRequest {
     )]
     #[serde(default)]
     pub(crate) since: Option<String>,
+    #[schemars(
+        description = "pr_wait: max seconds to block polling checks before returning (default 60, capped at 120) — if still pending, call pr_wait again"
+    )]
+    #[serde(default)]
+    pub(crate) wait_secs: Option<u64>,
+    #[schemars(description = "pr_wait: seconds between check polls (default 10, min 3)")]
+    #[serde(default)]
+    pub(crate) poll_interval_secs: Option<u64>,
 }
 
 /// All local artifact backends (flared, another session, or our own
@@ -665,11 +697,11 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ItemRequest {
     #[schemars(
-        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|cancel|add_label|remove_label|groom|standup|health"
+        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health"
     )]
     pub(crate) action: String,
     #[schemars(
-        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, add_label, remove_label"
+        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label"
     )]
     #[serde(default)]
     pub(crate) id: Option<String>,
@@ -710,16 +742,18 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) label_id: Option<String>,
     #[schemars(
-        description = "Filter by state group (list); one of backlog|unstarted|started|completed|cancelled|triage, or a comma-separated list (e.g. \"backlog,unstarted,started\") to match any"
+        description = "Filter by state group (list); one of backlog|unstarted|started|in_review|completed|cancelled|triage, or a comma-separated list (e.g. \"backlog,unstarted,started\") to match any"
     )]
     #[serde(default)]
     pub(crate) state_group: Option<String>,
     #[schemars(
-        description = "Max items to return (list: omit for no limit; search: omit for 20, capped at 1000; groom: omit for 15, capped at 200)"
+        description = "Max items to return (list: omit for 50, capped at 500; search: omit for 20, capped at 1000; groom: omit for 15, capped at 200)"
     )]
     #[serde(default)]
     pub(crate) limit: Option<i64>,
-    #[schemars(description = "Items to skip before applying limit (list); default 0")]
+    #[schemars(
+        description = "Items to skip before applying limit (list); default 0. `list`'s response includes `next_offset`/`prev_offset` — pass those back here to page forward/backward"
+    )]
     #[serde(default)]
     pub(crate) offset: Option<i64>,
     #[schemars(description = "FTS5 search query (search)")]
@@ -743,6 +777,11 @@ pub(crate) struct ItemRequest {
     #[schemars(description = "Trailing weekly windows for velocity (health); default 4, max 52")]
     #[serde(default)]
     pub(crate) window_weeks: Option<i64>,
+    #[schemars(
+        description = "done only: push the branch and open a PR (default true, matching prior behavior). Set false to mark the item done without publishing anything — e.g. when the fix isn't ready to ship yet."
+    )]
+    #[serde(default)]
+    pub(crate) push: Option<bool>,
 }
 
 /// Lean per-item projection for `item(list)` — the raw 19-field `Item` (full
@@ -759,6 +798,22 @@ pub(crate) struct ItemSummary {
     pub(crate) parent_id: Option<String>,
     pub(crate) sequence_id: i64,
     pub(crate) updated_at: i64,
+}
+
+/// `item(list)`'s response envelope — carries `next_offset`/`prev_offset` so
+/// a caller paging through a large project can navigate by re-sending the
+/// given offset as-is, rather than re-deriving it from `total`/`limit`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ItemListPage {
+    pub(crate) items: Vec<ItemSummary>,
+    /// Count matching the filters, before this page's offset/limit were applied.
+    pub(crate) total: usize,
+    pub(crate) offset: usize,
+    pub(crate) limit: usize,
+    /// Pass as `offset` on the next call for the next page; `null` on the last page.
+    pub(crate) next_offset: Option<usize>,
+    /// Pass as `offset` on the next call for the previous page; `null` on the first page.
+    pub(crate) prev_offset: Option<usize>,
 }
 
 /// One shortlisted item plus the decision-support signals `groom` computes
