@@ -464,6 +464,125 @@ fn item_done_removes_its_own_clean_worktree() {
 }
 
 #[test]
+fn item_release_removes_its_own_clean_worktree() {
+    // Item #335: `done`/`check_merge` were the only paths that ever cleaned
+    // up a claimed worktree -- a plain `release` (an agent abandoning a
+    // claim, or an item completed by hand outside the `done` flow) left it
+    // orphaned forever.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let claimed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let worktree_path = std::path::PathBuf::from(claimed["worktree_path"].as_str().unwrap());
+    assert!(
+        worktree_path.exists(),
+        "claim must have created the worktree"
+    );
+
+    let released: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "release".into(),
+            id: Some(item_id),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(released["released"], true, "{released:?}");
+    assert!(
+        !worktree_path.exists(),
+        "releasing a cleanly-finished claim must remove its worktree, not orphan it"
+    );
+}
+
+#[test]
+fn item_release_leaves_a_dirty_worktree_in_place() {
+    // The same safety net `done` gets: uncommitted changes exist ONLY in
+    // that checkout, so a release must never delete them out from under
+    // whoever might resume the work.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let claimed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let worktree_path = std::path::PathBuf::from(claimed["worktree_path"].as_str().unwrap());
+    std::fs::write(worktree_path.join("uncommitted.txt"), "not yet committed").unwrap();
+
+    s.item(Parameters(ItemRequest {
+        action: "release".into(),
+        id: Some(item_id),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    assert!(
+        worktree_path.join("uncommitted.txt").exists(),
+        "a dirty worktree must be left in place, not deleted out from under uncommitted work"
+    );
+}
+
+#[test]
 fn item_done_leaves_a_dirty_worktree_in_place() {
     // The one case cleanup must refuse: uncommitted changes exist ONLY in
     // that checkout, so deleting it would be destructive, not tidy.
