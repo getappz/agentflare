@@ -415,7 +415,7 @@ struct PushRef {
 }
 
 fn strip_ref_prefix(name: &str) -> String {
-    name.trim_start_matches("refs/heads/").to_string()
+    name.strip_prefix("refs/heads/").unwrap_or(name).to_string()
 }
 
 /// Every local branch name, for `--all`/`--mirror` (which push every local
@@ -444,6 +444,13 @@ fn local_branches(repo_root: &Path) -> Option<Vec<String>> {
 /// pushed), while `is_protected_branch` on `destination` still catches
 /// "this deletes the default branch remotely".
 fn parse_refspec(spec: &str) -> PushRef {
+    // A leading `+` force-marks the whole refspec (`+master`,
+    // `+feature/x:master`) -- strip it before parsing. Left in place, the
+    // no-colon case below carries it straight into `source`/`destination`
+    // (`"+master"`), which then silently fails to match the default branch
+    // name and lets a force push of the default branch slip the
+    // direct-push guard entirely.
+    let spec = spec.strip_prefix('+').unwrap_or(spec);
     match spec.split_once(':') {
         Some((src, dst)) if !dst.is_empty() => {
             let dst = strip_ref_prefix(dst);
@@ -466,19 +473,60 @@ fn parse_refspec(spec: &str) -> PushRef {
     }
 }
 
+/// `git push` flags that consume a separate following argument (as opposed
+/// to the `--flag=value` form, which already reads as one token starting
+/// with `-` and is dropped whole by the flag filter below). Left
+/// unhandled, the value token (e.g. the `myrepo.git` in `--repo myrepo.git
+/// feature/x`) reads as an ordinary positional and throws off the
+/// `non_flags[0]` = remote / `non_flags[1..]` = refspecs split -- in the
+/// worst case (no explicit refspec) shifting a real branch name out of
+/// position and silently swapping in the flag's value as the "branch"
+/// being pushed, which then never matches the default branch name.
+const VALUE_TAKING_PUSH_FLAGS: &[&str] =
+    &["-o", "--push-option", "--receive-pack", "--repo", "--exec"];
+
+/// Positional (non-flag) arguments, with the value token following any
+/// `VALUE_TAKING_PUSH_FLAGS` entry dropped alongside the flag itself.
+fn non_flag_args(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut skip_next = false;
+    for a in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a.starts_with('-') {
+            if VALUE_TAKING_PUSH_FLAGS.contains(&a.as_str()) {
+                skip_next = true;
+            }
+            continue;
+        }
+        out.push(a.as_str());
+    }
+    out
+}
+
 /// Resolves every ref a `push` invocation would actually write, skipping
-/// flags positionally (`-u`, `--force`, `--force-with-lease`, `--tags`, ...)
-/// rather than assuming fixed indices -- a flag before the remote/refspec
-/// (e.g. `git push -u origin feature/x`) previously threw off a fixed-index
-/// read, misreading the remote name (`"origin"`) as the branch being pushed.
-/// Models three push shapes agentflare's own audit found `pushed_branch`
+/// flags positionally (`-u`, `--force`, `--force-with-lease`, ...) rather
+/// than assuming fixed indices -- a flag before the remote/refspec (e.g.
+/// `git push -u origin feature/x`) previously threw off a fixed-index read,
+/// misreading the remote name (`"origin"`) as the branch being pushed.
+/// Models the push shapes agentflare's own audit found `pushed_branch`
 /// collapsing into a single (wrong) branch name (item #321):
 /// - an explicit `src:dest` refspec (or several) -- each pair kept separate,
 ///   so e.g. `git push origin feature/x:master` is judged on `master` (the
 ///   actual write target), not `feature/x` (what was previously read as the
 ///   pushed branch, silently bypassing default-branch protection).
-/// - `--all`/`--mirror` -- every local branch, each to its same-named
-///   remote ref, not just the one branch a positional read would find.
+/// - `--all` -- every local branch, each to its same-named remote ref, not
+///   just the one branch a positional read would find.
+/// - `--mirror` -- pushes every ref (branches, tags, and deletes anything
+///   present remotely but not locally), a strictly larger surface than
+///   `local_branches` enumerates. Approximating it as "every local branch"
+///   could miss exactly the kind of write this exists to catch, so it's
+///   treated as unresolvable rather than under-approximated.
+/// - `--tags` with no explicit refspec -- pushes every tag, not a branch;
+///   there's nothing here for branch-protection/trust-root checks to
+///   inspect, so no ref (not even a current-branch fallback) applies.
 /// - no refspec at all (bare `git push`, or `git push <remote>`) -- falls
 ///   back to the current checked-out branch, pushed to itself.
 ///
@@ -487,12 +535,10 @@ fn parse_refspec(spec: &str) -> PushRef {
 /// callers must fail closed rather than assume nothing risky is being
 /// pushed.
 fn pushed_refs(repo_root: &Path, args: &[String]) -> Option<Vec<PushRef>> {
-    let non_flags: Vec<&str> = args
-        .iter()
-        .filter(|a| !a.starts_with('-'))
-        .map(String::as_str)
-        .collect();
-    if args.iter().any(|a| a == "--all" || a == "--mirror") {
+    if args.iter().any(|a| a == "--mirror") {
+        return None;
+    }
+    if args.iter().any(|a| a == "--all") {
         return local_branches(repo_root).map(|branches| {
             branches
                 .into_iter()
@@ -502,6 +548,10 @@ fn pushed_refs(repo_root: &Path, args: &[String]) -> Option<Vec<PushRef>> {
                 })
                 .collect()
         });
+    }
+    let non_flags = non_flag_args(args);
+    if args.iter().any(|a| a == "--tags") && non_flags.len() <= 1 {
+        return Some(Vec::new());
     }
     if non_flags.len() <= 1 {
         let branch = current_branch(repo_root)?;
@@ -577,26 +627,37 @@ pub fn classify_with_home(
     });
     let default_branch = resolve_default_branch(repo_root);
     // Resolve every ref the push actually writes, then derive both push
-    // facts from the full set: whether ANY of them carries trust-root
-    // changes, and whether ANY destination *is* the default branch (direct
-    // push blocked in favour of a PR). An unresolvable push mode/refspec
-    // (`pushed_refs` returning `None`) fails closed -- forcing
-    // `targets_default_branch` true regardless of `trust_root_touch` is what
-    // actually makes that closed: `classify_pure`'s `Unknown` arm only
-    // denies when paired with `targets_default_branch`, so leaving it
-    // `false` here would let an unresolvable push straight through.
+    // facts from the full set: whether ANY destination *is* the default
+    // branch (direct push blocked in favour of a PR), and -- only then --
+    // whether ANY of them carries trust-root changes. `classify_pure`
+    // never looks at `trust_root_touch` unless `targets_default_branch` is
+    // true (every match arm below it is gated on that), so checking it
+    // first skips `combined_trust_root_touch`'s `git diff` subprocesses
+    // entirely for the common case of a push that isn't touching the
+    // default branch. An unresolvable push mode/refspec (`pushed_refs`
+    // returning `None`) fails closed -- forcing `targets_default_branch`
+    // true regardless of `trust_root_touch` is what actually makes that
+    // closed: `classify_pure`'s `Unknown` arm only denies when paired with
+    // `targets_default_branch`, so leaving it `false` here would let an
+    // unresolvable push straight through.
     let (trust_root_touch, targets_default_branch) = if subcommand == "push" {
         match pushed_refs(repo_root, args) {
-            Some(refs) => (
-                combined_trust_root_touch(
-                    repo_root,
-                    &refs,
-                    &default_branch,
-                    &policy.trust_root_paths,
-                ),
-                refs.iter()
-                    .any(|r| is_protected_branch(&r.destination, Some(&default_branch))),
-            ),
+            Some(refs) => {
+                let targets_default_branch = refs
+                    .iter()
+                    .any(|r| is_protected_branch(&r.destination, Some(&default_branch)));
+                let trust_root_touch = if targets_default_branch {
+                    combined_trust_root_touch(
+                        repo_root,
+                        &refs,
+                        &default_branch,
+                        &policy.trust_root_paths,
+                    )
+                } else {
+                    TrustRootTouch::Clean
+                };
+                (trust_root_touch, targets_default_branch)
+            }
             None => (TrustRootTouch::Unknown, true),
         }
     } else {
@@ -1275,6 +1336,98 @@ mod tests {
                     destination: "master".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn pushed_refs_mirror_flag_is_unresolvable() {
+        // `--mirror` pushes every ref, including deletions of anything not
+        // present locally -- a strictly larger surface than `local_branches`
+        // enumerates. Approximating it the same way `--all` is handled could
+        // miss exactly the kind of write this exists to catch, so it must
+        // fail closed (`None`), not silently under-approximate.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        assert_eq!(
+            pushed_refs(&repo.path, &args(&["origin", "--mirror"])),
+            None
+        );
+    }
+
+    #[test]
+    fn pushed_refs_tags_only_push_has_no_branch_refs() {
+        // `git push origin --tags` with no explicit refspec pushes every
+        // tag, not a branch -- there's nothing here for branch-protection
+        // checks to inspect, and it must not fall back to "current branch"
+        // (which `--tags` never touches).
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        assert_eq!(
+            pushed_refs(&repo.path, &args(&["origin", "--tags"])),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn pushed_refs_skips_the_value_of_value_taking_flags() {
+        // `-o`/`--push-option`/`--receive-pack`/`--repo`/`--exec` all
+        // consume a separate following token. Left unskipped, that token
+        // reads as an ordinary positional and throws off the
+        // remote/refspec split -- in the worst case (no explicit refspec)
+        // the flag's value silently stands in for the branch actually
+        // being pushed, so a push of the real current branch (here the
+        // default branch) never gets recognized as one.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        let expect_master = PushRef {
+            source: "master".to_string(),
+            destination: "master".to_string(),
+        };
+        assert_eq!(
+            single_ref(pushed_refs(&repo.path, &args(&["-o", "ci.skip", "origin"]))),
+            expect_master
+        );
+        assert_eq!(
+            single_ref(pushed_refs(
+                &repo.path,
+                &args(&["--receive-pack", "/opt/git/git-receive-pack", "origin"])
+            )),
+            expect_master
+        );
+    }
+
+    #[test]
+    fn parse_refspec_strips_the_force_marker() {
+        // A leading `+` force-marks the whole refspec. Left in place on the
+        // no-colon form, "+master" never matches the default branch name
+        // "master", letting a force push of the default branch slip the
+        // direct-push guard entirely.
+        assert_eq!(
+            parse_refspec("+master"),
+            PushRef {
+                source: "master".to_string(),
+                destination: "master".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_refspec("+feature/x:master"),
+            PushRef {
+                source: "feature/x".to_string(),
+                destination: "master".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn force_push_of_default_branch_via_no_colon_refspec_is_denied_end_to_end() {
+        // `git push origin +master` -- a force push written in the no-colon
+        // `+branch` form rather than `--force`. Must be judged the same as
+        // an ordinary push of the default branch.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        crate::shell::run_in(&repo.path, &["commit", "--allow-empty", "-m", "init"]).unwrap();
+        let event = classify(&repo.path, "push", &args(&["origin", "+master"]));
+        assert!(
+            matches!(event.disposition, Disposition::Deny { .. }),
+            "{:?}",
+            event.disposition
         );
     }
 
