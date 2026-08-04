@@ -776,7 +776,7 @@ fn run_scope_check(subcommand: &str) -> ScopeCheckResult {
             "this touches path(s) inside claim '{target}' (owner {owner}, scope '{scope}') -- work inside that claim's own worktree, or coordinate with {owner}."
         )),
         scope::ScopeVerdict::OutOfTree { target } => scope_deny(format!(
-            "you hold claim '{target}' -- do this work in its isolated worktree, not the canonical checkout (see `git worktree add`)."
+            "you hold claim '{target}' -- do this work in its isolated worktree, not the canonical checkout. If '{target}' is an item, call `item(action=\"claim\", id=<item>)` for that same item to get its worktree path (this claim doesn't have one yet if it was acquired through the standalone `claim`/`mcp__flare__claim` tool, which only takes a scope lock -- `git worktree add` itself is blocked, so that command alone won't get you there)."
         )),
         scope::ScopeVerdict::Clear | scope::ScopeVerdict::Related => scope_pass(),
     }

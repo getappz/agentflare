@@ -297,7 +297,7 @@ pub fn classify_pure(
             if is_protected_branch(target, Some(default_branch)) {
                 Disposition::Deny {
                     reason: format!(
-                        "'{target}' is this repo's default branch — direct checkout/switch is blocked by the agentflare git shim. Create an isolated worktree first."
+                        "'{target}' is this repo's default branch — direct checkout/switch is blocked by the agentflare git shim. Call `item(action=\"claim\", id=<item>)` to get an isolated worktree instead (not the standalone `claim`/`mcp__flare__claim` tool, which only takes a scope lock)."
                     ),
                 }
             } else {
@@ -344,7 +344,7 @@ pub fn classify_pure(
                 Disposition::Passthrough
             } else {
                 Disposition::Deny {
-                    reason: "'git worktree' is orchestrator-managed by agentflare — use the `item` MCP tool's claim flow instead of calling it directly.".to_string(),
+                    reason: "'git worktree' is orchestrator-managed by agentflare — call `item(action=\"claim\", id=<item>)` to provision one. (Not the standalone `claim`/`mcp__flare__claim` tool -- that only takes a scope lock and does not create a worktree.)".to_string(),
                 }
             }
         }
