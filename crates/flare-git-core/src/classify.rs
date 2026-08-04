@@ -402,29 +402,145 @@ pub fn resolve_trust_root_touch(
     }
 }
 
-/// Resolves which local branch/ref a `push` invocation would actually
-/// push, skipping flags positionally (`-u`, `--force`, `--force-with-lease`,
-/// `--tags`, ...) rather than assuming `args[1]` -- a flag before the
-/// remote/refspec (e.g. `git push -u origin feature/x`) previously threw
-/// off a fixed-index read, misreading the remote name (`"origin"`) as the
-/// branch being pushed and either mis-diffing or spuriously denying. Falls
-/// back to the current checked-out branch when the refspec is omitted
-/// entirely (bare `git push`, or `git push <remote>` with no explicit ref
-/// -- both push the current/tracked branch, not something namable from
-/// `args` alone) -- this also closes the gap where the single most common
-/// push form (`git push`) skipped the trust-root check entirely.
-fn pushed_branch(repo_root: &Path, args: &[String]) -> Option<String> {
+/// One ref a `push` invocation would actually write, split into the two
+/// halves classification needs separately: `source` is the local content
+/// being pushed (what a trust-root diff runs against), `destination` is the
+/// remote ref name being written to (what `is_protected_branch` gates on).
+/// For a plain (no-colon) refspec, or the no-refspec fallback, the two are
+/// the same branch name; a `src:dest` refspec is the one case they diverge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PushRef {
+    source: String,
+    destination: String,
+}
+
+fn strip_ref_prefix(name: &str) -> String {
+    name.trim_start_matches("refs/heads/").to_string()
+}
+
+/// Every local branch name, for `--all`/`--mirror` (which push every local
+/// branch to its identically-named remote ref, not something namable from
+/// `args` alone). `None` if the listing itself fails -- callers must treat
+/// that as an unresolvable push, not as "no branches to worry about".
+fn local_branches(repo_root: &Path) -> Option<Vec<String>> {
+    crate::shell::run_in(
+        repo_root,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    )
+    .ok()
+    .map(|out| {
+        out.lines()
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+}
+
+/// One refspec argument (e.g. `feature/x`, `feature/x:master`, `:master` for
+/// a remote-delete) into its source/destination pair. A bare name with no
+/// colon pushes to a remote ref of the same name. An empty source half
+/// (delete form) has no local content to diff -- `destination` doubles as
+/// `source` so the trust-root diff below self-diffs to `Clean` (nothing was
+/// pushed), while `is_protected_branch` on `destination` still catches
+/// "this deletes the default branch remotely".
+fn parse_refspec(spec: &str) -> PushRef {
+    match spec.split_once(':') {
+        Some((src, dst)) if !dst.is_empty() => {
+            let dst = strip_ref_prefix(dst);
+            PushRef {
+                source: if src.is_empty() {
+                    dst.clone()
+                } else {
+                    strip_ref_prefix(src)
+                },
+                destination: dst,
+            }
+        }
+        _ => {
+            let name = strip_ref_prefix(spec.split(':').next().unwrap_or(spec));
+            PushRef {
+                source: name.clone(),
+                destination: name,
+            }
+        }
+    }
+}
+
+/// Resolves every ref a `push` invocation would actually write, skipping
+/// flags positionally (`-u`, `--force`, `--force-with-lease`, `--tags`, ...)
+/// rather than assuming fixed indices -- a flag before the remote/refspec
+/// (e.g. `git push -u origin feature/x`) previously threw off a fixed-index
+/// read, misreading the remote name (`"origin"`) as the branch being pushed.
+/// Models three push shapes agentflare's own audit found `pushed_branch`
+/// collapsing into a single (wrong) branch name (item #321):
+/// - an explicit `src:dest` refspec (or several) -- each pair kept separate,
+///   so e.g. `git push origin feature/x:master` is judged on `master` (the
+///   actual write target), not `feature/x` (what was previously read as the
+///   pushed branch, silently bypassing default-branch protection).
+/// - `--all`/`--mirror` -- every local branch, each to its same-named
+///   remote ref, not just the one branch a positional read would find.
+/// - no refspec at all (bare `git push`, or `git push <remote>`) -- falls
+///   back to the current checked-out branch, pushed to itself.
+///
+/// `None` means the push's targets couldn't be resolved at all (branch
+/// enumeration failed, or there's no current branch to fall back to) --
+/// callers must fail closed rather than assume nothing risky is being
+/// pushed.
+fn pushed_refs(repo_root: &Path, args: &[String]) -> Option<Vec<PushRef>> {
     let non_flags: Vec<&str> = args
         .iter()
         .filter(|a| !a.starts_with('-'))
         .map(String::as_str)
         .collect();
-    let raw = match non_flags.len() {
-        0 | 1 => current_branch(repo_root),
-        _ => Some(non_flags[1].to_string()),
-    }?;
-    let branch = raw.split(':').next().unwrap_or(&raw);
-    Some(branch.trim_start_matches("refs/heads/").to_string())
+    if args.iter().any(|a| a == "--all" || a == "--mirror") {
+        return local_branches(repo_root).map(|branches| {
+            branches
+                .into_iter()
+                .map(|b| PushRef {
+                    source: b.clone(),
+                    destination: b,
+                })
+                .collect()
+        });
+    }
+    if non_flags.len() <= 1 {
+        let branch = current_branch(repo_root)?;
+        return Some(vec![PushRef {
+            source: branch.clone(),
+            destination: branch,
+        }]);
+    }
+    Some(non_flags[1..].iter().map(|r| parse_refspec(r)).collect())
+}
+
+/// Folds `resolve_trust_root_touch` over every pushed ref's `source` --
+/// `Touched` wins over `Unknown` wins over `Clean`, and matched paths union
+/// across refs, so a trust-root change on ANY pushed ref is caught rather
+/// than only the first/only one a single-branch read would have inspected.
+fn combined_trust_root_touch(
+    repo_root: &Path,
+    refs: &[PushRef],
+    default_branch: &str,
+    trust_root_paths: &[String],
+) -> TrustRootTouch {
+    let mut touched: Vec<String> = Vec::new();
+    let mut saw_unknown = false;
+    for r in refs {
+        match resolve_trust_root_touch(repo_root, &r.source, default_branch, trust_root_paths) {
+            TrustRootTouch::Touched(paths) => touched.extend(paths),
+            TrustRootTouch::Unknown => saw_unknown = true,
+            TrustRootTouch::Clean => {}
+        }
+    }
+    if !touched.is_empty() {
+        touched.sort();
+        touched.dedup();
+        TrustRootTouch::Touched(touched)
+    } else if saw_unknown {
+        TrustRootTouch::Unknown
+    } else {
+        TrustRootTouch::Clean
+    }
 }
 
 /// I/O-resolving entry point: resolves the default branch and (for `push`
@@ -460,19 +576,32 @@ pub fn classify_with_home(
         ResolvedGitShimPolicy::baseline()
     });
     let default_branch = resolve_default_branch(repo_root);
-    // Resolve the actual pushed branch once, then derive both push facts from
-    // it: whether it carries trust-root changes and whether it *is* the
-    // default branch (direct push blocked in favour of a PR).
-    let pushed = (subcommand == "push")
-        .then(|| pushed_branch(repo_root, args))
-        .flatten();
-    let trust_root_touch = pushed
-        .as_deref()
-        .map(|b| resolve_trust_root_touch(repo_root, b, &default_branch, &policy.trust_root_paths))
-        .unwrap_or(TrustRootTouch::Clean);
-    let targets_default_branch = pushed
-        .as_deref()
-        .is_some_and(|b| is_protected_branch(b, Some(&default_branch)));
+    // Resolve every ref the push actually writes, then derive both push
+    // facts from the full set: whether ANY of them carries trust-root
+    // changes, and whether ANY destination *is* the default branch (direct
+    // push blocked in favour of a PR). An unresolvable push mode/refspec
+    // (`pushed_refs` returning `None`) fails closed -- forcing
+    // `targets_default_branch` true regardless of `trust_root_touch` is what
+    // actually makes that closed: `classify_pure`'s `Unknown` arm only
+    // denies when paired with `targets_default_branch`, so leaving it
+    // `false` here would let an unresolvable push straight through.
+    let (trust_root_touch, targets_default_branch) = if subcommand == "push" {
+        match pushed_refs(repo_root, args) {
+            Some(refs) => (
+                combined_trust_root_touch(
+                    repo_root,
+                    &refs,
+                    &default_branch,
+                    &policy.trust_root_paths,
+                ),
+                refs.iter()
+                    .any(|r| is_protected_branch(&r.destination, Some(&default_branch))),
+            ),
+            None => (TrustRootTouch::Unknown, true),
+        }
+    } else {
+        (TrustRootTouch::Clean, false)
+    };
     let mut disposition = classify_pure(
         subcommand,
         args,
@@ -1024,35 +1153,128 @@ mod tests {
         assert!(!is_destructive("clean", &args(&["--dry-run"])));
     }
 
+    fn single_ref(refs: Option<Vec<PushRef>>) -> PushRef {
+        let mut refs = refs.expect("push targets must resolve");
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        refs.remove(0)
+    }
+
     #[test]
-    fn pushed_branch_reads_the_refspec_positionally_skipping_leading_flags() {
+    fn pushed_refs_reads_the_refspec_positionally_skipping_leading_flags() {
         // `-u` before remote/refspec previously threw off a fixed-index
         // `args[1]` read, misreading "origin" as the branch being pushed.
         let repo = crate::shell::test_support::init_repo_with_branch("master");
+        let expect_feature_x = PushRef {
+            source: "feature/x".to_string(),
+            destination: "feature/x".to_string(),
+        };
         assert_eq!(
-            pushed_branch(&repo.path, &args(&["-u", "origin", "feature/x"])).as_deref(),
-            Some("feature/x")
+            single_ref(pushed_refs(
+                &repo.path,
+                &args(&["-u", "origin", "feature/x"])
+            )),
+            expect_feature_x
         );
         assert_eq!(
-            pushed_branch(&repo.path, &args(&["--force", "origin", "feature/x"])).as_deref(),
-            Some("feature/x")
+            single_ref(pushed_refs(
+                &repo.path,
+                &args(&["--force", "origin", "feature/x"])
+            )),
+            expect_feature_x
         );
         assert_eq!(
-            pushed_branch(&repo.path, &args(&["origin", "feature/x"])).as_deref(),
-            Some("feature/x")
+            single_ref(pushed_refs(&repo.path, &args(&["origin", "feature/x"]))),
+            expect_feature_x
         );
     }
 
     #[test]
-    fn pushed_branch_falls_back_to_current_branch_when_refspec_omitted() {
+    fn pushed_refs_falls_back_to_current_branch_when_refspec_omitted() {
         // Bare `git push` and `git push <remote>` (no explicit ref) both push
         // the current/tracked branch -- previously these skipped the
         // trust-root check entirely (args.len() >= 2 was false).
         let repo = crate::shell::test_support::init_repo_with_branch("feature/y");
-        assert_eq!(pushed_branch(&repo.path, &[]).as_deref(), Some("feature/y"));
+        let expect_feature_y = PushRef {
+            source: "feature/y".to_string(),
+            destination: "feature/y".to_string(),
+        };
+        assert_eq!(single_ref(pushed_refs(&repo.path, &[])), expect_feature_y);
         assert_eq!(
-            pushed_branch(&repo.path, &args(&["origin"])).as_deref(),
-            Some("feature/y")
+            single_ref(pushed_refs(&repo.path, &args(&["origin"]))),
+            expect_feature_y
+        );
+    }
+
+    #[test]
+    fn pushed_refs_splits_src_dest_refspecs_instead_of_reading_the_source_for_both_halves() {
+        // The item #321 bug: `pushed_branch` used to read only the refspec's
+        // source and use that single name for BOTH the trust-root diff and
+        // the "does this target the default branch" check. A `src:dest`
+        // refspec needs the two kept separate.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        assert_eq!(
+            single_ref(pushed_refs(
+                &repo.path,
+                &args(&["origin", "feature/x:master"])
+            )),
+            PushRef {
+                source: "feature/x".to_string(),
+                destination: "master".to_string(),
+            }
+        );
+        assert_eq!(
+            single_ref(pushed_refs(
+                &repo.path,
+                &args(&["origin", "master:feature/x"])
+            )),
+            PushRef {
+                source: "master".to_string(),
+                destination: "feature/x".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn pushed_refs_resolves_every_refspec_in_a_multi_ref_push() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        let refs = pushed_refs(
+            &repo.path,
+            &args(&["origin", "feature/a", "feature/b:master"]),
+        )
+        .unwrap();
+        assert_eq!(
+            refs,
+            vec![
+                PushRef {
+                    source: "feature/a".to_string(),
+                    destination: "feature/a".to_string(),
+                },
+                PushRef {
+                    source: "feature/b".to_string(),
+                    destination: "master".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pushed_refs_all_flag_resolves_every_local_branch_to_itself() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        crate::shell::run_in(&repo.path, &["branch", "feature/x"]).unwrap();
+        let mut refs = pushed_refs(&repo.path, &args(&["origin", "--all"])).unwrap();
+        refs.sort_by(|a, b| a.destination.cmp(&b.destination));
+        assert_eq!(
+            refs,
+            vec![
+                PushRef {
+                    source: "feature/x".to_string(),
+                    destination: "feature/x".to_string(),
+                },
+                PushRef {
+                    source: "master".to_string(),
+                    destination: "master".to_string(),
+                },
+            ]
         );
     }
 
@@ -1082,6 +1304,57 @@ mod tests {
         std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
         crate::shell::run_in(&repo.path, &["commit", "--allow-empty", "-m", "init"]).unwrap();
         let event = classify(&repo.path, "push", &[]);
+        assert!(
+            matches!(event.disposition, Disposition::Deny { .. }),
+            "{:?}",
+            event.disposition
+        );
+    }
+
+    #[test]
+    fn push_feature_to_master_via_dest_refspec_is_denied_end_to_end() {
+        // Item #321's exact bug: `git push origin feature/x:master` writes
+        // to the default branch through a `src:dest` refspec. The old
+        // `pushed_branch` read only "feature/x" (the source) and checked
+        // *that* against the default branch name -- never matching, so this
+        // push sailed through and bypassed default-branch protection
+        // entirely. The destination, not the source, is what must be
+        // checked.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        crate::shell::run_in(&repo.path, &["checkout", "-b", "feature/x"]).unwrap();
+        crate::shell::run_in(&repo.path, &["commit", "--allow-empty", "-m", "work"]).unwrap();
+        let event = classify(&repo.path, "push", &args(&["origin", "feature/x:master"]));
+        assert!(
+            matches!(event.disposition, Disposition::Deny { .. }),
+            "{:?}",
+            event.disposition
+        );
+    }
+
+    #[test]
+    fn push_master_to_a_feature_ref_via_src_refspec_is_not_denied_end_to_end() {
+        // The flip side of the same bug: `git push origin master:feature/x`
+        // pushes master's *content* to a non-default remote ref. The old
+        // code read "master" (the source) and, since that name matches the
+        // default branch, wrongly denied this even though the actual write
+        // destination isn't protected at all.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        let event = classify(&repo.path, "push", &args(&["origin", "master:feature/x"]));
+        assert_eq!(event.disposition, Disposition::Passthrough, "{event:?}");
+    }
+
+    #[test]
+    fn push_all_denied_when_any_local_branch_maps_to_the_default_branch() {
+        // `--all` pushes every local branch to its same-named remote ref --
+        // if one of those local branches happens to be named the same as
+        // the default branch, that ref-pair must be caught too, not just
+        // whichever single branch a positional read would have picked up.
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
+        crate::shell::run_in(&repo.path, &["branch", "feature/x"]).unwrap();
+        let event = classify(&repo.path, "push", &args(&["origin", "--all"]));
         assert!(
             matches!(event.disposition, Disposition::Deny { .. }),
             "{:?}",
