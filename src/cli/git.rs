@@ -887,15 +887,39 @@ fn ship_cmd(opts: ShipArgs) {
         std::process::exit(1);
     }
 
-    let ahead = shell::run_in(
+    if shell::run_in(&repo_root, &["rev-parse", "--verify", "--quiet", &base]).is_err() {
+        crate::ui::error(&format!(
+            "agentflare git ship: base '{base}' does not resolve in this repo -- pass --base explicitly"
+        ));
+        std::process::exit(1);
+    }
+    let ahead = match shell::run_in(
         &repo_root,
         &["rev-list", "--count", &format!("{base}..{head}")],
-    )
-    .unwrap_or_default();
-    if ahead.is_empty() || ahead == "0" {
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            crate::ui::error(&format!("agentflare git ship: could not count commits: {e}"));
+            std::process::exit(1);
+        }
+    };
+    if ahead == "0" {
         crate::ui::error(&format!(
             "agentflare git ship: '{head}' has no commits ahead of '{base}' -- nothing to ship"
         ));
+        std::process::exit(1);
+    }
+
+    // Resolved and validated before the push so an invalid title fails
+    // before anything remote happens -- every failure past this point only
+    // warns and returns instead of a hard exit, since the push has already
+    // landed by then and there's nothing left to abort.
+    let title = opts
+        .title
+        .clone()
+        .unwrap_or_else(|| default_pr_title(&repo_root, &head));
+    if let Err(e) = crate::mcp_server::AgentflareMcp::validate_conventional_pr_title(&title) {
+        crate::ui::error(&format!("agentflare git ship: {e} -- pass --title explicitly"));
         std::process::exit(1);
     }
 
@@ -919,21 +943,17 @@ fn ship_cmd(opts: ShipArgs) {
         }
     };
 
+    // `find_existing` matches open/closed/merged PRs alike (by design, for
+    // callers like `item done` that want to avoid re-opening a duplicate
+    // after a merge). `ship` needs the opposite for a closed/merged match:
+    // the caller just pushed new commits ahead of `base`, so that's new
+    // work needing a fresh PR, not a stale closed one to report as "open".
     let pr = match pulls::find_existing(&client, &repo, &head) {
-        Ok(Some(existing)) => {
+        Ok(Some(existing)) if existing.state == "open" => {
             crate::ui::success(&format!("PR already open: {}", existing.html_url));
             existing
         }
-        Ok(None) => {
-            let title = opts
-                .title
-                .clone()
-                .unwrap_or_else(|| default_pr_title(&repo_root, &head));
-            if let Err(e) = crate::mcp_server::AgentflareMcp::validate_conventional_pr_title(&title)
-            {
-                crate::ui::error(&format!("agentflare git ship: {e} -- pass --title explicitly"));
-                std::process::exit(1);
-            }
+        Ok(_) => {
             let body = opts
                 .body
                 .clone()
@@ -1010,7 +1030,11 @@ fn wait_for_checks(
             }
         };
         let summary = crate::github::mcp::checks_wait_summary(&checks, start.elapsed().as_secs());
-        if !summary["pending"].as_bool().unwrap_or(false) {
+        let total = summary["total_checks"].as_u64().unwrap_or(0);
+        // Zero checks means no workflow has registered against the head SHA
+        // yet (common in the first few seconds after a push) -- not a green
+        // build, so keep polling instead of reporting a false success.
+        if total > 0 && !summary["pending"].as_bool().unwrap_or(false) {
             let failed: Vec<String> = summary["failed_checks"]
                 .as_array()
                 .map(|a| {
@@ -1019,7 +1043,6 @@ fn wait_for_checks(
                         .collect()
                 })
                 .unwrap_or_default();
-            let total = summary["total_checks"].as_u64().unwrap_or(0);
             if failed.is_empty() {
                 crate::ui::success(&format!("CI green ({total} checks)"));
             } else {
