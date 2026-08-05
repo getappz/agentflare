@@ -1269,7 +1269,7 @@ impl AgentflareMcp {
     /// `amannn/action-semantic-pull-request` config so the check fires here
     /// instead of only after push+PR-open. Keep this type list in sync with
     /// that workflow file if it changes.
-    fn validate_conventional_pr_title(title: &str) -> Result<(), String> {
+    pub(crate) fn validate_conventional_pr_title(title: &str) -> Result<(), String> {
         const TYPES: &[&str] = &[
             "feat", "fix", "docs", "perf", "refactor", "style", "test", "chore", "ci",
         ];
