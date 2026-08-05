@@ -421,6 +421,14 @@ const DEFAULT_COACHING_RULES: &[DefaultCoachingRule] = &[
         sync: &["claude-code"],
         enforced: true,
     },
+    DefaultCoachingRule {
+        id: "yagni-gate",
+        title: "YAGNI check before writing code",
+        body: "@rule: before Write/Edit, run the flare-code ladder -- (1) does this need to exist at all? skip speculative features; (2) reuse an existing helper/util/pattern already in this codebase before writing a new one; (3) stdlib before custom code; (4) already-installed dependency before adding one; (5) shortest correct form wins. @why: catching over-engineering before the diff exists beats reviewing it after -- ponytail-measured ~54% avg LOC reduction, up to 94% on over-built patterns. @skip: mechanical edits (renames, formatting, config, generated files) and test/fixture code.",
+        tools: &["Write", "Edit"],
+        sync: &["claude-code"],
+        enforced: false,
+    },
 ];
 
 /// True if every `DEFAULT_COACHING_RULES` entry either doesn't exist yet
@@ -604,7 +612,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
         Component {
             id: "core-coaching",
             needs_consent: false,
-            describe: "built-in coaching rules nudging flare-docs, flare-search, lean-ctx, and flare tool-search over their native equivalents".to_string(),
+            describe: "built-in coaching rules nudging flare-docs, flare-search, lean-ctx, and flare tool-search over their native equivalents, plus a pre-write YAGNI check".to_string(),
             check: Box::new(move || !claude_code_only || coaching_defaults_satisfied()),
             apply: Box::new(move || {
                 if !claude_code_only {
@@ -1617,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn coaching_defaults_seed_all_four_rules_on_fresh_home() {
+    fn coaching_defaults_seed_all_default_rules_on_fresh_home() {
         crate::paths::test_support::with_temp_home(|| {
             assert!(!coaching_defaults_satisfied());
             let summary = apply_coaching_defaults();
