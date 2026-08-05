@@ -899,7 +899,9 @@ fn ship_cmd(opts: ShipArgs) {
     ) {
         Ok(n) => n,
         Err(e) => {
-            crate::ui::error(&format!("agentflare git ship: could not count commits: {e}"));
+            crate::ui::error(&format!(
+                "agentflare git ship: could not count commits: {e}"
+            ));
             std::process::exit(1);
         }
     };
@@ -919,7 +921,9 @@ fn ship_cmd(opts: ShipArgs) {
         .clone()
         .unwrap_or_else(|| default_pr_title(&repo_root, &head));
     if let Err(e) = crate::mcp_server::AgentflareMcp::validate_conventional_pr_title(&title) {
-        crate::ui::error(&format!("agentflare git ship: {e} -- pass --title explicitly"));
+        crate::ui::error(&format!(
+            "agentflare git ship: {e} -- pass --title explicitly"
+        ));
         std::process::exit(1);
     }
 
