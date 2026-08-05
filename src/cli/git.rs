@@ -54,6 +54,10 @@ pub enum GitCommand {
     Audit(WorktreeAuditArgs),
     /// Health sweep over all claim worktrees (flare doctor).
     Doctor(DoctorArgs),
+    /// Push the current branch, open (or find) its PR, then poll CI status
+    /// -- the "ship it" macro. Requires a clean working tree (commit first);
+    /// this never stages or commits for you.
+    Ship(ShipArgs),
 }
 
 #[derive(Args)]
@@ -169,6 +173,26 @@ pub enum DoctorFormat {
     Markdown,
 }
 
+#[derive(Args)]
+pub struct ShipArgs {
+    /// Base branch to open the PR against. Defaults to the repo's resolved default branch.
+    #[arg(long)]
+    pub base: Option<String>,
+    /// PR title. Defaults to the current branch's latest commit subject and
+    /// must be a conventional-commit type (feat/fix/docs/...).
+    #[arg(long)]
+    pub title: Option<String>,
+    /// PR body. Defaults to a bullet list of base..branch commit subjects.
+    #[arg(long)]
+    pub body: Option<String>,
+    /// Skip polling CI status after the PR is open/found.
+    #[arg(long)]
+    pub no_wait: bool,
+    /// Max seconds to poll CI before giving up (the PR is already open by then).
+    #[arg(long, default_value_t = 300)]
+    pub wait_secs: u64,
+}
+
 /// Canonical location: `~/.agentflare/githooks/`.
 fn shared_hooks_dir() -> PathBuf {
     home().join(".agentflare").join("githooks")
@@ -213,6 +237,7 @@ pub fn run(args: GitArgs) {
         GitCommand::ScopeCheck(opts) => scope_check(&opts.subcommand),
         GitCommand::Audit(opts) => worktree_audit_cmd(opts),
         GitCommand::Doctor(opts) => doctor_cmd(opts),
+        GitCommand::Ship(opts) => ship_cmd(opts),
     }
 }
 
@@ -820,6 +845,197 @@ fn changed_paths(repo_root: &Path, subcommand: &str) -> Vec<String> {
     shell::run_in(repo_root, &args)
         .map(|s| s.lines().map(String::from).collect())
         .unwrap_or_default()
+}
+
+/// The "ship it" macro: push the current branch, open (or reuse) its PR,
+/// then poll CI -- collapsing what's otherwise 3-4 separate `git`/`gh`
+/// calls (or `flare_git` MCP actions `pr_create`+`pr_wait`) into one.
+/// Deliberately never stages or commits: matches `item done`'s existing
+/// push_and_open_pr convention of only ever pushing what's already
+/// committed, so ship can't silently sweep up unrelated dirty files.
+fn ship_cmd(opts: ShipArgs) {
+    use crate::github::{Client, RepoId, pulls};
+
+    let Some(repo_root) = resolve_repo_root("ship") else {
+        return;
+    };
+
+    match shell::run_in(&repo_root, &["status", "--porcelain"]) {
+        Ok(s) if !s.is_empty() => {
+            crate::ui::error("agentflare git ship: uncommitted changes -- commit them first");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            crate::ui::error(&format!("agentflare git ship: {e}"));
+            std::process::exit(1);
+        }
+        _ => {}
+    }
+
+    let Some(head) = branch::current_branch(&repo_root) else {
+        crate::ui::error("agentflare git ship: could not resolve the current branch");
+        std::process::exit(1);
+    };
+    let base = opts
+        .base
+        .clone()
+        .unwrap_or_else(|| branch::resolve_default_branch(&repo_root));
+    if head == base {
+        crate::ui::error(&format!(
+            "agentflare git ship: on '{base}' itself -- checkout a feature branch first"
+        ));
+        std::process::exit(1);
+    }
+
+    let ahead = shell::run_in(
+        &repo_root,
+        &["rev-list", "--count", &format!("{base}..{head}")],
+    )
+    .unwrap_or_default();
+    if ahead.is_empty() || ahead == "0" {
+        crate::ui::error(&format!(
+            "agentflare git ship: '{head}' has no commits ahead of '{base}' -- nothing to ship"
+        ));
+        std::process::exit(1);
+    }
+
+    crate::ui::step(&format!("pushing {head}..."));
+    if let Err(e) = shell::run_in(&repo_root, &["push", "-u", "origin", &head]) {
+        crate::ui::error(&format!("agentflare git ship: push failed: {e}"));
+        std::process::exit(1);
+    }
+
+    let Some(repo) = RepoId::resolve_from_remote(&repo_root) else {
+        crate::ui::warning("pushed, but could not resolve the origin remote -- open a PR manually");
+        return;
+    };
+    let client = match Client::new() {
+        Ok(c) => c,
+        Err(e) => {
+            crate::ui::warning(&format!(
+                "pushed, but no GitHub credentials ({e}) -- open a PR manually"
+            ));
+            return;
+        }
+    };
+
+    let pr = match pulls::find_existing(&client, &repo, &head) {
+        Ok(Some(existing)) => {
+            crate::ui::success(&format!("PR already open: {}", existing.html_url));
+            existing
+        }
+        Ok(None) => {
+            let title = opts
+                .title
+                .clone()
+                .unwrap_or_else(|| default_pr_title(&repo_root, &head));
+            if let Err(e) = crate::mcp_server::AgentflareMcp::validate_conventional_pr_title(&title)
+            {
+                crate::ui::error(&format!("agentflare git ship: {e} -- pass --title explicitly"));
+                std::process::exit(1);
+            }
+            let body = opts
+                .body
+                .clone()
+                .unwrap_or_else(|| default_pr_body(&repo_root, &base, &head));
+            match pulls::create(&client, &repo, &title, &head, &base, Some(&body)) {
+                Ok(pr) => {
+                    crate::ui::success(&format!("opened PR #{}: {}", pr.number, pr.html_url));
+                    pr
+                }
+                Err(e) => {
+                    crate::ui::warning(&format!("pushed, but PR creation failed: {e}"));
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            crate::ui::warning(&format!(
+                "pushed, but could not check for an existing PR: {e}"
+            ));
+            return;
+        }
+    };
+
+    if opts.no_wait {
+        return;
+    }
+    wait_for_checks(&client, &repo, &pr, opts.wait_secs);
+}
+
+/// Falls back to the branch's latest commit subject when `--title` is
+/// omitted -- the same "just use the commit message" default a human
+/// running `gh pr create --fill` gets.
+fn default_pr_title(repo_root: &Path, branch_name: &str) -> String {
+    shell::run_in(repo_root, &["log", "-1", "--format=%s", branch_name])
+        .unwrap_or_else(|_| format!("ship {branch_name}"))
+}
+
+/// Falls back to a bullet list of `base..head` commit subjects when
+/// `--body` is omitted.
+fn default_pr_body(repo_root: &Path, base: &str, head: &str) -> String {
+    let log = shell::run_in(
+        repo_root,
+        &["log", "--format=- %s", &format!("{base}..{head}")],
+    )
+    .unwrap_or_default();
+    if log.is_empty() {
+        format!("Shipped via `agentflare git ship` ({base}..{head}).")
+    } else {
+        log
+    }
+}
+
+/// Bounded synchronous poll -- v1 scope deliberately stops here rather than
+/// a TUI-style live-refresh loop (see item #292's non-goal). Reuses
+/// `github::mcp::checks_wait_summary` so the pending/failed classification
+/// stays identical to the `flare_git` MCP tool's `pr_wait` action.
+fn wait_for_checks(
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    pr: &crate::github::models::PullRequest,
+    wait_secs: u64,
+) {
+    let Some(sha) = pr.head.as_ref().map(|h| h.sha.clone()) else {
+        return;
+    };
+    crate::ui::step("waiting for CI checks...");
+    let start = std::time::Instant::now();
+    loop {
+        let checks = match crate::github::actions::list_check_runs(client, repo, &sha) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::ui::warning(&format!("could not fetch check status: {e}"));
+                return;
+            }
+        };
+        let summary = crate::github::mcp::checks_wait_summary(&checks, start.elapsed().as_secs());
+        if !summary["pending"].as_bool().unwrap_or(false) {
+            let failed: Vec<String> = summary["failed_checks"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let total = summary["total_checks"].as_u64().unwrap_or(0);
+            if failed.is_empty() {
+                crate::ui::success(&format!("CI green ({total} checks)"));
+            } else {
+                crate::ui::error(&format!("CI failed: {}", failed.join(", ")));
+            }
+            return;
+        }
+        if start.elapsed().as_secs() >= wait_secs {
+            crate::ui::warning(&format!(
+                "still pending after {wait_secs}s -- check manually: {}",
+                pr.html_url
+            ));
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    }
 }
 
 #[cfg(test)]
