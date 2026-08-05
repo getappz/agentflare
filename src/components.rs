@@ -1641,6 +1641,22 @@ mod tests {
                 assert_eq!(r.body, d.body);
                 assert_eq!(r.tier, crate::coaching::rule::RuleTier::Builtin);
                 assert_eq!(r.enforced, d.enforced);
+                let got_tools: Vec<&str> = r
+                    .trigger
+                    .as_ref()
+                    .map(|t| t.tools.iter().map(String::as_str).collect())
+                    .unwrap_or_default();
+                assert_eq!(
+                    got_tools, d.tools,
+                    "rule '{}' tool trigger drifted from its default",
+                    d.id
+                );
+                let got_sync: Vec<&str> = r.sync.iter().map(String::as_str).collect();
+                assert_eq!(
+                    got_sync, d.sync,
+                    "rule '{}' sync target drifted from its default",
+                    d.id
+                );
             }
         });
     }
