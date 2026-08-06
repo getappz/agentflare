@@ -131,8 +131,51 @@ pub fn decide(conn: &rusqlite::Connection, item: &agentflare_backend::item::Item
         }
     }
 
-    // Tiers 3-6 land in Tasks 4-5.
-    Decision::run("stub: tiers 3-6 not yet implemented")
+    let now = crate::claims::now();
+    let ttl_secs = crate::claims::ttl_secs();
+
+    if let Some((goal_item, _)) = &goal {
+        // Tier 3: evidence-wait — a sibling under the same goal is in the
+        // "started" state group but its claim has gone stale (heartbeat
+        // past TTL): abandoned work needs a human look before this goal
+        // takes on anything new.
+        if let Ok(siblings) = agentflare_backend::item::list_by_project(conn, &goal_item.project_id) {
+            for sibling in siblings
+                .iter()
+                .filter(|s| s.parent_id.as_deref() == Some(goal_item.id.as_str()) && s.id != item.id)
+            {
+                let Ok(state) = agentflare_backend::state::get(conn, &sibling.state_id) else {
+                    continue;
+                };
+                if state.group_name != "started" {
+                    continue;
+                }
+                let has_any_claim = agentflare_backend::claim::current_owner(conn, &sibling.id).is_some();
+                let has_live_claim = agentflare_backend::claim::has_active_claim_by_other(
+                    conn, &sibling.id, "", now, ttl_secs,
+                )
+                .unwrap_or(false);
+                if has_any_claim && !has_live_claim {
+                    return Decision::wait(format!(
+                        "sibling item {} is started with a stale claim",
+                        sibling.id
+                    ));
+                }
+            }
+        }
+    }
+
+    // Tier 4: focus-wait — another agent already holds a live claim on this
+    // item itself.
+    let this_owner = item.assignee_agent.as_deref().unwrap_or("");
+    if agentflare_backend::claim::has_active_claim_by_other(conn, &item.id, this_owner, now, ttl_secs)
+        .unwrap_or(false)
+    {
+        return Decision::wait("another agent already holds a live claim on this item");
+    }
+
+    // Tiers 5-6 land in Task 5.
+    Decision::run("stub: tiers 5-6 not yet implemented")
 }
 
 #[cfg(test)]
@@ -316,5 +359,55 @@ mod tests {
 
         let decision = decide(&conn, &todo);
         assert_ne!(decision.effective_action, EffectiveAction::Ask);
+    }
+
+    fn seed_started_state(conn: &rusqlite::Connection, project_id: &str) -> String {
+        let states = agentflare_backend::state::list_by_project(conn, project_id).unwrap();
+        states
+            .iter()
+            .find(|s| s.group_name == "started")
+            .unwrap()
+            .id
+            .clone()
+    }
+
+    #[test]
+    fn stale_claim_on_sibling_waits() {
+        let conn = test_conn();
+        let (pid, sid) = seed_project(&conn);
+        let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, 0);
+        let started_sid = seed_started_state(&conn, &pid);
+        let stalled_sibling = make_todo(&conn, &pid, &started_sid, &goal.id);
+        // Claim it, then let the TTL be zero seconds — instantly stale.
+        agentflare_backend::claim::acquire(&conn, &stalled_sibling.id, "claude:1", crate::claims::now() - 10_000, 1)
+            .unwrap();
+        let todo = make_todo(&conn, &pid, &sid, &goal.id);
+
+        let decision = decide(&conn, &todo);
+        assert_eq!(decision.effective_action, EffectiveAction::Wait);
+    }
+
+    #[test]
+    fn live_claim_by_another_agent_on_this_item_waits() {
+        let conn = test_conn();
+        let (pid, sid) = seed_project(&conn);
+        let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, 0);
+        let todo = make_todo(&conn, &pid, &sid, &goal.id);
+        agentflare_backend::claim::acquire(&conn, &todo.id, "codex:1", crate::claims::now(), 1800)
+            .unwrap();
+
+        let decision = decide(&conn, &todo);
+        assert_eq!(decision.effective_action, EffectiveAction::Wait);
+    }
+
+    #[test]
+    fn no_claims_anywhere_falls_through_past_tiers_3_and_4() {
+        let conn = test_conn();
+        let (pid, sid) = seed_project(&conn);
+        let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, 0);
+        let todo = make_todo(&conn, &pid, &sid, &goal.id);
+
+        let decision = decide(&conn, &todo);
+        assert_ne!(decision.effective_action, EffectiveAction::Wait);
     }
 }
