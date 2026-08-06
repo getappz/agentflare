@@ -8,6 +8,7 @@ use crate::mcp_server::types::{CommentRequest, ItemRequest};
 const READY_LABEL: &str = "ready-for-work";
 const DISPATCHED_LABEL: &str = "dispatched";
 const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
+const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 
 /// Returns the matching `Agent` only if `agent_registry::autonomous_args`
 /// confirms it has a headless permission-bypass flag — the same gate
@@ -58,19 +59,39 @@ pub(crate) fn run_discovery_tick(
     };
 
     for item in items {
-        match item
-            .assignee_agent
-            .as_deref()
-            .and_then(resolve_confirmed_agent)
-        {
-            None => {
-                skip_item(mcp, &item, &label_id_by_name, &ready_id);
-                result.skipped += 1;
-            }
-            Some(agent) => {
+        match crate::quota::decide::decide_for_supervisor(mcp, &item) {
+            crate::quota::decide::EffectiveAction::Run
+            | crate::quota::decide::EffectiveAction::SelfRepair => {
+                let Some(agent) = item
+                    .assignee_agent
+                    .as_deref()
+                    .and_then(resolve_confirmed_agent)
+                else {
+                    // decide() already checked eligibility (tier 5) before
+                    // returning Run/SelfRepair, so this is unreachable in
+                    // practice; treat it the same as the pre-existing skip
+                    // path rather than panicking on a decision-vs-dispatch
+                    // mismatch.
+                    skip_item(mcp, &item, &label_id_by_name, &ready_id);
+                    result.skipped += 1;
+                    continue;
+                };
                 if dispatch_item(mcp, queue, &item, agent, &label_id_by_name, &ready_id) {
                     result.dispatched += 1;
                 }
+            }
+            crate::quota::decide::EffectiveAction::Ask(question) => {
+                ask_item(mcp, &item, &question, &label_id_by_name, &ready_id);
+                result.skipped += 1;
+            }
+            crate::quota::decide::EffectiveAction::Wait => {
+                // Leave the ready-for-work label in place: the wait
+                // condition may clear before the next tick, and the item
+                // must still be visible to that tick's discovery query.
+            }
+            crate::quota::decide::EffectiveAction::StayQuiet => {
+                skip_item(mcp, &item, &label_id_by_name, &ready_id);
+                result.skipped += 1;
             }
         }
     }
@@ -106,6 +127,35 @@ fn skip_item(
             action: "add_label".into(),
             id: Some(item.id.clone()),
             label_id: Some(needs_manual_id.clone()),
+            ..Default::default()
+        });
+    }
+}
+
+fn ask_item(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    question: &str,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+    ready_id: &str,
+) {
+    let _ = mcp.comment_impl(CommentRequest {
+        action: "create".into(),
+        item_id: Some(item.id.clone()),
+        body: Some(format!("## supervisor — gated\n\n{question}")),
+        ..Default::default()
+    });
+    let _ = mcp.item_remove_label(ItemRequest {
+        action: "remove_label".into(),
+        id: Some(item.id.clone()),
+        label_id: Some(ready_id.to_string()),
+        ..Default::default()
+    });
+    if let Some(gated_id) = label_id_by_name.get(NEEDS_HUMAN_GATE_LABEL) {
+        let _ = mcp.item_add_label(ItemRequest {
+            action: "add_label".into(),
+            id: Some(item.id.clone()),
+            label_id: Some(gated_id.clone()),
             ..Default::default()
         });
     }
@@ -271,6 +321,269 @@ mod tests {
             .unwrap();
         assert!(!labels_contain_name(&mcp, &labels, "ready-for-work"));
         assert!(labels_contain_name(&mcp, &labels, "dispatched"));
+    }
+
+    fn seed_ready_item_under_gated_goal(mcp: &AgentflareMcp) -> String {
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            for name in [
+                "ready-for-work",
+                "dispatched",
+                "needs-manual-dispatch",
+                NEEDS_HUMAN_GATE_LABEL,
+            ] {
+                let _ = agentflare_backend::label::create(
+                    conn,
+                    agentflare_backend::label::CreateLabel {
+                        project_id: Some(project.id.clone()),
+                        workspace_id: project.workspace_id.clone(),
+                        name: name.into(),
+                        color: None,
+                        parent_id: None,
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                    },
+                );
+            }
+            let states = agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+            let state_id = states.iter().find(|s| s.is_default).unwrap().id.clone();
+            let goal_metadata = serde_json::json!({
+                "goal": {
+                    "objective": "ship it",
+                    "scope": { "allowed_paths": [], "disallowed_actions": [] },
+                    "quota_mode": "default",
+                    "lifecycle": "gated",
+                    "consecutive_self_repairs": 0,
+                }
+            })
+            .to_string();
+            let goal_item = agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id.clone(),
+                    state_id: state_id.clone(),
+                    name: "goal".into(),
+                    description: None,
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: Some(goal_metadata),
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                },
+            )
+            .unwrap();
+            let item = agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id.clone(),
+                    state_id,
+                    name: "Do the thing".into(),
+                    description: Some("do it well".into()),
+                    priority: None,
+                    parent_id: Some(goal_item.id.clone()),
+                    assignee_agent: Some("claude-code".into()),
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: None,
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                },
+            )
+            .unwrap();
+            let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+            let ready_id = &labels
+                .iter()
+                .find(|l| l.name == "ready-for-work")
+                .unwrap()
+                .id;
+            agentflare_backend::item::add_label(conn, &item.id, ready_id).unwrap();
+            item.id
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn gated_goal_never_dispatches_and_relabels_to_needs_human_gate() {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_ready_item_under_gated_goal(&mcp);
+
+        let result = run_discovery_tick(&mcp, &queue);
+
+        assert_eq!(result.dispatched, 0);
+        assert!(
+            queue.list(None).unwrap().is_empty(),
+            "an ask decision must never enqueue a job"
+        );
+
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(!labels_contain_name(&mcp, &labels, "ready-for-work"));
+        assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
+    }
+
+    fn seed_ready_item_under_active_goal_with_repairs(
+        mcp: &AgentflareMcp,
+        repairs: u32,
+    ) -> (String, String) {
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            for name in [
+                "ready-for-work",
+                "dispatched",
+                "needs-manual-dispatch",
+                NEEDS_HUMAN_GATE_LABEL,
+            ] {
+                let _ = agentflare_backend::label::create(
+                    conn,
+                    agentflare_backend::label::CreateLabel {
+                        project_id: Some(project.id.clone()),
+                        workspace_id: project.workspace_id.clone(),
+                        name: name.into(),
+                        color: None,
+                        parent_id: None,
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                    },
+                );
+            }
+            let states = agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+            let state_id = states.iter().find(|s| s.is_default).unwrap().id.clone();
+            let goal_metadata = serde_json::json!({
+                "goal": {
+                    "objective": "ship it",
+                    "scope": { "allowed_paths": [], "disallowed_actions": [] },
+                    "quota_mode": "default",
+                    "lifecycle": "active",
+                    "consecutive_self_repairs": repairs,
+                }
+            })
+            .to_string();
+            let goal_item = agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id.clone(),
+                    state_id: state_id.clone(),
+                    name: "goal".into(),
+                    description: None,
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: Some(goal_metadata),
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                },
+            )
+            .unwrap();
+            agentflare_backend::vent::upsert(
+                conn,
+                &project.id,
+                "minor friction",
+                "low",
+                "[]",
+                "topic",
+                "evt-1",
+                1,
+                crate::claims::now(),
+            )
+            .unwrap();
+            let vents = agentflare_backend::vent::list(conn, &project.id, false).unwrap();
+            agentflare_backend::vent::set_actionable(conn, &vents[0].id, true).unwrap();
+            agentflare_backend::vent::link_item(conn, &vents[0].id, &goal_item.id).unwrap();
+            let item = agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id.clone(),
+                    state_id,
+                    name: "Do the thing".into(),
+                    description: Some("do it well".into()),
+                    priority: None,
+                    parent_id: Some(goal_item.id.clone()),
+                    assignee_agent: Some("claude-code".into()),
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: None,
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                },
+            )
+            .unwrap();
+            let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+            let ready_id = &labels
+                .iter()
+                .find(|l| l.name == "ready-for-work")
+                .unwrap()
+                .id;
+            agentflare_backend::item::add_label(conn, &item.id, ready_id).unwrap();
+            (item.id, goal_item.id)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn under_cap_self_repairs_and_dispatches() {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let (_item_id, _goal_id) = seed_ready_item_under_active_goal_with_repairs(&mcp, 0);
+
+        let result = run_discovery_tick(&mcp, &queue);
+
+        assert_eq!(result.dispatched, 1, "self-repair still dispatches the job");
+        assert_eq!(queue.list(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn at_cap_forces_ask_instead_of_dispatching() {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let (item_id, _goal_id) = seed_ready_item_under_active_goal_with_repairs(
+            &mcp,
+            crate::quota::decide::SELF_REPAIR_CAP,
+        );
+
+        let result = run_discovery_tick(&mcp, &queue);
+
+        assert_eq!(
+            result.dispatched, 0,
+            "the cap must force ask, not another self-repair dispatch"
+        );
+        assert!(queue.list(None).unwrap().is_empty());
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
+    }
+
+    #[test]
+    fn ungrouped_ready_item_dispatches_exactly_as_before_this_change() {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        // Reuses the pre-existing seed_ready_item helper (no goal ancestor
+        // at all) — this is the plan's explicit no-regression guarantee.
+        let item_id = seed_ready_item(&mcp, Some("claude-code"));
+
+        let result = run_discovery_tick(&mcp, &queue);
+
+        assert_eq!(result.dispatched, 1);
+        assert_eq!(result.skipped, 0);
+        let jobs = queue.list(None).unwrap();
+        assert!(jobs[0].args.contains(&item_id));
     }
 
     #[test]

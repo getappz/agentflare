@@ -48,6 +48,7 @@ mod optimize;
 mod paths;
 mod pricing;
 mod progress;
+mod quota;
 mod review;
 mod rollup;
 mod rule_text;
