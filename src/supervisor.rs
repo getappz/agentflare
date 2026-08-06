@@ -2,8 +2,8 @@
 //! dispatches an `agentflare work` job for each one whose assignee is a
 //! confirmed-autonomous agent (skips the rest with a comment).
 
-use crate::mcp_server::AgentflareMcp;
 use crate::mcp_server::types::{CommentRequest, ItemRequest};
+use crate::mcp_server::AgentflareMcp;
 
 const READY_LABEL: &str = "ready-for-work";
 const DISPATCHED_LABEL: &str = "dispatched";

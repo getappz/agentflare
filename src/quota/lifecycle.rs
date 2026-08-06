@@ -11,6 +11,10 @@ pub enum GoalLifecycle {
     Done,
 }
 
+// Only `Gate` has a caller today (decide_for_supervisor's Ask branch). The
+// rest complete the state machine for the quota MCP tool this item's spec
+// calls for, which isn't wired up yet.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleEvent {
     Pause,
@@ -79,11 +83,9 @@ mod tests {
             GoalLifecycle::Gated.apply(LifecycleEvent::Clear),
             Ok(GoalLifecycle::Active)
         );
-        assert!(
-            GoalLifecycle::Gated
-                .apply(LifecycleEvent::Complete)
-                .is_err()
-        );
+        assert!(GoalLifecycle::Gated
+            .apply(LifecycleEvent::Complete)
+            .is_err());
     }
 
     #[test]
