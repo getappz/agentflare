@@ -83,9 +83,11 @@ mod tests {
             GoalLifecycle::Gated.apply(LifecycleEvent::Clear),
             Ok(GoalLifecycle::Active)
         );
-        assert!(GoalLifecycle::Gated
-            .apply(LifecycleEvent::Complete)
-            .is_err());
+        assert!(
+            GoalLifecycle::Gated
+                .apply(LifecycleEvent::Complete)
+                .is_err()
+        );
     }
 
     #[test]
