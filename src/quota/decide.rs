@@ -12,7 +12,7 @@ pub const SELF_REPAIR_CAP: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum EffectiveAction {
+pub enum EffectiveActionInternal {
     Run,
     Ask,
     Wait,
@@ -23,7 +23,7 @@ pub enum EffectiveAction {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Decision {
     pub should_run: bool,
-    pub effective_action: EffectiveAction,
+    pub effective_action: EffectiveActionInternal,
     pub reason: String,
     pub gate_question: Option<String>,
 }
@@ -32,7 +32,7 @@ impl Decision {
     fn run(reason: impl Into<String>) -> Self {
         Decision {
             should_run: true,
-            effective_action: EffectiveAction::Run,
+            effective_action: EffectiveActionInternal::Run,
             reason: reason.into(),
             gate_question: None,
         }
@@ -41,7 +41,7 @@ impl Decision {
     fn ask(reason: impl Into<String>, question: impl Into<String>) -> Self {
         Decision {
             should_run: false,
-            effective_action: EffectiveAction::Ask,
+            effective_action: EffectiveActionInternal::Ask,
             reason: reason.into(),
             gate_question: Some(question.into()),
         }
@@ -50,7 +50,7 @@ impl Decision {
     fn self_repair(reason: impl Into<String>) -> Self {
         Decision {
             should_run: true,
-            effective_action: EffectiveAction::SelfRepair,
+            effective_action: EffectiveActionInternal::SelfRepair,
             reason: reason.into(),
             gate_question: None,
         }
@@ -59,7 +59,7 @@ impl Decision {
     fn wait(reason: impl Into<String>) -> Self {
         Decision {
             should_run: false,
-            effective_action: EffectiveAction::Wait,
+            effective_action: EffectiveActionInternal::Wait,
             reason: reason.into(),
             gate_question: None,
         }
@@ -68,7 +68,7 @@ impl Decision {
     fn stay_quiet(reason: impl Into<String>) -> Self {
         Decision {
             should_run: false,
-            effective_action: EffectiveAction::StayQuiet,
+            effective_action: EffectiveActionInternal::StayQuiet,
             reason: reason.into(),
             gate_question: None,
         }
@@ -77,7 +77,7 @@ impl Decision {
     fn fail_closed(reason: impl Into<String>) -> Self {
         Decision {
             should_run: false,
-            effective_action: EffectiveAction::Ask,
+            effective_action: EffectiveActionInternal::Ask,
             reason: reason.into(),
             gate_question: Some(
                 "This goal's saved state is invalid and needs a human to fix it before work can continue.".into(),
@@ -186,6 +186,66 @@ pub fn decide(conn: &rusqlite::Connection, item: &agentflare_backend::item::Item
     // enforcement (a port of agenticmq::limiter's sliding-window TPM/RPM
     // logic) is a follow-on spec; this is its interface point.
     Decision::run("eligible and nothing blocking")
+}
+
+/// Caller-facing dispatch decision for `run_discovery_tick`'s match:
+/// `Decision`'s tier-level result is folded so the `Ask` variant carries
+/// the gate question inline, and the goal lifecycle transition / self-repair
+/// counter side effects that `decide()` itself (being side-effect-free)
+/// deliberately does not perform are applied here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectiveAction {
+    Run,
+    SelfRepair,
+    Wait,
+    Ask(String),
+    StayQuiet,
+}
+
+pub fn decide_for_supervisor(
+    mcp: &crate::mcp_server::AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+) -> EffectiveAction {
+    let decision = mcp
+        .with_backend_db(|conn| decide(conn, item))
+        .unwrap_or_else(|_| Decision::fail_closed("could not open backend db"));
+
+    let goal = mcp
+        .with_backend_db(|conn| super::goal::find_goal_ancestor(conn, item))
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+
+    match decision.effective_action {
+        EffectiveActionInternal::Run => EffectiveAction::Run,
+        EffectiveActionInternal::SelfRepair => {
+            if let Some((goal_item, mut meta)) = goal {
+                meta.consecutive_self_repairs += 1;
+                let _ = mcp.with_backend_db(|conn| {
+                    super::goal::save_goal_metadata(conn, &goal_item.id, &meta)
+                });
+            }
+            EffectiveAction::SelfRepair
+        }
+        EffectiveActionInternal::Wait => EffectiveAction::Wait,
+        EffectiveActionInternal::Ask => {
+            if let Some((goal_item, mut meta)) = goal {
+                meta.consecutive_self_repairs = 0;
+                if let Ok(next) = meta.lifecycle.apply(super::lifecycle::LifecycleEvent::Gate) {
+                    meta.lifecycle = next;
+                }
+                let _ = mcp.with_backend_db(|conn| {
+                    super::goal::save_goal_metadata(conn, &goal_item.id, &meta)
+                });
+            }
+            EffectiveAction::Ask(
+                decision
+                    .gate_question
+                    .unwrap_or_else(|| decision.reason.clone()),
+            )
+        }
+        EffectiveActionInternal::StayQuiet => EffectiveAction::StayQuiet,
+    }
 }
 
 #[cfg(test)]
@@ -306,7 +366,7 @@ mod tests {
         agentflare_backend::vent::link_item(&conn, &vents[0].id, &goal.id).unwrap();
 
         let decision = decide(&conn, &todo);
-        assert_eq!(decision.effective_action, EffectiveAction::Ask);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Ask);
         assert!(!decision.should_run);
         assert!(decision.gate_question.is_some());
     }
@@ -327,7 +387,7 @@ mod tests {
         agentflare_backend::vent::link_item(&conn, &vents[0].id, &goal.id).unwrap();
 
         let decision = decide(&conn, &todo);
-        assert_eq!(decision.effective_action, EffectiveAction::SelfRepair);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::SelfRepair);
     }
 
     #[test]
@@ -346,7 +406,7 @@ mod tests {
         agentflare_backend::vent::link_item(&conn, &vents[0].id, &goal.id).unwrap();
 
         let decision = decide(&conn, &todo);
-        assert_eq!(decision.effective_action, EffectiveAction::Ask);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Ask);
     }
 
     #[test]
@@ -357,7 +417,7 @@ mod tests {
         let todo = make_todo(&conn, &pid, &sid, &goal.id);
 
         let decision = decide(&conn, &todo);
-        assert_eq!(decision.effective_action, EffectiveAction::Ask);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Ask);
     }
 
     #[test]
@@ -368,7 +428,7 @@ mod tests {
         let todo = make_todo(&conn, &pid, &sid, &goal.id);
 
         let decision = decide(&conn, &todo);
-        assert_ne!(decision.effective_action, EffectiveAction::Ask);
+        assert_ne!(decision.effective_action, EffectiveActionInternal::Ask);
     }
 
     fn seed_started_state(conn: &rusqlite::Connection, project_id: &str) -> String {
@@ -394,7 +454,7 @@ mod tests {
         let todo = make_todo(&conn, &pid, &sid, &goal.id);
 
         let decision = decide(&conn, &todo);
-        assert_eq!(decision.effective_action, EffectiveAction::Wait);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Wait);
     }
 
     #[test]
@@ -407,7 +467,7 @@ mod tests {
             .unwrap();
 
         let decision = decide(&conn, &todo);
-        assert_eq!(decision.effective_action, EffectiveAction::Wait);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Wait);
     }
 
     #[test]
@@ -418,7 +478,7 @@ mod tests {
         let todo = make_todo(&conn, &pid, &sid, &goal.id);
 
         let decision = decide(&conn, &todo);
-        assert_ne!(decision.effective_action, EffectiveAction::Wait);
+        assert_ne!(decision.effective_action, EffectiveActionInternal::Wait);
     }
 
     #[test]
@@ -439,7 +499,7 @@ mod tests {
         todo = agentflare_backend::item::get(&conn, &todo.id).unwrap();
 
         let decision = decide(&conn, &todo);
-        assert_eq!(decision.effective_action, EffectiveAction::StayQuiet);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::StayQuiet);
         assert!(!decision.should_run);
     }
 
@@ -451,7 +511,7 @@ mod tests {
         let todo = make_todo(&conn, &pid, &sid, &goal.id);
 
         let decision = decide(&conn, &todo);
-        assert_eq!(decision.effective_action, EffectiveAction::Run);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Run);
         assert!(decision.should_run);
     }
 
@@ -481,7 +541,7 @@ mod tests {
         .unwrap();
 
         let decision = decide(&conn, &todo);
-        assert_eq!(decision.effective_action, EffectiveAction::Run);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Run);
     }
 
     #[test]
@@ -512,7 +572,7 @@ mod tests {
 
         let decision = decide(&conn, &todo);
         assert!(!decision.should_run);
-        assert_eq!(decision.effective_action, EffectiveAction::Ask);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Ask);
         assert!(decision.reason.contains("goal_state_invalid"));
     }
 }
