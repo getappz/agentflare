@@ -276,13 +276,30 @@ fn run_work(args: WorkArgs) -> i32 {
     // same resolver `resolve_agent` uses further down post-claim — so this
     // check and the real resolution can never diverge. Auto-routing needs
     // the claimed item's own attributes, so it's resolved further down.
-    if let Some(explicit) = args.agent.as_deref()
-        && agent_registry::agent_by_name(explicit).is_none()
-    {
-        crate::ui::error(&format!(
-            "unknown agent: {explicit} — use `agentflare agents list`"
-        ));
-        return 1;
+    if let Some(explicit) = args.agent.as_deref() {
+        let Some(resolved) = agent_registry::agent_by_name(explicit) else {
+            crate::ui::error(&format!(
+                "unknown agent: {explicit} — use `agentflare agents list`"
+            ));
+            return 1;
+        };
+        // The claim below identifies its own owner via `claims::owner_id()`,
+        // which falls back to agent-detector's parent-process/env sniffing
+        // when AGENTFLARE_AGENT isn't set. That sniffing finds nothing when
+        // this process is spawned headless (e.g. by the supervisor's
+        // dispatch job, no parent agent process, no session env) and falls
+        // back further to owner "cli" — which then loses to `item::claim`'s
+        // BlockedByAssignee check against whatever agent the item was
+        // actually assigned/dispatched to. An explicit `--agent` is a
+        // stronger, unambiguous statement of identity than any of that
+        // sniffing, so it wins outright here, same for a human typing it
+        // directly or the supervisor dispatching this exact command.
+        //
+        // SAFETY: set once, synchronously, before any worker threads exist
+        // in this process (this is the first thing `run_work` does).
+        unsafe {
+            std::env::set_var("AGENTFLARE_AGENT", resolved.as_str());
+        }
     }
 
     // --- Claim ---

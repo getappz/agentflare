@@ -179,6 +179,19 @@ pub fn is_linked_worktree(repo_root: &Path) -> bool {
     }
 }
 
+/// The main/canonical checkout's root, even when `repo_root` is itself a
+/// linked worktree -- derived from `--git-common-dir`, which always points
+/// at the shared `.git` inside the main checkout no matter which worktree
+/// it's run from. `None` outside a git repo. `--git-common-dir` can return
+/// either an absolute path or one relative to `repo_root` depending on git
+/// version; `repo_root.join(..)` handles both (joining an absolute path
+/// onto any base just returns that absolute path unchanged).
+#[must_use]
+pub fn main_worktree_root(repo_root: &Path) -> Option<PathBuf> {
+    let common_dir = run_in_opt(repo_root, &["rev-parse", "--git-common-dir"])?;
+    repo_root.join(common_dir).parent().map(Path::to_path_buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +298,38 @@ mod tests {
         )
         .unwrap();
         assert!(is_linked_worktree(&wt_path));
+    }
+
+    #[test]
+    fn main_worktree_root_resolves_to_the_main_checkout_from_inside_a_linked_worktree() {
+        let repo = init_repo_with_branch("master");
+        let wt_parent = tempfile::TempDir::new().unwrap();
+        let wt_path = wt_parent.path().join("wt-check");
+        crate::shell::run_in(
+            &repo.path,
+            &[
+                "worktree",
+                "add",
+                wt_path.to_str().unwrap(),
+                "-b",
+                "wt-branch",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            main_worktree_root(&wt_path).map(|p| p.canonicalize().unwrap()),
+            repo.path.canonicalize().ok(),
+            "must resolve to the main checkout, not the linked worktree it was called from"
+        );
+    }
+
+    #[test]
+    fn main_worktree_root_is_its_own_root_from_the_main_checkout() {
+        let repo = init_repo_with_branch("master");
+        assert_eq!(
+            main_worktree_root(&repo.path).map(|p| p.canonicalize().unwrap()),
+            repo.path.canonicalize().ok()
+        );
     }
 
     fn init_remote_and_stale_local_clone()

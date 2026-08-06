@@ -552,10 +552,24 @@ impl AgentflareMcp {
     /// `repo_root()`, but honoring `worktree_repo_root_override` — used only
     /// by the worktree-on-claim feature so tests never run real `git
     /// worktree`/branch operations against this actual repository.
+    ///
+    /// Also redirects to the main checkout when `repo_root()` itself
+    /// resolves to a linked worktree (e.g. a job spawned from inside an
+    /// existing item worktree) — otherwise every item's `.worktrees/`
+    /// lands wherever the calling process's cwd happened to be, nesting a
+    /// fresh worktree inside whatever worktree launched it instead of
+    /// alongside it in the one shared location.
     pub(crate) fn worktree_repo_root(&self) -> std::path::PathBuf {
-        self.worktree_repo_root_override
-            .clone()
-            .unwrap_or_else(Self::repo_root)
+        if let Some(root) = self.worktree_repo_root_override.clone() {
+            return root;
+        }
+        let root = Self::repo_root();
+        if flare_git_core::branch::is_linked_worktree(&root)
+            && let Some(main_root) = flare_git_core::branch::main_worktree_root(&root)
+        {
+            return main_root;
+        }
+        root
     }
 
     /// Test-only constructor: an isolated instance backed entirely by the
