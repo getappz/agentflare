@@ -208,7 +208,13 @@ mod tests {
     fn find_goal_ancestor_walks_up_the_parent_chain() {
         let conn = test_conn();
         let (project_id, state_id) = seed_project(&conn);
-        let goal_item = make_item(&conn, &project_id, &state_id, None, Some(sample_goal_json()));
+        let goal_item = make_item(
+            &conn,
+            &project_id,
+            &state_id,
+            None,
+            Some(sample_goal_json()),
+        );
         let child = make_item(&conn, &project_id, &state_id, Some(&goal_item.id), None);
         let grandchild = make_item(&conn, &project_id, &state_id, Some(&child.id), None);
 

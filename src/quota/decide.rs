@@ -118,7 +118,9 @@ pub fn decide(conn: &rusqlite::Connection, item: &agentflare_backend::item::Item
                         "This goal has hit its self-repair limit while friction reports remain unresolved — please review.",
                     );
                 }
-                return Decision::self_repair("low/medium-severity friction linked; repairing under cap");
+                return Decision::self_repair(
+                    "low/medium-severity friction linked; repairing under cap",
+                );
             }
         }
 
@@ -139,20 +141,25 @@ pub fn decide(conn: &rusqlite::Connection, item: &agentflare_backend::item::Item
         // "started" state group but its claim has gone stale (heartbeat
         // past TTL): abandoned work needs a human look before this goal
         // takes on anything new.
-        if let Ok(siblings) = agentflare_backend::item::list_by_project(conn, &goal_item.project_id) {
-            for sibling in siblings
-                .iter()
-                .filter(|s| s.parent_id.as_deref() == Some(goal_item.id.as_str()) && s.id != item.id)
-            {
+        if let Ok(siblings) = agentflare_backend::item::list_by_project(conn, &goal_item.project_id)
+        {
+            for sibling in siblings.iter().filter(|s| {
+                s.parent_id.as_deref() == Some(goal_item.id.as_str()) && s.id != item.id
+            }) {
                 let Ok(state) = agentflare_backend::state::get(conn, &sibling.state_id) else {
                     continue;
                 };
                 if state.group_name != "started" {
                     continue;
                 }
-                let has_any_claim = agentflare_backend::claim::current_owner(conn, &sibling.id).is_some();
+                let has_any_claim =
+                    agentflare_backend::claim::current_owner(conn, &sibling.id).is_some();
                 let has_live_claim = agentflare_backend::claim::has_active_claim_by_other(
-                    conn, &sibling.id, "", now, ttl_secs,
+                    conn,
+                    &sibling.id,
+                    "",
+                    now,
+                    ttl_secs,
                 )
                 .unwrap_or(false);
                 if has_any_claim && !has_live_claim {
@@ -168,14 +175,18 @@ pub fn decide(conn: &rusqlite::Connection, item: &agentflare_backend::item::Item
     // Tier 4: focus-wait — another agent already holds a live claim on this
     // item itself.
     let this_owner = item.assignee_agent.as_deref().unwrap_or("");
-    if agentflare_backend::claim::has_active_claim_by_other(conn, &item.id, this_owner, now, ttl_secs)
-        .unwrap_or(false)
+    if agentflare_backend::claim::has_active_claim_by_other(
+        conn, &item.id, this_owner, now, ttl_secs,
+    )
+    .unwrap_or(false)
     {
         return Decision::wait("another agent already holds a live claim on this item");
     }
 
     // Tier 5: eligibility — unchanged from today's supervisor behavior.
-    if crate::supervisor::resolve_confirmed_agent(item.assignee_agent.as_deref().unwrap_or("")).is_none() {
+    if crate::supervisor::resolve_confirmed_agent(item.assignee_agent.as_deref().unwrap_or(""))
+        .is_none()
+    {
         return Decision::stay_quiet(match &item.assignee_agent {
             None => "no assignee_agent set — cannot auto-dispatch".to_string(),
             Some(a) => format!("assignee '{a}' is not a confirmed-autonomous agent"),
@@ -357,7 +368,14 @@ mod tests {
         let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, 0);
         let todo = make_todo(&conn, &pid, &sid, &goal.id);
         agentflare_backend::vent::upsert(
-            &conn, &pid, "something broke", "high", "[]", "topic", "evt-1", 1,
+            &conn,
+            &pid,
+            "something broke",
+            "high",
+            "[]",
+            "topic",
+            "evt-1",
+            1,
             crate::claims::now(),
         )
         .unwrap();
@@ -378,7 +396,14 @@ mod tests {
         let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, 0);
         let todo = make_todo(&conn, &pid, &sid, &goal.id);
         agentflare_backend::vent::upsert(
-            &conn, &pid, "minor friction", "low", "[]", "topic", "evt-1", 1,
+            &conn,
+            &pid,
+            "minor friction",
+            "low",
+            "[]",
+            "topic",
+            "evt-1",
+            1,
             crate::claims::now(),
         )
         .unwrap();
@@ -387,7 +412,10 @@ mod tests {
         agentflare_backend::vent::link_item(&conn, &vents[0].id, &goal.id).unwrap();
 
         let decision = decide(&conn, &todo);
-        assert_eq!(decision.effective_action, EffectiveActionInternal::SelfRepair);
+        assert_eq!(
+            decision.effective_action,
+            EffectiveActionInternal::SelfRepair
+        );
     }
 
     #[test]
@@ -397,7 +425,14 @@ mod tests {
         let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, SELF_REPAIR_CAP);
         let todo = make_todo(&conn, &pid, &sid, &goal.id);
         agentflare_backend::vent::upsert(
-            &conn, &pid, "minor friction", "low", "[]", "topic", "evt-1", 1,
+            &conn,
+            &pid,
+            "minor friction",
+            "low",
+            "[]",
+            "topic",
+            "evt-1",
+            1,
             crate::claims::now(),
         )
         .unwrap();
@@ -449,8 +484,14 @@ mod tests {
         let started_sid = seed_started_state(&conn, &pid);
         let stalled_sibling = make_todo(&conn, &pid, &started_sid, &goal.id);
         // Claim it, then let the TTL be zero seconds — instantly stale.
-        agentflare_backend::claim::acquire(&conn, &stalled_sibling.id, "claude:1", crate::claims::now() - 10_000, 1)
-            .unwrap();
+        agentflare_backend::claim::acquire(
+            &conn,
+            &stalled_sibling.id,
+            "claude:1",
+            crate::claims::now() - 10_000,
+            1,
+        )
+        .unwrap();
         let todo = make_todo(&conn, &pid, &sid, &goal.id);
 
         let decision = decide(&conn, &todo);
@@ -499,7 +540,10 @@ mod tests {
         todo = agentflare_backend::item::get(&conn, &todo.id).unwrap();
 
         let decision = decide(&conn, &todo);
-        assert_eq!(decision.effective_action, EffectiveActionInternal::StayQuiet);
+        assert_eq!(
+            decision.effective_action,
+            EffectiveActionInternal::StayQuiet
+        );
         assert!(!decision.should_run);
     }
 

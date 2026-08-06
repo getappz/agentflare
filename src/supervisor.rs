@@ -326,7 +326,12 @@ mod tests {
     fn seed_ready_item_under_gated_goal(mcp: &AgentflareMcp) -> String {
         mcp.with_backend_db(|conn| {
             let project = mcp.resolve_project(conn).unwrap();
-            for name in ["ready-for-work", "dispatched", "needs-manual-dispatch", NEEDS_HUMAN_GATE_LABEL] {
+            for name in [
+                "ready-for-work",
+                "dispatched",
+                "needs-manual-dispatch",
+                NEEDS_HUMAN_GATE_LABEL,
+            ] {
                 let _ = agentflare_backend::label::create(
                     conn,
                     agentflare_backend::label::CreateLabel {
@@ -394,7 +399,11 @@ mod tests {
             )
             .unwrap();
             let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
-            let ready_id = &labels.iter().find(|l| l.name == "ready-for-work").unwrap().id;
+            let ready_id = &labels
+                .iter()
+                .find(|l| l.name == "ready-for-work")
+                .unwrap()
+                .id;
             agentflare_backend::item::add_label(conn, &item.id, ready_id).unwrap();
             item.id
         })
@@ -410,7 +419,10 @@ mod tests {
         let result = run_discovery_tick(&mcp, &queue);
 
         assert_eq!(result.dispatched, 0);
-        assert!(queue.list(None).unwrap().is_empty(), "an ask decision must never enqueue a job");
+        assert!(
+            queue.list(None).unwrap().is_empty(),
+            "an ask decision must never enqueue a job"
+        );
 
         let labels = mcp
             .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
@@ -419,10 +431,18 @@ mod tests {
         assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
     }
 
-    fn seed_ready_item_under_active_goal_with_repairs(mcp: &AgentflareMcp, repairs: u32) -> (String, String) {
+    fn seed_ready_item_under_active_goal_with_repairs(
+        mcp: &AgentflareMcp,
+        repairs: u32,
+    ) -> (String, String) {
         mcp.with_backend_db(|conn| {
             let project = mcp.resolve_project(conn).unwrap();
-            for name in ["ready-for-work", "dispatched", "needs-manual-dispatch", NEEDS_HUMAN_GATE_LABEL] {
+            for name in [
+                "ready-for-work",
+                "dispatched",
+                "needs-manual-dispatch",
+                NEEDS_HUMAN_GATE_LABEL,
+            ] {
                 let _ = agentflare_backend::label::create(
                     conn,
                     agentflare_backend::label::CreateLabel {
@@ -470,7 +490,14 @@ mod tests {
             )
             .unwrap();
             agentflare_backend::vent::upsert(
-                conn, &project.id, "minor friction", "low", "[]", "topic", "evt-1", 1,
+                conn,
+                &project.id,
+                "minor friction",
+                "low",
+                "[]",
+                "topic",
+                "evt-1",
+                1,
                 crate::claims::now(),
             )
             .unwrap();
@@ -498,7 +525,11 @@ mod tests {
             )
             .unwrap();
             let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
-            let ready_id = &labels.iter().find(|l| l.name == "ready-for-work").unwrap().id;
+            let ready_id = &labels
+                .iter()
+                .find(|l| l.name == "ready-for-work")
+                .unwrap()
+                .id;
             agentflare_backend::item::add_label(conn, &item.id, ready_id).unwrap();
             (item.id, goal_item.id)
         })
@@ -521,12 +552,17 @@ mod tests {
     fn at_cap_forces_ask_instead_of_dispatching() {
         let mcp = test_mcp();
         let queue = test_queue();
-        let (item_id, _goal_id) =
-            seed_ready_item_under_active_goal_with_repairs(&mcp, crate::quota::decide::SELF_REPAIR_CAP);
+        let (item_id, _goal_id) = seed_ready_item_under_active_goal_with_repairs(
+            &mcp,
+            crate::quota::decide::SELF_REPAIR_CAP,
+        );
 
         let result = run_discovery_tick(&mcp, &queue);
 
-        assert_eq!(result.dispatched, 0, "the cap must force ask, not another self-repair dispatch");
+        assert_eq!(
+            result.dispatched, 0,
+            "the cap must force ask, not another self-repair dispatch"
+        );
         assert!(queue.list(None).unwrap().is_empty());
         let labels = mcp
             .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())

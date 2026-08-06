@@ -34,7 +34,9 @@ impl GoalLifecycle {
             (Paused, Resume) => Ok(Active),
             (Paused, Complete) => Ok(Done),
             (Gated, Clear) => Ok(Active),
-            (state, event) => Err(format!("illegal lifecycle transition: {event:?} from {state:?}")),
+            (state, event) => Err(format!(
+                "illegal lifecycle transition: {event:?} from {state:?}"
+            )),
         }
     }
 }
@@ -45,21 +47,43 @@ mod tests {
 
     #[test]
     fn active_pauses_gates_and_completes() {
-        assert_eq!(GoalLifecycle::Active.apply(LifecycleEvent::Pause), Ok(GoalLifecycle::Paused));
-        assert_eq!(GoalLifecycle::Active.apply(LifecycleEvent::Gate), Ok(GoalLifecycle::Gated));
-        assert_eq!(GoalLifecycle::Active.apply(LifecycleEvent::Complete), Ok(GoalLifecycle::Done));
+        assert_eq!(
+            GoalLifecycle::Active.apply(LifecycleEvent::Pause),
+            Ok(GoalLifecycle::Paused)
+        );
+        assert_eq!(
+            GoalLifecycle::Active.apply(LifecycleEvent::Gate),
+            Ok(GoalLifecycle::Gated)
+        );
+        assert_eq!(
+            GoalLifecycle::Active.apply(LifecycleEvent::Complete),
+            Ok(GoalLifecycle::Done)
+        );
     }
 
     #[test]
     fn paused_resumes_or_completes() {
-        assert_eq!(GoalLifecycle::Paused.apply(LifecycleEvent::Resume), Ok(GoalLifecycle::Active));
-        assert_eq!(GoalLifecycle::Paused.apply(LifecycleEvent::Complete), Ok(GoalLifecycle::Done));
+        assert_eq!(
+            GoalLifecycle::Paused.apply(LifecycleEvent::Resume),
+            Ok(GoalLifecycle::Active)
+        );
+        assert_eq!(
+            GoalLifecycle::Paused.apply(LifecycleEvent::Complete),
+            Ok(GoalLifecycle::Done)
+        );
     }
 
     #[test]
     fn gated_only_clears_to_active() {
-        assert_eq!(GoalLifecycle::Gated.apply(LifecycleEvent::Clear), Ok(GoalLifecycle::Active));
-        assert!(GoalLifecycle::Gated.apply(LifecycleEvent::Complete).is_err());
+        assert_eq!(
+            GoalLifecycle::Gated.apply(LifecycleEvent::Clear),
+            Ok(GoalLifecycle::Active)
+        );
+        assert!(
+            GoalLifecycle::Gated
+                .apply(LifecycleEvent::Complete)
+                .is_err()
+        );
     }
 
     #[test]
@@ -71,7 +95,10 @@ mod tests {
             LifecycleEvent::Clear,
             LifecycleEvent::Complete,
         ] {
-            assert!(GoalLifecycle::Done.apply(event).is_err(), "{event:?} must not leave Done");
+            assert!(
+                GoalLifecycle::Done.apply(event).is_err(),
+                "{event:?} must not leave Done"
+            );
         }
     }
 
