@@ -174,8 +174,18 @@ pub fn decide(conn: &rusqlite::Connection, item: &agentflare_backend::item::Item
         return Decision::wait("another agent already holds a live claim on this item");
     }
 
-    // Tiers 5-6 land in Task 5.
-    Decision::run("stub: tiers 5-6 not yet implemented")
+    // Tier 5: eligibility — unchanged from today's supervisor behavior.
+    if crate::supervisor::resolve_confirmed_agent(item.assignee_agent.as_deref().unwrap_or("")).is_none() {
+        return Decision::stay_quiet(match &item.assignee_agent {
+            None => "no assignee_agent set — cannot auto-dispatch".to_string(),
+            Some(a) => format!("assignee '{a}' is not a confirmed-autonomous agent"),
+        });
+    }
+
+    // Tier 6: compute-quota. Stub for v1 — always passes. Real budget
+    // enforcement (a port of agenticmq::limiter's sliding-window TPM/RPM
+    // logic) is a follow-on spec; this is its interface point.
+    Decision::run("eligible and nothing blocking")
 }
 
 #[cfg(test)]
@@ -409,5 +419,100 @@ mod tests {
 
         let decision = decide(&conn, &todo);
         assert_ne!(decision.effective_action, EffectiveAction::Wait);
+    }
+
+    #[test]
+    fn unconfirmed_agent_stays_quiet_not_ask_or_wait() {
+        let conn = test_conn();
+        let (pid, sid) = seed_project(&conn);
+        let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, 0);
+        let mut todo = make_todo(&conn, &pid, &sid, &goal.id);
+        agentflare_backend::item::update(
+            &conn,
+            &todo.id,
+            agentflare_backend::item::UpdateItem {
+                assignee_agent: Some("opencode".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        todo = agentflare_backend::item::get(&conn, &todo.id).unwrap();
+
+        let decision = decide(&conn, &todo);
+        assert_eq!(decision.effective_action, EffectiveAction::StayQuiet);
+        assert!(!decision.should_run);
+    }
+
+    #[test]
+    fn confirmed_agent_with_nothing_blocking_runs() {
+        let conn = test_conn();
+        let (pid, sid) = seed_project(&conn);
+        let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, 0);
+        let todo = make_todo(&conn, &pid, &sid, &goal.id);
+
+        let decision = decide(&conn, &todo);
+        assert_eq!(decision.effective_action, EffectiveAction::Run);
+        assert!(decision.should_run);
+    }
+
+    #[test]
+    fn ungrouped_item_with_no_goal_behaves_like_eligibility_only() {
+        let conn = test_conn();
+        let (pid, sid) = seed_project(&conn);
+        let todo = agentflare_backend::item::create(
+            &conn,
+            agentflare_backend::item::CreateItem {
+                project_id: pid.clone(),
+                state_id: sid.clone(),
+                name: "lone todo".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: Some("claude-code".into()),
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        let decision = decide(&conn, &todo);
+        assert_eq!(decision.effective_action, EffectiveAction::Run);
+    }
+
+    #[test]
+    fn malformed_goal_metadata_fails_closed_to_ask() {
+        let conn = test_conn();
+        let (pid, sid) = seed_project(&conn);
+        let goal = agentflare_backend::item::create(
+            &conn,
+            agentflare_backend::item::CreateItem {
+                project_id: pid.clone(),
+                state_id: sid.clone(),
+                name: "broken goal".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: Some(r#"{"goal":{"objective":"missing required fields"}}"#.into()),
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        let todo = make_todo(&conn, &pid, &sid, &goal.id);
+
+        let decision = decide(&conn, &todo);
+        assert!(!decision.should_run);
+        assert_eq!(decision.effective_action, EffectiveAction::Ask);
+        assert!(decision.reason.contains("goal_state_invalid"));
     }
 }
