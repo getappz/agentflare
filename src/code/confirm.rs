@@ -103,12 +103,22 @@ mod tests {
 
     #[test]
     fn parses_lean_ctx_grep_output_skipping_the_summary_line() {
-        let hits = parse_lean_ctx_grep_output(SAMPLE_LEAN_CTX_GREP_OUTPUT, Path::new("/ws/crates/x"));
+        let hits =
+            parse_lean_ctx_grep_output(SAMPLE_LEAN_CTX_GREP_OUTPUT, Path::new("/ws/crates/x"));
         assert_eq!(hits.len(), 3);
-        assert_eq!(hits[0].file, PathBuf::from("/ws/crates/x/tests/queue_test.rs"));
+        assert_eq!(
+            hits[0].file,
+            PathBuf::from("/ws/crates/x/tests/queue_test.rs")
+        );
         assert_eq!(hits[0].line, 1);
-        assert_eq!(hits[0].text, "use agentflare_jobs::{AgentJob, JobState, Queue};");
-        assert_eq!(hits[1].file, PathBuf::from("/ws/crates/x/tests/supervisor_test.rs"));
+        assert_eq!(
+            hits[0].text,
+            "use agentflare_jobs::{AgentJob, JobState, Queue};"
+        );
+        assert_eq!(
+            hits[1].file,
+            PathBuf::from("/ws/crates/x/tests/supervisor_test.rs")
+        );
     }
 
     #[test]
@@ -140,8 +150,12 @@ mod tests {
         let hits = search_crate_dir(dir.path(), "my_crate");
         // Only counts if lean-ctx isn't installed in the test environment;
         // assert on content, not on which path was taken.
-        assert_eq!(hits.len(), 1, "expected exactly one hit, got: {:?}",
-            hits.iter().map(|h| &h.file).collect::<Vec<_>>());
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly one hit, got: {:?}",
+            hits.iter().map(|h| &h.file).collect::<Vec<_>>()
+        );
         assert_eq!(hits[0].file, dir.path().join("lib.rs"));
         assert_eq!(hits[0].line, 1);
     }

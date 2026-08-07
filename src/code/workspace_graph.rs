@@ -91,8 +91,7 @@ impl WorkspaceGraph {
 
     fn from_metadata_json(json: &str) -> Result<Self, serde_json::Error> {
         let meta: Metadata = serde_json::from_str(json)?;
-        let member_ids: HashSet<&str> =
-            meta.workspace_members.iter().map(String::as_str).collect();
+        let member_ids: HashSet<&str> = meta.workspace_members.iter().map(String::as_str).collect();
 
         let mut id_to_name: HashMap<&str, &str> = HashMap::new();
         let mut crates = Vec::new();
@@ -285,8 +284,10 @@ mod tests {
             .resolve_owner_crate(Path::new("/ws/crates/core/src/lib.rs"))
             .unwrap();
         assert_eq!(owner.name, "core");
-        assert!(graph
-            .resolve_owner_crate(Path::new("/ws/not-in-workspace/x.rs"))
-            .is_none());
+        assert!(
+            graph
+                .resolve_owner_crate(Path::new("/ws/not-in-workspace/x.rs"))
+                .is_none()
+        );
     }
 }

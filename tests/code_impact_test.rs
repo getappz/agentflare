@@ -67,11 +67,9 @@ fn impact_of_the_real_supervisor_finds_its_own_integration_test_not_the_unrelate
     let workspace = build_fixture_workspace();
     let root = workspace.path();
 
-    let report = agentflare::code::impact_for_path(
-        root,
-        &root.join("crates/jobs/src/supervisor.rs"),
-    )
-    .unwrap();
+    let report =
+        agentflare::code::impact_for_path(root, &root.join("crates/jobs/src/supervisor.rs"))
+            .unwrap();
 
     assert_eq!(report.owner_crate, "jobs");
     let test_hit = report
@@ -84,26 +82,30 @@ fn impact_of_the_real_supervisor_finds_its_own_integration_test_not_the_unrelate
         report.hits.iter().map(|h| &h.file).collect::<Vec<_>>()
     );
     // The unrelated same-named file's crate must never appear as a hit.
-    assert!(report
-        .hits
-        .iter()
-        .all(|h| !h.file.ends_with("crates/top/src/supervisor.rs")));
+    assert!(
+        report
+            .hits
+            .iter()
+            .all(|h| !h.file.ends_with("crates/top/src/supervisor.rs"))
+    );
 }
 
 #[test]
 fn impact_of_a_file_outside_any_workspace_member_is_a_clear_error() {
     let workspace = build_fixture_workspace();
     let root = workspace.path();
-    let err = agentflare::code::impact_for_path(root, Path::new("/tmp/not-in-workspace.rs"))
-        .unwrap_err();
-    assert!(matches!(err, agentflare::code::ImpactError::NotInWorkspace(_)));
+    let err =
+        agentflare::code::impact_for_path(root, Path::new("/tmp/not-in-workspace.rs")).unwrap_err();
+    assert!(matches!(
+        err,
+        agentflare::code::ImpactError::NotInWorkspace(_)
+    ));
 }
 
 #[test]
 fn impact_with_no_cargo_toml_is_a_clear_error() {
     let dir = tempfile::tempdir().unwrap();
-    let err = agentflare::code::impact_for_path(dir.path(), &dir.path().join("x.rs"))
-        .unwrap_err();
+    let err = agentflare::code::impact_for_path(dir.path(), &dir.path().join("x.rs")).unwrap_err();
     assert!(matches!(
         err,
         agentflare::code::ImpactError::Graph(
