@@ -17,6 +17,7 @@ mod channels;
 mod claims;
 mod cli;
 mod coaching;
+mod code;
 mod compact;
 mod components;
 mod core;
