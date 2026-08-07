@@ -33,10 +33,25 @@ impl WorkerPool {
 
     pub fn shutdown(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        // Workers may be parked in `wait_for_work` for up to its timeout —
-        // wake them immediately so shutdown doesn't wait that out.
-        self.queue.wake_workers();
         let handles = std::mem::take(&mut self.handles);
+        // Workers may be parked in `wait_for_work` for up to its timeout —
+        // wake them immediately so shutdown doesn't wait that out. A single
+        // `wake_workers` call races a worker that hasn't reached the notify
+        // check yet (see its doc comment): with N workers, whichever one
+        // observes the flag first consumes it, leaving any other
+        // not-yet-parked worker to fall through to the full fallback
+        // timeout instead of noticing `running` immediately. Retrying the
+        // wake until every worker has exited closes that gap — a no-op for
+        // a worker mid-job (nothing is parked on the condvar to wake), and
+        // bounded by the retry cap for one that's still finishing real
+        // work, which the trailing `join` below waits out regardless.
+        for _ in 0..40 {
+            if handles.iter().all(JoinHandle::is_finished) {
+                break;
+            }
+            self.queue.wake_workers();
+            std::thread::sleep(Duration::from_millis(5));
+        }
         for h in handles {
             let _ = h.join();
         }
