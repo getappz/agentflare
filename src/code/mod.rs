@@ -71,12 +71,37 @@ pub fn impact_for_path(repo_root: &Path, target: &Path) -> Result<ImpactReport, 
     // owner (coarse, crate-level); confirm with an actual reference search
     // scoped to each candidate, so an unused/stale dependency in Cargo.toml
     // doesn't produce a false positive.
+    //
+    // In a nested layout (a workspace member's manifest_dir contains other
+    // members' directories underneath it — e.g. the root binary crate here,
+    // whose manifest_dir is the repo root and so recursively contains every
+    // `crates/*` member too) a hit's file can belong to a DIFFERENT crate
+    // than the one we're scanning for. Left unfiltered, that reports the
+    // same file twice (once correctly via its true owner, once again
+    // mislabeled via whichever ancestor crate happened to contain it) —
+    // exactly the over-broad-result failure mode we rejected `codegraph
+    // affected` for. Keep a hit only when the file's own owning crate
+    // (resolved the same way `owner` above was) really is the crate we
+    // searched.
     let crate_ident = owner.name.replace('-', "_");
+    let mut seen: std::collections::HashSet<(PathBuf, usize)> = std::collections::HashSet::new();
+    for hit in hits.iter() {
+        seen.insert((hit.file.clone(), hit.line));
+    }
     for dependent_name in graph.reverse_dependents(&owner.name) {
         let Some(dependent) = graph.crate_by_name(&dependent_name) else {
             continue;
         };
         for hit in confirm::search_crate_dir(&dependent.manifest_dir, &crate_ident) {
+            let truly_owned_by_dependent = graph
+                .resolve_owner_crate(&hit.file)
+                .is_some_and(|c| c.name == dependent_name);
+            if !truly_owned_by_dependent {
+                continue;
+            }
+            if !seen.insert((hit.file.clone(), hit.line)) {
+                continue;
+            }
             hits.push(ImpactHit {
                 file: hit.file,
                 line: hit.line,

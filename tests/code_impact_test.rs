@@ -90,6 +90,99 @@ fn impact_of_the_real_supervisor_finds_its_own_integration_test_not_the_unrelate
     );
 }
 
+/// Mirrors this repo's actual layout: a root package whose manifest_dir
+/// IS the workspace root (like the `agentflare` binary crate), which
+/// therefore recursively contains another member crate's directory
+/// underneath it. A confirm-scan that doesn't attribute each hit back to
+/// its true owning crate reports that member's own files twice — once
+/// correctly, once again mislabeled as "via the root crate" — exactly the
+/// over-broad/duplicate result a live run against the real repo surfaced.
+fn build_nested_fixture_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = [".", "crates/lib_a"]
+resolver = "2"
+
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lib_a = { path = "crates/lib_a" }
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn uses_lib_a() { lib_a::hello(); }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+    fs::create_dir_all(root.join("crates/lib_a/src")).unwrap();
+    fs::create_dir_all(root.join("crates/lib_a/tests")).unwrap();
+    fs::write(
+        root.join("crates/lib_a/Cargo.toml"),
+        "[package]\nname = \"lib_a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/lib_a/src/lib.rs"),
+        "pub fn hello() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/lib_a/tests/lib_a_test.rs"),
+        "use lib_a::hello;\n#[test]\nfn it_works() { hello(); }\n",
+    )
+    .unwrap();
+
+    dir
+}
+
+#[test]
+fn impact_never_double_reports_a_nested_crates_own_files_under_an_ancestor_crate() {
+    let workspace = build_nested_fixture_workspace();
+    let root = workspace.path();
+
+    let report =
+        agentflare::code::impact_for_path(root, &root.join("crates/lib_a/src/lib.rs")).unwrap();
+
+    assert_eq!(report.owner_crate, "lib_a");
+    let test_hits: Vec<_> = report
+        .hits
+        .iter()
+        .filter(|h| h.file.ends_with("crates/lib_a/tests/lib_a_test.rs"))
+        .collect();
+    assert_eq!(
+        test_hits.len(),
+        1,
+        "lib_a's own integration test must appear exactly once, got: {test_hits:?}"
+    );
+    assert!(matches!(
+        test_hits[0].reason,
+        agentflare::code::ImpactReason::OwnIntegrationTest
+    ));
+    // The real cross-crate reference (src/lib.rs calling lib_a::hello()) must
+    // still be found, attributed to its true owner `app`, not duplicated.
+    let src_hits: Vec<_> = report
+        .hits
+        .iter()
+        .filter(|h| h.file.ends_with("src/lib.rs") && !h.file.to_string_lossy().contains("lib_a"))
+        .collect();
+    assert_eq!(
+        src_hits.len(),
+        1,
+        "app's src/lib.rs reference must appear exactly once, got: {src_hits:?}"
+    );
+}
+
 #[test]
 fn impact_of_a_file_outside_any_workspace_member_is_a_clear_error() {
     let workspace = build_fixture_workspace();
