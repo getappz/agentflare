@@ -145,23 +145,73 @@ impl Supervisor {
     }
 }
 
+/// PIDs of every live descendant of `pid` (children, grandchildren, ...),
+/// walked via `/proc/<pid>/task/*/children` -- Linux-only (no `/proc` on
+/// macOS/Windows). Needed because a descendant that called
+/// `process_group(0)` on itself (see `agent_launch::run_captured`, which
+/// does exactly this so *it* can kill a runaway agent CLI) has left the
+/// process group `-{pid}` targets below; signaling it by group alone won't
+/// reach it, so `kill_graceful` also signals every PID this returns
+/// directly.
+#[cfg(target_os = "linux")]
+fn descendant_pids(pid: u32) -> Vec<u32> {
+    fn children_of(pid: u32) -> Vec<u32> {
+        let task_dir = format!("/proc/{pid}/task");
+        let Ok(entries) = std::fs::read_dir(&task_dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let children_path = entry.path().join("children");
+            let Ok(contents) = std::fs::read_to_string(&children_path) else {
+                continue;
+            };
+            out.extend(
+                contents
+                    .split_whitespace()
+                    .filter_map(|s| s.parse::<u32>().ok()),
+            );
+        }
+        out
+    }
+
+    let mut all = Vec::new();
+    let mut frontier = children_of(pid);
+    while let Some(next_pid) = frontier.pop() {
+        all.push(next_pid);
+        frontier.extend(children_of(next_pid));
+    }
+    all
+}
+
+#[cfg(not(target_os = "linux"))]
+fn descendant_pids(_pid: u32) -> Vec<u32> {
+    Vec::new()
+}
+
 fn kill_graceful(child: &mut std::process::Child, kill_after: Duration) {
     #[cfg(unix)]
     {
         let pid = child.id();
-        let _ = Command::new("kill")
-            .arg("-s")
-            .arg("TERM")
-            .arg("--")
-            .arg(format!("-{pid}"))
-            .status();
+        let signal = |sig: &str, pid: u32| {
+            let _ = Command::new("kill")
+                .arg("-s")
+                .arg(sig)
+                .arg("--")
+                .arg(format!("-{pid}"))
+                .status();
+            for descendant in descendant_pids(pid) {
+                let _ = Command::new("kill")
+                    .arg("-s")
+                    .arg(sig)
+                    .arg("--")
+                    .arg(descendant.to_string())
+                    .status();
+            }
+        };
+        signal("TERM", pid);
         std::thread::sleep(kill_after);
-        let _ = Command::new("kill")
-            .arg("-s")
-            .arg("KILL")
-            .arg("--")
-            .arg(format!("-{pid}"))
-            .status();
+        signal("KILL", pid);
     }
     #[cfg(windows)]
     {
@@ -182,5 +232,50 @@ fn kill_graceful(child: &mut std::process::Child, kill_after: Duration) {
     // never block forever on a process we failed to actually terminate.
     if matches!(child.try_wait(), Ok(None)) {
         let _ = child.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `setsid` moves the grandchild into a brand-new session/process group of
+    // its own -- exactly what `agent_launch::run_captured` does to its own
+    // child so *it* can kill a runaway agent CLI independently. That leaves
+    // the grandchild outside the group `kill -TERM -- -<pid>` targets, so a
+    // fix that only sends the group signal would leave it running past the
+    // timeout. Only `/proc` (Linux) backs `descendant_pids`, so this is
+    // scoped to Linux CI rather than xfailing on macOS/Windows runners.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_times_out_and_kills_a_descendant_that_escaped_into_its_own_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("still-alive");
+        let mut supervisor = Supervisor::new(
+            "test".to_string(),
+            "sh".to_string(),
+            vec![
+                "-c".to_string(),
+                format!("setsid sh -c 'sleep 5; touch {}' & wait", marker.display()),
+            ],
+            vec![],
+            None,
+            0, // times out immediately — the point is what happens on timeout
+            0,
+            dir.path().to_path_buf(),
+        );
+
+        let (output, _state) = supervisor.spawn().unwrap();
+        assert!(output.timed_out, "should report timeout");
+        // The 5s `sleep` inside the setsid'd grandchild would still have it
+        // alive if `kill_graceful` only signaled the direct child's process
+        // group; give it a moment past `spawn()` returning, then confirm it
+        // never reached its `touch`.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !marker.exists(),
+            "a descendant that escaped into its own process group must still be \
+             killed on timeout, not just orphaned"
+        );
     }
 }
