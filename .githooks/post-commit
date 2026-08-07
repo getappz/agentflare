@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# agentflare code-index freshness (post-commit).
+#
+# Keeps lean-ctx's BM25 search index and call-graph in sync with the working
+# tree after every commit, so lean-ctx-backed lookups (ctx_search,
+# ctx_callgraph, `agentflare code impact`'s reference confirmation) never
+# run against a stale graph. Mirrors the "auto-update the code index on
+# commit" behavior hosted code-graph memory tools provide, without any
+# extra service -- just the two existing lean-ctx CLI commands.
+#
+# Runs detached in the background: a commit must never wait on reindexing.
+# Fail-open by design -- if lean-ctx isn't on PATH, this is a silent no-op.
+#
+# Installed into a project via `agentflare git install-hooks`, same as
+# pre-commit/pre-push/prepare-commit-msg (agentflare stores the canonical
+# copy under ~/.agentflare/githooks/).
+
+if command -v lean-ctx >/dev/null 2>&1; then
+    ( lean-ctx index build >/dev/null 2>&1; lean-ctx graph build >/dev/null 2>&1 ) &
+    disown 2>/dev/null || true
+fi
+
+exit 0
