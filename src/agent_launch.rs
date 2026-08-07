@@ -293,11 +293,44 @@ pub fn run_headless(
     cmd.env_remove("CARGO_TARGET_DIR");
     match run_captured(cmd, timeout) {
         Ok(c) if c.success => HeadlessOutcome::Ok(c.stdout),
-        Ok(c) if c.timed_out => {
-            HeadlessOutcome::Failed(format!("{} timed out after {timeout:?}", spec.display_name))
-        }
+        Ok(c) if c.timed_out => HeadlessOutcome::Failed(format!(
+            "{} timed out after {timeout:?}{}",
+            spec.display_name,
+            diagnostic_suffix(&c)
+        )),
         Ok(_) => HeadlessOutcome::Failed(format!("{} exited non-zero", spec.display_name)),
         Err(e) => HeadlessOutcome::Failed(format!("failed to run {}: {e}", spec.display_name)),
+    }
+}
+
+/// The captured child's own output is real, useful diagnostic evidence of
+/// what it was doing right up to the kill — dropping it (the old behavior)
+/// turned every timeout into a black box with no way to tell "made real
+/// progress and got killed mid-verification" apart from "never did anything."
+/// Prefers stdout (the agent's actual reply stream); falls back to stderr
+/// when stdout is empty.
+fn diagnostic_suffix(captured: &Captured) -> String {
+    let (label, text) = if !captured.stdout.is_empty() {
+        ("stdout", captured.stdout.as_str())
+    } else if !captured.stderr.is_empty() {
+        ("stderr", captured.stderr.as_str())
+    } else {
+        return " (no output captured)".to_string();
+    };
+    format!(
+        " — last {label} before kill:\n{}",
+        tail_str(text, DIAGNOSTIC_TAIL_CHARS)
+    )
+}
+
+const DIAGNOSTIC_TAIL_CHARS: usize = 2000;
+
+/// The last `max_chars` characters of `s`, UTF-8-boundary-safe (never slices
+/// through the middle of a multi-byte character).
+fn tail_str(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().rev().nth(max_chars.saturating_sub(1)) {
+        Some((idx, _)) => &s[idx..],
+        None => s,
     }
 }
 
@@ -370,6 +403,19 @@ mod tests {
         assert!(out.success);
         assert!(!out.timed_out);
         assert_eq!(out.stdout, "hello world");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_captured_keeps_output_written_before_a_timeout_kill() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf 'made it here'; sleep 5");
+        let out = run_captured(cmd, std::time::Duration::from_millis(150)).unwrap();
+        assert!(out.timed_out);
+        assert_eq!(
+            out.stdout, "made it here",
+            "output written before the kill must still be captured, not discarded"
+        );
     }
 
     #[cfg(unix)]
@@ -585,5 +631,63 @@ mod tests {
             HeadlessOutcome::NotFound(m) => assert!(m.contains("not found")),
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tail_str_returns_the_whole_string_when_shorter_than_the_limit() {
+        assert_eq!(tail_str("hello", 100), "hello");
+    }
+
+    #[test]
+    fn tail_str_returns_only_the_last_n_chars() {
+        assert_eq!(tail_str("abcdefgh", 3), "fgh");
+    }
+
+    #[test]
+    fn tail_str_does_not_panic_on_a_multibyte_boundary() {
+        // Each of these is a 3-4 byte UTF-8 char; slicing by raw byte offset
+        // instead of char boundary would panic here.
+        let s = "a€b€c€d€e€f€g€h€i€j";
+        // Must not panic, and must return valid, non-empty UTF-8.
+        let tail = tail_str(s, 5);
+        assert!(!tail.is_empty());
+        assert!(tail.chars().count() <= 5);
+    }
+
+    #[test]
+    fn diagnostic_suffix_reports_no_output_captured_when_both_streams_are_empty() {
+        let c = Captured {
+            success: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: true,
+        };
+        assert_eq!(diagnostic_suffix(&c), " (no output captured)");
+    }
+
+    #[test]
+    fn diagnostic_suffix_prefers_stdout_over_stderr() {
+        let c = Captured {
+            success: false,
+            stdout: "working on task 3...".to_string(),
+            stderr: "some warning".to_string(),
+            timed_out: true,
+        };
+        let suffix = diagnostic_suffix(&c);
+        assert!(suffix.contains("last stdout before kill"));
+        assert!(suffix.contains("working on task 3..."));
+    }
+
+    #[test]
+    fn diagnostic_suffix_falls_back_to_stderr_when_stdout_is_empty() {
+        let c = Captured {
+            success: false,
+            stdout: String::new(),
+            stderr: "panic: something broke".to_string(),
+            timed_out: true,
+        };
+        let suffix = diagnostic_suffix(&c);
+        assert!(suffix.contains("last stderr before kill"));
+        assert!(suffix.contains("panic: something broke"));
     }
 }
