@@ -16,6 +16,7 @@ mod build_time;
 mod channels;
 mod claims;
 mod cli;
+mod code;
 mod coaching;
 mod compact;
 mod components;

@@ -36,6 +36,10 @@ pkg-fmt = "zip"
 name = "agentflare"
 path = "src/main.rs"
 
+[lib]
+name = "agentflare"
+path = "src/lib.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
