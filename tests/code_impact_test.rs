@@ -132,11 +132,7 @@ lib_a = { path = "crates/lib_a" }
         "[package]\nname = \"lib_a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
     .unwrap();
-    fs::write(
-        root.join("crates/lib_a/src/lib.rs"),
-        "pub fn hello() {}\n",
-    )
-    .unwrap();
+    fs::write(root.join("crates/lib_a/src/lib.rs"), "pub fn hello() {}\n").unwrap();
     fs::write(
         root.join("crates/lib_a/tests/lib_a_test.rs"),
         "use lib_a::hello;\n#[test]\nfn it_works() { hello(); }\n",
