@@ -251,6 +251,25 @@ fn extract_command_prefix(command: &str) -> String {
     first_word.to_string()
 }
 
+/// True for shell redirection/control-operator tokens (`>`, `>>`, `<`,
+/// `2>`, `2>&1`, `&>`, `|`, `||`, `&&`, `;`) that a naive whitespace split
+/// leaves as their own token (e.g. `2>/dev/null`) or attached to a target
+/// (e.g. `>out.txt`) -- neither is a filepath the command reads/writes by
+/// name, so both must be excluded rather than mistaken for one.
+fn is_shell_operator_token(part: &str) -> bool {
+    let trimmed = part.trim_start_matches(|c: char| c.is_ascii_digit());
+    matches!(trimmed.chars().next(), Some('>' | '<' | '&' | '|' | ';'))
+}
+
+/// True when `part` is a redirection operator with no target fused onto it
+/// (e.g. `>`, `2>`, `>>`) -- the shell takes the *next* whitespace-separated
+/// token as the redirect target, so that token must also be dropped rather
+/// than kept as a filepath the command reads.
+fn is_bare_redirect_operator(part: &str) -> bool {
+    let trimmed = part.trim_start_matches(|c: char| c.is_ascii_digit());
+    matches!(trimmed, ">" | ">>" | "<" | "<<" | "&>" | "&>>")
+}
+
 fn extract_filepaths(command: &str, _output: &str) -> String {
     let listing_commands = [
         "ls", "dir", "find", "tree", "pwd", "cd", "mkdir", "rmdir", "rm",
@@ -273,11 +292,24 @@ fn extract_filepaths(command: &str, _output: &str) -> String {
     }
 
     if reading_commands.contains(&base_cmd.as_str()) {
-        let filepaths: Vec<&str> = parts[1..]
-            .iter()
-            .filter(|p| !p.starts_with('-'))
-            .copied()
-            .collect();
+        let mut filepaths: Vec<&str> = Vec::new();
+        let mut skip_next = false;
+        for part in &parts[1..] {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if part.starts_with('-') {
+                continue;
+            }
+            if is_shell_operator_token(part) {
+                if is_bare_redirect_operator(part) {
+                    skip_next = true;
+                }
+                continue;
+            }
+            filepaths.push(part);
+        }
         if filepaths.is_empty() {
             return "<filepaths>\n</filepaths>".into();
         }
@@ -300,6 +332,12 @@ fn extract_filepaths(command: &str, _output: &str) -> String {
                     if *part == "-e" || *part == "-f" {
                         pattern_via_flag = true;
                     }
+                    skip_next = true;
+                }
+                continue;
+            }
+            if is_shell_operator_token(part) {
+                if is_bare_redirect_operator(part) {
                     skip_next = true;
                 }
                 continue;
@@ -675,6 +713,24 @@ mod tests {
     fn test_extract_filepaths_grep_file_pattern() {
         let result = extract_filepaths("grep pattern src/main.rs tests/test.rs", "matches");
         assert!(result.contains("tests/test.rs"));
+    }
+
+    #[test]
+    fn test_extract_filepaths_ignores_stderr_redirect() {
+        let result = extract_filepaths("tail -5 src/main.rs 2>/dev/null", "some content");
+        assert_eq!(result, "<filepaths>\nsrc/main.rs\n</filepaths>");
+    }
+
+    #[test]
+    fn test_extract_filepaths_ignores_stdout_redirect() {
+        let result = extract_filepaths("cat src/main.rs > out.txt", "some content");
+        assert_eq!(result, "<filepaths>\nsrc/main.rs\n</filepaths>");
+    }
+
+    #[test]
+    fn test_extract_filepaths_grep_ignores_redirect() {
+        let result = extract_filepaths("grep pattern src/main.rs 2>/dev/null", "matches");
+        assert_eq!(result, "<filepaths>\nsrc/main.rs\n</filepaths>");
     }
 
     #[test]
