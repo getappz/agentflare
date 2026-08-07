@@ -166,7 +166,11 @@ fn descendant_pids(pid: u32) -> Vec<u32> {
             let Ok(contents) = std::fs::read_to_string(&children_path) else {
                 continue;
             };
-            out.extend(contents.split_whitespace().filter_map(|s| s.parse::<u32>().ok()));
+            out.extend(
+                contents
+                    .split_whitespace()
+                    .filter_map(|s| s.parse::<u32>().ok()),
+            );
         }
         out
     }
@@ -190,9 +194,19 @@ fn kill_graceful(child: &mut std::process::Child, kill_after: Duration) {
     {
         let pid = child.id();
         let signal = |sig: &str, pid: u32| {
-            let _ = Command::new("kill").arg("-s").arg(sig).arg("--").arg(format!("-{pid}")).status();
+            let _ = Command::new("kill")
+                .arg("-s")
+                .arg(sig)
+                .arg("--")
+                .arg(format!("-{pid}"))
+                .status();
             for descendant in descendant_pids(pid) {
-                let _ = Command::new("kill").arg("-s").arg(sig).arg("--").arg(descendant.to_string()).status();
+                let _ = Command::new("kill")
+                    .arg("-s")
+                    .arg(sig)
+                    .arg("--")
+                    .arg(descendant.to_string())
+                    .status();
             }
         };
         signal("TERM", pid);
