@@ -1,6 +1,6 @@
 //! `agentflare git` -- git-related CLI surface: installing the shared
 //! branch-protection hooks (pre-commit / pre-push / prepare-commit-msg /
-//! reference-transaction) into a repo, installing/uninstalling the
+//! reference-transaction / post-commit) into a repo, installing/uninstalling the
 //! flare-git-shim PATH shim, and the recovery-snapshot commands
 //! (`snapshot list/restore/prune`) that make `flare_git_core::snapshot`'s
 //! automatic pre-destructive snapshots actually usable.
@@ -205,6 +205,7 @@ const PRE_COMMIT: &str = include_str!("../../.githooks/pre-commit");
 const PRE_PUSH: &str = include_str!("../../.githooks/pre-push");
 const PREPARE_COMMIT_MSG: &str = include_str!("../../.githooks/prepare-commit-msg");
 const REFERENCE_TRANSACTION: &str = include_str!("../../.githooks/reference-transaction");
+const POST_COMMIT: &str = include_str!("../../.githooks/post-commit");
 
 /// Every hook this command installs, in (filename, embedded template) pairs.
 const HOOKS: &[(&str, &str)] = &[
@@ -212,6 +213,7 @@ const HOOKS: &[(&str, &str)] = &[
     ("pre-push", PRE_PUSH),
     ("prepare-commit-msg", PREPARE_COMMIT_MSG),
     ("reference-transaction", REFERENCE_TRANSACTION),
+    ("post-commit", POST_COMMIT),
 ];
 
 fn ensure_shared_templates() -> std::io::Result<()> {
@@ -428,8 +430,9 @@ fn install_hooks(opts: InstallHooksArgs) {
         println!(
             "\nBranch-protection hooks installed. Direct commits/pushes to the \
              default branch are now blocked for every git client in this repo. \
-             Commits are also stamped with provenance trailers, and every ref \
-             move is journaled to ~/.agentflare/audit/git-refs.jsonl."
+             Commits are also stamped with provenance trailers, every ref \
+             move is journaled to ~/.agentflare/audit/git-refs.jsonl, and \
+             lean-ctx's code index refreshes in the background after each commit."
         );
         let _ = opts;
     }
