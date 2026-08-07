@@ -111,7 +111,12 @@ pub fn config_dir() -> PathBuf {
 /// or write the persisted default mode (`default_mode`/`set_default_mode`)
 /// hit the real on-disk config file and can race each other under cargo's
 /// parallel test runner (see the `defaults_to_full` vs `roundtrip_default_mode`
-/// flake this was added to fix).
+/// flake this was added to fix). The directory is keyed by process id: under
+/// nextest each test is its own process, so the `ENV_TEST_LOCK` mutex below
+/// only serializes tests *within* one process — a fixed shared path would
+/// still let two nextest processes race on the same directory (this broke
+/// `roundtrip_default_mode` on Windows, where a concurrent delete/write on
+/// the same path fails outright instead of just racing).
 #[cfg(test)]
 struct ConfigDirOverrideGuard;
 
@@ -130,7 +135,8 @@ fn with_temp_config_dir<T>(f: impl FnOnce() -> T) -> T {
     let _guard = ENV_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = std::env::temp_dir().join("flare-code-test-config-dir");
+    let dir =
+        std::env::temp_dir().join(format!("flare-code-test-config-dir-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     unsafe { std::env::set_var("FLARE_CODE_CONFIG_DIR_OVERRIDE", &dir) };
