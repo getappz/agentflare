@@ -5,12 +5,26 @@
 use crate::github::{Client, GitHubError, RepoId};
 use base64::Engine as _;
 
+#[derive(Debug)]
 pub struct FileContent {
     pub content: String,
     pub sha: String,
 }
 
 fn decode_content(json: &serde_json::Value) -> Result<String, GitHubError> {
+    // For files over the Contents API's 1MB inline limit, GitHub returns
+    // encoding "none" with an empty content string instead of the real
+    // bytes -- silently decoding that as an empty file would make a sync
+    // treat a too-large remote log as empty and overwrite it with the local
+    // merge, destroying every remote-only fact in one push. Fail loud
+    // instead: this API just isn't built to carry a file past that size.
+    let encoding = json.get("encoding").and_then(|v| v.as_str()).unwrap_or("");
+    if encoding != "base64" {
+        return Err(GitHubError::Parse(format!(
+            "contents response has encoding {encoding:?}, expected \"base64\" \
+             (files over the Contents API's 1MB inline limit report empty content instead of erroring)"
+        )));
+    }
     let raw = json
         .get("content")
         .and_then(|v| v.as_str())
@@ -20,7 +34,8 @@ fn decode_content(json: &serde_json::Value) -> Result<String, GitHubError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(compact)
         .map_err(|e| GitHubError::Parse(format!("contents response had bad base64: {e}")))?;
-    String::from_utf8(bytes).map_err(|e| GitHubError::Parse(format!("contents response was not utf8: {e}")))
+    String::from_utf8(bytes)
+        .map_err(|e| GitHubError::Parse(format!("contents response was not utf8: {e}")))
 }
 
 /// Fetches `path` at `r#ref` (a branch name). `None` means the file does not
@@ -119,15 +134,23 @@ pub fn ensure_branch(client: &Client, repo: &RepoId, branch: &str) -> Result<(),
                     GitHubError::Parse("default branch ref missing object.sha".to_string())
                 })?;
             let create_path = format!("/repos/{}/{}/git/refs", repo.owner, repo.repo);
-            client.request(
+            let create_result = client.request(
                 "POST",
                 &create_path,
                 Some(serde_json::json!({
                     "ref": format!("refs/heads/{branch}"),
                     "sha": sha,
                 })),
-            )?;
-            Ok(())
+            );
+            // 422 here almost always means another sync run won the race and
+            // created the branch between our GET and this POST -- confirm
+            // that before treating it as a real failure.
+            if let Err(GitHubError::Http { status: 422, .. }) = &create_result
+                && client.request("GET", &ref_path, None).is_ok()
+            {
+                return Ok(());
+            }
+            create_result.map(|_| ())
         }
         Err(e) => Err(e),
     }
@@ -169,10 +192,7 @@ mod tests {
 
     #[test]
     fn get_file_returns_none_on_404() {
-        let server = MockServer::start(vec![MockResponse::json(
-            404,
-            r#"{"message":"Not Found"}"#,
-        )]);
+        let server = MockServer::start(vec![MockResponse::json(404, r#"{"message":"Not Found"}"#)]);
         let client = server.client(None);
         assert!(
             get_file(&client, &repo(), "x.jsonl", "main")
@@ -243,5 +263,57 @@ mod tests {
         let sent: serde_json::Value = serde_json::from_str(&reqs[3].body).unwrap();
         assert_eq!(sent["ref"], "refs/heads/agentflare-memory");
         assert_eq!(sent["sha"], "tip123");
+    }
+
+    #[test]
+    fn get_file_rejects_a_non_base64_encoding() {
+        // Files over the Contents API's 1MB inline limit come back this way
+        // instead of erroring -- must not be read as an empty file.
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"sha":"abc123","content":"","encoding":"none"}"#,
+        )]);
+        let client = server.client(None);
+        let err = get_file(&client, &repo(), "memory-sync.jsonl", "agentflare-memory").unwrap_err();
+        assert!(
+            matches!(err, GitHubError::Parse(_)),
+            "expected Parse, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_branch_treats_a_concurrent_create_422_as_success_when_the_branch_now_exists() {
+        let server = MockServer::start(vec![
+            MockResponse::json(404, r#"{"message":"Not Found"}"#),
+            MockResponse::json(200, r#"{"default_branch":"main"}"#),
+            MockResponse::json(200, r#"{"object":{"sha":"tip123"}}"#),
+            MockResponse::json(422, r#"{"message":"Reference already exists"}"#),
+            MockResponse::json(200, r#"{"object":{"sha":"tip123"}}"#),
+        ]);
+        let client = server.client(Some("tok"));
+        ensure_branch(&client, &repo(), "agentflare-memory").unwrap();
+
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 5);
+        assert_eq!(reqs[3].method, "POST");
+        assert_eq!(reqs[4].method, "GET");
+        assert_eq!(reqs[4].path, "/repos/o/r/git/ref/heads/agentflare-memory");
+    }
+
+    #[test]
+    fn ensure_branch_propagates_a_422_when_the_branch_still_does_not_exist() {
+        let server = MockServer::start(vec![
+            MockResponse::json(404, r#"{"message":"Not Found"}"#),
+            MockResponse::json(200, r#"{"default_branch":"main"}"#),
+            MockResponse::json(200, r#"{"object":{"sha":"tip123"}}"#),
+            MockResponse::json(422, r#"{"message":"Validation Failed"}"#),
+            MockResponse::json(404, r#"{"message":"Not Found"}"#),
+        ]);
+        let client = server.client(Some("tok"));
+        let err = ensure_branch(&client, &repo(), "agentflare-memory").unwrap_err();
+        assert!(
+            matches!(err, GitHubError::Http { status: 422, .. }),
+            "expected the original 422, got {err:?}"
+        );
     }
 }

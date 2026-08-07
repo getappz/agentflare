@@ -88,9 +88,11 @@ pub fn save(
 /// Upsert used by cross-machine sync import. Unlike `save`, the caller
 /// supplies `created_at`/`updated_at` from the source machine's clock (not
 /// `now_iso()`), and a topic_key match is only overwritten when the
-/// incoming `updated_at` is strictly newer than the local row's — a pulled
-/// entry that is stale relative to a fresher local edit must not clobber it.
-/// ISO8601 timestamps in this fixed format compare correctly as strings.
+/// incoming row is newer than the local one, or ties it with different
+/// content (the deterministic winner `sync::merge` already picked) — a
+/// pulled entry that is strictly stale relative to a fresher local edit
+/// must not clobber it. ISO8601 timestamps in this fixed format compare
+/// correctly as strings.
 #[allow(clippy::too_many_arguments)]
 pub fn upsert_synced(
     conn: &Connection,
@@ -105,23 +107,49 @@ pub fn upsert_synced(
     updated_at: &str,
 ) -> rusqlite::Result<SaveOutcome> {
     if let Some(tk) = topic_key.filter(|t| !t.is_empty()) {
-        if let Some((id, existing_updated_at)) = conn
+        if let Some((id, existing_updated_at, existing_content, existing_title)) = conn
             .query_row(
-                "SELECT id, updated_at FROM observations
-                 WHERE topic_key = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR project = ?2) LIMIT 1",
+                "SELECT id, updated_at, content, title FROM observations
+                 WHERE topic_key = ?1 AND deleted_at IS NULL AND project IS ?2 LIMIT 1",
                 params![tk, project],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
             )
             .optional()?
         {
-            if updated_at <= existing_updated_at.as_str() {
+            // A tie on `updated_at` with identical content is a true no-op
+            // (skip it rather than bump revision_count for nothing); a tie
+            // with different content must still converge to whichever entry
+            // `sync::merge` picked as the winner, or the local db silently
+            // disagrees with the file it just wrote to the remote branch.
+            let is_stale = updated_at < existing_updated_at.as_str()
+                || (updated_at == existing_updated_at.as_str()
+                    && content == existing_content
+                    && title == existing_title);
+            if is_stale {
                 return Ok(SaveOutcome::Duplicate(id));
             }
             conn.execute(
                 "UPDATE observations SET content = ?2, title = ?3, normalized_hash = ?4,
-                 revision_count = revision_count + 1, updated_at = ?5, last_seen_at = ?5
+                 type = ?5, scope = ?6, created_at = ?7,
+                 revision_count = revision_count + 1, updated_at = ?8, last_seen_at = ?8
                  WHERE id = ?1",
-                params![id, content, title, normalized_hash, updated_at],
+                params![
+                    id,
+                    content,
+                    title,
+                    normalized_hash,
+                    r#type,
+                    scope,
+                    created_at,
+                    updated_at
+                ],
             )?;
             return Ok(SaveOutcome::Updated(id));
         }
@@ -130,7 +158,17 @@ pub fn upsert_synced(
                 (type, title, content, project, scope, topic_key, normalized_hash,
                  created_at, updated_at, last_seen_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
-            params![r#type, title, content, project, scope, tk, normalized_hash, created_at, updated_at],
+            params![
+                r#type,
+                title,
+                content,
+                project,
+                scope,
+                tk,
+                normalized_hash,
+                created_at,
+                updated_at
+            ],
         )?;
         return Ok(SaveOutcome::Created(conn.last_insert_rowid()));
     }
@@ -623,10 +661,191 @@ mod tests {
     }
 
     #[test]
+    fn upsert_synced_applies_the_merge_winner_on_an_equal_timestamp_tie_with_different_content() {
+        let conn = new_db();
+        let id = match save(
+            &conn,
+            None,
+            "decision",
+            "remote-newer title",
+            "remote-newer content",
+            None,
+            Some("proj-a"),
+            None,
+            Some("topic-x"),
+        )
+        .unwrap()
+        {
+            SaveOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        conn.execute(
+            "UPDATE observations SET updated_at = '2026-06-01T00:00:00.000Z' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+
+        // Same tie-break `sync::merge` uses on an exact-timestamp collision:
+        // the entry chosen there must still land here, not get skipped as
+        // "not strictly newer".
+        let outcome = upsert_synced(
+            &conn,
+            "decision",
+            "local-older title",
+            "local-older content",
+            Some("proj-a"),
+            "project",
+            Some("topic-x"),
+            &hash_normalized("local-older title", "local-older content"),
+            "2026-06-01T00:00:00.000Z",
+            "2026-06-01T00:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(outcome, SaveOutcome::Updated(id));
+        let obs = get(&conn, id).unwrap().unwrap();
+        assert_eq!(obs.title, "local-older title");
+    }
+
+    #[test]
+    fn upsert_synced_is_a_true_noop_on_an_equal_timestamp_tie_with_identical_content() {
+        let conn = new_db();
+        let id = match save(
+            &conn,
+            None,
+            "decision",
+            "t",
+            "c",
+            None,
+            Some("proj-a"),
+            None,
+            Some("topic-x"),
+        )
+        .unwrap()
+        {
+            SaveOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        let before = get(&conn, id).unwrap().unwrap();
+
+        let outcome = upsert_synced(
+            &conn,
+            "decision",
+            "t",
+            "c",
+            Some("proj-a"),
+            "project",
+            Some("topic-x"),
+            &hash_normalized("t", "c"),
+            &before.created_at,
+            &before.updated_at,
+        )
+        .unwrap();
+        assert_eq!(outcome, SaveOutcome::Duplicate(id));
+        let after = get(&conn, id).unwrap().unwrap();
+        assert_eq!(
+            after.revision_count, before.revision_count,
+            "an identical tie must not bump revision_count"
+        );
+    }
+
+    #[test]
+    fn upsert_synced_updates_type_scope_and_created_at_on_a_newer_entry() {
+        let conn = new_db();
+        let id = match save(
+            &conn,
+            None,
+            "note",
+            "t",
+            "c",
+            None,
+            Some("proj-a"),
+            Some("project"),
+            Some("topic-x"),
+        )
+        .unwrap()
+        {
+            SaveOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        upsert_synced(
+            &conn,
+            "decision",
+            "t2",
+            "c2",
+            Some("proj-a"),
+            "global",
+            Some("topic-x"),
+            &hash_normalized("t2", "c2"),
+            "2025-01-01T00:00:00.000Z",
+            "2027-01-01T00:00:00.000Z",
+        )
+        .unwrap();
+
+        let obs = get(&conn, id).unwrap().unwrap();
+        assert_eq!(obs.r#type, "decision");
+        assert_eq!(obs.scope, "global");
+        assert_eq!(obs.created_at, "2025-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn upsert_synced_does_not_let_a_global_entry_clobber_a_project_scoped_one() {
+        let conn = new_db();
+        let id = match save(
+            &conn,
+            None,
+            "decision",
+            "project fact",
+            "project content",
+            None,
+            Some("proj-a"),
+            None,
+            Some("topic-x"),
+        )
+        .unwrap()
+        {
+            SaveOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        // No project (a global entry) sharing the same topic_key must not
+        // match the project-scoped row -- `project IS ?2`, not
+        // `?2 IS NULL OR project = ?2`, which would match every project.
+        let outcome = upsert_synced(
+            &conn,
+            "decision",
+            "global fact",
+            "global content",
+            None,
+            "project",
+            Some("topic-x"),
+            &hash_normalized("global fact", "global content"),
+            "2027-01-01T00:00:00.000Z",
+            "2027-01-01T00:00:00.000Z",
+        )
+        .unwrap();
+        assert!(matches!(outcome, SaveOutcome::Created(_)));
+
+        let obs = get(&conn, id).unwrap().unwrap();
+        assert_eq!(
+            obs.title, "project fact",
+            "the project-scoped row must be untouched"
+        );
+    }
+
+    #[test]
     fn list_all_returns_every_project_and_excludes_soft_deleted() {
         let conn = new_db();
         let keep_a = match save(
-            &conn, None, "note", "a", "a", None, Some("proj-a"), None, None,
+            &conn,
+            None,
+            "note",
+            "a",
+            "a",
+            None,
+            Some("proj-a"),
+            None,
+            None,
         )
         .unwrap()
         {
@@ -634,7 +853,15 @@ mod tests {
             other => panic!("expected Created, got {other:?}"),
         };
         let keep_b = match save(
-            &conn, None, "note", "b", "b", None, Some("proj-b"), None, None,
+            &conn,
+            None,
+            "note",
+            "b",
+            "b",
+            None,
+            Some("proj-b"),
+            None,
+            None,
         )
         .unwrap()
         {
@@ -642,7 +869,15 @@ mod tests {
             other => panic!("expected Created, got {other:?}"),
         };
         let deleted = match save(
-            &conn, None, "note", "d", "d", None, Some("proj-a"), None, None,
+            &conn,
+            None,
+            "note",
+            "d",
+            "d",
+            None,
+            Some("proj-a"),
+            None,
+            None,
         )
         .unwrap()
         {

@@ -38,8 +38,9 @@ impl MemorySyncConfig {
              push to (a small private repo works fine)"
                 .to_string()
         })?;
-        let repo = RepoId::parse(repo_str.trim())
-            .ok_or_else(|| format!("AGENTFLARE_MEMORY_SYNC_REPO={repo_str:?} is not a GitHub owner/repo"))?;
+        let repo = RepoId::parse(repo_str.trim()).ok_or_else(|| {
+            format!("AGENTFLARE_MEMORY_SYNC_REPO={repo_str:?} is not a GitHub owner/repo")
+        })?;
         let branch = std::env::var("AGENTFLARE_MEMORY_SYNC_BRANCH")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -89,7 +90,10 @@ impl From<&Observation> for SyncEntry {
 }
 
 pub fn export_all(conn: &Connection) -> rusqlite::Result<Vec<SyncEntry>> {
-    Ok(observations::list_all(conn)?.iter().map(SyncEntry::from).collect())
+    Ok(observations::list_all(conn)?
+        .iter()
+        .map(SyncEntry::from)
+        .collect())
 }
 
 fn merge_key(e: &SyncEntry) -> (String, String) {
@@ -150,10 +154,19 @@ pub fn import_entries(conn: &Connection, entries: &[SyncEntry]) -> rusqlite::Res
     Ok(changed)
 }
 
-fn parse_jsonl(text: &str) -> Vec<SyncEntry> {
+/// Parses every nonblank line as a `SyncEntry`, or fails on the first bad
+/// one. Silently dropping unparseable lines (the old behavior) would mean a
+/// single malformed record permanently deletes itself from the shared log
+/// the next time this machine pushes a merge that omits it -- better to
+/// abort the whole sync than to quietly rewrite the file out from under
+/// whoever wrote that line.
+fn parse_jsonl(text: &str) -> Result<Vec<SyncEntry>, String> {
     text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .map(|(i, l)| {
+            serde_json::from_str(l).map_err(|e| format!("invalid JSONL at line {}: {e}", i + 1))
+        })
         .collect()
 }
 
@@ -185,17 +198,21 @@ pub fn run(
     crate::github::contents::ensure_branch(client, &config.repo, &config.branch)
         .map_err(|e| format!("ensure branch {}: {e}", config.branch))?;
 
-    let mut existing = crate::github::contents::get_file(client, &config.repo, &config.path, &config.branch)
-        .map_err(|e| format!("fetch remote memory log: {e}"))?;
+    let mut existing =
+        crate::github::contents::get_file(client, &config.repo, &config.path, &config.branch)
+            .map_err(|e| format!("fetch remote memory log: {e}"))?;
 
     let remote_entries = existing
         .as_ref()
         .map(|f| parse_jsonl(&f.content))
+        .transpose()
+        .map_err(|e| format!("parse remote memory log: {e}"))?
         .unwrap_or_default();
     let local_entries = export_all(conn).map_err(|e| format!("read local observations: {e}"))?;
     let merged = merge(remote_entries, local_entries);
 
-    let imported = import_entries(conn, &merged).map_err(|e| format!("import merged entries: {e}"))?;
+    let mut imported =
+        import_entries(conn, &merged).map_err(|e| format!("import merged entries: {e}"))?;
 
     let serialized = to_jsonl(&merged);
     let unchanged = existing.as_ref().is_some_and(|f| f.content == serialized);
@@ -215,8 +232,11 @@ pub fn run(
         match result {
             Ok(_) => true,
             Err(crate::github::GitHubError::Http { status: 409, .. }) => {
-                // Someone else pushed between our GET and PUT -- refetch and
-                // retry once with the fresh sha rather than clobber them.
+                // Someone else pushed between our GET and PUT. Refetch and
+                // re-merge from scratch rather than blindly retrying the
+                // stale `serialized` payload -- that would force-push over
+                // whatever the other workstation just added, which is
+                // exactly the loss this whole module exists to prevent.
                 existing = crate::github::contents::get_file(
                     client,
                     &config.repo,
@@ -224,13 +244,28 @@ pub fn run(
                     &config.branch,
                 )
                 .map_err(|e| format!("refetch after conflict: {e}"))?;
+
+                let retry_remote = existing
+                    .as_ref()
+                    .map(|f| parse_jsonl(&f.content))
+                    .transpose()
+                    .map_err(|e| format!("parse remote memory log after conflict: {e}"))?
+                    .unwrap_or_default();
+                let retry_merged = merge(
+                    retry_remote,
+                    export_all(conn).map_err(|e| format!("read local observations: {e}"))?,
+                );
+                imported += import_entries(conn, &retry_merged)
+                    .map_err(|e| format!("import retry merge: {e}"))?;
+                let retry_serialized = to_jsonl(&retry_merged);
+
                 crate::github::contents::put_file(
                     client,
                     &config.repo,
                     &config.path,
                     &config.branch,
                     "chore: sync memory observations",
-                    &serialized,
+                    &retry_serialized,
                     existing.as_ref().map(|f| f.sha.as_str()),
                 )
                 .map_err(|e| format!("push merged memory log after retry: {e}"))?;
@@ -272,8 +307,18 @@ mod tests {
 
     #[test]
     fn merge_prefers_local_when_local_is_newer_and_remote_when_remote_is_newer() {
-        let remote = vec![entry("p", "topic-x", "remote-newer", "2026-06-01T00:00:00.000Z")];
-        let local = vec![entry("p", "topic-x", "local-older", "2026-01-01T00:00:00.000Z")];
+        let remote = vec![entry(
+            "p",
+            "topic-x",
+            "remote-newer",
+            "2026-06-01T00:00:00.000Z",
+        )];
+        let local = vec![entry(
+            "p",
+            "topic-x",
+            "local-older",
+            "2026-01-01T00:00:00.000Z",
+        )];
         let merged = merge(remote, local);
         assert_eq!(merged[0].title, "remote-newer");
     }
@@ -291,7 +336,11 @@ mod tests {
         let remote = vec![entry("proj-a", "topic-x", "a", "2026-01-01T00:00:00.000Z")];
         let local = vec![entry("proj-b", "topic-x", "b", "2026-01-01T00:00:00.000Z")];
         let merged = merge(remote, local);
-        assert_eq!(merged.len(), 2, "same topic_key in different projects must not collapse");
+        assert_eq!(
+            merged.len(),
+            2,
+            "same topic_key in different projects must not collapse"
+        );
     }
 
     #[test]
@@ -301,7 +350,17 @@ mod tests {
             entry("p", "topic-b", "b", "2026-01-02T00:00:00.000Z"),
         ];
         let text = to_jsonl(&entries);
-        assert_eq!(parse_jsonl(&text), entries);
+        assert_eq!(parse_jsonl(&text).unwrap(), entries);
+    }
+
+    #[test]
+    fn parse_jsonl_fails_loud_on_a_malformed_line_instead_of_dropping_it() {
+        let text = "{\"not\":\"a valid SyncEntry\"}\n";
+        let err = parse_jsonl(text).unwrap_err();
+        assert!(
+            err.contains("line 1"),
+            "error should name the offending line: {err}"
+        );
     }
 
     #[test]
@@ -359,7 +418,12 @@ mod tests {
         )
         .unwrap();
 
-        let remote_entry = entry("proj-a", "topic-remote", "remote fact", "2026-01-01T00:00:00.000Z");
+        let remote_entry = entry(
+            "proj-a",
+            "topic-remote",
+            "remote fact",
+            "2026-01-01T00:00:00.000Z",
+        );
         let remote_jsonl = to_jsonl(&[remote_entry]);
         let b64 = {
             use base64::Engine as _;
@@ -381,7 +445,10 @@ mod tests {
 
         let report = run(&conn, &client, &config()).unwrap();
         assert!(report.pushed);
-        assert_eq!(report.imported, 1, "the remote-only entry should be imported");
+        assert_eq!(
+            report.imported, 1,
+            "the remote-only entry should be imported"
+        );
 
         let all = observations::list_all(&conn).unwrap();
         assert!(all.iter().any(|o| o.title == "remote fact"));
@@ -396,7 +463,12 @@ mod tests {
     #[test]
     fn run_skips_the_push_when_the_merge_matches_remote_exactly() {
         let conn = new_db();
-        let remote_entry = entry("proj-a", "topic-x", "shared fact", "2026-01-01T00:00:00.000Z");
+        let remote_entry = entry(
+            "proj-a",
+            "topic-x",
+            "shared fact",
+            "2026-01-01T00:00:00.000Z",
+        );
         let remote_jsonl = to_jsonl(&[remote_entry]);
         let b64 = {
             use base64::Engine as _;
@@ -416,5 +488,100 @@ mod tests {
         assert!(!report.pushed, "identical merge must not trigger a PUT");
         let reqs = server.requests();
         assert_eq!(reqs.len(), 2, "no PUT request should have been made");
+    }
+
+    #[test]
+    fn run_re_merges_after_a_409_conflict_instead_of_overwriting_a_concurrent_push() {
+        use base64::Engine as _;
+
+        let conn = new_db();
+        observations::save(
+            &conn,
+            None,
+            "decision",
+            "local fact",
+            "local content",
+            None,
+            Some("proj-a"),
+            None,
+            Some("topic-local"),
+        )
+        .unwrap();
+
+        let remote_entry = entry(
+            "proj-a",
+            "topic-x",
+            "remote fact",
+            "2026-01-01T00:00:00.000Z",
+        );
+        let initial_jsonl = to_jsonl(std::slice::from_ref(&remote_entry));
+        let initial_b64 =
+            base64::engine::general_purpose::STANDARD.encode(initial_jsonl.as_bytes());
+
+        // Added to the remote log by another workstation between our GET
+        // and PUT -- the retry must not lose this.
+        let concurrent_entry = entry(
+            "proj-a",
+            "topic-concurrent",
+            "concurrent fact",
+            "2026-02-01T00:00:00.000Z",
+        );
+        let updated_jsonl = to_jsonl(&[remote_entry, concurrent_entry]);
+        let updated_b64 =
+            base64::engine::general_purpose::STANDARD.encode(updated_jsonl.as_bytes());
+
+        let server = MockServer::start(vec![
+            // ensure_branch: branch already exists.
+            MockResponse::json(200, r#"{"object":{"sha":"tip"}}"#),
+            // get_file: initial remote content.
+            MockResponse::json(
+                200,
+                &format!(r#"{{"sha":"filesha","content":"{initial_b64}","encoding":"base64"}}"#),
+            ),
+            // put_file: someone else pushed in between -- conflict.
+            MockResponse::json(409, r#"{"message":"conflict"}"#),
+            // get_file: refetch after conflict, now includes the concurrent entry.
+            MockResponse::json(
+                200,
+                &format!(r#"{{"sha":"newfilesha","content":"{updated_b64}","encoding":"base64"}}"#),
+            ),
+            // put_file: retry succeeds.
+            MockResponse::json(200, r#"{"content":{"sha":"final"}}"#),
+        ]);
+        let client = server.client(Some("tok"));
+
+        let report = run(&conn, &client, &config()).unwrap();
+        assert!(report.pushed);
+        assert_eq!(
+            report.imported, 2,
+            "the original remote fact and the concurrently-added one should both be imported"
+        );
+
+        let all = observations::list_all(&conn).unwrap();
+        assert!(all.iter().any(|o| o.title == "remote fact"));
+        assert!(all.iter().any(|o| o.title == "local fact"));
+        assert!(
+            all.iter().any(|o| o.title == "concurrent fact"),
+            "the entry added between our GET and PUT must survive the retry"
+        );
+
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 5);
+        assert_eq!(reqs[2].method, "PUT");
+        assert_eq!(reqs[4].method, "PUT");
+        let retry_sent: serde_json::Value = serde_json::from_str(&reqs[4].body).unwrap();
+        assert_eq!(
+            retry_sent["sha"], "newfilesha",
+            "retry must use the fresh sha"
+        );
+        let retry_content = base64::engine::general_purpose::STANDARD
+            .decode(retry_sent["content"].as_str().unwrap())
+            .unwrap();
+        assert!(
+            String::from_utf8(retry_content)
+                .unwrap()
+                .contains("concurrent fact"),
+            "the retry payload must carry the concurrently-added entry, not the stale first merge"
+        );
     }
 }

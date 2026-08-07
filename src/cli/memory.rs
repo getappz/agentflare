@@ -164,7 +164,11 @@ fn run_sync() {
             config.repo,
             config.branch,
             report.imported,
-            if report.pushed { "updated" } else { "already current" }
+            if report.pushed {
+                "updated"
+            } else {
+                "already current"
+            }
         ),
         Err(e) => crate::ui::error(&e),
     }
