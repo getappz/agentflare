@@ -984,10 +984,40 @@ fn ship_cmd(opts: ShipArgs) {
         }
     };
 
+    remember_shipped(&repo_root, &repo, &base, &head, &pr);
+
     if opts.no_wait {
         return;
     }
     wait_for_checks(&client, &repo, &pr, opts.wait_secs);
+}
+
+/// Records that a PR was shipped in agentflare's own memory store, so a
+/// later session (this one or another agent's) can `memory recall` it
+/// instead of re-discovering the work from scratch. Best-effort: a memory
+/// write must never fail a ship that already succeeded, so a `remember`
+/// error only prints a warning.
+fn remember_shipped(
+    repo_root: &Path,
+    repo: &crate::github::RepoId,
+    base: &str,
+    head: &str,
+    pr: &crate::github::models::PullRequest,
+) {
+    let log = default_pr_body(repo_root, base, head);
+    let content = format!("{log}\n\n{}", pr.html_url);
+    let input = crate::memory::mcp::RememberInput {
+        title: format!("Shipped: {}", pr.title),
+        content,
+        r#type: "decision".to_string(),
+        session_id: None,
+        project: Some(repo.repo.clone()),
+        topic_key: Some(format!("pr-{}", pr.number)),
+        scope: None,
+    };
+    if let Err(e) = crate::memory::mcp::handle_remember(input) {
+        crate::ui::warning(&format!("PR shipped, but memory remember failed: {e}"));
+    }
 }
 
 /// Falls back to the branch's latest commit subject when `--title` is
