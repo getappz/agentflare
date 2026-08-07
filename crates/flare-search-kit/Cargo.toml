@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
 
 [features]
 default = []
