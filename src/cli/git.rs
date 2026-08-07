@@ -1,6 +1,6 @@
 //! `agentflare git` -- git-related CLI surface: installing the shared
 //! branch-protection hooks (pre-commit / pre-push / prepare-commit-msg /
-//! reference-transaction) into a repo, installing/uninstalling the
+//! reference-transaction / post-commit) into a repo, installing/uninstalling the
 //! flare-git-shim PATH shim, and the recovery-snapshot commands
 //! (`snapshot list/restore/prune`) that make `flare_git_core::snapshot`'s
 //! automatic pre-destructive snapshots actually usable.
@@ -205,6 +205,7 @@ const PRE_COMMIT: &str = include_str!("../../.githooks/pre-commit");
 const PRE_PUSH: &str = include_str!("../../.githooks/pre-push");
 const PREPARE_COMMIT_MSG: &str = include_str!("../../.githooks/prepare-commit-msg");
 const REFERENCE_TRANSACTION: &str = include_str!("../../.githooks/reference-transaction");
+const POST_COMMIT: &str = include_str!("../../.githooks/post-commit");
 
 /// Every hook this command installs, in (filename, embedded template) pairs.
 const HOOKS: &[(&str, &str)] = &[
@@ -212,6 +213,7 @@ const HOOKS: &[(&str, &str)] = &[
     ("pre-push", PRE_PUSH),
     ("prepare-commit-msg", PREPARE_COMMIT_MSG),
     ("reference-transaction", REFERENCE_TRANSACTION),
+    ("post-commit", POST_COMMIT),
 ];
 
 fn ensure_shared_templates() -> std::io::Result<()> {
@@ -428,8 +430,9 @@ fn install_hooks(opts: InstallHooksArgs) {
         println!(
             "\nBranch-protection hooks installed. Direct commits/pushes to the \
              default branch are now blocked for every git client in this repo. \
-             Commits are also stamped with provenance trailers, and every ref \
-             move is journaled to ~/.agentflare/audit/git-refs.jsonl."
+             Commits are also stamped with provenance trailers, every ref \
+             move is journaled to ~/.agentflare/audit/git-refs.jsonl, and \
+             lean-ctx's code index refreshes in the background after each commit."
         );
         let _ = opts;
     }
@@ -981,10 +984,40 @@ fn ship_cmd(opts: ShipArgs) {
         }
     };
 
+    remember_shipped(&repo_root, &repo, &base, &head, &pr);
+
     if opts.no_wait {
         return;
     }
     wait_for_checks(&client, &repo, &pr, opts.wait_secs);
+}
+
+/// Records that a PR was shipped in agentflare's own memory store, so a
+/// later session (this one or another agent's) can `memory recall` it
+/// instead of re-discovering the work from scratch. Best-effort: a memory
+/// write must never fail a ship that already succeeded, so a `remember`
+/// error only prints a warning.
+fn remember_shipped(
+    repo_root: &Path,
+    repo: &crate::github::RepoId,
+    base: &str,
+    head: &str,
+    pr: &crate::github::models::PullRequest,
+) {
+    let log = default_pr_body(repo_root, base, head);
+    let content = format!("{log}\n\n{}", pr.html_url);
+    let input = crate::memory::mcp::RememberInput {
+        title: format!("Shipped: {}", pr.title),
+        content,
+        r#type: "decision".to_string(),
+        session_id: None,
+        project: Some(repo.repo.clone()),
+        topic_key: Some(format!("pr-{}", pr.number)),
+        scope: None,
+    };
+    if let Err(e) = crate::memory::mcp::handle_remember(input) {
+        crate::ui::warning(&format!("PR shipped, but memory remember failed: {e}"));
+    }
 }
 
 /// Falls back to the branch's latest commit subject when `--title` is
