@@ -57,9 +57,6 @@ name = "agent-detector"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9bfb5cc9405a158bc050668e34b3bbbd3ace4ff7c4e06036e7418417f90a9ab5"
-dependencies = [
- "sysinfo 0.38.4",
-]
 
 [[package]]
 name = "agentflare"
@@ -77,6 +74,7 @@ dependencies = [
  "agentflare-jobs",
  "agentflare-skill-registry",
  "agentflare-store",
+ "agentflare-workspace-hack",
  "axum",
  "base64",
  "built",
@@ -127,6 +125,7 @@ dependencies = [
 name = "agentflare-agent-registry"
 version = "0.1.0"
 dependencies = [
+ "agentflare-workspace-hack",
  "clap",
  "serde",
  "toml",
@@ -138,6 +137,7 @@ version = "0.1.0"
 dependencies = [
  "agentflare-db-kit",
  "agentflare-store",
+ "agentflare-workspace-hack",
  "blake3",
  "flate2",
  "nanoid",
@@ -153,6 +153,7 @@ version = "0.1.0"
 dependencies = [
  "agentflare-agent-registry",
  "agentflare-db-kit",
+ "agentflare-workspace-hack",
  "flare-search-kit",
  "hex",
  "hmac",
@@ -171,6 +172,7 @@ dependencies = [
 name = "agentflare-db-kit"
 version = "0.1.0"
 dependencies = [
+ "agentflare-workspace-hack",
  "nanoid",
  "rusqlite",
  "rusqlite_migration",
@@ -183,17 +185,19 @@ dependencies = [
 name = "agentflare-flare-code"
 version = "0.1.0"
 dependencies = [
+ "agentflare-workspace-hack",
  "dirs",
  "regex",
  "serde",
  "serde_json",
- "sysinfo 0.34.2",
+ "sysinfo",
 ]
 
 [[package]]
 name = "agentflare-flare-output"
 version = "0.1.0"
 dependencies = [
+ "agentflare-workspace-hack",
  "dirs",
  "regex",
  "serde_json",
@@ -207,6 +211,7 @@ dependencies = [
 name = "agentflare-gateway-registry"
 version = "0.1.0"
 dependencies = [
+ "agentflare-workspace-hack",
  "axum",
  "flare-search-kit",
  "futures-util",
@@ -231,6 +236,7 @@ name = "agentflare-jobs"
 version = "0.1.0"
 dependencies = [
  "agentflare-db-kit",
+ "agentflare-workspace-hack",
  "parking_lot",
  "rusqlite",
  "rusqlite_migration",
@@ -244,6 +250,7 @@ dependencies = [
 name = "agentflare-shim"
 version = "0.1.0"
 dependencies = [
+ "agentflare-workspace-hack",
  "dirs",
  "which",
 ]
@@ -253,6 +260,7 @@ name = "agentflare-skill-registry"
 version = "0.1.1"
 dependencies = [
  "agentflare-gateway-registry",
+ "agentflare-workspace-hack",
  "dirs",
  "fastrand",
  "flare-search-kit",
@@ -271,6 +279,7 @@ name = "agentflare-store"
 version = "0.1.0"
 dependencies = [
  "agentflare-db-kit",
+ "agentflare-workspace-hack",
  "anyhow",
  "blake3",
  "bytemuck",
@@ -289,6 +298,64 @@ dependencies = [
  "thiserror",
  "tracing",
  "ureq 2.12.1",
+]
+
+[[package]]
+name = "agentflare-workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "axum-core",
+ "bitflags",
+ "cc",
+ "chrono",
+ "crypto-common 0.1.7",
+ "digest 0.10.7",
+ "errno",
+ "form_urlencoded",
+ "futures-channel",
+ "futures-sink",
+ "futures-util",
+ "getrandom 0.2.17",
+ "getrandom 0.4.3",
+ "hashbrown 0.17.1",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "libc",
+ "memchr",
+ "num-traits",
+ "once_cell",
+ "percent-encoding",
+ "proc-macro2",
+ "quote",
+ "rand_core 0.6.4",
+ "regex",
+ "regex-syntax",
+ "reqwest 0.13.4",
+ "rmcp",
+ "rustix 1.1.4",
+ "rustls",
+ "rustls-webpki",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "simd-adler32",
+ "similar",
+ "smallvec",
+ "syn",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-core",
+ "typenum",
+ "ureq 2.12.1",
+ "winapi",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -1112,6 +1179,7 @@ version = "0.1.0"
 dependencies = [
  "agentflare-db-kit",
  "agentflare-store",
+ "agentflare-workspace-hack",
  "dirs",
  "flate2",
  "rusqlite",
@@ -1137,6 +1205,7 @@ dependencies = [
  "agent-detector",
  "agentflare-backend",
  "agentflare-shim",
+ "agentflare-workspace-hack",
  "dirs",
  "fs2",
  "rusqlite",
@@ -1154,6 +1223,7 @@ name = "flare-git-shim"
 version = "0.1.0"
 dependencies = [
  "agentflare-shim",
+ "agentflare-workspace-hack",
  "dirs",
  "flare-git-core",
  "serde",
@@ -1165,6 +1235,7 @@ dependencies = [
 name = "flare-proxy"
 version = "0.1.0"
 dependencies = [
+ "agentflare-workspace-hack",
  "axum",
  "base64",
  "futures",
@@ -1179,6 +1250,7 @@ dependencies = [
 name = "flare-search-kit"
 version = "0.1.0"
 dependencies = [
+ "agentflare-workspace-hack",
  "serde",
 ]
 
@@ -1187,6 +1259,7 @@ name = "flare-vault"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "agentflare-workspace-hack",
  "argon2",
  "base64",
  "chrono",
@@ -2150,16 +2223,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags",
-]
-
-[[package]]
-name = "objc2-io-kit"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
-dependencies = [
- "libc",
- "objc2-core-foundation",
 ]
 
 [[package]]
@@ -3482,20 +3545,6 @@ dependencies = [
  "ntapi",
  "objc2-core-foundation",
  "windows 0.57.0",
-]
-
-[[package]]
-name = "sysinfo"
-version = "0.38.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92ab6a2f8bfe508deb3c6406578252e491d299cbbf3bc0529ecc3313aee4a52f"
-dependencies = [
- "libc",
- "memchr",
- "ntapi",
- "objc2-core-foundation",
- "objc2-io-kit",
- "windows 0.62.2",
 ]
 
 [[package]]

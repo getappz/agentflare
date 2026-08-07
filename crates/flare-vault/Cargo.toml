@@ -23,6 +23,7 @@ hex = "0.4"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

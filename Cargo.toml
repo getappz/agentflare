@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault"]
+members = ["agentflare-workspace-hack","crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault"]
 resolver = "2"
 
 [package]
@@ -72,7 +72,7 @@ regex = "1"
 agentflare-artifacts = { path = "crates/agentflare-artifacts" }
 agentflare-backend = { package = "agentflare-backend", path = "crates/agentflare-backend" }
 db_kit = { package = "agentflare-db-kit", path = "crates/agentflare-db-kit" }
-agent-detector = "0.2.1"
+agent-detector = { version = "0.2.1", default-features = false }
 flare-search-kit = { path = "crates/flare-search-kit" }
 axum = "0.8"
 fs2 = "0.4"
@@ -86,6 +86,7 @@ flare-vault = { path = "crates/flare-vault" }
 skill = { version = "0.8", default-features = false, features = ["network"] }
 agentflare-jobs = { path = "crates/agentflare-jobs" }
 machine-uid = "0.6.0"
+agentflare-workspace-hack = { version = "0.1", path = "agentflare-workspace-hack" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

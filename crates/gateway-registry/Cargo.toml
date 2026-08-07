@@ -23,6 +23,7 @@ sha2 = "0.10"
 flare-search-kit = { path = "../flare-search-kit" }
 http = "1.4"
 ureq = { version = "2", features = ["json"] }
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
 
 [dev-dependencies]
 tempfile = "3"

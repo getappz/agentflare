@@ -1,0 +1,5 @@
+[profile.default]
+# A single hung test shouldn't be able to pin a runner for the job's full
+# 25-minute timeout (see ci.yml) — kill it well before that and let the rest
+# of the suite keep going.
+slow-timeout = { period = "60s", terminate-after = 5 }

@@ -26,6 +26,7 @@ ureq = { version = "2", features = ["json"], optional = true }
 sha2 = { version = "0.10", optional = true }
 ndarray = { version = "0.17", optional = true }
 ort = { version = "=2.0.0-rc.12", optional = true, default-features = true, features = ["ndarray"] }
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
 
 [features]
 default = []
