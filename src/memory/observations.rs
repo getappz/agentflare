@@ -85,6 +85,68 @@ pub fn save(
     Ok(SaveOutcome::Created(id))
 }
 
+/// Upsert used by cross-machine sync import. Unlike `save`, the caller
+/// supplies `created_at`/`updated_at` from the source machine's clock (not
+/// `now_iso()`), and a topic_key match is only overwritten when the
+/// incoming `updated_at` is strictly newer than the local row's — a pulled
+/// entry that is stale relative to a fresher local edit must not clobber it.
+/// ISO8601 timestamps in this fixed format compare correctly as strings.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_synced(
+    conn: &Connection,
+    r#type: &str,
+    title: &str,
+    content: &str,
+    project: Option<&str>,
+    scope: &str,
+    topic_key: Option<&str>,
+    normalized_hash: &str,
+    created_at: &str,
+    updated_at: &str,
+) -> rusqlite::Result<SaveOutcome> {
+    if let Some(tk) = topic_key.filter(|t| !t.is_empty()) {
+        if let Some((id, existing_updated_at)) = conn
+            .query_row(
+                "SELECT id, updated_at FROM observations
+                 WHERE topic_key = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR project = ?2) LIMIT 1",
+                params![tk, project],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            if updated_at <= existing_updated_at.as_str() {
+                return Ok(SaveOutcome::Duplicate(id));
+            }
+            conn.execute(
+                "UPDATE observations SET content = ?2, title = ?3, normalized_hash = ?4,
+                 revision_count = revision_count + 1, updated_at = ?5, last_seen_at = ?5
+                 WHERE id = ?1",
+                params![id, content, title, normalized_hash, updated_at],
+            )?;
+            return Ok(SaveOutcome::Updated(id));
+        }
+        conn.execute(
+            "INSERT INTO observations
+                (type, title, content, project, scope, topic_key, normalized_hash,
+                 created_at, updated_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+            params![r#type, title, content, project, scope, tk, normalized_hash, created_at, updated_at],
+        )?;
+        return Ok(SaveOutcome::Created(conn.last_insert_rowid()));
+    }
+
+    if let Some((id, _)) = find_duplicate(conn, normalized_hash, project)? {
+        return Ok(SaveOutcome::Duplicate(id));
+    }
+    conn.execute(
+        "INSERT INTO observations
+            (type, title, content, project, scope, normalized_hash, created_at, updated_at, last_seen_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+        params![r#type, title, content, project, scope, normalized_hash, created_at, updated_at],
+    )?;
+    Ok(SaveOutcome::Created(conn.last_insert_rowid()))
+}
+
 pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Observation>> {
     conn.query_row(
         "SELECT id, session_id, type, title, content, tool_name, project, scope,
@@ -177,6 +239,23 @@ pub fn list_recent(
          LIMIT ?3",
     )?;
     let rows = stmt.query_map(params![project, r#type, limit as i64], map_observation)?;
+    rows.collect()
+}
+
+/// All non-deleted observations across every project, unpaged. Used by
+/// memory::sync, which needs the whole set to merge against a remote copy
+/// -- `list_recent`'s `limit` doesn't fit that (and `usize::MAX as i64`
+/// wraps negative on a 64-bit build).
+pub fn list_all(conn: &Connection) -> rusqlite::Result<Vec<Observation>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, type, title, content, tool_name, project, scope,
+                topic_key, normalized_hash, revision_count, duplicate_count,
+                last_seen_at, review_after, pinned, created_at, updated_at, deleted_at
+         FROM observations
+         WHERE deleted_at IS NULL
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([], map_observation)?;
     rows.collect()
 }
 
@@ -402,5 +481,180 @@ mod tests {
         // Soft-deleted rows are excluded from list_recent.
         let recent = list_recent(&conn, Some("proj-a"), None, 10).unwrap();
         assert!(recent.iter().all(|o| o.id != id));
+    }
+
+    #[test]
+    fn upsert_synced_creates_when_topic_key_is_new() {
+        let conn = new_db();
+        let outcome = upsert_synced(
+            &conn,
+            "decision",
+            "t",
+            "c",
+            Some("proj-a"),
+            "project",
+            Some("topic-x"),
+            &hash_normalized("t", "c"),
+            "2026-01-01T00:00:00.000Z",
+            "2026-01-01T00:00:00.000Z",
+        )
+        .unwrap();
+        assert!(matches!(outcome, SaveOutcome::Created(_)));
+    }
+
+    // The whole point of upsert_synced over save: a remote row that is
+    // OLDER than the local one must not overwrite it.
+    #[test]
+    fn upsert_synced_skips_a_stale_topic_key_update() {
+        let conn = new_db();
+        let id = match save(
+            &conn,
+            None,
+            "decision",
+            "fresh title",
+            "fresh content",
+            None,
+            Some("proj-a"),
+            None,
+            Some("topic-x"),
+        )
+        .unwrap()
+        {
+            SaveOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        conn.execute(
+            "UPDATE observations SET updated_at = '2026-06-01T00:00:00.000Z' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+
+        let outcome = upsert_synced(
+            &conn,
+            "decision",
+            "stale title",
+            "stale content",
+            Some("proj-a"),
+            "project",
+            Some("topic-x"),
+            &hash_normalized("stale title", "stale content"),
+            "2026-01-01T00:00:00.000Z",
+            "2026-01-01T00:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(outcome, SaveOutcome::Duplicate(id));
+        let obs = get(&conn, id).unwrap().unwrap();
+        assert_eq!(obs.title, "fresh title");
+    }
+
+    #[test]
+    fn upsert_synced_applies_a_newer_topic_key_update() {
+        let conn = new_db();
+        let id = match save(
+            &conn,
+            None,
+            "decision",
+            "old title",
+            "old content",
+            None,
+            Some("proj-a"),
+            None,
+            Some("topic-x"),
+        )
+        .unwrap()
+        {
+            SaveOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let outcome = upsert_synced(
+            &conn,
+            "decision",
+            "new title",
+            "new content",
+            Some("proj-a"),
+            "project",
+            Some("topic-x"),
+            &hash_normalized("new title", "new content"),
+            "2026-01-01T00:00:00.000Z",
+            "2027-01-01T00:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(outcome, SaveOutcome::Updated(id));
+        let obs = get(&conn, id).unwrap().unwrap();
+        assert_eq!(obs.title, "new title");
+    }
+
+    #[test]
+    fn upsert_synced_dedupes_non_topic_key_entries_by_hash() {
+        let conn = new_db();
+        let hash = hash_normalized("t", "c");
+        let first = upsert_synced(
+            &conn,
+            "note",
+            "t",
+            "c",
+            Some("proj-a"),
+            "project",
+            None,
+            &hash,
+            "2026-01-01T00:00:00.000Z",
+            "2026-01-01T00:00:00.000Z",
+        )
+        .unwrap();
+        let id = match first {
+            SaveOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        let second = upsert_synced(
+            &conn,
+            "note",
+            "t",
+            "c",
+            Some("proj-a"),
+            "project",
+            None,
+            &hash,
+            "2026-01-01T00:00:00.000Z",
+            "2026-01-01T00:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(second, SaveOutcome::Duplicate(id));
+    }
+
+    #[test]
+    fn list_all_returns_every_project_and_excludes_soft_deleted() {
+        let conn = new_db();
+        let keep_a = match save(
+            &conn, None, "note", "a", "a", None, Some("proj-a"), None, None,
+        )
+        .unwrap()
+        {
+            SaveOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        let keep_b = match save(
+            &conn, None, "note", "b", "b", None, Some("proj-b"), None, None,
+        )
+        .unwrap()
+        {
+            SaveOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        let deleted = match save(
+            &conn, None, "note", "d", "d", None, Some("proj-a"), None, None,
+        )
+        .unwrap()
+        {
+            SaveOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        soft_delete(&conn, deleted).unwrap();
+
+        let all = list_all(&conn).unwrap();
+        let ids: Vec<i64> = all.iter().map(|o| o.id).collect();
+        assert!(ids.contains(&keep_a));
+        assert!(ids.contains(&keep_b));
+        assert!(!ids.contains(&deleted));
     }
 }

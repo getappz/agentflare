@@ -43,6 +43,10 @@ pub enum MemoryCommands {
         #[arg(long, default_value = "200")]
         batch: usize,
     },
+    /// Sync observations with a shared GitHub branch so other workstations
+    /// see the same facts. Requires AGENTFLARE_MEMORY_SYNC_REPO=owner/repo
+    /// (AGENTFLARE_MEMORY_SYNC_BRANCH/_PATH override the branch/file name).
+    Sync,
 }
 
 impl MemoryArgs {
@@ -136,6 +140,32 @@ impl MemoryArgs {
                     },
                 }
             }
+            MemoryCommands::Sync => run_sync(),
         }
+    }
+}
+
+fn run_sync() {
+    let config = match crate::memory::sync::MemorySyncConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => return crate::ui::error(&e),
+    };
+    let client = match crate::github::Client::new() {
+        Ok(c) => c,
+        Err(e) => return crate::ui::error(&e.to_string()),
+    };
+    let conn = match crate::memory::store::open() {
+        Ok(c) => c,
+        Err(e) => return crate::ui::error(&e.to_string()),
+    };
+    match crate::memory::sync::run(&conn, &client, &config) {
+        Ok(report) => println!(
+            "synced with {}@{}: {} observation(s) changed locally, remote {}",
+            config.repo,
+            config.branch,
+            report.imported,
+            if report.pushed { "updated" } else { "already current" }
+        ),
+        Err(e) => crate::ui::error(&e),
     }
 }

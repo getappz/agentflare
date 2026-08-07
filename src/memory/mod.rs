@@ -9,3 +9,4 @@ pub mod search;
 pub mod sessions;
 pub mod store;
 pub mod summaries;
+pub mod sync;
