@@ -310,12 +310,10 @@ pub fn run_headless(
 /// Prefers stdout (the agent's actual reply stream); falls back to stderr
 /// when stdout is empty.
 fn diagnostic_suffix(captured: &Captured) -> String {
-    let stdout = captured.stdout.trim();
-    let stderr = captured.stderr.trim();
-    let (label, text) = if !stdout.is_empty() {
-        ("stdout", stdout)
-    } else if !stderr.is_empty() {
-        ("stderr", stderr)
+    let (label, text) = if !captured.stdout.is_empty() {
+        ("stdout", captured.stdout.as_str())
+    } else if !captured.stderr.is_empty() {
+        ("stderr", captured.stderr.as_str())
     } else {
         return " (no output captured)".to_string();
     };
