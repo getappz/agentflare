@@ -10,6 +10,12 @@ const DISPATCHED_LABEL: &str = "dispatched";
 const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
 const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 
+/// `agentflare work`'s own `--timeout` defaults to 1800s (its real budget
+/// for a headless agent run) -- this is that budget plus margin for the
+/// claim/worktree setup and done/push/PR steps around it, so the outer job
+/// timeout never cuts off a run before work's own inner timeout would.
+const WORK_JOB_TIMEOUT_SECS: u64 = 2100;
+
 /// Returns the matching `Agent` only if `agent_registry::autonomous_args`
 /// confirms it has a headless permission-bypass flag — the same gate
 /// `agentflare work` itself uses (`src/cli/work.rs`'s `run_work`).
@@ -172,12 +178,14 @@ fn dispatch_item(
     let command = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "agentflare".to_string());
-    let job = agentflare_jobs::AgentJob::new(command).args([
-        "work".to_string(),
-        item.id.clone(),
-        "--agent".to_string(),
-        agent.as_str().to_string(),
-    ]);
+    let job = agentflare_jobs::AgentJob::new(command)
+        .args([
+            "work".to_string(),
+            item.id.clone(),
+            "--agent".to_string(),
+            agent.as_str().to_string(),
+        ])
+        .timeout(WORK_JOB_TIMEOUT_SECS);
     let Ok(info) = queue.enqueue(&job) else {
         return false;
     };
