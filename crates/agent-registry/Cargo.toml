@@ -11,6 +11,7 @@ publish = false
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
 
 [lints.rust]
 unsafe_code = "warn"

@@ -16,3 +16,4 @@ futures = "0.3"
 base64 = "0.22"
 regex = "1"
 nanoid = "0.5"
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }

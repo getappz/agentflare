@@ -1,10 +1,21 @@
 use std::io;
 use std::path::PathBuf;
 
-#[must_use]
-pub fn flag_path() -> PathBuf {
+/// Test-only override so `flag_path`/`session_path` don't touch the real
+/// on-disk state dir. `FLARE_CODE_STATE_DIR_OVERRIDE` takes precedence over
+/// `dirs::state_dir()` when set, same mechanism as `config::config_dir()`'s
+/// `FLARE_CODE_CONFIG_DIR_OVERRIDE`.
+fn state_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("FLARE_CODE_STATE_DIR_OVERRIDE") {
+        return PathBuf::from(p);
+    }
     dirs::state_dir()
         .unwrap_or_else(|| dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")))
+}
+
+#[must_use]
+pub fn flag_path() -> PathBuf {
+    state_dir()
         .join("agentflare")
         .join("flare-code")
         .join("active")
@@ -12,8 +23,7 @@ pub fn flag_path() -> PathBuf {
 
 #[must_use]
 pub fn session_path() -> PathBuf {
-    dirs::state_dir()
-        .unwrap_or_else(|| dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")))
+    state_dir()
         .join("agentflare")
         .join("flare-code")
         .join("session-mode")
@@ -83,45 +93,68 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // Both tests read/write the same process-global state files
-    // (`flag_path()` / `session_path()`). Cargo runs them on parallel threads
-    // by default, so without this lock `clear_nonexistent_is_noop`'s
-    // `clear_active()` can delete the flag file `roundtrip_active_mode` just
-    // wrote — a race that passes on Linux but panics on macOS and hangs on
-    // Windows. Serialize every test that touches these files.
+    // Both tests read/write the same state files (`flag_path()` /
+    // `session_path()`). `STATE_LOCK` serializes them within one process
+    // (cargo test's default), but nextest runs each test as its own
+    // process, where a process-local mutex protects nothing -- sibling
+    // processes would race on the same real on-disk state dir otherwise.
+    // `with_temp_state_dir` keys the override by process id so every
+    // nextest process gets its own directory instead of touching the real
+    // one, same fix as `config::with_temp_config_dir`.
     static STATE_LOCK: Mutex<()> = Mutex::new(());
 
-    #[test]
-    fn roundtrip_active_mode() {
+    struct StateDirOverrideGuard;
+
+    #[allow(unsafe_code)]
+    impl Drop for StateDirOverrideGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("FLARE_CODE_STATE_DIR_OVERRIDE") };
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn with_temp_state_dir<T>(f: impl FnOnce() -> T) -> T {
         let _guard = STATE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        clear_active();
-        assert_eq!(active_mode(), None);
+        let dir =
+            std::env::temp_dir().join(format!("flare-code-test-state-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FLARE_CODE_STATE_DIR_OVERRIDE", &dir) };
+        let _override_guard = StateDirOverrideGuard;
+        f()
+    }
 
-        set_active("full").unwrap();
-        assert_eq!(active_mode(), Some("full".to_string()));
-        assert_eq!(active_scope(), "global");
+    #[test]
+    fn roundtrip_active_mode() {
+        with_temp_state_dir(|| {
+            clear_active();
+            assert_eq!(active_mode(), None);
 
-        set_session("ultra").unwrap();
-        assert_eq!(active_mode(), Some("ultra".to_string()));
-        assert_eq!(active_scope(), "session");
+            set_active("full").unwrap();
+            assert_eq!(active_mode(), Some("full".to_string()));
+            assert_eq!(active_scope(), "global");
 
-        clear_session();
-        assert_eq!(active_mode(), Some("full".to_string()));
-        assert_eq!(active_scope(), "global");
+            set_session("ultra").unwrap();
+            assert_eq!(active_mode(), Some("ultra".to_string()));
+            assert_eq!(active_scope(), "session");
 
-        clear_active();
-        assert_eq!(active_mode(), None);
+            clear_session();
+            assert_eq!(active_mode(), Some("full".to_string()));
+            assert_eq!(active_scope(), "global");
+
+            clear_active();
+            assert_eq!(active_mode(), None);
+        });
     }
 
     #[test]
     fn clear_nonexistent_is_noop() {
-        let _guard = STATE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        clear_active();
-        clear_active();
-        clear_session();
+        with_temp_state_dir(|| {
+            clear_active();
+            clear_active();
+            clear_session();
+        });
     }
 }
