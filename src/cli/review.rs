@@ -78,6 +78,29 @@ pub enum ReviewAction {
         #[arg(long)]
         json: bool,
     },
+    /// Compute one agent's project-level performance review (quantity,
+    /// quality, cost, attention) and save it to the memory store as a
+    /// `performance_review` observation. Run `agentflare memory sync`
+    /// afterward to share it with other workstations.
+    Performance {
+        /// Backend project id (agentflare item-tracker project — run
+        /// `agentflare memory observations` or check the dashboard to find
+        /// it; this is NOT the same identifier as --repo).
+        #[arg(long)]
+        project: String,
+        /// Agent name (default: detected, same convention as `submit`).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Scope quality scoring to one repo (default: current repo).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Window size in days ending now, for quantity/attention/cost
+        /// (quality is always all-time — see `scores`).
+        #[arg(long, default_value = "7")]
+        days: i64,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl ReviewArgs {
@@ -218,6 +241,97 @@ impl ReviewArgs {
                             s.rounds
                         );
                     }
+                }
+            }
+            ReviewAction::Performance {
+                project,
+                agent,
+                repo,
+                days,
+                json,
+            } => {
+                let agent = agent.unwrap_or_else(crate::review::submitter_name);
+                let repo = repo.or_else(|| crate::claims::resolve_repo(None));
+                let now = crate::claims::now();
+                let since = now - days.max(1) * 86_400;
+
+                let backend_conn =
+                    match agentflare_backend::db::open_db(&crate::vent::paths::backend_db_path())
+                    {
+                        Ok(c) => c,
+                        Err(e) => fail(format!("cannot open backend db: {e}")),
+                    };
+
+                let today = chrono::Local::now().date_naive();
+                let cost_start = today - chrono::Duration::days(days.max(1) - 1);
+                let cost_totals =
+                    crate::cost::summarize((cost_start, today), crate::cost::GroupBy::Project);
+                let cost_key = crate::mcp_server::AgentflareMcp::resolve_project_name();
+                let project_cost_usd =
+                    cost_totals.get(&cost_key).map(|t| t.cost_usd).unwrap_or(0.0);
+
+                let review = match crate::review::performance_review(
+                    &backend_conn,
+                    &conn,
+                    &project,
+                    repo.as_deref(),
+                    &agent,
+                    since,
+                    now,
+                    project_cost_usd,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => fail(format!("performance_review failed: {e}")),
+                };
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&review).unwrap_or_default()
+                    );
+                } else {
+                    println!("{agent} — project {project} — last {days}d");
+                    println!("  completed:  {}", review.quantity_completed);
+                    match review.quality_accuracy {
+                        Some(acc) => println!(
+                            "  quality:    {:.0}% ({}/{} verified, {} round(s), all-time)",
+                            acc * 100.0,
+                            review.quality_findings,
+                            review.quality_findings,
+                            review.quality_rounds
+                        ),
+                        None => println!("  quality:    no recorded review rounds"),
+                    }
+                    println!("  attention:  {} ask(s)", review.attention_asks);
+                    println!(
+                        "  cost:       ${:.4} (whole project, all agents, {days}d window)",
+                        review.project_cost_usd
+                    );
+                }
+
+                let mem_conn = match crate::memory::store::open() {
+                    Ok(c) => c,
+                    Err(e) => fail(format!("cannot open memory store: {e}")),
+                };
+                let content = serde_json::to_string(&review).unwrap_or_default();
+                let topic_key = format!("perf_review:{project}:{agent}");
+                match crate::memory::observations::save(
+                    &mem_conn,
+                    None,
+                    "performance_review",
+                    &format!("{agent} performance — {project}"),
+                    &content,
+                    None,
+                    Some(&project),
+                    Some("workstation"),
+                    Some(&topic_key),
+                ) {
+                    Ok(_) => println!(
+                        "\nsaved — run `agentflare memory sync` to share across workstations"
+                    ),
+                    Err(e) => crate::ui::error(&format!(
+                        "warning: review computed but not saved to memory: {e}"
+                    )),
                 }
             }
         }
