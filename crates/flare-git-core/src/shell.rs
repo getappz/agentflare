@@ -151,9 +151,7 @@ pub fn diff(repo_root: &Path, base: &str, head: &str) -> Result<String, String> 
     cmd.args(["diff", "--unified=3", &range])
         .current_dir(repo_root);
     no_console_window(&mut cmd);
-    let out = cmd
-        .output()
-        .map_err(|e| format!("git diff failed: {e}"))?;
+    let out = cmd.output().map_err(|e| format!("git diff failed: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "git diff {range}: {}",
