@@ -235,6 +235,68 @@ pub fn scores(conn: &Connection, repo: Option<&str>) -> rusqlite::Result<Vec<Age
     Ok(out)
 }
 
+/// One agent's project-level value over a window — loopx calls this shape
+/// `project_reward_review_v0`. Deliberately a read-only projection over
+/// three independently-owned stores (backend items, review score_events,
+/// the Claude-Code cost rollup) rather than a new table: quantity/quality/
+/// attention are per-agent, but cost is whole-project (`file_rollup` has no
+/// agent dimension) and quality is all-time (`score_events` isn't date-
+/// filtered) — both are reported as such, not silently narrowed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PerformanceReview {
+    pub agent: String,
+    pub since: i64,
+    pub until: i64,
+    pub quantity_completed: u32,
+    pub quality_accuracy: Option<f64>,
+    pub quality_findings: u32,
+    pub quality_rounds: u32,
+    pub attention_asks: u32,
+    pub project_cost_usd: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn performance_review(
+    backend_conn: &rusqlite::Connection,
+    main_conn: &Connection,
+    project_id: &str,
+    repo: Option<&str>,
+    agent: &str,
+    since: i64,
+    until: i64,
+    project_cost_usd: f64,
+) -> rusqlite::Result<PerformanceReview> {
+    // Not `list_by_assignee_agent` -- that query deliberately excludes
+    // completed/cancelled items (it's built for "what's this agent working
+    // on now"), the opposite of what a completed-work count needs.
+    let quantity_completed = agentflare_backend::item::list_by_project(backend_conn, project_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| i.assignee_agent.as_deref() == Some(agent))
+        .filter(|i| i.completed_at.is_some_and(|t| t >= since && t <= until))
+        .count() as u32;
+
+    let agent_score = scores(main_conn, repo)?
+        .into_iter()
+        .find(|s| s.agent == agent);
+
+    let attention_asks =
+        agentflare_backend::ask_event::count_since(backend_conn, project_id, Some(agent), since)
+            .unwrap_or(0) as u32;
+
+    Ok(PerformanceReview {
+        agent: agent.to_string(),
+        since,
+        until,
+        quantity_completed,
+        quality_accuracy: agent_score.as_ref().map(|s| s.accuracy),
+        quality_findings: agent_score.as_ref().map(|s| s.findings).unwrap_or(0),
+        quality_rounds: agent_score.as_ref().map(|s| s.rounds).unwrap_or(0),
+        attention_asks,
+        project_cost_usd,
+    })
+}
+
 // --- diff parsing (pure) -----------------------------------------------------
 
 /// Parses a unified diff into the set of new-side line numbers present in each
@@ -710,6 +772,108 @@ diff --git a/f b/f
         record_round(&conn, "o/r", "8", &[sf("agentA", "f", 1, None)], &ch, 100).unwrap();
         let s = scores(&conn, Some("o/r")).unwrap();
         assert_eq!((s[0].findings, s[0].rounds), (2, 2));
+    }
+
+    #[test]
+    fn performance_review_joins_quantity_quality_and_attention() {
+        let backend_conn = agentflare_backend::db::open_in_memory().unwrap();
+        let workspace = agentflare_backend::workspace::create(
+            &backend_conn,
+            agentflare_backend::workspace::CreateWorkspace {
+                name: "ws".into(),
+                slug: "ws".into(),
+                owner_agent: None,
+                item_label: None,
+            },
+        )
+        .unwrap();
+        let project = agentflare_backend::project::create(
+            &backend_conn,
+            agentflare_backend::project::CreateProject {
+                workspace_id: workspace.id,
+                name: "proj".into(),
+                identifier: "proj".into(),
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+        let states =
+            agentflare_backend::state::list_by_project(&backend_conn, &project.id).unwrap();
+        let default_state = states.iter().find(|s| s.is_default).unwrap().id.clone();
+
+        let item = agentflare_backend::item::create(
+            &backend_conn,
+            agentflare_backend::item::CreateItem {
+                project_id: project.id.clone(),
+                state_id: default_state,
+                name: "todo".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: Some("claude-code".into()),
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+        let completed_state =
+            agentflare_backend::state::list_by_project(&backend_conn, &project.id)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.group_name == "completed")
+                .unwrap()
+                .id;
+        agentflare_backend::item::update_state(&backend_conn, &item.id, &completed_state)
+            .unwrap();
+
+        agentflare_backend::ask_event::record(
+            &backend_conn,
+            &project.id,
+            None,
+            &item.id,
+            Some("claude-code"),
+            "gated",
+            Some("q?"),
+            50,
+        )
+        .unwrap();
+
+        let main_conn = Connection::open_in_memory().unwrap();
+        migrate(&main_conn).unwrap();
+        record_round(
+            &main_conn,
+            "acme/repo",
+            "1",
+            &[sf("claude-code", "a.rs", 1, None)],
+            &changed(&[("a.rs", &[1])]),
+            100,
+        )
+        .unwrap();
+
+        let review = performance_review(
+            &backend_conn,
+            &main_conn,
+            &project.id,
+            Some("acme/repo"),
+            "claude-code",
+            0,
+            i64::MAX,
+            1.2345,
+        )
+        .unwrap();
+
+        assert_eq!(review.quantity_completed, 1);
+        assert_eq!(review.quality_accuracy, Some(1.0));
+        assert_eq!(review.quality_findings, 1);
+        assert_eq!(review.quality_rounds, 1);
+        assert_eq!(review.attention_asks, 1);
+        assert_eq!(review.project_cost_usd, 1.2345);
     }
 
     #[test]
