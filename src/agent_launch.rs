@@ -352,6 +352,15 @@ pub fn run_headless(
     // See the matching strip in `run_launch_env` above (item #139) — same
     // rationale applies to headless child processes.
     cmd.env_remove("CARGO_TARGET_DIR");
+    // Explicit, not inherited from this process's own ambient env: when the
+    // agent shells out to `git`, the `flare-git-shim` on its PATH classifies
+    // bypass eligibility by `AGENTFLARE_AGENT` (see `flare-git-core::classify`).
+    // A subprocess-per-`agentflare work`-invocation caller already has this
+    // set correctly in its own ambient env and this is a no-op for it, but a
+    // caller running multiple work items as threads inside one long-lived
+    // process (item #19's in-process dispatch) has no single ambient value
+    // that's correct for all of them — only an explicit per-spawn env var is.
+    cmd.env("AGENTFLARE_AGENT", spec.id.as_str());
     match run_captured(cmd, hard_cap, idle_timeout) {
         Ok(c) if c.success => HeadlessOutcome::Ok(c.stdout),
         Ok(c) if c.timed_out => {

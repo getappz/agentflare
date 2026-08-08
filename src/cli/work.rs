@@ -5,6 +5,14 @@ use agent_registry::{self, autonomous_args, headless_args};
 use clap::Args;
 use std::time::Duration;
 
+/// `agentflare work --timeout`'s default, and what the in-process
+/// [`WorkItemExecutor`] uses for daemon-dispatched work items (which don't
+/// go through CLI arg parsing, so can't pick up clap's `default_value_t`) —
+/// named so the two can't silently drift apart.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 21_600;
+/// `agentflare work --idle-timeout`'s default; see [`DEFAULT_TIMEOUT_SECS`].
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+
 /// Claim a work item, run an agent on it in an isolated worktree, and
 /// report the result (comment + PR, or error) back onto the item.
 #[derive(Args)]
@@ -19,7 +27,7 @@ pub struct WorkArgs {
     /// Absolute hard-cap timeout in seconds, regardless of activity
     /// (default 21600 = 6h). A backstop against a runaway process, not the
     /// primary signal for whether to keep a job alive — see --idle-timeout.
-    #[arg(long, default_value_t = 21600)]
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
     pub timeout: u64,
     /// Kill the agent if it produces no new stdout/stderr output for this
     /// many seconds (default 300 = 5 min). This is the primary liveness
@@ -27,7 +35,7 @@ pub struct WorkArgs {
     /// --timeout even if that takes hours; a genuinely stuck task is caught
     /// quickly instead of running out the full --timeout with nothing
     /// happening.
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = DEFAULT_IDLE_TIMEOUT_SECS)]
     pub idle_timeout: u64,
     /// Max agent turns before forced stop (Claude Code only).
     #[arg(long)]
@@ -274,11 +282,19 @@ fn notify(recipient: &str, body: &str, item_id: &str) {
 
 impl WorkArgs {
     pub fn run(self) {
-        std::process::exit(run_work(self));
+        std::process::exit(execute_work(self, &mut std::io::stdout()));
     }
 }
 
-fn run_work(args: WorkArgs) -> i32 {
+/// Claims `args.target`, runs the resolved agent on it, and reports the
+/// outcome back onto the item — the whole body of `agentflare work`.
+/// Progress lines that used to go straight to stdout now go through `log`
+/// instead, so this same logic can run in-process inside the daemon
+/// (`WorkItemExecutor`, called from `agentflare_jobs::WorkerPool`) with its
+/// progress captured into that job's own log file — the exact same file the
+/// dashboard already tails for subprocess-dispatched jobs — rather than only
+/// working when there's a real subprocess's stdout to capture.
+pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> i32 {
     let mcp = AgentflareMcp::default();
     let timeout = Duration::from_secs(args.timeout);
     let idle_timeout = Duration::from_secs(args.idle_timeout);
@@ -306,10 +322,21 @@ fn run_work(args: WorkArgs) -> i32 {
         // sniffing, so it wins outright here, same for a human typing it
         // directly or the supervisor dispatching this exact command.
         //
-        // SAFETY: set once, synchronously, before any worker threads exist
-        // in this process (this is the first thing `run_work` does).
-        unsafe {
-            std::env::set_var("AGENTFLARE_AGENT", resolved.as_str());
+        // Skipped when a per-thread owner override is already active
+        // (`WorkItemExecutor`'s in-process path, see `claims::owner_id()`):
+        // that already makes `owner_id()` resolve correctly, and mutating
+        // this process-global env var from a worker thread would race
+        // against every other worker thread doing the same for a different
+        // job — see `claims::with_owner_override`'s doc comment.
+        //
+        // SAFETY: when reached, this is a single-process-per-command CLI
+        // invocation (no owner override active) — set once, synchronously,
+        // before any worker threads exist in this process (this is the
+        // first thing `execute_work` does).
+        if !crate::claims::has_owner_override() {
+            unsafe {
+                std::env::set_var("AGENTFLARE_AGENT", resolved.as_str());
+            }
         }
     }
 
@@ -339,7 +366,7 @@ fn run_work(args: WorkArgs) -> i32 {
         .unwrap_or(&args.target)
         .to_string();
     let item_id = item_id.as_str();
-    println!("claimed: {item_id}");
+    let _ = writeln!(log, "claimed: {item_id}");
 
     // --- Worktree ---
     let worktree_path = claim["worktree_path"]
@@ -351,7 +378,7 @@ fn run_work(args: WorkArgs) -> i32 {
         crate::ui::error(msg);
         return 1;
     };
-    println!("worktree: {}", wpath.display());
+    let _ = writeln!(log, "worktree: {}", wpath.display());
 
     // --- Fetch item + prior discussion + labels ---
     let fetched = mcp.with_backend_db(|conn| {
@@ -414,7 +441,7 @@ fn run_work(args: WorkArgs) -> i32 {
         crate::ui::error(&msg);
         return 1;
     }
-    println!("agent: {} ({route_reason})", agent_enum.as_str());
+    let _ = writeln!(log, "agent: {} ({route_reason})", agent_enum.as_str());
 
     let prompt = build_prompt(&item_detail, &comments);
 
@@ -485,9 +512,9 @@ fn run_work(args: WorkArgs) -> i32 {
                 notify(recipient, &comment_body, item_id);
             }
 
-            println!("done: {item_id}");
+            let _ = writeln!(log, "done: {item_id}");
             if let Some(url) = &pr_url {
-                println!("pr: {url}");
+                let _ = writeln!(log, "pr: {url}");
             }
             0
         }
@@ -495,7 +522,47 @@ fn run_work(args: WorkArgs) -> i32 {
             let msg = failure_message(&other);
             release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
             crate::ui::error(&msg);
+            let _ = writeln!(log, "failed: {msg}");
             1
+        }
+    }
+}
+
+/// Runs an in-process work-item dispatch job for `agentflare_jobs::WorkerPool`
+/// (see `dispatch_item` in `src/supervisor.rs`, which enqueues jobs this
+/// executes) instead of the daemon spawning a fresh `agentflare work`
+/// subprocess per item. `args` is `[item_id, agent]` — see `dispatch_item`
+/// for how it's built.
+pub struct WorkItemExecutor;
+
+impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
+    fn execute(&self, job_id: &str, args: &[String], log: &mut dyn std::io::Write) -> Result<(), String> {
+        let (Some(item_id), Some(agent)) = (args.first(), args.get(1)) else {
+            return Err(format!(
+                "malformed in-process work job: expected [item_id, agent], got {args:?}"
+            ));
+        };
+        let work_args = WorkArgs {
+            target: item_id.clone(),
+            agent: Some(agent.clone()),
+            timeout: DEFAULT_TIMEOUT_SECS,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT_SECS,
+            max_turns: None,
+            max_cost_usd: None,
+            notify: None,
+        };
+        // `<agent>:<job-id>` — the job's own queue id is a natural instance
+        // discriminator, playing the role a subprocess's unique pid plays
+        // for `claims::owner_id()` in the CLI path (see its doc comment).
+        let owner = format!("{agent}:{job_id}");
+        let exit_code =
+            crate::claims::with_owner_override(owner, || execute_work(work_args, log));
+        if exit_code == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "agentflare work exited with code {exit_code} — see the job log for details"
+            ))
         }
     }
 }

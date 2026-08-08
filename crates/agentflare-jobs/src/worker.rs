@@ -1,5 +1,7 @@
+use crate::executor::InProcessExecutor;
 use crate::queue::Queue;
 use crate::supervisor::Supervisor;
+use crate::types::JobOutput;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -9,6 +11,7 @@ pub struct WorkerPool {
     queue: Arc<Queue>,
     handles: Vec<JoinHandle<()>>,
     running: Arc<AtomicBool>,
+    executor: Option<Arc<dyn InProcessExecutor>>,
 }
 
 impl WorkerPool {
@@ -17,7 +20,19 @@ impl WorkerPool {
             queue: Arc::new(queue),
             handles: vec![],
             running: Arc::new(AtomicBool::new(false)),
+            executor: None,
         }
+    }
+
+    /// Registers the executor `start`'s workers use for jobs marked
+    /// `AgentJob::in_process` — see `InProcessExecutor`'s doc comment. A job
+    /// marked `in_process` with no executor registered fails immediately
+    /// (see `worker_loop`) rather than falling back to spawning `command` as
+    /// a subprocess, so a caller that forgets to register one gets a loud,
+    /// per-job failure instead of a silent behavior change.
+    pub fn with_executor(mut self, executor: Arc<dyn InProcessExecutor>) -> Self {
+        self.executor = Some(executor);
+        self
     }
 
     pub fn start(&mut self, num_workers: usize) {
@@ -25,8 +40,9 @@ impl WorkerPool {
         for _ in 0..num_workers {
             let queue = self.queue.clone();
             let running = self.running.clone();
+            let executor = self.executor.clone();
             self.handles.push(std::thread::spawn(move || {
-                worker_loop(&queue, &running);
+                worker_loop(&queue, &running, executor.as_ref());
             }));
         }
     }
@@ -58,9 +74,12 @@ impl WorkerPool {
     }
 }
 
-fn worker_loop(queue: &Queue, running: &AtomicBool) {
+fn worker_loop(queue: &Queue, running: &AtomicBool, executor: Option<&Arc<dyn InProcessExecutor>>) {
     while running.load(Ordering::SeqCst) {
         match queue.dequeue() {
+            Ok(Some((id, job))) if job.in_process => {
+                run_in_process(queue, &id, &job, executor);
+            }
             Ok(Some((id, job))) => {
                 let mut sup = Supervisor::new(
                     id.clone(),
@@ -94,6 +113,95 @@ fn worker_loop(queue: &Queue, running: &AtomicBool) {
             Err(e) => {
                 eprintln!("agentflare-jobs: dequeue error: {e}");
                 std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+}
+
+/// Runs one `in_process` job via `executor`, writing its progress to the
+/// same `{id}.stdout` log-file path `Supervisor::spawn` uses for subprocess
+/// jobs (see `InProcessExecutor`'s doc comment), then records the outcome
+/// through `queue.complete`/`queue.fail` exactly as the subprocess path does
+/// — so persisted state, retries, and the dashboard's job API/SSE all work
+/// identically regardless of which way a given job actually ran.
+///
+/// The executor call itself runs on a fresh, short-lived thread rather than
+/// this (long-lived, pooled) one, with `job.timeout_secs` as a watchdog: an
+/// in-process job has no OS-level SIGKILL backstop the way a subprocess does
+/// (a stuck claim/worktree/done step can't be force-killed), so without this
+/// a hang there would wedge one of the pool's worker threads forever. On
+/// timeout the job is marked failed and this worker moves on to the next
+/// queued job; the stuck thread itself is abandoned (there is no safe way to
+/// force-kill a thread in Rust) rather than actually terminated — a real,
+/// deliberate trade-off against the OS-level guarantee a subprocess gets,
+/// not a bug. The one genuinely open-ended part of a work item -- the agent
+/// CLI itself -- is still a real subprocess under `agent_launch::run_captured`
+/// with its own hard-cap/idle-timeout kill, unaffected by any of this.
+fn run_in_process(
+    queue: &Queue,
+    id: &str,
+    job: &crate::types::AgentJob,
+    executor: Option<&Arc<dyn InProcessExecutor>>,
+) {
+    let Some(executor) = executor else {
+        if let Err(e) = queue.fail(id, "job is marked in_process but no InProcessExecutor is registered on this WorkerPool") {
+            eprintln!("agentflare-jobs: failed to record failure for {id}: {e}");
+        }
+        return;
+    };
+    let _ = std::fs::create_dir_all(queue.log_dir());
+    let stdout_path = queue.log_dir().join(format!("{id}.stdout"));
+    let stderr_path = queue.log_dir().join(format!("{id}.stderr"));
+    let mut log_file = match std::fs::File::create(&stdout_path) {
+        Ok(f) => f,
+        Err(e) => {
+            if let Err(qe) = queue.fail(id, &format!("failed to open job log file: {e}")) {
+                eprintln!("agentflare-jobs: failed to record failure for {id}: {qe}");
+            }
+            return;
+        }
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let executor = executor.clone();
+    let job_id = id.to_string();
+    let args = job.args.clone();
+    std::thread::spawn(move || {
+        let result = executor.execute(&job_id, &args, &mut log_file);
+        let _ = tx.send(result);
+    });
+
+    let outcome = rx.recv_timeout(Duration::from_secs(job.timeout_secs.max(1)));
+    match outcome {
+        Ok(Ok(())) => {
+            let stdout_total_bytes = std::fs::metadata(&stdout_path).map(|m| m.len()).unwrap_or(0);
+            let output = JobOutput {
+                exit_code: Some(0),
+                timed_out: false,
+                stdout_path,
+                stderr_path,
+                stdout_total_bytes,
+                stderr_total_bytes: 0,
+            };
+            if let Err(e) = queue.complete(id, &output, true) {
+                eprintln!("agentflare-jobs: failed to complete job {id}: {e}");
+            }
+        }
+        Ok(Err(msg)) => {
+            if let Err(e) = queue.fail(id, &msg) {
+                eprintln!("agentflare-jobs: failed to record failure for {id}: {e}");
+            }
+        }
+        Err(_) => {
+            let msg = format!(
+                "in-process job exceeded its {}s timeout and was abandoned \
+                 (a coordination step may be stuck — the agent CLI subprocess \
+                 itself has its own separate hard-cap/idle-timeout and is not \
+                 what this timeout measures)",
+                job.timeout_secs
+            );
+            if let Err(e) = queue.fail(id, &msg) {
+                eprintln!("agentflare-jobs: failed to record failure for {id}: {e}");
             }
         }
     }

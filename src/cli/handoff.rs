@@ -79,15 +79,17 @@ impl HandoffArgs {
                 .unwrap_or_default();
             format!("t{nanos}")
         });
+        // Routed through `claims::owner_id()` (which strips the `:instance`
+        // suffix via `agent_of`) rather than reading `AGENTFLARE_AGENT`
+        // directly: same fallback chain (env -> detected agent -> "cli") for
+        // every existing caller, but it also picks up a thread-local
+        // identity override for free when this runs as in-process dispatched
+        // work inside the daemon (see `claims::with_owner_override`) —
+        // env-var-based identity doesn't work there since worker threads
+        // share one process env.
         let sender = self
             .sender
-            .or_else(|| {
-                std::env::var("AGENTFLARE_AGENT")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-            })
-            .or_else(agent_detector::agent_name)
-            .unwrap_or_else(|| "cli".into());
+            .unwrap_or_else(|| crate::claims::agent_of(&crate::claims::owner_id()).to_string());
 
         let store: agentflare_artifacts::ArtifactStore = match self.dir.clone() {
             Some(d) => agentflare_artifacts::ArtifactStore::new(d),
