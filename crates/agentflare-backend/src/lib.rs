@@ -1,3 +1,4 @@
+pub mod ask_event;
 pub mod asset;
 pub mod claim;
 pub mod comment;
