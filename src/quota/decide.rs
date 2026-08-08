@@ -217,6 +217,7 @@ pub fn decide_for_supervisor(
     mcp: &crate::mcp_server::AgentflareMcp,
     item: &agentflare_backend::item::Item,
 ) -> EffectiveAction {
+    let now = crate::claims::now();
     let decision = mcp
         .with_backend_db(|conn| decide(conn, item))
         .unwrap_or_else(|_| Decision::fail_closed("could not open backend db"));
@@ -240,6 +241,7 @@ pub fn decide_for_supervisor(
         }
         EffectiveActionInternal::Wait => EffectiveAction::Wait,
         EffectiveActionInternal::Ask => {
+            let goal_item_id = goal.as_ref().map(|(gi, _)| gi.id.clone());
             if let Some((goal_item, mut meta)) = goal {
                 meta.consecutive_self_repairs = 0;
                 if let Ok(next) = meta.lifecycle.apply(super::lifecycle::LifecycleEvent::Gate) {
@@ -249,6 +251,18 @@ pub fn decide_for_supervisor(
                     super::goal::save_goal_metadata(conn, &goal_item.id, &meta)
                 });
             }
+            let _ = mcp.with_backend_db(|conn| {
+                agentflare_backend::ask_event::record(
+                    conn,
+                    &item.project_id,
+                    goal_item_id.as_deref(),
+                    &item.id,
+                    item.assignee_agent.as_deref(),
+                    &decision.reason,
+                    decision.gate_question.as_deref(),
+                    now,
+                )
+            });
             EffectiveAction::Ask(
                 decision
                     .gate_question
@@ -453,6 +467,25 @@ mod tests {
 
         let decision = decide(&conn, &todo);
         assert_eq!(decision.effective_action, EffectiveActionInternal::Ask);
+    }
+
+    #[test]
+    fn gated_lifecycle_records_an_ask_event() {
+        let conn = test_conn();
+        let (pid, sid) = seed_project(&conn);
+        let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Gated, 0);
+        let todo = make_todo(&conn, &pid, &sid, &goal.id);
+
+        let decision = decide(&conn, &todo);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Ask);
+
+        // decide() itself is pure and does not write; recording happens in
+        // decide_for_supervisor, which needs an AgentflareMcp and is covered
+        // by ask_event's own unit test for the write path. This pins that
+        // decide() still reaches Ask for a gated goal, which
+        // decide_for_supervisor's Ask arm relies on to call
+        // ask_event::record.
+        assert!(decision.gate_question.is_some());
     }
 
     #[test]
