@@ -411,17 +411,22 @@ mod tests {
         assert_eq!(parse_trigger_line("bogus with no colon"), None);
     }
 
-    // A process-local counter (the original approach here) isn't actually
-    // unique: `cargo nextest` runs each test in its own process by default,
-    // so every process's counter restarts at 0 and concurrent test processes
-    // collide on the exact same `agentflare-coaching-rule-test-0` path —
-    // the real cause of intermittent Windows CI failures in this module
-    // (both write/write and write/delete races), not just an AV-scanning
-    // hiccup. `tempfile::tempdir()` (already used elsewhere in this crate)
-    // is genuinely unique across processes and cleans itself up on drop, so
-    // callers don't need their own best-effort `remove_dir_all` either.
-    fn temp_dir_for_test() -> tempfile::TempDir {
-        tempfile::tempdir().unwrap()
+    fn temp_dir_for_test() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // `COUNTER` alone isn't enough: nextest runs each test in its own
+        // process, so every process's counter starts back at 0 and every
+        // test calling this ends up on the *same* path -- a race that
+        // Windows' stricter file locking turns into a hard failure instead
+        // of the silent tolerance Unix gives it. Mix in the pid so
+        // concurrent test processes never collide; the counter still
+        // covers multiple calls within one process (old-style `cargo test`,
+        // or more than one call in the same test).
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("agentflare-coaching-rule-test-{pid}-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
     }
 
     #[test]
@@ -432,7 +437,7 @@ mod tests {
             auto_match: true,
         };
         write_rule_file(
-            dir.path(),
+            &dir,
             "revfix",
             "Reviews ship with fixes",
             "Body text",
@@ -444,17 +449,19 @@ mod tests {
         )
         .unwrap();
 
-        let rule = parse_rule_file(&dir.path().join("coaching-revfix.md")).unwrap();
+        let rule = parse_rule_file(&dir.join("coaching-revfix.md")).unwrap();
         assert_eq!(rule.trigger, Some(trigger));
         assert_eq!(rule.tier, RuleTier::Override);
         assert!(rule.sync.is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn write_then_parse_roundtrips_no_trigger() {
         let dir = temp_dir_for_test();
         write_rule_file(
-            dir.path(),
+            &dir,
             "hygiene",
             "Title",
             "Body",
@@ -466,15 +473,17 @@ mod tests {
         )
         .unwrap();
 
-        let rule = parse_rule_file(&dir.path().join("coaching-hygiene.md")).unwrap();
+        let rule = parse_rule_file(&dir.join("coaching-hygiene.md")).unwrap();
         assert_eq!(rule.trigger, None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn write_then_parse_roundtrips_tier_and_sync() {
         let dir = temp_dir_for_test();
         write_rule_file(
-            dir.path(),
+            &dir,
             "search17",
             "Search",
             "Body",
@@ -486,33 +495,37 @@ mod tests {
         )
         .unwrap();
 
-        let rule = parse_rule_file(&dir.path().join("coaching-search17.md")).unwrap();
+        let rule = parse_rule_file(&dir.join("coaching-search17.md")).unwrap();
         assert_eq!(rule.tier, RuleTier::Builtin);
         assert_eq!(
             rule.sync,
             vec!["claude-code".to_string(), "opencode".to_string()]
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn parse_old_file_without_tier_sync_defaults_to_override() {
         let dir = temp_dir_for_test();
-        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.path().join("coaching-old.md"),
+            dir.join("coaching-old.md"),
             "---\n# Pattern: old \u{2014} Old\n# Applied: 2026-01-01\n---\n\nBody\n",
         )
         .unwrap();
-        let rule = parse_rule_file(&dir.path().join("coaching-old.md")).unwrap();
+        let rule = parse_rule_file(&dir.join("coaching-old.md")).unwrap();
         assert_eq!(rule.tier, RuleTier::Override);
         assert!(rule.sync.is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn parse_rule_file_skips_file_with_invalid_id_in_filename() {
         let dir = temp_dir_for_test();
         write_rule_file(
-            dir.path(),
+            &dir,
             "hygiene",
             "Title",
             "Body",
@@ -523,22 +536,24 @@ mod tests {
             None,
         )
         .unwrap();
-        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.path().join("coaching-not a valid id.md"),
+            dir.join("coaching-not a valid id.md"),
             "---\n# Pattern: x \u{2014} y\n# Applied: 2026-01-01\n---\n\nBody\n",
         )
         .unwrap();
 
-        assert!(parse_rule_file(&dir.path().join("coaching-not a valid id.md")).is_none());
-        assert!(parse_rule_file(&dir.path().join("coaching-hygiene.md")).is_some());
+        assert!(parse_rule_file(&dir.join("coaching-not a valid id.md")).is_none());
+        assert!(parse_rule_file(&dir.join("coaching-hygiene.md")).is_some());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn write_then_parse_roundtrips_enforced_flag() {
         let dir = temp_dir_for_test();
         write_rule_file(
-            dir.path(),
+            &dir,
             "search17",
             "Search",
             "Body",
@@ -550,21 +565,25 @@ mod tests {
         )
         .unwrap();
 
-        let rule = parse_rule_file(&dir.path().join("coaching-search17.md")).unwrap();
+        let rule = parse_rule_file(&dir.join("coaching-search17.md")).unwrap();
         assert!(rule.enforced);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn parse_old_file_without_enforce_line_defaults_to_false() {
         let dir = temp_dir_for_test();
-        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.path().join("coaching-old.md"),
+            dir.join("coaching-old.md"),
             "---\n# Pattern: old \u{2014} Old\n# Applied: 2026-01-01\n---\n\nBody\n",
         )
         .unwrap();
-        let rule = parse_rule_file(&dir.path().join("coaching-old.md")).unwrap();
+        let rule = parse_rule_file(&dir.join("coaching-old.md")).unwrap();
         assert!(!rule.enforced);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
