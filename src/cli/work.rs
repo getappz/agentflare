@@ -16,9 +16,19 @@ pub struct WorkArgs {
     /// and any `~/.agentflare/config.toml` `[router]` rules.
     #[arg(long)]
     pub agent: Option<String>,
-    /// Headless run timeout in seconds (default 1800 = 30 min).
-    #[arg(long, default_value_t = 1800)]
+    /// Absolute hard-cap timeout in seconds, regardless of activity
+    /// (default 21600 = 6h). A backstop against a runaway process, not the
+    /// primary signal for whether to keep a job alive — see --idle-timeout.
+    #[arg(long, default_value_t = 21600)]
     pub timeout: u64,
+    /// Kill the agent if it produces no new stdout/stderr output for this
+    /// many seconds (default 300 = 5 min). This is the primary liveness
+    /// signal: a task that keeps producing output can run all the way to
+    /// --timeout even if that takes hours; a genuinely stuck task is caught
+    /// quickly instead of running out the full --timeout with nothing
+    /// happening.
+    #[arg(long, default_value_t = 300)]
+    pub idle_timeout: u64,
     /// Max agent turns before forced stop (Claude Code only).
     #[arg(long)]
     pub max_turns: Option<u64>,
@@ -271,6 +281,7 @@ impl WorkArgs {
 fn run_work(args: WorkArgs) -> i32 {
     let mcp = AgentflareMcp::default();
     let timeout = Duration::from_secs(args.timeout);
+    let idle_timeout = Duration::from_secs(args.idle_timeout);
 
     // An explicit --agent fails fast, before claiming anything, through the
     // same resolver `resolve_agent` uses further down post-claim — so this
@@ -424,6 +435,7 @@ fn run_work(args: WorkArgs) -> i32 {
         agent_enum.as_str(),
         &prompt,
         timeout,
+        idle_timeout,
         &extra_args,
     );
 

@@ -6,6 +6,8 @@ use agent_registry::{Agent, AgentSpec, Tier, headless_args};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -122,8 +124,12 @@ pub struct Captured {
     pub stdout: String,
     /// Everything the child wrote to stderr.
     pub stderr: String,
-    /// True iff the child was killed for outliving the timeout.
+    /// True iff the child was killed for outliving `hard_cap` or going idle
+    /// for `idle_timeout` (see `idle_killed` to tell the two apart).
     pub timed_out: bool,
+    /// True iff `timed_out` was caused by the idle window elapsing with no
+    /// new stdout/stderr bytes, rather than `hard_cap` being reached.
+    pub idle_killed: bool,
 }
 
 /// Kill `child` and everything it spawned, not just the direct process. A
@@ -163,11 +169,21 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
 }
 
 /// Run `cmd` to completion, capturing stdout, and kill the child (and its
-/// whole process tree) if it outlives `timeout` (reporting `timed_out`).
-/// Stdout is drained on a separate thread so a child that fills the OS pipe
-/// buffer can't deadlock the wait loop.
+/// whole process tree) if either `hard_cap` elapses regardless of activity
+/// (a backstop against runaway output, not the primary signal — see
+/// `idle_timeout`), or `idle_timeout` elapses with no new stdout/stderr
+/// bytes (the primary liveness signal: a task producing steady output can
+/// run all the way to `hard_cap` even if that takes hours, while a task
+/// that's genuinely stuck is caught quickly). Both streams are drained on
+/// separate threads so a child that fills the OS pipe buffer can't deadlock
+/// the wait loop; each thread bumps a shared byte counter per chunk read so
+/// the wait loop can observe activity without waiting for EOF.
 #[allow(dead_code)]
-pub fn run_captured(mut cmd: Command, timeout: Duration) -> std::io::Result<Captured> {
+pub fn run_captured(
+    mut cmd: Command,
+    hard_cap: Duration,
+    idle_timeout: Duration,
+) -> std::io::Result<Captured> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
@@ -181,29 +197,70 @@ pub fn run_captured(mut cmd: Command, timeout: Duration) -> std::io::Result<Capt
     }
     let mut child = cmd.spawn()?;
 
+    let activity = Arc::new(AtomicU64::new(0));
+
     let mut pipe = child.stdout.take().expect("stdout piped above");
+    let stdout_activity = activity.clone();
     let reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = pipe.read_to_string(&mut buf);
-        buf
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        // Read in chunks (rather than `read_to_string` straight to EOF) so
+        // `activity` reflects bytes as they arrive, not only once the child
+        // exits — the wait loop below needs that to detect a stalled child
+        // before it closes its pipes.
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    stdout_activity.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
     });
     let mut err_pipe = child.stderr.take().expect("stderr piped above");
+    let stderr_activity = activity.clone();
     let err_reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = err_pipe.read_to_string(&mut buf);
-        buf
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match err_pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    stderr_activity.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
     });
 
     let start = Instant::now();
+    let mut last_activity_bytes = 0u64;
+    let mut last_activity_at = Instant::now();
     let mut timed_out = false;
+    let mut idle_killed = false;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if start.elapsed() >= timeout {
+        let bytes_so_far = activity.load(Ordering::Relaxed);
+        if bytes_so_far != last_activity_bytes {
+            last_activity_bytes = bytes_so_far;
+            last_activity_at = Instant::now();
+        }
+        if start.elapsed() >= hard_cap {
             kill_tree(&mut child);
             let status = child.wait()?;
             timed_out = true;
+            break status;
+        }
+        if last_activity_at.elapsed() >= idle_timeout {
+            kill_tree(&mut child);
+            let status = child.wait()?;
+            timed_out = true;
+            idle_killed = true;
             break status;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -216,6 +273,7 @@ pub fn run_captured(mut cmd: Command, timeout: Duration) -> std::io::Result<Capt
         stdout,
         stderr,
         timed_out,
+        idle_killed,
     })
 }
 
@@ -253,14 +311,17 @@ pub enum HeadlessOutcome {
 }
 
 /// Run an agent non-interactively with `prompt` and capture its reply, killing
-/// it if it outlives `timeout`. Reuses the shared registry (binary discovery +
-/// per-agent print-mode mapping) so callers don't reimplement any of it.
+/// it if it outlives `hard_cap` or goes `idle_timeout` without new output
+/// (see `run_captured`'s doc comment for the distinction). Reuses the shared
+/// registry (binary discovery + per-agent print-mode mapping) so callers
+/// don't reimplement any of it.
 #[allow(dead_code)]
 pub fn run_headless(
     registry: &[AgentSpec],
     agent: &str,
     prompt: &str,
-    timeout: Duration,
+    hard_cap: Duration,
+    idle_timeout: Duration,
     extra_args: &[String],
 ) -> HeadlessOutcome {
     let Some(spec) = registry.iter().find(|s| s.id.as_str() == agent) else {
@@ -291,13 +352,20 @@ pub fn run_headless(
     // See the matching strip in `run_launch_env` above (item #139) — same
     // rationale applies to headless child processes.
     cmd.env_remove("CARGO_TARGET_DIR");
-    match run_captured(cmd, timeout) {
+    match run_captured(cmd, hard_cap, idle_timeout) {
         Ok(c) if c.success => HeadlessOutcome::Ok(c.stdout),
-        Ok(c) if c.timed_out => HeadlessOutcome::Failed(format!(
-            "{} timed out after {timeout:?}{}",
-            spec.display_name,
-            diagnostic_suffix(&c)
-        )),
+        Ok(c) if c.timed_out => {
+            let reason = if c.idle_killed {
+                format!("went idle for {idle_timeout:?} (no new output)")
+            } else {
+                format!("exceeded hard cap of {hard_cap:?}")
+            };
+            HeadlessOutcome::Failed(format!(
+                "{} timed out — {reason}{}",
+                spec.display_name,
+                diagnostic_suffix(&c)
+            ))
+        }
         Ok(_) => HeadlessOutcome::Failed(format!("{} exited non-zero", spec.display_name)),
         Err(e) => HeadlessOutcome::Failed(format!("failed to run {}: {e}", spec.display_name)),
     }
@@ -399,7 +467,12 @@ mod tests {
     fn run_captured_captures_stdout() {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("printf 'hello world'");
-        let out = run_captured(cmd, std::time::Duration::from_secs(5)).unwrap();
+        let out = run_captured(
+            cmd,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
         assert!(out.success);
         assert!(!out.timed_out);
         assert_eq!(out.stdout, "hello world");
@@ -410,7 +483,12 @@ mod tests {
     fn run_captured_keeps_output_written_before_a_timeout_kill() {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("printf 'made it here'; sleep 5");
-        let out = run_captured(cmd, std::time::Duration::from_millis(150)).unwrap();
+        let out = run_captured(
+            cmd,
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(150),
+        )
+        .unwrap();
         assert!(out.timed_out);
         assert_eq!(
             out.stdout, "made it here",
@@ -424,13 +502,69 @@ mod tests {
         let start = std::time::Instant::now();
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("sleep 5");
-        let out = run_captured(cmd, std::time::Duration::from_millis(150)).unwrap();
+        let out = run_captured(
+            cmd,
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(150),
+        )
+        .unwrap();
         assert!(out.timed_out, "should report timeout");
         assert!(!out.success, "a killed child is not a success");
         // Must return promptly, not wait out the full 5s sleep.
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
             "did not kill promptly"
+        );
+    }
+
+    // A process that keeps producing output must NOT be killed just because
+    // it has run past what used to be the single fixed timeout — only a
+    // genuinely stalled child (no new bytes for `idle_timeout`) should be.
+    // This is the behavior item #20 exists to add.
+    #[cfg(unix)]
+    #[test]
+    fn run_captured_does_not_idle_timeout_while_output_keeps_arriving() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("for i in 1 2 3 4 5; do printf 'x'; sleep 0.05; done");
+        let out = run_captured(
+            cmd,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap();
+        assert!(
+            !out.timed_out,
+            "steady output growth must reset the idle clock, not get killed"
+        );
+        assert_eq!(out.stdout, "xxxxx");
+    }
+
+    // Mirrors `run_captured_keeps_output_written_before_a_timeout_kill` but
+    // with a generous hard cap and a tight idle window, proving the idle
+    // timeout — not the hard cap — is what catches a child that produced
+    // real output and then went quiet.
+    #[cfg(unix)]
+    #[test]
+    fn run_captured_idle_timeout_kills_a_stalled_child_well_before_the_hard_cap() {
+        let start = std::time::Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf 'did some work'; sleep 5");
+        let out = run_captured(
+            cmd,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(150),
+        )
+        .unwrap();
+        assert!(out.timed_out, "should time out");
+        assert!(
+            out.idle_killed,
+            "should be killed for going idle, not for exceeding the hard cap"
+        );
+        assert_eq!(out.stdout, "did some work");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "idle timeout should fire well before the 30s hard cap"
         );
     }
 
@@ -446,7 +580,12 @@ mod tests {
         let start = std::time::Instant::now();
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("sleep 5 & wait");
-        let out = run_captured(cmd, std::time::Duration::from_millis(150)).unwrap();
+        let out = run_captured(
+            cmd,
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(150),
+        )
+        .unwrap();
         assert!(out.timed_out, "should report timeout");
         assert!(!out.success, "a killed child is not a success");
         assert!(
@@ -609,7 +748,14 @@ mod tests {
     #[test]
     fn run_headless_unknown_agent() {
         let reg = headless_registry();
-        match run_headless(&reg, "nope", "hi", Duration::from_secs(1), &[]) {
+        match run_headless(
+            &reg,
+            "nope",
+            "hi",
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            &[],
+        ) {
             HeadlessOutcome::UnknownAgent(m) => assert!(m.contains("nope")),
             other => panic!("expected UnknownAgent, got {other:?}"),
         }
@@ -618,7 +764,14 @@ mod tests {
     #[test]
     fn run_headless_agent_without_print_mode() {
         let reg = headless_registry();
-        match run_headless(&reg, "aider", "hi", Duration::from_secs(1), &[]) {
+        match run_headless(
+            &reg,
+            "aider",
+            "hi",
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            &[],
+        ) {
             HeadlessOutcome::NotHeadless(m) => assert!(m.contains("aider")),
             other => panic!("expected NotHeadless, got {other:?}"),
         }
@@ -627,7 +780,14 @@ mod tests {
     #[test]
     fn run_headless_binary_not_found() {
         let reg = headless_registry();
-        match run_headless(&reg, "codex", "hi", Duration::from_secs(1), &[]) {
+        match run_headless(
+            &reg,
+            "codex",
+            "hi",
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            &[],
+        ) {
             HeadlessOutcome::NotFound(m) => assert!(m.contains("not found")),
             other => panic!("expected NotFound, got {other:?}"),
         }
@@ -661,6 +821,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             timed_out: true,
+            idle_killed: false,
         };
         assert_eq!(diagnostic_suffix(&c), " (no output captured)");
     }
@@ -672,6 +833,7 @@ mod tests {
             stdout: "working on task 3...".to_string(),
             stderr: "some warning".to_string(),
             timed_out: true,
+            idle_killed: false,
         };
         let suffix = diagnostic_suffix(&c);
         assert!(suffix.contains("last stdout before kill"));
@@ -685,6 +847,7 @@ mod tests {
             stdout: String::new(),
             stderr: "panic: something broke".to_string(),
             timed_out: true,
+            idle_killed: false,
         };
         let suffix = diagnostic_suffix(&c);
         assert!(suffix.contains("last stderr before kill"));
