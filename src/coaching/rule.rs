@@ -413,9 +413,18 @@ mod tests {
 
     fn temp_dir_for_test() -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
+        // `COUNTER` alone isn't enough: nextest runs each test in its own
+        // process, so every process's counter starts back at 0 and every
+        // test calling this ends up on the *same* path -- a race that
+        // Windows' stricter file locking turns into a hard failure instead
+        // of the silent tolerance Unix gives it. Mix in the pid so
+        // concurrent test processes never collide; the counter still
+        // covers multiple calls within one process (old-style `cargo test`,
+        // or more than one call in the same test).
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("agentflare-coaching-rule-test-{n}"));
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("agentflare-coaching-rule-test-{pid}-{n}"));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
