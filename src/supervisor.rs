@@ -13,11 +13,19 @@ const DISPATCHED_LABEL: &str = "dispatched";
 const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
 const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 
-/// `agentflare work`'s own `--timeout` defaults to 1800s (its real budget
-/// for a headless agent run) -- this is that budget plus margin for the
-/// claim/worktree setup and done/push/PR steps around it, so the outer job
-/// timeout never cuts off a run before work's own inner timeout would.
-const WORK_JOB_TIMEOUT_SECS: u64 = 2100;
+/// `agentflare work`'s own `--timeout` is its hard-cap safety net, not the
+/// primary judge of whether it's still making progress -- that's
+/// `--idle-timeout`, which lets a job run for hours as long as it keeps
+/// producing output (see item #20). It defaults to 21600s (6h); this is
+/// that budget plus margin for the claim/worktree setup and done/push/PR
+/// steps around it, so the outer job timeout never cuts off a run before
+/// work's own inner timeout would. Before item #20 this outer timeout was
+/// 2100s (aligned to work's old 1800s fixed timeout) -- left unaligned
+/// after work's default grew, it would have silently reintroduced the same
+/// "killed a legitimately-progressing job" bug for every job actually
+/// dispatched by the daemon, since this is the timeout that governs them,
+/// not work's own.
+const WORK_JOB_TIMEOUT_SECS: u64 = 21_900;
 
 /// Returns the matching `Agent` only if `agent_registry::autonomous_args`
 /// confirms it has a headless permission-bypass flag — the same gate
