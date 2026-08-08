@@ -7,6 +7,7 @@ pub mod actions;
 pub mod auth;
 pub mod bridge;
 pub mod client;
+pub mod contents;
 pub mod identity;
 pub mod init_auth;
 pub mod issues;
