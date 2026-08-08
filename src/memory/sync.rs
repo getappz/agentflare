@@ -24,23 +24,37 @@ pub struct MemorySyncConfig {
 }
 
 impl MemorySyncConfig {
-    /// `AGENTFLARE_MEMORY_SYNC_REPO` (required, `owner/repo`),
-    /// `AGENTFLARE_MEMORY_SYNC_BRANCH` (default `agentflare-memory`),
-    /// `AGENTFLARE_MEMORY_SYNC_PATH` (default `memory-sync.jsonl`).
-    ///
-    /// Env-driven and explicit-repo-only, same shape as `BridgeConfig` --
-    /// but unlike the bridge, never derived from cwd's `origin` remote:
-    /// memory is global to the workstation, not scoped to whatever project
-    /// happens to be checked out where this command is run.
+    /// Repo defaults to the current directory's `origin` remote (same as
+    /// the GitHub bridge), so no per-machine setup is needed and each
+    /// project's observations land on its own branch of its own repo
+    /// rather than one global log shared across every project on this
+    /// workstation. Override with `AGENTFLARE_MEMORY_SYNC_REPO`
+    /// (`owner/repo`) to point somewhere else.
+    /// `AGENTFLARE_MEMORY_SYNC_BRANCH` (default `agentflare-memory`) and
+    /// `AGENTFLARE_MEMORY_SYNC_PATH` (default `memory-sync.jsonl`) are
+    /// still independently overridable.
     pub fn from_env() -> Result<MemorySyncConfig, String> {
-        let repo_str = std::env::var("AGENTFLARE_MEMORY_SYNC_REPO").map_err(|_| {
-            "AGENTFLARE_MEMORY_SYNC_REPO is not set -- point it at an owner/repo you can \
-             push to (a small private repo works fine)"
-                .to_string()
-        })?;
-        let repo = RepoId::parse(repo_str.trim()).ok_or_else(|| {
-            format!("AGENTFLARE_MEMORY_SYNC_REPO={repo_str:?} is not a GitHub owner/repo")
-        })?;
+        let cwd = std::env::current_dir()
+            .map_err(|e| format!("cannot read the working directory: {e}"))?;
+        Self::from_env_at(&cwd)
+    }
+
+    /// Split out from `from_env` so repo resolution is testable without
+    /// mutating the process's working directory.
+    pub fn from_env_at(repo_root: &std::path::Path) -> Result<MemorySyncConfig, String> {
+        let repo = match std::env::var("AGENTFLARE_MEMORY_SYNC_REPO")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(repo_str) => RepoId::parse(repo_str.trim()).ok_or_else(|| {
+                format!("AGENTFLARE_MEMORY_SYNC_REPO={repo_str:?} is not a GitHub owner/repo")
+            })?,
+            None => RepoId::resolve_from_remote(repo_root).ok_or_else(|| {
+                "no GitHub `origin` remote here -- run this from a repo you can push to, \
+                 or set AGENTFLARE_MEMORY_SYNC_REPO=owner/repo"
+                    .to_string()
+            })?,
+        };
         let branch = std::env::var("AGENTFLARE_MEMORY_SYNC_BRANCH")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -364,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn from_env_requires_a_repo() {
+    fn from_env_at_falls_back_to_the_repo_roots_origin_remote() {
         let _guard = agent_registry::detect::PATH_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -372,8 +386,38 @@ mod tests {
         unsafe {
             std::env::remove_var("AGENTFLARE_MEMORY_SYNC_REPO");
         }
-        let err = MemorySyncConfig::from_env().unwrap_err();
+
+        let dir = tempfile::tempdir().unwrap();
+        flare_git_core::shell::run_in(dir.path(), &["init", "-q"]).unwrap();
+        flare_git_core::shell::run_in(
+            dir.path(),
+            &["remote", "add", "origin", "git@github.com:o/r.git"],
+        )
+        .unwrap();
+        let config = MemorySyncConfig::from_env_at(dir.path()).unwrap();
+        assert_eq!(config.repo.to_string(), "o/r");
+
+        if let Some(v) = original {
+            unsafe {
+                std::env::set_var("AGENTFLARE_MEMORY_SYNC_REPO", v);
+            }
+        }
+    }
+
+    #[test]
+    fn from_env_at_requires_a_repo_when_theres_no_origin_remote() {
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let original = std::env::var_os("AGENTFLARE_MEMORY_SYNC_REPO");
+        unsafe {
+            std::env::remove_var("AGENTFLARE_MEMORY_SYNC_REPO");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = MemorySyncConfig::from_env_at(dir.path()).unwrap_err();
         assert!(err.contains("AGENTFLARE_MEMORY_SYNC_REPO"));
+
         if let Some(v) = original {
             unsafe {
                 std::env::set_var("AGENTFLARE_MEMORY_SYNC_REPO", v);
