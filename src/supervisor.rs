@@ -186,7 +186,9 @@ fn dispatch_item(
     // Runs in-process via `WorkItemExecutor` (registered on the daemon's
     // `WorkerPool`, see `dashboard/server.rs::run`) instead of spawning a
     // fresh `agentflare work` subprocess — item #19. `command` is a display
-    // label only (shown in the dashboard's job list); nothing spawns it.
+    // label only (shown in the dashboard's job list); nothing spawns it, so
+    // master's `current_exe()`-staleness fix (see git history) is moot here:
+    // there's no exe path to resolve at all once dispatch never spawns one.
     // `args` is `[item_id, agent]`, exactly what `WorkItemExecutor::execute`
     // expects.
     let job = agentflare_jobs::AgentJob::new("agentflare-work")
