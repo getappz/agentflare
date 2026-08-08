@@ -39,6 +39,16 @@ fn priority_rank(p: &str) -> u8 {
 /// with metadata={"size":"S"} stored `"{\"size\": \"S\"}"` instead of the
 /// object). Shared by every `metadata`-blob field reader below so the
 /// double-encoding workaround lives in exactly one place.
+///
+/// Root cause (now fixed at the write side too, see `metadata_to_json_string`
+/// below): some callers send `metadata` as an already-JSON-encoded string
+/// rather than a native object; `ItemRequest.metadata: Option<serde_json::Value>`
+/// deserializes that as `Value::String(the_json_text)`, and the old
+/// `req.metadata.map(|v| v.to_string())` write path blindly re-stringified
+/// whatever `Value` variant it got — correct for `Value::Object`, wrong for
+/// `Value::String`, which wraps already-valid JSON text in another layer of
+/// quotes/escaping. This read-side unwrap stays as a defense for rows
+/// written before the write-side fix.
 fn parsed_metadata(metadata: &str) -> Option<serde_json::Value> {
     let mut value = serde_json::from_str::<serde_json::Value>(metadata).ok()?;
     if let serde_json::Value::String(inner) = &value
@@ -47,6 +57,18 @@ fn parsed_metadata(metadata: &str) -> Option<serde_json::Value> {
         value = reparsed;
     }
     Some(value)
+}
+
+/// Converts a caller-supplied `metadata` value into the JSON string
+/// `CreateItem`/`UpdateItem` store. A `Value::String` is already
+/// JSON-encoded text (see `parsed_metadata`'s doc comment for why that
+/// shape shows up) and must be used as-is; anything else (the normal case —
+/// a real object) is serialized once, same as `Value::to_string()` did.
+fn metadata_to_json_string(value: serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s,
+        other => other.to_string(),
+    }
 }
 
 /// `size` lives in the free-form `metadata` JSON blob (`{"size": "S"|"M"|"L"}`)
@@ -219,7 +241,7 @@ impl AgentflareMcp {
                 sort_order: None,
                 external_source: None,
                 external_id: None,
-                metadata: req.metadata.map(|v| v.to_string()),
+                metadata: req.metadata.map(metadata_to_json_string),
                 label_ids: req.label_ids.unwrap_or_default(),
                 assignee_ids: vec![],
                 dependency_ids: req.dependency_ids.unwrap_or_default(),
@@ -349,7 +371,7 @@ impl AgentflareMcp {
                 state_id: None,
                 assignee_agent: req.assignee_agent.clone(),
                 sort_order: None,
-                metadata: req.metadata.map(|v| v.to_string()),
+                metadata: req.metadata.map(metadata_to_json_string),
             };
             let item =
                 agentflare_backend::item::update(conn, &id, input).map_err(map_backend_err)?;
@@ -1162,5 +1184,31 @@ mod metadata_field_tests {
     fn parsed_size_survives_double_encoded_metadata() {
         let metadata = double_encoded(serde_json::json!({"size": "S"}));
         assert_eq!(parsed_size(&metadata), Some("S".to_string()));
+    }
+
+    #[test]
+    fn metadata_to_json_string_serializes_a_plain_object_once() {
+        let value = serde_json::json!({"goal": {"objective": "ship it"}});
+        let stored = metadata_to_json_string(value.clone());
+        assert_eq!(stored, value.to_string());
+        // Single-encoded: parses straight to an object, no extra unwrap needed.
+        let reparsed: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert!(reparsed.is_object());
+    }
+
+    #[test]
+    fn metadata_to_json_string_does_not_double_encode_a_pre_stringified_value() {
+        // What a caller sending metadata as an already-JSON-encoded string
+        // (rather than a native object) produces once `ItemRequest.metadata:
+        // Option<serde_json::Value>` deserializes it: Value::String(json_text).
+        let pre_stringified =
+            serde_json::Value::String(r#"{"goal":{"objective":"ship it"}}"#.to_string());
+        let stored = metadata_to_json_string(pre_stringified);
+        assert_eq!(stored, r#"{"goal":{"objective":"ship it"}}"#);
+        let reparsed: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert!(
+            reparsed.is_object(),
+            "must parse straight to an object, not a string wrapping one: {reparsed:?}"
+        );
     }
 }
