@@ -118,10 +118,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(count_since(&conn, &pid, None, 0).unwrap(), 2);
-        assert_eq!(
-            count_since(&conn, &pid, Some("claude-code"), 0).unwrap(),
-            1
-        );
+        assert_eq!(count_since(&conn, &pid, Some("claude-code"), 0).unwrap(), 1);
         assert_eq!(count_since(&conn, &pid, None, 150).unwrap(), 1);
     }
 }

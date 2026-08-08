@@ -256,8 +256,7 @@ impl ReviewArgs {
                 let since = now - days.max(1) * 86_400;
 
                 let backend_conn =
-                    match agentflare_backend::db::open_db(&crate::vent::paths::backend_db_path())
-                    {
+                    match agentflare_backend::db::open_db(&crate::vent::paths::backend_db_path()) {
                         Ok(c) => c,
                         Err(e) => fail(format!("cannot open backend db: {e}")),
                     };
@@ -267,8 +266,10 @@ impl ReviewArgs {
                 let cost_totals =
                     crate::cost::summarize((cost_start, today), crate::cost::GroupBy::Project);
                 let cost_key = crate::mcp_server::AgentflareMcp::resolve_project_name();
-                let project_cost_usd =
-                    cost_totals.get(&cost_key).map(|t| t.cost_usd).unwrap_or(0.0);
+                let project_cost_usd = cost_totals
+                    .get(&cost_key)
+                    .map(|t| t.cost_usd)
+                    .unwrap_or(0.0);
 
                 let review = match crate::review::performance_review(
                     &backend_conn,

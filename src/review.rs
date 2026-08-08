@@ -829,8 +829,7 @@ diff --git a/f b/f
                 .find(|s| s.group_name == "completed")
                 .unwrap()
                 .id;
-        agentflare_backend::item::update_state(&backend_conn, &item.id, &completed_state)
-            .unwrap();
+        agentflare_backend::item::update_state(&backend_conn, &item.id, &completed_state).unwrap();
 
         agentflare_backend::ask_event::record(
             &backend_conn,
