@@ -327,7 +327,10 @@ mod tests {
 
         let jobs = queue.list(None).unwrap();
         assert_eq!(jobs.len(), 1);
-        assert!(jobs[0].in_process, "work-item jobs must run in-process (item #19)");
+        assert!(
+            jobs[0].in_process,
+            "work-item jobs must run in-process (item #19)"
+        );
         assert!(jobs[0].args.contains(&item_id));
         assert!(jobs[0].args.contains(&"claude-code".to_string()));
 

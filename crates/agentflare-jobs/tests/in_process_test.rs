@@ -53,7 +53,10 @@ fn in_process_job_completes_via_the_registered_executor_and_writes_its_log() {
                 .in_process(),
         )
         .unwrap();
-    assert!(info.in_process, "enqueue should echo the in_process flag back");
+    assert!(
+        info.in_process,
+        "enqueue should echo the in_process flag back"
+    );
 
     let final_info = wait_for_terminal(&q, &info.id, 200);
     pool.shutdown();
@@ -152,7 +155,12 @@ fn in_process_job_that_hangs_is_abandoned_at_its_timeout_instead_of_wedging_the_
 
     let start = std::time::Instant::now();
     let info = q
-        .enqueue(&AgentJob::new("label-only").in_process().timeout(1).max_retries(0))
+        .enqueue(
+            &AgentJob::new("label-only")
+                .in_process()
+                .timeout(1)
+                .max_retries(0),
+        )
         .unwrap();
 
     let final_info = wait_for_terminal(&q, &info.id, 400);

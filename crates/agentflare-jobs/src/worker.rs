@@ -144,7 +144,10 @@ fn run_in_process(
     executor: Option<&Arc<dyn InProcessExecutor>>,
 ) {
     let Some(executor) = executor else {
-        if let Err(e) = queue.fail(id, "job is marked in_process but no InProcessExecutor is registered on this WorkerPool") {
+        if let Err(e) = queue.fail(
+            id,
+            "job is marked in_process but no InProcessExecutor is registered on this WorkerPool",
+        ) {
             eprintln!("agentflare-jobs: failed to record failure for {id}: {e}");
         }
         return;
@@ -174,7 +177,9 @@ fn run_in_process(
     let outcome = rx.recv_timeout(Duration::from_secs(job.timeout_secs.max(1)));
     match outcome {
         Ok(Ok(())) => {
-            let stdout_total_bytes = std::fs::metadata(&stdout_path).map(|m| m.len()).unwrap_or(0);
+            let stdout_total_bytes = std::fs::metadata(&stdout_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
             let output = JobOutput {
                 exit_code: Some(0),
                 timed_out: false,

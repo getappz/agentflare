@@ -12,5 +12,10 @@ pub trait InProcessExecutor: Send + Sync {
     /// name/location `Supervisor::spawn` uses for subprocess jobs, so
     /// existing log-tailing (e.g. the dashboard's `/api/jobs/:id/stream`)
     /// keeps working unchanged for in-process jobs too.
-    fn execute(&self, job_id: &str, args: &[String], log: &mut dyn std::io::Write) -> Result<(), String>;
+    fn execute(
+        &self,
+        job_id: &str,
+        args: &[String],
+        log: &mut dyn std::io::Write,
+    ) -> Result<(), String>;
 }

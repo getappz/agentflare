@@ -536,7 +536,12 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> i32 
 pub struct WorkItemExecutor;
 
 impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
-    fn execute(&self, job_id: &str, args: &[String], log: &mut dyn std::io::Write) -> Result<(), String> {
+    fn execute(
+        &self,
+        job_id: &str,
+        args: &[String],
+        log: &mut dyn std::io::Write,
+    ) -> Result<(), String> {
         let (Some(item_id), Some(agent)) = (args.first(), args.get(1)) else {
             return Err(format!(
                 "malformed in-process work job: expected [item_id, agent], got {args:?}"
@@ -555,8 +560,7 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
         // discriminator, playing the role a subprocess's unique pid plays
         // for `claims::owner_id()` in the CLI path (see its doc comment).
         let owner = format!("{agent}:{job_id}");
-        let exit_code =
-            crate::claims::with_owner_override(owner, || execute_work(work_args, log));
+        let exit_code = crate::claims::with_owner_override(owner, || execute_work(work_args, log));
         if exit_code == 0 {
             Ok(())
         } else {
