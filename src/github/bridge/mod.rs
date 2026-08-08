@@ -5,6 +5,7 @@ pub mod claim;
 pub mod config;
 pub mod items;
 pub mod marker;
+pub mod queue_status;
 pub mod runner;
 pub mod tick;
 

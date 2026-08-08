@@ -23,6 +23,7 @@ impl AgentflareMcp {
             "issue_comment",
             "issue_close",
             "issue_label",
+            "bridge_queue_status",
             "release_list",
             "release_get",
             "release_latest",
@@ -233,6 +234,27 @@ impl AgentflareMcp {
                 let labels = req.labels.clone().unwrap_or_default();
                 issues::add_labels(&client, &repo, n, &labels).map_err(to_mcp_error)?;
                 format!("Added {} label(s) to issue #{n}", labels.len())
+            }
+            "bridge_queue_status" => {
+                // Capacity signal for deciding whether to route new work
+                // onto the bridge queue (handoff recipient="github") or
+                // keep it local: an empty/fast-clearing queue suggests
+                // capacity exists somewhere; unclaimed issues piling up
+                // suggests nothing is currently pulling from it. Reads only
+                // -- no local daemon state needed, so this reflects reality
+                // across every workstation with the bridge enabled, not
+                // just this one.
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let queue_label = crate::github::bridge::config::resolve_project_queue_label(&cwd);
+                let status = crate::github::bridge::queue_status::queue_status(
+                    &client,
+                    &repo,
+                    &queue_label,
+                    crate::claims::now(),
+                    crate::claims::ttl_secs(),
+                )
+                .map_err(to_mcp_error)?;
+                serde_json::to_string_pretty(&status).unwrap_or_default()
             }
             "release_list" => {
                 let rels = releases::list(&client, &repo).map_err(to_mcp_error)?;
