@@ -445,7 +445,12 @@ mod tests {
         assert_eq!(rule.tier, RuleTier::Override);
         assert!(rule.sync.is_empty());
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        // Best-effort, like `temp_dir_for_test`'s own pre-cleanup: on Windows
+        // CI, a file just written/renamed can transiently stay locked for a
+        // few ms (real-time AV scanning) after this test's actual assertions
+        // above have already passed, causing an unrelated flaky
+        // PermissionDenied here if this were `.unwrap()`'d.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -467,7 +472,12 @@ mod tests {
         let rule = parse_rule_file(&dir.join("coaching-hygiene.md")).unwrap();
         assert_eq!(rule.trigger, None);
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        // Best-effort, like `temp_dir_for_test`'s own pre-cleanup: on Windows
+        // CI, a file just written/renamed can transiently stay locked for a
+        // few ms (real-time AV scanning) after this test's actual assertions
+        // above have already passed, causing an unrelated flaky
+        // PermissionDenied here if this were `.unwrap()`'d.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -493,7 +503,12 @@ mod tests {
             vec!["claude-code".to_string(), "opencode".to_string()]
         );
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        // Best-effort, like `temp_dir_for_test`'s own pre-cleanup: on Windows
+        // CI, a file just written/renamed can transiently stay locked for a
+        // few ms (real-time AV scanning) after this test's actual assertions
+        // above have already passed, causing an unrelated flaky
+        // PermissionDenied here if this were `.unwrap()`'d.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -509,7 +524,12 @@ mod tests {
         assert_eq!(rule.tier, RuleTier::Override);
         assert!(rule.sync.is_empty());
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        // Best-effort, like `temp_dir_for_test`'s own pre-cleanup: on Windows
+        // CI, a file just written/renamed can transiently stay locked for a
+        // few ms (real-time AV scanning) after this test's actual assertions
+        // above have already passed, causing an unrelated flaky
+        // PermissionDenied here if this were `.unwrap()`'d.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -537,7 +557,12 @@ mod tests {
         assert!(parse_rule_file(&dir.join("coaching-not a valid id.md")).is_none());
         assert!(parse_rule_file(&dir.join("coaching-hygiene.md")).is_some());
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        // Best-effort, like `temp_dir_for_test`'s own pre-cleanup: on Windows
+        // CI, a file just written/renamed can transiently stay locked for a
+        // few ms (real-time AV scanning) after this test's actual assertions
+        // above have already passed, causing an unrelated flaky
+        // PermissionDenied here if this were `.unwrap()`'d.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -559,7 +584,12 @@ mod tests {
         let rule = parse_rule_file(&dir.join("coaching-search17.md")).unwrap();
         assert!(rule.enforced);
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        // Best-effort, like `temp_dir_for_test`'s own pre-cleanup: on Windows
+        // CI, a file just written/renamed can transiently stay locked for a
+        // few ms (real-time AV scanning) after this test's actual assertions
+        // above have already passed, causing an unrelated flaky
+        // PermissionDenied here if this were `.unwrap()`'d.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -574,7 +604,12 @@ mod tests {
         let rule = parse_rule_file(&dir.join("coaching-old.md")).unwrap();
         assert!(!rule.enforced);
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        // Best-effort, like `temp_dir_for_test`'s own pre-cleanup: on Windows
+        // CI, a file just written/renamed can transiently stay locked for a
+        // few ms (real-time AV scanning) after this test's actual assertions
+        // above have already passed, causing an unrelated flaky
+        // PermissionDenied here if this were `.unwrap()`'d.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
