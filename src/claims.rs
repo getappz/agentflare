@@ -248,6 +248,46 @@ pub fn scope_clear_warning(
 
 // --- identity / config resolution (impure; thin wrappers over env + git) ---
 
+std::thread_local! {
+    // Per-thread override for `owner_id()`. `AGENTFLARE_AGENT`/`AGENTFLARE_SESSION`
+    // are process-global, which is fine for a fresh-process-per-command CLI
+    // but wrong once multiple work items run as threads inside one long-lived
+    // daemon process (see `with_owner_override`'s doc comment) — two worker
+    // threads racing on `std::env::set_var` could attribute a claim/comment
+    // to the wrong agent. Thread-local sidesteps that: each worker thread's
+    // override is independent, no shared mutable state, no locking needed.
+    static OWNER_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `owner_id()` returning `owner` instead of resolving it from
+/// env — for in-process job execution (`agentflare_jobs::InProcessExecutor`),
+/// where every worker thread shares the daemon's one process env/pid and so
+/// can't rely on `AGENTFLARE_AGENT`/`AGENTFLARE_SESSION`/pid the way a fresh
+/// `agentflare work` subprocess naturally can. `owner` should already be the
+/// full `<agent>:<instance>` pair (e.g. `claude-code:<job-id>`) — the job's
+/// own queue id makes a good instance discriminator, playing the same role
+/// the subprocess's own unique pid plays today.
+pub fn with_owner_override<R>(owner: impl Into<String>, f: impl FnOnce() -> R) -> R {
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            OWNER_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+    OWNER_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(owner.into()));
+    let _clear = ClearOnDrop;
+    f()
+}
+
+/// Whether the calling thread is currently inside a [`with_owner_override`]
+/// scope — lets callers that would otherwise mutate the process-global
+/// `AGENTFLARE_AGENT` env var (safe only when there's a single process per
+/// identity) skip that mutation once identity is already established
+/// per-thread instead.
+pub fn has_owner_override() -> bool {
+    OWNER_OVERRIDE.with(|cell| cell.borrow().is_some())
+}
+
 /// `<agent>:<instance>` — same agent chain as handoff, plus an instance
 /// discriminator so two parallel sessions of one agent are distinct owners.
 ///
@@ -258,6 +298,9 @@ pub fn scope_clear_warning(
 /// separate `agentflare claim` invocations (acquire in one, release in
 /// another); otherwise each command is a distinct owner.
 pub fn owner_id() -> String {
+    if let Some(owner) = OWNER_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return owner;
+    }
     let agent = std::env::var("AGENTFLARE_AGENT")
         .ok()
         .filter(|s| !s.is_empty())
@@ -552,5 +595,60 @@ mod tests {
         assert!(repo_key_from_url("https://bitbucket.org/o/r").is_none());
         assert!(repo_key_from_url("git@gitlab.com:o/r.git").is_none());
         assert!(repo_key_from_url("ssh://git@gitlab.com/o/r.git").is_none());
+    }
+
+    #[test]
+    fn with_owner_override_makes_owner_id_return_the_given_value() {
+        let seen = with_owner_override("claude-code:job-123", owner_id);
+        assert_eq!(seen, "claude-code:job-123");
+    }
+
+    #[test]
+    fn owner_id_falls_back_to_env_once_the_override_scope_ends() {
+        // Without an override, owner_id() reads env/pid as usual — just
+        // asserting the override doesn't leak past its own scope (a stale
+        // leftover would misattribute every subsequent claim/comment on this
+        // thread to the wrong agent).
+        let overridden = with_owner_override("claude-code:job-123", owner_id);
+        let after = owner_id();
+        assert_eq!(overridden, "claude-code:job-123");
+        assert_ne!(after, "claude-code:job-123");
+    }
+
+    #[test]
+    fn has_owner_override_reflects_whether_a_scope_is_active() {
+        assert!(!has_owner_override());
+        with_owner_override("codex:job-9", || {
+            assert!(has_owner_override());
+        });
+        assert!(!has_owner_override());
+    }
+
+    // The whole point of a thread-local override (vs. the process-global
+    // `AGENTFLARE_AGENT` env var it replaces for in-process job dispatch) is
+    // that concurrent worker threads each running a different job's agent
+    // never see each other's identity — proves that directly rather than
+    // just trusting thread_local!'s documented semantics.
+    #[test]
+    fn concurrent_overrides_on_different_threads_never_see_each_others_value() {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let owner = format!("agent-{i}:job-{i}");
+                    with_owner_override(owner.clone(), || {
+                        // Yield repeatedly so other threads' set/clear cycles
+                        // have every chance to interleave with this one if
+                        // the override were shared instead of thread-local.
+                        for _ in 0..50 {
+                            assert_eq!(owner_id(), owner);
+                            std::thread::yield_now();
+                        }
+                    });
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

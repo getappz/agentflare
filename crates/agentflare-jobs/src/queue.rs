@@ -138,6 +138,7 @@ impl Queue {
             started_at: None,
             finished_at: None,
             output: None,
+            in_process: job.in_process,
         })
     }
 
@@ -328,8 +329,8 @@ fn map_job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobInfo> {
     // `payload` is our own `serde_json::to_string(&AgentJob)` from `enqueue`,
     // so a parse failure here would mean on-disk corruption, not bad input —
     // fall back to an empty command/args rather than failing the whole read.
-    let (command, args) = serde_json::from_str::<crate::types::AgentJob>(&payload_json)
-        .map(|job| (job.command, job.args))
+    let (command, args, in_process) = serde_json::from_str::<crate::types::AgentJob>(&payload_json)
+        .map(|job| (job.command, job.args, job.in_process))
         .unwrap_or_default();
     Ok(JobInfo {
         id: r.get(0)?,
@@ -356,6 +357,7 @@ fn map_job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobInfo> {
             stdout_total_bytes: stdout_bytes as u64,
             stderr_total_bytes: stderr_bytes as u64,
         }),
+        in_process,
     })
 }
 

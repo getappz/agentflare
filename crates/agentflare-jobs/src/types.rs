@@ -31,6 +31,15 @@ pub struct AgentJob {
     pub agent_type: Option<String>,
     pub prompt: Option<String>,
     pub metadata: HashMap<String, String>,
+    /// When true, a worker runs this job by calling the registered
+    /// `InProcessExecutor` with `args` instead of spawning `command` as an
+    /// OS subprocess — `command`/`env`/`cwd`/`kill_after_secs` are then
+    /// unused (subprocess-only) but kept for display/back-compat. Defaults
+    /// to false via `#[serde(default)]` so every job persisted before this
+    /// field existed, and every plain `POST /api/jobs` submission (which
+    /// never sets it), keeps spawning a real subprocess exactly as before.
+    #[serde(default)]
+    pub in_process: bool,
 }
 
 impl AgentJob {
@@ -47,7 +56,16 @@ impl AgentJob {
             agent_type: None,
             prompt: None,
             metadata: HashMap::new(),
+            in_process: false,
         }
+    }
+
+    /// Marks this job to run via the daemon's registered `InProcessExecutor`
+    /// instead of spawning `command` as a subprocess — see the `in_process`
+    /// field's doc comment.
+    pub fn in_process(mut self) -> Self {
+        self.in_process = true;
+        self
     }
 
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
@@ -114,4 +132,5 @@ pub struct JobInfo {
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub output: Option<JobOutput>,
+    pub in_process: bool,
 }

@@ -1,5 +1,6 @@
 //! Background discovery loop: finds items labeled `ready-for-work` and
-//! dispatches an `agentflare work` job for each one whose assignee is a
+//! dispatches an in-process work job (`WorkItemExecutor`, running the same
+//! logic as `agentflare work`) for each one whose assignee is a
 //! confirmed-autonomous agent (skips the rest with a comment).
 
 use crate::mcp_server::AgentflareMcp;
@@ -10,18 +11,17 @@ const DISPATCHED_LABEL: &str = "dispatched";
 const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
 const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 
-/// `agentflare work`'s own `--timeout` is its hard-cap safety net, not the
-/// primary judge of whether it's still making progress -- that's
-/// `--idle-timeout`, which lets a job run for hours as long as it keeps
-/// producing output (see item #20). It defaults to 21600s (6h); this is
-/// that budget plus margin for the claim/worktree setup and done/push/PR
-/// steps around it, so the outer job timeout never cuts off a run before
-/// work's own inner timeout would. Before item #20 this outer timeout was
-/// 2100s (aligned to work's old 1800s fixed timeout) -- left unaligned
-/// after work's default grew, it would have silently reintroduced the same
-/// "killed a legitimately-progressing job" bug for every job actually
-/// dispatched by the daemon, since this is the timeout that governs them,
-/// not work's own.
+/// Since item #19, work items run in-process via `WorkItemExecutor` rather
+/// than as a spawned `agentflare work` subprocess, so this is no longer an
+/// outer subprocess wall-clock kill -- it's the watchdog `run_in_process`
+/// (agentflare-jobs' `worker.rs`) uses to abandon a stuck job (see its doc
+/// comment) rather than let a hung coordination step wedge a worker thread
+/// forever. `WorkArgs::DEFAULT_TIMEOUT_SECS` (21600s = 6h) is `agentflare
+/// work`'s own hard-cap safety net -- not the primary judge of progress,
+/// that's `--idle-timeout` (item #20) -- so this stays that budget plus
+/// margin for the claim/worktree/done steps around it, exactly as when it
+/// wrapped a real subprocess: it must never fire before the work being
+/// watched would have stopped on its own.
 const WORK_JOB_TIMEOUT_SECS: u64 = 21_900;
 
 /// Returns the matching `Agent` only if `agent_registry::autonomous_args`
@@ -183,28 +183,18 @@ fn dispatch_item(
     label_id_by_name: &std::collections::HashMap<String, String>,
     ready_id: &str,
 ) -> bool {
-    // `current_exe()` can return `Ok` with a path that no longer exists: on
-    // Linux, once the running binary's file is replaced (cargo install,
-    // package upgrade, `agentflare update`) it resolves via /proc/self/exe
-    // to the old, now-deleted inode -- Ok(path), but that path won't exec.
-    // A long-running daemon that resolves this once at dispatch time then
-    // fails every dispatch until someone notices and restarts it, so check
-    // the path is still real and fall back to a bare "agentflare" (resolved
-    // via PATH at spawn time, same fallback already used for the Err case)
-    // rather than trust a stale exe path.
-    let command = std::env::current_exe()
-        .ok()
-        .filter(|p| p.exists())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "agentflare".to_string());
-    let job = agentflare_jobs::AgentJob::new(command)
-        .args([
-            "work".to_string(),
-            item.id.clone(),
-            "--agent".to_string(),
-            agent.as_str().to_string(),
-        ])
-        .timeout(WORK_JOB_TIMEOUT_SECS);
+    // Runs in-process via `WorkItemExecutor` (registered on the daemon's
+    // `WorkerPool`, see `dashboard/server.rs::run`) instead of spawning a
+    // fresh `agentflare work` subprocess — item #19. `command` is a display
+    // label only (shown in the dashboard's job list); nothing spawns it, so
+    // master's `current_exe()`-staleness fix (see git history) is moot here:
+    // there's no exe path to resolve at all once dispatch never spawns one.
+    // `args` is `[item_id, agent]`, exactly what `WorkItemExecutor::execute`
+    // expects.
+    let job = agentflare_jobs::AgentJob::new("agentflare-work")
+        .args([item.id.clone(), agent.as_str().to_string()])
+        .timeout(WORK_JOB_TIMEOUT_SECS)
+        .in_process();
     let Ok(info) = queue.enqueue(&job) else {
         return false;
     };
@@ -339,7 +329,10 @@ mod tests {
 
         let jobs = queue.list(None).unwrap();
         assert_eq!(jobs.len(), 1);
-        assert!(jobs[0].args.contains(&"work".to_string()));
+        assert!(
+            jobs[0].in_process,
+            "work-item jobs must run in-process (item #19)"
+        );
         assert!(jobs[0].args.contains(&item_id));
         assert!(jobs[0].args.contains(&"claude-code".to_string()));
 
