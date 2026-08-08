@@ -5,7 +5,10 @@
 use crate::mcp_server::AgentflareMcp;
 use crate::mcp_server::types::{CommentRequest, ItemRequest};
 
-const READY_LABEL: &str = "ready-for-work";
+/// Also read by `mcp_server::handoff` — a freshly handed-off item is labeled
+/// with this so the discovery loop below notices it without a human having
+/// to add the label by hand. Single source of truth so the two can't drift.
+pub(crate) const READY_LABEL: &str = "ready-for-work";
 const DISPATCHED_LABEL: &str = "dispatched";
 const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
 const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
