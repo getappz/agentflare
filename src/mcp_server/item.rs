@@ -60,14 +60,20 @@ fn parsed_metadata(metadata: &str) -> Option<serde_json::Value> {
 }
 
 /// Converts a caller-supplied `metadata` value into the JSON string
-/// `CreateItem`/`UpdateItem` store. A `Value::String` is already
-/// JSON-encoded text (see `parsed_metadata`'s doc comment for why that
-/// shape shows up) and must be used as-is; anything else (the normal case —
-/// a real object) is serialized once, same as `Value::to_string()` did.
+/// `CreateItem`/`UpdateItem` store. A `Value::String` whose content is
+/// itself valid JSON is already-encoded text (see `parsed_metadata`'s doc
+/// comment for why that shape shows up) and must be used as-is; anything
+/// else -- including a genuine plain-string metadata value like `"hello"`,
+/// which is NOT already-encoded JSON -- is serialized normally, same as
+/// `Value::to_string()` did. Mirrors `parsed_metadata`'s own "does the
+/// inner string reparse as JSON" test so both sides agree on what counts
+/// as double-encoded.
 fn metadata_to_json_string(value: serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => s,
-        other => other.to_string(),
+    match &value {
+        serde_json::Value::String(s) if serde_json::from_str::<serde_json::Value>(s).is_ok() => {
+            s.clone()
+        }
+        _ => value.to_string(),
     }
 }
 
@@ -1210,5 +1216,18 @@ mod metadata_field_tests {
             reparsed.is_object(),
             "must parse straight to an object, not a string wrapping one: {reparsed:?}"
         );
+    }
+
+    #[test]
+    fn metadata_to_json_string_still_json_encodes_a_genuine_plain_string() {
+        // metadata: "hello" is a real (if unusual) case -- "hello" is not
+        // itself valid JSON, so it must NOT be used verbatim; it needs to
+        // stay wrapped as the JSON string "hello" like a plain
+        // Value::to_string() would produce, or the stored metadata column
+        // stops being valid JSON at all.
+        let stored = metadata_to_json_string(serde_json::Value::String("hello".to_string()));
+        assert_eq!(stored, "\"hello\"");
+        let reparsed: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(reparsed, serde_json::Value::String("hello".to_string()));
     }
 }
