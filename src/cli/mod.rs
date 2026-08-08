@@ -27,7 +27,7 @@ mod uninstall;
 mod update;
 mod vault;
 mod vent;
-mod work;
+pub(crate) mod work;
 
 use clap::{Parser, Subcommand};
 use std::sync::LazyLock;

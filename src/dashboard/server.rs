@@ -605,7 +605,8 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
     // operation) so its worker threads keep polling the queue; there is no
     // graceful in-process shutdown path today (see `daemon::stop_daemon`,
     // which relies on SIGTERM/SIGKILL), so neither does this.
-    let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone());
+    let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
+        .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor));
     worker_pool.start(2);
     spawn_job_cleanup(queue.clone());
     spawn_supervisor_discovery(
