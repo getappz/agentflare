@@ -44,6 +44,22 @@ impl AgentflareMcp {
         }
         let recipient = recipient.trim().to_string();
         let name = name.trim().to_string();
+
+        // "github" is reserved: it means "any workstation," not a specific
+        // agent. Publishes as a labelled issue on the bridge's pull queue
+        // instead of a local item -- the already-running bridge tick loop
+        // (src/github/bridge/tick.rs) picks it up on whichever workstation
+        // has claim headroom next, no local item/asset created here at all.
+        if recipient.eq_ignore_ascii_case("github") {
+            if item_id.is_some() {
+                return Err(ErrorData::invalid_params(
+                    "recipient=\"github\" publishes new work to the bridge queue -- it can't target an existing item_id",
+                    None,
+                ));
+            }
+            return self.handoff_to_bridge_queue(&name, &content, description.as_deref());
+        }
+
         let ext = match r#type.as_deref() {
             Some("html") => "html",
             Some("mermaid") | Some("diagram") => "mmd",
@@ -289,6 +305,51 @@ impl AgentflareMcp {
         })?
     }
 
+    /// Publishes `name`/body as a GitHub issue labelled with the bridge's
+    /// queue label, on the repo resolved from this workstation's `origin`
+    /// remote -- same resolution `flare_git_impl` already uses. Deliberately
+    /// thin: issue creation and the claim/heartbeat/export lifecycle already
+    /// live in `github::issues` and `github::bridge::tick`; this just gets
+    /// work onto the queue.
+    fn handoff_to_bridge_queue(
+        &self,
+        name: &str,
+        content: &str,
+        description: Option<&str>,
+    ) -> Result<String, ErrorData> {
+        use crate::github::{Client, bridge::config, issues};
+
+        let repo_root = self.worktree_repo_root();
+        let repo = config::resolve_project_repo(&repo_root).ok_or_else(|| {
+            ErrorData::invalid_params(
+                "recipient=\"github\" needs a GitHub `origin` remote in the current repo (or a \
+                 [bridge] repo override in .agentflare/config.toml)",
+                None,
+            )
+        })?;
+        let client = Client::new().map_err(to_mcp_error)?;
+        let queue_label = config::resolve_project_queue_label(&repo_root);
+        let body = description.unwrap_or(content);
+        let issue = issues::create(
+            &client,
+            &repo,
+            name,
+            Some(body),
+            std::slice::from_ref(&queue_label),
+            &[],
+        )
+        .map_err(to_mcp_error)?;
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "repo": repo.to_string(),
+            "issue_number": issue.number,
+            "issue_url": issue.html_url,
+            "queue_label": queue_label,
+            "recipient": "github",
+        }))
+        .unwrap_or_default())
+    }
+
     /// Verified, not trusted: rejects a fabricated or typo'd continuation
     /// OID rather than recording it as-is. `oid` must exist in the repo as
     /// a commit (not just any object); when `branch` is given and exists,
@@ -415,6 +476,35 @@ mod tests {
             .unwrap();
         })
         .unwrap();
+    }
+
+    #[test]
+    fn recipient_github_rejects_an_item_id() {
+        // Credential-independent, like flare_git_impl's own
+        // unknown_action_is_rejected_before_repo_or_client_setup: this must
+        // fail on its own merits before ever resolving a repo or a client.
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            recipient: "github".to_string(),
+            item_id: Some("some-item".to_string()),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        assert!(err.to_string().contains("item_id"), "{err}");
+    }
+
+    #[test]
+    fn recipient_github_without_an_origin_remote_fails_clearly() {
+        // test_mcp()'s repo has no `origin` configured, so this exercises
+        // handoff_to_bridge_queue's repo resolution without hitting the
+        // network at all.
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            recipient: "github".to_string(),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        assert!(err.to_string().contains("origin"), "{err}");
     }
 
     #[test]

@@ -115,6 +115,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "toml",
  "ureq 2.12.1",
  "windows-sys 0.59.0",
  "zeroize",
