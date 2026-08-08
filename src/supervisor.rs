@@ -175,9 +175,20 @@ fn dispatch_item(
     label_id_by_name: &std::collections::HashMap<String, String>,
     ready_id: &str,
 ) -> bool {
+    // `current_exe()` can return `Ok` with a path that no longer exists: on
+    // Linux, once the running binary's file is replaced (cargo install,
+    // package upgrade, `agentflare update`) it resolves via /proc/self/exe
+    // to the old, now-deleted inode -- Ok(path), but that path won't exec.
+    // A long-running daemon that resolves this once at dispatch time then
+    // fails every dispatch until someone notices and restarts it, so check
+    // the path is still real and fall back to a bare "agentflare" (resolved
+    // via PATH at spawn time, same fallback already used for the Err case)
+    // rather than trust a stale exe path.
     let command = std::env::current_exe()
+        .ok()
+        .filter(|p| p.exists())
         .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "agentflare".to_string());
+        .unwrap_or_else(|| "agentflare".to_string());
     let job = agentflare_jobs::AgentJob::new(command)
         .args([
             "work".to_string(),
