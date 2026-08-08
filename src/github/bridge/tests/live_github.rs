@@ -74,6 +74,7 @@ fn live(repo: RepoId, max_claims: usize) -> Live {
                 None,
                 Some(&max_claims.to_string()),
                 None,
+                None,
                 instance.clone(),
             ),
             project_id: project_id.clone(),

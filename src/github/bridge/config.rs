@@ -158,6 +158,15 @@ pub struct BridgeConfig {
     pub max_claims: usize,
     pub ttl_secs: i64,
     pub queue_label: String,
+    /// Agent to dispatch for issues this instance claims, e.g. `claude-code`
+    /// -- must match an `agent_registry::Agent` id exactly
+    /// (`supervisor::resolve_confirmed_agent`), same as `handoff`'s
+    /// recipient. `None` (the default) means claimed items are never
+    /// labeled `ready-for-work`: nothing dispatches, same as before this
+    /// field existed. Deliberately not auto-detected -- which of several
+    /// installed agents should work claimed issues is a choice, not
+    /// something to guess.
+    pub work_agent: Option<String>,
     pub instance_id: String,
 }
 
@@ -388,6 +397,7 @@ impl BridgeConfig {
             get("AGENTFLARE_BRIDGE_INTERVAL_SECS").as_deref(),
             get("AGENTFLARE_BRIDGE_MAX_CLAIMS").as_deref(),
             get("AGENTFLARE_BRIDGE_QUEUE_LABEL").as_deref(),
+            get("AGENTFLARE_BRIDGE_WORK_AGENT").as_deref(),
             instance,
         )
     }
@@ -399,6 +409,7 @@ impl BridgeConfig {
         interval: Option<&str>,
         max_claims: Option<&str>,
         queue_label: Option<&str>,
+        work_agent: Option<&str>,
         instance_id: String,
     ) -> BridgeConfig {
         BridgeConfig {
@@ -413,6 +424,10 @@ impl BridgeConfig {
             // Reuses the EXISTING claim TTL so marker liveness and the local
             // ledger expire on one schedule.
             ttl_secs: crate::claims::ttl_secs(),
+            work_agent: work_agent
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             queue_label: queue_label
                 .filter(|s| !s.is_empty())
                 .unwrap_or(DEFAULT_QUEUE_LABEL)
@@ -428,12 +443,13 @@ mod tests {
 
     #[test]
     fn defaults_are_off_and_conservative() {
-        let c = BridgeConfig::from_values(None, None, None, None, "agent:1".to_string());
+        let c = BridgeConfig::from_values(None, None, None, None, None, "agent:1".to_string());
         assert!(!c.enabled, "bridge must be opt-in");
         assert_eq!(c.interval_secs, 60);
         assert_eq!(c.max_claims, 3);
         assert_eq!(c.queue_label, "agentflare");
         assert_eq!(c.instance_id, "agent:1");
+        assert_eq!(c.work_agent, None, "no dispatch until opted in");
     }
 
     #[test]
@@ -443,22 +459,32 @@ mod tests {
             Some("15"),
             Some("7"),
             Some("queue"),
+            Some("claude-code"),
             "agent:1".to_string(),
         );
         assert!(c.enabled);
         assert_eq!(c.interval_secs, 15);
         assert_eq!(c.max_claims, 7);
         assert_eq!(c.queue_label, "queue");
+        assert_eq!(c.work_agent.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn work_agent_blank_or_whitespace_only_is_none() {
+        for v in ["", "   "] {
+            let c = BridgeConfig::from_values(None, None, None, None, Some(v), "a".to_string());
+            assert_eq!(c.work_agent, None, "{v:?} should not set a work agent");
+        }
     }
 
     #[test]
     fn enabled_accepts_common_truthy_spellings() {
         for v in ["1", "true", "TRUE", "yes"] {
-            let c = BridgeConfig::from_values(Some(v), None, None, None, "a".to_string());
+            let c = BridgeConfig::from_values(Some(v), None, None, None, None, "a".to_string());
             assert!(c.enabled, "{v} should enable");
         }
         for v in ["0", "false", "no", "", "banana"] {
-            let c = BridgeConfig::from_values(Some(v), None, None, None, "a".to_string());
+            let c = BridgeConfig::from_values(Some(v), None, None, None, None, "a".to_string());
             assert!(!c.enabled, "{v} should not enable");
         }
     }
@@ -587,6 +613,7 @@ mod tests {
             Some("not-a-number"),
             Some(""),
             None,
+            None,
             "a".to_string(),
         );
         assert_eq!(c.interval_secs, 60);
@@ -595,7 +622,7 @@ mod tests {
 
     #[test]
     fn interval_has_a_floor_so_a_typo_cannot_hammer_github() {
-        let c = BridgeConfig::from_values(Some("1"), Some("0"), None, None, "a".to_string());
+        let c = BridgeConfig::from_values(Some("1"), Some("0"), None, None, None, "a".to_string());
         assert_eq!(c.interval_secs, MIN_INTERVAL_SECS);
     }
 
@@ -799,7 +826,7 @@ mod tests {
 
     #[test]
     fn max_claims_zero_is_legal_drain_mode_not_a_floor_violation() {
-        let c = BridgeConfig::from_values(Some("1"), None, Some("0"), None, "a".to_string());
+        let c = BridgeConfig::from_values(Some("1"), None, Some("0"), None, None, "a".to_string());
         assert_eq!(
             c.max_claims, 0,
             "0 must pass through unfloored: it means drain mode (stop claiming \

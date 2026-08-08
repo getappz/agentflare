@@ -347,26 +347,52 @@ fn record_claim(
                 .map_err(|e| GitHubError::Parse(e.to_string()))?;
             existing
         }
-        None => agentflare_backend::item::create(
-            conn,
-            agentflare_backend::item::CreateItem {
-                project_id: ctx.project_id.clone(),
-                state_id,
-                name: issue.title.clone(),
-                description: issue.body.clone(),
-                priority: None,
-                parent_id: None,
-                assignee_agent: Some(ctx.config.instance_id.clone()),
-                sort_order: None,
-                external_source: Some(items::EXTERNAL_SOURCE.to_string()),
-                external_id: Some(issue.number.to_string()),
-                metadata: None,
-                label_ids: vec![],
-                assignee_ids: vec![],
-                dependency_ids: vec![],
-            },
-        )
-        .map_err(|e| GitHubError::Parse(e.to_string()))?,
+        None => {
+            // Labeling `ready-for-work` (when a work agent is configured
+            // and the project has that label at all -- skipped otherwise
+            // rather than creating it out of nowhere, same reasoning as
+            // `handoff_impl`) is what actually gets this claimed issue
+            // dispatched: `spawn_supervisor_discovery`'s own tick is what
+            // launches the agent from there, not this function. Without a
+            // work agent, `assignee_agent` stays the bridge's own instance
+            // id -- claimed but nothing picks it up, same as before this
+            // existed.
+            let ready_label_id = ctx.config.work_agent.as_ref().and_then(|_| {
+                agentflare_backend::label::list_by_project(conn, &ctx.project_id)
+                    .ok()
+                    .and_then(|labels| {
+                        labels
+                            .into_iter()
+                            .find(|l| l.name == crate::supervisor::READY_LABEL)
+                    })
+                    .map(|l| l.id)
+            });
+            agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: ctx.project_id.clone(),
+                    state_id,
+                    name: issue.title.clone(),
+                    description: issue.body.clone(),
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: Some(
+                        ctx.config
+                            .work_agent
+                            .clone()
+                            .unwrap_or_else(|| ctx.config.instance_id.clone()),
+                    ),
+                    sort_order: None,
+                    external_source: Some(items::EXTERNAL_SOURCE.to_string()),
+                    external_id: Some(issue.number.to_string()),
+                    metadata: None,
+                    label_ids: ready_label_id.into_iter().collect(),
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                },
+            )
+            .map_err(|e| GitHubError::Parse(e.to_string()))?
+        }
     };
 
     // Local ledger too, so this instance's OWN agents do not double-claim.
@@ -783,6 +809,69 @@ mod tests {
         let sent: serde_json::Value = serde_json::from_str(&rewrite.body).unwrap();
         let marker = Marker::parse(sent["body"].as_str().unwrap()).unwrap();
         assert_eq!(marker.item, item.id);
+
+        // Without a configured work agent, a claim is visible but nobody's
+        // been told to work it -- assignee stays the bridge's own instance
+        // id, not a real dispatchable agent name.
+        assert_eq!(item.assignee_agent.as_deref(), Some("me:1"));
+    }
+
+    #[test]
+    fn winning_a_claim_with_a_work_agent_configured_dispatches_it() {
+        let server = MockServer::start(vec![
+            MockResponse::json(
+                200,
+                r#"[{"number":7,"html_url":"u","state":"open","title":"Do the thing","body":"","labels":[{"name":"agentflare"}]}]"#,
+            ),
+            MockResponse::json(200, "[]"),
+            MockResponse::json(201, r#"{"id":100}"#),
+            MockResponse::json(
+                200,
+                &format!(
+                    r#"[{{"id":100,"user":{{"login":"u"}},"body":{}}}]"#,
+                    serde_json::to_string(&marker_body(Action::Claim, "me:1", NOW)).unwrap()
+                ),
+            ),
+            MockResponse::json(200, r#"{"id":100}"#),
+            MockResponse::json(200, "[]"),
+        ]);
+        let (conn, project_id) = test_db();
+        let project = agentflare_backend::project::get(&conn, &project_id).unwrap();
+        agentflare_backend::label::create(
+            &conn,
+            agentflare_backend::label::CreateLabel {
+                project_id: Some(project_id.clone()),
+                workspace_id: project.workspace_id,
+                name: crate::supervisor::READY_LABEL.to_string(),
+                color: None,
+                parent_id: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+
+        let mut ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+        ctx.config.work_agent = Some("claude-code".to_string());
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert_eq!(report.claimed, vec![7]);
+        let item = crate::github::bridge::items::find_by_issue(&conn, &project_id, 7).unwrap();
+        assert_eq!(
+            item.assignee_agent.as_deref(),
+            Some("claude-code"),
+            "assignee must be the configured work agent, not the bridge's own instance id"
+        );
+        let label_ids = agentflare_backend::item::list_labels(&conn, &item.id).unwrap();
+        let label_names: Vec<String> = label_ids
+            .iter()
+            .map(|id| agentflare_backend::label::get(&conn, id).unwrap().name)
+            .collect();
+        assert!(
+            label_names.contains(&crate::supervisor::READY_LABEL.to_string()),
+            "expected ready-for-work label, got {label_names:?}"
+        );
     }
 
     #[test]
@@ -1596,6 +1685,7 @@ mod tests {
                 Some("1"),
                 None,
                 Some(&max_claims.to_string()),
+                None,
                 None,
                 "me:1".to_string(),
             ),
