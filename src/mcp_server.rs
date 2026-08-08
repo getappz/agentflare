@@ -652,7 +652,7 @@ impl AgentflareMcp {
 
     /// Derives a project name from the git remote (`getappz/agentflare` →
     /// `agentflare`) or, outside a repo, the directory basename.
-    fn resolve_project_name() -> String {
+    pub(crate) fn resolve_project_name() -> String {
         if let Some(repo) = Self::run_git(&["remote", "get-url", "origin"]) {
             let normalized = crate::claims::normalize_repo(&repo);
             if let Some(name) = normalized.rsplit('/').next().filter(|s| !s.is_empty()) {
