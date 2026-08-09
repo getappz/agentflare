@@ -538,9 +538,17 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> i32 
                     (reply, None, None)
                 };
 
+            // The agent may already have called `done` itself with its own
+            // `summary` (in which case this second call is a no-op — the
+            // claim is already released) -- but the common case is a
+            // headless run that just replies with text and lets this
+            // wrapper handle `done`, so pass the parsed reply through as
+            // the PR body rather than leaving it as the generic
+            // placeholder.
             let done_resp = match mcp.item_done(ItemRequest {
                 action: "done".into(),
                 id: Some(item_id.into()),
+                summary: Some(reply_text.clone()),
                 ..Default::default()
             }) {
                 Ok(j) => j,
