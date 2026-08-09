@@ -5,7 +5,9 @@
 //! separate from `worker_test.rs`'s existing subprocess-path coverage, which
 //! stays unchanged and passing to prove that path is untouched.
 
-use agentflare_jobs::{AgentJob, InProcessExecutor, JobFailure, JobInfo, JobState, Queue, WorkerPool};
+use agentflare_jobs::{
+    AgentJob, InProcessExecutor, JobFailure, JobInfo, JobState, Queue, WorkerPool,
+};
 use std::sync::Arc;
 
 fn test_queue() -> Queue {

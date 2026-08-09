@@ -597,7 +597,11 @@ fn parse_work_max_concurrency(raw: Option<&str>) -> usize {
 }
 
 fn work_max_concurrency() -> usize {
-    parse_work_max_concurrency(std::env::var("AGENTFLARE_WORK_MAX_CONCURRENCY").ok().as_deref())
+    parse_work_max_concurrency(
+        std::env::var("AGENTFLARE_WORK_MAX_CONCURRENCY")
+            .ok()
+            .as_deref(),
+    )
 }
 
 pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {

@@ -22,6 +22,17 @@ fn as_progress(p: Option<&ProgressSender>) -> Option<&dyn flare_git_core::worktr
 
 pub use flare_git_core::worktree::resolve_target_branch;
 
+/// Whether `item`'s branch has any committed content `target_branch`
+/// doesn't already have. See `flare_git_core::worktree::branch_diverged`.
+pub fn branch_diverged(
+    item: &agentflare_backend::item::Item,
+    repo_root: &Path,
+    target_branch: &str,
+) -> bool {
+    let branch = format!("task/{}", item.sequence_id);
+    flare_git_core::worktree::branch_diverged(repo_root, &branch, target_branch)
+}
+
 pub fn create_worktree(
     item: &agentflare_backend::item::Item,
     repo_root: &Path,
@@ -66,6 +77,18 @@ pub fn is_pr_merged(item: &agentflare_backend::item::Item, repo_root: &Path) -> 
     }
 }
 
+/// The PR body: `summary` (the agent's own "what changed and why", or an
+/// explicit `summary` on the `done` call) when it's real content, else the
+/// old generic placeholder. A real summary makes for a far more reviewable
+/// PR than the placeholder — reviewers previously had to open the diff
+/// cold, with no idea what the change was even trying to do.
+fn pr_body(item_id: &str, summary: Option<&str>) -> String {
+    match summary.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => format!("Auto-opened on `item done` for {item_id}."),
+    }
+}
+
 /// Pushes `item`'s isolated worktree branch and opens a PR against
 /// `target_branch` — the `done`-side counterpart to `create_worktree`.
 /// Deliberately never merges: unreviewed code should never land on the
@@ -79,6 +102,7 @@ pub fn push_and_open_pr(
     repo_root: &Path,
     target_branch: &str,
     progress: Option<&ProgressSender>,
+    summary: Option<&str>,
 ) -> Option<String> {
     let branch = flare_git_core::worktree::push_branch(
         item,
@@ -89,7 +113,7 @@ pub fn push_and_open_pr(
     if let Some(p) = progress {
         p.send(0.5, Some(1.0), Some("Creating PR...".into()));
     }
-    let body = format!("Auto-opened on `item done` for {}.", item.id);
+    let body = pr_body(&item.id, summary);
     let repo = match RepoId::resolve_from_remote(repo_root) {
         Some(r) => r,
         None => {
@@ -152,5 +176,42 @@ pub fn push_and_open_pr(
             eprintln!("worktree: PR creation failed for item {}: {e}", item.id);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_body_uses_the_summary_when_given_one() {
+        assert_eq!(
+            pr_body("item-1", Some("Fixed the race by adding a mutex.")),
+            "Fixed the race by adding a mutex."
+        );
+    }
+
+    #[test]
+    fn pr_body_trims_the_summary() {
+        assert_eq!(
+            pr_body("item-1", Some("  Fixed the race.  \n")),
+            "Fixed the race."
+        );
+    }
+
+    #[test]
+    fn pr_body_falls_back_to_the_placeholder_when_summary_is_none() {
+        assert_eq!(
+            pr_body("item-1", None),
+            "Auto-opened on `item done` for item-1."
+        );
+    }
+
+    #[test]
+    fn pr_body_falls_back_to_the_placeholder_when_summary_is_blank() {
+        assert_eq!(
+            pr_body("item-1", Some("   ")),
+            "Auto-opened on `item done` for item-1."
+        );
     }
 }

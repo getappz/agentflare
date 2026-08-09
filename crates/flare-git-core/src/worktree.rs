@@ -66,6 +66,21 @@ pub fn already_isolated_for(branch: &str, repo_root: &Path) -> bool {
     }
 }
 
+/// `true` if `worktree_path` already exists on disk and is itself a git
+/// worktree checked out to `branch` -- the on-disk counterpart to
+/// `already_isolated_for` above, for callers running from outside the
+/// worktree (the daemon's normal case) rather than from inside it.
+#[must_use]
+fn worktree_already_checked_out(worktree_path: &Path, branch: &str) -> bool {
+    if !worktree_path.is_dir() {
+        return false;
+    }
+    match run_git_in(worktree_path, &["branch", "--show-current"]) {
+        Ok(b) => b == branch,
+        Err(_) => false,
+    }
+}
+
 /// Adds `.worktrees/` and `.cargo/` to this repo's LOCAL, untracked ignore
 /// rules (`.git/info/exclude`) rather than the tracked `.gitignore` — a
 /// claim should never create a commit in the caller's repository (would
@@ -222,7 +237,15 @@ pub fn create_worktree(
         .join(".worktrees")
         .join("task")
         .join(item.sequence_id.to_string());
-    if already_isolated_for(&branch, repo_root) {
+    // Two ways a re-claim can find its own worktree already in place:
+    // `already_isolated_for` catches the recursive case (the calling
+    // process is itself already running from inside it), but the daemon's
+    // normal dispatch always calls this from the main repo root, so that
+    // check never fires there -- it needs the on-disk check too, or
+    // `git worktree add` below fails ("already exists") on a re-claim.
+    if already_isolated_for(&branch, repo_root)
+        || worktree_already_checked_out(&worktree_path, &branch)
+    {
         // Re-claiming an existing worktree: nothing to create, but still
         // ensure its target dir is isolated (idempotent, no-op if present),
         // and re-warn since the ambient env can still be shadowing it.
@@ -441,6 +464,30 @@ pub(crate) fn run_output_timeout(
     })
 }
 
+/// Whether `branch` has committed content `target_branch` doesn't already
+/// have: new commits (`rev-list --count`) whose *content* isn't already
+/// fully present on the target either (`diff --quiet` content-diff guard,
+/// catching squash-merges — two-dot, not three-dot: we want whether the two
+/// tips are identical, not whether branch differs from merge-base).
+///
+/// Used by `push_branch` below to skip pushing/PR-ing a no-op branch, and by
+/// `item_done` (main binary) to tell a genuinely empty run (no commits at
+/// all) apart from a run whose push/PR failed for some other reason —
+/// only the former should block marking an item done.
+pub fn branch_diverged(repo_root: &Path, branch: &str, target_branch: &str) -> bool {
+    match run_git_in(
+        repo_root,
+        &["rev-list", "--count", &format!("{target_branch}..{branch}")],
+    ) {
+        Ok(count) if count != "0" => {}
+        _ => return false,
+    }
+    !run_git_in_ok(
+        repo_root,
+        &["diff", "--quiet", &format!("{target_branch}..{branch}")],
+    )
+}
+
 /// Pushes `item`'s isolated worktree branch to `target_branch`'s remote, if
 /// the branch exists, has new commits, and its content isn't already fully
 /// present on the target (squash-merge guard). Returns the pushed branch
@@ -467,21 +514,7 @@ pub fn push_branch(
     }
     // Nothing to push (and nothing worth a PR) if the branch never
     // diverged from its target — e.g. `done` called with no commits made.
-    match run_git_in(
-        repo_root,
-        &["rev-list", "--count", &format!("{target_branch}..{branch}")],
-    ) {
-        Ok(count) if count != "0" => {}
-        _ => return None,
-    }
-    // Content-diff guard: even when the branch has new commits, its
-    // *content* may already be on the target (squash-merge). Compares
-    // target→branch tree (two-dot, not three-dot: we want whether the
-    // two tips are identical, not whether branch differs from merge-base).
-    if run_git_in_ok(
-        repo_root,
-        &["diff", "--quiet", &format!("{target_branch}..{branch}")],
-    ) {
+    if !branch_diverged(repo_root, &branch, target_branch) {
         return None;
     }
     if let Some(p) = progress {
@@ -1066,6 +1099,31 @@ mod tests {
         let target = resolve_default_branch(&repo.path);
         let result = create_worktree(&item, &repo.path, &target, None);
         assert!(result.is_ok(), "{:?}", result.err());
+        assert!(worktree_path.exists());
+        let checked_out = run_git_in(&worktree_path, &["branch", "--show-current"]).unwrap();
+        assert_eq!(checked_out, "task/1");
+    }
+
+    #[test]
+    fn create_worktree_reuses_an_existing_worktree_when_called_from_the_repo_root() {
+        // The daemon always calls create_worktree from the main repo root,
+        // never from inside the worktree itself, so already_isolated_for's
+        // "am I currently inside that worktree?" check (compares --git-dir
+        // vs --git-common-dir on repo_root) can never fire for a real
+        // re-claim -- it only ever returns true for the recursive case
+        // where a caller happens to already be cd'd into the worktree.
+        // Without an on-disk check, the second call falls through to
+        // `git worktree add`, which refuses to re-add a branch that's
+        // already checked out elsewhere ("bad git state?" in item #43/#30).
+        let repo = init_repo();
+        let item = test_item(1);
+        let target = resolve_default_branch(&repo.path);
+        let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+
+        let result = create_worktree(&item, &repo.path, &target, None);
+
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert_eq!(result.unwrap(), worktree_path);
         assert!(worktree_path.exists());
         let checked_out = run_git_in(&worktree_path, &["branch", "--show-current"]).unwrap();
         assert_eq!(checked_out, "task/1");

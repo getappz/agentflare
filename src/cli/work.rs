@@ -68,12 +68,16 @@ fn build_prompt(
     prompt
 }
 
-/// Claude Code's `--output-format json` reply shape: `{"result": "...",
-/// "session_id": "...", "total_cost_usd": 0.0}`. Falls back to the raw text
-/// unparsed for any agent/output that isn't that exact JSON shape — never
-/// errors, never blocks the caller.
+/// Claude Code's `--output-format stream-json` reply shape: one JSON object
+/// per line (system init, tool_use/tool_result, assistant messages, ...),
+/// with only the FINAL line carrying `{"result": "...", "session_id": "...",
+/// "total_cost_usd": 0.0}` — the same shape the single-object `json` format
+/// uses for its one and only line, so parsing "the last line" handles both.
+/// Falls back to the raw text unparsed for any agent/output whose last line
+/// isn't that exact JSON shape — never errors, never blocks the caller.
 fn parse_claude_reply(raw: &str) -> (String, Option<String>, Option<f64>) {
-    match serde_json::from_str::<serde_json::Value>(raw.trim()) {
+    let last_line = raw.trim().lines().next_back().unwrap_or("");
+    match serde_json::from_str::<serde_json::Value>(last_line) {
         Ok(v) => {
             let text = v
                 .get("result")
@@ -128,10 +132,21 @@ fn failure_message(outcome: &HeadlessOutcome) -> String {
 /// Per-agent extra argv inserted before the prompt: the confirmed
 /// permission-bypass flag, plus — Claude Code only, since it's the only
 /// agent with a confirmed structured-output flag and native turn/cost caps
-/// — `--output-format json` and any `--max-turns`/`--max-cost-usd` the
-/// caller asked for. Other agents get only their bypass flag; a
-/// caller-supplied cap for them is dropped with a warning rather than
-/// guessed at.
+/// — `--output-format stream-json` (plus the `--verbose` Claude Code
+/// requires alongside it — confirmed by hand: omitting it errors with
+/// "--print with stream-json output requires --verbose") and any
+/// `--max-turns`/`--max-cost-usd` the caller asked for. Other agents get
+/// only their bypass flag; a caller-supplied cap for them is dropped with a
+/// warning rather than guessed at.
+///
+/// NOT plain `--output-format json`: that format writes nothing to
+/// stdout/stderr until the entire run finishes (confirmed by hand: 0 bytes
+/// for 54s+ on a trivial 2-tool-call task), so `run_captured`'s idle-timeout
+/// (default 300s) kills any real, longer task as a false-positive hang
+/// before it can ever finish — the actual cause behind item #43's repeated
+/// "went idle for 300s (no output captured)" failures. `stream-json` emits
+/// one JSON object per turn/tool-call as it happens, giving genuine
+/// liveness; `parse_claude_reply` reads the result back off its final line.
 fn build_extra_args(
     agent: agent_registry::Agent,
     max_turns: Option<u64>,
@@ -144,7 +159,8 @@ fn build_extra_args(
         .collect();
     if agent == agent_registry::Agent::ClaudeCode {
         args.push("--output-format".to_string());
-        args.push("json".to_string());
+        args.push("stream-json".to_string());
+        args.push("--verbose".to_string());
         if let Some(turns) = max_turns {
             args.push(format!("--max-turns={turns}"));
         }
@@ -543,9 +559,17 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
                     (reply, None, None)
                 };
 
+            // The agent may already have called `done` itself with its own
+            // `summary` (in which case this second call is a no-op — the
+            // claim is already released) -- but the common case is a
+            // headless run that just replies with text and lets this
+            // wrapper handle `done`, so pass the parsed reply through as
+            // the PR body rather than leaving it as the generic
+            // placeholder.
             let done_resp = match mcp.item_done(ItemRequest {
                 action: "done".into(),
                 id: Some(item_id.into()),
+                summary: Some(reply_text.clone()),
                 ..Default::default()
             }) {
                 Ok(j) => j,
@@ -699,6 +723,26 @@ mod tests {
     #[test]
     fn parse_claude_reply_extracts_structured_fields() {
         let raw = r#"{"result":"Fixed the race by adding a mutex.","session_id":"sess-123","total_cost_usd":0.0842}"#;
+        let (text, session_id, cost) = parse_claude_reply(raw);
+        assert_eq!(text, "Fixed the race by adding a mutex.");
+        assert_eq!(session_id.as_deref(), Some("sess-123"));
+        assert_eq!(cost, Some(0.0842));
+    }
+
+    #[test]
+    fn parse_claude_reply_extracts_the_result_from_the_last_line_of_a_stream_json_transcript() {
+        // --output-format stream-json emits one JSON object per line (system
+        // init, tool_use/tool_result, assistant messages, ...) and only the
+        // FINAL line carries the same {"result":...} shape the single-object
+        // `json` format uses — everything before it must be ignored, not
+        // treated as (or blended into) the reply text.
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"sess-123"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working..."}]}}"#,
+            "\n",
+            r#"{"type":"result","result":"Fixed the race by adding a mutex.","session_id":"sess-123","total_cost_usd":0.0842}"#,
+        );
         let (text, session_id, cost) = parse_claude_reply(raw);
         assert_eq!(text, "Fixed the race by adding a mutex.");
         assert_eq!(session_id.as_deref(), Some("sess-123"));
@@ -887,11 +931,21 @@ use  = "opencode"
     }
 
     #[test]
-    fn build_extra_args_includes_bypass_and_json_output_for_claude() {
+    fn build_extra_args_includes_bypass_and_streaming_output_for_claude() {
+        // Plain `--output-format json` writes NOTHING to stdout/stderr until
+        // the entire run finishes (confirmed by hand: 0 bytes for 54s+ on a
+        // trivial 2-tool-call task) — run_captured's idle-timeout (default
+        // 300s) then kills any real task before it can finish, every time.
+        // `stream-json` (+ the `--verbose` it requires) emits one JSON
+        // object per turn/tool-call as it happens, giving a genuine
+        // liveness signal; its final line carries the same {"result":...}
+        // shape `parse_claude_reply` already expects.
         let args = build_extra_args(agent_registry::Agent::ClaudeCode, None, None);
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(args.contains(&"--output-format".to_string()));
-        assert!(args.contains(&"json".to_string()));
+        assert!(args.contains(&"stream-json".to_string()));
+        assert!(!args.contains(&"json".to_string()));
+        assert!(args.contains(&"--verbose".to_string()));
         assert!(!args.iter().any(|a| a.starts_with("--max-turns")));
     }
 

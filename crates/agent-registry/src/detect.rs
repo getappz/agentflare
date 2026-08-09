@@ -512,6 +512,22 @@ pub fn detect_all(
     detect_all_with(registry, cache, &RealVersionRunner)
 }
 
+/// IDs of every `Tier::Cli` agent in `registry` with a binary on PATH —
+/// presence only, no version resolution. `detect_all`/`detect_all_with` spawn
+/// a `--version` subprocess per detected agent (`resolve_version_with`), which
+/// is the right cost for callers that display versions (`agentflare agents
+/// list`/`doctor`) but pure waste for callers that only need the ID list:
+/// on Windows, Node-wrapped CLIs (e.g. opencode, copilot) can each take
+/// 500ms+ just to start up and print `--version`, paid sequentially.
+#[must_use]
+pub fn detect_present(registry: &[AgentSpec]) -> Vec<&'static str> {
+    registry
+        .iter()
+        .filter(|spec| spec.tier == Tier::Cli && find_binary(spec.binary_names).is_some())
+        .map(|spec| spec.id.as_str())
+        .collect()
+}
+
 #[cfg(test)]
 mod detect_all_tests {
     use super::*;

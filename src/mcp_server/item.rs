@@ -607,13 +607,20 @@ impl AgentflareMcp {
             Ok::<_, ErrorData>((item_id, owns_claim, item, target_branch))
         })??;
         let should_push = req.push.unwrap_or(true);
+        let summary = req.summary.as_deref();
         let pr_url = match (&item, &target_branch) {
             (Some(item), Some(target)) if should_push => PROGRESS_SENDER
                 .try_with(|ps| {
-                    crate::worktree::push_and_open_pr(item, &repo_root, target, ps.as_ref())
+                    crate::worktree::push_and_open_pr(
+                        item,
+                        &repo_root,
+                        target,
+                        ps.as_ref(),
+                        summary,
+                    )
                 })
                 .unwrap_or_else(|_| {
-                    crate::worktree::push_and_open_pr(item, &repo_root, target, None)
+                    crate::worktree::push_and_open_pr(item, &repo_root, target, None, summary)
                 }),
             _ => None,
         };
@@ -634,7 +641,53 @@ impl AgentflareMcp {
         // no-ops (logging) rather than trusting push/PR success alone as
         // proof nothing would be lost.
         let in_review = owns_claim && pr_url.is_some();
+        // No PR resulted — either nothing was ever committed on the claimed
+        // branch, or a real commit's push/PR failed for some other reason.
+        // Only the former should block completion: marking an item
+        // "completed" when its branch never diverged from target claims
+        // work was delivered when none was (item #48) — a headless run that
+        // merely replies with text, with no tool use, previously exited 0
+        // and sailed straight through to `mark_completed` below with zero
+        // code changed.
+        let nothing_was_ever_committed = !in_review
+            && owns_claim
+            && item
+                .as_ref()
+                .zip(target_branch.as_ref())
+                .is_none_or(|(item, target)| {
+                    !crate::worktree::branch_diverged(item, &repo_root, target)
+                });
+        // Shared by both "nothing was ever committed" (worktree is clean by
+        // definition, safe to remove) and a real completion: release the
+        // lease so the item is genuinely available again — either for a
+        // fresh claim (nothing done) or because the work is done — instead
+        // of leaving it wedged on a claim nobody will ever release.
+        // `cleanup_worktree` itself still verifies the tree is clean before
+        // removing it, so this is safe even if `nothing_was_ever_committed`
+        // somehow raced with an uncommitted local change.
+        let release_claim_and_cleanup = |item: &Option<agentflare_backend::item::Item>| {
+            if let Some(item) = item {
+                crate::worktree::cleanup_worktree(item, &repo_root);
+            }
+            match self.with_backend_db(|conn| {
+                agentflare_backend::claim::done(conn, &item_id, &owner, now)
+            }) {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => eprintln!(
+                    "worktree: releasing claim for item {item_id} affected no rows (owner mismatch or already released)"
+                ),
+                Ok(Err(e)) => {
+                    eprintln!("worktree: failed to release claim for item {item_id}: {e}")
+                }
+                Err(e) => {
+                    eprintln!("worktree: failed to release claim for item {item_id}: {e:?}")
+                }
+            }
+        };
         let done = if !owns_claim {
+            false
+        } else if nothing_was_ever_committed {
+            release_claim_and_cleanup(&item);
             false
         } else if in_review {
             self.with_backend_db(|conn| {
@@ -647,23 +700,7 @@ impl AgentflareMcp {
                     .map_err(map_backend_err)
             })??;
             if moved {
-                if let Some(item) = &item {
-                    crate::worktree::cleanup_worktree(item, &repo_root);
-                }
-                match self.with_backend_db(|conn| {
-                    agentflare_backend::claim::done(conn, &item_id, &owner, now)
-                }) {
-                    Ok(Ok(true)) => {}
-                    Ok(Ok(false)) => eprintln!(
-                        "worktree: releasing claim for item {item_id} affected no rows (owner mismatch or already released)"
-                    ),
-                    Ok(Err(e)) => {
-                        eprintln!("worktree: failed to release claim for item {item_id}: {e}")
-                    }
-                    Err(e) => {
-                        eprintln!("worktree: failed to release claim for item {item_id}: {e:?}")
-                    }
-                }
+                release_claim_and_cleanup(&item);
             }
             moved
         };
