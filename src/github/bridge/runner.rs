@@ -174,6 +174,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "a:1".to_string(),
         );
         assert!(!should_run(&cfg));
@@ -183,6 +184,7 @@ mod tests {
     fn enabled_config_runs() {
         let cfg = crate::github::bridge::config::BridgeConfig::from_values(
             Some("1"),
+            None,
             None,
             None,
             None,

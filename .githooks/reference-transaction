@@ -1,31 +1,116 @@
 #!/usr/bin/env bash
-# agentflare reference-transaction journal.
+# agentflare reference-transaction journal + branch-protection backstop.
 #
-# Backstop audit trail independent of the git-shim's own interception: this
-# fires for EVERY ref move in this repo, whether git was invoked through
-# the agentflare git shim, bare git, or any other path -- unlike the shim's
-# own audit log (crates/flare-git-core/src/audit.rs), which only sees
-# invocations that actually went through it.
+# Two independent jobs, at two different transaction states:
+#  - "committed": audit-log every ref move (unchanged behavior). Fail-open:
+#    this half cannot block anything.
+#  - "prepared": DENY the transaction if it would advance
+#    refs/heads/<default-branch> to a commit not already reachable from
+#    refs/remotes/origin/<default-branch> -- i.e. block ANY operation
+#    (commit, merge, rebase, reset, cherry-pick, anything) that introduces
+#    work directly onto the default branch's local ref that the remote
+#    doesn't already have. A plain `git fetch` + fast-forward
+#    `git pull`/`git merge --ff-only` stays allowed, since the resulting
+#    oid is exactly what's already on origin -- the check is "is this oid
+#    already on the remote", not "is this a fast-forward" (a fresh local
+#    commit is ALSO a fast-forward from its own parent, so that alone can't
+#    distinguish "syncing from origin" from "new local work").
 #
-# Git invokes this hook once per state ("prepared", "committed", "aborted")
-# with ref-update lines (`<old-oid> <new-oid> <refname>`) on stdin; only
-# "committed" (the transaction that actually succeeded) is logged.
+# This is the general backstop pre-commit/pre-merge-commit/pre-push can't
+# be individually: those gate specific git verbs one at a time, so a verb
+# nobody's added a hook for yet (reset --hard, rebase, cherry-pick, tag -f,
+# branch -f) slips through. This hook fires for EVERY ref move regardless
+# of which git command caused it.
 #
-# Fail-open by design: if the agentflare binary isn't on PATH or errors,
-# the underlying git operation is completely unaffected either way -- this
-# hook cannot block anything, it only observes.
+# Fail-open on ambiguity: if the default branch or origin's tracking ref
+# can't be resolved, the update is allowed rather than blocked -- this
+# check must never be able to brick git entirely.
 #
 # Installed into a project via `agentflare git install-hooks`, same as
 # pre-commit/pre-push/prepare-commit-msg.
 
 state="$1"
 
-if [ "$state" != "committed" ]; then
+resolve_default_branch() {
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if git symbolic-ref refs/remotes/origin/HEAD >/dev/null 2>&1; then
+        git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@'
+        return 0
+    fi
+
+    local cfg
+    cfg="$(git config --get init.defaultBranch 2>/dev/null || true)"
+    if [ -n "$cfg" ]; then
+        echo "$cfg"
+        return 0
+    fi
+
+    for cand in main master; do
+        if git show-ref --verify --quiet "refs/heads/$cand" 2>/dev/null; then
+            echo "$cand"
+            return 0
+        fi
+    done
+
+    echo "master"
+}
+
+if [ "$state" = "committed" ]; then
+    if command -v agentflare >/dev/null 2>&1; then
+        agentflare git ref-transaction-log || true
+    fi
     exit 0
 fi
 
-if command -v agentflare >/dev/null 2>&1; then
-    agentflare git ref-transaction-log || true
+if [ "$state" != "prepared" ]; then
+    exit 0
 fi
+
+default="$(resolve_default_branch)" || exit 0
+[ -n "$default" ] || exit 0
+
+default_ref="refs/heads/$default"
+origin_ref="refs/remotes/origin/$default"
+
+# Fail open if origin's tracking ref can't be resolved at all (no remote,
+# never fetched) -- nothing to compare against, so nothing to safely block.
+if ! git rev-parse --verify --quiet "$origin_ref" >/dev/null 2>&1; then
+    exit 0
+fi
+
+while IFS=' ' read -r old_oid new_oid refname; do
+    [ "$refname" = "$default_ref" ] || continue
+
+    # Deletion (new_oid all-zeros) is never "catching up to remote".
+    if [[ "$new_oid" =~ ^0+$ ]]; then
+        echo "ERROR: refusing to delete the default branch ref '$default_ref'." >&2
+        exit 1
+    fi
+
+    if git merge-base --is-ancestor "$new_oid" "$origin_ref" 2>/dev/null; then
+        continue
+    fi
+
+    cat >&2 <<EOF
+ERROR: refusing to move '$default_ref' to a commit not already on '$origin_ref'.
+
+This blocks ANY operation (commit, merge, rebase, reset, cherry-pick, ...)
+that would introduce work directly onto the default branch's local ref.
+Syncing from the remote (fetch + fast-forward pull/merge) is unaffected.
+
+agentflare enforces branch isolation: create an isolated worktree or feature
+branch first, e.g.
+    git worktree add ../<repo>-<topic> -b <topic>
+    # or, in-session:
+    git checkout -b <topic>
+
+Then commit there and open a PR. To override in an emergency (not recommended):
+    git -c core.hooksPath= <command>
+EOF
+    exit 1
+done
 
 exit 0

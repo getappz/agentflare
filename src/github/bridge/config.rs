@@ -14,6 +14,242 @@ pub const MIN_INTERVAL_SECS: u64 = 15;
 const DEFAULT_MAX_CLAIMS: usize = 3;
 const DEFAULT_QUEUE_LABEL: &str = "agentflare";
 
+/// `repo`/`queue_label` overrides read from `.agentflare/config.toml`'s
+/// `[bridge]` table. Deliberately narrower than `BridgeConfig`: the
+/// standalone daemon (`runner::resolve_repo`) has no reliable cwd (neither
+/// the launchd plist nor the systemd unit sets one), so it can't consume a
+/// project-local file -- only CLI/MCP call sites that run from inside a
+/// real repo (e.g. `handoff`'s `recipient="github"` path, `agentflare
+/// github-bridge`) do. `enabled`/`interval_secs`/`max_claims` aren't read
+/// from here for the same reason: nothing in this project-scoped path
+/// claims issues, so those knobs would have no consumer.
+#[derive(Debug, Default, Clone)]
+struct ProjectBridgeSettings {
+    repo: Option<String>,
+    queue_label: Option<String>,
+}
+
+fn bridge_table(doc: &toml::Value) -> Option<&toml::value::Table> {
+    doc.get("bridge")?.as_table()
+}
+
+/// Project-local layer wins over user-home on a per-key basis (same
+/// precedence flare_git_core's other config consumers use). A malformed
+/// file falls back to defaults rather than failing the caller -- this is a
+/// convenience override, not a hard requirement.
+fn read_project_bridge_settings(repo_root: &Path) -> ProjectBridgeSettings {
+    let Ok(layers) =
+        flare_git_core::config_loader::locate_and_parse(repo_root, Some(&crate::paths::home()))
+    else {
+        return ProjectBridgeSettings::default();
+    };
+    let mut out = ProjectBridgeSettings::default();
+    for doc in [
+        layers.user_home.as_ref().map(|(_, v)| v),
+        layers.project_local.as_ref().map(|(_, v)| v),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some(bridge) = bridge_table(doc) else {
+            continue;
+        };
+        if let Some(v) = bridge.get("repo").and_then(|v| v.as_str()) {
+            out.repo = Some(v.to_string());
+        }
+        if let Some(v) = bridge.get("queue_label").and_then(|v| v.as_str()) {
+            out.queue_label = Some(v.to_string());
+        }
+    }
+    out
+}
+
+/// `AGENTFLARE_BRIDGE_REPO`, else `.agentflare/config.toml`'s
+/// `[bridge].repo`, else `repo_root`'s `origin` remote.
+///
+/// An explicit override (env var or project file) that fails to parse as
+/// `owner/repo` is an `Err`, not a silent fall-through to `origin` — a typo'd
+/// override that quietly published to the wrong repo is worse than a loud
+/// failure. Only the absence of any override falls back to `origin`, which
+/// is why that last step alone stays `Option`-shaped.
+pub fn resolve_project_repo(repo_root: &Path) -> Result<Option<crate::github::RepoId>, String> {
+    if let Some(explicit) = std::env::var("AGENTFLARE_BRIDGE_REPO")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return crate::github::RepoId::parse(explicit.trim())
+            .map(Some)
+            .ok_or_else(|| {
+                format!("AGENTFLARE_BRIDGE_REPO={explicit:?} is not a valid owner/repo")
+            });
+    }
+    if let Some(repo_str) = read_project_bridge_settings(repo_root).repo {
+        return crate::github::RepoId::parse(repo_str.trim())
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "[bridge].repo = {repo_str:?} in .agentflare/config.toml is not a valid owner/repo"
+                )
+            });
+    }
+    Ok(crate::github::RepoId::resolve_from_remote(repo_root))
+}
+
+/// Same resolution the standalone daemon (`bridge::runner::resolve_repo`)
+/// uses: `AGENTFLARE_BRIDGE_REPO`, else `repo_root`'s `origin` remote.
+/// Deliberately excludes the project-local `.agentflare/config.toml`
+/// override `resolve_project_repo` also consults -- the daemon has no
+/// reliable cwd (see the module doc), so it can never read that file.
+/// Exposed so a CLI/MCP call site that resolves via the project file can
+/// tell whether a locally-running daemon would actually watch the same repo.
+pub fn resolve_daemon_repo(repo_root: &Path) -> Option<crate::github::RepoId> {
+    if let Some(explicit) = std::env::var("AGENTFLARE_BRIDGE_REPO")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return crate::github::RepoId::parse(explicit.trim());
+    }
+    crate::github::RepoId::resolve_from_remote(repo_root)
+}
+
+/// Whether `AGENTFLARE_BRIDGE_ENABLED` would let a daemon started on this
+/// workstation actually poll -- the same truthiness check `BridgeConfig`
+/// applies, exposed standalone so a caller can decide whether comparing
+/// against [`resolve_daemon_repo`] is even meaningful.
+pub fn daemon_enabled() -> bool {
+    std::env::var("AGENTFLARE_BRIDGE_ENABLED").is_ok_and(|v| truthy(&v))
+}
+
+/// `AGENTFLARE_BRIDGE_QUEUE_LABEL`, else `.agentflare/config.toml`'s
+/// `[bridge].queue_label`, else `DEFAULT_QUEUE_LABEL`. Every source is
+/// trimmed and an empty/whitespace-only result is treated as absent, so a
+/// stray blank value falls through to the next source instead of becoming
+/// the effective (and unusable) label.
+pub fn resolve_project_queue_label(repo_root: &Path) -> String {
+    std::env::var("AGENTFLARE_BRIDGE_QUEUE_LABEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            read_project_bridge_settings(repo_root)
+                .queue_label
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_QUEUE_LABEL.to_string())
+}
+
+/// Opens (creating if absent) `.agentflare/config.toml.lock` next to the
+/// config file and takes an exclusive advisory lock on it, blocking until
+/// acquired. Held for the caller's whole read-modify-write section so two
+/// concurrent `github-bridge set`/`unset` processes serialize instead of
+/// racing to overwrite each other's change. The lock is released when the
+/// returned file is dropped.
+fn lock_project_config(repo_root: &Path) -> Result<std::fs::File, String> {
+    let dir = repo_root.join(".agentflare");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let lock_path = dir.join("config.toml.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("{}: {e}", lock_path.display()))?;
+    fs2::FileExt::lock_exclusive(&file).map_err(|e| format!("{}: {e}", lock_path.display()))?;
+    Ok(file)
+}
+
+/// Writes `doc` to `path` via a same-directory temp file + rename, so a
+/// process that dies mid-write leaves the original file intact rather than
+/// truncated -- `rename` is atomic on both POSIX and Windows when source and
+/// destination share a filesystem, which a sibling temp file guarantees.
+fn atomic_write_toml(path: &Path, doc: &toml::Value) -> Result<(), String> {
+    let tmp_path = path.with_file_name(format!("config.toml.{}.tmp", std::process::id()));
+    std::fs::write(
+        &tmp_path,
+        toml::to_string_pretty(doc).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Merges `repo`/`queue_label` into `.agentflare/config.toml`'s `[bridge]`
+/// table (creating the file and directory if needed), leaving any other
+/// top-level table (e.g. `[git_shim]`) untouched. Comments are not
+/// preserved -- `toml::Value` isn't a comment-preserving representation,
+/// same tradeoff `components::merge_json` already accepts for the JSON
+/// config files agentflare merges elsewhere.
+///
+/// The whole read-modify-write happens under [`lock_project_config`] and the
+/// result lands via [`atomic_write_toml`], so two `github-bridge set`
+/// processes racing on the same file serialize instead of one silently
+/// clobbering the other's change, and a crash mid-write can't leave the file
+/// truncated.
+pub fn write_project_bridge_settings(
+    repo_root: &Path,
+    repo: Option<&str>,
+    queue_label: Option<&str>,
+) -> Result<PathBuf, String> {
+    let _lock = lock_project_config(repo_root)?;
+    let path = repo_root.join(".agentflare").join("config.toml");
+    let mut doc: toml::Value = match std::fs::read_to_string(&path) {
+        Ok(s) => s.parse().map_err(|e| format!("{}: {e}", path.display()))?,
+        // Only an absent file means "start from an empty document" -- any
+        // other read failure (permissions, the path being a directory, a
+        // transient I/O error) must not be treated the same way, or this
+        // would silently overwrite an existing, merely-unreadable config
+        // file with one containing only the [bridge] table just written.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(toml::value::Table::new())
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let table = doc
+        .as_table_mut()
+        .ok_or_else(|| format!("{}: top-level value is not a table", path.display()))?;
+    let bridge = table
+        .entry("bridge")
+        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| format!("{}: [bridge] is not a table", path.display()))?;
+    if let Some(r) = repo {
+        bridge.insert("repo".to_string(), toml::Value::String(r.to_string()));
+    }
+    if let Some(l) = queue_label {
+        bridge.insert(
+            "queue_label".to_string(),
+            toml::Value::String(l.to_string()),
+        );
+    }
+    atomic_write_toml(&path, &doc)?;
+    Ok(path)
+}
+
+/// Removes the `[bridge]` table entirely from `.agentflare/config.toml`,
+/// falling resolution back to env vars / origin remote / defaults. A noop
+/// (not an error) when the file or table doesn't exist. Same locking +
+/// atomic-replace treatment as [`write_project_bridge_settings`].
+pub fn clear_project_bridge_settings(repo_root: &Path) -> Result<PathBuf, String> {
+    let _lock = lock_project_config(repo_root)?;
+    let path = repo_root.join(".agentflare").join("config.toml");
+    // Only an absent file is a true noop -- any other read failure must
+    // surface as an error rather than falsely reporting "cleared" when
+    // nothing was actually read or changed.
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let mut doc: toml::Value = content
+        .parse()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(table) = doc.as_table_mut() {
+        table.remove("bridge");
+    }
+    atomic_write_toml(&path, &doc)?;
+    Ok(path)
+}
+
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
     pub enabled: bool,
@@ -26,6 +262,15 @@ pub struct BridgeConfig {
     pub max_claims: usize,
     pub ttl_secs: i64,
     pub queue_label: String,
+    /// Agent to dispatch for issues this instance claims, e.g. `claude-code`
+    /// -- must match an `agent_registry::Agent` id exactly
+    /// (`supervisor::resolve_confirmed_agent`), same as `handoff`'s
+    /// recipient. `None` (the default) means claimed items are never
+    /// labeled `ready-for-work`: nothing dispatches, same as before this
+    /// field existed. Deliberately not auto-detected -- which of several
+    /// installed agents should work claimed issues is a choice, not
+    /// something to guess.
+    pub work_agent: Option<String>,
     pub instance_id: String,
 }
 
@@ -256,6 +501,7 @@ impl BridgeConfig {
             get("AGENTFLARE_BRIDGE_INTERVAL_SECS").as_deref(),
             get("AGENTFLARE_BRIDGE_MAX_CLAIMS").as_deref(),
             get("AGENTFLARE_BRIDGE_QUEUE_LABEL").as_deref(),
+            get("AGENTFLARE_BRIDGE_WORK_AGENT").as_deref(),
             instance,
         )
     }
@@ -267,6 +513,7 @@ impl BridgeConfig {
         interval: Option<&str>,
         max_claims: Option<&str>,
         queue_label: Option<&str>,
+        work_agent: Option<&str>,
         instance_id: String,
     ) -> BridgeConfig {
         BridgeConfig {
@@ -281,6 +528,10 @@ impl BridgeConfig {
             // Reuses the EXISTING claim TTL so marker liveness and the local
             // ledger expire on one schedule.
             ttl_secs: crate::claims::ttl_secs(),
+            work_agent: work_agent
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             queue_label: queue_label
                 .filter(|s| !s.is_empty())
                 .unwrap_or(DEFAULT_QUEUE_LABEL)
@@ -296,12 +547,13 @@ mod tests {
 
     #[test]
     fn defaults_are_off_and_conservative() {
-        let c = BridgeConfig::from_values(None, None, None, None, "agent:1".to_string());
+        let c = BridgeConfig::from_values(None, None, None, None, None, "agent:1".to_string());
         assert!(!c.enabled, "bridge must be opt-in");
         assert_eq!(c.interval_secs, 60);
         assert_eq!(c.max_claims, 3);
         assert_eq!(c.queue_label, "agentflare");
         assert_eq!(c.instance_id, "agent:1");
+        assert_eq!(c.work_agent, None, "no dispatch until opted in");
     }
 
     #[test]
@@ -311,24 +563,260 @@ mod tests {
             Some("15"),
             Some("7"),
             Some("queue"),
+            Some("claude-code"),
             "agent:1".to_string(),
         );
         assert!(c.enabled);
         assert_eq!(c.interval_secs, 15);
         assert_eq!(c.max_claims, 7);
         assert_eq!(c.queue_label, "queue");
+        assert_eq!(c.work_agent.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn work_agent_blank_or_whitespace_only_is_none() {
+        for v in ["", "   "] {
+            let c = BridgeConfig::from_values(None, None, None, None, Some(v), "a".to_string());
+            assert_eq!(c.work_agent, None, "{v:?} should not set a work agent");
+        }
     }
 
     #[test]
     fn enabled_accepts_common_truthy_spellings() {
         for v in ["1", "true", "TRUE", "yes"] {
-            let c = BridgeConfig::from_values(Some(v), None, None, None, "a".to_string());
+            let c = BridgeConfig::from_values(Some(v), None, None, None, None, "a".to_string());
             assert!(c.enabled, "{v} should enable");
         }
         for v in ["0", "false", "no", "", "banana"] {
-            let c = BridgeConfig::from_values(Some(v), None, None, None, "a".to_string());
+            let c = BridgeConfig::from_values(Some(v), None, None, None, None, "a".to_string());
             assert!(!c.enabled, "{v} should not enable");
         }
+    }
+
+    #[test]
+    fn resolve_project_repo_prefers_env_then_project_file_then_origin_remote() {
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("AGENTFLARE_BRIDGE_REPO");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        flare_git_core::shell::run_in(dir.path(), &["init", "-q"]).unwrap();
+        flare_git_core::shell::run_in(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:origin-owner/origin-repo.git",
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_project_repo(dir.path())
+                .unwrap()
+                .map(|r| r.to_string()),
+            Some("origin-owner/origin-repo".to_string())
+        );
+
+        write_project_bridge_settings(dir.path(), Some("file-owner/file-repo"), None).unwrap();
+        assert_eq!(
+            resolve_project_repo(dir.path())
+                .unwrap()
+                .map(|r| r.to_string()),
+            Some("file-owner/file-repo".to_string())
+        );
+
+        unsafe {
+            std::env::set_var("AGENTFLARE_BRIDGE_REPO", "env-owner/env-repo");
+        }
+        assert_eq!(
+            resolve_project_repo(dir.path())
+                .unwrap()
+                .map(|r| r.to_string()),
+            Some("env-owner/env-repo".to_string())
+        );
+        unsafe {
+            std::env::remove_var("AGENTFLARE_BRIDGE_REPO");
+        }
+    }
+
+    #[test]
+    fn resolve_project_repo_rejects_an_invalid_explicit_override_instead_of_falling_through() {
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("AGENTFLARE_BRIDGE_REPO");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        flare_git_core::shell::run_in(dir.path(), &["init", "-q"]).unwrap();
+        flare_git_core::shell::run_in(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:origin-owner/origin-repo.git",
+            ],
+        )
+        .unwrap();
+
+        // A malformed project-file override must error, not silently fall
+        // through to origin — a typo should not go unnoticed and quietly
+        // publish somewhere else.
+        write_project_bridge_settings(dir.path(), Some("not-a-valid-repo"), None).unwrap();
+        let err = resolve_project_repo(dir.path()).unwrap_err();
+        assert!(err.contains("not-a-valid-repo"), "{err}");
+
+        clear_project_bridge_settings(dir.path()).unwrap();
+
+        // Same for an explicit env override.
+        unsafe {
+            std::env::set_var("AGENTFLARE_BRIDGE_REPO", "also-not-valid");
+        }
+        let err = resolve_project_repo(dir.path()).unwrap_err();
+        assert!(err.contains("also-not-valid"), "{err}");
+        unsafe {
+            std::env::remove_var("AGENTFLARE_BRIDGE_REPO");
+        }
+    }
+
+    #[test]
+    fn resolve_project_queue_label_falls_back_through_env_file_default() {
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("AGENTFLARE_BRIDGE_QUEUE_LABEL");
+        }
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(resolve_project_queue_label(dir.path()), "agentflare");
+
+        write_project_bridge_settings(dir.path(), None, Some("custom-label")).unwrap();
+        assert_eq!(resolve_project_queue_label(dir.path()), "custom-label");
+
+        unsafe {
+            std::env::set_var("AGENTFLARE_BRIDGE_QUEUE_LABEL", "env-label");
+        }
+        assert_eq!(resolve_project_queue_label(dir.path()), "env-label");
+        unsafe {
+            std::env::remove_var("AGENTFLARE_BRIDGE_QUEUE_LABEL");
+        }
+    }
+
+    #[test]
+    fn resolve_project_queue_label_trims_and_ignores_whitespace_only_overrides() {
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("AGENTFLARE_BRIDGE_QUEUE_LABEL");
+        }
+        let dir = tempfile::tempdir().unwrap();
+
+        // A whitespace-only project-file value must not become the effective
+        // label -- fall through to the default instead.
+        write_project_bridge_settings(dir.path(), None, Some("   ")).unwrap();
+        assert_eq!(resolve_project_queue_label(dir.path()), "agentflare");
+
+        // A padded value must come back trimmed.
+        write_project_bridge_settings(dir.path(), None, Some("  padded-label  ")).unwrap();
+        assert_eq!(resolve_project_queue_label(dir.path()), "padded-label");
+
+        unsafe {
+            std::env::set_var("AGENTFLARE_BRIDGE_QUEUE_LABEL", "   ");
+        }
+        assert_eq!(
+            resolve_project_queue_label(dir.path()),
+            "padded-label",
+            "a whitespace-only env override must fall through to the project file"
+        );
+        unsafe {
+            std::env::set_var("AGENTFLARE_BRIDGE_QUEUE_LABEL", "  env-padded  ");
+        }
+        assert_eq!(resolve_project_queue_label(dir.path()), "env-padded");
+        unsafe {
+            std::env::remove_var("AGENTFLARE_BRIDGE_QUEUE_LABEL");
+        }
+    }
+
+    #[test]
+    fn write_project_bridge_settings_preserves_other_top_level_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".agentflare")).unwrap();
+        std::fs::write(
+            dir.path().join(".agentflare").join("config.toml"),
+            "[git_shim]\nextra_trust_root_paths = [\"x\"]\n",
+        )
+        .unwrap();
+
+        write_project_bridge_settings(dir.path(), Some("o/r"), None).unwrap();
+
+        let content =
+            std::fs::read_to_string(dir.path().join(".agentflare").join("config.toml")).unwrap();
+        let parsed: toml::Value = content.parse().unwrap();
+        assert_eq!(
+            parsed
+                .get("git_shim")
+                .and_then(|g| g.get("extra_trust_root_paths")),
+            Some(&toml::Value::Array(vec![toml::Value::String("x".into())]))
+        );
+        assert_eq!(
+            parsed
+                .get("bridge")
+                .and_then(|b| b.get("repo"))
+                .and_then(|v| v.as_str()),
+            Some("o/r")
+        );
+    }
+
+    #[test]
+    fn clear_project_bridge_settings_removes_only_the_bridge_table() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project_bridge_settings(dir.path(), Some("o/r"), Some("l")).unwrap();
+        let mut content =
+            std::fs::read_to_string(dir.path().join(".agentflare").join("config.toml")).unwrap();
+        content.push_str("\n[git_shim]\nextra_trust_root_paths = [\"x\"]\n");
+        std::fs::write(dir.path().join(".agentflare").join("config.toml"), content).unwrap();
+
+        clear_project_bridge_settings(dir.path()).unwrap();
+
+        let content =
+            std::fs::read_to_string(dir.path().join(".agentflare").join("config.toml")).unwrap();
+        let parsed: toml::Value = content.parse().unwrap();
+        assert!(parsed.get("bridge").is_none());
+        assert!(parsed.get("git_shim").is_some());
+    }
+
+    #[test]
+    fn write_project_bridge_settings_errors_rather_than_silently_starting_fresh_on_a_real_read_failure()
+     {
+        // A directory sitting where the config file is expected makes
+        // `read_to_string` fail with something other than `NotFound` on
+        // every platform -- must surface as an error, not be treated the
+        // same as "file absent" and have its (unreadable) content silently
+        // replaced by a document containing only the [bridge] table.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".agentflare").join("config.toml")).unwrap();
+
+        let err = write_project_bridge_settings(dir.path(), Some("o/r"), None).unwrap_err();
+        assert!(err.contains("config.toml"), "{err}");
+    }
+
+    #[test]
+    fn clear_project_bridge_settings_errors_rather_than_silently_reporting_cleared_on_a_real_read_failure()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".agentflare").join("config.toml")).unwrap();
+
+        let err = clear_project_bridge_settings(dir.path()).unwrap_err();
+        assert!(err.contains("config.toml"), "{err}");
     }
 
     #[test]
@@ -338,6 +826,7 @@ mod tests {
             Some("not-a-number"),
             Some(""),
             None,
+            None,
             "a".to_string(),
         );
         assert_eq!(c.interval_secs, 60);
@@ -346,7 +835,7 @@ mod tests {
 
     #[test]
     fn interval_has_a_floor_so_a_typo_cannot_hammer_github() {
-        let c = BridgeConfig::from_values(Some("1"), Some("0"), None, None, "a".to_string());
+        let c = BridgeConfig::from_values(Some("1"), Some("0"), None, None, None, "a".to_string());
         assert_eq!(c.interval_secs, MIN_INTERVAL_SECS);
     }
 
@@ -550,7 +1039,7 @@ mod tests {
 
     #[test]
     fn max_claims_zero_is_legal_drain_mode_not_a_floor_violation() {
-        let c = BridgeConfig::from_values(Some("1"), None, Some("0"), None, "a".to_string());
+        let c = BridgeConfig::from_values(Some("1"), None, Some("0"), None, None, "a".to_string());
         assert_eq!(
             c.max_claims, 0,
             "0 must pass through unfloored: it means drain mode (stop claiming \

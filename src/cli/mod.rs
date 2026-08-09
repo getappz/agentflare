@@ -13,6 +13,7 @@ mod docs;
 mod doctor;
 mod gateway;
 pub(crate) mod git;
+mod github_bridge;
 mod handoff;
 mod hook;
 mod init;
@@ -69,6 +70,7 @@ pub enum Commands {
     Auth(auth::AuthArgs),
     Artifacts(artifacts::ArtifactsArgs),
     Handoff(handoff::HandoffArgs),
+    GithubBridge(github_bridge::GithubBridgeArgs),
     #[command(alias = "flare", visible_alias = "opt")]
     Optimize(optimize::OptimizeArgs),
     #[command(visible_alias = "logo")]
@@ -107,6 +109,7 @@ impl Commands {
             Self::Auth(cmd) => cmd.run(),
             Self::Artifacts(cmd) => cmd.run(),
             Self::Handoff(cmd) => cmd.run(),
+            Self::GithubBridge(cmd) => cmd.run(),
             Self::Optimize(cmd) => cmd.run(),
             Self::About(cmd) => crate::about::run(cmd),
             Self::Channel(cmd) => cmd.run(),

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# agentflare branch-protection guard (pre-merge-commit).
+#
+# `pre-commit` alone does NOT fire for a merge that creates a merge commit
+# (`pre-merge-commit` is git's separate, dedicated hook for that -- see
+# githooks(5)); without this, `git merge --no-ff <branch>` while checked out
+# on the default branch bypasses pre-commit's guard entirely, which is
+# functionally the same as a direct commit to it. Delegates to pre-commit
+# rather than duplicating its logic -- one source of truth for what "direct
+# commit to the default branch" means, whether it's a plain commit or a
+# merge commit.
+exec "$(dirname "$0")/pre-commit"

@@ -8,6 +8,7 @@ FROZEN_LIMIT=2000
 ALLOWLIST=(
   src/mcp_server.rs
   crates/agentflare-backend/src/item.rs
+  src/components.rs
 )
 
 cd "$(dirname "$0")/.."

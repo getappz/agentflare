@@ -1,6 +1,8 @@
 //! Git Contents/Refs API — just enough to read and write one file on a named
-//! branch, creating that branch from the repo's default branch if it doesn't
-//! exist yet. Backs `memory::sync`; not a general git client.
+//! branch, creating that branch as an orphan commit (empty tree, no parent)
+//! if it doesn't exist yet — the branch carries only what's written onto it
+//! via `put_file`, not a snapshot of the whole repo. Backs `memory::sync`;
+//! not a general git client.
 
 use crate::github::{Client, GitHubError, RepoId};
 use base64::Engine as _;
@@ -105,9 +107,12 @@ pub fn put_file(
         .ok_or_else(|| GitHubError::Parse("put response missing content.sha".to_string()))
 }
 
-/// Makes sure `branch` exists, branching it off the repo's default branch if
-/// not. The Contents API commits onto an existing branch ref only — it does
-/// not create one implicitly.
+/// Makes sure `branch` exists, creating it as an orphan branch (a root
+/// commit over an empty tree, no parent) if not — so it starts out
+/// containing nothing rather than a copy of the whole repo, since `put_file`
+/// never removes what a branch inherited from wherever it was cut from. The
+/// Contents API commits onto an existing branch ref only — it does not
+/// create one implicitly.
 pub fn ensure_branch(client: &Client, repo: &RepoId, branch: &str) -> Result<(), GitHubError> {
     let ref_path = format!(
         "/repos/{}/{}/git/ref/heads/{}",
@@ -118,28 +123,36 @@ pub fn ensure_branch(client: &Client, repo: &RepoId, branch: &str) -> Result<(),
     match client.request("GET", &ref_path, None) {
         Ok(_) => Ok(()),
         Err(GitHubError::NotFound) => {
-            let default_branch = super::repos::get_default_branch(client, repo)?;
-            let default_ref_path = format!(
-                "/repos/{}/{}/git/ref/heads/{}",
-                repo.owner,
-                repo.repo,
-                crate::github::encode_query(&default_branch)
-            );
-            let default_ref = client.request("GET", &default_ref_path, None)?;
-            let sha = default_ref
-                .get("object")
-                .and_then(|o| o.get("sha"))
+            let tree_path = format!("/repos/{}/{}/git/trees", repo.owner, repo.repo);
+            let tree =
+                client.request("POST", &tree_path, Some(serde_json::json!({ "tree": [] })))?;
+            let tree_sha = tree
+                .get("sha")
                 .and_then(|s| s.as_str())
-                .ok_or_else(|| {
-                    GitHubError::Parse("default branch ref missing object.sha".to_string())
-                })?;
+                .ok_or_else(|| GitHubError::Parse("tree response missing sha".to_string()))?;
+
+            let commit_path = format!("/repos/{}/{}/git/commits", repo.owner, repo.repo);
+            let commit = client.request(
+                "POST",
+                &commit_path,
+                Some(serde_json::json!({
+                    "message": format!("chore: init {branch} (orphan)"),
+                    "tree": tree_sha,
+                    "parents": Vec::<String>::new(),
+                })),
+            )?;
+            let commit_sha = commit
+                .get("sha")
+                .and_then(|s| s.as_str())
+                .ok_or_else(|| GitHubError::Parse("commit response missing sha".to_string()))?;
+
             let create_path = format!("/repos/{}/{}/git/refs", repo.owner, repo.repo);
             let create_result = client.request(
                 "POST",
                 &create_path,
                 Some(serde_json::json!({
                     "ref": format!("refs/heads/{branch}"),
-                    "sha": sha,
+                    "sha": commit_sha,
                 })),
             );
             // 422 here almost always means another sync run won the race and
@@ -244,11 +257,11 @@ mod tests {
     }
 
     #[test]
-    fn ensure_branch_creates_from_default_branch_when_missing() {
+    fn ensure_branch_creates_an_orphan_commit_when_missing() {
         let server = MockServer::start(vec![
             MockResponse::json(404, r#"{"message":"Not Found"}"#),
-            MockResponse::json(200, r#"{"default_branch":"main"}"#),
-            MockResponse::json(200, r#"{"object":{"sha":"tip123"}}"#),
+            MockResponse::json(201, r#"{"sha":"emptytree"}"#),
+            MockResponse::json(201, r#"{"sha":"orphancommit"}"#),
             MockResponse::json(201, r#"{"ref":"refs/heads/agentflare-memory"}"#),
         ]);
         let client = server.client(Some("tok"));
@@ -256,13 +269,23 @@ mod tests {
 
         let reqs = server.requests();
         assert_eq!(reqs[0].path, "/repos/o/r/git/ref/heads/agentflare-memory");
-        assert_eq!(reqs[1].path, "/repos/o/r");
-        assert_eq!(reqs[2].path, "/repos/o/r/git/ref/heads/main");
+
+        assert_eq!(reqs[1].method, "POST");
+        assert_eq!(reqs[1].path, "/repos/o/r/git/trees");
+        let tree_sent: serde_json::Value = serde_json::from_str(&reqs[1].body).unwrap();
+        assert_eq!(tree_sent["tree"], serde_json::json!([]));
+
+        assert_eq!(reqs[2].method, "POST");
+        assert_eq!(reqs[2].path, "/repos/o/r/git/commits");
+        let commit_sent: serde_json::Value = serde_json::from_str(&reqs[2].body).unwrap();
+        assert_eq!(commit_sent["tree"], "emptytree");
+        assert_eq!(commit_sent["parents"], serde_json::json!([]));
+
         assert_eq!(reqs[3].method, "POST");
         assert_eq!(reqs[3].path, "/repos/o/r/git/refs");
         let sent: serde_json::Value = serde_json::from_str(&reqs[3].body).unwrap();
         assert_eq!(sent["ref"], "refs/heads/agentflare-memory");
-        assert_eq!(sent["sha"], "tip123");
+        assert_eq!(sent["sha"], "orphancommit");
     }
 
     #[test]
@@ -285,8 +308,8 @@ mod tests {
     fn ensure_branch_treats_a_concurrent_create_422_as_success_when_the_branch_now_exists() {
         let server = MockServer::start(vec![
             MockResponse::json(404, r#"{"message":"Not Found"}"#),
-            MockResponse::json(200, r#"{"default_branch":"main"}"#),
-            MockResponse::json(200, r#"{"object":{"sha":"tip123"}}"#),
+            MockResponse::json(201, r#"{"sha":"emptytree"}"#),
+            MockResponse::json(201, r#"{"sha":"orphancommit"}"#),
             MockResponse::json(422, r#"{"message":"Reference already exists"}"#),
             MockResponse::json(200, r#"{"object":{"sha":"tip123"}}"#),
         ]);
@@ -304,8 +327,8 @@ mod tests {
     fn ensure_branch_propagates_a_422_when_the_branch_still_does_not_exist() {
         let server = MockServer::start(vec![
             MockResponse::json(404, r#"{"message":"Not Found"}"#),
-            MockResponse::json(200, r#"{"default_branch":"main"}"#),
-            MockResponse::json(200, r#"{"object":{"sha":"tip123"}}"#),
+            MockResponse::json(201, r#"{"sha":"emptytree"}"#),
+            MockResponse::json(201, r#"{"sha":"orphancommit"}"#),
             MockResponse::json(422, r#"{"message":"Validation Failed"}"#),
             MockResponse::json(404, r#"{"message":"Not Found"}"#),
         ]);

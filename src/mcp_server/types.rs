@@ -469,7 +469,7 @@ pub(crate) struct FlareDocsRequest {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GitHubRequest {
     #[schemars(
-        description = "Action: pr_create|pr_list|pr_get|pr_status|pr_wait|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|release_list|release_get|release_latest|release_create|run_list|run_get|run_rerun|workflow_dispatch"
+        description = "Action: pr_create|pr_list|pr_get|pr_status|pr_wait|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|bridge_queue_status|release_list|release_get|release_latest|release_create|run_list|run_get|run_rerun|workflow_dispatch"
     )]
     pub(crate) action: String,
     #[schemars(description = "owner/repo (default: resolved from the current repo's origin)")]
