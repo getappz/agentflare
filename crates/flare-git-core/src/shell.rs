@@ -98,13 +98,28 @@ pub(crate) fn git_binary() -> PathBuf {
         .clone()
 }
 
+/// This crate's git spawns run inside the agentflare daemon far more than
+/// any other one -- `resolve_project()` calls `run_in`-backed `repo_toplevel`
+/// on essentially every project/item MCP call. The daemon itself is
+/// console-less, so without this flag every one of those spawns
+/// auto-allocates a console window on Windows, flashing briefly.
+#[cfg(windows)]
+fn no_console_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+#[cfg(not(windows))]
+fn no_console_window(_cmd: &mut Command) {}
+
 /// Runs `git` in `repo_root`; `Ok(stdout)` trimmed on success, `Err(stderr)`
 /// trimmed on a non-zero exit, or a process-spawn error message (git
 /// missing, etc) if it couldn't even run.
 pub fn run_in(repo_root: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(git_binary())
-        .args(args)
-        .current_dir(repo_root)
+    let mut cmd = Command::new(git_binary());
+    cmd.args(args).current_dir(repo_root);
+    no_console_window(&mut cmd);
+    let out = cmd
         .output()
         .map_err(|e| format!("git not available: {e}"))?;
     if !out.status.success() {
@@ -132,11 +147,11 @@ pub fn run_in_ok(repo_root: &Path, args: &[&str]) -> bool {
 /// the rest of this module's helpers return.
 pub fn diff(repo_root: &Path, base: &str, head: &str) -> Result<String, String> {
     let range = format!("{base}...{head}");
-    let out = Command::new(git_binary())
-        .args(["diff", "--unified=3", &range])
-        .current_dir(repo_root)
-        .output()
-        .map_err(|e| format!("git diff failed: {e}"))?;
+    let mut cmd = Command::new(git_binary());
+    cmd.args(["diff", "--unified=3", &range])
+        .current_dir(repo_root);
+    no_console_window(&mut cmd);
+    let out = cmd.output().map_err(|e| format!("git diff failed: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "git diff {range}: {}",

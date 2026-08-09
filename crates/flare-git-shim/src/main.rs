@@ -184,10 +184,19 @@ struct ScopeCheckResult {
 /// the escape hatch for a broken/missing `agentflare` binary, same as any
 /// other misclassification.
 fn scope_check_deny_reason(subcommand: &str) -> Option<String> {
-    let output = match std::process::Command::new("agentflare")
-        .args(["git", "scope-check", "--subcommand", subcommand])
-        .output()
+    let mut cmd = std::process::Command::new("agentflare");
+    cmd.args(["git", "scope-check", "--subcommand", subcommand]);
+    // Runs on every git invocation through this shim; without this flag,
+    // whenever the invoking parent has no inherited console (e.g. spawned by
+    // an IDE/editor extension), Windows auto-allocates one for this child —
+    // visible as a brief flashing terminal window.
+    #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = match cmd.output() {
         Ok(o) => o,
         Err(e) => {
             return Some(format!(

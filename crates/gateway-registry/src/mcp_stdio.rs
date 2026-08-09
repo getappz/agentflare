@@ -100,6 +100,15 @@ impl McpStdioBackend {
                     // timeout actually terminates the hung child, not just our
                     // side of the connection.
                     cmd.kill_on_drop(true);
+                    // This process (the agentflare daemon) is itself console-less;
+                    // any console-subsystem backend spawned without this flag gets
+                    // a console window auto-allocated by Windows, which flashes
+                    // briefly on screen on every circuit-breaker/timeout respawn.
+                    #[cfg(windows)]
+                    {
+                        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                        cmd.creation_flags(CREATE_NO_WINDOW);
+                    }
                 }),
             )
             .map_err(|e| {

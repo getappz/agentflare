@@ -541,12 +541,32 @@ impl AgentflareMcp {
     /// across multiple linked projects depending on which subdirectory a
     /// tool was invoked from. Falls back to raw cwd only when nothing is
     /// found anywhere above it.
+    ///
+    /// Memoized per-cwd: every project/item MCP call runs this, and in the
+    /// long-running daemon that meant a fresh `git rev-parse` subprocess on
+    /// essentially every call. Keyed by cwd rather than a single cached
+    /// value because `cli::work::execute_work` calls `set_current_dir` to
+    /// switch into an item's worktree for in-process work-item execution —
+    /// a single-value cache would freeze on whatever cwd resolved first and
+    /// silently break resolution for every worktree after that. A distinct
+    /// cwd is always a fresh lookup; a repeated cwd is a cache hit.
     pub(crate) fn repo_root() -> std::path::PathBuf {
         let cwd = std::env::current_dir().unwrap_or_default();
-        if let Some(root) = flare_git_core::branch::repo_toplevel(&cwd) {
-            return root;
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>>,
+        > = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        if let Ok(guard) = cache.lock()
+            && let Some(root) = guard.get(&cwd)
+        {
+            return root.clone();
         }
-        Self::find_root_from(&cwd, &crate::paths::home())
+        let root = flare_git_core::branch::repo_toplevel(&cwd)
+            .unwrap_or_else(|| Self::find_root_from(&cwd, &crate::paths::home()));
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(cwd, root.clone());
+        }
+        root
     }
 
     /// `repo_root()`, but honoring `worktree_repo_root_override` — used only

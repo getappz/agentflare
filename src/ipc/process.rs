@@ -1,10 +1,14 @@
 use std::time::Duration;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 pub fn is_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
         let status = std::process::Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .output();
         match status {
             Ok(o) => {
@@ -26,7 +30,6 @@ pub fn is_alive(pid: u32) -> bool {
 pub fn spawn_detached(binary: &str, args: &[&str]) -> Result<u32, String> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         let mut cmd = std::process::Command::new(binary);
         cmd.args(args);
         cmd.creation_flags(
@@ -54,6 +57,7 @@ pub fn terminate_gracefully(pid: u32) -> Result<(), String> {
     {
         let status = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string()])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .status()
             .map_err(|e| format!("taskkill: {e}"))?;
         if status.success() {
@@ -81,6 +85,7 @@ pub fn force_kill(pid: u32) -> Result<(), String> {
     {
         let status = std::process::Command::new("taskkill")
             .args(["/F", "/PID", &pid.to_string()])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .status()
             .map_err(|e| format!("taskkill /F: {e}"))?;
         if status.success() {
@@ -121,6 +126,7 @@ fn list_pids_raw(binary_name: &str) -> String {
             "CSV",
             "/NH",
         ])
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
         .output();
     #[cfg(not(windows))]
     let output = std::process::Command::new("pgrep")

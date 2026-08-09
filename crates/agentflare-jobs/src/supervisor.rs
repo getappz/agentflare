@@ -70,6 +70,18 @@ impl Supervisor {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
+        // This supervisor is driven by the daemon's own background discovery
+        // tick (`spawn_supervisor_discovery`, every `SUPERVISOR_DISCOVERY_INTERVAL`)
+        // as well as interactive job requests — no console-attached parent is
+        // guaranteed. Without this flag every dispatched job auto-allocates a
+        // console window on Windows, flashing briefly even with no active
+        // Claude Code session, since the daemon runs unattended in the background.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
 
         let mut child = cmd.spawn()?;
 
@@ -215,11 +227,17 @@ fn kill_graceful(child: &mut std::process::Child, kill_after: Duration) {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let pid = child.id().to_string();
-        let _ = Command::new("taskkill").args(["/T", "/PID", &pid]).status();
+        let _ = Command::new("taskkill")
+            .args(["/T", "/PID", &pid])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
         std::thread::sleep(kill_after);
         let _ = Command::new("taskkill")
             .args(["/T", "/F", "/PID", &pid])
+            .creation_flags(CREATE_NO_WINDOW)
             .status();
     }
     #[cfg(not(any(unix, windows)))]

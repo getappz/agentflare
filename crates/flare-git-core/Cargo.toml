@@ -15,7 +15,7 @@ agentflare-backend = { package = "agentflare-backend", path = "../agentflare-bac
 agentflare-shim = { path = "../agentflare-shim" }
 walkdir = "2"
 dirs = "6"
-agent-detector = { version = "0.2.1", default-features = false }
+agent-detector = { version = "0.2.1", default-features = false, features = ["process-tree"] }
 which = "6"
 fs2 = "0.4"
 toml = "0.8"
