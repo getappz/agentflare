@@ -58,6 +58,7 @@ pub(crate) struct DiscoveryTickResult {
 pub(crate) fn run_discovery_tick(
     mcp: &AgentflareMcp,
     queue: &agentflare_jobs::Queue,
+    auth_conn: &rusqlite::Connection,
 ) -> DiscoveryTickResult {
     let mut result = DiscoveryTickResult {
         dispatched: 0,
@@ -101,6 +102,13 @@ pub(crate) fn run_discovery_tick(
                     result.skipped += 1;
                     continue;
                 };
+                if crate::auth_db::is_cooling_down(auth_conn, agent.as_str()) {
+                    // Leave the ready-for-work label in place, same as the
+                    // Wait branch below: the cooldown may clear before the
+                    // next tick, and the item must still be visible to that
+                    // tick's discovery query.
+                    continue;
+                }
                 if dispatch_item(mcp, queue, &item, agent, &label_id_by_name, &ready_id) {
                     result.dispatched += 1;
                 }
@@ -275,6 +283,12 @@ mod tests {
         agentflare_jobs::Queue::open_memory(dir.join("logs")).unwrap()
     }
 
+    fn test_auth_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::auth_db::migrate(&conn).unwrap();
+        conn
+    }
+
     fn seed_ready_item(mcp: &AgentflareMcp, assignee: Option<&str>) -> String {
         mcp.with_backend_db(|conn| {
             let project = mcp.resolve_project(conn).unwrap();
@@ -344,7 +358,8 @@ mod tests {
         let queue = test_queue();
         let item_id = seed_ready_item(&mcp, Some("claude-code"));
 
-        let result = run_discovery_tick(&mcp, &queue);
+        let auth_conn = test_auth_conn();
+        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
 
         assert_eq!(result.dispatched, 1);
         assert_eq!(result.skipped, 0);
@@ -363,6 +378,31 @@ mod tests {
             .unwrap();
         assert!(!labels_contain_name(&mcp, &labels, "ready-for-work"));
         assert!(labels_contain_name(&mcp, &labels, "dispatched"));
+    }
+
+    #[test]
+    fn agent_in_cooldown_is_skipped_not_dispatched() {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let auth_conn = test_auth_conn();
+        let item_id = seed_ready_item(&mcp, Some("claude-code"));
+        crate::auth_db::set_cooldown(&auth_conn, "claude-code", "__default__", 30, "rate limit");
+
+        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
+
+        assert_eq!(result.dispatched, 0);
+        assert!(
+            queue.list(None).unwrap().is_empty(),
+            "a cooling-down agent must not be dispatched"
+        );
+
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(
+            labels_contain_name(&mcp, &labels, "ready-for-work"),
+            "the item must stay ready-for-work so a later tick can pick it up once the cooldown clears"
+        );
     }
 
     fn seed_ready_item_under_gated_goal(mcp: &AgentflareMcp) -> String {
@@ -458,7 +498,8 @@ mod tests {
         let queue = test_queue();
         let item_id = seed_ready_item_under_gated_goal(&mcp);
 
-        let result = run_discovery_tick(&mcp, &queue);
+        let auth_conn = test_auth_conn();
+        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
 
         assert_eq!(result.dispatched, 0);
         assert!(
@@ -584,7 +625,8 @@ mod tests {
         let queue = test_queue();
         let (_item_id, _goal_id) = seed_ready_item_under_active_goal_with_repairs(&mcp, 0);
 
-        let result = run_discovery_tick(&mcp, &queue);
+        let auth_conn = test_auth_conn();
+        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
 
         assert_eq!(result.dispatched, 1, "self-repair still dispatches the job");
         assert_eq!(queue.list(None).unwrap().len(), 1);
@@ -599,7 +641,8 @@ mod tests {
             crate::quota::decide::SELF_REPAIR_CAP,
         );
 
-        let result = run_discovery_tick(&mcp, &queue);
+        let auth_conn = test_auth_conn();
+        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
 
         assert_eq!(
             result.dispatched, 0,
@@ -620,7 +663,8 @@ mod tests {
         // at all) — this is the plan's explicit no-regression guarantee.
         let item_id = seed_ready_item(&mcp, Some("claude-code"));
 
-        let result = run_discovery_tick(&mcp, &queue);
+        let auth_conn = test_auth_conn();
+        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
 
         assert_eq!(result.dispatched, 1);
         assert_eq!(result.skipped, 0);
@@ -634,7 +678,8 @@ mod tests {
         let queue = test_queue();
         let item_id = seed_ready_item(&mcp, Some("opencode"));
 
-        let result = run_discovery_tick(&mcp, &queue);
+        let auth_conn = test_auth_conn();
+        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
 
         assert_eq!(result.dispatched, 0);
         assert_eq!(result.skipped, 1);

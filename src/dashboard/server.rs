@@ -182,7 +182,8 @@ fn spawn_supervisor_discovery(
             let queue = queue.clone();
             let mcp = mcp.clone();
             let result = tokio::task::spawn_blocking(move || {
-                crate::supervisor::run_discovery_tick(&mcp, &queue)
+                let auth_conn = crate::auth_db::open_or_rebuild();
+                crate::supervisor::run_discovery_tick(&mcp, &queue, &auth_conn)
             })
             .await;
             match result {
