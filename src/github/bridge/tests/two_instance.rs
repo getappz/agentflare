@@ -47,7 +47,7 @@ impl SharedIssue {
             .map(|l| format!(r#"{{"name":{}}}"#, json_str(l)))
             .collect();
         format!(
-            r#"{{"number":{ISSUE},"html_url":"u","state":"{}","title":"Do the thing","body":"","labels":[{}]}}"#,
+            r#"{{"number":{ISSUE},"html_url":"u","state":"{}","title":"Do the thing","body":"","labels":[{}],"author_association":"OWNER"}}"#,
             if self.closed { "closed" } else { "open" },
             labels.join(",")
         )
