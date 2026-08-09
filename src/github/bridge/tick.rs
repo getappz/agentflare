@@ -367,13 +367,40 @@ fn record_claim(
                     })
                     .map(|l| l.id)
             });
+            // `handoff`'s `recipient="github"` path embeds the full
+            // structured payload (content/completed/remaining/thread_id) as
+            // a hidden marker after the human-readable body -- recover it
+            // so a bridge-originated item carries the same fields a local
+            // handoff would, instead of only the rendered issue body with no
+            // metadata. An issue opened by hand (or from before this
+            // existed) has no marker; `handoff` returns `None` and this
+            // falls back to the old behavior unchanged.
+            let handoff = issue
+                .body
+                .as_deref()
+                .and_then(crate::github::bridge::handoff_payload::HandoffPayload::extract);
+            let description = handoff
+                .as_ref()
+                .map(|p| p.content.clone())
+                .or_else(|| issue.body.clone());
+            let metadata = handoff.as_ref().map(|p| {
+                let mut m = serde_json::json!({
+                    "completed": p.completed,
+                    "remaining": p.remaining,
+                });
+                if let Some(t) = &p.thread_id {
+                    m["thread_id"] = serde_json::json!(t);
+                }
+                m.to_string()
+            });
+
             agentflare_backend::item::create(
                 conn,
                 agentflare_backend::item::CreateItem {
                     project_id: ctx.project_id.clone(),
                     state_id,
                     name: issue.title.clone(),
-                    description: issue.body.clone(),
+                    description,
                     priority: None,
                     parent_id: None,
                     assignee_agent: Some(
@@ -385,7 +412,7 @@ fn record_claim(
                     sort_order: None,
                     external_source: Some(items::EXTERNAL_SOURCE.to_string()),
                     external_id: Some(issue.number.to_string()),
-                    metadata: None,
+                    metadata,
                     label_ids: ready_label_id.into_iter().collect(),
                     assignee_ids: vec![],
                     dependency_ids: vec![],
@@ -906,6 +933,54 @@ mod tests {
         assert_eq!(held[0].target, "issue#7");
         assert_eq!(held[0].owner, "me:1");
         let _ = server.requests();
+    }
+
+    #[test]
+    fn claiming_an_issue_published_by_handoff_recovers_its_full_payload() {
+        // `handoff`'s recipient="github" path embeds content/completed/
+        // remaining/thread_id as a hidden marker after the visible body
+        // (`handoff_payload::HandoffPayload`); a bare `issue.body.clone()`
+        // would only ever see the visible half.
+        let payload = crate::github::bridge::handoff_payload::HandoffPayload {
+            key: "thread-1".into(),
+            content: "the full content".into(),
+            completed: "done so far".into(),
+            remaining: "left to do".into(),
+            thread_id: Some("thread-1".into()),
+        };
+        let body = payload.embed("visible description");
+        let issue_list = format!(
+            r#"[{{"number":7,"html_url":"u","state":"open","title":"t","body":{},"labels":[{{"name":"agentflare"}}]}}]"#,
+            serde_json::to_string(&body).unwrap()
+        );
+        let server = MockServer::start(vec![
+            MockResponse::json(200, &issue_list),
+            MockResponse::json(200, "[]"),
+            MockResponse::json(201, r#"{"id":100}"#),
+            MockResponse::json(
+                200,
+                &format!(
+                    r#"[{{"id":100,"user":{{"login":"u"}},"body":{}}}]"#,
+                    serde_json::to_string(&marker_body(Action::Claim, "me:1", NOW)).unwrap()
+                ),
+            ),
+            MockResponse::json(200, r#"{"id":100}"#), // marker rewrite
+            MockResponse::json(200, "[]"),            // claimed: label
+        ]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert_eq!(report.claimed, vec![7]);
+        let item = crate::github::bridge::items::find_by_issue(&conn, &project_id, 7).unwrap();
+        assert_eq!(
+            item.description, "the full content",
+            "description must come from the embedded payload's content, not the visible body"
+        );
+        let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+        assert_eq!(metadata["completed"], "done so far");
+        assert_eq!(metadata["remaining"], "left to do");
+        assert_eq!(metadata["thread_id"], "thread-1");
     }
 
     #[test]

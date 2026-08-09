@@ -57,7 +57,14 @@ impl AgentflareMcp {
                     None,
                 ));
             }
-            return self.handoff_to_bridge_queue(&name, &content, description.as_deref());
+            return self.handoff_to_bridge_queue(
+                &name,
+                &content,
+                description.as_deref(),
+                &completed,
+                &remaining,
+                thread_id.as_deref(),
+            );
         }
 
         let ext = match r#type.as_deref() {
@@ -306,48 +313,109 @@ impl AgentflareMcp {
     }
 
     /// Publishes `name`/body as a GitHub issue labelled with the bridge's
-    /// queue label, on the repo resolved from this workstation's `origin`
-    /// remote -- same resolution `flare_git_impl` already uses. Deliberately
-    /// thin: issue creation and the claim/heartbeat/export lifecycle already
-    /// live in `github::issues` and `github::bridge::tick`; this just gets
-    /// work onto the queue.
+    /// queue label, on the repo resolved from `AGENTFLARE_BRIDGE_REPO`, else
+    /// this repo's `.agentflare/config.toml` `[bridge].repo` override, else
+    /// the workstation's `origin` remote (`bridge::config::resolve_project_repo`
+    /// -- same chain `agentflare github-bridge` and `bridge_queue_status`
+    /// resolve through). Deliberately thin: issue creation and the
+    /// claim/heartbeat/export lifecycle already live in `github::issues` and
+    /// `github::bridge::tick`; this just gets work onto the queue.
+    ///
+    /// Idempotent across retries: the full structured payload (`content`,
+    /// `completed`, `remaining`, `thread_id`) and a dedup key (`thread_id`,
+    /// else `name`) are embedded as a hidden marker in the issue body
+    /// (`bridge::handoff_payload`) -- recovered by the bridge importer
+    /// (`tick::record_claim`) when the issue is claimed, and looked up here
+    /// first so a retry after a timeout reuses the existing issue instead of
+    /// publishing a duplicate.
     fn handoff_to_bridge_queue(
         &self,
         name: &str,
         content: &str,
         description: Option<&str>,
+        completed: &str,
+        remaining: &str,
+        thread_id: Option<&str>,
     ) -> Result<String, ErrorData> {
+        use crate::github::bridge::handoff_payload::HandoffPayload;
         use crate::github::{Client, bridge::config, issues};
 
         let repo_root = self.worktree_repo_root();
-        let repo = config::resolve_project_repo(&repo_root).ok_or_else(|| {
-            ErrorData::invalid_params(
-                "recipient=\"github\" needs a GitHub `origin` remote in the current repo (or a \
-                 [bridge] repo override in .agentflare/config.toml)",
-                None,
-            )
-        })?;
+        let repo = config::resolve_project_repo(&repo_root)
+            .map_err(|e| ErrorData::invalid_params(e, None))?
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "recipient=\"github\" needs a GitHub `origin` remote in the current repo \
+                     (or a [bridge] repo override in .agentflare/config.toml)",
+                    None,
+                )
+            })?;
         let client = Client::new().map_err(to_mcp_error)?;
         let queue_label = config::resolve_project_queue_label(&repo_root);
-        let body = description.unwrap_or(content);
-        let issue = issues::create(
-            &client,
-            &repo,
-            name,
-            Some(body),
-            std::slice::from_ref(&queue_label),
-            &[],
-        )
-        .map_err(to_mcp_error)?;
 
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        let key = thread_id.unwrap_or(name).to_string();
+        let payload = HandoffPayload {
+            key: key.clone(),
+            content: content.to_string(),
+            completed: completed.to_string(),
+            remaining: remaining.to_string(),
+            thread_id: thread_id.map(str::to_string),
+        };
+
+        // A bare retry after e.g. a network timeout must reuse the issue
+        // this call already created rather than publish a second one --
+        // `issues::create` has no idempotency of its own.
+        let existing = issues::list_filtered(&client, &repo, "open", Some(&queue_label), None)
+            .map_err(to_mcp_error)?
+            .into_iter()
+            .find(|issue| {
+                issue
+                    .body
+                    .as_deref()
+                    .and_then(HandoffPayload::extract)
+                    .is_some_and(|p| p.key == key)
+            });
+
+        let issue = match existing {
+            Some(issue) => issue,
+            None => {
+                let body = payload.embed(description.unwrap_or(content));
+                issues::create(
+                    &client,
+                    &repo,
+                    name,
+                    Some(&body),
+                    std::slice::from_ref(&queue_label),
+                    &[],
+                )
+                .map_err(to_mcp_error)?
+            }
+        };
+
+        let mut result = serde_json::json!({
             "repo": repo.to_string(),
             "issue_number": issue.number,
             "issue_url": issue.html_url,
             "queue_label": queue_label,
             "recipient": "github",
-        }))
-        .unwrap_or_default())
+        });
+
+        // Report rather than reject: a project-local [bridge].repo override
+        // can legitimately target a repo another workstation's daemon
+        // watches, not this one -- see resolve_project_repo's module doc.
+        // But if THIS workstation's daemon is enabled and points somewhere
+        // else, say so -- nothing local will poll what was just published.
+        if config::daemon_enabled()
+            && let Some(daemon_repo) = config::resolve_daemon_repo(&repo_root)
+            && daemon_repo != repo
+        {
+            result["warning"] = serde_json::json!(format!(
+                "this workstation's bridge daemon is enabled but watches {daemon_repo} -- it \
+                 will not poll {repo}; relying on another workstation's daemon to pick this up"
+            ));
+        }
+
+        Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
     }
 
     /// Verified, not trusted: rejects a fabricated or typo'd continuation
@@ -497,7 +565,20 @@ mod tests {
     fn recipient_github_without_an_origin_remote_fails_clearly() {
         // test_mcp()'s repo has no `origin` configured, so this exercises
         // handoff_to_bridge_queue's repo resolution without hitting the
-        // network at all.
+        // network at all -- but only if AGENTFLARE_BRIDGE_REPO isn't
+        // inherited from the outer environment; resolve_project_repo checks
+        // it before `origin`, and a set value would let this reach
+        // Client::new()/issues::create instead, hitting the network and
+        // potentially creating a real issue. Cleared and restored under the
+        // shared lock other env-mutating tests in this crate already use.
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("AGENTFLARE_BRIDGE_REPO").ok();
+        unsafe {
+            std::env::remove_var("AGENTFLARE_BRIDGE_REPO");
+        }
+
         let (_tmp, mcp) = test_mcp();
         let req = HandoffRequest {
             recipient: "github".to_string(),
@@ -505,6 +586,13 @@ mod tests {
         };
         let err = mcp.handoff_impl(req).unwrap_err();
         assert!(err.to_string().contains("origin"), "{err}");
+
+        unsafe {
+            match &prior {
+                Some(v) => std::env::set_var("AGENTFLARE_BRIDGE_REPO", v),
+                None => std::env::remove_var("AGENTFLARE_BRIDGE_REPO"),
+            }
+        }
     }
 
     #[test]

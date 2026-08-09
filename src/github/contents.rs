@@ -124,7 +124,8 @@ pub fn ensure_branch(client: &Client, repo: &RepoId, branch: &str) -> Result<(),
         Ok(_) => Ok(()),
         Err(GitHubError::NotFound) => {
             let tree_path = format!("/repos/{}/{}/git/trees", repo.owner, repo.repo);
-            let tree = client.request("POST", &tree_path, Some(serde_json::json!({ "tree": [] })))?;
+            let tree =
+                client.request("POST", &tree_path, Some(serde_json::json!({ "tree": [] })))?;
             let tree_sha = tree
                 .get("sha")
                 .and_then(|s| s.as_str())

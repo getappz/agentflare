@@ -246,9 +246,25 @@ impl AgentflareMcp {
                 // just this one.
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let queue_label = crate::github::bridge::config::resolve_project_queue_label(&cwd);
+                // An explicit `req.repo` always wins (`repo` above already
+                // reflects that). Otherwise resolve through the SAME chain
+                // `handoff`'s `recipient="github"` path uses
+                // (`resolve_project_repo`: env, then project-local
+                // `.agentflare/config.toml`, then origin) rather than the
+                // plain-origin resolution `repo` fell back to -- otherwise a
+                // project with a `[bridge].repo` override would have
+                // `handoff` publish to one repo and this status check read
+                // the queue of a different one.
+                let status_repo = if req.repo.is_some() {
+                    repo.clone()
+                } else {
+                    crate::github::bridge::config::resolve_project_repo(&cwd)
+                        .map_err(|e| ErrorData::invalid_params(e, None))?
+                        .unwrap_or_else(|| repo.clone())
+                };
                 let status = crate::github::bridge::queue_status::queue_status(
                     &client,
-                    &repo,
+                    &status_repo,
                     &queue_label,
                     crate::claims::now(),
                     crate::claims::ttl_secs(),

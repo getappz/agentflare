@@ -506,17 +506,19 @@ fn apply_coaching_defaults() -> String {
     }
 }
 
-/// Fully-qualified flare-gateway tool names either nudged toward by a
-/// core-module coaching rule, or otherwise deemed safe to call unprompted
-/// (`handoff` -- local item/asset writes and, since it also creates GitHub
-/// issues via `recipient="github"`, real external writes too). Kept
-/// allowlisted in `~/.claude/settings.json` so calling them doesn't cost a
-/// permission prompt every time.
+/// Fully-qualified flare-gateway tool names deemed safe to call unprompted.
+/// Kept allowlisted in `~/.claude/settings.json` so calling them doesn't cost
+/// a permission prompt every time.
+///
+/// `handoff` is deliberately NOT here even though most of it is local
+/// item/asset writes: its `recipient="github"` path publishes a real,
+/// externally-visible GitHub issue, and an allowlisted tool call skips the
+/// permission prompt that would otherwise let a human catch an unintended
+/// external publish before it happens.
 const GATEWAY_PERMISSIONS_ALLOW: &[&str] = &[
     "mcp__flare__docs",
     "mcp__flare__search",
     "mcp__flare__tool",
-    "mcp__flare__handoff",
     "ToolSearch",
 ];
 
@@ -1563,8 +1565,8 @@ mod tests {
         });
         let changed = apply_gateway_permissions(&mut settings).unwrap();
         assert_eq!(
-            changed, 5,
-            "4 missing entries added + 1 stale entry stripped"
+            changed, 4,
+            "3 missing entries added + 1 stale entry stripped"
         );
         let allow = settings["permissions"]["allow"].as_array().unwrap();
         for name in GATEWAY_PERMISSIONS_ALLOW {

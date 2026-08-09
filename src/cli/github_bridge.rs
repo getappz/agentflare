@@ -54,6 +54,15 @@ fn cmd_set(repo: Option<String>, queue_label: Option<String>) {
         eprintln!("error: pass --repo and/or --queue-label");
         std::process::exit(1);
     }
+    // Validate before persisting -- an unparseable `--repo` written as-is
+    // would only surface as a confusing failure the next time something
+    // resolves it, far from where the typo was made.
+    if let Some(r) = &repo
+        && crate::github::RepoId::parse(r).is_none()
+    {
+        eprintln!("error: --repo {r:?} is not a valid owner/repo");
+        std::process::exit(1);
+    }
     let root = repo_root_or_exit();
     match crate::github::bridge::config::write_project_bridge_settings(
         &root,
@@ -85,8 +94,11 @@ fn cmd_status() {
     let queue_label = crate::github::bridge::config::resolve_project_queue_label(&root);
     println!(
         "repo:        {}",
-        repo.map(|r| r.to_string())
-            .unwrap_or_else(|| "(none resolved)".to_string())
+        match repo {
+            Ok(Some(r)) => r.to_string(),
+            Ok(None) => "(none resolved)".to_string(),
+            Err(e) => format!("(error: {e})"),
+        }
     );
     println!("queue_label: {queue_label}");
     println!();

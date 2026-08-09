@@ -153,6 +153,31 @@ pub fn list_comments(
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
+/// All general (non-line-anchored) comments across the WHOLE repo in one
+/// paginated listing, each tagged with its `issue_url` (see
+/// [`Comment::issue_number`]) -- the repo-wide counterpart to
+/// [`list_comments`]'s per-issue endpoint.
+///
+/// `queue_status` uses this instead of one [`list_comments`] call per open
+/// issue: a queue of N issues used to cost N+1 requests (plus pagination on
+/// each), which can exhaust rate limits or time out on a large queue. This
+/// costs one paginated listing regardless of N, at the price of also
+/// fetching comments on issues outside the queue label -- an acceptable
+/// trade since the queue label already keeps `open_issues` itself small, and
+/// callers filter by [`Comment::issue_number`] anyway.
+pub fn list_all_comments(
+    client: &Client,
+    repo: &RepoId,
+    since: Option<&str>,
+) -> Result<Vec<Comment>, GitHubError> {
+    let mut path = format!("/repos/{}/{}/issues/comments", repo.owner, repo.repo);
+    if let Some(s) = since {
+        path.push_str(&format!("?since={}", crate::github::encode_query(s)));
+    }
+    let json = client.get_paginated(&path, crate::github::client::as_array)?;
+    serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
+}
+
 pub fn close(client: &Client, repo: &RepoId, number: u64) -> Result<Issue, GitHubError> {
     let path = format!("/repos/{}/{}/issues/{number}", repo.owner, repo.repo);
     let json = client.request(
@@ -388,6 +413,33 @@ mod tests {
         assert_eq!(
             server.requests()[0].path,
             "/repos/o/r/issues/4/comments?since=2026-07-19T00%3A00%3A00Z&per_page=100&page=1"
+        );
+    }
+
+    #[test]
+    fn list_all_comments_fetches_the_repo_wide_endpoint_with_issue_urls() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"[{"id":1,"user":{"login":"a"},"body":"hi","issue_url":"https://api.github.com/repos/o/r/issues/7"}]"#,
+        )]);
+        let client = server.client(None);
+        let comments = list_all_comments(&client, &repo(), None).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].issue_number(), Some(7));
+        assert_eq!(
+            server.requests()[0].path,
+            "/repos/o/r/issues/comments?per_page=100&page=1"
+        );
+    }
+
+    #[test]
+    fn list_all_comments_appends_since_query() {
+        let server = MockServer::start(vec![MockResponse::json(200, "[]")]);
+        let client = server.client(None);
+        list_all_comments(&client, &repo(), Some("2026-07-19T00:00:00Z")).unwrap();
+        assert_eq!(
+            server.requests()[0].path,
+            "/repos/o/r/issues/comments?since=2026-07-19T00%3A00%3A00Z&per_page=100&page=1"
         );
     }
 
