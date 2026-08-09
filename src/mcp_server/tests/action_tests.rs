@@ -354,7 +354,7 @@ fn item_claim_response_includes_worktree_error_instead_of_silently_omitting_it()
 }
 
 #[test]
-fn item_done_without_new_commits_omits_pr_fields() {
+fn item_done_without_new_commits_leaves_the_item_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let repo_root = repo_dir.path().to_path_buf();
@@ -390,7 +390,8 @@ fn item_done_without_new_commits_omits_pr_fields() {
 
     // No commits were made in the claimed worktree, so `done` has
     // nothing to push/PR — must not attempt a real push (no remote
-    // configured on this throwaway repo).
+    // configured on this throwaway repo), and must not mark the item
+    // completed either (item #48): nothing was actually delivered.
     let result: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
             action: "done".into(),
@@ -400,7 +401,8 @@ fn item_done_without_new_commits_omits_pr_fields() {
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(result["done"], true);
+    assert_eq!(result["done"], false);
+    assert_eq!(result["status"], "unchanged");
     assert!(result.get("pr_url").is_none());
     assert!(result.get("next").is_none());
 }
