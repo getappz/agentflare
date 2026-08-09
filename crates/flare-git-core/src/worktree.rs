@@ -441,6 +441,30 @@ pub(crate) fn run_output_timeout(
     })
 }
 
+/// Whether `branch` has committed content `target_branch` doesn't already
+/// have: new commits (`rev-list --count`) whose *content* isn't already
+/// fully present on the target either (`diff --quiet` content-diff guard,
+/// catching squash-merges — two-dot, not three-dot: we want whether the two
+/// tips are identical, not whether branch differs from merge-base).
+///
+/// Used by `push_branch` below to skip pushing/PR-ing a no-op branch, and by
+/// `item_done` (main binary) to tell a genuinely empty run (no commits at
+/// all) apart from a run whose push/PR failed for some other reason —
+/// only the former should block marking an item done.
+pub fn branch_diverged(repo_root: &Path, branch: &str, target_branch: &str) -> bool {
+    match run_git_in(
+        repo_root,
+        &["rev-list", "--count", &format!("{target_branch}..{branch}")],
+    ) {
+        Ok(count) if count != "0" => {}
+        _ => return false,
+    }
+    !run_git_in_ok(
+        repo_root,
+        &["diff", "--quiet", &format!("{target_branch}..{branch}")],
+    )
+}
+
 /// Pushes `item`'s isolated worktree branch to `target_branch`'s remote, if
 /// the branch exists, has new commits, and its content isn't already fully
 /// present on the target (squash-merge guard). Returns the pushed branch
@@ -467,21 +491,7 @@ pub fn push_branch(
     }
     // Nothing to push (and nothing worth a PR) if the branch never
     // diverged from its target — e.g. `done` called with no commits made.
-    match run_git_in(
-        repo_root,
-        &["rev-list", "--count", &format!("{target_branch}..{branch}")],
-    ) {
-        Ok(count) if count != "0" => {}
-        _ => return None,
-    }
-    // Content-diff guard: even when the branch has new commits, its
-    // *content* may already be on the target (squash-merge). Compares
-    // target→branch tree (two-dot, not three-dot: we want whether the
-    // two tips are identical, not whether branch differs from merge-base).
-    if run_git_in_ok(
-        repo_root,
-        &["diff", "--quiet", &format!("{target_branch}..{branch}")],
-    ) {
+    if !branch_diverged(repo_root, &branch, target_branch) {
         return None;
     }
     if let Some(p) = progress {
