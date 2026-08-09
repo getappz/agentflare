@@ -607,13 +607,20 @@ impl AgentflareMcp {
             Ok::<_, ErrorData>((item_id, owns_claim, item, target_branch))
         })??;
         let should_push = req.push.unwrap_or(true);
+        let summary = req.summary.as_deref();
         let pr_url = match (&item, &target_branch) {
             (Some(item), Some(target)) if should_push => PROGRESS_SENDER
                 .try_with(|ps| {
-                    crate::worktree::push_and_open_pr(item, &repo_root, target, ps.as_ref())
+                    crate::worktree::push_and_open_pr(
+                        item,
+                        &repo_root,
+                        target,
+                        ps.as_ref(),
+                        summary,
+                    )
                 })
                 .unwrap_or_else(|_| {
-                    crate::worktree::push_and_open_pr(item, &repo_root, target, None)
+                    crate::worktree::push_and_open_pr(item, &repo_root, target, None, summary)
                 }),
             _ => None,
         };
