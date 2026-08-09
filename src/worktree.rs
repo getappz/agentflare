@@ -22,6 +22,17 @@ fn as_progress(p: Option<&ProgressSender>) -> Option<&dyn flare_git_core::worktr
 
 pub use flare_git_core::worktree::resolve_target_branch;
 
+/// Whether `item`'s branch has any committed content `target_branch`
+/// doesn't already have. See `flare_git_core::worktree::branch_diverged`.
+pub fn branch_diverged(
+    item: &agentflare_backend::item::Item,
+    repo_root: &Path,
+    target_branch: &str,
+) -> bool {
+    let branch = format!("task/{}", item.sequence_id);
+    flare_git_core::worktree::branch_diverged(repo_root, &branch, target_branch)
+}
+
 pub fn create_worktree(
     item: &agentflare_backend::item::Item,
     repo_root: &Path,

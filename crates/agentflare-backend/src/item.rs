@@ -647,7 +647,14 @@ pub enum ClaimOutcome {
 /// `assignee_agent` is canonicalized on write (see `create`/`update`), but
 /// `owner` is the raw caller-supplied id, so an alias like `claude:1` must
 /// be canonicalized here too or it won't match `claude-code`.
-fn agent_part(owner: &str) -> String {
+///
+/// `pub` because `assignee_agent` legitimately carries the instance suffix
+/// after a claim (`claim()` below stores the raw `owner`, on purpose — see
+/// its own doc comment and the tests pinning that), so any caller outside
+/// this module that reads `assignee_agent` back to resolve *which agent
+/// type* it names (not which specific instance) needs the same stripping
+/// this module already does internally, instead of re-deriving it.
+pub fn agent_part(owner: &str) -> String {
     agent_registry::canonicalize(owner.split(':').next().unwrap_or(owner))
 }
 
