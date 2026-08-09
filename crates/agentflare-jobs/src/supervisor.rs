@@ -52,8 +52,14 @@ impl Supervisor {
     pub fn spawn(&mut self) -> std::io::Result<(JobOutput, JobState)> {
         let _ = std::fs::create_dir_all(&self.log_dir);
 
-        let mut cmd = Command::new(&self.command);
-        cmd.args(&self.args)
+        // Native Linux and WSL2 run the job inside a bwrap sandbox; Windows
+        // and macOS have no equivalent here yet, so they get the command
+        // back unchanged (see `crate::sandbox`).
+        let (sandboxed_command, sandboxed_args) =
+            crate::sandbox::wrap(&self.command, &self.args, self.cwd.as_deref());
+
+        let mut cmd = Command::new(&sandboxed_command);
+        cmd.args(&sandboxed_args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
