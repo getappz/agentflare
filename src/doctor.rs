@@ -46,15 +46,15 @@ pub(crate) fn stale_rules_for_host(host: &str) -> Vec<StaleRule> {
 }
 
 /// Hosts to check when `--agent` isn't given: every agent binary actually
-/// detected on PATH (same detection `agentflare agents` uses) — avoids
-/// reporting on config for tools the user doesn't have installed. Version
-/// resolution accuracy doesn't matter here (only which agents are present),
-/// so a throwaway cache is fine.
+/// detected on PATH — avoids reporting on config for tools the user doesn't
+/// have installed. Presence-only (`detect_present`), not `detect_all`: this
+/// only needs the ID list, and `detect_all` would additionally spawn a
+/// `--version` subprocess per detected agent that doctor never looks at —
+/// Node-wrapped CLIs make that spawn cost hundreds of ms each.
 fn default_hosts() -> Vec<String> {
-    let mut cache = std::collections::HashMap::new();
-    agent_registry::detect::detect_all(agent_registry::REGISTRY, &mut cache)
+    agent_registry::detect::detect_present(agent_registry::REGISTRY)
         .into_iter()
-        .map(|a| a.id.to_string())
+        .map(str::to_string)
         .collect()
 }
 

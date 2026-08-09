@@ -25,6 +25,32 @@ fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_default()
 }
 
+/// `doctor` builds a fresh `Component` list per host (6+ hosts by default),
+/// but these three checks each spawn a subprocess (`git`, `where`/`which`)
+/// and their result never depends on which host is being checked — spawning
+/// them once per host multiplies process-creation overhead (dominant cost on
+/// Windows) for no reason. Memoize for the process's lifetime.
+fn mise_present_cached() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| crate::mise_install::mise_bin().is_some())
+}
+
+fn leanctx_installed_cached() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        crate::tool_install::installed(&crate::tool_install::LEAN_CTX)
+            && crate::gateway_integrations::already_registered("leanctx")
+    })
+}
+
+fn githooks_installed_cached() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| match flare_git_core::branch::repo_toplevel(&cwd()) {
+        Some(root) => crate::cli::git::hooks_installed_for(&root),
+        None => true,
+    })
+}
+
 fn run_ok(cmd: &str, args: &[&str]) -> bool {
     Command::new(cmd)
         .args(args)
@@ -308,16 +334,14 @@ pub(crate) fn unsync_host(rule_id: &str, host: &str) -> Result<(), String> {
 /// Agent IDs detected on this machine, for `skill_registry::Registry::open_default`'s
 /// `detected_agents` param. skill-registry itself has no `agent-registry` dependency
 /// (deliberately decoupled — skill discovery only needs agent IDs, not the version-
-/// detection machinery); every call site collects them the same way, using a
-/// throwaway cache since none of these callers need cross-call version caching.
+/// detection machinery), so this uses `detect_present` (PATH presence only) rather
+/// than `detect_all`, which would spawn a `--version` subprocess per detected agent
+/// for a value nothing here reads.
 pub(crate) fn detected_skill_agents() -> Vec<String> {
-    agent_registry::detect_all(
-        agent_registry::REGISTRY,
-        &mut std::collections::HashMap::new(),
-    )
-    .into_iter()
-    .map(|d| d.id.to_lowercase())
-    .collect()
+    agent_registry::detect_present(agent_registry::REGISTRY)
+        .into_iter()
+        .map(str::to_lowercase)
+        .collect()
 }
 
 /// Every skill name the shared skill_registry cache currently knows about —
@@ -666,7 +690,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
             id: "mise",
             needs_consent: true,
             describe: "mise (dev-tool manager) — used by `agentflare run` to launch agents with mise-managed tools on PATH; https://mise.run".to_string(),
-            check: Box::new(|| crate::mise_install::mise_bin().is_some()),
+            check: Box::new(mise_present_cached),
             apply: Box::new(|| match crate::mise_install::ensure_mise() {
                 crate::mise_install::MiseOutcome::Present(_) => "mise already installed".to_string(),
                 crate::mise_install::MiseOutcome::Installed(p) => {
@@ -701,10 +725,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
             id: "githooks",
             needs_consent: true,
             describe: "Branch-protection git hooks (.githooks/, core.hooksPath) — blocks direct commits/pushes to the default branch for every git client, not just tool calls this agent's PreToolUse hook watches".to_string(),
-            check: Box::new(|| match flare_git_core::branch::repo_toplevel(&cwd()) {
-                Some(root) => crate::cli::git::hooks_installed_for(&root),
-                None => true,
-            }),
+            check: Box::new(githooks_installed_cached),
             apply: Box::new(|| match flare_git_core::branch::repo_toplevel(&cwd()) {
                 Some(root) => match crate::cli::git::install_hooks_for(&root) {
                     Ok(true) => "installed .githooks/* + core.hooksPath = .githooks".to_string(),
@@ -775,10 +796,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
             // whatever native entry the upstream onboarder already created so
             // the same ~80 ctx_* tools aren't declared twice.
             describe: "lean-ctx (context compression) — native installer (curl | sh, or brew), registered behind the agentflare gateway (the `tool` action-dispatch), not the host's native tool list".to_string(),
-            check: Box::new(|| {
-                crate::tool_install::installed(&crate::tool_install::LEAN_CTX)
-                    && crate::gateway_integrations::already_registered("leanctx")
-            }),
+            check: Box::new(leanctx_installed_cached),
             apply: {
                 let log = leanctx_log.clone();
                 let host = host_owned.clone();
