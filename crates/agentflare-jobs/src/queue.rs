@@ -59,6 +59,7 @@ pub fn migrations() -> rusqlite_migration::Migrations<'static> {
             "ALTER TABLE agent_jobs ADD COLUMN stdout_bytes INTEGER NOT NULL DEFAULT 0;
             ALTER TABLE agent_jobs ADD COLUMN stderr_bytes INTEGER NOT NULL DEFAULT 0;",
         ),
+        rusqlite_migration::M::up("ALTER TABLE agent_jobs ADD COLUMN not_before INTEGER;"),
     ])
 }
 
@@ -145,21 +146,21 @@ impl Queue {
     pub fn dequeue(&self) -> Result<Option<(String, crate::types::AgentJob)>, Error> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = db_kit::ids::now();
         let row: Option<(String, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT id, payload FROM agent_jobs
-                 WHERE state = 'queued'
+                 WHERE state = 'queued' AND (not_before IS NULL OR not_before <= ?1)
                  ORDER BY created_at ASC
                  LIMIT 1",
             )?;
-            stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
+            stmt.query_row(params![now], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?
         };
         let (id, payload_json) = match row {
             Some(r) => r,
             None => return Ok(None),
         };
-        let now = db_kit::ids::now();
         tx.execute(
             "UPDATE agent_jobs SET state = 'running', started_at = ?1 WHERE id = ?2",
             params![now, id],
@@ -199,7 +200,7 @@ impl Queue {
         Ok(())
     }
 
-    pub fn fail(&self, id: &str, error: &str) -> Result<(), Error> {
+    pub fn fail(&self, id: &str, error: &str, retry_after_secs: Option<u64>) -> Result<(), Error> {
         let now = db_kit::ids::now();
         let conn = self.conn.lock();
         let (retries, max_retries): (u32, u32) = conn.query_row(
@@ -209,11 +210,12 @@ impl Queue {
         )?;
         let retried = retries < max_retries;
         if retried {
+            let not_before = retry_after_secs.map(|s| now + s as i64);
             conn.execute(
                 "UPDATE agent_jobs
-                 SET state = 'queued', retries = retries + 1, error = ?1, started_at = NULL
-                 WHERE id = ?2",
-                params![error, id],
+                 SET state = 'queued', retries = retries + 1, error = ?1, started_at = NULL, not_before = ?2
+                 WHERE id = ?3",
+                params![error, not_before, id],
             )?;
         } else {
             conn.execute(
@@ -225,7 +227,11 @@ impl Queue {
         }
         drop(conn);
         // A retry goes back to 'queued' — wake workers so it's picked up
-        // promptly instead of waiting out the fallback poll interval.
+        // promptly instead of waiting out the fallback poll interval. Waking
+        // them even when `not_before` is in the future is harmless (their
+        // next `dequeue` simply finds nothing and re-parks) and keeps this
+        // function simple; the fallback poll in `worker_loop` is the real
+        // backstop for the delayed case regardless.
         if retried {
             self.wake_workers();
         }
@@ -389,5 +395,72 @@ impl<T> OptionalExt<T> for Result<T, rusqlite::Error> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::AgentJob;
+
+    fn test_queue() -> (Queue, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::open_memory(dir.path().join("logs")).unwrap();
+        (queue, dir)
+    }
+
+    #[test]
+    fn fail_without_retry_delay_requeues_immediately() {
+        let (queue, _dir) = test_queue();
+        let job = AgentJob::new("true").max_retries(1);
+        let info = queue.enqueue(&job).unwrap();
+        queue.dequeue().unwrap();
+        queue.fail(&info.id, "boom", None).unwrap();
+        let (id, _) = queue
+            .dequeue()
+            .unwrap()
+            .expect("retried job should be immediately eligible");
+        assert_eq!(id, info.id);
+    }
+
+    #[test]
+    fn fail_with_retry_delay_hides_the_job_until_not_before_passes() {
+        let (queue, _dir) = test_queue();
+        let job = AgentJob::new("true").max_retries(1);
+        let info = queue.enqueue(&job).unwrap();
+        queue.dequeue().unwrap();
+        queue.fail(&info.id, "rate limited", Some(3600)).unwrap();
+
+        assert!(
+            queue.dequeue().unwrap().is_none(),
+            "a job with a future not_before must not be dequeued yet"
+        );
+
+        // Simulate the delay having elapsed, without a real sleep.
+        {
+            let conn = queue.conn.lock();
+            conn.execute(
+                "UPDATE agent_jobs SET not_before = 0 WHERE id = ?1",
+                params![info.id],
+            )
+            .unwrap();
+        }
+        let (id, _) = queue
+            .dequeue()
+            .unwrap()
+            .expect("job should be eligible once not_before has passed");
+        assert_eq!(id, info.id);
+    }
+
+    #[test]
+    fn fail_past_max_retries_marks_failed_regardless_of_retry_delay() {
+        let (queue, _dir) = test_queue();
+        let job = AgentJob::new("true").max_retries(0);
+        let info = queue.enqueue(&job).unwrap();
+        queue.dequeue().unwrap();
+        queue.fail(&info.id, "boom", Some(60)).unwrap();
+        let jobs = queue.list(Some(JobState::Failed)).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, info.id);
     }
 }
