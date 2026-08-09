@@ -68,6 +68,12 @@ pub struct Issue {
     #[serde(default)]
     #[allow(dead_code)]
     pub created_at: Option<String>,
+    // Absent (empty-string default, never trusted) rather than a hard parse
+    // error on an unexpected response shape -- callers gating on this must
+    // fail closed the same way a malformed/missing value fails closed, not
+    // treat a parse hiccup as license to trust the content anyway.
+    #[serde(default)]
+    pub author_association: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

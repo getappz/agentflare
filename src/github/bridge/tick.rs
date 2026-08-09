@@ -264,6 +264,21 @@ fn items_tracked(conn: &rusqlite::Connection, ctx: &Ctx) -> Vec<agentflare_backe
         .collect()
 }
 
+/// Whether GitHub's own `author_association` for an issue is trusted enough
+/// to let its raw title/body become a work item's description -- that
+/// description later becomes an autonomous agent's literal prompt (see
+/// `build_prompt` in `cli/work.rs`), run with a permission-bypass flag. The
+/// bar matches gh-aw's (github/gh-aw) own `min-integrity: approved` default
+/// for public repos: repo owners, members, and collaborators only. Anyone
+/// else who can get an issue opened -- which on a public repo is anyone at
+/// all -- must not be able to get its content executed as instructions.
+fn is_trusted_author(issue: &Issue) -> bool {
+    matches!(
+        issue.author_association.as_str(),
+        "OWNER" | "MEMBER" | "COLLABORATOR"
+    )
+}
+
 /// Optimistic two-step claim: post our marker, then re-read and check we are
 /// the earliest. GitHub offers no compare-and-swap on labels or comments, so
 /// this is the closest available approximation.
@@ -273,6 +288,12 @@ fn try_claim(
     issue: &Issue,
     now: i64,
 ) -> Result<bool, GitHubError> {
+    // Reject before doing ANYTHING else -- not even reading comments -- so
+    // an untrusted issue gets zero engagement from the bridge, not just a
+    // skipped claim.
+    if !is_trusted_author(issue) {
+        return Ok(false);
+    }
     let before = comment_pairs(ctx, issue.number)?;
     match claim_rules::resolve_holder(&before, now, ctx.config.ttl_secs) {
         // GitHub says WE hold it, but we got here — so we have no active
@@ -779,7 +800,7 @@ mod tests {
         // One response: the queue listing. Any claim attempt would need more.
         let server = MockServer::start(vec![MockResponse::json(
             200,
-            r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}]}]"#,
+            r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}],"author_association":"OWNER"}]"#,
         )]);
         let ctx = test_ctx(&server, 0);
         let (conn, project_id) = test_db();
@@ -798,7 +819,7 @@ mod tests {
             // 1. queue listing
             MockResponse::json(
                 200,
-                r#"[{"number":7,"html_url":"u","state":"open","title":"Do the thing","body":"","labels":[{"name":"agentflare"}]}]"#,
+                r#"[{"number":7,"html_url":"u","state":"open","title":"Do the thing","body":"","labels":[{"name":"agentflare"}],"author_association":"OWNER"}]"#,
             ),
             // 2. existing comments on #7 — none, so it is unclaimed
             MockResponse::json(200, "[]"),
@@ -848,7 +869,7 @@ mod tests {
         let server = MockServer::start(vec![
             MockResponse::json(
                 200,
-                r#"[{"number":7,"html_url":"u","state":"open","title":"Do the thing","body":"","labels":[{"name":"agentflare"}]}]"#,
+                r#"[{"number":7,"html_url":"u","state":"open","title":"Do the thing","body":"","labels":[{"name":"agentflare"}],"author_association":"OWNER"}]"#,
             ),
             MockResponse::json(200, "[]"),
             MockResponse::json(201, r#"{"id":100}"#),
@@ -910,7 +931,7 @@ mod tests {
         let server = MockServer::start(vec![
             MockResponse::json(
                 200,
-                r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}]}]"#,
+                r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}],"author_association":"OWNER"}]"#,
             ),
             MockResponse::json(200, "[]"),
             MockResponse::json(201, r#"{"id":100}"#),
@@ -950,7 +971,7 @@ mod tests {
         };
         let body = payload.embed("visible description");
         let issue_list = format!(
-            r#"[{{"number":7,"html_url":"u","state":"open","title":"t","body":{},"labels":[{{"name":"agentflare"}}]}}]"#,
+            r#"[{{"number":7,"html_url":"u","state":"open","title":"t","body":{},"labels":[{{"name":"agentflare"}}],"author_association":"OWNER"}}]"#,
             serde_json::to_string(&body).unwrap()
         );
         let server = MockServer::start(vec![
@@ -988,7 +1009,7 @@ mod tests {
         let server = MockServer::start(vec![
             MockResponse::json(
                 200,
-                r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}]}]"#,
+                r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}],"author_association":"OWNER"}]"#,
             ),
             MockResponse::json(200, "[]"),
             MockResponse::json(201, r#"{"id":100}"#),
@@ -1010,6 +1031,31 @@ mod tests {
         assert!(report.claimed.is_empty(), "must not claim after losing");
         assert!(crate::github::bridge::items::find_by_issue(&conn, &project_id, 7).is_none());
         let _ = server.requests();
+    }
+
+    #[test]
+    fn an_untrusted_authors_issue_is_never_claimed_or_engaged() {
+        // Anyone who can get an issue opened (and, on a repo with lax
+        // triage permissions, labeled) must NOT be able to get its raw
+        // body turned into a work item, an autonomous agent prompt, and
+        // eventually a `--dangerously-skip-permissions` shell -- that is
+        // an indirect-prompt-injection-to-RCE path. Only one response is
+        // queued (the listing) because a rejected issue must not even get
+        // as far as reading its comments or posting a claim -- any write
+        // call at all would be a bug here.
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"do something","labels":[{"name":"agentflare"}],"author_association":"CONTRIBUTOR"}]"#,
+        )]);
+        let (conn, project_id) = test_db();
+        let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+        let report = run_once(&ctx, &conn, NOW).unwrap();
+
+        assert!(report.claimed.is_empty());
+        assert!(crate::github::bridge::items::find_by_issue(&conn, &project_id, 7).is_none());
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 1, "must not read comments or write anything");
+        assert_eq!(reqs[0].method, "GET");
     }
 
     #[test]
@@ -1193,7 +1239,7 @@ mod tests {
         .unwrap()
     }
 
-    const QUEUE_ONE_ISSUE: &str = r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}]}]"#;
+    const QUEUE_ONE_ISSUE: &str = r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}],"author_association":"OWNER"}]"#;
 
     fn one_comment(id: u64, body: &str) -> String {
         format!(
@@ -1357,7 +1403,7 @@ mod tests {
         // labels fed the content hash, so the very next tick saw a "change"
         // and posted "Progress from …" reporting the bridge's own side
         // effect — one junk comment on every issue it ever claims.
-        let with_claim = r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"},{"name":"claimed:me:1"}]}]"#;
+        let with_claim = r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"},{"name":"claimed:me:1"}],"author_association":"OWNER"}]"#;
         let server = MockServer::start(vec![
             MockResponse::json(200, with_claim),
             MockResponse::json(
@@ -1389,7 +1435,7 @@ mod tests {
     fn a_real_label_change_still_reads_as_a_content_change() {
         // The guard rail: filtering `claimed:` must not make the hash blind
         // to labels a HUMAN adds.
-        let relabelled = r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"},{"name":"urgent"}]}]"#;
+        let relabelled = r#"[{"number":7,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"},{"name":"urgent"}],"author_association":"OWNER"}]"#;
         let server = MockServer::start(vec![
             MockResponse::json(200, relabelled),
             MockResponse::json(
@@ -1566,8 +1612,8 @@ mod tests {
         // queue whose head was already tracked burned the whole allowance and
         // this instance claimed nothing — every tick, while free issues sat
         // right below the head.
-        let queue = r#"[{"number":1,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}]},
-                        {"number":2,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}]}]"#;
+        let queue = r#"[{"number":1,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}],"author_association":"OWNER"},
+                        {"number":2,"html_url":"u","state":"open","title":"t","body":"","labels":[{"name":"agentflare"}],"author_association":"OWNER"}]"#;
         let server = MockServer::start(vec![
             MockResponse::json(200, queue),
             // step 1 re-verifies #1: our own fresh claim, so we keep it and
