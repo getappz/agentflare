@@ -97,18 +97,33 @@ pub fn run(agent: Option<&str>, json: bool) {
             .unwrap()
         );
     } else {
-        for r in &checks {
-            let mark = if r.ok { "ok" } else { "MISSING" };
-            println!(
-                "[{mark:7}] {:16} {:10} {}",
-                r.host, r.component_id, r.describe
-            );
+        let total = checks.len();
+        let passed = checks.iter().filter(|r| r.ok).count();
+
+        println!("agentflare doctor\n");
+        for host in &hosts {
+            let host_checks: Vec<&CheckResult> =
+                checks.iter().filter(|r| &r.host == host).collect();
+            let host_stale: Vec<&StaleRule> = stale.iter().filter(|s| &s.host == host).collect();
+            let host_ok = host_checks.iter().filter(|r| r.ok).count();
+            let host_total = host_checks.len();
+            let host_healthy = host_ok == host_total && host_stale.is_empty();
+            let mark = if host_healthy { "✓" } else { "✗" };
+
+            println!("{mark} {host:16} {host_ok}/{host_total} ok");
+            for r in host_checks.iter().filter(|r| !r.ok) {
+                println!("    ✗ {:22} {}", r.component_id, r.describe);
+            }
+            for s in &host_stale {
+                println!("    ⚠ stale rule: {}", s.path.display());
+            }
         }
-        for s in &stale {
-            println!("[STALE  ] {:16} {}", s.host, s.path.display());
-        }
+
+        println!();
         if healthy {
-            println!("all checks passed");
+            println!("{passed}/{total} checks passed — all good.");
+        } else {
+            println!("{passed}/{total} checks passed — run `agentflare init` to fix.");
         }
     }
 
