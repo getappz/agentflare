@@ -152,6 +152,7 @@ fn lock_project_config(repo_root: &Path) -> Result<std::fs::File, String> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)
         .map_err(|e| format!("{}: {e}", lock_path.display()))?;
     fs2::FileExt::lock_exclusive(&file).map_err(|e| format!("{}: {e}", lock_path.display()))?;
