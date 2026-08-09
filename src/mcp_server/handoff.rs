@@ -91,8 +91,8 @@ impl AgentflareMcp {
                         assignee_agent: Some(recipient.clone()),
                         ..Default::default()
                     };
-                    let item =
-                        agentflare_backend::item::update(conn, id, input).map_err(map_backend_err)?;
+                    let item = agentflare_backend::item::update(conn, id, input)
+                        .map_err(map_backend_err)?;
                     // Queue it for autonomous dispatch too, same as the
                     // brand-new-item path below — but only when it's safe:
                     // genuinely fresh (backlog/unstarted/triage) and nobody
@@ -107,9 +107,13 @@ impl AgentflareMcp {
                     // needed a separate `item add_label` call every time.
                     let state = agentflare_backend::state::get(conn, &item.state_id)
                         .map_err(map_backend_err)?;
-                    let never_claimed = agentflare_backend::claim::current_owner(conn, id).is_none();
+                    let never_claimed =
+                        agentflare_backend::claim::current_owner(conn, id).is_none();
                     if never_claimed
-                        && matches!(state.group_name.as_str(), "backlog" | "unstarted" | "triage")
+                        && matches!(
+                            state.group_name.as_str(),
+                            "backlog" | "unstarted" | "triage"
+                        )
                         && let Some(ready_id) = ready_label_id(conn, &project.id)
                     {
                         let _ = agentflare_backend::item::add_label(conn, id, &ready_id);
