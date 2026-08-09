@@ -368,11 +368,35 @@ pub(crate) fn ensure_on_path(_dir: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
+/// `true` on Unix when `path` has at least one executable bit set. Git
+/// silently ignores a non-executable hook (just an advisory "hint", not an
+/// error), so a content-correct-but-non-executable hook must NOT read as
+/// installed -- confirmed live: this exact gap let a direct commit through
+/// on `master` moments after this component's own commit landed, because
+/// the merge hadn't yet brought in the executable-bit fix.
+///
+/// Always `true` on non-Unix: there's no POSIX exec bit to check, and
+/// `install_hooks_for` never attempts to set one there either (matching git
+/// for Windows' own model, where hook "executability" isn't a filesystem
+/// permission).
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool {
+    true
+}
+
 /// `true` when `repo_root`'s hooks are already current: `core.hooksPath` is
-/// `.githooks` and every file in `HOOKS` exists there with content matching
-/// the embedded template. Used by both the CLI command (to skip a no-op
-/// re-copy) and the `init`/`doctor` "githooks" component (to report
-/// satisfied without touching the filesystem).
+/// `.githooks` and every file in `HOOKS` exists there, executable, with
+/// content matching the embedded template. Used by both the CLI command (to
+/// skip a no-op re-copy) and the `init`/`doctor` "githooks" component (to
+/// report satisfied without touching the filesystem).
 pub(crate) fn hooks_installed_for(repo_root: &Path) -> bool {
     let hooks_path =
         flare_git_core::shell::run_in_opt(repo_root, &["config", "--get", "core.hooksPath"]);
@@ -380,14 +404,17 @@ pub(crate) fn hooks_installed_for(repo_root: &Path) -> bool {
         return false;
     }
     HOOKS.iter().all(|(name, template)| {
-        fs::read(repo_root.join(".githooks").join(name)).ok().as_deref() == Some(template.as_bytes())
+        let dst = repo_root.join(".githooks").join(name);
+        fs::read(&dst).ok().as_deref() == Some(template.as_bytes()) && is_executable(&dst)
     })
 }
 
 /// Writes the shared canonical templates (if missing), copies whichever of
-/// `HOOKS` are missing or stale into `repo_root/.githooks/`, and points
-/// `core.hooksPath` at it if it isn't already. Returns whether anything
-/// actually changed. Shared by the interactive CLI command and the
+/// `HOOKS` are missing or stale into `repo_root/.githooks/`, chmods +x
+/// whichever aren't already executable (checked independently of content --
+/// a content-correct file can still have lost its executable bit), and
+/// points `core.hooksPath` at it if it isn't already. Returns whether
+/// anything actually changed. Shared by the interactive CLI command and the
 /// `init`/`doctor` "githooks" component -- same logic, same source of
 /// truth, so the two can never drift apart on what "installed" means.
 pub(crate) fn install_hooks_for(repo_root: &Path) -> Result<bool, String> {
@@ -399,16 +426,17 @@ pub(crate) fn install_hooks_for(repo_root: &Path) -> Result<bool, String> {
     let mut changed = false;
     for (name, template) in HOOKS {
         let dst = local_dir.join(name);
-        if fs::read(&dst).ok().as_deref() == Some(template.as_bytes()) {
-            continue;
+        if fs::read(&dst).ok().as_deref() != Some(template.as_bytes()) {
+            fs::write(&dst, template).map_err(|e| format!("writing {name}: {e}"))?;
+            changed = true;
         }
-        fs::write(&dst, template).map_err(|e| format!("writing {name}: {e}"))?;
         #[cfg(unix)]
-        {
+        if !is_executable(&dst) {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o755));
+            fs::set_permissions(&dst, fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("chmod +x {name}: {e}"))?;
+            changed = true;
         }
-        changed = true;
     }
 
     let current_hooks_path =
@@ -1195,6 +1223,33 @@ mod tests {
         assert!(changed, "a stale hook must be rewritten");
         let content = std::fs::read(repo.path().join(".githooks").join("pre-commit")).unwrap();
         assert_eq!(content, PRE_COMMIT.as_bytes());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_hooks_for_repairs_a_hook_that_lost_its_executable_bit() {
+        // Content-correct but not executable: git silently ignores the hook
+        // (an advisory hint, not an error) rather than running it -- so a
+        // check that only compares content would report "installed" on a
+        // hook that in practice never fires. Confirmed live: this exact gap
+        // let a direct commit through on master moments after this
+        // component's own fix commit landed, because the merge hadn't yet
+        // brought the executable-bit fix into the working tree.
+        use std::os::unix::fs::PermissionsExt;
+        let repo = init_repo();
+        install_hooks_for(repo.path()).unwrap();
+        let dst = repo.path().join(".githooks").join("pre-commit");
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            !hooks_installed_for(repo.path()),
+            "a non-executable hook must not read as installed, even with correct content"
+        );
+        let changed = install_hooks_for(repo.path()).unwrap();
+        assert!(changed, "the lost executable bit must be restored");
+        assert!(is_executable(&dst));
+        // Content untouched -- only the mode needed fixing.
+        assert_eq!(std::fs::read(&dst).unwrap(), PRE_COMMIT.as_bytes());
     }
 
     #[test]
