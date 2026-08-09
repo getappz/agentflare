@@ -339,8 +339,61 @@ fn notify(recipient: &str, body: &str, item_id: &str) {
 
 impl WorkArgs {
     pub fn run(self) {
-        std::process::exit(execute_work(self, &mut std::io::stdout()));
+        std::process::exit(execute_work(self, &mut std::io::stdout()).exit_code);
     }
+}
+
+/// `execute_work`'s result: the process exit code (0 = success), plus — set
+/// only when the failure was classified as rate-limit shaped — a hint for
+/// how long the job queue should wait before retrying this item.
+/// `WorkItemExecutor` converts this into `agentflare_jobs::JobFailure`.
+pub(crate) struct WorkOutcome {
+    pub exit_code: i32,
+    pub retry_after_secs: Option<u64>,
+}
+
+impl From<i32> for WorkOutcome {
+    fn from(exit_code: i32) -> Self {
+        WorkOutcome {
+            exit_code,
+            retry_after_secs: None,
+        }
+    }
+}
+
+/// Cooldown-table key used when there's no active vault rotation profile for
+/// `agent` — keeps `auth_db`'s `(agent, profile)`-keyed cooldown table as the
+/// single source of truth for both the interactive (`auth_runner`) and
+/// autonomous (this file) dispatch paths, even for the common single-
+/// credential setup that never configured vault profiles.
+const DEFAULT_COOLDOWN_PROFILE: &str = "__default__";
+/// Matches the cooldown length `auth_runner::run` already uses for the
+/// interactive path's rate-limit rotation.
+const RATE_LIMIT_COOLDOWN_MINUTES: u32 = 30;
+
+/// Classifies a headless run's failure message the same way the interactive
+/// `agentflare run` path does (`auth_runner::is_rate_limited`) and, if it
+/// looks rate-limit shaped, records a cooldown so `auth_db::is_cooling_down`
+/// (checked by the discovery tick before dispatching the next item for this
+/// agent, and by `auth rotate`) sees it too. Returns the seconds until that
+/// cooldown clears, for the caller to pass through as the job queue's
+/// retry-after delay.
+fn classify_and_cooldown(agent: &str, failure_message: &str) -> Option<u64> {
+    if !crate::auth_runner::is_rate_limited(failure_message) {
+        return None;
+    }
+    let conn = crate::auth_db::open_or_rebuild();
+    let profile = crate::auth_db::get_rotation_last(&conn, agent)
+        .map(|(profile, _)| profile)
+        .unwrap_or_else(|| DEFAULT_COOLDOWN_PROFILE.to_string());
+    crate::auth_db::set_cooldown(
+        &conn,
+        agent,
+        &profile,
+        RATE_LIMIT_COOLDOWN_MINUTES,
+        "rate limit",
+    );
+    Some(RATE_LIMIT_COOLDOWN_MINUTES as u64 * 60)
 }
 
 /// Claims `args.target`, runs the resolved agent on it, and reports the
@@ -351,7 +404,7 @@ impl WorkArgs {
 /// progress captured into that job's own log file — the exact same file the
 /// dashboard already tails for subprocess-dispatched jobs — rather than only
 /// working when there's a real subprocess's stdout to capture.
-pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> i32 {
+pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> WorkOutcome {
     let mcp = AgentflareMcp::default();
     let timeout = Duration::from_secs(args.timeout);
     let idle_timeout = Duration::from_secs(args.idle_timeout);
@@ -365,7 +418,7 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> i32 
             crate::ui::error(&format!(
                 "unknown agent: {explicit} — use `agentflare agents list`"
             ));
-            return 1;
+            return 1.into();
         };
         // The claim below identifies its own owner via `claims::owner_id()`,
         // which falls back to agent-detector's parent-process/env sniffing
@@ -406,7 +459,7 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> i32 
         Ok(json) => json,
         Err(e) => {
             crate::ui::error(&format!("claim failed: {}", e.message));
-            return 1;
+            return 1.into();
         }
     };
     let claim: serde_json::Value =
@@ -416,7 +469,7 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> i32 
         let owner = claim["owner"].as_str().unwrap_or("?");
         let age = claim["age_secs"].as_i64().unwrap_or(0);
         crate::ui::error(&format!("item held by {owner} ({age}s) — cannot claim"));
-        return 1;
+        return 1.into();
     }
     let item_id = claim["item_id"]
         .as_str()
@@ -433,7 +486,7 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> i32 
         let msg = "claim succeeded but no worktree was created (bad git state?)";
         release_and_comment(&mcp, item_id, msg, args.notify.as_deref());
         crate::ui::error(msg);
-        return 1;
+        return 1.into();
     };
     let _ = writeln!(log, "worktree: {}", wpath.display());
 
@@ -456,7 +509,7 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> i32 
             let msg = "failed to read item details after claim";
             release_and_comment(&mcp, item_id, msg, args.notify.as_deref());
             crate::ui::error(msg);
-            return 1;
+            return 1.into();
         }
     };
 
@@ -489,14 +542,14 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> i32 
         Err(msg) => {
             release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
             crate::ui::error(&msg);
-            return 1;
+            return 1.into();
         }
     };
     if headless_args(agent_enum).is_none() {
         let msg = format!("agent {} has no headless print mode", agent_enum.as_str());
         release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
         crate::ui::error(&msg);
-        return 1;
+        return 1.into();
     }
     let _ = writeln!(log, "agent: {} ({route_reason})", agent_enum.as_str());
 
@@ -511,7 +564,7 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> i32 
         let msg = format!("failed to chdir into {}", wpath.display());
         release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
         crate::ui::error(&msg);
-        return 1;
+        return 1.into();
     }
 
     let outcome = agent_launch::run_headless(
@@ -554,7 +607,7 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> i32 
                 Ok(j) => j,
                 Err(e) => {
                     crate::ui::error(&format!("item_done failed: {}", e.message));
-                    return 1;
+                    return 1.into();
                 }
             };
             let done_val: serde_json::Value =
@@ -581,14 +634,18 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> i32 
             if let Some(url) = &pr_url {
                 let _ = writeln!(log, "pr: {url}");
             }
-            0
+            0.into()
         }
         other => {
             let msg = failure_message(&other);
             release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
             crate::ui::error(&msg);
             let _ = writeln!(log, "failed: {msg}");
-            1
+            let retry_after_secs = classify_and_cooldown(agent_enum.as_str(), &msg);
+            WorkOutcome {
+                exit_code: 1,
+                retry_after_secs,
+            }
         }
     }
 }
@@ -606,11 +663,12 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
         job_id: &str,
         args: &[String],
         log: &mut dyn std::io::Write,
-    ) -> Result<(), String> {
+    ) -> Result<(), agentflare_jobs::JobFailure> {
         let (Some(item_id), Some(agent)) = (args.first(), args.get(1)) else {
             return Err(format!(
                 "malformed in-process work job: expected [item_id, agent], got {args:?}"
-            ));
+            )
+            .into());
         };
         let work_args = WorkArgs {
             target: item_id.clone(),
@@ -625,13 +683,17 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
         // discriminator, playing the role a subprocess's unique pid plays
         // for `claims::owner_id()` in the CLI path (see its doc comment).
         let owner = format!("{agent}:{job_id}");
-        let exit_code = crate::claims::with_owner_override(owner, || execute_work(work_args, log));
-        if exit_code == 0 {
+        let outcome = crate::claims::with_owner_override(owner, || execute_work(work_args, log));
+        if outcome.exit_code == 0 {
             Ok(())
         } else {
-            Err(format!(
-                "agentflare work exited with code {exit_code} — see the job log for details"
-            ))
+            Err(agentflare_jobs::JobFailure {
+                message: format!(
+                    "agentflare work exited with code {} — see the job log for details",
+                    outcome.exit_code
+                ),
+                retry_after_secs: outcome.retry_after_secs,
+            })
         }
     }
 }
@@ -900,6 +962,36 @@ use  = "opencode"
     fn failure_message_extracts_inner_string() {
         let outcome = HeadlessOutcome::NotFound("claude not found".into());
         assert_eq!(failure_message(&outcome), "claude not found");
+    }
+
+    #[test]
+    fn failure_message_includes_diagnostic_suffix_for_plain_failures() {
+        let outcome = HeadlessOutcome::Failed(format!(
+            "claude-code exited non-zero — last stderr before kill:\n{}",
+            "HTTP 429 Too Many Requests"
+        ));
+        let msg = failure_message(&outcome);
+        assert!(msg.contains("HTTP 429 Too Many Requests"));
+    }
+
+    #[test]
+    fn classify_and_cooldown_ignores_non_rate_limit_failures() {
+        crate::paths::test_support::with_temp_home(|| {
+            let retry = classify_and_cooldown("claude-code", "something went wrong");
+            assert!(retry.is_none());
+            let conn = crate::auth_db::open_or_rebuild();
+            assert!(!crate::auth_db::is_cooling_down(&conn, "claude-code"));
+        });
+    }
+
+    #[test]
+    fn classify_and_cooldown_sets_a_cooldown_on_rate_limit_shaped_failures() {
+        crate::paths::test_support::with_temp_home(|| {
+            let retry = classify_and_cooldown("claude-code", "HTTP 429 Too Many Requests");
+            assert_eq!(retry, Some(RATE_LIMIT_COOLDOWN_MINUTES as u64 * 60));
+            let conn = crate::auth_db::open_or_rebuild();
+            assert!(crate::auth_db::is_cooling_down(&conn, "claude-code"));
+        });
     }
 
     #[test]

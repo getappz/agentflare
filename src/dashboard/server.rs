@@ -182,7 +182,8 @@ fn spawn_supervisor_discovery(
             let queue = queue.clone();
             let mcp = mcp.clone();
             let result = tokio::task::spawn_blocking(move || {
-                crate::supervisor::run_discovery_tick(&mcp, &queue)
+                let auth_conn = crate::auth_db::open_or_rebuild();
+                crate::supervisor::run_discovery_tick(&mcp, &queue, &auth_conn)
             })
             .await;
             match result {
@@ -582,6 +583,27 @@ fn is_local_bind(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
+/// Parses `AGENTFLARE_WORK_MAX_CONCURRENCY` (default `2`, matching the
+/// hardcoded value this replaces). Split into a pure parse step so the
+/// override logic is testable without mutating process-global env state —
+/// env vars are shared across the whole test binary, unlike this narrow
+/// seam. Zero and unparseable values fall back to the default rather than
+/// silently starting a `WorkerPool` with no workers, which would wedge the
+/// queue forever with no error.
+fn parse_work_max_concurrency(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(2)
+}
+
+fn work_max_concurrency() -> usize {
+    parse_work_max_concurrency(
+        std::env::var("AGENTFLARE_WORK_MAX_CONCURRENCY")
+            .ok()
+            .as_deref(),
+    )
+}
+
 pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
     if !is_local_bind(host) && !yes_expose {
         eprintln!(
@@ -607,7 +629,7 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
     // which relies on SIGTERM/SIGKILL), so neither does this.
     let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
         .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor));
-    worker_pool.start(2);
+    worker_pool.start(work_max_concurrency());
     spawn_job_cleanup(queue.clone());
     spawn_supervisor_discovery(
         queue.clone(),
@@ -635,6 +657,22 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_work_max_concurrency_defaults_to_two() {
+        assert_eq!(parse_work_max_concurrency(None), 2);
+    }
+
+    #[test]
+    fn parse_work_max_concurrency_honors_a_valid_override() {
+        assert_eq!(parse_work_max_concurrency(Some("5")), 5);
+    }
+
+    #[test]
+    fn parse_work_max_concurrency_falls_back_on_garbage_or_zero() {
+        assert_eq!(parse_work_max_concurrency(Some("not-a-number")), 2);
+        assert_eq!(parse_work_max_concurrency(Some("0")), 2);
+    }
 
     fn test_queue() -> Queue {
         // `.keep()` so the dir outlives this function — otherwise the

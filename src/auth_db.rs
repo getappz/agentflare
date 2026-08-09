@@ -260,6 +260,19 @@ pub fn list_cooldowns(conn: &Connection, agent: Option<&str>) -> Vec<CooldownRow
     }
 }
 
+/// True if `agent` has at least one active (not-yet-expired) cooldown row,
+/// for any profile. Checked by agent only, not agent+profile: a caller
+/// deciding whether to dispatch a not-yet-started job doesn't know which
+/// profile that job will end up using, so this errs toward not dispatching
+/// rather than guessing a specific profile. Used by the autonomous
+/// work-dispatch path (`src/supervisor.rs`'s discovery tick, `src/cli/work.rs`'s
+/// `classify_and_cooldown`) to pause redispatch into a rate limit the
+/// interactive path (`auth_runner`) already recorded — or that this same
+/// autonomous path just recorded itself.
+pub fn is_cooling_down(conn: &Connection, agent: &str) -> bool {
+    !list_cooldowns(conn, Some(agent)).is_empty()
+}
+
 pub fn clear_cooldown(conn: &Connection, agent: &str, profile: &str) {
     conn.execute(
         "DELETE FROM cooldowns WHERE agent = ?1 AND profile = ?2",
@@ -444,6 +457,16 @@ mod tests {
             let list = list_cooldowns(&conn, Some("claude-code"));
             assert_eq!(list.len(), 1);
             assert_eq!(list[0].profile, "alice");
+        });
+    }
+
+    #[test]
+    fn is_cooling_down_reflects_active_cooldowns() {
+        with_temp_home(|| {
+            let conn = open_or_rebuild();
+            assert!(!is_cooling_down(&conn, "claude-code"));
+            set_cooldown(&conn, "claude-code", "alice", 30, "rate limit");
+            assert!(is_cooling_down(&conn, "claude-code"));
         });
     }
 

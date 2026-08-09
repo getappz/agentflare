@@ -5,7 +5,9 @@
 //! separate from `worker_test.rs`'s existing subprocess-path coverage, which
 //! stays unchanged and passing to prove that path is untouched.
 
-use agentflare_jobs::{AgentJob, InProcessExecutor, JobInfo, JobState, Queue, WorkerPool};
+use agentflare_jobs::{
+    AgentJob, InProcessExecutor, JobFailure, JobInfo, JobState, Queue, WorkerPool,
+};
 use std::sync::Arc;
 
 fn test_queue() -> Queue {
@@ -34,7 +36,7 @@ impl InProcessExecutor for EchoExecutor {
         job_id: &str,
         args: &[String],
         log: &mut dyn std::io::Write,
-    ) -> Result<(), String> {
+    ) -> Result<(), JobFailure> {
         let _ = writeln!(log, "running job {job_id} with args {args:?}");
         Ok(())
     }
@@ -81,8 +83,8 @@ impl InProcessExecutor for FailingExecutor {
         _job_id: &str,
         _args: &[String],
         _log: &mut dyn std::io::Write,
-    ) -> Result<(), String> {
-        Err("deliberate failure".to_string())
+    ) -> Result<(), JobFailure> {
+        Err("deliberate failure".into())
     }
 }
 
@@ -135,7 +137,7 @@ impl InProcessExecutor for SlowExecutor {
         _job_id: &str,
         _args: &[String],
         _log: &mut dyn std::io::Write,
-    ) -> Result<(), String> {
+    ) -> Result<(), JobFailure> {
         std::thread::sleep(std::time::Duration::from_secs(5));
         Ok(())
     }

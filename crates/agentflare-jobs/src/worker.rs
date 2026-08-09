@@ -1,4 +1,4 @@
-use crate::executor::InProcessExecutor;
+use crate::executor::{InProcessExecutor, JobFailure};
 use crate::queue::Queue;
 use crate::supervisor::Supervisor;
 use crate::types::JobOutput;
@@ -99,7 +99,7 @@ fn worker_loop(queue: &Queue, running: &AtomicBool, executor: Option<&Arc<dyn In
                         }
                     }
                     Err(e) => {
-                        if let Err(qe) = queue.fail(&id, &e.to_string()) {
+                        if let Err(qe) = queue.fail(&id, &e.to_string(), None) {
                             eprintln!("agentflare-jobs: failed to record failure for {id}: {qe}");
                         }
                     }
@@ -147,6 +147,7 @@ fn run_in_process(
         if let Err(e) = queue.fail(
             id,
             "job is marked in_process but no InProcessExecutor is registered on this WorkerPool",
+            None,
         ) {
             eprintln!("agentflare-jobs: failed to record failure for {id}: {e}");
         }
@@ -158,14 +159,14 @@ fn run_in_process(
     let mut log_file = match std::fs::File::create(&stdout_path) {
         Ok(f) => f,
         Err(e) => {
-            if let Err(qe) = queue.fail(id, &format!("failed to open job log file: {e}")) {
+            if let Err(qe) = queue.fail(id, &format!("failed to open job log file: {e}"), None) {
                 eprintln!("agentflare-jobs: failed to record failure for {id}: {qe}");
             }
             return;
         }
     };
 
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), JobFailure>>();
     let executor = executor.clone();
     let job_id = id.to_string();
     let args = job.args.clone();
@@ -192,8 +193,8 @@ fn run_in_process(
                 eprintln!("agentflare-jobs: failed to complete job {id}: {e}");
             }
         }
-        Ok(Err(msg)) => {
-            if let Err(e) = queue.fail(id, &msg) {
+        Ok(Err(failure)) => {
+            if let Err(e) = queue.fail(id, &failure.message, failure.retry_after_secs) {
                 eprintln!("agentflare-jobs: failed to record failure for {id}: {e}");
             }
         }
@@ -205,7 +206,7 @@ fn run_in_process(
                  what this timeout measures)",
                 job.timeout_secs
             );
-            if let Err(e) = queue.fail(id, &msg) {
+            if let Err(e) = queue.fail(id, &msg, None) {
                 eprintln!("agentflare-jobs: failed to record failure for {id}: {e}");
             }
         }

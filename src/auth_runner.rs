@@ -65,12 +65,22 @@ enum ExitKind {
     Failure(i32),
 }
 
+/// Pattern-matches `text` against the same rate-limit phrase list the
+/// interactive retry loop above uses (`RATE_LIMIT_PATTERNS`), independent of
+/// any exit code — used by the autonomous work-dispatch path
+/// (`src/cli/work.rs`'s `classify_and_cooldown`) to classify a headless
+/// run's captured failure text the same way this file's own retry loop
+/// already classifies a subprocess's stderr.
+pub(crate) fn is_rate_limited(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    RATE_LIMIT_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
 fn categorize_exit(code: i32, stderr: &str) -> ExitKind {
     if code == 0 {
         return ExitKind::Success;
     }
-    let lower = stderr.to_lowercase();
-    if RATE_LIMIT_PATTERNS.iter().any(|p| lower.contains(p)) {
+    if is_rate_limited(stderr) {
         return ExitKind::RateLimited;
     }
     ExitKind::Failure(code)
@@ -186,5 +196,12 @@ mod tests {
     fn categorize_failure_on_unknown_error() {
         let result = categorize_exit(1, "something went wrong");
         assert!(matches!(result, ExitKind::Failure(1)));
+    }
+
+    #[test]
+    fn is_rate_limited_matches_common_phrases() {
+        assert!(is_rate_limited("HTTP 429 Too Many Requests"));
+        assert!(is_rate_limited("quota exceeded for today"));
+        assert!(!is_rate_limited("something went wrong"));
     }
 }
