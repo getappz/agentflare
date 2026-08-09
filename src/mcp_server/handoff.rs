@@ -1,5 +1,18 @@
 use super::*;
 
+/// The project's `ready-for-work` label id, if the project has that label at
+/// all — skipped (returns `None`) rather than creating it out of nowhere.
+/// Shared by both branches of `handoff_impl` below: a brand-new handed-off
+/// item, and an existing item that's safe to queue (see the `Some(id)`
+/// branch's own comment for what "safe" means there).
+fn ready_label_id(conn: &rusqlite::Connection, project_id: &str) -> Option<String> {
+    agentflare_backend::label::list_by_project(conn, project_id)
+        .ok()?
+        .into_iter()
+        .find(|l| l.name == crate::supervisor::READY_LABEL)
+        .map(|l| l.id)
+}
+
 impl AgentflareMcp {
     pub fn handoff_impl(
         &self,
@@ -78,7 +91,30 @@ impl AgentflareMcp {
                         assignee_agent: Some(recipient.clone()),
                         ..Default::default()
                     };
-                    agentflare_backend::item::update(conn, id, input).map_err(map_backend_err)?
+                    let item =
+                        agentflare_backend::item::update(conn, id, input).map_err(map_backend_err)?;
+                    // Queue it for autonomous dispatch too, same as the
+                    // brand-new-item path below — but only when it's safe:
+                    // genuinely fresh (backlog/unstarted/triage) and nobody
+                    // has ever claimed it. An explicit `item_id` handoff onto
+                    // something already claimed, in progress, in review, or
+                    // completed must NOT be silently re-queued — same danger
+                    // the reply/continuation branch below already guards
+                    // against, just reached via a different path (a caller
+                    // passing `item_id` directly instead of relying on
+                    // name/thread matching). Without this, `handoff` onto an
+                    // existing item only ever set the assignee — queuing it
+                    // needed a separate `item add_label` call every time.
+                    let state = agentflare_backend::state::get(conn, &item.state_id)
+                        .map_err(map_backend_err)?;
+                    let never_claimed = agentflare_backend::claim::current_owner(conn, id).is_none();
+                    if never_claimed
+                        && matches!(state.group_name.as_str(), "backlog" | "unstarted" | "triage")
+                        && let Some(ready_id) = ready_label_id(conn, &project.id)
+                    {
+                        let _ = agentflare_backend::item::add_label(conn, id, &ready_id);
+                    }
+                    item
                 }
                 None => {
                     // Reuse an existing open item already assigned to the
@@ -136,15 +172,7 @@ impl AgentflareMcp {
                         // may already be claimed, in progress, or done, and
                         // silently re-queuing those for dispatch would be
                         // wrong.
-                        let ready_label_id =
-                            agentflare_backend::label::list_by_project(conn, &project.id)
-                                .ok()
-                                .and_then(|labels| {
-                                    labels
-                                        .into_iter()
-                                        .find(|l| l.name == crate::supervisor::READY_LABEL)
-                                })
-                                .map(|l| l.id);
+                        let ready_label_id = ready_label_id(conn, &project.id);
                         let input = agentflare_backend::item::CreateItem {
                             project_id: project.id.clone(),
                             state_id,
@@ -449,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_to_an_existing_item_is_not_labeled_ready_for_work() {
+    fn a_reply_to_an_already_claimed_item_is_not_relabeled_ready_for_work() {
         let (_tmp, mcp) = test_mcp();
         seed_ready_for_work_label(&mcp);
 
@@ -459,8 +487,32 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        // A human clears the label after picking it up manually, same as the
-        // supervisor's own discovery tick would once it dispatches the item.
+        // The recipient actually claims it — moves to "started", creates a
+        // claim row — same as the supervisor's own discovery tick dispatch
+        // would once it picks the item up. This is the real condition the
+        // explicit-`item_id` branch must protect against, not merely the
+        // label being absent (see the sibling test below: a still-fresh
+        // item with no label DOES get relabeled now, on purpose). Claims
+        // directly against the backend (not through the MCP `item_claim`
+        // wrapper, whose owner resolves ambiently from process identity —
+        // not controllable here) with an owner matching the assignee
+        // (`claude-code`), since `item::claim`'s handoff-freeze rule blocks
+        // a mismatched owner from acquiring a freshly handed-off item.
+        mcp.with_backend_db(|conn| {
+            agentflare_backend::item::claim(
+                conn,
+                &item_id,
+                "claude-code:test",
+                db_kit::ids::now(),
+                1800,
+            )
+        })
+        .unwrap()
+        .unwrap();
+        // The real dispatch path (`supervisor::dispatch_item`) strips the
+        // ready-for-work label the moment it enqueues a job, well before
+        // the agent ever claims anything — mirror that here so this test
+        // reflects the label state a real in-flight item actually has.
         mcp.with_backend_db(|conn| {
             let label_ids = agentflare_backend::item::list_labels(conn, &item_id).unwrap();
             for id in label_ids {
@@ -469,8 +521,8 @@ mod tests {
         })
         .unwrap();
 
-        // A reply (item_id set) must not silently re-queue an item that may
-        // already be claimed, in progress, or done.
+        // A reply (item_id set) must not silently re-queue an item that's
+        // already claimed, in progress, or done.
         let reply = HandoffRequest {
             item_id: Some(item_id.clone()),
             completed: "more".to_string(),
@@ -480,5 +532,43 @@ mod tests {
         mcp.handoff_impl(reply).unwrap();
 
         assert!(item_label_names(&mcp, &item_id).is_empty());
+    }
+
+    #[test]
+    fn an_explicit_item_id_handoff_labels_a_still_fresh_unclaimed_item() {
+        let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
+
+        // First handoff creates the item, then a human clears the label
+        // without actually claiming it (e.g. picked up by hand outside the
+        // autonomous queue, or just never got labeled the first time).
+        let first = mcp.handoff_impl(base_request()).unwrap();
+        let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        mcp.with_backend_db(|conn| {
+            let label_ids = agentflare_backend::item::list_labels(conn, &item_id).unwrap();
+            for id in label_ids {
+                agentflare_backend::item::remove_label(conn, &item_id, &id).unwrap();
+            }
+        })
+        .unwrap();
+
+        // A second handoff onto the same still-fresh, never-claimed item
+        // must queue it for dispatch — the whole point of this change is
+        // that a single `handoff(item_id=...)` call is enough, no separate
+        // `item add_label` call required.
+        let reply = HandoffRequest {
+            item_id: Some(item_id.clone()),
+            completed: "more".to_string(),
+            remaining: "less".to_string(),
+            ..base_request()
+        };
+        mcp.handoff_impl(reply).unwrap();
+
+        assert!(
+            item_label_names(&mcp, &item_id).contains(&crate::supervisor::READY_LABEL.to_string())
+        );
     }
 }
