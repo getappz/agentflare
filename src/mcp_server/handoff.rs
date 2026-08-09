@@ -321,13 +321,19 @@ impl AgentflareMcp {
     /// claim/heartbeat/export lifecycle already live in `github::issues` and
     /// `github::bridge::tick`; this just gets work onto the queue.
     ///
-    /// Idempotent across retries: the full structured payload (`content`,
-    /// `completed`, `remaining`, `thread_id`) and a dedup key (`thread_id`,
-    /// else `name`) are embedded as a hidden marker in the issue body
+    /// Idempotent across retries while the previous attempt's issue is still
+    /// UNCLAIMED: the full structured payload (`content`, `completed`,
+    /// `remaining`, `thread_id`) and a dedup key (`thread_id`, else `name`)
+    /// are embedded as a hidden marker in the issue body
     /// (`bridge::handoff_payload`) -- recovered by the bridge importer
     /// (`tick::record_claim`) when the issue is claimed, and looked up here
     /// first so a retry after a timeout reuses the existing issue instead of
-    /// publishing a duplicate.
+    /// publishing a duplicate. Once claimed, a matching key is NOT reused --
+    /// a local item already exists carrying that payload, and nothing
+    /// re-reads the issue afterward, so reusing it would silently drop this
+    /// call's (possibly updated) `completed`/`remaining` instead of
+    /// publishing them as a fresh, distinct entry. The result's `reused`
+    /// field says which happened.
     fn handoff_to_bridge_queue(
         &self,
         name: &str,
@@ -337,6 +343,7 @@ impl AgentflareMcp {
         remaining: &str,
         thread_id: Option<&str>,
     ) -> Result<String, ErrorData> {
+        use crate::github::bridge::claim as claim_rules;
         use crate::github::bridge::handoff_payload::HandoffPayload;
         use crate::github::{Client, bridge::config, issues};
 
@@ -364,8 +371,15 @@ impl AgentflareMcp {
 
         // A bare retry after e.g. a network timeout must reuse the issue
         // this call already created rather than publish a second one --
-        // `issues::create` has no idempotency of its own.
-        let existing = issues::list_filtered(&client, &repo, "open", Some(&queue_label), None)
+        // `issues::create` has no idempotency of its own. But only while
+        // that issue is still UNCLAIMED: once the bridge (or anything else)
+        // has claimed it, a local item already exists carrying this exact
+        // payload, and nothing re-reads the issue afterward -- returning it
+        // again here would silently swallow this call's (possibly updated)
+        // completed/remaining instead of the bare retry this exists for.
+        // Same claim-liveness check `queue_status`/`tick` already use, so a
+        // stale (expired) claim is correctly treated as no claim at all.
+        let candidate = issues::list_filtered(&client, &repo, "open", Some(&queue_label), None)
             .map_err(to_mcp_error)?
             .into_iter()
             .find(|issue| {
@@ -375,12 +389,30 @@ impl AgentflareMcp {
                     .and_then(HandoffPayload::extract)
                     .is_some_and(|p| p.key == key)
             });
+        let reusable = match candidate {
+            Some(issue) => {
+                let comments: Vec<(u64, String)> =
+                    issues::list_comments(&client, &repo, issue.number, None)
+                        .map_err(to_mcp_error)?
+                        .into_iter()
+                        .map(|c| (c.id, c.body))
+                        .collect();
+                let claimed = claim_rules::resolve_holder(
+                    &comments,
+                    crate::claims::now(),
+                    crate::claims::ttl_secs(),
+                )
+                .is_some();
+                (!claimed).then_some(issue)
+            }
+            None => None,
+        };
 
-        let issue = match existing {
-            Some(issue) => issue,
+        let (issue, reused) = match reusable {
+            Some(issue) => (issue, true),
             None => {
                 let body = payload.embed(description.unwrap_or(content));
-                issues::create(
+                let issue = issues::create(
                     &client,
                     &repo,
                     name,
@@ -388,7 +420,8 @@ impl AgentflareMcp {
                     std::slice::from_ref(&queue_label),
                     &[],
                 )
-                .map_err(to_mcp_error)?
+                .map_err(to_mcp_error)?;
+                (issue, false)
             }
         };
 
@@ -398,6 +431,7 @@ impl AgentflareMcp {
             "issue_url": issue.html_url,
             "queue_label": queue_label,
             "recipient": "github",
+            "reused": reused,
         });
 
         // Report rather than reject: a project-local [bridge].repo override
