@@ -194,7 +194,15 @@ pub fn write_project_bridge_settings(
     let path = repo_root.join(".agentflare").join("config.toml");
     let mut doc: toml::Value = match std::fs::read_to_string(&path) {
         Ok(s) => s.parse().map_err(|e| format!("{}: {e}", path.display()))?,
-        Err(_) => toml::Value::Table(toml::value::Table::new()),
+        // Only an absent file means "start from an empty document" -- any
+        // other read failure (permissions, the path being a directory, a
+        // transient I/O error) must not be treated the same way, or this
+        // would silently overwrite an existing, merely-unreadable config
+        // file with one containing only the [bridge] table just written.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(toml::value::Table::new())
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     let table = doc
         .as_table_mut()
@@ -224,8 +232,13 @@ pub fn write_project_bridge_settings(
 pub fn clear_project_bridge_settings(repo_root: &Path) -> Result<PathBuf, String> {
     let _lock = lock_project_config(repo_root)?;
     let path = repo_root.join(".agentflare").join("config.toml");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return Ok(path);
+    // Only an absent file is a true noop -- any other read failure must
+    // surface as an error rather than falsely reporting "cleared" when
+    // nothing was actually read or changed.
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     let mut doc: toml::Value = content
         .parse()
@@ -779,6 +792,31 @@ mod tests {
         let parsed: toml::Value = content.parse().unwrap();
         assert!(parsed.get("bridge").is_none());
         assert!(parsed.get("git_shim").is_some());
+    }
+
+    #[test]
+    fn write_project_bridge_settings_errors_rather_than_silently_starting_fresh_on_a_real_read_failure()
+     {
+        // A directory sitting where the config file is expected makes
+        // `read_to_string` fail with something other than `NotFound` on
+        // every platform -- must surface as an error, not be treated the
+        // same as "file absent" and have its (unreadable) content silently
+        // replaced by a document containing only the [bridge] table.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".agentflare").join("config.toml")).unwrap();
+
+        let err = write_project_bridge_settings(dir.path(), Some("o/r"), None).unwrap_err();
+        assert!(err.contains("config.toml"), "{err}");
+    }
+
+    #[test]
+    fn clear_project_bridge_settings_errors_rather_than_silently_reporting_cleared_on_a_real_read_failure()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".agentflare").join("config.toml")).unwrap();
+
+        let err = clear_project_bridge_settings(dir.path()).unwrap_err();
+        assert!(err.contains("config.toml"), "{err}");
     }
 
     #[test]
