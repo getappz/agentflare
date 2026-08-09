@@ -328,6 +328,7 @@ dependencies = [
  "libc",
  "memchr",
  "num-traits",
+ "objc2-core-foundation",
  "once_cell",
  "percent-encoding",
  "proc-macro2",
@@ -357,6 +358,7 @@ dependencies = [
  "typenum",
  "ureq 2.12.1",
  "winapi",
+ "windows 0.62.2",
  "windows-sys 0.61.2",
  "zeroize",
 ]
