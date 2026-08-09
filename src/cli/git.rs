@@ -1192,12 +1192,14 @@ mod tests {
         assert!(changed);
         for (name, template) in HOOKS {
             let content = std::fs::read(repo.path().join(".githooks").join(name)).unwrap();
-            assert_eq!(content, template.as_bytes(), "{name} should match the embedded template");
+            assert_eq!(
+                content,
+                template.as_bytes(),
+                "{name} should match the embedded template"
+            );
         }
-        let hooks_path = flare_git_core::shell::run_in_opt(
-            repo.path(),
-            &["config", "--get", "core.hooksPath"],
-        );
+        let hooks_path =
+            flare_git_core::shell::run_in_opt(repo.path(), &["config", "--get", "core.hooksPath"]);
         assert_eq!(hooks_path.as_deref(), Some(".githooks"));
     }
 
@@ -1206,13 +1208,19 @@ mod tests {
         let repo = init_repo();
         assert!(!hooks_installed_for(repo.path()), "nothing installed yet");
         install_hooks_for(repo.path()).unwrap();
-        assert!(hooks_installed_for(repo.path()), "should report installed after install_hooks_for");
+        assert!(
+            hooks_installed_for(repo.path()),
+            "should report installed after install_hooks_for"
+        );
     }
 
     #[test]
     fn install_hooks_for_is_idempotent() {
         let repo = init_repo();
-        assert!(install_hooks_for(repo.path()).unwrap(), "first install changes something");
+        assert!(
+            install_hooks_for(repo.path()).unwrap(),
+            "first install changes something"
+        );
         assert!(
             !install_hooks_for(repo.path()).unwrap(),
             "second install on an already-current repo must report no change"
@@ -1223,9 +1231,16 @@ mod tests {
     fn install_hooks_for_repairs_a_stale_hand_edited_hook() {
         let repo = init_repo();
         install_hooks_for(repo.path()).unwrap();
-        std::fs::write(repo.path().join(".githooks").join("pre-commit"), "tampered\n").unwrap();
+        std::fs::write(
+            repo.path().join(".githooks").join("pre-commit"),
+            "tampered\n",
+        )
+        .unwrap();
 
-        assert!(!hooks_installed_for(repo.path()), "tampered hook must not read as installed");
+        assert!(
+            !hooks_installed_for(repo.path()),
+            "tampered hook must not read as installed"
+        );
         let changed = install_hooks_for(repo.path()).unwrap();
         assert!(changed, "a stale hook must be rewritten");
         let content = std::fs::read(repo.path().join(".githooks").join("pre-commit")).unwrap();
