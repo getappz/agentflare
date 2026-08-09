@@ -368,7 +368,62 @@ pub(crate) fn ensure_on_path(_dir: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
+/// `true` when `repo_root`'s hooks are already current: `core.hooksPath` is
+/// `.githooks` and every file in `HOOKS` exists there with content matching
+/// the embedded template. Used by both the CLI command (to skip a no-op
+/// re-copy) and the `init`/`doctor` "githooks" component (to report
+/// satisfied without touching the filesystem).
+pub(crate) fn hooks_installed_for(repo_root: &Path) -> bool {
+    let hooks_path =
+        flare_git_core::shell::run_in_opt(repo_root, &["config", "--get", "core.hooksPath"]);
+    if hooks_path.as_deref() != Some(".githooks") {
+        return false;
+    }
+    HOOKS.iter().all(|(name, template)| {
+        fs::read(repo_root.join(".githooks").join(name)).ok().as_deref() == Some(template.as_bytes())
+    })
+}
+
+/// Writes the shared canonical templates (if missing), copies whichever of
+/// `HOOKS` are missing or stale into `repo_root/.githooks/`, and points
+/// `core.hooksPath` at it if it isn't already. Returns whether anything
+/// actually changed. Shared by the interactive CLI command and the
+/// `init`/`doctor` "githooks" component -- same logic, same source of
+/// truth, so the two can never drift apart on what "installed" means.
+pub(crate) fn install_hooks_for(repo_root: &Path) -> Result<bool, String> {
+    ensure_shared_templates().map_err(|e| format!("cannot write shared templates: {e}"))?;
+
+    let local_dir = repo_root.join(".githooks");
+    fs::create_dir_all(&local_dir).map_err(|e| format!("cannot create {local_dir:?}: {e}"))?;
+
+    let mut changed = false;
+    for (name, template) in HOOKS {
+        let dst = local_dir.join(name);
+        if fs::read(&dst).ok().as_deref() == Some(template.as_bytes()) {
+            continue;
+        }
+        fs::write(&dst, template).map_err(|e| format!("writing {name}: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o755));
+        }
+        changed = true;
+    }
+
+    let current_hooks_path =
+        flare_git_core::shell::run_in_opt(repo_root, &["config", "--get", "core.hooksPath"]);
+    if current_hooks_path.as_deref() != Some(".githooks") {
+        flare_git_core::shell::run_in(repo_root, &["config", "core.hooksPath", ".githooks"])
+            .map_err(|e| format!("git config core.hooksPath: {e}"))?;
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
 fn install_hooks(opts: InstallHooksArgs) {
+    let _ = opts;
     let repo_root = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -387,54 +442,23 @@ fn install_hooks(opts: InstallHooksArgs) {
         return;
     }
 
-    if let Err(e) = ensure_shared_templates() {
-        crate::ui::error(&format!(
-            "agentflare git install-hooks: cannot write shared templates: {e}"
-        ));
-        return;
-    }
-
-    let local_dir = repo_root.join(".githooks");
-    if let Err(e) = fs::create_dir_all(&local_dir) {
-        crate::ui::error(&format!(
-            "agentflare git install-hooks: cannot create {local_dir:?}: {e}"
-        ));
-        return;
-    }
-
-    let mut changed = false;
-    for (name, _) in HOOKS {
-        let src = shared_hooks_dir().join(name);
-        let dst = local_dir.join(name);
-        match fs::copy(&src, &dst) {
-            Ok(_) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o755));
-                }
+    match install_hooks_for(&repo_root) {
+        Ok(changed) => {
+            for (name, _) in HOOKS {
                 crate::ui::success(&format!(".githooks/{name}"));
-                changed = true;
             }
-            Err(e) => {
-                crate::ui::error(&format!("copying {name}: {e}"));
-                return;
+            crate::ui::success("core.hooksPath = .githooks");
+            if changed {
+                println!(
+                    "\nBranch-protection hooks installed. Direct commits/pushes to the \
+                     default branch are now blocked for every git client in this repo. \
+                     Commits are also stamped with provenance trailers, every ref \
+                     move is journaled to ~/.agentflare/audit/git-refs.jsonl, and \
+                     lean-ctx's code index refreshes in the background after each commit."
+                );
             }
         }
-    }
-
-    flare_git_core::shell::run_in(&repo_root, &["config", "core.hooksPath", ".githooks"]).ok();
-    crate::ui::success("core.hooksPath = .githooks");
-
-    if changed {
-        println!(
-            "\nBranch-protection hooks installed. Direct commits/pushes to the \
-             default branch are now blocked for every git client in this repo. \
-             Commits are also stamped with provenance trailers, every ref \
-             move is journaled to ~/.agentflare/audit/git-refs.jsonl, and \
-             lean-ctx's code index refreshes in the background after each commit."
-        );
-        let _ = opts;
+        Err(e) => crate::ui::error(&format!("agentflare git install-hooks: {e}")),
     }
 }
 
@@ -1124,6 +1148,53 @@ mod tests {
         run_git(dir.path(), &["add", "tracked.txt"]);
         run_git(dir.path(), &["commit", "-q", "-m", "seed"]);
         dir
+    }
+
+    #[test]
+    fn install_hooks_for_writes_all_hooks_and_sets_core_hooks_path() {
+        let repo = init_repo();
+        let changed = install_hooks_for(repo.path()).unwrap();
+        assert!(changed);
+        for (name, template) in HOOKS {
+            let content = std::fs::read(repo.path().join(".githooks").join(name)).unwrap();
+            assert_eq!(content, template.as_bytes(), "{name} should match the embedded template");
+        }
+        let hooks_path = flare_git_core::shell::run_in_opt(
+            repo.path(),
+            &["config", "--get", "core.hooksPath"],
+        );
+        assert_eq!(hooks_path.as_deref(), Some(".githooks"));
+    }
+
+    #[test]
+    fn hooks_installed_for_reflects_install_state() {
+        let repo = init_repo();
+        assert!(!hooks_installed_for(repo.path()), "nothing installed yet");
+        install_hooks_for(repo.path()).unwrap();
+        assert!(hooks_installed_for(repo.path()), "should report installed after install_hooks_for");
+    }
+
+    #[test]
+    fn install_hooks_for_is_idempotent() {
+        let repo = init_repo();
+        assert!(install_hooks_for(repo.path()).unwrap(), "first install changes something");
+        assert!(
+            !install_hooks_for(repo.path()).unwrap(),
+            "second install on an already-current repo must report no change"
+        );
+    }
+
+    #[test]
+    fn install_hooks_for_repairs_a_stale_hand_edited_hook() {
+        let repo = init_repo();
+        install_hooks_for(repo.path()).unwrap();
+        std::fs::write(repo.path().join(".githooks").join("pre-commit"), "tampered\n").unwrap();
+
+        assert!(!hooks_installed_for(repo.path()), "tampered hook must not read as installed");
+        let changed = install_hooks_for(repo.path()).unwrap();
+        assert!(changed, "a stale hook must be rewritten");
+        let content = std::fs::read(repo.path().join(".githooks").join("pre-commit")).unwrap();
+        assert_eq!(content, PRE_COMMIT.as_bytes());
     }
 
     #[test]

@@ -688,6 +688,32 @@ pub fn get_components(host: &str) -> Vec<Component> {
             check: Box::new(crate::shim_install::all_shims_present),
             apply: Box::new(crate::shim_install::install),
         },
+        // Branch-protection git hooks (.githooks/, core.hooksPath): the
+        // PreToolUse guard in hook_redirect.rs only watches specific tool
+        // names, so a `git commit` via Bash -- or via any tool name it
+        // doesn't recognize (e.g. a gateway-routed ctx_patch call) -- slips
+        // past it entirely. A native git hook is the shell-agnostic
+        // enforcement boundary: it fires for every git client regardless of
+        // how the commit was invoked. Host-independent (a real git hook,
+        // not tied to any agent's own tool-call model), so this is not
+        // gated by `claude_code_only` the way `opencode-branch-guard` is.
+        Component {
+            id: "githooks",
+            needs_consent: true,
+            describe: "Branch-protection git hooks (.githooks/, core.hooksPath) — blocks direct commits/pushes to the default branch for every git client, not just tool calls this agent's PreToolUse hook watches".to_string(),
+            check: Box::new(|| match flare_git_core::branch::repo_toplevel(&cwd()) {
+                Some(root) => crate::cli::git::hooks_installed_for(&root),
+                None => true,
+            }),
+            apply: Box::new(|| match flare_git_core::branch::repo_toplevel(&cwd()) {
+                Some(root) => match crate::cli::git::install_hooks_for(&root) {
+                    Ok(true) => "installed .githooks/* + core.hooksPath = .githooks".to_string(),
+                    Ok(false) => "already up to date".to_string(),
+                    Err(e) => format!("failed: {e}"),
+                },
+                None => "not applicable outside a git repo".to_string(),
+            }),
+        },
         // Claude Code's non-interactive Bash tool sources `~/.bashenv` via
         // BASH_ENV -- the lean-ctx function dispatcher (bash-level companion
         // to the PATH shims above) and the force-push/rm -rf DEBUG-trap
@@ -1024,6 +1050,7 @@ mod tests {
             "rules",
             "mise",
             "shims",
+            "githooks",
             "claude-code-bashenv-guard",
             "opencode-branch-guard",
             "leanctx",
@@ -1037,6 +1064,7 @@ mod tests {
             "rules",
             "mise",
             "shims",
+            "githooks",
             "claude-code-bashenv-guard",
             "opencode-branch-guard",
             "leanctx",
@@ -1629,6 +1657,17 @@ mod tests {
             assert!((gw.check)());
         });
     }
+
+    // No with_temp_cwd-based check/apply-cycle test here (unlike the other
+    // components above): the githooks component's closures resolve
+    // `flare_git_core::branch::repo_toplevel(&cwd())` fresh on every call,
+    // and under cargo test's parallel execution that raced with this
+    // process's real cwd and mutated *this actual checkout*'s
+    // core.hooksPath instead of the isolated tempdir (confirmed via
+    // .git/config's mtime). `hooks_installed_for`/`install_hooks_for`
+    // (`cli::git`'s tests) already cover the exact same logic these
+    // closures just delegate to, with explicit repo_root paths instead of
+    // ambient cwd -- no coverage lost by not re-testing it here too.
 
     #[test]
     fn coaching_defaults_seed_all_default_rules_on_fresh_home() {
