@@ -782,6 +782,11 @@ pub(crate) struct ItemRequest {
     )]
     #[serde(default)]
     pub(crate) push: Option<bool>,
+    #[schemars(
+        description = "done only: markdown summary of what changed and why — becomes the PR body when a PR opens (falls back to a generic placeholder if omitted). Write this before calling done, not after."
+    )]
+    #[serde(default)]
+    pub(crate) summary: Option<String>,
 }
 
 /// Lean per-item projection for `item(list)` — the raw 19-field `Item` (full
