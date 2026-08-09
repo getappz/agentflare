@@ -129,8 +129,17 @@ fn find_or_install_bwrap() -> Option<PathBuf> {
 /// failing to spawn at all) when a box hasn't installed bubblewrap yet.
 fn which_bwrap() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("bwrap"))
+    find_on_path(&path, "bwrap")
+}
+
+/// Pure PATH search, factored out so tests can exercise it without mutating
+/// the real process-wide `PATH` env var -- `std::env::set_var` affects every
+/// thread in the test binary, and cargo's test harness runs tests in
+/// parallel by default, so an env-mutating test here would race with any
+/// other test that spawns a child process expecting `PATH` to be intact.
+fn find_on_path(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
 }
 
@@ -140,10 +149,6 @@ mod tests {
 
     #[test]
     fn missing_bwrap_falls_back_to_none() {
-        // SAFETY: single-threaded test process; no other test reads PATH here.
-        unsafe {
-            std::env::set_var("PATH", "");
-        }
-        assert!(which_bwrap().is_none());
+        assert!(find_on_path(std::ffi::OsStr::new(""), "bwrap").is_none());
     }
 }
