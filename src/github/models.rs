@@ -142,20 +142,6 @@ pub struct Comment {
     #[serde(default)]
     #[allow(dead_code)]
     pub created_at: Option<String>,
-    /// Only present on the repo-wide `/issues/comments` listing (absent, and
-    /// unneeded, on the per-issue `/issues/{n}/comments` one): a full API URL
-    /// like `.../repos/{owner}/{repo}/issues/{number}`, letting
-    /// [`crate::github::issues::list_all_comments`]'s caller group comments
-    /// by issue without a separate request per issue.
-    #[serde(default)]
-    pub issue_url: Option<String>,
-}
-
-impl Comment {
-    /// The trailing `{number}` off `issue_url`, when present and numeric.
-    pub fn issue_number(&self) -> Option<u64> {
-        self.issue_url.as_deref()?.rsplit('/').next()?.parse().ok()
-    }
 }
 
 #[cfg(test)]
@@ -223,29 +209,6 @@ mod tests {
         // resolves on this value.
         let without_id = serde_json::json!({ "user": {"login": "a"}, "body": "hi" });
         assert!(serde_json::from_value::<Comment>(without_id).is_err());
-    }
-
-    #[test]
-    fn issue_number_parses_the_trailing_segment_of_issue_url() {
-        let json = serde_json::json!({
-            "id": 1, "user": {"login": "a"}, "body": "hi",
-            "issue_url": "https://api.github.com/repos/o/r/issues/42"
-        });
-        let c: Comment = serde_json::from_value(json).unwrap();
-        assert_eq!(c.issue_number(), Some(42));
-    }
-
-    #[test]
-    fn issue_number_is_none_when_issue_url_is_absent_or_unparseable() {
-        let json = serde_json::json!({ "id": 1, "user": {"login": "a"}, "body": "hi" });
-        let c: Comment = serde_json::from_value(json).unwrap();
-        assert_eq!(c.issue_number(), None);
-
-        let json = serde_json::json!({
-            "id": 1, "user": {"login": "a"}, "body": "hi", "issue_url": "not-a-url"
-        });
-        let c: Comment = serde_json::from_value(json).unwrap();
-        assert_eq!(c.issue_number(), None);
     }
 }
 
