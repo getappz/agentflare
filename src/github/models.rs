@@ -65,6 +65,9 @@ pub struct Issue {
     #[serde(default)]
     #[allow(dead_code)]
     pub updated_at: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

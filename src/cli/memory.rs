@@ -44,7 +44,8 @@ pub enum MemoryCommands {
         batch: usize,
     },
     /// Sync observations with a shared GitHub branch so other workstations
-    /// see the same facts. Requires AGENTFLARE_MEMORY_SYNC_REPO=owner/repo
+    /// see the same facts. Defaults to this repo's `origin` remote; set
+    /// AGENTFLARE_MEMORY_SYNC_REPO=owner/repo to point elsewhere
     /// (AGENTFLARE_MEMORY_SYNC_BRANCH/_PATH override the branch/file name).
     Sync,
 }

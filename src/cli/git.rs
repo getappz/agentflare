@@ -1,7 +1,8 @@
 //! `agentflare git` -- git-related CLI surface: installing the shared
-//! branch-protection hooks (pre-commit / pre-push / prepare-commit-msg /
-//! reference-transaction / post-commit) into a repo, installing/uninstalling the
-//! flare-git-shim PATH shim, and the recovery-snapshot commands
+//! branch-protection hooks (pre-commit / pre-merge-commit / pre-push /
+//! prepare-commit-msg / reference-transaction / post-commit) into a repo,
+//! installing/uninstalling the flare-git-shim PATH shim, and the
+//! recovery-snapshot commands
 //! (`snapshot list/restore/prune`) that make `flare_git_core::snapshot`'s
 //! automatic pre-destructive snapshots actually usable.
 //!
@@ -202,6 +203,11 @@ fn shared_hooks_dir() -> PathBuf {
 /// `~/.agentflare/githooks/` on first `install-hooks`, so the shared location
 /// is self-bootstrapping and survives repo checkouts.
 const PRE_COMMIT: &str = include_str!("../../.githooks/pre-commit");
+// `pre-commit` alone does not fire for a merge commit -- git only invokes it
+// for a plain `git commit`. `pre-merge-commit` is git's separate hook for
+// that (githooks(5)); ours just execs `pre-commit` so there's one source of
+// truth for what "direct commit to the default branch" means.
+const PRE_MERGE_COMMIT: &str = include_str!("../../.githooks/pre-merge-commit");
 const PRE_PUSH: &str = include_str!("../../.githooks/pre-push");
 const PREPARE_COMMIT_MSG: &str = include_str!("../../.githooks/prepare-commit-msg");
 const REFERENCE_TRANSACTION: &str = include_str!("../../.githooks/reference-transaction");
@@ -210,6 +216,7 @@ const POST_COMMIT: &str = include_str!("../../.githooks/post-commit");
 /// Every hook this command installs, in (filename, embedded template) pairs.
 const HOOKS: &[(&str, &str)] = &[
     ("pre-commit", PRE_COMMIT),
+    ("pre-merge-commit", PRE_MERGE_COMMIT),
     ("pre-push", PRE_PUSH),
     ("prepare-commit-msg", PREPARE_COMMIT_MSG),
     ("reference-transaction", REFERENCE_TRANSACTION),
@@ -368,7 +375,90 @@ pub(crate) fn ensure_on_path(_dir: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
+/// `true` on Unix when `path` has at least one executable bit set. Git
+/// silently ignores a non-executable hook (just an advisory "hint", not an
+/// error), so a content-correct-but-non-executable hook must NOT read as
+/// installed -- confirmed live: this exact gap let a direct commit through
+/// on `master` moments after this component's own commit landed, because
+/// the merge hadn't yet brought in the executable-bit fix.
+///
+/// Always `true` on non-Unix: there's no POSIX exec bit to check, and
+/// `install_hooks_for` never attempts to set one there either (matching git
+/// for Windows' own model, where hook "executability" isn't a filesystem
+/// permission).
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool {
+    true
+}
+
+/// `true` when `repo_root`'s hooks are already current: `core.hooksPath` is
+/// `.githooks` and every file in `HOOKS` exists there, executable, with
+/// content matching the embedded template. Used by both the CLI command (to
+/// skip a no-op re-copy) and the `init`/`doctor` "githooks" component (to
+/// report satisfied without touching the filesystem).
+pub(crate) fn hooks_installed_for(repo_root: &Path) -> bool {
+    let hooks_path =
+        flare_git_core::shell::run_in_opt(repo_root, &["config", "--get", "core.hooksPath"]);
+    if hooks_path.as_deref() != Some(".githooks") {
+        return false;
+    }
+    HOOKS.iter().all(|(name, template)| {
+        let dst = repo_root.join(".githooks").join(name);
+        fs::read(&dst).ok().as_deref() == Some(template.as_bytes()) && is_executable(&dst)
+    })
+}
+
+/// Writes the shared canonical templates (if missing), copies whichever of
+/// `HOOKS` are missing or stale into `repo_root/.githooks/`, chmods +x
+/// whichever aren't already executable (checked independently of content --
+/// a content-correct file can still have lost its executable bit), and
+/// points `core.hooksPath` at it if it isn't already. Returns whether
+/// anything actually changed. Shared by the interactive CLI command and the
+/// `init`/`doctor` "githooks" component -- same logic, same source of
+/// truth, so the two can never drift apart on what "installed" means.
+pub(crate) fn install_hooks_for(repo_root: &Path) -> Result<bool, String> {
+    ensure_shared_templates().map_err(|e| format!("cannot write shared templates: {e}"))?;
+
+    let local_dir = repo_root.join(".githooks");
+    fs::create_dir_all(&local_dir).map_err(|e| format!("cannot create {local_dir:?}: {e}"))?;
+
+    let mut changed = false;
+    for (name, template) in HOOKS {
+        let dst = local_dir.join(name);
+        if fs::read(&dst).ok().as_deref() != Some(template.as_bytes()) {
+            fs::write(&dst, template).map_err(|e| format!("writing {name}: {e}"))?;
+            changed = true;
+        }
+        #[cfg(unix)]
+        if !is_executable(&dst) {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dst, fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("chmod +x {name}: {e}"))?;
+            changed = true;
+        }
+    }
+
+    let current_hooks_path =
+        flare_git_core::shell::run_in_opt(repo_root, &["config", "--get", "core.hooksPath"]);
+    if current_hooks_path.as_deref() != Some(".githooks") {
+        flare_git_core::shell::run_in(repo_root, &["config", "core.hooksPath", ".githooks"])
+            .map_err(|e| format!("git config core.hooksPath: {e}"))?;
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
 fn install_hooks(opts: InstallHooksArgs) {
+    let _ = opts;
     let repo_root = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -387,54 +477,23 @@ fn install_hooks(opts: InstallHooksArgs) {
         return;
     }
 
-    if let Err(e) = ensure_shared_templates() {
-        crate::ui::error(&format!(
-            "agentflare git install-hooks: cannot write shared templates: {e}"
-        ));
-        return;
-    }
-
-    let local_dir = repo_root.join(".githooks");
-    if let Err(e) = fs::create_dir_all(&local_dir) {
-        crate::ui::error(&format!(
-            "agentflare git install-hooks: cannot create {local_dir:?}: {e}"
-        ));
-        return;
-    }
-
-    let mut changed = false;
-    for (name, _) in HOOKS {
-        let src = shared_hooks_dir().join(name);
-        let dst = local_dir.join(name);
-        match fs::copy(&src, &dst) {
-            Ok(_) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o755));
-                }
+    match install_hooks_for(&repo_root) {
+        Ok(changed) => {
+            for (name, _) in HOOKS {
                 crate::ui::success(&format!(".githooks/{name}"));
-                changed = true;
             }
-            Err(e) => {
-                crate::ui::error(&format!("copying {name}: {e}"));
-                return;
+            crate::ui::success("core.hooksPath = .githooks");
+            if changed {
+                println!(
+                    "\nBranch-protection hooks installed. Direct commits/pushes to the \
+                     default branch are now blocked for every git client in this repo. \
+                     Commits are also stamped with provenance trailers, every ref \
+                     move is journaled to ~/.agentflare/audit/git-refs.jsonl, and \
+                     lean-ctx's code index refreshes in the background after each commit."
+                );
             }
         }
-    }
-
-    flare_git_core::shell::run_in(&repo_root, &["config", "core.hooksPath", ".githooks"]).ok();
-    crate::ui::success("core.hooksPath = .githooks");
-
-    if changed {
-        println!(
-            "\nBranch-protection hooks installed. Direct commits/pushes to the \
-             default branch are now blocked for every git client in this repo. \
-             Commits are also stamped with provenance trailers, every ref \
-             move is journaled to ~/.agentflare/audit/git-refs.jsonl, and \
-             lean-ctx's code index refreshes in the background after each commit."
-        );
-        let _ = opts;
+        Err(e) => crate::ui::error(&format!("agentflare git install-hooks: {e}")),
     }
 }
 
@@ -1124,6 +1183,95 @@ mod tests {
         run_git(dir.path(), &["add", "tracked.txt"]);
         run_git(dir.path(), &["commit", "-q", "-m", "seed"]);
         dir
+    }
+
+    #[test]
+    fn install_hooks_for_writes_all_hooks_and_sets_core_hooks_path() {
+        let repo = init_repo();
+        let changed = install_hooks_for(repo.path()).unwrap();
+        assert!(changed);
+        for (name, template) in HOOKS {
+            let content = std::fs::read(repo.path().join(".githooks").join(name)).unwrap();
+            assert_eq!(
+                content,
+                template.as_bytes(),
+                "{name} should match the embedded template"
+            );
+        }
+        let hooks_path =
+            flare_git_core::shell::run_in_opt(repo.path(), &["config", "--get", "core.hooksPath"]);
+        assert_eq!(hooks_path.as_deref(), Some(".githooks"));
+    }
+
+    #[test]
+    fn hooks_installed_for_reflects_install_state() {
+        let repo = init_repo();
+        assert!(!hooks_installed_for(repo.path()), "nothing installed yet");
+        install_hooks_for(repo.path()).unwrap();
+        assert!(
+            hooks_installed_for(repo.path()),
+            "should report installed after install_hooks_for"
+        );
+    }
+
+    #[test]
+    fn install_hooks_for_is_idempotent() {
+        let repo = init_repo();
+        assert!(
+            install_hooks_for(repo.path()).unwrap(),
+            "first install changes something"
+        );
+        assert!(
+            !install_hooks_for(repo.path()).unwrap(),
+            "second install on an already-current repo must report no change"
+        );
+    }
+
+    #[test]
+    fn install_hooks_for_repairs_a_stale_hand_edited_hook() {
+        let repo = init_repo();
+        install_hooks_for(repo.path()).unwrap();
+        std::fs::write(
+            repo.path().join(".githooks").join("pre-commit"),
+            "tampered\n",
+        )
+        .unwrap();
+
+        assert!(
+            !hooks_installed_for(repo.path()),
+            "tampered hook must not read as installed"
+        );
+        let changed = install_hooks_for(repo.path()).unwrap();
+        assert!(changed, "a stale hook must be rewritten");
+        let content = std::fs::read(repo.path().join(".githooks").join("pre-commit")).unwrap();
+        assert_eq!(content, PRE_COMMIT.as_bytes());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_hooks_for_repairs_a_hook_that_lost_its_executable_bit() {
+        // Content-correct but not executable: git silently ignores the hook
+        // (an advisory hint, not an error) rather than running it -- so a
+        // check that only compares content would report "installed" on a
+        // hook that in practice never fires. Confirmed live: this exact gap
+        // let a direct commit through on master moments after this
+        // component's own fix commit landed, because the merge hadn't yet
+        // brought the executable-bit fix into the working tree.
+        use std::os::unix::fs::PermissionsExt;
+        let repo = init_repo();
+        install_hooks_for(repo.path()).unwrap();
+        let dst = repo.path().join(".githooks").join("pre-commit");
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            !hooks_installed_for(repo.path()),
+            "a non-executable hook must not read as installed, even with correct content"
+        );
+        let changed = install_hooks_for(repo.path()).unwrap();
+        assert!(changed, "the lost executable bit must be restored");
+        assert!(is_executable(&dst));
+        // Content untouched -- only the mode needed fixing.
+        assert_eq!(std::fs::read(&dst).unwrap(), PRE_COMMIT.as_bytes());
     }
 
     #[test]
