@@ -9,7 +9,10 @@
 //! glob-based path masking, or seccomp network filter -- this job runner
 //! operates on worktrees it already controls, not arbitrary third-party
 //! workspaces, so that machinery isn't needed here.
+mod bwrap_install;
+
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// $HOME subdirectories commonly needed by build/package tooling (cargo,
 /// rustup, npm, pip caches) that would otherwise sit outside the job's cwd
@@ -22,7 +25,7 @@ pub(super) fn wrap(
     args: &[String],
     cwd: Option<&Path>,
 ) -> Option<(String, Vec<String>)> {
-    let bwrap = which_bwrap()?;
+    let bwrap = find_or_install_bwrap()?;
 
     let mut bwrap_args = vec![
         "--new-session".to_string(),
@@ -86,6 +89,38 @@ pub(super) fn wrap(
 
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+/// Finds `bwrap` on `PATH`, installing it via `bwrap_install` on first miss,
+/// and caches the result for the life of the process so a box without
+/// bubblewrap (or without `mise`) doesn't retry the install on every job.
+/// Logs the outcome either way -- a job silently running unsandboxed because
+/// bwrap was missing should never look identical to a sandboxed one.
+fn find_or_install_bwrap() -> Option<PathBuf> {
+    static BWRAP: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BWRAP
+        .get_or_init(|| {
+            if let Some(path) = which_bwrap() {
+                return Some(path);
+            }
+            match bwrap_install::install() {
+                Some(path) => {
+                    eprintln!(
+                        "agentflare-jobs: installed bwrap via mise at {}",
+                        path.display()
+                    );
+                    Some(path)
+                }
+                None => {
+                    eprintln!(
+                        "agentflare-jobs: bwrap not found and could not be installed \
+                         (mise missing or install failed) -- running this job unsandboxed"
+                    );
+                    None
+                }
+            }
+        })
+        .clone()
 }
 
 /// Minimal `PATH` scan for `bwrap`. This crate has no `which` dependency, and
