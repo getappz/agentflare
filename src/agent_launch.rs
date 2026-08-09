@@ -375,7 +375,11 @@ pub fn run_headless(
                 diagnostic_suffix(&c)
             ))
         }
-        Ok(_) => HeadlessOutcome::Failed(format!("{} exited non-zero", spec.display_name)),
+        Ok(c) => HeadlessOutcome::Failed(format!(
+            "{} exited non-zero{}",
+            spec.display_name,
+            diagnostic_suffix(&c)
+        )),
         Err(e) => HeadlessOutcome::Failed(format!("failed to run {}: {e}", spec.display_name)),
     }
 }
@@ -861,5 +865,26 @@ mod tests {
         let suffix = diagnostic_suffix(&c);
         assert!(suffix.contains("last stderr before kill"));
         assert!(suffix.contains("panic: something broke"));
+    }
+
+    #[test]
+    fn failed_non_zero_exit_includes_captured_output() {
+        let captured = Captured {
+            stdout: String::new(),
+            stderr: "HTTP 429 Too Many Requests".to_string(),
+            success: false,
+            timed_out: false,
+            idle_killed: false,
+        };
+        let msg = match Ok::<_, std::io::Error>(captured) {
+            Ok(c) if c.success => unreachable!(),
+            Ok(c) if c.timed_out => unreachable!(),
+            Ok(c) => format!("test exited non-zero{}", diagnostic_suffix(&c)),
+            Err(_) => unreachable!(),
+        };
+        assert!(
+            msg.contains("HTTP 429 Too Many Requests"),
+            "expected captured stderr in the failure message, got: {msg}"
+        );
     }
 }

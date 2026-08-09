@@ -772,6 +772,16 @@ use  = "opencode"
     }
 
     #[test]
+    fn failure_message_includes_diagnostic_suffix_for_plain_failures() {
+        let outcome = HeadlessOutcome::Failed(format!(
+            "claude-code exited non-zero — last stderr before kill:\n{}",
+            "HTTP 429 Too Many Requests"
+        ));
+        let msg = failure_message(&outcome);
+        assert!(msg.contains("HTTP 429 Too Many Requests"));
+    }
+
+    #[test]
     fn build_extra_args_includes_bypass_and_json_output_for_claude() {
         let args = build_extra_args(agent_registry::Agent::ClaudeCode, None, None);
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
