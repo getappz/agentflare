@@ -30,10 +30,18 @@ const WORK_JOB_TIMEOUT_SECS: u64 = 21_900;
 /// Returns the matching `Agent` only if `agent_registry::autonomous_args`
 /// confirms it has a headless permission-bypass flag — the same gate
 /// `agentflare work` itself uses (`src/cli/work.rs`'s `run_work`).
+///
+/// `assignee` may carry an instance suffix (`<agent>:<instance>`) once an
+/// item has been claimed at least once — `item::claim` deliberately stores
+/// the raw claim owner there (see its doc comment). Strip it via the same
+/// `agent_part` the claim/handoff-freeze logic itself uses internally,
+/// rather than matching the raw string and silently failing to recognize a
+/// previously-claimed item's own assignee.
 pub(crate) fn resolve_confirmed_agent(assignee: &str) -> Option<agent_registry::Agent> {
+    let canonical = agentflare_backend::item::agent_part(assignee);
     let agent = agent_registry::REGISTRY
         .iter()
-        .find(|s| s.id.as_str() == assignee)
+        .find(|s| s.id.as_str() == canonical)
         .map(|s| s.id)?;
     agent_registry::autonomous_args(agent).map(|_| agent)
 }
@@ -233,6 +241,17 @@ mod tests {
     fn resolve_confirmed_agent_accepts_claude_code() {
         assert_eq!(
             resolve_confirmed_agent("claude-code"),
+            Some(agent_registry::Agent::ClaudeCode)
+        );
+    }
+
+    #[test]
+    fn resolve_confirmed_agent_recognizes_an_instance_suffixed_assignee() {
+        // A previously-claimed item's assignee_agent carries `<agent>:<instance>`
+        // (see item::claim's doc comment) — this must still resolve, or a
+        // once-claimed item can never be redispatched.
+        assert_eq!(
+            resolve_confirmed_agent("claude-code:some-job-id"),
             Some(agent_registry::Agent::ClaudeCode)
         );
     }
