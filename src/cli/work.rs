@@ -215,8 +215,17 @@ fn resolve_agent(
             .ok_or_else(|| format!("unknown agent: {name} — use `agentflare agents list`"));
     }
 
+    // `assignee_agent` may carry an instance suffix (`<agent>:<instance>`)
+    // once the item has been claimed at least once — `item::claim` stores
+    // the raw claim owner there deliberately (see its doc comment). Strip it
+    // via the same `agent_part` the claim/handoff-freeze logic already uses
+    // internally, so a previously-claimed item still routes to its own
+    // assignee instead of silently falling through to the router's other
+    // rules.
     let assigned_agent = item
         .assignee_agent
+        .as_deref()
+        .map(agentflare_backend::item::agent_part)
         .as_deref()
         .and_then(agent_registry::agent_by_name);
     let task = agent_registry::TaskContext {
@@ -675,6 +684,20 @@ mod tests {
     fn resolve_agent_falls_back_to_the_items_own_assignee() {
         let mut item = test_item();
         item.assignee_agent = Some("claude".to_string()); // alias, agent_by_name() maps it
+        let config = agent_registry::RouterConfig::default();
+        let (agent, reason) = resolve_agent(None, &item, &[], &config, &[]).unwrap();
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+        assert_eq!(reason, "explicit assignment on task");
+    }
+
+    #[test]
+    fn resolve_agent_falls_back_to_an_instance_suffixed_assignee() {
+        // A previously-claimed item's assignee_agent carries
+        // `<agent>:<instance>` (see item::claim's doc comment) — this must
+        // still route correctly, or a once-claimed item silently loses its
+        // assignee on the next auto-routed dispatch.
+        let mut item = test_item();
+        item.assignee_agent = Some("claude-code:some-job-id".to_string());
         let config = agent_registry::RouterConfig::default();
         let (agent, reason) = resolve_agent(None, &item, &[], &config, &[]).unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
