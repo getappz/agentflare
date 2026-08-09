@@ -1,7 +1,8 @@
 //! `agentflare git` -- git-related CLI surface: installing the shared
-//! branch-protection hooks (pre-commit / pre-push / prepare-commit-msg /
-//! reference-transaction / post-commit) into a repo, installing/uninstalling the
-//! flare-git-shim PATH shim, and the recovery-snapshot commands
+//! branch-protection hooks (pre-commit / pre-merge-commit / pre-push /
+//! prepare-commit-msg / reference-transaction / post-commit) into a repo,
+//! installing/uninstalling the flare-git-shim PATH shim, and the
+//! recovery-snapshot commands
 //! (`snapshot list/restore/prune`) that make `flare_git_core::snapshot`'s
 //! automatic pre-destructive snapshots actually usable.
 //!
@@ -202,6 +203,11 @@ fn shared_hooks_dir() -> PathBuf {
 /// `~/.agentflare/githooks/` on first `install-hooks`, so the shared location
 /// is self-bootstrapping and survives repo checkouts.
 const PRE_COMMIT: &str = include_str!("../../.githooks/pre-commit");
+// `pre-commit` alone does not fire for a merge commit -- git only invokes it
+// for a plain `git commit`. `pre-merge-commit` is git's separate hook for
+// that (githooks(5)); ours just execs `pre-commit` so there's one source of
+// truth for what "direct commit to the default branch" means.
+const PRE_MERGE_COMMIT: &str = include_str!("../../.githooks/pre-merge-commit");
 const PRE_PUSH: &str = include_str!("../../.githooks/pre-push");
 const PREPARE_COMMIT_MSG: &str = include_str!("../../.githooks/prepare-commit-msg");
 const REFERENCE_TRANSACTION: &str = include_str!("../../.githooks/reference-transaction");
@@ -210,6 +216,7 @@ const POST_COMMIT: &str = include_str!("../../.githooks/post-commit");
 /// Every hook this command installs, in (filename, embedded template) pairs.
 const HOOKS: &[(&str, &str)] = &[
     ("pre-commit", PRE_COMMIT),
+    ("pre-merge-commit", PRE_MERGE_COMMIT),
     ("pre-push", PRE_PUSH),
     ("prepare-commit-msg", PREPARE_COMMIT_MSG),
     ("reference-transaction", REFERENCE_TRANSACTION),
