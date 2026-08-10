@@ -231,7 +231,7 @@ fn cache_path() -> PathBuf {
 /// flare-proxy can't depend on that crate (agentflare depends on
 /// flare-proxy, not the reverse), so this is a small local copy of the
 /// same convention rather than a shared helper.
-fn agentflare_home() -> PathBuf {
+pub(super) fn agentflare_home() -> PathBuf {
     let home = std::env::var("AGENTFLARE_HOME_OVERRIDE")
         .map(PathBuf::from)
         .or_else(|_| dirs::home_dir().ok_or(()))

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod anthropic;
 pub mod gemini;
 pub mod openai_compat;
+pub mod quota;
 mod registry;
 
 /// "Download on demand" for the provider registry — call once at proxy
