@@ -68,9 +68,45 @@ fn unsupported_provider_type(provider_types: &[String]) -> Option<&str> {
     provider_types.iter().map(String::as_str).find(|pt| {
         !matches!(
             *pt,
-            "nvidia_nim" | "open_router" | "lmstudio" | "anthropic" | "gemini"
+            "nvidia_nim"
+                | "open_router"
+                | "lmstudio"
+                | "anthropic"
+                | "gemini"
+                | "cf_gateway_anthropic"
+                | "cf_gateway_openai"
         )
     })
+}
+
+/// Cloudflare AI Gateway is a URL prefix in front of a provider's own wire
+/// protocol, not a distinct one — `.../anthropic` still speaks Anthropic's
+/// real Messages API shape, `.../compat` still speaks OpenAI's
+/// `/chat/completions` shape. So this needs no new `ProviderKind`, just a
+/// base_url built from account_id/gateway_id and an optional gateway-auth
+/// header, layered onto the existing Anthropic/OpenAiCompatible paths.
+fn cloudflare_gateway_base_url(provider_segment: &str) -> Option<String> {
+    let account_id = std::env::var("CF_AI_GATEWAY_ACCOUNT_ID").ok()?;
+    let gateway_id = std::env::var("CF_AI_GATEWAY_ID").ok()?;
+    if account_id.is_empty() || gateway_id.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/{provider_segment}"
+    ))
+}
+
+/// `cf-aig-authorization` is Cloudflare's own gateway-level auth, separate
+/// from the underlying provider's API key (which still goes through the
+/// normal `Authorization`/`x-api-key` header each provider module already
+/// sends). Optional — a gateway with no auth configured just omits it.
+fn cloudflare_gateway_headers() -> Vec<(String, String)> {
+    match std::env::var("CF_AI_GATEWAY_TOKEN") {
+        Ok(token) if !token.is_empty() => {
+            vec![("cf-aig-authorization".into(), format!("Bearer {token}"))]
+        }
+        _ => vec![],
+    }
 }
 
 impl ProviderConfig {
@@ -107,51 +143,80 @@ impl ProviderConfig {
         // time, with an opaque "unknown provider".
         if let Some(bad) = unsupported_provider_type(&provider_types) {
             eprintln!(
-                "agentflare: unsupported provider prefix '{bad}' in MODEL/MODEL_OPUS/MODEL_SONNET/MODEL_HAIKU -- falling back to default_free() config. Supported prefixes: nvidia_nim, open_router, lmstudio, anthropic, gemini."
+                "agentflare: unsupported provider prefix '{bad}' in MODEL/MODEL_OPUS/MODEL_SONNET/MODEL_HAIKU -- falling back to default_free() config. Supported prefixes: nvidia_nim, open_router, lmstudio, anthropic, gemini, cf_gateway_anthropic, cf_gateway_openai."
             );
             return Self::default_free();
         }
 
         let mut providers = Vec::new();
         for pt in &provider_types {
-            let (base_url, api_key_env, kind, extra_headers) = match pt.as_str() {
-                "nvidia_nim" => (
-                    "https://integrate.api.nvidia.com/v1",
-                    Some("NVIDIA_NIM_API_KEY"),
-                    ProviderKind::OpenAiCompatible,
-                    vec![],
-                ),
-                "open_router" => (
-                    "https://openrouter.ai/api/v1",
-                    Some("OPENROUTER_API_KEY"),
-                    ProviderKind::OpenAiCompatible,
-                    openrouter_headers(),
-                ),
-                "lmstudio" => (
-                    "http://localhost:1234/v1",
-                    None,
-                    ProviderKind::OpenAiCompatible,
-                    vec![],
-                ),
-                "anthropic" => (
-                    "https://api.anthropic.com",
-                    Some("ANTHROPIC_API_KEY"),
-                    ProviderKind::Anthropic,
-                    vec![],
-                ),
-                "gemini" => (
-                    "https://generativelanguage.googleapis.com/v1beta",
-                    Some("GEMINI_API_KEY"),
-                    ProviderKind::Gemini,
-                    vec![],
-                ),
-                _ => continue,
-            };
+            let (base_url, api_key_env, kind, extra_headers): (String, Option<&str>, _, _) =
+                match pt.as_str() {
+                    "nvidia_nim" => (
+                        "https://integrate.api.nvidia.com/v1".into(),
+                        Some("NVIDIA_NIM_API_KEY"),
+                        ProviderKind::OpenAiCompatible,
+                        vec![],
+                    ),
+                    "open_router" => (
+                        "https://openrouter.ai/api/v1".into(),
+                        Some("OPENROUTER_API_KEY"),
+                        ProviderKind::OpenAiCompatible,
+                        openrouter_headers(),
+                    ),
+                    "lmstudio" => (
+                        "http://localhost:1234/v1".into(),
+                        None,
+                        ProviderKind::OpenAiCompatible,
+                        vec![],
+                    ),
+                    "anthropic" => (
+                        "https://api.anthropic.com".into(),
+                        Some("ANTHROPIC_API_KEY"),
+                        ProviderKind::Anthropic,
+                        vec![],
+                    ),
+                    "gemini" => (
+                        "https://generativelanguage.googleapis.com/v1beta".into(),
+                        Some("GEMINI_API_KEY"),
+                        ProviderKind::Gemini,
+                        vec![],
+                    ),
+                    "cf_gateway_anthropic" => {
+                        let Some(base) = cloudflare_gateway_base_url("anthropic") else {
+                            eprintln!(
+                                "agentflare: cf_gateway_anthropic requires CF_AI_GATEWAY_ACCOUNT_ID and CF_AI_GATEWAY_ID -- falling back to default_free() config."
+                            );
+                            return Self::default_free();
+                        };
+                        (
+                            base,
+                            Some("ANTHROPIC_API_KEY"),
+                            ProviderKind::Anthropic,
+                            cloudflare_gateway_headers(),
+                        )
+                    }
+                    "cf_gateway_openai" => {
+                        let Some(base) = cloudflare_gateway_base_url("compat") else {
+                            eprintln!(
+                                "agentflare: cf_gateway_openai requires CF_AI_GATEWAY_ACCOUNT_ID and CF_AI_GATEWAY_ID -- falling back to default_free() config."
+                            );
+                            return Self::default_free();
+                        };
+                        (
+                            base,
+                            Some("OPENAI_API_KEY"),
+                            ProviderKind::OpenAiCompatible,
+                            cloudflare_gateway_headers(),
+                        )
+                    }
+                    _ => continue,
+                };
 
             providers.push(ProviderEntry {
                 id: pt.clone(),
                 kind,
-                base_url: base_url.into(),
+                base_url,
                 api_key_env: api_key_env.map(String::from),
                 default_model: None,
                 models: vec![],
@@ -419,5 +484,80 @@ mod tests {
             provider.base_url,
             "https://generativelanguage.googleapis.com/v1beta"
         );
+    }
+
+    #[test]
+    fn from_env_cf_gateway_anthropic_builds_url_and_reuses_anthropic_kind() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("MODEL", "cf_gateway_anthropic/claude-sonnet-4-5");
+        std::env::set_var("CF_AI_GATEWAY_ACCOUNT_ID", "acct123");
+        std::env::set_var("CF_AI_GATEWAY_ID", "gw456");
+        std::env::set_var("CF_AI_GATEWAY_TOKEN", "gwtoken");
+        std::env::remove_var("MODEL_OPUS");
+        std::env::remove_var("MODEL_SONNET");
+        std::env::remove_var("MODEL_HAIKU");
+
+        let config = ProviderConfig::from_env();
+        std::env::remove_var("MODEL");
+        std::env::remove_var("CF_AI_GATEWAY_ACCOUNT_ID");
+        std::env::remove_var("CF_AI_GATEWAY_ID");
+        std::env::remove_var("CF_AI_GATEWAY_TOKEN");
+
+        let provider = config.provider("cf_gateway_anthropic").unwrap();
+        assert!(matches!(provider.kind, ProviderKind::Anthropic));
+        assert_eq!(
+            provider.base_url,
+            "https://gateway.ai.cloudflare.com/v1/acct123/gw456/anthropic"
+        );
+        assert_eq!(provider.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert!(provider
+            .extra_headers
+            .iter()
+            .any(|(k, v)| k == "cf-aig-authorization" && v == "Bearer gwtoken"));
+    }
+
+    #[test]
+    fn from_env_cf_gateway_openai_uses_compat_route() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("MODEL", "cf_gateway_openai/gpt-5");
+        std::env::set_var("CF_AI_GATEWAY_ACCOUNT_ID", "acct123");
+        std::env::set_var("CF_AI_GATEWAY_ID", "gw456");
+        std::env::remove_var("CF_AI_GATEWAY_TOKEN");
+        std::env::remove_var("MODEL_OPUS");
+        std::env::remove_var("MODEL_SONNET");
+        std::env::remove_var("MODEL_HAIKU");
+
+        let config = ProviderConfig::from_env();
+        std::env::remove_var("MODEL");
+        std::env::remove_var("CF_AI_GATEWAY_ACCOUNT_ID");
+        std::env::remove_var("CF_AI_GATEWAY_ID");
+
+        let provider = config.provider("cf_gateway_openai").unwrap();
+        assert!(matches!(provider.kind, ProviderKind::OpenAiCompatible));
+        assert_eq!(
+            provider.base_url,
+            "https://gateway.ai.cloudflare.com/v1/acct123/gw456/compat"
+        );
+        assert!(provider.extra_headers.is_empty());
+    }
+
+    #[test]
+    fn from_env_cf_gateway_missing_account_falls_back_to_default_free() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("MODEL", "cf_gateway_anthropic/claude-sonnet-4-5");
+        std::env::remove_var("CF_AI_GATEWAY_ACCOUNT_ID");
+        std::env::remove_var("CF_AI_GATEWAY_ID");
+        std::env::remove_var("MODEL_OPUS");
+        std::env::remove_var("MODEL_SONNET");
+        std::env::remove_var("MODEL_HAIKU");
+
+        let config = ProviderConfig::from_env();
+        std::env::remove_var("MODEL");
+
+        // No CF_AI_GATEWAY_ACCOUNT_ID/ID set -> can't build a base_url ->
+        // falls back to default_free() rather than shipping a provider
+        // entry with an unusable URL.
+        assert!(config.provider("cf_gateway_anthropic").is_none());
+        assert!(config.provider("nvidia-nim").is_some());
     }
 }
