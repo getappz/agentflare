@@ -16,6 +16,11 @@ pub use providers::ProviderConfig;
 use std::time::Duration;
 
 pub fn router() -> Router {
+    // Best-effort, short-timeout refresh of the provider registry before
+    // the first ProviderConfig::from_env() read — see
+    // providers::ensure_fresh_registry for what "on demand" means here.
+    providers::ensure_fresh_registry();
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()

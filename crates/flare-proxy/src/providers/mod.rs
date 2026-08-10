@@ -5,6 +5,17 @@ pub mod gemini;
 pub mod openai_compat;
 mod registry;
 
+/// "Download on demand" for the provider registry — call once at proxy
+/// startup, before the first `ProviderConfig::from_env()`/`default_free()`.
+/// Best-effort: a stale/missing local cache triggers one short-timeout
+/// fetch of `registry/providers.toml`'s latest published version; any
+/// failure (offline, DNS, non-2xx) silently falls back to the embedded
+/// copy shipped with this binary. See `providers::registry` for the full
+/// embedded+cache+remote merge behavior.
+pub fn ensure_fresh_registry() {
+    registry::ensure_fresh();
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub providers: Vec<ProviderEntry>,

@@ -17,4 +17,6 @@ base64 = "0.22"
 regex = "1"
 nanoid = "0.5"
 toml = "0.8"
+dirs = "6"
+ureq = { version = "2", features = ["json"] }
 agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
