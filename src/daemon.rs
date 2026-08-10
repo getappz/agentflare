@@ -10,6 +10,16 @@ pub fn daemon_pid_path() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("agentflare-daemon.pid"))
 }
 
+/// stdout+stderr of the current daemon session — truncated fresh on every
+/// `start`/`restart` (see `spawn_detached`), same lifetime as the runtime
+/// dir it lives in. Not a rotated history: `agentflare daemon logs` is for
+/// seeing what THIS run of the daemon is doing, not an audit trail.
+pub fn daemon_log_path() -> PathBuf {
+    dirs::runtime_dir()
+        .map(|d| d.join("agentflare").join("daemon.log"))
+        .unwrap_or_else(|| std::env::temp_dir().join("agentflare-daemon.log"))
+}
+
 pub fn daemon_start_lock_path() -> PathBuf {
     dirs::runtime_dir()
         .map(|d| d.join("agentflare").join("daemon.start.lock"))
@@ -122,12 +132,17 @@ pub fn start_daemon() -> Result<u32, String> {
     }
 
     let binary = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let log_path = daemon_log_path();
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create log dir {parent:?}: {e}"))?;
+    }
     // Must match the `ExecStart`/`ProgramArguments` invocation the installed
     // systemd/launchd units use (see `daemon_autostart.rs`) — both spawn
     // `serve --_foreground-daemon`, not just the bare flag.
     let _pid = process::spawn_detached(
         &binary.to_string_lossy(),
         &["serve", "--_foreground-daemon"],
+        Some(&log_path),
     )?;
 
     for _ in 0..20 {

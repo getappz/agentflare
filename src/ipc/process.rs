@@ -27,11 +27,35 @@ pub fn is_alive(pid: u32) -> bool {
     }
 }
 
-pub fn spawn_detached(binary: &str, args: &[&str]) -> Result<u32, String> {
+/// Spawns `binary` detached from the calling process. `log_path`, if given,
+/// is truncated and used for both the child's stdout and stderr — `None`
+/// discards them, same as before this parameter existed.
+pub fn spawn_detached(
+    binary: &str,
+    args: &[&str],
+    log_path: Option<&std::path::Path>,
+) -> Result<u32, String> {
+    // One shared `File` cloned for both streams: two independent
+    // `File::create` handles to the same path would each get their own
+    // write cursor at 0 and clobber each other instead of interleaving,
+    // the same reason a shell needs `2>&1` rather than two redirects.
+    let (out, err) = match log_path {
+        Some(p) => {
+            let f = std::fs::File::create(p)
+                .map_err(|e| format!("open log file {}: {e}", p.display()))?;
+            let f2 = f
+                .try_clone()
+                .map_err(|e| format!("open log file {}: {e}", p.display()))?;
+            (std::process::Stdio::from(f), std::process::Stdio::from(f2))
+        }
+        None => (std::process::Stdio::null(), std::process::Stdio::null()),
+    };
     #[cfg(windows)]
     {
         let mut cmd = std::process::Command::new(binary);
         cmd.args(args);
+        cmd.stdout(out);
+        cmd.stderr(err);
         cmd.creation_flags(
             windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
                 | windows_sys::Win32::System::Threading::DETACHED_PROCESS,
@@ -44,8 +68,8 @@ pub fn spawn_detached(binary: &str, args: &[&str]) -> Result<u32, String> {
         let child = std::process::Command::new(binary)
             .args(args)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(out)
+            .stderr(err)
             .spawn()
             .map_err(|e| format!("spawn: {e}"))?;
         Ok(child.id())
