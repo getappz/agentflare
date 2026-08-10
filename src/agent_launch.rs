@@ -347,8 +347,17 @@ pub fn run_headless(
             spec.display_name
         ));
     };
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
+    // Native Linux and WSL2 run the agent CLI inside a bwrap sandbox, same as
+    // `Supervisor::spawn`; Windows and macOS get argv back unchanged (see
+    // `agentflare_jobs::sandbox`). Uses the ambient cwd since neither this
+    // function nor `run_captured` below ever calls `Command::current_dir` —
+    // the child inherits whatever directory the caller already chdir'd into
+    // (e.g. `execute_work`'s worktree chdir for autonomous dispatch).
+    let cwd = std::env::current_dir().ok();
+    let (sandboxed_command, sandboxed_args) =
+        agentflare_jobs::sandbox::wrap(&argv[0], &argv[1..], cwd.as_deref());
+    let mut cmd = Command::new(&sandboxed_command);
+    cmd.args(&sandboxed_args);
     // See the matching strip in `run_launch_env` above (item #139) — same
     // rationale applies to headless child processes.
     cmd.env_remove("CARGO_TARGET_DIR");

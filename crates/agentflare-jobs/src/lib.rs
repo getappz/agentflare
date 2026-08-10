@@ -1,6 +1,6 @@
 pub mod executor;
 pub mod queue;
-mod sandbox;
+pub mod sandbox;
 pub mod supervisor;
 pub mod types;
 pub mod worker;
