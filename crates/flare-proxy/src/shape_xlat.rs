@@ -399,6 +399,128 @@ pub fn openai_chunk_to_anthropic_sse(chunk: &Value, buffer: &mut AnthropicStream
     out
 }
 
+/// Gemini's `streamGenerateContent?alt=sse` chunk shape is
+/// `candidates[0].content.parts[]`, not OpenAI's `choices[0].delta` — same
+/// job as `openai_chunk_to_anthropic_sse`, different source field paths.
+/// Gemini emits each `functionCall` whole (no incremental argument deltas),
+/// so the tool-call block is opened, filled, and left for `gemini_finish_stream`
+/// to close in one pass rather than streamed via `input_json_delta` chunks.
+pub fn gemini_chunk_to_anthropic_sse(chunk: &Value, buffer: &mut AnthropicStreamBuffer) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    let parts = match chunk
+        .pointer("/candidates/0/content/parts")
+        .and_then(|v| v.as_array())
+    {
+        Some(p) => p,
+        None => return out,
+    };
+
+    if !buffer.started {
+        buffer.started = true;
+        buffer.open_indices.insert(0);
+        buffer.next_index = 1;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let msg_id = format!("msg_{}", ts);
+        buffer.message_id = Some(msg_id.clone());
+
+        emit_event(
+            &mut out,
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": Value::Null,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": chunk.pointer("/usageMetadata/promptTokenCount").and_then(|v| v.as_u64()).unwrap_or(0),
+                        "output_tokens": 0
+                    }
+                }
+            }),
+        );
+        emit_event(
+            &mut out,
+            "content_block_start",
+            &json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "text",
+                    "text": ""
+                }
+            }),
+        );
+        emit_event(&mut out, "ping", &json!({ "type": "ping" }));
+    }
+
+    for part in parts {
+        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+            if !text.is_empty() {
+                emit_event(
+                    &mut out,
+                    "content_block_delta",
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {
+                            "type": "text_delta",
+                            "text": text
+                        }
+                    }),
+                );
+            }
+            continue;
+        }
+
+        if let Some(call) = part.get("functionCall") {
+            let name = call.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
+            let idx = buffer.next_index;
+            buffer.next_index += 1;
+            buffer.open_indices.insert(idx);
+            let tc_id = format!("call_{idx}");
+
+            emit_event(
+                &mut out,
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tc_id,
+                        "name": name,
+                        "input": {}
+                    }
+                }),
+            );
+            emit_event(
+                &mut out,
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": serde_json::to_string(&args).unwrap_or_default()
+                    }
+                }),
+            );
+        }
+    }
+
+    out
+}
+
 /// Close every open content block and emit message_delta/message_stop.
 /// Callers doing extra out-of-band block injection (e.g. heuristic tool-call
 /// extraction) must do so — and register/close their own indices — before
@@ -439,6 +561,59 @@ pub fn finish_stream(chunk: &Value, buffer: &mut AnthropicStreamBuffer) -> Vec<u
             },
             "usage": {
                 "output_tokens": chunk.pointer("/usage/completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+            }
+        }),
+    );
+    emit_event(
+        &mut out,
+        "message_stop",
+        &json!({
+            "type": "message_stop"
+        }),
+    );
+
+    out
+}
+
+/// Gemini counterpart to `finish_stream` — Gemini's finish reason lives at
+/// `candidates[0].finishReason` (`STOP`/`MAX_TOKENS`/`TOOL_CALLS`, not
+/// OpenAI's lowercase `stop`/`length`/`tool_calls`) and completion usage at
+/// `usageMetadata.candidatesTokenCount`.
+pub fn gemini_finish_stream(chunk: &Value, buffer: &mut AnthropicStreamBuffer) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    let finish_reason = chunk
+        .pointer("/candidates/0/finishReason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("STOP");
+
+    for idx in std::mem::take(&mut buffer.open_indices) {
+        emit_event(
+            &mut out,
+            "content_block_stop",
+            &json!({
+                "type": "content_block_stop",
+                "index": idx
+            }),
+        );
+    }
+
+    let sr = match finish_reason {
+        "MAX_TOKENS" => "max_tokens",
+        "TOOL_CALLS" => "tool_use",
+        _ => "end_turn",
+    };
+    emit_event(
+        &mut out,
+        "message_delta",
+        &json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": sr,
+                "stop_sequence": null
+            },
+            "usage": {
+                "output_tokens": chunk.pointer("/usageMetadata/candidatesTokenCount").and_then(|v| v.as_u64()).unwrap_or(0)
             }
         }),
     );
@@ -638,5 +813,61 @@ mod tests {
             last_block_stop_pos < stop_pos,
             "content_block_stop must precede message_stop"
         );
+    }
+
+    #[test]
+    fn test_gemini_stream_text_delta() {
+        let mut buffer = AnthropicStreamBuffer::default();
+        let chunk = json!({
+            "candidates": [{ "content": { "parts": [{ "text": "Hello" }] } }]
+        });
+        let bytes = gemini_chunk_to_anthropic_sse(&chunk, &mut buffer);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("message_start"));
+        assert!(text.contains("\"text\":\"Hello\""));
+        assert!(buffer.open_indices.contains(&0));
+    }
+
+    #[test]
+    fn test_gemini_stream_function_call_gets_fresh_index() {
+        let mut buffer = AnthropicStreamBuffer::default();
+        gemini_chunk_to_anthropic_sse(
+            &json!({"candidates": [{"content": {"parts": [{"text": ""}]}}]}),
+            &mut buffer,
+        );
+
+        let call_chunk = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "functionCall": { "name": "get_weather", "args": { "city": "Paris" } } }]
+                }
+            }]
+        });
+        let bytes = gemini_chunk_to_anthropic_sse(&call_chunk, &mut buffer);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\"index\":1"));
+        assert!(text.contains("\"name\":\"get_weather\""));
+        // partial_json's value is itself a JSON-encoded string, so the
+        // embedded object comes through escaped (\"city\":\"Paris\").
+        assert!(text.contains("city"));
+        assert!(text.contains("Paris"));
+        assert!(buffer.open_indices.contains(&0));
+        assert!(buffer.open_indices.contains(&1));
+
+        let finish = json!({"candidates": [{"finishReason": "TOOL_CALLS"}]});
+        let out = String::from_utf8(gemini_finish_stream(&finish, &mut buffer)).unwrap();
+        assert_eq!(out.matches("event: content_block_stop").count(), 2);
+        assert!(out.contains("\"stop_reason\":\"tool_use\""));
+        assert!(buffer.open_indices.is_empty());
+    }
+
+    #[test]
+    fn test_gemini_finish_stream_maps_max_tokens() {
+        let mut buffer = AnthropicStreamBuffer::default();
+        buffer.open_indices.insert(0);
+        let finish = json!({"candidates": [{"finishReason": "MAX_TOKENS"}], "usageMetadata": {"candidatesTokenCount": 42}});
+        let out = String::from_utf8(gemini_finish_stream(&finish, &mut buffer)).unwrap();
+        assert!(out.contains("\"stop_reason\":\"max_tokens\""));
+        assert!(out.contains("\"output_tokens\":42"));
     }
 }

@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+pub mod anthropic;
+pub mod gemini;
+pub mod openai_compat;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub providers: Vec<ProviderEntry>,
@@ -18,13 +22,23 @@ pub struct ProviderEntry {
     pub api_key_env: Option<String>,
     pub default_model: Option<String>,
     pub models: Vec<ModelDef>,
+    /// Extra static headers this provider always sends (e.g. OpenRouter's
+    /// HTTP-Referer/X-Title). Distinct from per-request auth, which is
+    /// derived from `api_key_env` by each provider module.
+    #[serde(default)]
+    pub extra_headers: Vec<(String, String)>,
 }
 
+/// Which upstream wire protocol a provider speaks. `OpenAiCompatible` covers
+/// any endpoint implementing OpenAI's `/chat/completions` shape (NVIDIA NIM,
+/// OpenRouter, LM Studio, and any future OpenAI-compatible endpoint —
+/// including one pointed at a Cloudflare AI Gateway OpenAI-compat route —
+/// need only a config entry here, not new code).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProviderKind {
-    NvidiaNim,
-    OpenRouter,
-    LmStudio,
+    OpenAiCompatible,
+    Anthropic,
+    Gemini,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,10 +65,12 @@ fn parse_model_string(s: &str) -> (String, String) {
 }
 
 fn unsupported_provider_type(provider_types: &[String]) -> Option<&str> {
-    provider_types
-        .iter()
-        .map(String::as_str)
-        .find(|pt| !matches!(*pt, "nvidia_nim" | "open_router" | "lmstudio"))
+    provider_types.iter().map(String::as_str).find(|pt| {
+        !matches!(
+            *pt,
+            "nvidia_nim" | "open_router" | "lmstudio" | "anthropic" | "gemini"
+        )
+    })
 }
 
 impl ProviderConfig {
@@ -91,25 +107,44 @@ impl ProviderConfig {
         // time, with an opaque "unknown provider".
         if let Some(bad) = unsupported_provider_type(&provider_types) {
             eprintln!(
-                "agentflare: unsupported provider prefix '{bad}' in MODEL/MODEL_OPUS/MODEL_SONNET/MODEL_HAIKU -- falling back to default_free() config. Supported prefixes: nvidia_nim, open_router, lmstudio."
+                "agentflare: unsupported provider prefix '{bad}' in MODEL/MODEL_OPUS/MODEL_SONNET/MODEL_HAIKU -- falling back to default_free() config. Supported prefixes: nvidia_nim, open_router, lmstudio, anthropic, gemini."
             );
             return Self::default_free();
         }
 
         let mut providers = Vec::new();
         for pt in &provider_types {
-            let (base_url, api_key_env, kind) = match pt.as_str() {
+            let (base_url, api_key_env, kind, extra_headers) = match pt.as_str() {
                 "nvidia_nim" => (
                     "https://integrate.api.nvidia.com/v1",
                     Some("NVIDIA_NIM_API_KEY"),
-                    ProviderKind::NvidiaNim,
+                    ProviderKind::OpenAiCompatible,
+                    vec![],
                 ),
                 "open_router" => (
                     "https://openrouter.ai/api/v1",
                     Some("OPENROUTER_API_KEY"),
-                    ProviderKind::OpenRouter,
+                    ProviderKind::OpenAiCompatible,
+                    openrouter_headers(),
                 ),
-                "lmstudio" => ("http://localhost:1234/v1", None, ProviderKind::LmStudio),
+                "lmstudio" => (
+                    "http://localhost:1234/v1",
+                    None,
+                    ProviderKind::OpenAiCompatible,
+                    vec![],
+                ),
+                "anthropic" => (
+                    "https://api.anthropic.com",
+                    Some("ANTHROPIC_API_KEY"),
+                    ProviderKind::Anthropic,
+                    vec![],
+                ),
+                "gemini" => (
+                    "https://generativelanguage.googleapis.com/v1beta",
+                    Some("GEMINI_API_KEY"),
+                    ProviderKind::Gemini,
+                    vec![],
+                ),
                 _ => continue,
             };
 
@@ -120,6 +155,7 @@ impl ProviderConfig {
                 api_key_env: api_key_env.map(String::from),
                 default_model: None,
                 models: vec![],
+                extra_headers,
             });
         }
 
@@ -184,7 +220,7 @@ impl ProviderConfig {
             providers: vec![
                 ProviderEntry {
                     id: "nvidia-nim".into(),
-                    kind: ProviderKind::NvidiaNim,
+                    kind: ProviderKind::OpenAiCompatible,
                     base_url: "https://integrate.api.nvidia.com/v1".into(),
                     api_key_env: Some("NVIDIA_NIM_API_KEY".into()),
                     default_model: Some("meta/llama-3.1-405b-instruct".into()),
@@ -200,10 +236,11 @@ impl ProviderConfig {
                             max_input_tokens: Some(128_000),
                         },
                     ],
+                    extra_headers: vec![],
                 },
                 ProviderEntry {
                     id: "openrouter".into(),
-                    kind: ProviderKind::OpenRouter,
+                    kind: ProviderKind::OpenAiCompatible,
                     base_url: "https://openrouter.ai/api/v1".into(),
                     api_key_env: Some("OPENROUTER_API_KEY".into()),
                     default_model: None,
@@ -212,10 +249,11 @@ impl ProviderConfig {
                         upstream_model: "openrouter/auto".into(),
                         max_input_tokens: None,
                     }],
+                    extra_headers: openrouter_headers(),
                 },
                 ProviderEntry {
                     id: "lm-studio".into(),
-                    kind: ProviderKind::LmStudio,
+                    kind: ProviderKind::OpenAiCompatible,
                     base_url: "http://localhost:1234/v1".into(),
                     api_key_env: None,
                     default_model: Some("local-model".into()),
@@ -224,6 +262,7 @@ impl ProviderConfig {
                         upstream_model: "local-model".into(),
                         max_input_tokens: Some(32_000),
                     }],
+                    extra_headers: vec![],
                 },
             ],
             routing: vec![
@@ -255,6 +294,13 @@ impl ProviderConfig {
     pub fn provider(&self, id: &str) -> Option<&ProviderEntry> {
         self.providers.iter().find(|p| p.id == id)
     }
+}
+
+fn openrouter_headers() -> Vec<(String, String)> {
+    vec![
+        ("HTTP-Referer".into(), "https://agentflare.dev".into()),
+        ("X-Title".into(), "agentflare".into()),
+    ]
 }
 
 #[cfg(test)]
@@ -333,7 +379,45 @@ mod tests {
             "nvidia_nim".to_string(),
             "open_router".to_string(),
             "lmstudio".to_string(),
+            "anthropic".to_string(),
+            "gemini".to_string(),
         ];
         assert_eq!(unsupported_provider_type(&types), None);
+    }
+
+    #[test]
+    fn from_env_anthropic_prefix_resolves_to_native_provider() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("MODEL", "anthropic/claude-sonnet-4-5");
+        std::env::remove_var("MODEL_OPUS");
+        std::env::remove_var("MODEL_SONNET");
+        std::env::remove_var("MODEL_HAIKU");
+
+        let config = ProviderConfig::from_env();
+        std::env::remove_var("MODEL");
+
+        let provider = config.provider("anthropic").unwrap();
+        assert!(matches!(provider.kind, ProviderKind::Anthropic));
+        assert_eq!(provider.base_url, "https://api.anthropic.com");
+        assert_eq!(provider.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn from_env_gemini_prefix_resolves_to_native_provider() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("MODEL", "gemini/gemini-2.5-flash");
+        std::env::remove_var("MODEL_OPUS");
+        std::env::remove_var("MODEL_SONNET");
+        std::env::remove_var("MODEL_HAIKU");
+
+        let config = ProviderConfig::from_env();
+        std::env::remove_var("MODEL");
+
+        let provider = config.provider("gemini").unwrap();
+        assert!(matches!(provider.kind, ProviderKind::Gemini));
+        assert_eq!(
+            provider.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
     }
 }

@@ -74,3 +74,12 @@ struct AppState {
     sc_config: shortcircuit::ShortCircuitConfig,
     client: reqwest::Client,
 }
+
+/// Serializes tests that mutate process-global env vars (`MODEL`,
+/// `MODEL_OPUS`, ...) — `cargo test` runs tests in parallel by default, and
+/// unsynchronized `env::set_var` calls across tests race.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
