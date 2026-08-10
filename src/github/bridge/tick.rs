@@ -388,6 +388,19 @@ fn record_claim(
                     })
                     .map(|l| l.id)
             });
+            // This decision is made once, right here, not re-evaluated on
+            // later ticks for this same issue (see the `Some(existing)` arm
+            // above) -- so a `work_agent` configured after this point never
+            // retroactively dispatches it. Silence here reads as "being
+            // worked" when it's actually just claimed and stuck; say so.
+            if ctx.config.work_agent.is_none() {
+                eprintln!(
+                    "github bridge: claimed #{} with no work_agent configured — it will \
+                     not be auto-dispatched; set AGENTFLARE_BRIDGE_WORK_AGENT or dispatch \
+                     it manually (`agentflare work`)",
+                    issue.number
+                );
+            }
             // `handoff`'s `recipient="github"` path embeds the full
             // structured payload (content/completed/remaining/thread_id) as
             // a hidden marker after the human-readable body -- recover it
