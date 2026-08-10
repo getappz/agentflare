@@ -199,3 +199,24 @@ prefix = "ollama"
 id = "ollama"
 kind = "openai_compatible"
 base_url = "http://localhost:11434/v1"
+
+[[providers]]
+prefix = "siliconflow"
+id = "siliconflow"
+kind = "openai_compatible"
+base_url = "https://api.siliconflow.com/v1"
+api_key_env = "SILICONFLOW_API_KEY"
+
+[[providers]]
+prefix = "llm7"
+id = "llm7"
+kind = "openai_compatible"
+base_url = "https://api.llm7.io/v1"
+api_key_env = "LLM7_API_KEY"
+
+[[providers]]
+prefix = "requesty"
+id = "requesty"
+kind = "openai_compatible"
+base_url = "https://router.requesty.ai/v1"
+api_key_env = "REQUESTY_API_KEY"

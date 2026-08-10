@@ -281,6 +281,9 @@ mod tests {
             "github_models",
             "cohere",
             "ollama",
+            "siliconflow",
+            "llm7",
+            "requesty",
         ] {
             let spec =
                 find(prefix).unwrap_or_else(|| panic!("registry must define provider '{prefix}'"));
