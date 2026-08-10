@@ -14,6 +14,13 @@ pub enum DaemonSubcommand {
     Status,
     Enable,
     Disable,
+    /// Print the current daemon session's stdout+stderr (bridge activity,
+    /// dashboard startup, etc). Truncated fresh on every start/restart.
+    Logs {
+        /// Keep printing new lines as the daemon writes them.
+        #[arg(short, long)]
+        follow: bool,
+    },
 }
 
 impl DaemonArgs {
@@ -25,6 +32,7 @@ impl DaemonArgs {
             DaemonSubcommand::Status => cmd_status(),
             DaemonSubcommand::Enable => cmd_enable(),
             DaemonSubcommand::Disable => cmd_disable(),
+            DaemonSubcommand::Logs { follow } => cmd_logs(follow),
         }
     }
 }
@@ -66,6 +74,38 @@ fn cmd_status() {
         None => {
             println!("daemon not running");
             std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_logs(follow: bool) {
+    use std::io::{Read, Write};
+    let path = crate::daemon::daemon_log_path();
+    let mut file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    };
+    let mut buf = String::new();
+    let _ = file.read_to_string(&mut buf);
+    print!("{buf}");
+    let _ = std::io::stdout().flush();
+    if !follow {
+        return;
+    }
+    // Simplest portable tail -f: re-read from the current position on the
+    // same handle, which reflects append-mode writes made by a different
+    // process to the same file. Not robust to the daemon restarting mid-tail
+    // (a fresh log truncates the same path) -- good enough for `-f` used
+    // interactively, same tradeoff `agentflare work`'s own log tailing makes.
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut chunk = String::new();
+        if file.read_to_string(&mut chunk).is_ok() && !chunk.is_empty() {
+            print!("{chunk}");
+            let _ = std::io::stdout().flush();
         }
     }
 }
