@@ -15,6 +15,24 @@ pub struct Vent {
     pub first_event_id: String,
     pub created_at: i64,
     pub updated_at: i64,
+    pub escalation_state: String,
+    pub escalation_level: i64,
+    pub escalated_at: Option<i64>,
+    pub acknowledged_at: Option<i64>,
+    pub resolved_at: Option<i64>,
+}
+
+/// Narrow projection of an escalation-eligible vent, used by the staleness
+/// sweep -- it only needs enough to decide the next state transition, not
+/// the full `Vent` (message/tags/topic_key are irrelevant there).
+#[derive(Debug, Clone)]
+pub struct EscalationRow {
+    pub id: String,
+    pub severity: String,
+    pub escalation_state: String,
+    pub escalation_level: i64,
+    pub escalated_at: Option<i64>,
+    pub item_id: String,
 }
 
 pub struct UpsertOutcome {
@@ -139,7 +157,8 @@ pub fn set_actionable(conn: &Connection, vent_id: &str, actionable: bool) -> Res
 pub fn list(conn: &Connection, project_id: &str, actionable_only: bool) -> Result<Vec<Vent>> {
     let mut stmt = conn.prepare(
         "SELECT id, project_id, message, severity, tags, topic_key, seen_count,
-                actionable, item_id, first_event_id, created_at, updated_at
+                actionable, item_id, first_event_id, created_at, updated_at,
+                escalation_state, escalation_level, escalated_at, acknowledged_at, resolved_at
          FROM vents WHERE project_id = ?1 AND (?2 = 0 OR actionable = 1)
          ORDER BY updated_at DESC",
     )?;
@@ -157,6 +176,79 @@ pub fn list(conn: &Connection, project_id: &str, actionable_only: bool) -> Resul
             first_event_id: r.get(9)?,
             created_at: r.get(10)?,
             updated_at: r.get(11)?,
+            escalation_state: r.get(12)?,
+            escalation_level: r.get(13)?,
+            escalated_at: r.get(14)?,
+            acknowledged_at: r.get(15)?,
+            resolved_at: r.get(16)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Opens the escalation state machine for a vent that just became
+/// actionable at critical/high severity. A no-op once escalation has
+/// already been opened (or resolved) for this vent -- only the `'none'`
+/// (never-escalated) starting state transitions here, so re-consolidating
+/// the same vent doesn't reset an in-flight or resolved escalation.
+pub fn ensure_escalation_open(conn: &Connection, vent_id: &str, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE vents SET escalation_state = 'open', escalation_level = 0, escalated_at = ?2
+         WHERE id = ?1 AND escalation_state = 'none'",
+        params![vent_id, now],
+    )?;
+    Ok(())
+}
+
+/// Marks an escalation acknowledged (its item was claimed / moved into
+/// progress) -- pauses further staleness re-escalation until it resolves
+/// or reverts.
+pub fn acknowledge_escalation(conn: &Connection, vent_id: &str, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE vents SET escalation_state = 'acknowledged', acknowledged_at = ?2 WHERE id = ?1",
+        params![vent_id, now],
+    )?;
+    Ok(())
+}
+
+/// Records a staleness-triggered re-escalation: bumps the tier and resets
+/// the staleness clock.
+pub fn bump_escalation(conn: &Connection, vent_id: &str, level: i64, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE vents SET escalation_level = ?2, escalated_at = ?3 WHERE id = ?1",
+        params![vent_id, level, now],
+    )?;
+    Ok(())
+}
+
+/// Terminal transition once the linked item completes or is cancelled.
+pub fn resolve_escalation(conn: &Connection, vent_id: &str, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE vents SET escalation_state = 'resolved', resolved_at = ?2 WHERE id = ?1",
+        params![vent_id, now],
+    )?;
+    Ok(())
+}
+
+/// Every vent still in an active escalation tier (`open` or
+/// `acknowledged`) with a linked item -- the working set for the
+/// staleness sweep.
+pub fn list_open_escalations(conn: &Connection, project_id: &str) -> Result<Vec<EscalationRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, severity, escalation_state, escalation_level, escalated_at, item_id
+         FROM vents
+         WHERE project_id = ?1 AND escalation_state IN ('open', 'acknowledged')
+               AND item_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params![project_id], |r| {
+        Ok(EscalationRow {
+            id: r.get(0)?,
+            severity: r.get(1)?,
+            escalation_state: r.get(2)?,
+            escalation_level: r.get(3)?,
+            escalated_at: r.get(4)?,
+            item_id: r.get::<_, Option<String>>(5)?.expect("filtered NOT NULL"),
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()

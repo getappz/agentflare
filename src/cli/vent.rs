@@ -67,6 +67,12 @@ pub fn run(args: VentArgs) {
             for id in r.items_created {
                 println!("  filed item {id}");
             }
+            if r.escalated + r.acknowledged + r.resolved > 0 {
+                println!(
+                    "escalations: {} re-escalated, {} acknowledged, {} resolved",
+                    r.escalated, r.acknowledged, r.resolved
+                );
+            }
         }
         VentCmd::File { title, body } => {
             let log = crate::vent::paths::global_log_path();
@@ -138,7 +144,7 @@ pub fn run(args: VentArgs) {
                 Ok(vents) => {
                     for v in vents {
                         println!(
-                            "{}  seen×{}  {}  {}{}",
+                            "{}  seen×{}  {}  {}{}{}",
                             if v.actionable { "●" } else { "○" },
                             v.seen_count,
                             v.severity,
@@ -146,6 +152,11 @@ pub fn run(args: VentArgs) {
                             v.item_id
                                 .map(|i| format!("  → item {i}"))
                                 .unwrap_or_default(),
+                            if v.escalation_state == "none" {
+                                String::new()
+                            } else {
+                                format!("  [{} tier {}]", v.escalation_state, v.escalation_level)
+                            },
                         );
                     }
                 }
