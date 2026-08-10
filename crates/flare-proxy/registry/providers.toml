@@ -72,3 +72,130 @@ base_url_template = "https://gateway.ai.cloudflare.com/v1/{CF_AI_GATEWAY_ACCOUNT
 api_key_env = "OPENAI_API_KEY"
 gateway_auth_env = "CF_AI_GATEWAY_TOKEN"
 gateway_auth_header = "cf-aig-authorization"
+
+# ---------------------------------------------------------------------------
+# Additional OpenAI-compatible providers. base_url values below are each
+# provider's own documented OpenAI-SDK-compatible endpoint as of this
+# session (2026-08-10) -- best-effort, not individually re-verified against
+# live docs for every entry. If one drifts, that's exactly what the
+# on-demand refresh (providers::ensure_fresh_registry, backed by this same
+# file published upstream) exists to fix without a new agentflare release.
+# ---------------------------------------------------------------------------
+
+[[providers]]
+prefix = "openai"
+id = "openai"
+kind = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[[providers]]
+prefix = "deepseek"
+id = "deepseek"
+kind = "openai_compatible"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[[providers]]
+prefix = "groq"
+id = "groq"
+kind = "openai_compatible"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+
+[[providers]]
+prefix = "mistral"
+id = "mistral"
+kind = "openai_compatible"
+base_url = "https://api.mistral.ai/v1"
+api_key_env = "MISTRAL_API_KEY"
+
+[[providers]]
+prefix = "xai"
+id = "xai"
+kind = "openai_compatible"
+base_url = "https://api.x.ai/v1"
+api_key_env = "XAI_API_KEY"
+
+[[providers]]
+prefix = "together"
+id = "together"
+kind = "openai_compatible"
+base_url = "https://api.together.xyz/v1"
+api_key_env = "TOGETHER_API_KEY"
+
+[[providers]]
+prefix = "perplexity"
+id = "perplexity"
+kind = "openai_compatible"
+base_url = "https://api.perplexity.ai"
+api_key_env = "PERPLEXITY_API_KEY"
+
+[[providers]]
+prefix = "fireworks"
+id = "fireworks"
+kind = "openai_compatible"
+base_url = "https://api.fireworks.ai/inference/v1"
+api_key_env = "FIREWORKS_API_KEY"
+
+[[providers]]
+prefix = "deepinfra"
+id = "deepinfra"
+kind = "openai_compatible"
+base_url = "https://api.deepinfra.com/v1/openai"
+api_key_env = "DEEPINFRA_API_KEY"
+
+[[providers]]
+prefix = "moonshot"
+id = "moonshot"
+kind = "openai_compatible"
+base_url = "https://api.moonshot.ai/v1"
+api_key_env = "MOONSHOT_API_KEY"
+
+[[providers]]
+prefix = "novita"
+id = "novita"
+kind = "openai_compatible"
+base_url = "https://api.novita.ai/v3/openai"
+api_key_env = "NOVITA_API_KEY"
+
+[[providers]]
+prefix = "hyperbolic"
+id = "hyperbolic"
+kind = "openai_compatible"
+base_url = "https://api.hyperbolic.xyz/v1"
+api_key_env = "HYPERBOLIC_API_KEY"
+
+[[providers]]
+prefix = "cerebras"
+id = "cerebras"
+kind = "openai_compatible"
+base_url = "https://api.cerebras.ai/v1"
+api_key_env = "CEREBRAS_API_KEY"
+
+[[providers]]
+prefix = "sambanova"
+id = "sambanova"
+kind = "openai_compatible"
+base_url = "https://api.sambanova.ai/v1"
+api_key_env = "SAMBANOVA_API_KEY"
+
+[[providers]]
+prefix = "github_models"
+id = "github-models"
+kind = "openai_compatible"
+base_url = "https://models.github.ai/inference"
+api_key_env = "GITHUB_TOKEN"
+
+[[providers]]
+prefix = "cohere"
+id = "cohere"
+kind = "openai_compatible"
+base_url = "https://api.cohere.ai/compatibility/v1"
+api_key_env = "COHERE_API_KEY"
+
+[[providers]]
+prefix = "ollama"
+id = "ollama"
+kind = "openai_compatible"
+base_url = "http://localhost:11434/v1"

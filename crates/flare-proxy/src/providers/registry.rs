@@ -247,6 +247,54 @@ mod tests {
     }
 
     #[test]
+    fn every_registry_entry_has_a_resolvable_static_or_gateway_url() {
+        // Every entry without a base_url_template must have a plain
+        // base_url -- catches a copy-paste mistake (e.g. a new provider
+        // block missing both fields) at test time instead of at request
+        // time via a confusing "no route" error.
+        for spec in registry() {
+            assert!(
+                spec.base_url.is_some() || spec.base_url_template.is_some(),
+                "provider '{}' has neither base_url nor base_url_template",
+                spec.prefix
+            );
+        }
+    }
+
+    #[test]
+    fn broad_openai_compatible_providers_are_present_and_resolve() {
+        for prefix in [
+            "openai",
+            "deepseek",
+            "groq",
+            "mistral",
+            "xai",
+            "together",
+            "perplexity",
+            "fireworks",
+            "deepinfra",
+            "moonshot",
+            "novita",
+            "hyperbolic",
+            "cerebras",
+            "sambanova",
+            "github_models",
+            "cohere",
+            "ollama",
+        ] {
+            let spec =
+                find(prefix).unwrap_or_else(|| panic!("registry must define provider '{prefix}'"));
+            assert!(matches!(spec.kind, ProviderKind::OpenAiCompatible));
+            let (base_url, _) =
+                resolve(spec).unwrap_or_else(|| panic!("'{prefix}' must resolve to a base_url"));
+            assert!(
+                base_url.starts_with("http://") || base_url.starts_with("https://"),
+                "'{prefix}' base_url '{base_url}' is not a valid URL prefix"
+            );
+        }
+    }
+
+    #[test]
     fn find_returns_known_static_provider() {
         let spec = find("nvidia_nim").expect("nvidia_nim must be in the registry");
         assert_eq!(spec.id, "nvidia-nim");
