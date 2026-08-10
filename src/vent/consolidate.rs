@@ -11,6 +11,9 @@ pub struct ConsolidateReport {
     pub items_created: Vec<String>,
     pub noise: usize,
     pub buffered_no_project: usize,
+    pub escalated: usize,
+    pub acknowledged: usize,
+    pub resolved: usize,
 }
 
 pub fn read_new_lines(log_path: &Path, cursor_path: &Path) -> (Vec<VentLine>, u64) {
@@ -67,10 +70,25 @@ pub fn consolidate_core(
 ) -> std::io::Result<ConsolidateReport> {
     let (lines, new_offset) = read_new_lines(log_path, cursor_path);
     let mut report = ConsolidateReport::default();
-    if lines.is_empty() {
-        return Ok(report);
+    if !lines.is_empty() {
+        consolidate_lines(conn, project_id, default_state_id, &lines, &mut report);
+        let _ = std::fs::write(cursor_path, new_offset.to_string());
     }
 
+    let sweep = sweep_escalations(conn, project_id, now());
+    report.escalated = sweep.escalated;
+    report.acknowledged = sweep.acknowledged;
+    report.resolved = sweep.resolved;
+    Ok(report)
+}
+
+fn consolidate_lines(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    default_state_id: &str,
+    lines: &[VentLine],
+    report: &mut ConsolidateReport,
+) {
     struct Group {
         message: String,
         severity: String,
@@ -79,7 +97,7 @@ pub fn consolidate_core(
         tags: Vec<String>,
     }
     let mut groups: BTreeMap<String, Group> = BTreeMap::new();
-    for l in &lines {
+    for l in lines {
         let key = topic_key(&l.message);
         let g = groups.entry(key).or_insert_with(|| Group {
             message: l.message.clone(),
@@ -131,6 +149,14 @@ pub fn consolidate_core(
             report.noise += g.count as usize;
             continue;
         }
+        // Critical/high severities open a resolvable escalation the first
+        // time they become actionable, whether that's on this vent's first
+        // item or a later re-consolidate of an already-filed one (e.g. a
+        // severity bump). `ensure_escalation_open` is a no-op once already
+        // open/resolved.
+        if crate::vent::classify::escalation_sla_secs(&g.severity).is_some() {
+            let _ = agentflare_backend::vent::ensure_escalation_open(conn, &out.id, now());
+        }
         if out.existing_item_id.is_some() {
             continue;
         }
@@ -150,7 +176,8 @@ pub fn consolidate_core(
                 "{}\n\n---\nsource: vent · severity: {} · seen: {}",
                 g.message, g.severity, out.seen_count
             )),
-            priority: None,
+            priority: crate::vent::classify::escalation_priority(&g.severity)
+                .map(|p| p.to_string()),
             parent_id: None,
             assignee_agent: None,
             sort_order: None,
@@ -169,9 +196,81 @@ pub fn consolidate_core(
             Err(e) => eprintln!("[vent] item::create failed: {e}"),
         }
     }
+}
 
-    let _ = std::fs::write(cursor_path, new_offset.to_string());
-    Ok(report)
+#[derive(Debug, Default)]
+struct EscalationSweep {
+    escalated: usize,
+    acknowledged: usize,
+    resolved: usize,
+}
+
+/// Runs on every consolidate pass (even with zero new vent lines, since
+/// staleness alone must be able to trigger it) over every vent still in an
+/// active escalation tier. Per row: an item that reached completed/
+/// cancelled resolves the escalation; one claimed into started/in_review
+/// acknowledges it (pausing further staleness checks); otherwise, once it's
+/// sat unclaimed past its severity's SLA, it re-escalates -- bumping the
+/// tier, re-forcing the item's priority, and leaving a comment so the
+/// staleness itself is visible on the item, not just in the vents table.
+fn sweep_escalations(conn: &rusqlite::Connection, project_id: &str, now: i64) -> EscalationSweep {
+    let mut sweep = EscalationSweep::default();
+    let rows = match agentflare_backend::vent::list_open_escalations(conn, project_id) {
+        Ok(r) => r,
+        Err(_) => return sweep,
+    };
+    for row in rows {
+        let Ok(item) = agentflare_backend::item::get(conn, &row.item_id) else {
+            continue;
+        };
+        let Ok(state) = agentflare_backend::state::get(conn, &item.state_id) else {
+            continue;
+        };
+        match state.group_name.as_str() {
+            "completed" | "cancelled" => {
+                let _ = agentflare_backend::vent::resolve_escalation(conn, &row.id, now);
+                sweep.resolved += 1;
+            }
+            "started" | "in_review" if row.escalation_state == "open" => {
+                let _ = agentflare_backend::vent::acknowledge_escalation(conn, &row.id, now);
+                sweep.acknowledged += 1;
+            }
+            _ if row.escalation_state == "open" => {
+                let Some(sla) = crate::vent::classify::escalation_sla_secs(&row.severity) else {
+                    continue;
+                };
+                let last = row.escalated_at.unwrap_or(item.created_at);
+                if now - last < sla {
+                    continue;
+                }
+                let new_level = row.escalation_level + 1;
+                let _ = agentflare_backend::vent::bump_escalation(conn, &row.id, new_level, now);
+                if let Some(priority) = crate::vent::classify::escalation_priority(&row.severity) {
+                    let _ = agentflare_backend::item::update(
+                        conn,
+                        &row.item_id,
+                        agentflare_backend::item::UpdateItem {
+                            priority: Some(priority.to_string()),
+                            ..Default::default()
+                        },
+                    );
+                }
+                let _ = agentflare_backend::comment::create(
+                    conn,
+                    &row.item_id,
+                    "agentflare:escalation",
+                    &format!(
+                        "re-escalated to tier {new_level} — {} vent unclaimed for {}m with no owner",
+                        row.severity,
+                        (now - last) / 60,
+                    ),
+                );
+                sweep.escalated += 1;
+            }
+            _ => {}
+        }
+    }
+    sweep
 }
 
 pub fn consolidate() -> ConsolidateReport {
@@ -427,5 +526,114 @@ mod tests {
             tags_json, r#"["dx"]"#,
             "an untagged run must not erase tags a prior run already persisted"
         );
+    }
+
+    fn insert_state(conn: &rusqlite::Connection, id: &str, group: &str, seq: f64) {
+        conn.execute(
+            "INSERT INTO states (id,project_id,name,group_name,sequence,is_default,created_at,updated_at)
+             VALUES (?1,'p',?1,?2,?3,0,1,1)",
+            rusqlite::params![id, group, seq],
+        )
+        .unwrap();
+    }
+
+    fn escalation_row(conn: &rusqlite::Connection) -> (String, i64, Option<i64>, String) {
+        conn.query_row(
+            "SELECT escalation_state, escalation_level, escalated_at,
+                    (SELECT priority FROM items WHERE items.id = vents.item_id)
+             FROM vents",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn high_severity_vent_opens_escalation_and_forces_item_priority() {
+        let conn = open_in_memory().unwrap();
+        let (p, s) = seed(&conn);
+        let dir = tempfile::tempdir().unwrap();
+        let (log, cur) = (dir.path().join("v.jsonl"), dir.path().join("v.cursor"));
+        write_lines(&log, &[("high", "the deploy pipeline is down")]);
+        consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+
+        let (state, level, escalated_at, priority) = escalation_row(&conn);
+        assert_eq!(state, "open");
+        assert_eq!(level, 0);
+        assert!(escalated_at.is_some());
+        assert_eq!(
+            priority, "high",
+            "high severity forces the item to high priority"
+        );
+    }
+
+    #[test]
+    fn stale_open_escalation_re_escalates_and_leaves_a_comment() {
+        let conn = open_in_memory().unwrap();
+        let (p, s) = seed(&conn);
+        let dir = tempfile::tempdir().unwrap();
+        let (log, cur) = (dir.path().join("v.jsonl"), dir.path().join("v.cursor"));
+        write_lines(&log, &[("critical", "prod database is unreachable")]);
+        let rep = consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+        let item_id = rep.items_created[0].clone();
+
+        // Backdate past the critical SLA (15m) so the next sweep re-escalates.
+        conn.execute("UPDATE vents SET escalated_at = escalated_at - 1000", [])
+            .unwrap();
+        let rep2 = consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+        assert_eq!(rep2.escalated, 1);
+
+        let (state, level, _, priority) = escalation_row(&conn);
+        assert_eq!(
+            state, "open",
+            "still unclaimed -- stays open, just re-escalated"
+        );
+        assert_eq!(level, 1, "staleness bumped the tier");
+        assert_eq!(priority, "urgent");
+
+        let comments = agentflare_backend::comment::list_by_item(&conn, &item_id).unwrap();
+        assert_eq!(
+            comments.len(),
+            1,
+            "re-escalation leaves a visible trail on the item"
+        );
+    }
+
+    #[test]
+    fn claiming_the_item_acknowledges_and_pauses_escalation() {
+        let conn = open_in_memory().unwrap();
+        let (p, s) = seed(&conn);
+        insert_state(&conn, "started", "started", 2.0);
+        let dir = tempfile::tempdir().unwrap();
+        let (log, cur) = (dir.path().join("v.jsonl"), dir.path().join("v.cursor"));
+        write_lines(&log, &[("high", "flaky CI runner")]);
+        let rep = consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+        let item_id = rep.items_created[0].clone();
+
+        agentflare_backend::item::update_state(&conn, &item_id, "started").unwrap();
+        let rep2 = consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+        assert_eq!(rep2.acknowledged, 1);
+
+        let (state, _, _, _) = escalation_row(&conn);
+        assert_eq!(state, "acknowledged");
+    }
+
+    #[test]
+    fn completing_the_item_resolves_escalation() {
+        let conn = open_in_memory().unwrap();
+        let (p, s) = seed(&conn);
+        insert_state(&conn, "done", "completed", 2.0);
+        let dir = tempfile::tempdir().unwrap();
+        let (log, cur) = (dir.path().join("v.jsonl"), dir.path().join("v.cursor"));
+        write_lines(&log, &[("high", "flaky CI runner")]);
+        let rep = consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+        let item_id = rep.items_created[0].clone();
+
+        agentflare_backend::item::update_state(&conn, &item_id, "done").unwrap();
+        let rep2 = consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+        assert_eq!(rep2.resolved, 1);
+
+        let (state, _, _, _) = escalation_row(&conn);
+        assert_eq!(state, "resolved");
     }
 }

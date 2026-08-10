@@ -1227,7 +1227,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Vent friction when the TOOLING blocks you (not the task) — a wrong/missing tool, a fabricated assumption, an environment gap. Actionable vents auto-file a DX item once per turn; noise is just logged. Use sparingly, exactly when you're genuinely blocked. DO: \"The $CLAUDE_JOB_DIR I assumed exists is empty — I fabricated it; there's no such env var and my temp writes went to /.\" DON'T: \"This build is slow to compile.\" Inputs: message (required), severity (low|medium|high), tags."
+        description = "Vent friction when the TOOLING blocks you (not the task) — a wrong/missing tool, a fabricated assumption, an environment gap. Actionable vents auto-file a DX item once per turn; noise is just logged. critical/high severities additionally open a resolvable escalation on that item: its priority is forced up and it re-escalates (bumped tier, re-notified) if left unclaimed past its SLA (critical: 15m, high: 2h), pausing once claimed and resolving once the item completes or is cancelled. Use sparingly, exactly when you're genuinely blocked. DO: \"The $CLAUDE_JOB_DIR I assumed exists is empty — I fabricated it; there's no such env var and my temp writes went to /.\" DON'T: \"This build is slow to compile.\" Inputs: message (required), severity (critical|high|medium|low), tags."
     )]
     fn vent(&self, Parameters(req): Parameters<VentRequest>) -> Result<String, ErrorData> {
         if req.message.trim().is_empty() {

@@ -44,26 +44,52 @@ pub fn topic_key(message: &str) -> String {
 
 pub fn severity_rank(severity: &str) -> u8 {
     match severity {
+        "critical" => 3,
         "high" => 2,
         "medium" => 1,
         _ => 0,
     }
 }
 
-/// Normalize user-supplied severity to exactly "low" | "medium" | "high"
-/// (case-insensitive), defaulting to "medium" for anything else. Shared by
-/// the MCP `vent` tool and the `agentflare vent say` CLI so both entry
-/// points classify identically.
+/// Normalize user-supplied severity to exactly "low" | "medium" | "high" |
+/// "critical" (case-insensitive), defaulting to "medium" for anything else.
+/// Shared by the MCP `vent` tool and the `agentflare vent say` CLI so both
+/// entry points classify identically.
 pub fn normalize_severity(input: Option<&str>) -> &'static str {
     match input.map(str::to_lowercase).as_deref() {
         Some("low") => "low",
         Some("high") => "high",
+        Some("critical") => "critical",
         _ => "medium",
     }
 }
 
 pub fn classify(severity: &str, seen_count: i64, message: &str) -> bool {
-    severity == "high" || seen_count >= ACTIONABLE_SEEN_THRESHOLD || MARKER_RE.is_match(message)
+    severity_rank(severity) >= severity_rank("high")
+        || seen_count >= ACTIONABLE_SEEN_THRESHOLD
+        || MARKER_RE.is_match(message)
+}
+
+/// Seconds a critical/high vent's linked item may sit unclaimed before the
+/// escalation sweep bumps its tier and re-notifies. `None` for
+/// medium/low -- those stay flat friction logging, not a resolvable
+/// escalation (gastown's `gt escalate` only chains CRITICAL/HIGH too).
+pub fn escalation_sla_secs(severity: &str) -> Option<i64> {
+    match severity {
+        "critical" => Some(15 * 60),
+        "high" => Some(2 * 60 * 60),
+        _ => None,
+    }
+}
+
+/// Item priority an escalation-eligible severity forces the linked item to
+/// on open and on every re-escalation.
+pub fn escalation_priority(severity: &str) -> Option<&'static str> {
+    match severity {
+        "critical" => Some("urgent"),
+        "high" => Some("high"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -88,7 +114,8 @@ mod tests {
     }
 
     #[test]
-    fn severity_rank_orders_low_medium_high() {
+    fn severity_rank_orders_critical_high_medium_low() {
+        assert!(severity_rank("critical") > severity_rank("high"));
         assert!(severity_rank("high") > severity_rank("medium"));
         assert!(severity_rank("medium") > severity_rank("low"));
         assert_eq!(severity_rank("garbage"), severity_rank("low"));
@@ -98,8 +125,29 @@ mod tests {
     fn normalize_severity_is_case_insensitive_and_defaults_to_medium() {
         assert_eq!(normalize_severity(Some("High")), "high");
         assert_eq!(normalize_severity(Some("LOW")), "low");
+        assert_eq!(normalize_severity(Some("Critical")), "critical");
         assert_eq!(normalize_severity(Some("garbage")), "medium");
         assert_eq!(normalize_severity(None), "medium");
+    }
+
+    #[test]
+    fn classify_treats_critical_as_actionable_regardless_of_message() {
+        assert!(classify("critical", 1, "all good"));
+    }
+
+    #[test]
+    fn escalation_sla_secs_only_applies_to_critical_and_high() {
+        assert_eq!(escalation_sla_secs("critical"), Some(15 * 60));
+        assert_eq!(escalation_sla_secs("high"), Some(2 * 60 * 60));
+        assert_eq!(escalation_sla_secs("medium"), None);
+        assert_eq!(escalation_sla_secs("low"), None);
+    }
+
+    #[test]
+    fn escalation_priority_maps_severity_to_item_priority() {
+        assert_eq!(escalation_priority("critical"), Some("urgent"));
+        assert_eq!(escalation_priority("high"), Some("high"));
+        assert_eq!(escalation_priority("medium"), None);
     }
 
     #[test]

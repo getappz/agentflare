@@ -5,6 +5,7 @@
 
 use super::goal::find_goal_ancestor;
 use super::lifecycle::GoalLifecycle;
+use crate::vent::classify::severity_rank;
 
 /// Consecutive self-repairs a goal may run before the next tick is forced
 /// to `ask` regardless of what tier 1 would otherwise say.
@@ -103,7 +104,9 @@ pub fn decide(conn: &rusqlite::Connection, item: &agentflare_backend::item::Item
                 })
                 .collect();
             if !linked.is_empty() {
-                let has_high = linked.iter().any(|v| v.severity == "high");
+                let has_high = linked
+                    .iter()
+                    .any(|v| severity_rank(&v.severity) >= severity_rank("high"));
                 if has_high {
                     return Decision::ask(
                         "a high-severity friction report is linked to this goal",
@@ -401,6 +404,37 @@ mod tests {
         assert_eq!(decision.effective_action, EffectiveActionInternal::Ask);
         assert!(!decision.should_run);
         assert!(decision.gate_question.is_some());
+    }
+
+    #[test]
+    fn critical_severity_vent_on_goal_forces_ask() {
+        let conn = test_conn();
+        let (pid, sid) = seed_project(&conn);
+        let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, 0);
+        let todo = make_todo(&conn, &pid, &sid, &goal.id);
+        agentflare_backend::vent::upsert(
+            &conn,
+            &pid,
+            "everything is on fire",
+            "critical",
+            "[]",
+            "topic",
+            "evt-1",
+            1,
+            crate::claims::now(),
+        )
+        .unwrap();
+        let vents = agentflare_backend::vent::list(&conn, &pid, false).unwrap();
+        agentflare_backend::vent::set_actionable(&conn, &vents[0].id, true).unwrap();
+        agentflare_backend::vent::link_item(&conn, &vents[0].id, &goal.id).unwrap();
+
+        let decision = decide(&conn, &todo);
+        assert_eq!(
+            decision.effective_action,
+            EffectiveActionInternal::Ask,
+            "critical must gate exactly like high, not fall through to self-repair"
+        );
+        assert!(!decision.should_run);
     }
 
     #[test]
