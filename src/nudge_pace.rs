@@ -39,27 +39,31 @@ impl PaceLock {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        for _ in 0..200 {
+        let mut last_err = None;
+        for attempt in 0..400u32 {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
                 Ok(_) => return Ok(Self { path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(e) => {
+                    // A holder that crashed without cleaning up (or, on
+                    // Windows, a transient AV/indexer handle on the lock
+                    // file) must never wedge nudge pacing shut: every ~2s
+                    // of contention, clear the lock and keep retrying —
+                    // rather than stealing it once and propagating any
+                    // further failure, which silently drops the caller's
+                    // write instead of just waiting longer.
+                    if attempt > 0 && attempt % 200 == 0 {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    last_err = Some(e);
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                Err(e) => return Err(e),
             }
         }
-        // A holder that crashed without cleaning up must never wedge nudge
-        // pacing shut: a lock held for ~2s is treated as stale and broken.
-        let _ = std::fs::remove_file(&path);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        Ok(Self { path })
+        Err(last_err.unwrap_or_else(|| std::io::Error::other("could not acquire nudge-pace lock")))
     }
 }
 
