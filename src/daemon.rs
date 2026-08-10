@@ -158,6 +158,79 @@ pub fn start_daemon() -> Result<u32, String> {
     Err("daemon did not start within 5s".to_string())
 }
 
+/// A point-in-time fingerprint (mtime + size) of the on-disk binary this
+/// process was launched from. `stat()`-cheap, and a genuinely different
+/// build sharing both by chance is astronomically unlikely -- no need for a
+/// content hash re-read on every check.
+///
+/// Exists because work items run in-process via `WorkItemExecutor` (item
+/// #19) instead of a spawned subprocess: a rebuild/`agentflare update` that
+/// replaces the binary no longer makes dispatch fail loudly (the old
+/// `dispatch_item` fix in `supervisor.rs`'s git history is moot once
+/// nothing spawns an exe path) -- it leaves a long-running daemon silently
+/// executing whatever job logic it happened to load at startup, forever
+/// (item #68).
+pub struct BinarySnapshot {
+    path: PathBuf,
+    modified: std::time::SystemTime,
+    len: u64,
+}
+
+impl BinarySnapshot {
+    /// `None` if `current_exe()` fails or the resolved path can't be
+    /// stat'd -- the staleness watchdog then has nothing to compare against
+    /// and skips itself, same tradeoff as any other best-effort startup
+    /// check in this module.
+    pub fn capture() -> Option<Self> {
+        let path = std::env::current_exe().ok()?;
+        let meta = std::fs::metadata(&path).ok()?;
+        Some(Self {
+            path,
+            modified: meta.modified().ok()?,
+            len: meta.len(),
+        })
+    }
+
+    /// `true` once the file now on disk at `path` no longer matches what
+    /// this process was actually loaded from -- e.g. `agentflare update`'s
+    /// same-fs `rename()` (see `update::swap`'s doc comment: the live
+    /// process keeps its original, now-unlinked inode) or a `cargo
+    /// build`/`cargo install` replaced the file while this process kept
+    /// running the old image.
+    pub fn is_stale(&self) -> bool {
+        match std::fs::metadata(&self.path).and_then(|m| Ok((m.modified()?, m.len()))) {
+            Ok((modified, len)) => modified != self.modified || len != self.len,
+            // Gone entirely (e.g. uninstalled) counts as stale too --
+            // nothing to keep serving from.
+            Err(_) => true,
+        }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+/// Spawns a replacement daemon from the (now-updated) binary at
+/// `snapshot`'s path and exits this process. Cleans up this process's own
+/// pid/lock files *first* so the replacement's own `is_daemon_running()`
+/// gate (`ServeArgs::run`) can't mistake this still-exiting process for a
+/// still-live one and refuse to start.
+pub fn respawn_from_stale(snapshot: &BinarySnapshot) -> ! {
+    cleanup_daemon_files();
+    let binary = snapshot.path().to_string_lossy().to_string();
+    // Must match `start_daemon`'s own spawn call -- both need the installed
+    // systemd/launchd units' `serve --_foreground-daemon` invocation.
+    match process::spawn_detached(&binary, &["serve", "--_foreground-daemon"], Some(&daemon_log_path())) {
+        Ok(pid) => eprintln!("agentflare-daemon: respawned as pid {pid}"),
+        Err(e) => eprintln!(
+            "agentflare-daemon: failed to respawn ({e}); exiting anyway -- a process \
+             supervisor (systemd/launchd), if configured, should restart it"
+        ),
+    }
+    std::process::exit(1)
+}
+
 pub fn stop_daemon() -> Result<(), String> {
     let pid = match is_daemon_running() {
         Some(p) => p,
@@ -197,4 +270,61 @@ pub fn stop_daemon() -> Result<(), String> {
 
     cleanup_daemon_files();
     Ok(())
+}
+
+#[cfg(test)]
+mod binary_snapshot_tests {
+    use super::BinarySnapshot;
+    use std::io::Write;
+
+    fn snapshot_at(path: &std::path::Path) -> BinarySnapshot {
+        let meta = std::fs::metadata(path).unwrap();
+        BinarySnapshot {
+            path: path.to_path_buf(),
+            modified: meta.modified().unwrap(),
+            len: meta.len(),
+        }
+    }
+
+    #[test]
+    fn is_stale_is_false_right_after_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agentflare");
+        std::fs::write(&path, b"v1").unwrap();
+
+        let snapshot = snapshot_at(&path);
+        assert!(!snapshot.is_stale());
+    }
+
+    #[test]
+    fn is_stale_is_true_once_the_file_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agentflare");
+        std::fs::write(&path, b"v1").unwrap();
+        let snapshot = snapshot_at(&path);
+
+        // Same replace-by-rename shape as `update::swap::replace_binary`:
+        // a longer file forces a distinct size even if two builds landed
+        // in the same mtime second.
+        let staged = dir.path().join("agentflare.new");
+        {
+            let mut f = std::fs::File::create(&staged).unwrap();
+            f.write_all(b"v2-longer-content").unwrap();
+        }
+        std::fs::rename(&staged, &path).unwrap();
+
+        assert!(snapshot.is_stale());
+    }
+
+    #[test]
+    fn is_stale_is_true_once_the_file_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agentflare");
+        std::fs::write(&path, b"v1").unwrap();
+        let snapshot = snapshot_at(&path);
+
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(snapshot.is_stale());
+    }
 }
