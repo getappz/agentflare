@@ -80,6 +80,28 @@ impl AgentflareMcp {
             );
         }
 
+        // Anything that isn't "github" and isn't a known agent type would
+        // otherwise become `assignee_agent` on the created/updated item with
+        // no validation at all -- a typo or a thematic word (e.g.
+        // "gastown") silently orphans the item, since nothing will ever
+        // claim or dispatch it. Same registry lookup `cli/work.rs`'s
+        // `--agent` flag already validates against.
+        if agent_registry::agent_by_name(&recipient).is_none() {
+            let mut valid: Vec<&str> = agent_registry::REGISTRY
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect();
+            valid.push("github");
+            valid.sort_unstable();
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "recipient '{recipient}' is not a known agent -- valid recipients: {}",
+                    valid.join(", ")
+                ),
+                None,
+            ));
+        }
+
         let ext = match r#type.as_deref() {
             Some("html") => "html",
             Some("mermaid") | Some("diagram") => "mmd",
@@ -659,6 +681,20 @@ mod tests {
                 None => std::env::remove_var("AGENTFLARE_BRIDGE_REPO"),
             }
         }
+    }
+
+    #[test]
+    fn recipient_not_in_the_agent_registry_is_rejected_with_valid_recipients_listed() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            recipient: "gastown".to_string(),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("gastown"), "{msg}");
+        assert!(msg.contains("claude-code"), "{msg}");
+        assert!(msg.contains("github"), "{msg}");
     }
 
     #[test]
