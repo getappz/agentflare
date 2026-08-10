@@ -29,23 +29,49 @@ supervisor — never implemented inline by you.
    `"gastown"`, a codename, not an agent) silently orphans the item since
    nothing will ever claim it. Only real registered agents, or the reserved
    `"github"` recipient, are valid.
-3. **Use `handoff`, not raw `item update`.** `mcp__flare__handoff` with
+3. **Classify the task type, then shape the handoff content for it.**
+   Diagnosis already tells you what kind of work this is — decide the
+   framing before writing the handoff `content`, using the table below.
+   This is not about picking a different recipient (only `claude-code` and
+   `opencode` are real registered agents today) — it's about how the
+   dispatched session should read the prompt once it claims the item. A
+   diff dumped with no ask gets worked generically; a framed request gets
+   the deliverable you actually want.
+4. **Use `handoff`, not raw `item update`.** `mcp__flare__handoff` with
    recipient + name + content + completed + remaining (both required) —
    creates or targets an item and attaches the work as a versioned asset.
    `item action=update assignee_agent=...` skips the asset trail.
-4. **Let the daemon dispatch it — don't run `agentflare work <id>`
+5. **Let the daemon dispatch it — don't run `agentflare work <id>`
    yourself.** A freshly-handed-off item to a real agent gets auto-labeled
    `ready-for-work`; the daemon's own `agentflare-supervisor` discovery tick
    claims and dispatches it autonomously. Manually running `agentflare work`
    defeats the point of this mode.
-5. **Monitor, don't poll blindly.** `agentflare daemon logs [--follow]` for
+6. **Monitor, don't poll blindly.** `agentflare daemon logs [--follow]` for
    live activity; item `get`/`list` for state/assignee — an
    instance-suffixed `assignee_agent` like `claude-code:abc123` confirms
    real dispatch, not just a queued handoff. The `agent_jobs` table
    (`state` + `output.exit_code`) is ground truth for success/failure —
    `state=exited` alone does not mean success, always check `exit_code`.
-6. **Report as a status table**, not a raw dump: item · state · assignee ·
+7. **Report as a status table**, not a raw dump: item · state · assignee ·
    one-line note. Flag anything stuck or orphaned.
+
+## Task-type routing heuristic
+
+Before calling `handoff`, match the diagnosed work to a shape and frame the
+`content` accordingly. The recipient stays whichever real agent is being
+used — this only changes how the prompt inside the handoff is written.
+
+| Task type | Signal from diagnosis | Frame the handoff content as |
+|---|---|---|
+| Review | "review this PR/diff", find bugs or style issues, no code should change | State it's review-only up front + link/diff + what to check for + "report findings, don't fix" |
+| Research | "investigate", "find out", "what's the state of X" | The question + scope boundaries + expected output shape (summary, comparison, recommendation) |
+| Bugfix | Reproducible failure, stack trace, failing test | Repro steps + expected vs. actual + suspected area — not just "fix this" |
+| Design-spec | "design", "propose an approach", pre-implementation | Constraints + goals + explicitly ask for a written plan/spec, not code |
+| Implementation | Already scoped/designed change ready to build | Spec or acceptance criteria + relevant files — enough to build without re-deriving intent |
+
+A handoff that just pastes a diff or a one-line title forces the dispatched
+session to guess the task type from content alone — it'll often default to
+"implement", which is wrong for review/research/design work.
 
 ## Quick reference
 
@@ -67,3 +93,6 @@ supervisor — never implemented inline by you.
 - Reading `state=exited` as success — check `exit_code`.
 - Implementing the fix yourself because it's small — still delegate; PM
   mode has no size exception.
+- Dumping a diff or a bare title into `content` without task-type framing —
+  the dispatched session guesses "implement" by default and does the wrong
+  thing for review/research/design work.
