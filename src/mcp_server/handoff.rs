@@ -87,8 +87,10 @@ impl AgentflareMcp {
         // claim or dispatch it. Same registry lookup `cli/work.rs`'s
         // `--agent` flag already validates against.
         if agent_registry::agent_by_name(&recipient).is_none() {
-            let mut valid: Vec<&str> =
-                agent_registry::REGISTRY.iter().map(|s| s.id.as_str()).collect();
+            let mut valid: Vec<&str> = agent_registry::REGISTRY
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect();
             valid.push("github");
             valid.sort_unstable();
             return Err(ErrorData::invalid_params(
