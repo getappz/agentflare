@@ -100,7 +100,13 @@ fn build_prompt(
         "\nIf you made any file changes, commit them (git add + git commit) before you \
          finish -- do not leave edits uncommitted. If you investigate and decide no code \
          change is warranted, it's fine to finish with zero commits. When you are done, \
-         summarize what you changed and why.\n",
+         summarize what you changed and why.\n\
+         \nThis is a one-shot headless run: once your turn ends, there is no mechanism to \
+         resume this session or report back later. Never run build, test, or lint commands \
+         as a background task with a plan to check on them afterward -- your turn will end \
+         before that happens and the result will be lost. Run all verification (builds, \
+         tests, lints) synchronously in the foreground and wait for it to complete before \
+         ending your turn.\n",
     );
     prompt
 }
@@ -782,6 +788,21 @@ mod tests {
         assert!(prompt.contains("commit"));
         assert!(prompt.contains("do not leave edits uncommitted"));
         assert!(prompt.contains("it's fine to finish with zero commits"));
+    }
+
+    #[test]
+    fn build_prompt_forbids_backgrounding_verification() {
+        // Items #68 and #70: a headless-dispatched agent ran `cargo build`
+        // as a background task and ended its turn saying it would report
+        // back once it finished -- but one-shot headless dispatch has no
+        // mechanism to resume the session, so the harness kills the
+        // background task and the verification result is lost. The prompt
+        // must tell the agent explicitly to run checks synchronously.
+        let item = test_item();
+        let prompt = build_prompt(&item, &[]);
+        assert!(prompt.contains("one-shot headless run"));
+        assert!(prompt.contains("no mechanism to resume"));
+        assert!(prompt.contains("Never run build, test, or lint commands as a background task"));
     }
 
     #[test]
