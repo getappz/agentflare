@@ -1,0 +1,296 @@
+//! Bubblewrap-based sandboxing for job commands on native Linux and WSL2.
+//!
+//! Flag set and ordering are adapted from openai/codex's `linux-sandbox`
+//! crate (`bwrap.rs`): read-only root by default (`--ro-bind / /`), an
+//! explicit writable bind for the job's cwd, `.git` re-protected read-only
+//! even though it sits inside that writable root, and `--chdir` into the
+//! cwd rather than relying on bubblewrap inheriting a possibly-symlinked
+//! logical cwd. Unlike codex's crate this has no split filesystem policy,
+//! glob-based path masking, or seccomp network filter -- this job runner
+//! operates on worktrees it already controls, not arbitrary third-party
+//! workspaces, so that machinery isn't needed here.
+mod bwrap_install;
+
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// $HOME subdirectories commonly needed by build/package tooling (cargo,
+/// rustup, npm, pip caches) that would otherwise sit outside the job's cwd
+/// and fail under the read-only root. Bound read-only with `--ro-bind-try`
+/// (missing dirs silently skipped) -- writable would let a sandboxed job
+/// persist changes into the host's caches (e.g. a malicious `~/.cargo/bin`
+/// entry or poisoned npm cache) that run unsandboxed on a future invocation,
+/// defeating the containment this sandbox exists to provide.
+const HOME_CACHE_DIRS: &[&str] = &[".cargo", ".rustup", ".cache", ".npm"];
+
+pub(super) fn wrap(
+    command: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> Option<(String, Vec<String>)> {
+    let bwrap = find_or_install_bwrap()?;
+    // Resolved once up front (not inside `build_bwrap_args`) so an
+    // unresolvable cwd falls back to running the job unsandboxed, the same
+    // as a missing `bwrap`/`mise` -- rather than binding a plausible-looking
+    // but wrong directory into the sandbox. A `None` cwd is left as `None`
+    // (nothing to resolve); only a `Some(path)` that fails to resolve bails
+    // the whole function out via `?`.
+    let cwd = match cwd {
+        Some(path) => Some(absolute_path(path)?),
+        None => None,
+    };
+    Some((
+        path_to_string(&bwrap),
+        build_bwrap_args(cwd.as_deref(), command, args),
+    ))
+}
+
+fn build_bwrap_args(cwd: Option<&Path>, command: &str, args: &[String]) -> Vec<String> {
+    build_bwrap_args_with_home(cwd, command, args, std::env::var_os("HOME").as_deref())
+}
+
+fn build_bwrap_args_with_home(
+    cwd: Option<&Path>,
+    command: &str,
+    args: &[String],
+    home: Option<&std::ffi::OsStr>,
+) -> Vec<String> {
+    let mut bwrap_args = vec![
+        "--new-session".to_string(),
+        "--die-with-parent".to_string(),
+        "--unshare-user".to_string(),
+        "--unshare-pid".to_string(),
+        "--ro-bind".to_string(),
+        "/".to_string(),
+        "/".to_string(),
+        "--dev".to_string(),
+        "/dev".to_string(),
+        "--proc".to_string(),
+        "/proc".to_string(),
+        "--bind-try".to_string(),
+        "/dev/shm".to_string(),
+        "/dev/shm".to_string(),
+        // A private, empty tmpfs -- not the host's real /tmp, which would
+        // otherwise be fully read-write to the job and shared with every
+        // other process (including other concurrently-sandboxed jobs) on
+        // the box.
+        "--tmpfs".to_string(),
+        "/tmp".to_string(),
+    ];
+
+    if let Some(cwd) = cwd {
+        let cwd_str = path_to_string(cwd);
+        bwrap_args.push("--bind".to_string());
+        bwrap_args.push(cwd_str.clone());
+        bwrap_args.push(cwd_str.clone());
+
+        let git_dir = cwd.join(".git");
+        if git_dir.exists() {
+            let git_str = path_to_string(&git_dir);
+            bwrap_args.push("--ro-bind".to_string());
+            bwrap_args.push(git_str.clone());
+            bwrap_args.push(git_str);
+        }
+
+        bwrap_args.push("--chdir".to_string());
+        bwrap_args.push(cwd_str);
+    }
+
+    if let Some(home) = home {
+        for cache in HOME_CACHE_DIRS {
+            let path = Path::new(home).join(cache);
+            if path.exists() {
+                let path_str = path_to_string(&path);
+                bwrap_args.push("--ro-bind-try".to_string());
+                bwrap_args.push(path_str.clone());
+                bwrap_args.push(path_str);
+            }
+        }
+    }
+
+    bwrap_args.push("--".to_string());
+    bwrap_args.push(command.to_string());
+    bwrap_args.extend(args.iter().cloned());
+
+    bwrap_args
+}
+
+/// Resolves `path` to a canonical absolute path -- symlinks and `.`/`..`
+/// components resolved by the OS (`realpath` semantics), not stripped
+/// lexically. bwrap's own `--bind`/`--chdir` source paths are taken
+/// literally, unlike `std::process::Command::current_dir`, which resolves a
+/// relative path against the parent's cwd before handing it to the child.
+/// Lexically stripping `..` instead of asking the OS would be wrong the
+/// moment a symlink sits in the path (`link/..` is the parent of whatever
+/// `link` points at, not the lexical parent of `link` itself). Returns
+/// `None` if the path doesn't exist or can't be resolved, so the caller
+/// falls back to unsandboxed rather than bind a wrong directory.
+fn absolute_path(path: &Path) -> Option<PathBuf> {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    std::fs::canonicalize(joined).ok()
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Finds `bwrap` on `PATH`, installing it via `bwrap_install` on first miss,
+/// and caches the result for the life of the process so a box without
+/// bubblewrap (or without `mise`) doesn't retry the install on every job.
+/// Logs the outcome either way -- a job silently running unsandboxed because
+/// bwrap was missing should never look identical to a sandboxed one.
+fn find_or_install_bwrap() -> Option<PathBuf> {
+    static BWRAP: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BWRAP
+        .get_or_init(|| {
+            if let Some(path) = which_bwrap() {
+                return Some(path);
+            }
+            match bwrap_install::install() {
+                Some(path) => {
+                    eprintln!(
+                        "agentflare-jobs: installed bwrap via mise at {}",
+                        path.display()
+                    );
+                    Some(path)
+                }
+                None => {
+                    eprintln!(
+                        "agentflare-jobs: bwrap not found and could not be installed \
+                         (mise missing or install failed) -- running this job unsandboxed"
+                    );
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
+/// Minimal `PATH` scan for `bwrap`. This crate has no `which` dependency, and
+/// `Command::new("bwrap")` alone won't tell us up front whether it's missing
+/// -- checking here lets a job fall back to running unsandboxed (rather than
+/// failing to spawn at all) when a box hasn't installed bubblewrap yet.
+fn which_bwrap() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    find_on_path(&path, "bwrap")
+}
+
+/// Pure PATH search, factored out so tests can exercise it without mutating
+/// the real process-wide `PATH` env var -- `std::env::set_var` affects every
+/// thread in the test binary, and cargo's test harness runs tests in
+/// parallel by default, so an env-mutating test here would race with any
+/// other test that spawns a child process expecting `PATH` to be intact.
+fn find_on_path(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// True if `path` is a regular file with at least one executable bit set.
+/// Matching on name + `is_file()` alone would happily "find" a stray
+/// non-executable file and hand it to `Command::new`, which then fails to
+/// spawn at all -- defeating the fallback-to-unsandboxed path this lookup
+/// exists for.
+pub(super) fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_bwrap_falls_back_to_none() {
+        assert!(find_on_path(std::ffi::OsStr::new(""), "bwrap").is_none());
+    }
+
+    #[test]
+    fn non_executable_candidate_on_path_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bwrap"), b"").unwrap();
+        let path_var = std::ffi::OsString::from(dir.path());
+        assert!(find_on_path(&path_var, "bwrap").is_none());
+    }
+
+    fn bind_arg(args: &[String]) -> (&str, &str) {
+        let idx = args
+            .iter()
+            .position(|a| a == "--bind")
+            .expect("--bind present");
+        (&args[idx + 1], &args[idx + 2])
+    }
+
+    #[test]
+    fn resolved_cwd_is_placed_into_bind_and_chdir_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let args = build_bwrap_args_with_home(Some(cwd.as_path()), "true", &[], None);
+        let expected = path_to_string(&cwd);
+        let (src, dest) = bind_arg(&args);
+        assert_eq!(src, expected);
+        assert_eq!(dest, expected);
+        let chdir_idx = args
+            .iter()
+            .position(|a| a == "--chdir")
+            .expect("--chdir present");
+        assert_eq!(args[chdir_idx + 1], expected);
+    }
+
+    #[test]
+    fn absolute_path_resolves_relative_dot_against_current_dir() {
+        let expected = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(absolute_path(Path::new(".")).unwrap(), expected);
+    }
+
+    #[test]
+    fn absolute_path_canonicalizes_an_already_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(absolute_path(dir.path()).unwrap(), expected);
+    }
+
+    #[test]
+    fn absolute_path_missing_directory_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(absolute_path(&dir.path().join("does-not-exist")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_path_resolves_a_symlinked_component_via_its_real_parent() {
+        // Lexically stripping `..` would resolve `link/..` back to `root`
+        // (the parent of the `link` entry itself); the correct, OS-resolved
+        // answer is `root/real` (the parent of what `link` actually points
+        // at) -- exactly the case lexical normalization gets wrong.
+        let root = tempfile::tempdir().unwrap();
+        let real_child = root.path().join("real").join("child");
+        std::fs::create_dir_all(&real_child).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real_child, &link).unwrap();
+
+        let resolved = absolute_path(&link.join("..")).unwrap();
+        let expected = std::fs::canonicalize(root.path().join("real")).unwrap();
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn home_cache_dirs_are_bound_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".cargo")).unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let args = build_bwrap_args_with_home(None, "true", &[], Some(&home));
+        let cargo_path = path_to_string(&dir.path().join(".cargo"));
+        let idx = args
+            .iter()
+            .position(|a| a == &cargo_path)
+            .expect(".cargo cache dir bound");
+        assert_eq!(args[idx - 1], "--ro-bind-try");
+    }
+}
