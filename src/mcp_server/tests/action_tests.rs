@@ -585,9 +585,87 @@ fn item_release_leaves_a_dirty_worktree_in_place() {
 }
 
 #[test]
-fn item_done_leaves_a_dirty_worktree_in_place() {
-    // The one case cleanup must refuse: uncommitted changes exist ONLY in
-    // that checkout, so deleting it would be destructive, not tidy.
+fn item_done_auto_commits_uncommitted_changes_instead_of_stranding_them() {
+    // Item #57: a headless run that edited real files but never ran `git
+    // commit` itself used to look identical, from the outside, to a
+    // genuine no-op -- `done` reported success while the actual edits sat
+    // stranded, uncommitted, in the worktree forever. `done` must now
+    // commit any uncommitted changes itself before treating the claim as
+    // having nothing to show for it.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    };
+    run_git(&repo_root, &["init", "-b", "master"]);
+    run_git(&repo_root, &["config", "user.email", "test@test.com"]);
+    run_git(&repo_root, &["config", "user.name", "Test"]);
+    run_git(&repo_root, &["commit", "--allow-empty", "-m", "initial"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root.clone()),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    let sequence_id = created["sequence_id"].as_i64().unwrap();
+
+    let claimed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let worktree_path = std::path::PathBuf::from(claimed["worktree_path"].as_str().unwrap());
+    std::fs::write(worktree_path.join("forgot_to_commit.txt"), "real work").unwrap();
+
+    // push: false avoids needing a real remote in this test -- the auto-
+    // commit safety net itself doesn't depend on whether the result gets
+    // pushed.
+    let result: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "done".into(),
+            id: Some(item_id),
+            summary: Some("Did the real work, just forgot to commit it.".into()),
+            push: Some(false),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(result["done"], true, "{result:?}");
+    assert_eq!(result["status"], "completed");
+
+    let branch = format!("task/{sequence_id}");
+    let log = run_git(
+        &repo_root,
+        &["log", &branch, "--name-only", "--pretty=format:"],
+    );
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("forgot_to_commit.txt"),
+        "the agent's uncommitted edit must have landed in a real commit, not been dropped"
+    );
+}
+
+#[test]
+fn item_done_leaves_a_dirty_worktree_in_place_when_auto_commit_cannot_run() {
+    // The remaining case cleanup must still refuse: when the auto-commit
+    // safety net itself can't run (git commands failing in the checkout),
+    // `done` must fall back to the old behavior -- leaving a dirty
+    // worktree in place rather than guessing it's safe to delete.
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let repo_root = repo_dir.path().to_path_buf();
@@ -626,6 +704,12 @@ fn item_done_leaves_a_dirty_worktree_in_place() {
     let worktree_path = std::path::PathBuf::from(claimed["worktree_path"].as_str().unwrap());
     std::fs::write(worktree_path.join("uncommitted.txt"), "not yet committed").unwrap();
 
+    // Break the checkout's gitdir pointer so `git status`/`add`/`commit`
+    // inside it all fail deterministically -- exercising the fallback path
+    // rather than the happy one above, without depending on environment-
+    // specific git author-identity fallbacks.
+    std::fs::write(worktree_path.join(".git"), "gitdir: /nonexistent").unwrap();
+
     s.item(Parameters(ItemRequest {
         action: "done".into(),
         id: Some(item_id),
@@ -635,7 +719,7 @@ fn item_done_leaves_a_dirty_worktree_in_place() {
 
     assert!(
         worktree_path.join("uncommitted.txt").exists(),
-        "a dirty worktree must be left in place, not deleted out from under uncommitted work"
+        "a worktree whose changes could not be auto-committed must be left in place"
     );
 }
 

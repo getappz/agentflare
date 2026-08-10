@@ -96,7 +96,12 @@ fn build_prompt(
             prompt.push_str(&format!("- [{}] {}\n", c.author_agent, c.body));
         }
     }
-    prompt.push_str("\nWhen you are done, summarize what you changed and why.\n");
+    prompt.push_str(
+        "\nIf you made any file changes, commit them (git add + git commit) before you \
+         finish -- do not leave edits uncommitted. If you investigate and decide no code \
+         change is warranted, it's fine to finish with zero commits. When you are done, \
+         summarize what you changed and why.\n",
+    );
     prompt
 }
 
@@ -764,6 +769,19 @@ mod tests {
         let item = test_item();
         let prompt = build_prompt(&item, &[]);
         assert!(!prompt.contains("Prior discussion"));
+    }
+
+    #[test]
+    fn build_prompt_instructs_the_agent_to_commit_before_finishing() {
+        // Item #57: a headless run that edited files but never ran `git
+        // commit` looked identical to a genuine no-op from outside. The
+        // prompt itself must tell the agent to commit its own work, on top
+        // of the `item_done`-side auto-commit safety net.
+        let item = test_item();
+        let prompt = build_prompt(&item, &[]);
+        assert!(prompt.contains("commit"));
+        assert!(prompt.contains("do not leave edits uncommitted"));
+        assert!(prompt.contains("it's fine to finish with zero commits"));
     }
 
     #[test]
