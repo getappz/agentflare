@@ -5,6 +5,11 @@ use crate::github::GitHubError;
 use crate::github::auth;
 use std::time::Duration;
 
+/// `Clone` is cheap: `ureq::Agent` wraps an `Arc` internally and all clones
+/// share its connection pool, so the bridge daemon can build one `Client`
+/// per credential resolution and reuse it across every repo it polls
+/// instead of re-authenticating per repo per tick.
+#[derive(Clone)]
 pub struct Client {
     agent: ureq::Agent,
     token: Option<String>,

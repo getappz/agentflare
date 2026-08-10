@@ -2,6 +2,7 @@
 //! rather than a tokio task — never call the GitHub client from the async
 //! runtime without `spawn_blocking`.
 
+use crate::github::RepoId;
 use crate::github::bridge::config::BridgeConfig;
 use crate::github::bridge::tick::{Ctx, run_once};
 
@@ -9,59 +10,85 @@ pub fn should_run(config: &BridgeConfig) -> bool {
     config.enabled
 }
 
-/// `owner/repo` from `AGENTFLARE_BRIDGE_REPO`, else the `origin` remote of
-/// the current directory.
+/// One repo this daemon should poll this tick, with the project/label/agent
+/// it maps to.
+struct BridgeTarget {
+    repo: RepoId,
+    project_id: String,
+    queue_label: String,
+    work_agent: Option<String>,
+}
+
+/// Repos to poll this tick: every row in `bridge_repos` (the reverse index
+/// of `.agentflare/project.json`, refreshed by `resolve_project` wherever an
+/// agentflare CLI/MCP call runs inside a linked repo) plus, for back-compat
+/// with the single-repo manual/dev workflow, `AGENTFLARE_BRIDGE_REPO` if it
+/// names a repo not already covered by the registry.
 ///
-/// The env var is not a convenience: `resolve_from_remote` derives the repo
-/// from **cwd**, and neither the launchd plist nor the systemd unit
-/// (`daemon_autostart.rs`) sets a working directory. Under
-/// `agentflare daemon start` the bridge would otherwise be enabled by env
-/// var and then silently never run, because cwd is not the repo.
-fn resolve_repo() -> Option<crate::github::RepoId> {
+/// Read fresh every tick, not just at startup, so a project linked (or
+/// re-linked) after the daemon started shows up without a restart.
+fn bridge_targets(conn: &rusqlite::Connection) -> Vec<BridgeTarget> {
+    let mut targets: Vec<BridgeTarget> = agentflare_backend::bridge_repo::list(conn)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let repo = RepoId::parse(&row.repo)?;
+            Some(BridgeTarget {
+                repo,
+                project_id: row.project_id,
+                queue_label: row.queue_label,
+                work_agent: row.work_agent,
+            })
+        })
+        .collect();
+
     if let Some(explicit) = std::env::var("AGENTFLARE_BRIDGE_REPO")
         .ok()
         .filter(|s| !s.trim().is_empty())
     {
-        let parsed = crate::github::RepoId::parse(explicit.trim());
-        if parsed.is_none() {
+        let Some(repo) = RepoId::parse(explicit.trim()) else {
             eprintln!(
                 "github bridge: AGENTFLARE_BRIDGE_REPO={explicit:?} is not a \
-                 GitHub owner/repo; not starting"
+                 GitHub owner/repo; ignoring"
             );
+            return targets;
+        };
+        if !targets.iter().any(|t| t.repo == repo) {
+            // Same resolution `build_ctx` used to do unconditionally: cwd-based,
+            // which only makes sense here because this override is for the
+            // interactive case (daemon started by hand from inside the repo),
+            // not the systemd/launchd path the registry above covers.
+            let repo_root = std::env::current_dir().unwrap_or_default();
+            let mcp = crate::mcp_server::AgentflareMcp::default();
+            match mcp.resolve_project(conn) {
+                Ok(p) => targets.push(BridgeTarget {
+                    repo,
+                    project_id: p.id,
+                    queue_label: crate::github::bridge::config::resolve_project_queue_label(
+                        &repo_root,
+                    ),
+                    work_agent: None,
+                }),
+                Err(e) => eprintln!(
+                    "github bridge: AGENTFLARE_BRIDGE_REPO={explicit:?} set but no project \
+                     linked ({e}); ignoring"
+                ),
+            }
         }
-        return parsed;
     }
-
-    let repo_root = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("github bridge: cannot read the working directory ({e}); not starting");
-            return None;
-        }
-    };
-    let repo = crate::github::RepoId::resolve_from_remote(&repo_root);
-    if repo.is_none() {
-        eprintln!(
-            "github bridge: no GitHub `origin` remote under {} — the daemon \
-             does not set a working directory, so set AGENTFLARE_BRIDGE_REPO=owner/repo; \
-             not starting",
-            repo_root.display()
-        );
-    }
-    repo
+    targets
 }
 
-/// Starts the poll loop if the bridge is enabled AND the environment is
-/// usable (GitHub origin, resolvable credential, resolvable project).
+/// Starts the poll loop if the bridge is enabled.
 ///
-/// Every failure path is a no-op — a daemon must not fail to start because an
-/// optional subsystem is unconfigured — but never a SILENT one. The bridge is
-/// opt-in, so anyone reaching these paths asked for it to run and needs to be
-/// told why it did not.
+/// Unlike before this no longer requires a resolvable repo up front — which
+/// repos to poll is now read from the registry every tick (see
+/// `bridge_targets`), so an empty registry at startup isn't fatal, just
+/// nothing to do yet.
 /// Nothing here touches the network or the filesystem, so the caller — the
 /// daemon, on its way to binding the dashboard port — returns immediately.
-/// Everything that can block (shelling out to `git remote`, and to
-/// `gh auth token` for a credential) happens on the spawned thread.
+/// Everything that can block (credential resolution, GitHub calls) happens
+/// on the spawned thread.
 pub fn spawn_if_enabled() -> Option<std::thread::JoinHandle<()>> {
     let config = BridgeConfig::from_env();
     if !should_run(&config) {
@@ -92,72 +119,93 @@ fn open_items_db() -> Option<rusqlite::Connection> {
     }
 }
 
-fn build_ctx(config: BridgeConfig, conn: &rusqlite::Connection) -> Option<Ctx> {
-    let repo = resolve_repo()?;
+fn run_forever(config: BridgeConfig) {
+    let interval = std::time::Duration::from_secs(config.interval_secs);
+    let Some(conn) = open_items_db() else { return };
     let client = match crate::github::Client::new() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("github bridge: no usable credential ({e}); not starting");
-            return None;
+            return;
         }
-    };
-    let mcp = crate::mcp_server::AgentflareMcp::default();
-    let project_id = match mcp.resolve_project(conn) {
-        Ok(p) => p.id,
-        Err(e) => {
-            eprintln!("github bridge: no project linked to this repo ({e}); not starting");
-            return None;
-        }
-    };
-    // The claim ledger is its own database (agentflare.db), separate from the
-    // backend db that holds items.
-    let ledger = match crate::db::open() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("github bridge: claim ledger unavailable ({e}); not starting");
-            return None;
-        }
-    };
-    Some(Ctx {
-        client,
-        repo,
-        config,
-        project_id,
-        ledger,
-    })
-}
-
-fn run_forever(config: BridgeConfig) {
-    let interval = std::time::Duration::from_secs(config.interval_secs);
-    let Some(conn) = open_items_db() else { return };
-    let Some(ctx) = build_ctx(config, &conn) else {
-        return;
     };
 
-    // Soft errors repeat every tick by nature, so log a CHANGE rather than
-    // each occurrence: 1440 identical lines a day would bury the one thing
-    // worth reading, and silence would hide a `Forbidden` — a bridge that is
-    // permanently dead and never says so.
-    let mut last_soft: Option<String> = None;
+    // Soft errors repeat every tick by nature, so log a CHANGE per repo
+    // rather than each occurrence: 1440 identical lines a day would bury the
+    // one thing worth reading, and silence would hide a `Forbidden` — a repo
+    // that is permanently unreachable and never says so. Keyed by repo since
+    // one daemon now polls several independently.
+    let mut last_soft: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut had_targets = true; // forces the "nothing registered" message on the first empty tick
     loop {
-        let now = crate::claims::now();
-        match run_once(&ctx, &conn, now) {
-            Ok(report) => {
-                if !report.claimed.is_empty() || !report.ceded.is_empty() {
-                    eprintln!(
-                        "github bridge: claimed {:?} ceded {:?}",
-                        report.claimed, report.ceded
-                    );
-                }
-                if report.soft_error != last_soft {
-                    match &report.soft_error {
-                        Some(e) => eprintln!("github bridge: ticks are ending early: {e}"),
-                        None => eprintln!("github bridge: recovered; ticks completing again"),
-                    }
-                    last_soft = report.soft_error;
-                }
+        let targets = bridge_targets(&conn);
+        if targets.is_empty() {
+            if had_targets {
+                eprintln!(
+                    "github bridge: no repos registered — link a project from inside a repo \
+                     (any agentflare CLI/MCP call there) or set AGENTFLARE_BRIDGE_REPO"
+                );
+                had_targets = false;
             }
-            Err(e) => eprintln!("github bridge: tick failed: {e}"),
+            std::thread::sleep(interval);
+            continue;
+        }
+        had_targets = true;
+
+        for target in targets {
+            // The claim ledger lives in its own database (agentflare.db),
+            // separate from the backend db that holds items. Reopened per
+            // repo per tick (a local sqlite open is cheap) rather than
+            // shared, so one repo's failure here only skips that repo
+            // instead of taking down the whole loop for the rest of the tick.
+            let ledger = match crate::db::open() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "github bridge: claim ledger unavailable ({e}); skipping remaining \
+                         repos this tick"
+                    );
+                    break;
+                }
+            };
+            let mut repo_config = config.clone();
+            repo_config.queue_label = target.queue_label;
+            repo_config.work_agent = target.work_agent.or(repo_config.work_agent);
+            let ctx = Ctx {
+                client: client.clone(),
+                repo: target.repo,
+                config: repo_config,
+                project_id: target.project_id,
+                ledger,
+            };
+            let now = crate::claims::now();
+            let repo_key = ctx.repo.to_string();
+            match run_once(&ctx, &conn, now) {
+                Ok(report) => {
+                    if !report.claimed.is_empty() || !report.ceded.is_empty() {
+                        eprintln!(
+                            "github bridge: {repo_key} claimed {:?} ceded {:?}",
+                            report.claimed, report.ceded
+                        );
+                    }
+                    let prev = last_soft.get(&repo_key).cloned();
+                    if report.soft_error != prev {
+                        match &report.soft_error {
+                            Some(e) => {
+                                eprintln!("github bridge: {repo_key} ticks are ending early: {e}");
+                                last_soft.insert(repo_key, e.clone());
+                            }
+                            None => {
+                                eprintln!(
+                                    "github bridge: {repo_key} recovered; ticks completing again"
+                                );
+                                last_soft.remove(&repo_key);
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("github bridge: {repo_key} tick failed: {e}"),
+            }
         }
         std::thread::sleep(interval);
     }
@@ -191,5 +239,70 @@ mod tests {
             "a:1".to_string(),
         );
         assert!(should_run(&cfg));
+    }
+
+    #[test]
+    fn bridge_targets_reads_every_registered_repo() {
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("AGENTFLARE_BRIDGE_REPO");
+        }
+
+        let conn = agentflare_backend::open_in_memory().unwrap();
+        let workspace = agentflare_backend::workspace::create(
+            &conn,
+            agentflare_backend::workspace::CreateWorkspace {
+                name: "ws".into(),
+                slug: "ws".into(),
+                owner_agent: None,
+                item_label: None,
+            },
+        )
+        .unwrap();
+        let mk_project = |name: &str| {
+            agentflare_backend::project::create(
+                &conn,
+                agentflare_backend::project::CreateProject {
+                    workspace_id: workspace.id.clone(),
+                    name: name.into(),
+                    identifier: name.into(),
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap()
+        };
+        let p1 = mk_project("proj-one");
+        let p2 = mk_project("proj-two");
+        agentflare_backend::bridge_repo::upsert(
+            &conn,
+            "getappz/one",
+            &p1.id,
+            "/repo/one",
+            "agentflare",
+            None,
+            1,
+        )
+        .unwrap();
+        agentflare_backend::bridge_repo::upsert(
+            &conn,
+            "getappz/two",
+            &p2.id,
+            "/repo/two",
+            "agentflare",
+            Some("claude-code"),
+            2,
+        )
+        .unwrap();
+
+        let targets = bridge_targets(&conn);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].repo.to_string(), "getappz/one");
+        assert_eq!(targets[0].project_id, p1.id);
+        assert_eq!(targets[0].work_agent, None);
+        assert_eq!(targets[1].repo.to_string(), "getappz/two");
+        assert_eq!(targets[1].work_agent.as_deref(), Some("claude-code"));
     }
 }

@@ -872,7 +872,10 @@ impl AgentflareMcp {
             && let Ok(link) = serde_json::from_slice::<ProjectLink>(&bytes)
         {
             match agentflare_backend::project::get(conn, &link.project_id) {
-                Ok(project) => return Ok(project),
+                Ok(project) => {
+                    self.register_bridge_repo(conn, &project.id);
+                    return Ok(project);
+                }
                 Err(agentflare_backend::Error::NotFound(_)) => {} // stale link — re-resolve below
                 Err(e) => return Err(map_backend_err(e)),
             }
@@ -931,7 +934,34 @@ impl AgentflareMcp {
             &link_path,
             serde_json::to_vec_pretty(&link).unwrap_or_default(),
         );
+        self.register_bridge_repo(conn, &project.id);
         Ok(project)
+    }
+
+    /// Refreshes this repo's row in the local GitHub bridge's repo registry
+    /// (`bridge_repos`) — the reverse of `project.json`'s folder→project
+    /// link, indexed by repo instead so the daemon (no reliable cwd, so it
+    /// cannot read `project.json` itself) can enumerate every repo it should
+    /// poll. A no-op when `origin` isn't a GitHub remote (e.g. a local-only
+    /// or non-GitHub-hosted repo): nothing to bridge, so nothing to
+    /// register. Best-effort — a registry write failure must not break
+    /// project resolution, which every MCP/CLI call in this repo depends on.
+    fn register_bridge_repo(&self, conn: &rusqlite::Connection, project_id: &str) {
+        let repo_root = Self::repo_root();
+        let Some(repo_id) = crate::github::RepoId::resolve_from_remote(&repo_root) else {
+            return;
+        };
+        let folder_path = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
+        let queue_label = crate::github::bridge::config::resolve_project_queue_label(&folder_path);
+        let _ = agentflare_backend::bridge_repo::upsert(
+            conn,
+            &repo_id.to_string(),
+            project_id,
+            &folder_path.to_string_lossy(),
+            &queue_label,
+            None,
+            crate::claims::now(),
+        );
     }
 
     /// NotFound and InvalidInput (version conflict) are caller-fixable →
