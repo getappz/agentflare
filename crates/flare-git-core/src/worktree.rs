@@ -701,6 +701,35 @@ pub fn cleanup_item_worktree(item: &Item, repo_root: &Path) -> bool {
     !gc_orphans(repo_root, &[name]).is_empty()
 }
 
+/// Commits any uncommitted changes sitting in `item`'s worktree checkout.
+///
+/// An agent can make real file edits and still exit without ever running
+/// `git commit` itself -- with no commit, the branch never diverges from
+/// its target, so `item_done` (main binary) can't tell that apart from a
+/// genuine no-op and the edits are silently stranded while `done` reports
+/// success (item #57). Called before that divergence check runs, so a
+/// forgotten commit gets made here first instead of falling through to the
+/// "nothing was committed" path.
+///
+/// No-ops (returns `false`) when the worktree doesn't exist, is already
+/// clean, or `add`/`commit` fails for some other reason -- the caller's
+/// existing dirty-tree handling (`cleanup_item_worktree` refusing to
+/// remove it) still covers all of those exactly as it did before.
+pub fn commit_uncommitted(item: &Item, repo_root: &Path, message: &str) -> bool {
+    let worktree_path = repo_root
+        .join(".worktrees")
+        .join("task")
+        .join(item.sequence_id.to_string());
+    match run_git_in(&worktree_path, &["status", "--porcelain"]) {
+        Ok(out) if !out.trim().is_empty() => {}
+        _ => return false,
+    }
+    if run_git_in(&worktree_path, &["add", "-A"]).is_err() {
+        return false;
+    }
+    run_git_in(&worktree_path, &["commit", "-m", message]).is_ok()
+}
+
 /// Remove a worktree directory, with retry + Windows fallback.
 ///
 /// On Windows, background processes (rust-analyzer, proc-macro-srv) may
@@ -1083,6 +1112,44 @@ mod tests {
         let repo = init_repo();
         let item = test_item(1);
         assert!(!cleanup_item_worktree(&item, &repo.path));
+    }
+
+    #[test]
+    fn commit_uncommitted_commits_a_dirty_worktree() {
+        let repo = init_repo();
+        let item = test_item(1);
+        let target = resolve_default_branch(&repo.path);
+        let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+        std::fs::write(worktree_path.join("forgot_to_commit.txt"), "x").unwrap();
+
+        assert!(commit_uncommitted(&item, &repo.path, "auto-committed"));
+
+        let status = run_git_in(&worktree_path, &["status", "--porcelain"]).unwrap();
+        assert!(status.is_empty(), "worktree must be clean after commit");
+        let branch = format!("task/{}", item.sequence_id);
+        assert!(branch_diverged(&repo.path, &branch, &target));
+    }
+
+    #[test]
+    fn commit_uncommitted_is_a_noop_on_a_clean_worktree() {
+        let repo = init_repo();
+        let item = test_item(1);
+        let target = resolve_default_branch(&repo.path);
+        create_worktree(&item, &repo.path, &target, None).unwrap();
+
+        assert!(!commit_uncommitted(&item, &repo.path, "auto-committed"));
+        assert!(!branch_diverged(
+            &repo.path,
+            &format!("task/{}", item.sequence_id),
+            &target
+        ));
+    }
+
+    #[test]
+    fn commit_uncommitted_is_a_noop_when_no_worktree_exists() {
+        let repo = init_repo();
+        let item = test_item(1);
+        assert!(!commit_uncommitted(&item, &repo.path, "auto-committed"));
     }
 
     #[test]
