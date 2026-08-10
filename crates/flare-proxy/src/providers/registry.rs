@@ -66,6 +66,18 @@ pub struct RegistrySpec {
     pub gateway_auth_env: Option<String>,
     #[serde(default)]
     pub gateway_auth_header: Option<String>,
+    /// Free-tier quota classification: "recurring-daily" | "recurring-monthly"
+    /// (renews; budget in `monthly_tokens`), "recurring-uncapped" (real free
+    /// access, rate/concurrency-limited, no token cap), "one-time-initial"
+    /// (signup credit in `credit_tokens`, does not renew), or "unmetered"
+    /// (local inference). `None` for paid-key/pass-through providers with no
+    /// free-tier data. Metadata only — not yet read by any selection logic.
+    #[serde(default)]
+    pub free_type: Option<String>,
+    #[serde(default)]
+    pub monthly_tokens: Option<u64>,
+    #[serde(default)]
+    pub credit_tokens: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -261,6 +273,29 @@ mod tests {
         }
     }
 
+    const KNOWN_FREE_TYPES: &[&str] = &[
+        "recurring-daily",
+        "recurring-monthly",
+        "recurring-uncapped",
+        "one-time-initial",
+        "unmetered",
+    ];
+
+    #[test]
+    fn every_registry_free_type_is_a_known_value() {
+        // Catches a typo'd free_type (e.g. "recuring-daily") at test time
+        // instead of it silently reading as "no quota data" to callers.
+        for spec in registry() {
+            if let Some(ft) = &spec.free_type {
+                assert!(
+                    KNOWN_FREE_TYPES.contains(&ft.as_str()),
+                    "provider '{}' has unknown free_type '{ft}' -- must be one of {KNOWN_FREE_TYPES:?}",
+                    spec.prefix
+                );
+            }
+        }
+    }
+
     #[test]
     fn broad_openai_compatible_providers_are_present_and_resolve() {
         for prefix in [
@@ -351,6 +386,9 @@ mod tests {
             extra_headers: vec![],
             gateway_auth_env: None,
             gateway_auth_header: None,
+            free_type: None,
+            monthly_tokens: None,
+            credit_tokens: None,
         }];
         let overrides = vec![
             RegistrySpec {
@@ -363,6 +401,9 @@ mod tests {
                 extra_headers: vec![],
                 gateway_auth_env: None,
                 gateway_auth_header: None,
+                free_type: None,
+                monthly_tokens: None,
+                credit_tokens: None,
             },
             RegistrySpec {
                 prefix: "brand_new".into(),
@@ -374,6 +415,9 @@ mod tests {
                 extra_headers: vec![],
                 gateway_auth_env: None,
                 gateway_auth_header: None,
+                free_type: None,
+                monthly_tokens: None,
+                credit_tokens: None,
             },
         ];
         merge(&mut embedded, overrides);
