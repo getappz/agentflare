@@ -254,6 +254,13 @@ pub fn clear_project_bridge_settings(repo_root: &Path) -> Result<PathBuf, String
 /// merges as its user-home layer, but read directly here: the machine name
 /// is machine-scoped, not project-scoped, so it must not depend on (or vary
 /// with) which repo the caller happens to be running from.
+///
+/// `#[allow(dead_code)]` on this and the four functions below: nothing in
+/// this PR (Task 1 of the "PR & Issue Attribution" plan, item #61) calls
+/// them yet — Tasks 2/3/5 (CLI, PR footer/labels, issue beacon label) are
+/// what consume them, and land as separate PRs on top of this one. Remove
+/// once the last of those merges.
+#[allow(dead_code)]
 fn home_config_path() -> PathBuf {
     crate::paths::home().join(".agentflare").join("config.toml")
 }
@@ -261,6 +268,7 @@ fn home_config_path() -> PathBuf {
 /// `[bridge].machine_name` from the user-home config file, trimmed and
 /// filtered to non-empty. `None` means unset — callers fall back to
 /// [`stable_instance_id`] via [`machine_label`].
+#[allow(dead_code)]
 pub fn read_machine_name() -> Option<String> {
     let content = std::fs::read_to_string(home_config_path()).ok()?;
     let doc: toml::Value = content.parse().ok()?;
@@ -276,6 +284,7 @@ pub fn read_machine_name() -> Option<String> {
 /// instance id (`flared:<12-hex>`) — so behavior is unchanged for anyone
 /// who hasn't opted in. Used to build `beacon:<label>` GitHub labels and PR
 /// footers.
+#[allow(dead_code)]
 pub fn machine_label() -> String {
     read_machine_name().unwrap_or_else(stable_instance_id)
 }
@@ -286,6 +295,7 @@ pub fn machine_label() -> String {
 /// the same character gate instance ids use — a name containing whitespace
 /// or `/` would corrupt the `beacon:<name>` label path the same way a bad
 /// instance id would corrupt `claimed:<id>`.
+#[allow(dead_code)]
 pub fn write_machine_name(name: &str) -> Result<PathBuf, String> {
     validate_instance_id(name)?;
     let home = crate::paths::home();
@@ -317,6 +327,7 @@ pub fn write_machine_name(name: &str) -> Result<PathBuf, String> {
 /// Removes `[bridge].machine_name`, falling `machine_label()` back to the
 /// hashed instance id. A noop (not an error) if it was never set — same
 /// contract as `clear_project_bridge_settings`.
+#[allow(dead_code)]
 pub fn clear_machine_name() -> Result<PathBuf, String> {
     let home = crate::paths::home();
     let _lock = lock_project_config(&home)?;
