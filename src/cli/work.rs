@@ -466,9 +466,23 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
         serde_json::from_str(&claim_resp).unwrap_or(serde_json::Value::Null);
     let status = claim["status"].as_str().unwrap_or("unknown");
     if status != "acquired" {
-        let owner = claim["owner"].as_str().unwrap_or("?");
-        let age = claim["age_secs"].as_i64().unwrap_or(0);
-        crate::ui::error(&format!("item held by {owner} ({age}s) — cannot claim"));
+        // "held" (a live claim by another owner) and "blocked" (an unaccepted
+        // handoff — see `ClaimOutcome::BlockedByAssignee`) are different
+        // shapes: "blocked" has no `owner`/`age_secs` at all, so formatting
+        // it as if it were "held" printed the nonsensical "held by ? (0s)"
+        // instead of the actionable reason the claim response already carries.
+        let msg = match status {
+            "blocked" => claim["reason"]
+                .as_str()
+                .unwrap_or("item is blocked by an unaccepted handoff")
+                .to_string(),
+            _ => {
+                let owner = claim["owner"].as_str().unwrap_or("?");
+                let age = claim["age_secs"].as_i64().unwrap_or(0);
+                format!("item held by {owner} ({age}s) — cannot claim")
+            }
+        };
+        crate::ui::error(&msg);
         return 1.into();
     }
     let item_id = claim["item_id"]
