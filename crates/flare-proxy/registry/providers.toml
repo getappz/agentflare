@@ -1,0 +1,74 @@
+# Provider registry for flare-proxy. Adding a new provider — including a
+# new Cloudflare AI Gateway route, or any future OpenAI-compatible endpoint
+# — is a config edit here, not a Rust change. See providers/mod.rs for the
+# loader; `kind` must be one of: openai_compatible | anthropic | gemini.
+#
+# `base_url` is a fixed URL. `base_url_template` instead may reference
+# `{ENV_VAR_NAME}` placeholders resolved from the process environment at
+# startup — used by the Cloudflare Gateway entries below, whose URL is
+# per-user (account_id/gateway_id). A provider with an unresolvable
+# template is skipped (see providers/mod.rs's fallback-to-default_free
+# behavior on missing required vars).
+#
+# `gateway_auth_env`/`gateway_auth_header` add an extra header sourced from
+# an env var, distinct from `api_key_env` (the underlying provider's own
+# key, sent the normal way by each provider module) — used for Cloudflare's
+# `cf-aig-authorization` gateway-level auth.
+
+version = 1
+
+[[providers]]
+prefix = "nvidia_nim"
+id = "nvidia-nim"
+kind = "openai_compatible"
+base_url = "https://integrate.api.nvidia.com/v1"
+api_key_env = "NVIDIA_NIM_API_KEY"
+
+[[providers]]
+prefix = "open_router"
+id = "openrouter"
+kind = "openai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+extra_headers = [
+    ["HTTP-Referer", "https://agentflare.dev"],
+    ["X-Title", "agentflare"],
+]
+
+[[providers]]
+prefix = "lmstudio"
+id = "lm-studio"
+kind = "openai_compatible"
+base_url = "http://localhost:1234/v1"
+
+[[providers]]
+prefix = "anthropic"
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[[providers]]
+prefix = "gemini"
+id = "gemini"
+kind = "gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_API_KEY"
+
+[[providers]]
+prefix = "cf_gateway_anthropic"
+id = "cf_gateway_anthropic"
+kind = "anthropic"
+base_url_template = "https://gateway.ai.cloudflare.com/v1/{CF_AI_GATEWAY_ACCOUNT_ID}/{CF_AI_GATEWAY_ID}/anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+gateway_auth_env = "CF_AI_GATEWAY_TOKEN"
+gateway_auth_header = "cf-aig-authorization"
+
+[[providers]]
+prefix = "cf_gateway_openai"
+id = "cf_gateway_openai"
+kind = "openai_compatible"
+base_url_template = "https://gateway.ai.cloudflare.com/v1/{CF_AI_GATEWAY_ACCOUNT_ID}/{CF_AI_GATEWAY_ID}/compat"
+api_key_env = "OPENAI_API_KEY"
+gateway_auth_env = "CF_AI_GATEWAY_TOKEN"
+gateway_auth_header = "cf-aig-authorization"

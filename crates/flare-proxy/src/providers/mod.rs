@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod anthropic;
 pub mod gemini;
 pub mod openai_compat;
+mod registry;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -33,9 +34,11 @@ pub struct ProviderEntry {
 /// any endpoint implementing OpenAI's `/chat/completions` shape (NVIDIA NIM,
 /// OpenRouter, LM Studio, and any future OpenAI-compatible endpoint —
 /// including one pointed at a Cloudflare AI Gateway OpenAI-compat route —
-/// need only a config entry here, not new code).
+/// need only a registry entry, not new code — see registry/providers.toml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
+    #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
     Anthropic,
     Gemini,
@@ -65,48 +68,10 @@ fn parse_model_string(s: &str) -> (String, String) {
 }
 
 fn unsupported_provider_type(provider_types: &[String]) -> Option<&str> {
-    provider_types.iter().map(String::as_str).find(|pt| {
-        !matches!(
-            *pt,
-            "nvidia_nim"
-                | "open_router"
-                | "lmstudio"
-                | "anthropic"
-                | "gemini"
-                | "cf_gateway_anthropic"
-                | "cf_gateway_openai"
-        )
-    })
-}
-
-/// Cloudflare AI Gateway is a URL prefix in front of a provider's own wire
-/// protocol, not a distinct one — `.../anthropic` still speaks Anthropic's
-/// real Messages API shape, `.../compat` still speaks OpenAI's
-/// `/chat/completions` shape. So this needs no new `ProviderKind`, just a
-/// base_url built from account_id/gateway_id and an optional gateway-auth
-/// header, layered onto the existing Anthropic/OpenAiCompatible paths.
-fn cloudflare_gateway_base_url(provider_segment: &str) -> Option<String> {
-    let account_id = std::env::var("CF_AI_GATEWAY_ACCOUNT_ID").ok()?;
-    let gateway_id = std::env::var("CF_AI_GATEWAY_ID").ok()?;
-    if account_id.is_empty() || gateway_id.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/{provider_segment}"
-    ))
-}
-
-/// `cf-aig-authorization` is Cloudflare's own gateway-level auth, separate
-/// from the underlying provider's API key (which still goes through the
-/// normal `Authorization`/`x-api-key` header each provider module already
-/// sends). Optional — a gateway with no auth configured just omits it.
-fn cloudflare_gateway_headers() -> Vec<(String, String)> {
-    match std::env::var("CF_AI_GATEWAY_TOKEN") {
-        Ok(token) if !token.is_empty() => {
-            vec![("cf-aig-authorization".into(), format!("Bearer {token}"))]
-        }
-        _ => vec![],
-    }
+    provider_types
+        .iter()
+        .map(String::as_str)
+        .find(|pt| registry::find(pt).is_none())
 }
 
 impl ProviderConfig {
@@ -143,81 +108,33 @@ impl ProviderConfig {
         // time, with an opaque "unknown provider".
         if let Some(bad) = unsupported_provider_type(&provider_types) {
             eprintln!(
-                "agentflare: unsupported provider prefix '{bad}' in MODEL/MODEL_OPUS/MODEL_SONNET/MODEL_HAIKU -- falling back to default_free() config. Supported prefixes: nvidia_nim, open_router, lmstudio, anthropic, gemini, cf_gateway_anthropic, cf_gateway_openai."
+                "agentflare: unsupported provider prefix '{bad}' in MODEL/MODEL_OPUS/MODEL_SONNET/MODEL_HAIKU -- falling back to default_free() config. Supported prefixes: {}.",
+                registry::known_prefixes().join(", ")
             );
             return Self::default_free();
         }
 
         let mut providers = Vec::new();
         for pt in &provider_types {
-            let (base_url, api_key_env, kind, extra_headers): (String, Option<&str>, _, _) =
-                match pt.as_str() {
-                    "nvidia_nim" => (
-                        "https://integrate.api.nvidia.com/v1".into(),
-                        Some("NVIDIA_NIM_API_KEY"),
-                        ProviderKind::OpenAiCompatible,
-                        vec![],
-                    ),
-                    "open_router" => (
-                        "https://openrouter.ai/api/v1".into(),
-                        Some("OPENROUTER_API_KEY"),
-                        ProviderKind::OpenAiCompatible,
-                        openrouter_headers(),
-                    ),
-                    "lmstudio" => (
-                        "http://localhost:1234/v1".into(),
-                        None,
-                        ProviderKind::OpenAiCompatible,
-                        vec![],
-                    ),
-                    "anthropic" => (
-                        "https://api.anthropic.com".into(),
-                        Some("ANTHROPIC_API_KEY"),
-                        ProviderKind::Anthropic,
-                        vec![],
-                    ),
-                    "gemini" => (
-                        "https://generativelanguage.googleapis.com/v1beta".into(),
-                        Some("GEMINI_API_KEY"),
-                        ProviderKind::Gemini,
-                        vec![],
-                    ),
-                    "cf_gateway_anthropic" => {
-                        let Some(base) = cloudflare_gateway_base_url("anthropic") else {
-                            eprintln!(
-                                "agentflare: cf_gateway_anthropic requires CF_AI_GATEWAY_ACCOUNT_ID and CF_AI_GATEWAY_ID -- falling back to default_free() config."
-                            );
-                            return Self::default_free();
-                        };
-                        (
-                            base,
-                            Some("ANTHROPIC_API_KEY"),
-                            ProviderKind::Anthropic,
-                            cloudflare_gateway_headers(),
-                        )
-                    }
-                    "cf_gateway_openai" => {
-                        let Some(base) = cloudflare_gateway_base_url("compat") else {
-                            eprintln!(
-                                "agentflare: cf_gateway_openai requires CF_AI_GATEWAY_ACCOUNT_ID and CF_AI_GATEWAY_ID -- falling back to default_free() config."
-                            );
-                            return Self::default_free();
-                        };
-                        (
-                            base,
-                            Some("OPENAI_API_KEY"),
-                            ProviderKind::OpenAiCompatible,
-                            cloudflare_gateway_headers(),
-                        )
-                    }
-                    _ => continue,
-                };
+            // unsupported_provider_type already verified every entry in
+            // provider_types resolves via the registry, so this only
+            // fails when a per-user template (Cloudflare's account_id/
+            // gateway_id) can't be resolved from the environment.
+            let Some(spec) = registry::find(pt) else {
+                continue;
+            };
+            let Some((base_url, extra_headers)) = registry::resolve(spec) else {
+                eprintln!(
+                    "agentflare: provider '{pt}' is missing required environment variables for its registry entry -- falling back to default_free() config."
+                );
+                return Self::default_free();
+            };
 
             providers.push(ProviderEntry {
-                id: pt.clone(),
-                kind,
+                id: spec.id.clone(),
+                kind: spec.kind.clone(),
                 base_url,
-                api_key_env: api_key_env.map(String::from),
+                api_key_env: spec.api_key_env.clone(),
                 default_model: None,
                 models: vec![],
                 extra_headers,
@@ -277,59 +194,66 @@ impl ProviderConfig {
     }
 
     pub fn default_free() -> Self {
+        let providers = [
+            (
+                "nvidia_nim",
+                Some("meta/llama-3.1-405b-instruct"),
+                vec![
+                    ModelDef {
+                        id: "meta/llama-3.1-405b-instruct".into(),
+                        upstream_model: "meta/llama-3.1-405b-instruct".into(),
+                        max_input_tokens: Some(128_000),
+                    },
+                    ModelDef {
+                        id: "meta/llama-3.3-70b-instruct".into(),
+                        upstream_model: "meta/llama-3.3-70b-instruct".into(),
+                        max_input_tokens: Some(128_000),
+                    },
+                ],
+            ),
+            (
+                "open_router",
+                None,
+                vec![ModelDef {
+                    id: "openrouter/auto".into(),
+                    upstream_model: "openrouter/auto".into(),
+                    max_input_tokens: None,
+                }],
+            ),
+            (
+                "lmstudio",
+                Some("local-model"),
+                vec![ModelDef {
+                    id: "local-model".into(),
+                    upstream_model: "local-model".into(),
+                    max_input_tokens: Some(32_000),
+                }],
+            ),
+        ]
+        .into_iter()
+        .map(|(prefix, default_model, models)| {
+            let spec = registry::find(prefix)
+                .unwrap_or_else(|| panic!("registry/providers.toml must define '{prefix}'"));
+            let (base_url, extra_headers) = registry::resolve(spec)
+                .unwrap_or_else(|| panic!("'{prefix}' has a static base_url and must resolve"));
+            ProviderEntry {
+                id: spec.id.clone(),
+                kind: spec.kind.clone(),
+                base_url,
+                api_key_env: spec.api_key_env.clone(),
+                default_model: default_model.map(String::from),
+                models,
+                extra_headers,
+            }
+        })
+        .collect();
+
         Self {
             model: None,
             model_opus: None,
             model_sonnet: None,
             model_haiku: None,
-            providers: vec![
-                ProviderEntry {
-                    id: "nvidia-nim".into(),
-                    kind: ProviderKind::OpenAiCompatible,
-                    base_url: "https://integrate.api.nvidia.com/v1".into(),
-                    api_key_env: Some("NVIDIA_NIM_API_KEY".into()),
-                    default_model: Some("meta/llama-3.1-405b-instruct".into()),
-                    models: vec![
-                        ModelDef {
-                            id: "meta/llama-3.1-405b-instruct".into(),
-                            upstream_model: "meta/llama-3.1-405b-instruct".into(),
-                            max_input_tokens: Some(128_000),
-                        },
-                        ModelDef {
-                            id: "meta/llama-3.3-70b-instruct".into(),
-                            upstream_model: "meta/llama-3.3-70b-instruct".into(),
-                            max_input_tokens: Some(128_000),
-                        },
-                    ],
-                    extra_headers: vec![],
-                },
-                ProviderEntry {
-                    id: "openrouter".into(),
-                    kind: ProviderKind::OpenAiCompatible,
-                    base_url: "https://openrouter.ai/api/v1".into(),
-                    api_key_env: Some("OPENROUTER_API_KEY".into()),
-                    default_model: None,
-                    models: vec![ModelDef {
-                        id: "openrouter/auto".into(),
-                        upstream_model: "openrouter/auto".into(),
-                        max_input_tokens: None,
-                    }],
-                    extra_headers: openrouter_headers(),
-                },
-                ProviderEntry {
-                    id: "lm-studio".into(),
-                    kind: ProviderKind::OpenAiCompatible,
-                    base_url: "http://localhost:1234/v1".into(),
-                    api_key_env: None,
-                    default_model: Some("local-model".into()),
-                    models: vec![ModelDef {
-                        id: "local-model".into(),
-                        upstream_model: "local-model".into(),
-                        max_input_tokens: Some(32_000),
-                    }],
-                    extra_headers: vec![],
-                },
-            ],
+            providers,
             routing: vec![
                 ModelRoute {
                     anthropic_model: "claude-sonnet-4-20250514".into(),
@@ -359,13 +283,6 @@ impl ProviderConfig {
     pub fn provider(&self, id: &str) -> Option<&ProviderEntry> {
         self.providers.iter().find(|p| p.id == id)
     }
-}
-
-fn openrouter_headers() -> Vec<(String, String)> {
-    vec![
-        ("HTTP-Referer".into(), "https://agentflare.dev".into()),
-        ("X-Title".into(), "agentflare".into()),
-    ]
 }
 
 #[cfg(test)]
