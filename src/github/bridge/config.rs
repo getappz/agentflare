@@ -250,6 +250,92 @@ pub fn clear_project_bridge_settings(repo_root: &Path) -> Result<PathBuf, String
     Ok(path)
 }
 
+/// `~/.agentflare/config.toml` — the same file `read_project_bridge_settings`
+/// merges as its user-home layer, but read directly here: the machine name
+/// is machine-scoped, not project-scoped, so it must not depend on (or vary
+/// with) which repo the caller happens to be running from.
+fn home_config_path() -> PathBuf {
+    crate::paths::home().join(".agentflare").join("config.toml")
+}
+
+/// `[bridge].machine_name` from the user-home config file, trimmed and
+/// filtered to non-empty. `None` means unset — callers fall back to
+/// [`stable_instance_id`] via [`machine_label`].
+pub fn read_machine_name() -> Option<String> {
+    let content = std::fs::read_to_string(home_config_path()).ok()?;
+    let doc: toml::Value = content.parse().ok()?;
+    bridge_table(&doc)?
+        .get("machine_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The friendly machine name if one is set, else the existing hashed
+/// instance id (`flared:<12-hex>`) — so behavior is unchanged for anyone
+/// who hasn't opted in. Used to build `beacon:<label>` GitHub labels and PR
+/// footers.
+pub fn machine_label() -> String {
+    read_machine_name().unwrap_or_else(stable_instance_id)
+}
+
+/// Writes `[bridge].machine_name` to the user-home config file. Same lock +
+/// atomic-replace treatment as `write_project_bridge_settings`, just
+/// pointed at the home directory instead of a repo root. Validated through
+/// the same character gate instance ids use — a name containing whitespace
+/// or `/` would corrupt the `beacon:<name>` label path the same way a bad
+/// instance id would corrupt `claimed:<id>`.
+pub fn write_machine_name(name: &str) -> Result<PathBuf, String> {
+    validate_instance_id(name)?;
+    let home = crate::paths::home();
+    let _lock = lock_project_config(&home)?;
+    let path = home_config_path();
+    let mut doc: toml::Value = match std::fs::read_to_string(&path) {
+        Ok(s) => s.parse().map_err(|e| format!("{}: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(toml::value::Table::new())
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let table = doc
+        .as_table_mut()
+        .ok_or_else(|| format!("{}: top-level value is not a table", path.display()))?;
+    let bridge = table
+        .entry("bridge")
+        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| format!("{}: [bridge] is not a table", path.display()))?;
+    bridge.insert(
+        "machine_name".to_string(),
+        toml::Value::String(name.to_string()),
+    );
+    atomic_write_toml(&path, &doc)?;
+    Ok(path)
+}
+
+/// Removes `[bridge].machine_name`, falling `machine_label()` back to the
+/// hashed instance id. A noop (not an error) if it was never set — same
+/// contract as `clear_project_bridge_settings`.
+pub fn clear_machine_name() -> Result<PathBuf, String> {
+    let home = crate::paths::home();
+    let _lock = lock_project_config(&home)?;
+    let path = home_config_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let mut doc: toml::Value = content
+        .parse()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(bridge) = doc.get_mut("bridge").and_then(|b| b.as_table_mut()) {
+        bridge.remove("machine_name");
+    }
+    atomic_write_toml(&path, &doc)?;
+    Ok(path)
+}
+
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
     pub enabled: bool,
@@ -1046,5 +1132,55 @@ mod tests {
              new work, keep re-verifying/exporting what's already held), not \
              a mistyped value to correct"
         );
+    }
+
+    #[test]
+    fn machine_label_falls_back_to_stable_instance_id_when_unset() {
+        crate::paths::test_support::with_temp_home(|| {
+            assert_eq!(machine_label(), stable_instance_id());
+        });
+    }
+
+    #[test]
+    fn write_then_read_machine_name_round_trips() {
+        crate::paths::test_support::with_temp_home(|| {
+            assert!(read_machine_name().is_none());
+            write_machine_name("kumar-laptop").unwrap();
+            assert_eq!(read_machine_name().as_deref(), Some("kumar-laptop"));
+            assert_eq!(machine_label(), "kumar-laptop");
+        });
+    }
+
+    #[test]
+    fn clear_machine_name_falls_back_to_stable_instance_id() {
+        crate::paths::test_support::with_temp_home(|| {
+            write_machine_name("kumar-laptop").unwrap();
+            clear_machine_name().unwrap();
+            assert!(read_machine_name().is_none());
+            assert_eq!(machine_label(), stable_instance_id());
+        });
+    }
+
+    #[test]
+    fn clear_machine_name_is_a_noop_when_never_set() {
+        crate::paths::test_support::with_temp_home(|| {
+            // Must not error just because the file/table doesn't exist yet.
+            clear_machine_name().unwrap();
+        });
+    }
+
+    #[test]
+    fn write_machine_name_rejects_whitespace() {
+        crate::paths::test_support::with_temp_home(|| {
+            assert!(write_machine_name("kumar laptop").is_err());
+            assert!(read_machine_name().is_none());
+        });
+    }
+
+    #[test]
+    fn write_machine_name_rejects_slash() {
+        crate::paths::test_support::with_temp_home(|| {
+            assert!(write_machine_name("kumar/laptop").is_err());
+        });
     }
 }
