@@ -93,7 +93,7 @@
                   <td class="af-mono" x-text="job.id.substring(0, 12) + '…'"></td>
                   <td class="af-mono af-truncate" x-text="jobCommand(job)"></td>
                   <td>
-                    <span class="af-badge" :class="stateClass(job.state)" x-text="job.state"></span>
+                    <span class="af-badge" :class="stateClass(job.state, job.output?.exit_code)" x-text="stateLabel(job.state, job.output?.exit_code)"></span>
                   </td>
                   <td x-text="afFormatTime(job.created_at)"></td>
                   <td x-text="afFormatTime(job.started_at)"></td>
@@ -109,7 +109,7 @@
           <div>
             <div class="af-item-header">
               <div class="af-item-meta">
-                <span>State: <strong :class="stateClass(detailState)" x-text="detailState"></strong></span>
+                <span>State: <strong :class="stateClass(detailState, detailExitCode)" x-text="stateLabel(detailState, detailExitCode)"></strong></span>
                 <span>ID: <strong class="af-mono" x-text="selectedId"></strong></span>
                 <span>Created: <strong x-text="afFormatTime(detailCreated)"></strong></span>
                 <span x-show="detailStarted">Started: <strong x-text="afFormatTime(detailStarted)"></strong></span>
@@ -275,12 +275,17 @@
           return 'command' in job ? job.command : (job.id || '');
         },
 
-        stateClass(state) {
+        stateClass(state, exitCode) {
           if (state === 'running') return 'af-prio af-prio-urgent';
           if (state === 'queued') return 'af-prio af-prio-medium';
-          if (state === 'exited') return 'af-prio af-prio-low';
+          if (state === 'exited') return exitCode === 0 ? 'af-prio af-prio-low' : 'af-prio af-prio-urgent';
           if (state === 'failed' || state === 'killed') return 'af-prio af-prio-urgent';
           return '';
+        },
+
+        stateLabel(state, exitCode) {
+          if (state === 'exited') return exitCode === 0 ? 'done' : 'failed';
+          return state;
         },
       };
     }
