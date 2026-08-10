@@ -29,7 +29,20 @@ pub(super) fn wrap(
     cwd: Option<&Path>,
 ) -> Option<(String, Vec<String>)> {
     let bwrap = find_or_install_bwrap()?;
-    Some((path_to_string(&bwrap), build_bwrap_args(cwd, command, args)))
+    // Resolved once up front (not inside `build_bwrap_args`) so an
+    // unresolvable cwd falls back to running the job unsandboxed, the same
+    // as a missing `bwrap`/`mise` -- rather than binding a plausible-looking
+    // but wrong directory into the sandbox. A `None` cwd is left as `None`
+    // (nothing to resolve); only a `Some(path)` that fails to resolve bails
+    // the whole function out via `?`.
+    let cwd = match cwd {
+        Some(path) => Some(absolute_path(path)?),
+        None => None,
+    };
+    Some((
+        path_to_string(&bwrap),
+        build_bwrap_args(cwd.as_deref(), command, args),
+    ))
 }
 
 fn build_bwrap_args(cwd: Option<&Path>, command: &str, args: &[String]) -> Vec<String> {
@@ -66,8 +79,7 @@ fn build_bwrap_args_with_home(
     ];
 
     if let Some(cwd) = cwd {
-        let cwd = absolute_path(cwd);
-        let cwd_str = path_to_string(&cwd);
+        let cwd_str = path_to_string(cwd);
         bwrap_args.push("--bind".to_string());
         bwrap_args.push(cwd_str.clone());
         bwrap_args.push(cwd_str.clone());
@@ -103,40 +115,23 @@ fn build_bwrap_args_with_home(
     bwrap_args
 }
 
-/// Resolves `path` to absolute against the current process's cwd when it
-/// isn't already one. bwrap's own `--bind`/`--chdir` source paths are taken
+/// Resolves `path` to a canonical absolute path -- symlinks and `.`/`..`
+/// components resolved by the OS (`realpath` semantics), not stripped
+/// lexically. bwrap's own `--bind`/`--chdir` source paths are taken
 /// literally, unlike `std::process::Command::current_dir`, which resolves a
-/// relative path against the parent's cwd before handing it to the child --
-/// without this, a relative job `cwd` would bind whatever bwrap's own
-/// (unrelated) working directory happens to be, not the job's intended one.
-fn absolute_path(path: &Path) -> PathBuf {
+/// relative path against the parent's cwd before handing it to the child.
+/// Lexically stripping `..` instead of asking the OS would be wrong the
+/// moment a symlink sits in the path (`link/..` is the parent of whatever
+/// `link` points at, not the lexical parent of `link` itself). Returns
+/// `None` if the path doesn't exist or can't be resolved, so the caller
+/// falls back to unsandboxed rather than bind a wrong directory.
+fn absolute_path(path: &Path) -> Option<PathBuf> {
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map(|base| base.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
+        std::env::current_dir().ok()?.join(path)
     };
-    normalize_lexically(&joined)
-}
-
-/// Collapses `.` and `..` components without touching the filesystem (no
-/// symlink resolution) -- e.g. `/a/./b` -> `/a/b`. A literal `cwd: "."`
-/// would otherwise reach bwrap as `<absolute-dir>/.`, which is harmless to
-/// the kernel but pointless clutter in the sandbox's own bind args.
-fn normalize_lexically(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
+    std::fs::canonicalize(joined).ok()
 }
 
 fn path_to_string(path: &Path) -> String {
@@ -233,29 +228,56 @@ mod tests {
     }
 
     #[test]
-    fn relative_cwd_is_normalized_to_absolute_bind() {
-        let args = build_bwrap_args_with_home(Some(Path::new(".")), "true", &[], None);
-        let expected = path_to_string(&std::env::current_dir().unwrap());
+    fn resolved_cwd_is_placed_into_bind_and_chdir_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let args = build_bwrap_args_with_home(Some(cwd.as_path()), "true", &[], None);
+        let expected = path_to_string(&cwd);
         let (src, dest) = bind_arg(&args);
         assert_eq!(src, expected);
         assert_eq!(dest, expected);
+        let chdir_idx = args
+            .iter()
+            .position(|a| a == "--chdir")
+            .expect("--chdir present");
+        assert_eq!(args[chdir_idx + 1], expected);
     }
 
     #[test]
-    fn nested_relative_cwd_is_normalized_to_absolute_bind() {
-        let args = build_bwrap_args_with_home(Some(Path::new("src")), "true", &[], None);
-        let expected = path_to_string(&std::env::current_dir().unwrap().join("src"));
-        let (src, _) = bind_arg(&args);
-        assert_eq!(src, expected);
+    fn absolute_path_resolves_relative_dot_against_current_dir() {
+        let expected = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(absolute_path(Path::new(".")).unwrap(), expected);
     }
 
     #[test]
-    fn absolute_cwd_is_left_unchanged() {
-        let abs = std::env::current_dir().unwrap();
-        let args = build_bwrap_args_with_home(Some(abs.as_path()), "true", &[], None);
-        let expected = path_to_string(&abs);
-        let (src, _) = bind_arg(&args);
-        assert_eq!(src, expected);
+    fn absolute_path_canonicalizes_an_already_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(absolute_path(dir.path()).unwrap(), expected);
+    }
+
+    #[test]
+    fn absolute_path_missing_directory_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(absolute_path(&dir.path().join("does-not-exist")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_path_resolves_a_symlinked_component_via_its_real_parent() {
+        // Lexically stripping `..` would resolve `link/..` back to `root`
+        // (the parent of the `link` entry itself); the correct, OS-resolved
+        // answer is `root/real` (the parent of what `link` actually points
+        // at) -- exactly the case lexical normalization gets wrong.
+        let root = tempfile::tempdir().unwrap();
+        let real_child = root.path().join("real").join("child");
+        std::fs::create_dir_all(&real_child).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real_child, &link).unwrap();
+
+        let resolved = absolute_path(&link.join("..")).unwrap();
+        let expected = std::fs::canonicalize(root.path().join("real")).unwrap();
+        assert_eq!(resolved, expected);
     }
 
     #[test]
