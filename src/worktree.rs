@@ -49,6 +49,16 @@ pub fn cleanup_worktree(item: &agentflare_backend::item::Item, repo_root: &Path)
     flare_git_core::worktree::cleanup_item_worktree(item, repo_root);
 }
 
+/// Commits any uncommitted changes in `item`'s worktree. See
+/// `flare_git_core::worktree::commit_uncommitted`.
+pub fn commit_uncommitted(
+    item: &agentflare_backend::item::Item,
+    repo_root: &Path,
+    message: &str,
+) -> bool {
+    flare_git_core::worktree::commit_uncommitted(item, repo_root, message)
+}
+
 /// Checks whether `item`'s branch already has a merged PR — the promotion
 /// signal `check_merge` uses to move an item out of "in_review" (item
 /// #420). Soft-fails like `push_and_open_pr`: no GitHub credentials, no

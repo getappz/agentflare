@@ -608,6 +608,23 @@ impl AgentflareMcp {
         })??;
         let should_push = req.push.unwrap_or(true);
         let summary = req.summary.as_deref();
+        // An agent can make real file edits and still exit without ever
+        // running `git commit` itself -- with no commit, the branch never
+        // diverges from target, so `nothing_was_ever_committed` below can't
+        // tell that apart from a genuine no-op, and the edits are silently
+        // stranded in the worktree while `done` still reports success
+        // (item #57). Commit them here, before push/PR or the "nothing was
+        // committed" classification ever run, using the agent's own summary
+        // as the commit message when there is one.
+        if let Some(item) = &item {
+            let message = summary
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Auto-committed by item done: uncommitted changes at completion");
+            if crate::worktree::commit_uncommitted(item, &repo_root, message) {
+                eprintln!("worktree: auto-committed uncommitted changes for item {item_id}");
+            }
+        }
         let pr_url = match (&item, &target_branch) {
             (Some(item), Some(target)) if should_push => PROGRESS_SENDER
                 .try_with(|ps| {
