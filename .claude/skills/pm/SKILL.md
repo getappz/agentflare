@@ -1,6 +1,6 @@
 ---
 name: pm
-description: Product management for the current agentflare project — run /pm:standup (daily activity digest), /pm:groom (backlog grooming + RICE/ICE prioritization), /pm:plan (Now/Next/Later sprint bucketing), or /pm:health (velocity + WIP + bottleneck scorecard). Read-only; operates on agentflare items via MCP.
+description: Product management for the current agentflare project — run /pm:standup (daily activity digest), /pm:groom (backlog grooming + RICE/ICE/WSJF/Value-Effort prioritization), /pm:plan (Now/Next/Later sprint bucketing), or /pm:health (velocity + WIP + bottleneck scorecard). Read-only; operates on agentflare items via MCP.
 ---
 
 # PM Agent — product management over agentflare items
@@ -13,7 +13,7 @@ add_label, remove_label — nor `comment` create/edit/delete. You may only read
 (`item` list/get/search/groom/standup/health, `comment` list, `handoff` inbox, `memory`).
 Output is suggestions for a human, never actions taken.
 
-All content authored from public PM methodologies (RICE, ICE, MoSCoW, Now/Next/Later). No third-party notices required.
+All content authored from public PM methodologies (RICE, ICE, WSJF, Value-Effort, MoSCoW, Now/Next/Later). No third-party notices required.
 
 ## Scope
 
@@ -40,7 +40,8 @@ Read-only: never change item state.
 
 ### /pm:groom — backlog grooming + prioritization
 
-Arg: staleness threshold in days (default 14).
+Args: staleness threshold in days (default 14); framework (`rice` default,
+`wsjf`, `value-effort` — see reference/rubric.md's Framework selection).
 
 1. One call: `item action="groom" state_group="backlog,unstarted" staleness_days=<threshold> limit=15`.
    This replaces the old `list` + N×`get` + hand-computed flags — the server
@@ -49,11 +50,14 @@ Arg: staleness threshold in days (default 14).
    `possible_duplicates`, `size`/`unestimated` precomputed per item, plus
    `pull_next` and the summary counts. Do not re-derive these by eyeballing
    timestamps or text — they're already computed.
-2. Score each shortlisted item with reference/rubric.md (RICE using the
-   returned `size` where present, ICE fallback where `unestimated=true`) —
-   your judgment is only needed for Reach and Confidence, which the server
-   can't infer from free text. Print a ranked table: rank · FIX-NN · name ·
-   score · one-line reason.
+2. Score each shortlisted item with reference/rubric.md using the requested
+   framework (RICE using the returned `size` where present, ICE fallback
+   where `unestimated=true`; `wsjf`/`value-effort` when explicitly requested,
+   marking `?` per item instead of ICE-falling-back when `unestimated=true`)
+   — your judgment is only needed for Reach/Confidence (RICE) or the
+   equivalent qualitative factors the other frameworks reuse, none of which
+   the server can infer from free text. Print a ranked table: rank · FIX-NN ·
+   name · score · one-line reason.
 3. Flag lists — read straight from the response, no recomputation:
    - **Stale**: items with `stale=true`.
    - **Unassigned**: items with `unassigned=true` (`unassigned_count` for the total).
@@ -67,15 +71,19 @@ Arg: staleness threshold in days (default 14).
 
 ### /pm:plan — Now / Next / Later bucketing
 
-Arg: capacity hint like "~8" (optional; caps the Now bucket).
+Args: capacity hint like "~8" (optional; caps the Now bucket); framework
+(`rice` default, `wsjf`, `value-effort` — see reference/rubric.md's
+Framework selection).
 
 1. One call: `item action="groom" state_group="backlog,unstarted" capacity=<hint or a sane default like 5>`.
    The server does the bucketing: `now` (top-`capacity` ready items — unblocked,
    has a `size`), `next` (remaining ready items), `later` (blocked items),
    `needs_estimation` (unestimated — excluded from planning). No hand-bucketing.
-2. Score each item with reference/rubric.md for the printed rationale (RICE
-   using `size`, ICE fallback for `unestimated` ones) — your judgment covers
-   Reach/Confidence, the buckets themselves are already computed.
+2. Score each item with reference/rubric.md for the printed rationale, using
+   the requested framework (RICE using `size`, ICE fallback for `unestimated`
+   ones; `wsjf`/`value-effort` when explicitly requested) — your judgment
+   covers the qualitative factors, the buckets themselves are already
+   computed.
 3. Print each bucket as an ordered list of `FIX-NN · name · score`.
 4. Print the time-signal caveat. Read-only — this proposes a plan, it does not
    assign or move items.
