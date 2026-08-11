@@ -449,11 +449,14 @@ fn diagnostic_suffix(captured: &Captured) -> String {
     )
 }
 
-const DIAGNOSTIC_TAIL_CHARS: usize = 2000;
+/// Also reused by `cli::work` to cap a headless run's reply before it's
+/// embedded in a success comment (item #81) — same "bounded tail, not the
+/// whole capture" spirit as this module's own timeout/failure diagnostics.
+pub(crate) const DIAGNOSTIC_TAIL_CHARS: usize = 2000;
 
 /// The last `max_chars` characters of `s`, UTF-8-boundary-safe (never slices
 /// through the middle of a multi-byte character).
-fn tail_str(s: &str, max_chars: usize) -> &str {
+pub(crate) fn tail_str(s: &str, max_chars: usize) -> &str {
     match s.char_indices().rev().nth(max_chars.saturating_sub(1)) {
         Some((idx, _)) => &s[idx..],
         None => s,

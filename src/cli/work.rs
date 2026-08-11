@@ -1,4 +1,4 @@
-use crate::agent_launch::{self, HeadlessOutcome};
+use crate::agent_launch::{self, DIAGNOSTIC_TAIL_CHARS, HeadlessOutcome, tail_str};
 use crate::mcp_server::AgentflareMcp;
 use crate::mcp_server::types::{AssetRequest, CommentRequest, ItemRequest};
 use agent_registry::{self, autonomous_args, headless_args};
@@ -245,6 +245,69 @@ fn format_success_comment(
         }
     }
     body
+}
+
+/// Caps a headless run's reply to `DIAGNOSTIC_TAIL_CHARS` before it's
+/// embedded in the success comment. Item #78's comment thread hit 1,068,249
+/// chars across two comments after `parse_claude_reply`'s raw-text fallback
+/// (last stdout line wasn't the expected `{"result": ...}` shape) returned
+/// an entire `stream-json` transcript as "the reply" — comments must stay
+/// summaries, not unbounded dumps. Content within budget is returned
+/// unchanged; anything larger is staged and attached to `item_id` as a
+/// versioned asset via [`stage_and_attach_asset`], and the comment carries
+/// only a bounded tail preview plus a pointer to the asset.
+fn cap_reply_for_comment(mcp: &AgentflareMcp, item_id: &str, reply: &str) -> String {
+    let total_chars = reply.chars().count();
+    if total_chars <= DIAGNOSTIC_TAIL_CHARS {
+        return reply.to_string();
+    }
+    let preview = tail_str(reply, DIAGNOSTIC_TAIL_CHARS);
+    match stage_and_attach_asset(mcp, item_id, reply) {
+        Ok(asset_id) => format!(
+            "(reply truncated to the last {DIAGNOSTIC_TAIL_CHARS} of {total_chars} chars — \
+             full output attached as asset {asset_id}; fetch via `mcp__flare__asset` \
+             action=get id={asset_id})\n\n{preview}"
+        ),
+        Err(e) => format!(
+            "(reply truncated to the last {DIAGNOSTIC_TAIL_CHARS} of {total_chars} chars — \
+             failed to attach full output as an asset: {e})\n\n{preview}"
+        ),
+    }
+}
+
+/// Stages `content` under `~/.agentflare/staging/` and attaches it to
+/// `item_id` as a versioned asset, the same staging convention
+/// `mcp_server::asset::asset_impl`'s `attach` action requires. Returns the
+/// new asset's id.
+fn stage_and_attach_asset(
+    mcp: &AgentflareMcp,
+    item_id: &str,
+    content: &str,
+) -> Result<String, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let filename = format!("work-reply-{item_id}-{nanos}.txt");
+    let staging_dir = crate::paths::home().join(".agentflare").join("staging");
+    std::fs::create_dir_all(&staging_dir).map_err(|e| e.to_string())?;
+    std::fs::write(staging_dir.join(&filename), content).map_err(|e| e.to_string())?;
+
+    let resp = mcp
+        .asset_impl(AssetRequest {
+            action: "attach".into(),
+            id: None,
+            item_id: Some(item_id.to_string()),
+            project_id: None,
+            filename: Some(filename),
+            metadata: None,
+        })
+        .map_err(|e| e.message.to_string())?;
+    let asset: serde_json::Value = serde_json::from_str(&resp).unwrap_or_default();
+    asset["id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "asset attach response missing id".to_string())
 }
 
 fn failure_message(outcome: &HeadlessOutcome) -> String {
@@ -736,8 +799,9 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
                 serde_json::from_str(&done_resp).unwrap_or(serde_json::Value::Null);
             let pr_url = done_val["pr_url"].as_str().map(str::to_string);
 
+            let comment_reply = cap_reply_for_comment(&mcp, item_id, &reply_text);
             let comment_body = format_success_comment(
-                &reply_text,
+                &comment_reply,
                 session_id.as_deref(),
                 cost_usd,
                 pr_url.as_deref(),
@@ -1221,6 +1285,15 @@ use  = "opencode"
     }
 
     #[test]
+    fn cap_reply_for_comment_leaves_a_reply_within_budget_unchanged() {
+        // No I/O should happen at all for the common case — an unused,
+        // never-touched-disk AgentflareMcp proves that.
+        let mcp = AgentflareMcp::for_test_memory();
+        let reply = "Fixed the race by adding a mutex.";
+        assert_eq!(cap_reply_for_comment(&mcp, "item-1", reply), reply);
+    }
+
+    #[test]
     fn failure_message_extracts_inner_string() {
         let outcome = HeadlessOutcome::NotFound("claude not found".into());
         assert_eq!(failure_message(&outcome), "claude not found");
@@ -1380,6 +1453,61 @@ use  = "opencode"
             .unwrap();
         assert_eq!(comments.len(), 1);
         assert!(comments[0].body.contains("claude-code not found on PATH"));
+    }
+
+    #[test]
+    fn cap_reply_for_comment_offloads_an_oversized_reply_to_a_retrievable_asset() {
+        // Item #78's real trigger: a stream-json transcript whose final line
+        // never matched parse_claude_reply's expected {"result": ...} shape,
+        // so its fallback returned the entire raw capture (there, ~1M chars)
+        // as "the reply" — this reproduces that shape at smaller scale.
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+            let backend_db = tmp.path().join("backend.db");
+            let project_link = tmp.path().join("project.json");
+
+            let mcp = AgentflareMcp::for_test(backend_db.clone(), repo_root.clone(), project_link);
+            let item = mcp.with_backend_db(|conn| seeded_item(&mcp, conn)).unwrap();
+
+            let raw: String = "not json\n".repeat(50_000);
+            assert!(raw.len() > DIAGNOSTIC_TAIL_CHARS * 100);
+
+            let comment_reply = cap_reply_for_comment(&mcp, &item.id, &raw);
+            assert!(
+                comment_reply.len() < raw.len() / 10,
+                "comment body must stay bounded, got {} of {} raw chars",
+                comment_reply.len(),
+                raw.len()
+            );
+            assert!(comment_reply.contains("truncated"));
+
+            let asset_id = comment_reply
+                .split("as asset ")
+                .nth(1)
+                .and_then(|s| s.split(';').next())
+                .expect("comment must reference the attached asset id")
+                .to_string();
+
+            let fetched = mcp
+                .asset_impl(AssetRequest {
+                    action: "get".into(),
+                    id: Some(asset_id),
+                    item_id: None,
+                    project_id: None,
+                    filename: None,
+                    metadata: None,
+                })
+                .unwrap();
+            let fetched: serde_json::Value = serde_json::from_str(&fetched).unwrap();
+            assert_eq!(
+                fetched["content"].as_str().unwrap(),
+                raw,
+                "the full raw reply must be retrievable verbatim from the attached asset"
+            );
+        });
     }
 
     #[test]
