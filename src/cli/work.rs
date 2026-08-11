@@ -64,6 +64,15 @@ pub struct WorkArgs {
 /// success-comment reply doing on the way out.
 const HANDOFF_ASSET_MAX_CHARS: usize = 8_000;
 
+/// Cap on how much of the concatenated "Prior discussion" thread gets
+/// inlined into the dispatch prompt. #81 bounded a single outgoing reply
+/// comment (`cap_reply_for_comment`); this applies the same tail-and-pointer
+/// discipline to the *incoming* thread of already-bounded comments, which
+/// had no aggregate cap of its own -- and since #441 moved prompt delivery
+/// from argv to stdin, there's no OS-level length limit left to catch it
+/// either.
+const COMMENTS_PROMPT_MAX_CHARS: usize = 8_000;
+
 /// The last `max_chars` characters of `s`, UTF-8-boundary-safe.
 fn tail_chars(s: &str, max_chars: usize) -> &str {
     match s.char_indices().rev().nth(max_chars.saturating_sub(1)) {
@@ -175,9 +184,21 @@ fn build_prompt(
         )
     };
     if !comments.is_empty() {
-        prompt.push_str("\nPrior discussion:\n");
+        let mut discussion = String::new();
         for c in comments {
-            prompt.push_str(&format!("- [{}] {}\n", c.author_agent, c.body));
+            discussion.push_str(&format!("- [{}] {}\n", c.author_agent, c.body));
+        }
+        prompt.push_str("\nPrior discussion:\n");
+        let total_chars = discussion.chars().count();
+        if total_chars <= COMMENTS_PROMPT_MAX_CHARS {
+            prompt.push_str(&discussion);
+        } else {
+            prompt.push_str(&format!(
+                "(showing the last {COMMENTS_PROMPT_MAX_CHARS} of {total_chars} chars -- full \
+                 thread via `mcp__flare__comment` action=list item_id={})\n\n",
+                item.id
+            ));
+            prompt.push_str(tail_chars(&discussion, COMMENTS_PROMPT_MAX_CHARS));
         }
     }
     if let Some(handoff) = latest_handoff {
@@ -942,6 +963,48 @@ mod tests {
         let item = test_item();
         let prompt = build_prompt(&item, &[], None);
         assert!(!prompt.contains("Prior discussion"));
+    }
+
+    #[test]
+    fn build_prompt_leaves_a_thread_within_budget_unchanged() {
+        let item = test_item();
+        let comments = vec![agentflare_backend::comment::ItemComment {
+            id: "c1".into(),
+            item_id: "item-1".into(),
+            author_agent: "alice".into(),
+            body: "probably a race in the setup fixture".into(),
+            created_at: 0,
+            updated_at: 0,
+        }];
+        let prompt = build_prompt(&item, &comments, None);
+        assert!(prompt.contains("probably a race in the setup fixture"));
+        assert!(!prompt.contains("showing the last"));
+    }
+
+    #[test]
+    fn build_prompt_caps_an_oversized_thread_at_the_tail_with_a_comment_pointer() {
+        // A thread of many individually-bounded (#81) comments still has no
+        // aggregate cap -- an oversized thread must be capped on the way in
+        // to the dispatch prompt, not dumped unbounded.
+        let item = test_item();
+        let comments = vec![agentflare_backend::comment::ItemComment {
+            id: "c1".into(),
+            item_id: "item-1".into(),
+            author_agent: "alice".into(),
+            body: "x".repeat(COMMENTS_PROMPT_MAX_CHARS * 3),
+            created_at: 0,
+            updated_at: 0,
+        }];
+        let prompt = build_prompt(&item, &comments, None);
+        assert!(prompt.contains("showing the last"));
+        assert!(prompt.contains(&format!(
+            "mcp__flare__comment` action=list item_id={}",
+            item.id
+        )));
+        // The tail of the (capped) discussion is present, but not the full
+        // oversized body.
+        assert!(prompt.contains(&"x".repeat(COMMENTS_PROMPT_MAX_CHARS - 1)));
+        assert!(!prompt.contains(&"x".repeat(COMMENTS_PROMPT_MAX_CHARS * 3)));
     }
 
     #[test]
