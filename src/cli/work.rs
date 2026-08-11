@@ -64,6 +64,15 @@ pub struct WorkArgs {
 /// success-comment reply doing on the way out.
 const HANDOFF_ASSET_MAX_CHARS: usize = 8_000;
 
+/// Cap on the total size of the "Prior discussion" section `build_prompt`
+/// inlines from an item's comments. #81 bounds each individual posted
+/// comment's body, but a thread can still accumulate many bounded comments
+/// into an unbounded total -- and since #441 moved prompt delivery from argv
+/// (which had the OS's E2BIG as an accidental backstop) to stdin (which has
+/// none), nothing else catches that growth. Same tail-and-pointer discipline
+/// as `HANDOFF_ASSET_MAX_CHARS`.
+const COMMENTS_INLINE_MAX_CHARS: usize = 8_000;
+
 /// The last `max_chars` characters of `s`, UTF-8-boundary-safe.
 fn tail_chars(s: &str, max_chars: usize) -> &str {
     match s.char_indices().rev().nth(max_chars.saturating_sub(1)) {
@@ -176,8 +185,22 @@ fn build_prompt(
     };
     if !comments.is_empty() {
         prompt.push_str("\nPrior discussion:\n");
+        let mut section = String::new();
         for c in comments {
-            prompt.push_str(&format!("- [{}] {}\n", c.author_agent, c.body));
+            section.push_str(&format!("- [{}] {}\n", c.author_agent, c.body));
+        }
+        let total_chars = section.chars().count();
+        if total_chars <= COMMENTS_INLINE_MAX_CHARS {
+            prompt.push_str(&section);
+        } else {
+            prompt.push_str(&format!(
+                "(showing the last {COMMENTS_INLINE_MAX_CHARS} of {total_chars} chars across \
+                 {} comments -- full history via `mcp__flare__comment` action=list \
+                 item_id={})\n\n{}\n",
+                comments.len(),
+                item.id,
+                tail_chars(&section, COMMENTS_INLINE_MAX_CHARS)
+            ));
         }
     }
     if let Some(handoff) = latest_handoff {
@@ -1108,6 +1131,37 @@ mod tests {
         );
         assert!(handoff.contains("full content in asset"));
         assert!(handoff.ends_with(&"x".repeat(HANDOFF_ASSET_MAX_CHARS)));
+    }
+
+    #[test]
+    fn build_prompt_caps_an_oversized_comment_thread_at_the_tail_with_a_pointer() {
+        // #85: each individual comment is bounded by #81, but a thread with
+        // many bounded comments can still sum to an unbounded total -- and
+        // since #441 moved prompt delivery to stdin, nothing else catches
+        // that growth. Total inlined comment text must be capped, not
+        // dumped unbounded into the prompt.
+        let item = test_item();
+        let comments: Vec<agentflare_backend::comment::ItemComment> = (0..50)
+            .map(|i| agentflare_backend::comment::ItemComment {
+                id: format!("c{i}"),
+                item_id: "item-1".into(),
+                author_agent: "alice".into(),
+                body: "x".repeat(500),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .collect();
+        let prompt = build_prompt(&item, &comments, None);
+        assert!(
+            prompt.len() < comments.len() * 500,
+            "capped prompt must be much shorter than the unbounded concatenation"
+        );
+        assert!(prompt.contains("full history via `mcp__flare__comment` action=list"));
+        assert!(prompt.contains(&item.id));
+        assert!(prompt.contains("50 comments"));
+        // the tail cut lands inside the run of bounded comments, so the very
+        // last (most recent) comment's full body must still be intact.
+        assert!(prompt.contains(&format!("{}\n", "x".repeat(500))));
     }
 
     #[test]
