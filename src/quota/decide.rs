@@ -211,7 +211,11 @@ pub fn decide(conn: &rusqlite::Connection, item: &agentflare_backend::item::Item
 pub enum EffectiveAction {
     Run,
     SelfRepair,
-    Wait,
+    /// Carries `Decision::reason` so `run_discovery_tick` can log *why* a
+    /// ready-for-work item wasn't dispatched this tick instead of leaving it
+    /// invisible (item #82 — silent skips were indistinguishable from "no
+    /// eligible items" in the daemon log).
+    Wait(String),
     Ask(String),
     StayQuiet,
 }
@@ -242,7 +246,7 @@ pub fn decide_for_supervisor(
             }
             EffectiveAction::SelfRepair
         }
-        EffectiveActionInternal::Wait => EffectiveAction::Wait,
+        EffectiveActionInternal::Wait => EffectiveAction::Wait(decision.reason.clone()),
         EffectiveActionInternal::Ask => {
             let goal_item_id = goal.as_ref().map(|(gi, _)| gi.id.clone());
             if let Some((goal_item, mut meta)) = goal {
