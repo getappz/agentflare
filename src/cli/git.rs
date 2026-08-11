@@ -794,6 +794,38 @@ fn scope_deny(reason: String) -> ScopeCheckResult {
     }
 }
 
+/// Splits this repo's live claims into "mine" (the invoker's own live claim,
+/// if any) and "others" (every other live claim, scope-enforceable against).
+///
+/// Deliberately matches on the FULL `owner_id()` (`agent:instance`), not just
+/// `claims::agent_of()` (agent type alone) -- claim ownership is documented
+/// as instance-scoped (see `claims::owner_id`'s doc comment), and
+/// `claim(action="release"|"done")` require an exact `owner_id()` match to
+/// let go of a claim. Matching "mine" by agent-type alone would misclassify
+/// a DIFFERENT session's live claim (a concurrent sibling, or one orphaned by
+/// a crashed prior session) as the invoker's own -- producing a spurious
+/// `OutOfTree` denial ("you hold claim X") for a claim the invoker doesn't
+/// actually own and has no way to release.
+fn partition_claims_by_owner(
+    live: &[crate::claims::Claim],
+    owner: &str,
+) -> (Option<String>, Vec<scope::ClaimScope>) {
+    let own_target = live
+        .iter()
+        .find(|c| c.owner == owner)
+        .map(|c| c.target.clone());
+    let others = live
+        .iter()
+        .filter(|c| c.owner != owner)
+        .map(|c| scope::ClaimScope {
+            target: c.target.clone(),
+            owner: c.owner.clone(),
+            scopes: c.scope.clone(),
+        })
+        .collect();
+    (own_target, others)
+}
+
 /// `agentflare git scope-check --subcommand commit|push` -- called by
 /// flare-git-shim before letting a commit/push through, to enforce item
 /// #234's claim path-scopes (data the shim itself has no DB access to).
@@ -839,20 +871,7 @@ fn run_scope_check(subcommand: &str) -> ScopeCheckResult {
     }
 
     let owner = crate::claims::owner_id();
-    let agent = crate::claims::agent_of(&owner);
-    let own_target = live
-        .iter()
-        .find(|c| crate::claims::agent_of(&c.owner) == agent)
-        .map(|c| c.target.clone());
-    let others: Vec<scope::ClaimScope> = live
-        .iter()
-        .filter(|c| crate::claims::agent_of(&c.owner) != agent)
-        .map(|c| scope::ClaimScope {
-            target: c.target.clone(),
-            owner: c.owner.clone(),
-            scopes: c.scope.clone(),
-        })
-        .collect();
+    let (own_target, others) = partition_claims_by_owner(&live, &owner);
 
     let changed = changed_paths(&repo_root, subcommand);
     let in_worktree = branch::is_linked_worktree(&repo_root);
@@ -1173,6 +1192,78 @@ mod tests {
             out.status.success(),
             "git {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn claim_fixture(target: &str, owner: &str, scope: Vec<String>) -> crate::claims::Claim {
+        crate::claims::Claim {
+            repo: "o/r".to_string(),
+            target: target.to_string(),
+            owner: owner.to_string(),
+            status: "claimed".to_string(),
+            created_at: 0,
+            heartbeat_at: 0,
+            git_commit: None,
+            scope,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn partition_claims_by_owner_does_not_treat_a_different_instance_as_mine() {
+        // item #444: a claim from a DIFFERENT session of the same agent type
+        // (e.g. orphaned by a crashed prior session) must never be
+        // classified as "own_target" -- that produces a spurious OutOfTree
+        // denial for a claim the invoker cannot release (release/done are
+        // exact-owner-scoped).
+        let live = vec![claim_fixture("item#1", "claude-code:28604", vec![])];
+        let (own_target, others) = partition_claims_by_owner(&live, "claude-code:14432");
+        assert_eq!(own_target, None);
+        assert_eq!(others.len(), 1);
+        assert_eq!(others[0].owner, "claude-code:28604");
+    }
+
+    #[test]
+    fn partition_claims_by_owner_matches_the_exact_same_instance() {
+        let live = vec![claim_fixture("item#1", "claude-code:14432", vec![])];
+        let (own_target, others) = partition_claims_by_owner(&live, "claude-code:14432");
+        assert_eq!(own_target, Some("item#1".to_string()));
+        assert!(others.is_empty());
+    }
+
+    #[test]
+    fn partition_claims_by_owner_enforces_scope_between_sibling_instances() {
+        // Second-order effect of the same bug: two concurrent sessions of
+        // the same agent type got zero scope enforcement against each other
+        // because agent-type equality swept both into neither list
+        // correctly. A sibling instance's scoped claim must land in
+        // `others`, not be silently dropped.
+        let live = vec![claim_fixture(
+            "item#2",
+            "claude-code:99999",
+            vec!["crates/foo/".to_string()],
+        )];
+        let (own_target, others) = partition_claims_by_owner(&live, "claude-code:14432");
+        assert_eq!(own_target, None);
+        assert_eq!(others.len(), 1);
+        assert_eq!(others[0].scopes, vec!["crates/foo/".to_string()]);
+
+        // The regression this test is actually about: that placement in
+        // `others` translates into real enforcement -- a changed path inside
+        // the sibling's declared scope must classify as Overlapping.
+        let verdict = scope::classify_scopes(
+            &["crates/foo/src/lib.rs".to_string()],
+            own_target.as_deref(),
+            false,
+            &others,
+        );
+        assert_eq!(
+            verdict,
+            scope::ScopeVerdict::Overlapping {
+                owner: "claude-code:99999".to_string(),
+                target: "item#2".to_string(),
+                scope: "crates/foo/".to_string(),
+            }
         );
     }
 
