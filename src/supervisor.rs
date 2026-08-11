@@ -49,6 +49,12 @@ pub(crate) fn resolve_confirmed_agent(assignee: &str) -> Option<agent_registry::
 pub(crate) struct DiscoveryTickResult {
     pub dispatched: usize,
     pub skipped: usize,
+    /// `ready-for-work` items left labeled for a later tick (cooldown or a
+    /// `Wait` decision) rather than dispatched or skipped-and-relabeled.
+    /// Logged per-item below so an operator can see *why* an
+    /// eligible-looking item didn't dispatch instead of the log staying
+    /// silent tick after tick (item #82).
+    pub waiting: usize,
 }
 
 /// One pass: list items labeled `ready-for-work`, dispatch a job for each
@@ -63,6 +69,7 @@ pub(crate) fn run_discovery_tick(
     let mut result = DiscoveryTickResult {
         dispatched: 0,
         skipped: 0,
+        waiting: 0,
     };
 
     let fetched = mcp.with_backend_db(|conn| {
@@ -107,6 +114,11 @@ pub(crate) fn run_discovery_tick(
                     // Wait branch below: the cooldown may clear before the
                     // next tick, and the item must still be visible to that
                     // tick's discovery query.
+                    eprintln!(
+                        "agentflare-supervisor: item #{} ({}) is ready-for-work but agent '{}' is cooling down",
+                        item.sequence_id, item.id, agent.as_str()
+                    );
+                    result.waiting += 1;
                     continue;
                 }
                 if dispatch_item(mcp, queue, &item, agent, &label_id_by_name, &ready_id) {
@@ -117,10 +129,15 @@ pub(crate) fn run_discovery_tick(
                 ask_item(mcp, &item, &question, &label_id_by_name, &ready_id);
                 result.skipped += 1;
             }
-            crate::quota::decide::EffectiveAction::Wait => {
+            crate::quota::decide::EffectiveAction::Wait(reason) => {
                 // Leave the ready-for-work label in place: the wait
                 // condition may clear before the next tick, and the item
                 // must still be visible to that tick's discovery query.
+                eprintln!(
+                    "agentflare-supervisor: item #{} ({}) is ready-for-work but waiting: {reason}",
+                    item.sequence_id, item.id
+                );
+                result.waiting += 1;
             }
             crate::quota::decide::EffectiveAction::StayQuiet => {
                 skip_item(mcp, &item, &label_id_by_name, &ready_id);
@@ -611,6 +628,11 @@ mod tests {
         let result = run_discovery_tick(&mcp, &queue, &auth_conn);
 
         assert_eq!(result.dispatched, 0);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(
+            result.waiting, 1,
+            "a cooling-down item must count as waiting, not vanish silently (item #82)"
+        );
         assert!(
             queue.list(None).unwrap().is_empty(),
             "a cooling-down agent must not be dispatched"
