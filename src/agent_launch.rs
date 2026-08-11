@@ -389,9 +389,19 @@ pub fn run_headless(
     // function nor `run_captured` below ever calls `Command::current_dir` —
     // the child inherits whatever directory the caller already chdir'd into
     // (e.g. `execute_work`'s worktree chdir for autonomous dispatch).
+    //
+    // `git_writable = true`: unlike `Supervisor::spawn`'s arbitrary job
+    // commands, this specific child IS the headless coding-agent CLI, whose
+    // entire job is `git add`/`git commit`/`git push` its own work. Item
+    // #88: re-protecting `.git` read-only here (the sandbox's default) made
+    // every headless work-item dispatch fail that step with "Read-only file
+    // system" -- which `flare_git_core::worktree::commit_uncommitted` then
+    // swallowed silently, so `agentflare_mcp::item_done` fell through to
+    // "nothing was ever committed" and reported success anyway (exit 0),
+    // leaving real staged/edited work stranded in the worktree.
     let cwd = std::env::current_dir().ok();
     let (sandboxed_command, sandboxed_args) =
-        agentflare_jobs::sandbox::wrap(&argv[0], &argv[1..], cwd.as_deref());
+        agentflare_jobs::sandbox::wrap(&argv[0], &argv[1..], cwd.as_deref(), true);
     let mut cmd = Command::new(&sandboxed_command);
     cmd.args(&sandboxed_args);
     // See the matching strip in `run_launch_env` above (item #139) — same
