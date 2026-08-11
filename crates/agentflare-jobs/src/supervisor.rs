@@ -204,7 +204,12 @@ fn descendant_pids(pid: u32) -> Vec<u32> {
     all
 }
 
-#[cfg(not(target_os = "linux"))]
+// Only reachable from `kill_graceful`'s `#[cfg(unix)]` block below, so this
+// stub is for macOS/BSD specifically (unix-but-not-Linux) — plain
+// `not(target_os = "linux")` also matches Windows, where the stub compiled
+// but its only caller didn't, leaving it dead code and failing `-D
+// dead-code` on that platform.
+#[cfg(all(unix, not(target_os = "linux")))]
 fn descendant_pids(_pid: u32) -> Vec<u32> {
     Vec::new()
 }
@@ -278,6 +283,10 @@ fn kill_graceful(child: &mut std::process::Child, kill_after: Duration) {
 
 #[cfg(test)]
 mod tests {
+    // Only `#[cfg(target_os = "linux")]` tests live in this module today, so
+    // this glob import is unused (and fails `-D unused-imports`) on every
+    // other platform.
+    #[cfg(target_os = "linux")]
     use super::*;
 
     // `setsid` moves the grandchild into a brand-new session/process group of
