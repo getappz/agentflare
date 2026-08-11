@@ -86,6 +86,7 @@ dependencies = [
  "cliclack",
  "color-eyre",
  "dirs",
+ "dunce",
  "eyre",
  "flare-docs",
  "flare-git-core",
