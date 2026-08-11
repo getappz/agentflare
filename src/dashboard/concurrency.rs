@@ -151,7 +151,11 @@ fn parse_vm_stat_field(output: &str, label: &str) -> u64 {
 fn parse_vm_stat(output: &str) -> Option<u64> {
     let page_size = output
         .find("page size of ")
-        .and_then(|idx| output[idx + "page size of ".len()..].split_whitespace().next())
+        .and_then(|idx| {
+            output[idx + "page size of ".len()..]
+                .split_whitespace()
+                .next()
+        })
         .and_then(|tok| tok.parse::<u64>().ok())
         .unwrap_or(4096);
     let pages = parse_vm_stat_field(output, "Pages free")
@@ -198,7 +202,7 @@ mod tests {
     #[test]
     fn scarce_memory_shrinks_below_the_cpu_cap() {
         // 1GB budget * 0.7 / 512MB per worker = 1 (floor).
-        assert_eq!(resolve_pool_size(8, 1 * GB), 1);
+        assert_eq!(resolve_pool_size(8, GB), 1);
         // 2GB budget * 0.7 / 512MB per worker = 2 (1.4GB / 512MB).
         assert_eq!(resolve_pool_size(8, 2 * GB), 2);
     }
