@@ -905,14 +905,15 @@ mod tests {
             // -- the latter is environment-dependent and flaked in CI.
             // Cross-agent-type would legitimately hit BlockedByAssignee
             // (protects a still-open handoff) -- not what this test covers.
-            let reclaim_json = crate::claims::with_owner_override("claude-code:a-fresh-instance", || {
-                mcp.item_claim(crate::mcp_server::types::ItemRequest {
-                    action: "claim".to_string(),
-                    id: Some(item.id.clone()),
-                    ..Default::default()
-                })
-                .unwrap()
-            });
+            let reclaim_json =
+                crate::claims::with_owner_override("claude-code:a-fresh-instance", || {
+                    mcp.item_claim(crate::mcp_server::types::ItemRequest {
+                        action: "claim".to_string(),
+                        id: Some(item.id.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                });
             let reclaim: serde_json::Value = serde_json::from_str(&reclaim_json).unwrap();
             assert_eq!(
                 reclaim["status"], "acquired",
