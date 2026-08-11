@@ -902,7 +902,7 @@ mod tests {
         // background task and the verification result is lost. The prompt
         // must tell the agent explicitly to run checks synchronously.
         let item = test_item();
-        let prompt = build_prompt(&item, &[]);
+        let prompt = build_prompt(&item, &[], None);
         assert!(prompt.contains("one-shot headless run"));
         assert!(prompt.contains("no mechanism to resume"));
         assert!(prompt.contains("Never run build, test, or lint commands as a background task"));
