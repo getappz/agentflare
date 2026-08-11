@@ -161,6 +161,19 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
         let _ = Command::new("taskkill")
             .args(["/T", "/F", "/PID", &child.id().to_string()])
             .status();
+        // `taskkill /T` builds its kill list from a single point-in-time
+        // process-tree snapshot. A grandchild spawned in the narrow window
+        // between that snapshot and termination (e.g. this child hadn't yet
+        // exec'd its own subprocess) can survive the call entirely
+        // undetected (item #78). Windows keeps a dead process's original
+        // parent-PID association around for lookups until the PID is
+        // reused, so a second pass a moment later still finds and kills any
+        // such straggler; it's a harmless no-op once the tree is already
+        // gone.
+        std::thread::sleep(Duration::from_millis(250));
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .status();
     }
     #[cfg(not(any(unix, windows)))]
     {
