@@ -104,6 +104,16 @@ impl WorkspaceGraph {
                 .parent()
                 .unwrap_or_else(|| Path::new(&pkg.manifest_path))
                 .to_path_buf();
+            // `cargo metadata`'s manifest_path can come back in a different
+            // path representation than paths callers build themselves — a
+            // symlink-free real path on macOS, or (observed on GitHub
+            // Actions Windows runners) an 8.3 short-name component like
+            // `RUNNER~1` instead of `runneradmin`. Canonicalize here so
+            // `resolve_owner_crate`'s prefix check compares apples to
+            // apples against a caller path canonicalized the same way.
+            // Falls back to the raw path when it can't be resolved (e.g.
+            // the synthetic fixture paths used in unit tests below).
+            let manifest_dir = dunce::canonicalize(&manifest_dir).unwrap_or(manifest_dir);
             let own_test_paths = pkg
                 .targets
                 .iter()

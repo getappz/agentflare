@@ -191,6 +191,30 @@ fn impact_of_a_file_outside_any_workspace_member_is_a_clear_error() {
     ));
 }
 
+// Simulates macOS's `/var` -> `/private/var`: the caller-supplied root is a
+// symlink to the real directory. `cargo metadata` (invoked with that symlink
+// as its cwd) reports canonical, symlink-free manifest paths, so the
+// membership check must canonicalize the candidate file the same way, or a
+// file that's genuinely inside the workspace gets rejected as outside it.
+#[test]
+#[cfg(unix)]
+fn impact_resolves_a_target_reached_through_a_symlinked_workspace_root() {
+    let real = build_fixture_workspace();
+    let real_root = real.path();
+
+    let link_parent = tempfile::tempdir().unwrap();
+    let link_root = link_parent.path().join("link-to-workspace");
+    std::os::unix::fs::symlink(real_root, &link_root).unwrap();
+
+    let report = agentflare::code::impact_for_path(
+        &link_root,
+        &link_root.join("crates/jobs/src/supervisor.rs"),
+    )
+    .unwrap();
+
+    assert_eq!(report.owner_crate, "jobs");
+}
+
 #[test]
 fn impact_with_no_cargo_toml_is_a_clear_error() {
     let dir = tempfile::tempdir().unwrap();

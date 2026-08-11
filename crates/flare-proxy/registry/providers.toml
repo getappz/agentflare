@@ -1,0 +1,264 @@
+# Provider registry for flare-proxy. Adding a new provider — including a
+# new Cloudflare AI Gateway route, or any future OpenAI-compatible endpoint
+# — is a config edit here, not a Rust change. See providers/mod.rs for the
+# loader; `kind` must be one of: openai_compatible | anthropic | gemini.
+#
+# `base_url` is a fixed URL. `base_url_template` instead may reference
+# `{ENV_VAR_NAME}` placeholders resolved from the process environment at
+# startup — used by the Cloudflare Gateway entries below, whose URL is
+# per-user (account_id/gateway_id). A provider with an unresolvable
+# template is skipped (see providers/mod.rs's fallback-to-default_free
+# behavior on missing required vars).
+#
+# `gateway_auth_env`/`gateway_auth_header` add an extra header sourced from
+# an env var, distinct from `api_key_env` (the underlying provider's own
+# key, sent the normal way by each provider module) — used for Cloudflare's
+# `cf-aig-authorization` gateway-level auth.
+#
+# `free_type`/`monthly_tokens`/`credit_tokens` are free-tier quota metadata,
+# not currently read by any Rust code -- they exist so a future
+# load-balancer can weigh candidates by remaining budget instead of always
+# hitting the first configured provider. `free_type` is one of:
+# "recurring-daily" | "recurring-monthly" (renews; `monthly_tokens` is the
+# budget, daily figures already normalized x30), "recurring-uncapped"
+# (real free access, rate/concurrency-limited, no token cap to track),
+# "one-time-initial" (a signup credit in `credit_tokens` that does not
+# renew), or "unmetered" (local inference, no quota). Absent = paid-key or
+# pass-through provider with no free-tier data. Source: OmniRoute's
+# `freeModelCatalog.data.ts` (github.com/diegosouzapw/OmniRoute), pool-
+# deduped to each provider's max, as of 2026-08-11 -- re-verify before
+# relying on it, free tiers change constantly.
+
+version = 1
+
+[[providers]]
+prefix = "nvidia_nim"
+id = "nvidia-nim"
+kind = "openai_compatible"
+base_url = "https://integrate.api.nvidia.com/v1"
+api_key_env = "NVIDIA_NIM_API_KEY"
+free_type = "one-time-initial"
+monthly_tokens = 0
+credit_tokens = 0
+
+[[providers]]
+prefix = "open_router"
+id = "openrouter"
+kind = "openai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+extra_headers = [
+    ["HTTP-Referer", "https://agentflare.dev"],
+    ["X-Title", "agentflare"],
+]
+free_type = "recurring-daily"
+monthly_tokens = 1200000
+
+[[providers]]
+prefix = "lmstudio"
+id = "lm-studio"
+kind = "openai_compatible"
+base_url = "http://localhost:1234/v1"
+free_type = "unmetered"
+
+[[providers]]
+prefix = "anthropic"
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[[providers]]
+prefix = "gemini"
+id = "gemini"
+kind = "gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_API_KEY"
+free_type = "recurring-daily"
+monthly_tokens = 60000000
+
+[[providers]]
+prefix = "cf_gateway_anthropic"
+id = "cf_gateway_anthropic"
+kind = "anthropic"
+base_url_template = "https://gateway.ai.cloudflare.com/v1/{CF_AI_GATEWAY_ACCOUNT_ID}/{CF_AI_GATEWAY_ID}/anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+gateway_auth_env = "CF_AI_GATEWAY_TOKEN"
+gateway_auth_header = "cf-aig-authorization"
+
+[[providers]]
+prefix = "cf_gateway_openai"
+id = "cf_gateway_openai"
+kind = "openai_compatible"
+base_url_template = "https://gateway.ai.cloudflare.com/v1/{CF_AI_GATEWAY_ACCOUNT_ID}/{CF_AI_GATEWAY_ID}/compat"
+api_key_env = "OPENAI_API_KEY"
+gateway_auth_env = "CF_AI_GATEWAY_TOKEN"
+gateway_auth_header = "cf-aig-authorization"
+
+# ---------------------------------------------------------------------------
+# Additional OpenAI-compatible providers. base_url values below are each
+# provider's own documented OpenAI-SDK-compatible endpoint as of this
+# session (2026-08-10) -- best-effort, not individually re-verified against
+# live docs for every entry. If one drifts, that's exactly what the
+# on-demand refresh (providers::ensure_fresh_registry, backed by this same
+# file published upstream) exists to fix without a new agentflare release.
+# ---------------------------------------------------------------------------
+
+[[providers]]
+prefix = "openai"
+id = "openai"
+kind = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[[providers]]
+prefix = "deepseek"
+id = "deepseek"
+kind = "openai_compatible"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+free_type = "one-time-initial"
+credit_tokens = 5000000
+
+[[providers]]
+prefix = "groq"
+id = "groq"
+kind = "openai_compatible"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+free_type = "recurring-daily"
+monthly_tokens = 15000000
+
+[[providers]]
+prefix = "mistral"
+id = "mistral"
+kind = "openai_compatible"
+base_url = "https://api.mistral.ai/v1"
+api_key_env = "MISTRAL_API_KEY"
+free_type = "recurring-monthly"
+monthly_tokens = 1000000000
+
+[[providers]]
+prefix = "xai"
+id = "xai"
+kind = "openai_compatible"
+base_url = "https://api.x.ai/v1"
+api_key_env = "XAI_API_KEY"
+
+[[providers]]
+prefix = "together"
+id = "together"
+kind = "openai_compatible"
+base_url = "https://api.together.xyz/v1"
+api_key_env = "TOGETHER_API_KEY"
+free_type = "one-time-initial"
+credit_tokens = 25000000
+
+[[providers]]
+prefix = "perplexity"
+id = "perplexity"
+kind = "openai_compatible"
+base_url = "https://api.perplexity.ai"
+api_key_env = "PERPLEXITY_API_KEY"
+
+[[providers]]
+prefix = "fireworks"
+id = "fireworks"
+kind = "openai_compatible"
+base_url = "https://api.fireworks.ai/inference/v1"
+api_key_env = "FIREWORKS_API_KEY"
+free_type = "one-time-initial"
+credit_tokens = 1000000
+
+[[providers]]
+prefix = "deepinfra"
+id = "deepinfra"
+kind = "openai_compatible"
+base_url = "https://api.deepinfra.com/v1/openai"
+api_key_env = "DEEPINFRA_API_KEY"
+free_type = "one-time-initial"
+credit_tokens = 1000000
+
+[[providers]]
+prefix = "moonshot"
+id = "moonshot"
+kind = "openai_compatible"
+base_url = "https://api.moonshot.ai/v1"
+api_key_env = "MOONSHOT_API_KEY"
+
+[[providers]]
+prefix = "novita"
+id = "novita"
+kind = "openai_compatible"
+base_url = "https://api.novita.ai/v3/openai"
+api_key_env = "NOVITA_API_KEY"
+free_type = "one-time-initial"
+credit_tokens = 500000
+
+[[providers]]
+prefix = "hyperbolic"
+id = "hyperbolic"
+kind = "openai_compatible"
+base_url = "https://api.hyperbolic.xyz/v1"
+api_key_env = "HYPERBOLIC_API_KEY"
+free_type = "one-time-initial"
+credit_tokens = 5000000
+
+[[providers]]
+prefix = "cerebras"
+id = "cerebras"
+kind = "openai_compatible"
+base_url = "https://api.cerebras.ai/v1"
+api_key_env = "CEREBRAS_API_KEY"
+free_type = "recurring-daily"
+monthly_tokens = 30000000
+
+[[providers]]
+prefix = "sambanova"
+id = "sambanova"
+kind = "openai_compatible"
+base_url = "https://api.sambanova.ai/v1"
+api_key_env = "SAMBANOVA_API_KEY"
+free_type = "recurring-daily"
+monthly_tokens = 6000000
+
+[[providers]]
+prefix = "cohere"
+id = "cohere"
+kind = "openai_compatible"
+base_url = "https://api.cohere.ai/compatibility/v1"
+api_key_env = "COHERE_API_KEY"
+free_type = "recurring-monthly"
+monthly_tokens = 800000
+
+[[providers]]
+prefix = "ollama"
+id = "ollama"
+kind = "openai_compatible"
+base_url = "http://localhost:11434/v1"
+free_type = "unmetered"
+
+[[providers]]
+prefix = "siliconflow"
+id = "siliconflow"
+kind = "openai_compatible"
+base_url = "https://api.siliconflow.com/v1"
+api_key_env = "SILICONFLOW_API_KEY"
+free_type = "recurring-uncapped"
+
+[[providers]]
+prefix = "llm7"
+id = "llm7"
+kind = "openai_compatible"
+base_url = "https://api.llm7.io/v1"
+api_key_env = "LLM7_API_KEY"
+free_type = "recurring-daily"
+monthly_tokens = 150000000
+
+[[providers]]
+prefix = "requesty"
+id = "requesty"
+kind = "openai_compatible"
+base_url = "https://router.requesty.ai/v1"
+api_key_env = "REQUESTY_API_KEY"
+free_type = "recurring-uncapped"
