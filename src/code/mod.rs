@@ -49,6 +49,16 @@ pub fn impact_for_path(repo_root: &Path, target: &Path) -> Result<ImpactReport, 
     } else {
         repo_root.join(target)
     };
+    // `cargo metadata` returns manifest paths canonicalized (symlink-free —
+    // notably resolving macOS's /var -> /private/var), but `absolute_target`
+    // is built from the caller-supplied root as-is. Canonicalize it the same
+    // way so a file that's genuinely in the workspace isn't rejected as
+    // outside it just because it was reached through a symlink. Use `dunce`
+    // rather than `std::fs::canonicalize` directly: on Windows, std adds a
+    // `\\?\` UNC prefix that cargo's own (unprefixed) manifest paths don't
+    // have, which would reintroduce the same mismatch on that platform.
+    // Falls back to the uncanonicalized path when the target doesn't exist.
+    let absolute_target = dunce::canonicalize(&absolute_target).unwrap_or(absolute_target);
     let owner = graph
         .resolve_owner_crate(&absolute_target)
         .ok_or_else(|| ImpactError::NotInWorkspace(absolute_target.clone()))?;

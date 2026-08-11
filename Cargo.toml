@@ -92,6 +92,7 @@ skill = { version = "0.8", default-features = false, features = ["network"] }
 agentflare-jobs = { path = "crates/agentflare-jobs" }
 machine-uid = "0.6.0"
 agentflare-workspace-hack = { version = "0.1", path = "agentflare-workspace-hack" }
+dunce = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

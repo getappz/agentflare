@@ -143,6 +143,12 @@ const COST_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 const JOB_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 const JOB_RETENTION_SECS: i64 = 7 * 24 * 3600;
 const SUPERVISOR_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12);
+/// Cadence for `spawn_supervisor_review_sweep` -- deliberately slower than
+/// `SUPERVISOR_DISCOVERY_INTERVAL`: each tick makes one GitHub API call per
+/// in_review item (PR lookup, plus a check-runs call unless it's already
+/// merged), against the same token `SUPERVISOR_DISCOVERY_INTERVAL`'s ticks
+/// never touch GitHub at all.
+const SUPERVISOR_REVIEW_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Runs for the lifetime of the process (like `snapshot_broadcaster`'s
 /// producer task): wakes on `JOB_CLEANUP_INTERVAL`, deletes finished jobs
@@ -187,14 +193,53 @@ fn spawn_supervisor_discovery(
             })
             .await;
             match result {
-                Ok(summary) if summary.dispatched > 0 || summary.skipped > 0 => {
+                Ok(summary)
+                    if summary.dispatched > 0 || summary.skipped > 0 || summary.waiting > 0 =>
+                {
                     eprintln!(
-                        "agentflare-supervisor: dispatched {}, skipped {}",
-                        summary.dispatched, summary.skipped
+                        "agentflare-supervisor: dispatched {}, skipped {}, waiting {}",
+                        summary.dispatched, summary.skipped, summary.waiting
                     );
                 }
                 Ok(_) => {}
                 Err(e) => eprintln!("agentflare-supervisor: tick task panicked: {e}"),
+            }
+        }
+    });
+}
+
+/// Runs for the lifetime of the process: wakes on
+/// `SUPERVISOR_REVIEW_SWEEP_INTERVAL`, polls PR/CI status for every item
+/// sitting in "in_review", promotes merged ones to "completed", and
+/// dispatches a self-repair job for ones with failing CI (item #65). Same
+/// `spawn_blocking` shape as `spawn_supervisor_discovery` -- the SQLite
+/// reads and the GitHub REST calls both block, so neither belongs on the
+/// async worker threads.
+fn spawn_supervisor_review_sweep(
+    queue: agentflare_jobs::Queue,
+    mcp: std::sync::Arc<crate::mcp_server::AgentflareMcp>,
+    interval: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            let queue = queue.clone();
+            let mcp = mcp.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let auth_conn = crate::auth_db::open_or_rebuild();
+                crate::supervisor::run_review_sweep(&mcp, &queue, &auth_conn)
+            })
+            .await;
+            match result {
+                Ok(summary) if summary.promoted > 0 || summary.self_repaired > 0 => {
+                    eprintln!(
+                        "agentflare-supervisor: review sweep promoted {}, self-repaired {}, skipped {}",
+                        summary.promoted, summary.self_repaired, summary.skipped
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("agentflare-supervisor: review sweep task panicked: {e}"),
             }
         }
     });
@@ -583,25 +628,35 @@ fn is_local_bind(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
-/// Parses `AGENTFLARE_WORK_MAX_CONCURRENCY` (default `2`, matching the
-/// hardcoded value this replaces). Split into a pure parse step so the
-/// override logic is testable without mutating process-global env state —
-/// env vars are shared across the whole test binary, unlike this narrow
-/// seam. Zero and unparseable values fall back to the default rather than
-/// silently starting a `WorkerPool` with no workers, which would wedge the
-/// queue forever with no error.
-fn parse_work_max_concurrency(raw: Option<&str>) -> usize {
-    raw.and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(2)
+/// Parses `AGENTFLARE_WORK_MAX_CONCURRENCY` into an explicit override, or
+/// `None` when absent, zero, or unparseable — in which case the caller
+/// falls back to `concurrency::resolve_pool_size`'s CPU+memory-aware
+/// default rather than silently starting a `WorkerPool` with no workers
+/// (which would wedge the queue forever with no error). Split into a pure
+/// parse step so the override logic is testable without mutating
+/// process-global env state — env vars are shared across the whole test
+/// binary, unlike this narrow seam.
+fn parse_work_max_concurrency(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 0)
 }
 
+/// Defaults to a CPU+memory-aware pool size (ported from codegraph's
+/// `ResolverPool.resolvePoolSize`, see `dashboard::concurrency`) instead of
+/// a flat hardcoded value, so a resource-starved box and a beefy dev box
+/// no longer run the same fixed concurrency.
 fn work_max_concurrency() -> usize {
     parse_work_max_concurrency(
         std::env::var("AGENTFLARE_WORK_MAX_CONCURRENCY")
             .ok()
             .as_deref(),
     )
+    .unwrap_or_else(|| {
+        let available_parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
+        crate::dashboard::concurrency::resolve_pool_size(
+            available_parallelism,
+            crate::dashboard::concurrency::memory_budget_bytes(),
+        )
+    })
 }
 
 pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
@@ -636,6 +691,11 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
         std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
         SUPERVISOR_DISCOVERY_INTERVAL,
     );
+    spawn_supervisor_review_sweep(
+        queue.clone(),
+        std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
+        SUPERVISOR_REVIEW_SWEEP_INTERVAL,
+    );
 
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
@@ -659,19 +719,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_work_max_concurrency_defaults_to_two() {
-        assert_eq!(parse_work_max_concurrency(None), 2);
+    fn parse_work_max_concurrency_is_none_when_absent() {
+        assert_eq!(parse_work_max_concurrency(None), None);
     }
 
     #[test]
     fn parse_work_max_concurrency_honors_a_valid_override() {
-        assert_eq!(parse_work_max_concurrency(Some("5")), 5);
+        assert_eq!(parse_work_max_concurrency(Some("5")), Some(5));
     }
 
     #[test]
     fn parse_work_max_concurrency_falls_back_on_garbage_or_zero() {
-        assert_eq!(parse_work_max_concurrency(Some("not-a-number")), 2);
-        assert_eq!(parse_work_max_concurrency(Some("0")), 2);
+        assert_eq!(parse_work_max_concurrency(Some("not-a-number")), None);
+        assert_eq!(parse_work_max_concurrency(Some("0")), None);
+    }
+
+    #[test]
+    fn work_max_concurrency_is_at_least_one() {
+        assert!(work_max_concurrency() >= 1);
     }
 
     fn test_queue() -> Queue {
@@ -1230,6 +1295,16 @@ mod tests {
         let mcp = std::sync::Arc::new(crate::mcp_server::AgentflareMcp::for_test_memory());
 
         spawn_supervisor_discovery(queue, mcp, std::time::Duration::from_millis(20));
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_supervisor_review_sweep_runs_without_panicking_on_an_empty_project() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let queue = agentflare_jobs::Queue::open_memory(dir.join("logs")).unwrap();
+        let mcp = std::sync::Arc::new(crate::mcp_server::AgentflareMcp::for_test_memory());
+
+        spawn_supervisor_review_sweep(queue, mcp, std::time::Duration::from_millis(20));
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     }
 }
