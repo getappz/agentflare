@@ -522,6 +522,8 @@ fn worktree_audit_preview(repo_root: &Path) {
             .unwrap_or_else(|| "?".into());
         let flag = if o.has_broken_gitdir {
             " [broken .git]"
+        } else if o.on_default_branch {
+            " [on default branch]"
         } else {
             ""
         };

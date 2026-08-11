@@ -9,6 +9,10 @@ ALLOWLIST=(
   src/mcp_server.rs
   crates/agentflare-backend/src/item.rs
   src/components.rs
+  # Already 1604 lines on master before item #441's git-shim polish touched
+  # it -- pre-existing debt, same situation as tick.rs/work.rs above. Frozen
+  # at <= FROZEN_LIMIT; a real split is separate work.
+  crates/flare-git-core/src/classify.rs
   # Already 1790 lines on master before this fix touched it -- pre-existing
   # debt, not something a security patch should take on splitting. Frozen
   # at <= FROZEN_LIMIT like the others; a real split is separate work.

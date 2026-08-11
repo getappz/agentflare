@@ -371,6 +371,65 @@ fn canonical_repo_detach_is_denied_for_agent_invocation_but_not_human() {
 }
 
 #[test]
+fn canonical_repo_branch_create_is_denied_with_accurate_message() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+
+    // `checkout -b` in the canonical checkout creates a feature branch --
+    // blocked, but the message must say "create a new branch", NOT the
+    // misleading "would detach HEAD" (vent #395 / item #441).
+    let out = shim(repo.path(), home.path(), &["checkout", "-b", "feature/x"]);
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("create a new branch"), "{stderr}");
+    assert!(!stderr.contains("detach HEAD"), "{stderr}");
+
+    // Escape hatch still lifts it.
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["checkout", "-b", "feature/x"])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("CLAUDECODE", "1")
+        .env("AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+#[test]
+fn canonical_repo_default_branch_return_is_allowed_with_escape_hatch() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    // Move the canonical checkout onto a (merged-and-deleted style) branch
+    // so switching back to the default branch is a real recovery.
+    assert!(flare_git_core::shell::run_in_ok(
+        repo.path(),
+        &["checkout", "-b", "feature/x"]
+    ));
+
+    // Without the escape hatch: switching to the protected default branch
+    // in the canonical checkout is denied.
+    let out = shim(repo.path(), home.path(), &["switch", "master"]);
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("default branch"), "{stderr}");
+
+    // With ALLOW_CANONICAL_MUTATE: the stranded-checkout recovery works --
+    // the agent can get back to the default branch instead of being stuck.
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["switch", "master"])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("CLAUDECODE", "1")
+        .env("AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let branch = flare_git_core::shell::run_in(repo.path(), &["branch", "--show-current"]).unwrap();
+    assert_eq!(branch.trim(), "master");
+}
+
+#[test]
 fn canonical_repo_detach_allowed_with_escape_hatch() {
     let repo = init_repo();
     let home = tempfile::TempDir::new().unwrap();
