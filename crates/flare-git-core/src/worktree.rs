@@ -745,6 +745,24 @@ pub fn cleanup_item_worktree(item: &Item, repo_root: &Path) -> bool {
     !gc_orphans(repo_root, &[name]).is_empty()
 }
 
+/// Result of `commit_uncommitted` -- distinguishes "there was nothing to
+/// commit" from "there was something to commit and it failed", which a bare
+/// `bool` couldn't (item #92). A permissions failure (item #88's read-only
+/// `.git` under bwrap) or any similar future failure mode -- disk full, a
+/// pre-commit hook rejection, a git config issue -- used to look identical
+/// to a genuine no-op from the caller's side, so `item_done` reported
+/// success while real, staged work sat stranded uncommitted.
+pub enum CommitOutcome {
+    /// The worktree doesn't exist, or its tree was already clean -- nothing
+    /// to commit, not a failure.
+    NothingToCommit,
+    /// Uncommitted changes existed and were committed successfully.
+    Committed,
+    /// Uncommitted changes existed but `git add`/`git commit` failed --
+    /// real work is stranded in the worktree, still uncommitted.
+    Failed(String),
+}
+
 /// Commits any uncommitted changes sitting in `item`'s worktree checkout.
 ///
 /// An agent can make real file edits and still exit without ever running
@@ -755,23 +773,28 @@ pub fn cleanup_item_worktree(item: &Item, repo_root: &Path) -> bool {
 /// forgotten commit gets made here first instead of falling through to the
 /// "nothing was committed" path.
 ///
-/// No-ops (returns `false`) when the worktree doesn't exist, is already
-/// clean, or `add`/`commit` fails for some other reason -- the caller's
-/// existing dirty-tree handling (`cleanup_item_worktree` refusing to
-/// remove it) still covers all of those exactly as it did before.
-pub fn commit_uncommitted(item: &Item, repo_root: &Path, message: &str) -> bool {
+/// Returns `NothingToCommit` when the worktree doesn't exist or is already
+/// clean -- the caller's existing dirty-tree handling (`cleanup_item_worktree`
+/// refusing to remove it) still covers those exactly as it did before. Once
+/// `status` has confirmed there IS something to commit, an `add`/`commit`
+/// failure is reported as `Failed` rather than silently folded into the same
+/// "nothing to do" bucket.
+pub fn commit_uncommitted(item: &Item, repo_root: &Path, message: &str) -> CommitOutcome {
     let worktree_path = repo_root
         .join(".worktrees")
         .join("task")
         .join(item.sequence_id.to_string());
     match run_git_in(&worktree_path, &["status", "--porcelain"]) {
         Ok(out) if !out.trim().is_empty() => {}
-        _ => return false,
+        _ => return CommitOutcome::NothingToCommit,
     }
-    if run_git_in(&worktree_path, &["add", "-A"]).is_err() {
-        return false;
+    if let Err(e) = run_git_in(&worktree_path, &["add", "-A"]) {
+        return CommitOutcome::Failed(format!("git add failed: {e}"));
     }
-    run_git_in(&worktree_path, &["commit", "-m", message]).is_ok()
+    match run_git_in(&worktree_path, &["commit", "-m", message]) {
+        Ok(_) => CommitOutcome::Committed,
+        Err(e) => CommitOutcome::Failed(format!("git commit failed: {e}")),
+    }
 }
 
 /// Remove a worktree directory, with retry + Windows fallback.
@@ -1275,7 +1298,10 @@ mod tests {
         let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
         std::fs::write(worktree_path.join("forgot_to_commit.txt"), "x").unwrap();
 
-        assert!(commit_uncommitted(&item, &repo.path, "auto-committed"));
+        assert!(matches!(
+            commit_uncommitted(&item, &repo.path, "auto-committed"),
+            CommitOutcome::Committed
+        ));
 
         let status = run_git_in(&worktree_path, &["status", "--porcelain"]).unwrap();
         assert!(status.is_empty(), "worktree must be clean after commit");
@@ -1290,7 +1316,10 @@ mod tests {
         let target = resolve_default_branch(&repo.path);
         create_worktree(&item, &repo.path, &target, None).unwrap();
 
-        assert!(!commit_uncommitted(&item, &repo.path, "auto-committed"));
+        assert!(matches!(
+            commit_uncommitted(&item, &repo.path, "auto-committed"),
+            CommitOutcome::NothingToCommit
+        ));
         assert!(!branch_diverged(
             &repo.path,
             &format!("task/{}", item.sequence_id),
@@ -1302,7 +1331,47 @@ mod tests {
     fn commit_uncommitted_is_a_noop_when_no_worktree_exists() {
         let repo = init_repo();
         let item = test_item(1);
-        assert!(!commit_uncommitted(&item, &repo.path, "auto-committed"));
+        assert!(matches!(
+            commit_uncommitted(&item, &repo.path, "auto-committed"),
+            CommitOutcome::NothingToCommit
+        ));
+    }
+
+    #[test]
+    fn commit_uncommitted_reports_failed_not_nothing_to_commit_when_add_fails() {
+        // Item #92: a dirty tree where `git add`/`git commit` itself fails
+        // (e.g. item #88's read-only `.git` under bwrap) must be
+        // distinguishable from a clean tree with nothing to do -- both used
+        // to collapse to the same `false`, so a real, stranded change looked
+        // identical to a genuine no-op from the caller's side.
+        let repo = init_repo();
+        let item = test_item(1);
+        let target = resolve_default_branch(&repo.path);
+        let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+        std::fs::write(worktree_path.join("forgot_to_commit.txt"), "x").unwrap();
+
+        // Make the index unwritable so `git add -A` fails deterministically
+        // while `git status` (read-only) still succeeds.
+        let index_path = worktree_path.join(".git");
+        let git_dir = std::fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|s| s.strip_prefix("gitdir: ").map(str::trim).map(String::from))
+            .map(PathBuf::from)
+            .unwrap_or(index_path);
+        let mut perms = std::fs::metadata(&git_dir).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&git_dir, perms.clone()).unwrap();
+
+        let result = commit_uncommitted(&item, &repo.path, "auto-committed");
+
+        // Restore write permission so the temp dir can be cleaned up.
+        perms.set_readonly(false);
+        std::fs::set_permissions(&git_dir, perms).unwrap();
+
+        assert!(
+            matches!(result, CommitOutcome::Failed(_)),
+            "a dirty tree whose add/commit fails must report Failed, not NothingToCommit"
+        );
     }
 
     #[test]
