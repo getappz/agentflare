@@ -9,6 +9,7 @@ pub mod events;
 pub mod item;
 pub mod label;
 pub mod project;
+pub mod project_dir;
 pub mod state;
 pub mod vent;
 pub mod webhook;
