@@ -238,6 +238,52 @@ impl Queue {
         Ok(())
     }
 
+    /// Sweeps every `agent_jobs` row still `state = 'running'` and marks it
+    /// terminal (`failed`) with an explanatory error and `finished_at` set.
+    ///
+    /// A freshly opened `Queue` can never have legitimately produced a
+    /// `running` row itself — nothing has dequeued anything yet — so any row
+    /// already in that state was left mid-flight by a previous process's
+    /// death (e.g. a daemon restart killing the worker thread and its
+    /// `run_in_process` timeout watchdog before either could finish it).
+    /// Must be called exactly once, right after `open`/`open_memory` and
+    /// before anything starts dequeuing (see `dashboard::server::run`) —
+    /// calling it again later would wrongly fail jobs this same process is
+    /// legitimately running.
+    ///
+    /// Returns the reconciled `(id, AgentJob)` pairs, parsed from each row's
+    /// own payload, so the caller — which knows how to release a work item's
+    /// claim; this crate doesn't — can release whatever claim each job's
+    /// item held. A row whose payload fails to parse is still marked failed
+    /// but omitted from the returned list (nothing to release).
+    pub fn reconcile_orphaned_running(
+        &self,
+    ) -> Result<Vec<(String, crate::types::AgentJob)>, Error> {
+        const ORPHAN_ERROR: &str = "orphaned by daemon restart";
+        let now = db_kit::ids::now();
+        let conn = self.conn.lock();
+        let rows: Vec<(String, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT id, payload FROM agent_jobs WHERE state = 'running'")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, _) in &rows {
+            conn.execute(
+                "UPDATE agent_jobs SET state = 'failed', error = ?1, finished_at = ?2 WHERE id = ?3",
+                params![ORPHAN_ERROR, now, id],
+            )?;
+        }
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, payload)| {
+                serde_json::from_str::<crate::types::AgentJob>(&payload)
+                    .ok()
+                    .map(|job| (id, job))
+            })
+            .collect())
+    }
+
     pub fn list(&self, state_filter: Option<JobState>) -> Result<Vec<JobInfo>, Error> {
         let conn = self.conn.lock();
         let (where_clause, state_val) = match state_filter {
@@ -450,6 +496,62 @@ mod tests {
             .unwrap()
             .expect("job should be eligible once not_before has passed");
         assert_eq!(id, info.id);
+    }
+
+    #[test]
+    fn reconcile_orphaned_running_marks_stale_running_jobs_failed_and_returns_them() {
+        let (queue, _dir) = test_queue();
+        let job = AgentJob::new("agentflare-work")
+            .args(["item-1", "claude-code"])
+            .in_process();
+        let info = queue.enqueue(&job).unwrap();
+        queue.dequeue().unwrap(); // simulate a prior process having claimed it
+
+        let reconciled = queue.reconcile_orphaned_running().unwrap();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].0, info.id);
+        assert_eq!(reconciled[0].1.args, vec!["item-1", "claude-code"]);
+
+        let stored = queue.get(&info.id).unwrap();
+        assert_eq!(stored.state, JobState::Failed);
+        assert!(stored.finished_at.is_some());
+        assert_eq!(stored.error.as_deref(), Some("orphaned by daemon restart"));
+    }
+
+    #[test]
+    fn reconcile_orphaned_running_leaves_terminal_and_queued_jobs_untouched() {
+        let (queue, _dir) = test_queue();
+        // Already terminal -- must not be double-processed.
+        let failed_job = AgentJob::new("true").max_retries(0);
+        let failed_info = queue.enqueue(&failed_job).unwrap();
+        queue.dequeue().unwrap();
+        queue.fail(&failed_info.id, "boom", None).unwrap();
+
+        // Never dequeued -- not orphaned, must stay queued.
+        let queued_info = queue.enqueue(&AgentJob::new("true")).unwrap();
+
+        let reconciled = queue.reconcile_orphaned_running().unwrap();
+        assert!(reconciled.is_empty());
+
+        let failed_stored = queue.get(&failed_info.id).unwrap();
+        assert_eq!(failed_stored.state, JobState::Failed);
+        assert_eq!(failed_stored.error.as_deref(), Some("boom"));
+        assert_eq!(queue.get(&queued_info.id).unwrap().state, JobState::Queued);
+    }
+
+    #[test]
+    fn reconcile_orphaned_running_does_not_touch_a_job_this_process_dequeues_after_the_call() {
+        let (queue, _dir) = test_queue();
+        let info = queue.enqueue(&AgentJob::new("true")).unwrap();
+
+        // Reconciliation runs before any dequeuing starts (as daemon startup
+        // does) -- nothing is running yet, so this is a no-op.
+        assert!(queue.reconcile_orphaned_running().unwrap().is_empty());
+
+        // This process now dequeues it itself; reconcile is never called
+        // again for the life of this process, so this row stays running.
+        queue.dequeue().unwrap();
+        assert_eq!(queue.get(&info.id).unwrap().state, JobState::Running);
     }
 
     #[test]
