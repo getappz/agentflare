@@ -2,6 +2,46 @@ use agentflare_jobs::{JobState, Supervisor};
 use std::fs;
 use tempfile::TempDir;
 
+/// item #78: on Windows, `kill_graceful` only confirms its *direct* child is
+/// reaped (`child.wait()`) — it never verifies a grandchild process is
+/// actually gone, trusting `taskkill /T`'s point-in-time tree snapshot
+/// blindly. If that snapshot misses a grandchild (e.g. spawned in the brief
+/// window between the snapshot and termination), it keeps running
+/// unsupervised. On a resource-constrained CI runner that's exactly the kind
+/// of background load that can starve whatever test nextest schedules next
+/// (see item #78's investigation). Poll for `image_name` processes whose
+/// command line contains `cmdline_needle` so a regression here fails loudly
+/// and locally instead of surfacing as an unrelated test's mystery timeout.
+#[cfg(windows)]
+fn assert_no_surviving_process(image_name: &str, cmdline_needle: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let ps_query = format!(
+            "(Get-CimInstance Win32_Process -Filter \"Name='{image_name}'\" | \
+             Where-Object {{ $_.CommandLine -like '*{cmdline_needle}*' }} | \
+             Select-Object -ExpandProperty ProcessId) -join ','"
+        );
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_query])
+            .output();
+        let survivors = out
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if survivors.is_empty() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "kill_graceful left {image_name} process(es) matching \
+                 '{cmdline_needle}' running after timeout (pid(s): {survivors}) \
+                 — the process tree was not fully terminated"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 fn sup(
     command: &str,
     args: &[&str],
@@ -76,6 +116,9 @@ fn timeout_kills_long_running_process() {
         elapsed.as_secs() < 15,
         "expected kill well before natural exit, took {elapsed:?}"
     );
+    // See `assert_no_surviving_process`'s doc comment (item #78).
+    #[cfg(windows)]
+    assert_no_surviving_process("ping.exe", "-n 31");
 }
 
 #[test]
