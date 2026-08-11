@@ -625,6 +625,25 @@ impl AgentflareMcp {
         }
     }
 
+    /// Scopes this instance to a specific project's repo root instead of the
+    /// process's own cwd — used when dispatching or running work against a
+    /// project other than whichever repo this process happens to have been
+    /// started from. `backend_db`/`store` stay defaulted (those are the
+    /// single shared system-wide stores, not per-repo); only project-link
+    /// and worktree resolution — the two cwd-derived axes — are pinned to
+    /// `repo_root`. See `supervisor::dispatch_item` (which reads the
+    /// target's folder from the `project_dirs` registry) and
+    /// `cli::work::WorkItemExecutor`, which thread it through here.
+    pub(crate) fn for_project_dir(repo_root: std::path::PathBuf) -> Self {
+        Self {
+            backend_project_link_override: Some(
+                repo_root.join(Self::LINK_MARKER).join("project.json"),
+            ),
+            worktree_repo_root_override: Some(repo_root),
+            ..Default::default()
+        }
+    }
+
     /// Pure walk-up so the non-git fallback path is unit-testable without
     /// touching process-global state: neither this process's real cwd nor
     /// `crate::paths::home()` (which itself reads the `AGENTFLARE_HOME_OVERRIDE`
@@ -874,6 +893,7 @@ impl AgentflareMcp {
             match agentflare_backend::project::get(conn, &link.project_id) {
                 Ok(project) => {
                     self.register_bridge_repo(conn, &project.id);
+                    self.register_project_dir(conn, &project.id);
                     return Ok(project);
                 }
                 Err(agentflare_backend::Error::NotFound(_)) => {} // stale link — re-resolve below
@@ -935,6 +955,7 @@ impl AgentflareMcp {
             serde_json::to_vec_pretty(&link).unwrap_or_default(),
         );
         self.register_bridge_repo(conn, &project.id);
+        self.register_project_dir(conn, &project.id);
         Ok(project)
     }
 
@@ -960,6 +981,25 @@ impl AgentflareMcp {
             &folder_path.to_string_lossy(),
             &queue_label,
             None,
+            crate::claims::now(),
+        );
+    }
+
+    /// Refreshes this repo's row in the general project-directory registry
+    /// (`project_dirs`) — the reverse of `project.json`'s folder→project
+    /// link, indexed by project instead so a process with no reliable cwd of
+    /// its own (the daemon's supervisor discovery loop) can enumerate every
+    /// project's folder it should operate against. Unlike
+    /// `register_bridge_repo`, not gated on a GitHub remote: every linked
+    /// project gets a row here. Best-effort — a registry write failure must
+    /// not break project resolution, which every MCP/CLI call depends on.
+    fn register_project_dir(&self, conn: &rusqlite::Connection, project_id: &str) {
+        let repo_root = Self::repo_root();
+        let folder_path = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
+        let _ = agentflare_backend::project_dir::upsert(
+            conn,
+            project_id,
+            &folder_path.to_string_lossy(),
             crate::claims::now(),
         );
     }
