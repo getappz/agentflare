@@ -899,16 +899,20 @@ mod tests {
             );
 
             // The real point of this test: the claim must actually be gone,
-            // not just the job row updated -- a fresh claim attempt (as a
-            // different owner, simulating a human or another agent picking
-            // the item back up) must succeed.
-            let reclaim_json = mcp
-                .item_claim(crate::mcp_server::types::ItemRequest {
+            // not just the job row updated -- a fresh same-agent-type claim
+            // (simulating re-dispatch after the restart) must succeed.
+            // Explicit `with_owner_override`, not ambient env/pid resolution
+            // -- the latter is environment-dependent and flaked in CI.
+            // Cross-agent-type would legitimately hit BlockedByAssignee
+            // (protects a still-open handoff) -- not what this test covers.
+            let reclaim_json = crate::claims::with_owner_override("claude-code:a-fresh-instance", || {
+                mcp.item_claim(crate::mcp_server::types::ItemRequest {
                     action: "claim".to_string(),
                     id: Some(item.id.clone()),
                     ..Default::default()
                 })
-                .unwrap();
+                .unwrap()
+            });
             let reclaim: serde_json::Value = serde_json::from_str(&reclaim_json).unwrap();
             assert_eq!(
                 reclaim["status"], "acquired",
