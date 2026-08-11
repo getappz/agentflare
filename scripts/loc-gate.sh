@@ -13,6 +13,11 @@ ALLOWLIST=(
   # debt, not something a security patch should take on splitting. Frozen
   # at <= FROZEN_LIMIT like the others; a real split is separate work.
   src/github/bridge/tick.rs
+  # Already 1554 lines on master before item #87's comment-thread-cap fix
+  # touched it -- same situation as tick.rs above: pre-existing debt a
+  # small, unrelated fix shouldn't be blocked on splitting. Frozen at
+  # <= FROZEN_LIMIT; a real split is separate work.
+  src/cli/work.rs
 )
 
 cd "$(dirname "$0")/.."
