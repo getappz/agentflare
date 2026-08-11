@@ -18,6 +18,20 @@ pub struct Trailers {
     pub item_id: Option<String>,
 }
 
+/// Extracts the `<sequence_id>` from a `task/<sequence_id>` or
+/// `task/<sequence_id>-<slug>` branch name (the `flare_git_core::worktree`
+/// convention, see `task_branch_name`) -- only the leading digit run after
+/// `task/` counts, so a slug suffix never leaks into the item id.
+fn item_id_from_branch(branch: Option<&str>) -> Option<String> {
+    let rest = branch?.strip_prefix("task/")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits)
+    }
+}
+
 /// Resolves the current commit's provenance: agent identity
 /// (`AGENTFLARE_AGENT`, falling back to auto-detection), the current
 /// branch, and — if the branch matches the `task/<sequence_id>` convention
@@ -29,10 +43,7 @@ pub fn build_trailers(repo_root: &Path) -> Trailers {
         .filter(|s| !s.is_empty())
         .or_else(agent_detector::agent_name);
     let branch = current_branch(repo_root);
-    let item_id = branch
-        .as_deref()
-        .and_then(|b| b.strip_prefix("task/"))
-        .map(str::to_string);
+    let item_id = item_id_from_branch(branch.as_deref());
     Trailers {
         agent,
         branch,
@@ -120,12 +131,25 @@ mod tests {
 
     #[test]
     fn item_id_extracted_from_task_branch_convention() {
-        // Mirrors flare_git_core::worktree's `format!("task/{}", item.sequence_id)`.
-        let t = Trailers {
-            agent: None,
-            branch: Some("task/17".to_string()),
-            item_id: Some("17".to_string()),
-        };
-        assert_eq!(t.item_id.as_deref(), Some("17"));
+        // Mirrors flare_git_core::worktree's bare `task/<sequence_id>` form.
+        assert_eq!(item_id_from_branch(Some("task/17")).as_deref(), Some("17"));
+    }
+
+    #[test]
+    fn item_id_extracted_from_slugged_task_branch_convention() {
+        // Mirrors flare_git_core::worktree::task_branch_name's slugged
+        // `task/<sequence_id>-<slug>` form -- only the leading digit run
+        // counts, not the whole remainder after `task/`.
+        assert_eq!(
+            item_id_from_branch(Some("task/33-agentflare-code-review")).as_deref(),
+            Some("33")
+        );
+    }
+
+    #[test]
+    fn item_id_none_for_a_non_task_branch() {
+        assert_eq!(item_id_from_branch(Some("main")), None);
+        assert_eq!(item_id_from_branch(Some("task/")), None);
+        assert_eq!(item_id_from_branch(None), None);
     }
 }
