@@ -113,19 +113,34 @@ pub fn agent_invocation_detected() -> bool {
 }
 
 /// `true` if `subcommand`/`args` is a branch-*creating* form: `git checkout
-/// -b/-B <name>` and `git switch -c/-C <name>`. These never detach HEAD
+/// -b/-B/--orphan <name>` and `git switch -c/-C/--create/--force-create/
+/// --orphan <name>` -- including the attached short-option spellings
+/// (`-bname`, `-Cname`, ...) and `--long=name`. These never detach HEAD
 /// (the new branch is checked out instead) but they DO move the canonical
 /// checkout off its current branch onto feature-branch work -- so the shim
 /// keeps blocking them there, with an accurate reason rather than the
-/// misleading "would detach HEAD" message (item #441 / vent #395).
+/// misleading "would detach HEAD" message (item #441 / vent #395). Scanning
+/// stops at a bare `--` -- anything after it is a pathspec, not an option.
 #[must_use]
 pub fn is_branch_create(subcommand: &str, args: &[String]) -> bool {
-    let create_flags: &[&str] = match subcommand {
-        "checkout" => &["-b", "-B"],
-        "switch" => &["-c", "-C"],
+    let (short_flags, long_flags): (&[&str], &[&str]) = match subcommand {
+        "checkout" => (&["-b", "-B"], &["--orphan"]),
+        "switch" => (&["-c", "-C"], &["--create", "--force-create", "--orphan"]),
         _ => return false,
     };
-    args.iter().any(|a| create_flags.contains(&a.as_str()))
+    for a in args {
+        if a == "--" {
+            break;
+        }
+        let is_short = short_flags.iter().any(|f| a.starts_with(f));
+        let is_long = long_flags
+            .iter()
+            .any(|f| a == f || a.starts_with(&format!("{f}=")));
+        if is_short || is_long {
+            return true;
+        }
+    }
+    false
 }
 
 /// `true` if `subcommand`/`args` would detach HEAD -- `git checkout
@@ -1238,6 +1253,30 @@ mod tests {
             &args(&["--detach", "feature/x"])
         ));
         assert!(!is_branch_create("push", &args(&["origin", "master"])));
+    }
+
+    #[test]
+    fn branch_create_recognizes_attached_and_long_forms() {
+        // Attached short-option spellings (`-bname`, not `-b name`).
+        assert!(is_branch_create("checkout", &args(&["-bfeature/x"])));
+        assert!(is_branch_create("checkout", &args(&["-Bfeature/x"])));
+        assert!(is_branch_create("switch", &args(&["-cfeature/x"])));
+        assert!(is_branch_create("switch", &args(&["-Cfeature/x"])));
+        // `--orphan` on both subcommands.
+        assert!(is_branch_create("checkout", &args(&["--orphan", "root"])));
+        assert!(is_branch_create("switch", &args(&["--orphan", "root"])));
+        // `switch`'s long forms of -c/-C, bare and `=name`.
+        assert!(is_branch_create(
+            "switch",
+            &args(&["--create", "feature/x"])
+        ));
+        assert!(is_branch_create("switch", &args(&["--create=feature/x"])));
+        assert!(is_branch_create(
+            "switch",
+            &args(&["--force-create", "feature/x"])
+        ));
+        // Scanning stops at `--`: nothing after it is an option.
+        assert!(!is_branch_create("checkout", &args(&["--", "-b"])));
     }
 
     #[test]

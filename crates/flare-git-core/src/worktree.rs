@@ -644,6 +644,17 @@ pub fn audit_orphans(
             if !on_default_branch {
                 continue;
             }
+            // Stranded-but-dirty is still real work -- same guard
+            // `cleanup_item_worktree` applies before its own `gc_orphans`
+            // call; fail closed (preserve) on a status-check error too.
+            let clean = matches!(run_git_in(path, &["status", "--porcelain"]), Ok(o) if o.trim().is_empty());
+            if !clean {
+                eprintln!(
+                    "worktree: preserving {} -- uncommitted changes",
+                    path.display()
+                );
+                continue;
+            }
         }
         let sequence_id = dir_name.parse::<i64>().ok();
         let size_bytes = dir_size(path);
@@ -1216,6 +1227,30 @@ mod tests {
         assert_eq!(orphans.len(), 1);
         assert!(!orphans[0].has_broken_gitdir);
         assert!(orphans[0].on_default_branch);
+    }
+
+    #[test]
+    fn audit_orphans_preserves_a_dirty_worktree_stranded_on_the_default_branch() {
+        let repo = init_repo();
+        let item = test_item(9);
+        let target = resolve_default_branch(&repo.path);
+        let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+        assert!(worktree_path.exists());
+        assert!(crate::shell::run_in_ok(
+            &repo.path,
+            &["switch", "-c", "canonical/other"]
+        ));
+        crate::shell::run_in(&worktree_path, &["switch", "master"]).unwrap();
+        // Uncommitted changes -- real work that must survive an audit/prune
+        // sweep even though the worktree is stranded on the default branch.
+        std::fs::write(worktree_path.join("dirty.txt"), "not committed").unwrap();
+
+        let orphans = audit_orphans(&repo.path, Some(&std::collections::HashSet::new()));
+        assert!(
+            orphans.is_empty(),
+            "dirty stranded worktree must not be listed as prunable: {} found",
+            orphans.len()
+        );
     }
 
     #[test]
