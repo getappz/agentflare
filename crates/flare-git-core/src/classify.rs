@@ -112,12 +112,30 @@ pub fn agent_invocation_detected() -> bool {
         || std::env::var_os("AGENTFLARE_AGENT").is_some_and(|s| !s.is_empty())
 }
 
+/// `true` if `subcommand`/`args` is a branch-*creating* form: `git checkout
+/// -b/-B <name>` and `git switch -c/-C <name>`. These never detach HEAD
+/// (the new branch is checked out instead) but they DO move the canonical
+/// checkout off its current branch onto feature-branch work -- so the shim
+/// keeps blocking them there, with an accurate reason rather than the
+/// misleading "would detach HEAD" message (item #441 / vent #395).
+#[must_use]
+pub fn is_branch_create(subcommand: &str, args: &[String]) -> bool {
+    let create_flags: &[&str] = match subcommand {
+        "checkout" => &["-b", "-B"],
+        "switch" => &["-c", "-C"],
+        _ => return false,
+    };
+    args.iter().any(|a| create_flags.contains(&a.as_str()))
+}
+
 /// `true` if `subcommand`/`args` would detach HEAD -- `git checkout
 /// <target>` implicitly detaches when `target` isn't an existing local
 /// branch (no `--detach` flag required for that form); `git switch` never
 /// silently detaches, only `switch --detach`/`-d` does. `git checkout --
 /// <pathspec>` (and any form with `--` before the target) restores files
-/// and never touches HEAD at all.
+/// and never touches HEAD at all. Branch-creating forms (`-b`/`-B`/`-c`/
+/// `-C`) check out the new branch and never detach -- handled by
+/// `is_branch_create` instead.
 #[must_use]
 pub fn would_detach_head(repo_root: &Path, subcommand: &str, args: &[String]) -> bool {
     match subcommand {
@@ -127,6 +145,9 @@ pub fn would_detach_head(repo_root: &Path, subcommand: &str, args: &[String]) ->
             }
             if args.iter().any(|a| a == "--detach") {
                 return true;
+            }
+            if is_branch_create(subcommand, args) {
+                return false; // `checkout -b <name>` checks out the new branch
             }
             let Some(target) = args.iter().find(|a| !a.starts_with('-')) else {
                 return false; // e.g. bare `git checkout` -- doesn't move HEAD
@@ -340,9 +361,19 @@ pub fn classify_pure(
             if is_read_only {
                 Disposition::Passthrough
             } else {
-                Disposition::Deny {
-                    reason: "'git worktree' is orchestrator-managed by agentflare — call `item(action=\"claim\", id=<item>)` to provision one. (Not the standalone `claim`/`mcp__flare__claim` tool -- that only takes a scope lock and does not create a worktree.)".to_string(),
-                }
+                // Distinguish provisioning (`add`) from teardown (`remove`/
+                // `prune`): an agent denied mid-teardown needs the exact
+                // tool+action that owns cleanup, not the provisioning call.
+                let teardown = matches!(
+                    args.first().map(String::as_str),
+                    Some("remove") | Some("prune")
+                );
+                let reason = if teardown {
+                    "'git worktree remove/prune' is orchestrator-managed by agentflare — to tear down an item's worktree call `item(action=\"check_merge\", id=<item>)` once its PR merges, or `item(action=\"release\", id=<item>)`; to prune stale worktrees run `agentflare git worktree audit --prune`.".to_string()
+                } else {
+                    "'git worktree' is orchestrator-managed by agentflare — call `item(action=\"claim\", id=<item>)` to provision one. (Not the standalone `claim`/`mcp__flare__claim` tool -- that only takes a scope lock and does not create a worktree.)".to_string()
+                };
+                Disposition::Deny { reason }
             }
         }
         // Fail-open: anything not explicitly matched above is allowed through
@@ -861,6 +892,45 @@ mod tests {
     }
 
     #[test]
+    fn worktree_teardown_deny_points_at_the_cleanup_tool() {
+        // Item #441 / vent #350: an agent denied mid-teardown needs the
+        // exact cleanup action, not the provisioning call.
+        let policy = ResolvedGitShimPolicy::baseline();
+        for sub in ["remove", "prune"] {
+            let d = classify_pure(
+                "worktree",
+                &args(&[sub, "../x"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false,
+                &policy,
+            );
+            let Disposition::Deny { reason } = d else {
+                panic!("expected deny for worktree {sub}");
+            };
+            assert!(reason.contains("check_merge"), "{reason}");
+            assert!(reason.contains("audit --prune"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn worktree_provision_deny_points_at_the_claim_tool() {
+        let policy = ResolvedGitShimPolicy::baseline();
+        let d = classify_pure(
+            "worktree",
+            &args(&["add", "../x"]),
+            "master",
+            &TrustRootTouch::Clean,
+            false,
+            &policy,
+        );
+        let Disposition::Deny { reason } = d else {
+            panic!("expected deny for worktree add");
+        };
+        assert!(reason.contains("item(action=\"claim\""), "{reason}");
+    }
+
+    #[test]
     fn worktree_list_is_passthrough() {
         let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
@@ -1153,6 +1223,37 @@ mod tests {
             &repo.path,
             "checkout",
             &args(&[&sha, "--", "some-file.txt"])
+        ));
+    }
+
+    #[test]
+    fn branch_create_forms_are_recognized() {
+        assert!(is_branch_create("checkout", &args(&["-b", "feature/x"])));
+        assert!(is_branch_create("checkout", &args(&["-B", "feature/x"])));
+        assert!(is_branch_create("switch", &args(&["-c", "feature/x"])));
+        assert!(is_branch_create("switch", &args(&["-C", "feature/x"])));
+        assert!(!is_branch_create("checkout", &args(&["feature/x"])));
+        assert!(!is_branch_create(
+            "checkout",
+            &args(&["--detach", "feature/x"])
+        ));
+        assert!(!is_branch_create("push", &args(&["origin", "master"])));
+    }
+
+    #[test]
+    fn would_detach_head_false_for_branch_creating_checkout() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        // `checkout -b <name>` creates the branch and checks it out -- HEAD
+        // is never detached, even though the target branch doesn't exist yet.
+        assert!(!would_detach_head(
+            &repo.path,
+            "checkout",
+            &args(&["-b", "feature/x"])
+        ));
+        assert!(!would_detach_head(
+            &repo.path,
+            "switch",
+            &args(&["-c", "feature/x"])
         ));
     }
 

@@ -564,6 +564,11 @@ pub struct OrphanWorktree {
     pub sequence_id: Option<i64>,
     pub size_bytes: u64,
     pub has_broken_gitdir: bool,
+    /// The worktree's gitdir is intact but it sits on the repo's default
+    /// branch (a task worktree stranded there) -- the gh merge-collision
+    /// case. Mutually exclusive-ish with `has_broken_gitdir`: at least one
+    /// of the two is always true for an orphan.
+    pub on_default_branch: bool,
 }
 
 /// Scan `.worktrees/task/*` for orphaned worktree directories.
@@ -585,6 +590,7 @@ pub fn audit_orphans(
     if !task_dir.exists() {
         return Vec::new();
     }
+    let default_branch = crate::branch::resolve_default_branch(repo_root);
     let mut orphans = Vec::new();
     // filter_map skips unreadable entries individually rather than failing
     // the whole scan on the first error -- a single permission-denied or
@@ -622,9 +628,22 @@ pub fn audit_orphans(
         {
             continue;
         }
-        // Only consider as orphan when the gitdir pointer is broken
+        // Only consider as orphan when the gitdir pointer is broken, OR the
+        // worktree is sitting on the repo's default branch. The second case
+        // is the stranded-worktree root cause behind gh pr merge --delete-
+        // branch / post-merge local-sync failures (item #441, vents #351/
+        // #394/#423): a task worktree should only ever be on its own
+        // task/<N> branch, so one that has been switched to the default
+        // branch is abandoned junk -- it holds the default branch checked
+        // out, which blocks both deleting it and gh's merge flow.
+        let mut on_default_branch = false;
         if !has_broken_gitdir {
-            continue;
+            on_default_branch = crate::branch::current_branch(path)
+                .map(|b| !b.is_empty() && b == default_branch)
+                .unwrap_or(false);
+            if !on_default_branch {
+                continue;
+            }
         }
         let sequence_id = dir_name.parse::<i64>().ok();
         let size_bytes = dir_size(path);
@@ -634,6 +653,7 @@ pub fn audit_orphans(
             sequence_id,
             size_bytes,
             has_broken_gitdir,
+            on_default_branch,
         });
     }
     orphans
@@ -1166,6 +1186,50 @@ mod tests {
         let repo = init_repo();
         let item = test_item(1);
         assert!(!cleanup_item_worktree(&item, &repo.path));
+    }
+
+    #[test]
+    fn audit_orphans_flags_a_worktree_stranded_on_the_default_branch() {
+        let repo = init_repo();
+        let item = test_item(7);
+        let target = resolve_default_branch(&repo.path);
+        let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+        assert!(worktree_path.exists());
+        // Free the default branch from the canonical checkout first -- git
+        // refuses to check out the same branch in two worktrees (this exact
+        // refusal is the gh merge-collision from item #441).
+        assert!(crate::shell::run_in_ok(
+            &repo.path,
+            &["switch", "-c", "canonical/other"]
+        ));
+        // The stranded-worktree failure mode: a task worktree that has been
+        // switched onto the default branch (intact gitdir, not broken).
+        crate::shell::run_in(&worktree_path, &["switch", "master"]).unwrap();
+
+        let claimed: std::collections::HashSet<String> =
+            std::collections::HashSet::from(["7".to_string()]);
+        // Claimed -> not an orphan.
+        assert!(audit_orphans(&repo.path, Some(&claimed)).is_empty());
+        // Not claimed -> orphan, flagged as on the default branch, with an
+        // intact gitdir.
+        let orphans = audit_orphans(&repo.path, Some(&std::collections::HashSet::new()));
+        assert_eq!(orphans.len(), 1);
+        assert!(!orphans[0].has_broken_gitdir);
+        assert!(orphans[0].on_default_branch);
+    }
+
+    #[test]
+    fn audit_orphans_ignores_a_claimed_or_own_branch_worktree() {
+        let repo = init_repo();
+        let item = test_item(8);
+        let target = resolve_default_branch(&repo.path);
+        let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+        assert!(worktree_path.exists());
+
+        // Own task/<N> branch, intact gitdir, unclaimed-but-live -- not an
+        // orphan (no broken gitdir, not on the default branch).
+        let orphans = audit_orphans(&repo.path, Some(&std::collections::HashSet::new()));
+        assert!(orphans.is_empty());
     }
 
     #[test]
