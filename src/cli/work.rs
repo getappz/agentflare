@@ -477,8 +477,11 @@ fn resolve_agent(
 /// Releases the claim and posts a failure comment (+ optional handoff
 /// notify) — the single path every early-exit and headless-failure branch
 /// in `run_work` routes through, so a claimed item never dead-ends silently
-/// held by a worker that errored out.
-fn release_and_comment(
+/// held by a worker that errored out. Also called by
+/// `dashboard::server`'s daemon-startup orphan sweep (item #40), under a
+/// `claims::with_owner_override` scope matching the dead job's own owner —
+/// hence `pub(crate)` rather than private to this module.
+pub(crate) fn release_and_comment(
     mcp: &AgentflareMcp,
     item_id: &str,
     reason: &str,

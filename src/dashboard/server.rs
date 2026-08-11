@@ -150,6 +150,60 @@ const SUPERVISOR_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::
 /// never touch GitHub at all.
 const SUPERVISOR_REVIEW_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Sweeps `agent_jobs` for rows left `state = 'running'` by a previous
+/// daemon process's death (`Queue::reconcile_orphaned_running`'s doc
+/// comment has the full root-cause trace — item #40) and releases whatever
+/// work-item claim each one held, exactly the way `execute_work`'s own
+/// failure path already does (`cli::work::release_and_comment`) rather than
+/// inventing a second release mechanism. Must run before `worker_pool.start`
+/// — see `reconcile_orphaned_running`'s doc comment for why call order
+/// matters here.
+fn reconcile_orphaned_jobs(queue: &Queue) {
+    let orphaned = match queue.reconcile_orphaned_running() {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            eprintln!("agentflare-jobs: orphan reconciliation failed: {e}");
+            return;
+        }
+    };
+    if orphaned.is_empty() {
+        return;
+    }
+    eprintln!(
+        "agentflare-jobs: reconciled {} job(s) left running by a previous daemon process",
+        orphaned.len()
+    );
+    for (job_id, job) in orphaned {
+        // Only `WorkItemExecutor`-dispatched jobs (see `enqueue_work_job` in
+        // `supervisor.rs`) hold an item claim at all -- a plain subprocess
+        // job submitted via `POST /api/jobs` has no item to release.
+        if !job.in_process {
+            continue;
+        }
+        let (Some(item_id), Some(agent)) = (job.args.first(), job.args.get(1)) else {
+            continue;
+        };
+        // Mirrors `WorkItemExecutor::execute`'s own project scoping and
+        // owner-id convention exactly, so `release_and_comment` resolves the
+        // same item/claim the dead job itself would have.
+        let mcp = match job.args.get(2) {
+            Some(folder_path) => crate::mcp_server::AgentflareMcp::for_project_dir(
+                std::path::PathBuf::from(folder_path),
+            ),
+            None => crate::mcp_server::AgentflareMcp::default(),
+        };
+        let owner = format!("{agent}:{job_id}");
+        crate::claims::with_owner_override(owner, || {
+            crate::cli::work::release_and_comment(
+                &mcp,
+                item_id,
+                "orphaned by daemon restart",
+                None,
+            );
+        });
+    }
+}
+
 /// Runs for the lifetime of the process (like `snapshot_broadcaster`'s
 /// producer task): wakes on `JOB_CLEANUP_INTERVAL`, deletes finished jobs
 /// older than `JOB_RETENTION_SECS`. The blocking SQLite + filesystem work
@@ -678,6 +732,9 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
         crate::state::state_dir().join("job-logs"),
     )
     .expect("failed to open job queue");
+    // Before anything below can dequeue a single job (see its own doc
+    // comment for why the ordering matters).
+    reconcile_orphaned_jobs(&queue);
     // Kept alive for the rest of `run()` (which never returns in normal
     // operation) so its worker threads keep polling the queue; there is no
     // graceful in-process shutdown path today (see `daemon::stop_daemon`,
@@ -737,6 +794,134 @@ mod tests {
     #[test]
     fn work_max_concurrency_is_at_least_one() {
         assert!(work_max_concurrency() >= 1);
+    }
+
+    fn init_test_repo(root: &std::path::Path) {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+        };
+        run(&["init", "-b", "master"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("README.md"), "test\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "initial"]);
+    }
+
+    /// End-to-end (item #40): a job dispatched by `enqueue_work_job`
+    /// (`supervisor.rs`) is claimed, its `agent_jobs` row moves to
+    /// `running`, and then the process dies before finishing -- simulated
+    /// here by never calling `queue.complete`/`fail` and instead going
+    /// straight to `reconcile_orphaned_jobs`, exactly what daemon startup
+    /// does on the next run. Confirms the row ends terminal *and* the
+    /// item's claim is actually released (re-claimable), not just that the
+    /// DB row changed state.
+    #[test]
+    fn reconcile_orphaned_jobs_releases_the_dead_jobs_item_claim() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let item = mcp
+                .with_backend_db(|conn| {
+                    let project = mcp.resolve_project(conn).unwrap();
+                    let state = agentflare_backend::state::list_by_project(conn, &project.id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|s| s.is_default)
+                        .unwrap();
+                    agentflare_backend::item::create(
+                        conn,
+                        agentflare_backend::item::CreateItem {
+                            project_id: project.id,
+                            state_id: state.id,
+                            name: "orphan sweep test item".into(),
+                            description: Some("do the thing".into()),
+                            priority: None,
+                            parent_id: None,
+                            assignee_agent: None,
+                            sort_order: None,
+                            external_source: None,
+                            external_id: None,
+                            metadata: None,
+                            label_ids: vec![],
+                            assignee_ids: vec![],
+                            dependency_ids: vec![],
+                        },
+                    )
+                    .unwrap()
+                })
+                .unwrap();
+
+            // Claim it as `claude-code:<job-id>` -- the same owner shape
+            // `WorkItemExecutor::execute` uses -- so `reconcile_orphaned_jobs`
+            // is releasing the exact claim its owner-string reconstruction
+            // is meant to match, not a fresh claim of its own.
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item.id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+            let queue = test_queue();
+            let info = queue.enqueue(&job).unwrap();
+            crate::claims::with_owner_override(format!("claude-code:{}", info.id), || {
+                let claim_json = mcp
+                    .item_claim(crate::mcp_server::types::ItemRequest {
+                        action: "claim".to_string(),
+                        id: Some(item.id.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let claim: serde_json::Value = serde_json::from_str(&claim_json).unwrap();
+                assert_eq!(claim["status"], "acquired");
+            });
+
+            // Simulate the daemon dying mid-job: the row is `running` with
+            // no completion ever recorded.
+            queue.dequeue().unwrap();
+
+            reconcile_orphaned_jobs(&queue);
+
+            let reconciled = queue.get(&info.id).unwrap();
+            assert_eq!(reconciled.state, JobState::Failed);
+            assert_eq!(
+                reconciled.error.as_deref(),
+                Some("orphaned by daemon restart")
+            );
+
+            // The real point of this test: the claim must actually be gone,
+            // not just the job row updated -- a fresh claim attempt (as a
+            // different owner, simulating a human or another agent picking
+            // the item back up) must succeed.
+            let reclaim_json = mcp
+                .item_claim(crate::mcp_server::types::ItemRequest {
+                    action: "claim".to_string(),
+                    id: Some(item.id.clone()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let reclaim: serde_json::Value = serde_json::from_str(&reclaim_json).unwrap();
+            assert_eq!(
+                reclaim["status"], "acquired",
+                "orphaned job's claim must be released so the item is re-claimable: {reclaim}"
+            );
+
+            let comments = mcp
+                .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(comments.len(), 1);
+            assert!(comments[0].body.contains("orphaned by daemon restart"));
+        });
     }
 
     fn test_queue() -> Queue {
