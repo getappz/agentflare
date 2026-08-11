@@ -193,10 +193,12 @@ fn spawn_supervisor_discovery(
             })
             .await;
             match result {
-                Ok(summary) if summary.dispatched > 0 || summary.skipped > 0 => {
+                Ok(summary)
+                    if summary.dispatched > 0 || summary.skipped > 0 || summary.waiting > 0 =>
+                {
                     eprintln!(
-                        "agentflare-supervisor: dispatched {}, skipped {}",
-                        summary.dispatched, summary.skipped
+                        "agentflare-supervisor: dispatched {}, skipped {}, waiting {}",
+                        summary.dispatched, summary.skipped, summary.waiting
                     );
                 }
                 Ok(_) => {}
