@@ -628,25 +628,35 @@ fn is_local_bind(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
-/// Parses `AGENTFLARE_WORK_MAX_CONCURRENCY` (default `2`, matching the
-/// hardcoded value this replaces). Split into a pure parse step so the
-/// override logic is testable without mutating process-global env state —
-/// env vars are shared across the whole test binary, unlike this narrow
-/// seam. Zero and unparseable values fall back to the default rather than
-/// silently starting a `WorkerPool` with no workers, which would wedge the
-/// queue forever with no error.
-fn parse_work_max_concurrency(raw: Option<&str>) -> usize {
-    raw.and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(2)
+/// Parses `AGENTFLARE_WORK_MAX_CONCURRENCY` into an explicit override, or
+/// `None` when absent, zero, or unparseable — in which case the caller
+/// falls back to `concurrency::resolve_pool_size`'s CPU+memory-aware
+/// default rather than silently starting a `WorkerPool` with no workers
+/// (which would wedge the queue forever with no error). Split into a pure
+/// parse step so the override logic is testable without mutating
+/// process-global env state — env vars are shared across the whole test
+/// binary, unlike this narrow seam.
+fn parse_work_max_concurrency(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 0)
 }
 
+/// Defaults to a CPU+memory-aware pool size (ported from codegraph's
+/// `ResolverPool.resolvePoolSize`, see `dashboard::concurrency`) instead of
+/// a flat hardcoded value, so a resource-starved box and a beefy dev box
+/// no longer run the same fixed concurrency.
 fn work_max_concurrency() -> usize {
     parse_work_max_concurrency(
         std::env::var("AGENTFLARE_WORK_MAX_CONCURRENCY")
             .ok()
             .as_deref(),
     )
+    .unwrap_or_else(|| {
+        let available_parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
+        crate::dashboard::concurrency::resolve_pool_size(
+            available_parallelism,
+            crate::dashboard::concurrency::memory_budget_bytes(),
+        )
+    })
 }
 
 pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
@@ -709,19 +719,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_work_max_concurrency_defaults_to_two() {
-        assert_eq!(parse_work_max_concurrency(None), 2);
+    fn parse_work_max_concurrency_is_none_when_absent() {
+        assert_eq!(parse_work_max_concurrency(None), None);
     }
 
     #[test]
     fn parse_work_max_concurrency_honors_a_valid_override() {
-        assert_eq!(parse_work_max_concurrency(Some("5")), 5);
+        assert_eq!(parse_work_max_concurrency(Some("5")), Some(5));
     }
 
     #[test]
     fn parse_work_max_concurrency_falls_back_on_garbage_or_zero() {
-        assert_eq!(parse_work_max_concurrency(Some("not-a-number")), 2);
-        assert_eq!(parse_work_max_concurrency(Some("0")), 2);
+        assert_eq!(parse_work_max_concurrency(Some("not-a-number")), None);
+        assert_eq!(parse_work_max_concurrency(Some("0")), None);
+    }
+
+    #[test]
+    fn work_max_concurrency_is_at_least_one() {
+        assert!(work_max_concurrency() >= 1);
     }
 
     fn test_queue() -> Queue {
