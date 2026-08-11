@@ -3,8 +3,9 @@
 //! Flag set and ordering are adapted from openai/codex's `linux-sandbox`
 //! crate (`bwrap.rs`): read-only root by default (`--ro-bind / /`), an
 //! explicit writable bind for the job's cwd, `.git` re-protected read-only
-//! even though it sits inside that writable root, and `--chdir` into the
-//! cwd rather than relying on bubblewrap inheriting a possibly-symlinked
+//! even though it sits inside that writable root (unless the caller passes
+//! `git_writable = true` -- see [`wrap`]'s doc comment), and `--chdir` into
+//! the cwd rather than relying on bubblewrap inheriting a possibly-symlinked
 //! logical cwd. Unlike codex's crate this has no split filesystem policy,
 //! glob-based path masking, or seccomp network filter -- this job runner
 //! operates on worktrees it already controls, not arbitrary third-party
@@ -23,10 +24,17 @@ use std::sync::OnceLock;
 /// defeating the containment this sandbox exists to provide.
 const HOME_CACHE_DIRS: &[&str] = &[".cargo", ".rustup", ".cache", ".npm"];
 
+/// `git_writable` controls whether `cwd/.git` is re-protected read-only
+/// (the default, `false` -- appropriate for an arbitrary job command that
+/// has no business rewriting git history) or left writable under the same
+/// `--bind` as the rest of `cwd` (`true` -- required by the headless
+/// coding-agent CLI itself, whose entire job is `git add`/`git commit`/
+/// `git push`; see `agent_launch::run_headless`'s call site).
 pub(super) fn wrap(
     command: &str,
     args: &[String],
     cwd: Option<&Path>,
+    git_writable: bool,
 ) -> Option<(String, Vec<String>)> {
     let bwrap = find_or_install_bwrap()?;
     // Resolved once up front (not inside `build_bwrap_args`) so an
@@ -41,12 +49,23 @@ pub(super) fn wrap(
     };
     Some((
         path_to_string(&bwrap),
-        build_bwrap_args(cwd.as_deref(), command, args),
+        build_bwrap_args(cwd.as_deref(), command, args, git_writable),
     ))
 }
 
-fn build_bwrap_args(cwd: Option<&Path>, command: &str, args: &[String]) -> Vec<String> {
-    build_bwrap_args_with_home(cwd, command, args, std::env::var_os("HOME").as_deref())
+fn build_bwrap_args(
+    cwd: Option<&Path>,
+    command: &str,
+    args: &[String],
+    git_writable: bool,
+) -> Vec<String> {
+    build_bwrap_args_with_home(
+        cwd,
+        command,
+        args,
+        std::env::var_os("HOME").as_deref(),
+        git_writable,
+    )
 }
 
 fn build_bwrap_args_with_home(
@@ -54,6 +73,7 @@ fn build_bwrap_args_with_home(
     command: &str,
     args: &[String],
     home: Option<&std::ffi::OsStr>,
+    git_writable: bool,
 ) -> Vec<String> {
     let mut bwrap_args = vec![
         "--new-session".to_string(),
@@ -85,7 +105,7 @@ fn build_bwrap_args_with_home(
         bwrap_args.push(cwd_str.clone());
 
         let git_dir = cwd.join(".git");
-        if git_dir.exists() {
+        if git_dir.exists() && !git_writable {
             let git_str = path_to_string(&git_dir);
             bwrap_args.push("--ro-bind".to_string());
             bwrap_args.push(git_str.clone());
@@ -231,7 +251,7 @@ mod tests {
     fn resolved_cwd_is_placed_into_bind_and_chdir_args() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = std::fs::canonicalize(dir.path()).unwrap();
-        let args = build_bwrap_args_with_home(Some(cwd.as_path()), "true", &[], None);
+        let args = build_bwrap_args_with_home(Some(cwd.as_path()), "true", &[], None, false);
         let expected = path_to_string(&cwd);
         let (src, dest) = bind_arg(&args);
         assert_eq!(src, expected);
@@ -241,6 +261,47 @@ mod tests {
             .position(|a| a == "--chdir")
             .expect("--chdir present");
         assert_eq!(args[chdir_idx + 1], expected);
+    }
+
+    #[test]
+    fn git_dir_is_re_protected_read_only_by_default() {
+        // Item #88: a sandboxed job command (e.g. a build/test/lint job via
+        // `Supervisor::spawn`) has no business rewriting git history, so
+        // `.git` stays read-only even though it sits inside the writable
+        // cwd bind -- the documented default this module's doc comment
+        // describes, now actually under test.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let args = build_bwrap_args_with_home(Some(cwd.as_path()), "true", &[], None, false);
+        let git_str = path_to_string(&cwd.join(".git"));
+        let idx = args
+            .iter()
+            .position(|a| a == &git_str)
+            .expect(".git path present in args");
+        assert_eq!(args[idx - 1], "--ro-bind");
+    }
+
+    #[test]
+    fn git_dir_stays_writable_when_the_caller_needs_to_commit() {
+        // Item #88: `run_headless` spawns the headless coding-agent CLI
+        // itself, whose entire job is `git add`/`git commit`/`git push` --
+        // re-protecting `.git` read-only for that specific caller made every
+        // headless work-item dispatch unable to ever commit its own staged
+        // changes (bwrap denies the write with "Read-only file system",
+        // which `commit_uncommitted` in flare-git-core then swallows
+        // silently, so `item_done` reports success with nothing committed).
+        // `git_writable = true` must leave `.git` under the plain writable
+        // `--bind` for cwd instead of adding a second read-only bind on top.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let args = build_bwrap_args_with_home(Some(cwd.as_path()), "true", &[], None, true);
+        let git_str = path_to_string(&cwd.join(".git"));
+        assert!(
+            !args.iter().any(|a| a == &git_str),
+            ".git must not appear as a separate bind entry when git_writable is true: {args:?}"
+        );
     }
 
     #[test]
@@ -285,7 +346,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".cargo")).unwrap();
         let home = std::ffi::OsString::from(dir.path());
-        let args = build_bwrap_args_with_home(None, "true", &[], Some(&home));
+        let args = build_bwrap_args_with_home(None, "true", &[], Some(&home), false);
         let cargo_path = path_to_string(&dir.path().join(".cargo"));
         let idx = args
             .iter()

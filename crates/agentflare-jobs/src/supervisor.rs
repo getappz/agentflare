@@ -54,9 +54,11 @@ impl Supervisor {
 
         // Native Linux and WSL2 run the job inside a bwrap sandbox; Windows
         // and macOS have no equivalent here yet, so they get the command
-        // back unchanged (see `crate::sandbox`).
+        // back unchanged (see `crate::sandbox`). `git_writable = false`: an
+        // arbitrary job command dispatched through here (build/test/lint,
+        // ...) has no business rewriting git history.
         let (sandboxed_command, sandboxed_args) =
-            crate::sandbox::wrap(&self.command, &self.args, self.cwd.as_deref());
+            crate::sandbox::wrap(&self.command, &self.args, self.cwd.as_deref(), false);
 
         let mut cmd = Command::new(&sandboxed_command);
         cmd.args(&sandboxed_args)
