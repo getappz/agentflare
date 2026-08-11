@@ -106,7 +106,7 @@ fn install_shims(release: bool, target: &Path) {
         (crate::shim_install::generic_shim_binary_name(), shim),
         (crate::cli::git::shim_dest_name().to_string(), git_shim),
     ] {
-        if let Err(e) = std::fs::copy(&src, bin_dir.join(&name)) {
+        if let Err(e) = crate::update::swap::replace_binary(&src, &bin_dir.join(&name)) {
             crate::ui::info(&format!("could not place {name} next to agentflare: {e}"));
             return;
         }
