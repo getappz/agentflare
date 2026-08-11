@@ -1,4 +1,4 @@
-use crate::providers::{ProviderConfig, ProviderKind};
+use crate::providers::{openai_compat, ProviderConfig, ProviderEntry, ProviderKind};
 use crate::shape_xlat::{self, AnthropicStreamBuffer};
 use axum::body::Body;
 use axum::http::StatusCode;
@@ -48,6 +48,126 @@ pub async fn proxy_request(
         None => String::new(),
     };
 
+    match provider.kind {
+        ProviderKind::Anthropic => {
+            proxy_anthropic(
+                client,
+                provider,
+                &api_key,
+                anthropic_body,
+                &route.upstream_model,
+            )
+            .await
+        }
+        ProviderKind::Gemini => {
+            proxy_gemini(
+                client,
+                provider,
+                &api_key,
+                anthropic_body,
+                &route.upstream_model,
+            )
+            .await
+        }
+        ProviderKind::OpenAiCompatible => {
+            proxy_openai_compat(
+                client,
+                provider,
+                &api_key,
+                anthropic_body,
+                &route.upstream_model,
+                route.requires_heuristic_tools,
+                route.requires_think_parsing,
+            )
+            .await
+        }
+    }
+}
+
+/// Native Anthropic upstream: the response is already Anthropic-shaped SSE,
+/// so it's forwarded byte-for-byte — no translation, no chunk buffering.
+async fn proxy_anthropic(
+    client: &reqwest::Client,
+    provider: &ProviderEntry,
+    api_key: &str,
+    anthropic_body: Value,
+    upstream_model: &str,
+) -> Response {
+    let body = crate::providers::anthropic::build_request_body(&anthropic_body, upstream_model);
+    let url = provider.base_url.trim_end_matches('/').to_string() + "/v1/messages";
+
+    let mut builder = client
+        .post(url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json");
+    builder = apply_extra_headers(builder, provider);
+
+    let resp = match builder.json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response(),
+    };
+
+    let resp = match check_status(resp).await {
+        Ok(resp) => resp,
+        Err(err) => return err,
+    };
+
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(Body::from_stream(resp.bytes_stream()))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR).into_response())
+}
+
+async fn proxy_gemini(
+    client: &reqwest::Client,
+    provider: &ProviderEntry,
+    api_key: &str,
+    anthropic_body: Value,
+    upstream_model: &str,
+) -> Response {
+    let body = crate::providers::gemini::build_request_body(&anthropic_body);
+    let url = format!(
+        "{}/models/{}:streamGenerateContent?alt=sse",
+        provider.base_url.trim_end_matches('/'),
+        upstream_model
+    );
+
+    let mut builder = client
+        .post(url)
+        .header("x-goog-api-key", api_key)
+        .header("Content-Type", "application/json");
+    builder = apply_extra_headers(builder, provider);
+
+    let resp = match builder.json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response(),
+    };
+
+    match check_status(resp).await {
+        Ok(resp) => stream_translated_sse(
+            resp,
+            shape_xlat::gemini_chunk_to_anthropic_sse,
+            shape_xlat::gemini_finish_stream,
+            false,
+            false,
+        ),
+        Err(err) => err,
+    }
+}
+
+async fn proxy_openai_compat(
+    client: &reqwest::Client,
+    provider: &ProviderEntry,
+    api_key: &str,
+    anthropic_body: Value,
+    upstream_model: &str,
+    needs_heuristic: bool,
+    needs_think: bool,
+) -> Response {
     let mut openai_req = match shape_xlat::messages_to_chat(&anthropic_body) {
         Some(r) => r,
         None => {
@@ -58,58 +178,71 @@ pub async fn proxy_request(
                 .into_response()
         }
     };
-    // `messages_to_chat` copies the incoming Anthropic model string as-is;
-    // swap in the provider-native model the route resolved to, or upstream
-    // APIs reject/ignore an unrecognized Anthropic model id.
-    openai_req["model"] = json!(route.upstream_model);
-
-    let upstream_model = &route.upstream_model;
     openai_req["model"] = json!(upstream_model);
 
-    let needs_heuristic = route.requires_heuristic_tools;
-    let needs_think = route.requires_think_parsing;
+    let url = provider.base_url.trim_end_matches('/').to_string() + "/chat/completions";
+    let builder = client.post(url).json(&openai_req);
+    let builder = openai_compat::apply_auth(builder, provider, api_key);
 
-    let mut req_builder = client
-        .post(provider.base_url.trim_end_matches('/').to_string() + "/chat/completions")
-        .json(&openai_req);
-
-    match provider.kind {
-        ProviderKind::NvidiaNim => {
-            req_builder = req_builder
-                .header("Authorization", format!("Bearer {api_key}"))
-                .header("Content-Type", "application/json");
-        }
-        ProviderKind::OpenRouter => {
-            req_builder = req_builder
-                .header("Authorization", format!("Bearer {api_key}"))
-                .header("Content-Type", "application/json")
-                .header("HTTP-Referer", "https://agentflare.dev")
-                .header("X-Title", "agentflare");
-        }
-        ProviderKind::LmStudio => {
-            req_builder = req_builder.header("Content-Type", "application/json");
-        }
-    }
-
-    let resp = match req_builder.send().await {
+    let resp = match builder.send().await {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response(),
     };
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        let err_val: Value =
-            serde_json::from_str(&body).unwrap_or(json!({"error": {"message": body}}));
-        return (
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            serde_json::to_string(&shape_xlat::error_to_anthropic(&err_val)).unwrap_or_default(),
-        )
-            .into_response();
+    match check_status(resp).await {
+        Ok(resp) => stream_translated_sse(
+            resp,
+            shape_xlat::openai_chunk_to_anthropic_sse,
+            shape_xlat::finish_stream,
+            needs_heuristic,
+            needs_think,
+        ),
+        Err(err) => err,
     }
+}
 
-    // Streaming SSE response
+/// Apply a provider's static extra headers (e.g. Cloudflare AI Gateway's
+/// `cf-aig-authorization`) to a request builder. The OpenAI-compatible path
+/// gets this via `openai_compat::apply_auth`; native Anthropic/Gemini build
+/// their own headers inline, so they call this directly.
+fn apply_extra_headers(
+    mut builder: reqwest::RequestBuilder,
+    provider: &ProviderEntry,
+) -> reqwest::RequestBuilder {
+    for (k, v) in &provider.extra_headers {
+        builder = builder.header(k, v);
+    }
+    builder
+}
+
+/// Verify the upstream response succeeded, converting a non-2xx into an
+/// Anthropic-shaped error `Response`. On success, hands back the still-open
+/// `reqwest::Response` so the caller can stream its body.
+async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let err_val: Value = serde_json::from_str(&body).unwrap_or(json!({"error": {"message": body}}));
+    Err((
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&shape_xlat::error_to_anthropic(&err_val)).unwrap_or_default(),
+    )
+        .into_response())
+}
+
+/// Shared SSE loop for providers whose raw stream needs translating into
+/// Anthropic's SSE shape (OpenAI-compatible and Gemini). Native Anthropic
+/// upstream skips this entirely — see `proxy_anthropic`.
+fn stream_translated_sse(
+    resp: reqwest::Response,
+    translate_chunk: fn(&Value, &mut AnthropicStreamBuffer) -> Vec<u8>,
+    finish: fn(&Value, &mut AnthropicStreamBuffer) -> Vec<u8>,
+    needs_heuristic: bool,
+    _needs_think: bool,
+) -> Response {
     let stream = resp.bytes_stream();
     let mut buffer = AnthropicStreamBuffer::default();
     let mut accumulated_text = String::new();
@@ -149,14 +282,24 @@ pub async fn proxy_request(
             if let Some(delta) = val.pointer("/choices/0/delta/content").and_then(|v| v.as_str()) {
                 accumulated_text.push_str(delta);
             }
+            if let Some(text) = val
+                .pointer("/candidates/0/content/parts/0/text")
+                .and_then(|v| v.as_str())
+            {
+                accumulated_text.push_str(text);
+            }
 
             let is_finish = val
                 .pointer("/choices/0/finish_reason")
                 .and_then(|v| v.as_str())
-                .is_some();
+                .is_some()
+                || val
+                    .pointer("/candidates/0/finishReason")
+                    .and_then(|v| v.as_str())
+                    .is_some();
 
-            let anthropic_sse = shape_xlat::openai_chunk_to_anthropic_sse(&val, &mut buffer);
-            out.extend_from_slice(&anthropic_sse);
+            let translated = translate_chunk(&val, &mut buffer);
+            out.extend_from_slice(&translated);
 
             if is_finish {
                 if needs_heuristic && !accumulated_text.is_empty() {
@@ -183,20 +326,15 @@ pub async fn proxy_request(
                     }
                 }
 
-                // Think tag stripping on accumulated text. NOTE: the raw
-                // deltas above are already streamed out via
-                // openai_chunk_to_anthropic_sse before this point runs, so
-                // this pass over accumulated_text cannot retroactively
-                // remove think-tag content from what the client already
-                // received. Properly suppressing think tags requires
-                // buffering deltas and delaying emission, which is a larger
-                // change tracked separately; this block intentionally does
-                // not claim to do that suppression.
-                if needs_think && !accumulated_text.is_empty() {
-                    let _ = crate::think::strip_think_tags(&accumulated_text);
-                }
+                // TODO(think-tag suppression): `_needs_think` is currently
+                // unused. The raw deltas above are already streamed out via
+                // `translate_chunk` before this point runs, so stripping
+                // think tags from `accumulated_text` here cannot
+                // retroactively remove them from what the client already
+                // received — that requires buffering deltas and delaying
+                // emission, a larger change tracked separately.
 
-                let finish_bytes = shape_xlat::finish_stream(&val, &mut buffer);
+                let finish_bytes = finish(&val, &mut buffer);
                 out.extend_from_slice(&finish_bytes);
             }
         }
