@@ -742,7 +742,11 @@ impl AgentflareMcp {
     /// errors) when GitHub can't be reached, same as `push_and_open_pr`.
     /// Also removes the item's worktree once promoted, same safety check
     /// (`cleanup_worktree`) as `done`'s no-PR path uses.
-    pub(super) fn item_check_merge(&self, req: ItemRequest) -> Result<String, ErrorData> {
+    ///
+    /// `pub(crate)`: also called directly by `supervisor::run_review_sweep`
+    /// (item #65) once it sees `worktree::PrCiStatus::Merged`, the same way
+    /// `item_claim` is already called directly from `cli::work`.
+    pub(crate) fn item_check_merge(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for check_merge", None))?;

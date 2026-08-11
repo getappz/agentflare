@@ -235,6 +235,40 @@ fn ask_item(
     }
 }
 
+/// Runs in-process via `WorkItemExecutor` (registered on the daemon's
+/// `WorkerPool`, see `dashboard/server.rs::run`) instead of spawning a fresh
+/// `agentflare work` subprocess — item #19. `command` is a display label
+/// only (shown in the dashboard's job list); nothing spawns it, so master's
+/// `current_exe()`-staleness fix (see git history) is moot here: there's no
+/// exe path to resolve at all once dispatch never spawns one. `args` is
+/// `[item_id, agent]`, plus `folder_path` when the caller has one (item
+/// #63) — `WorkItemExecutor::execute` claims/worktrees against that folder
+/// instead of wherever this daemon process happens to have started.
+///
+/// Shared by `dispatch_item` (a fresh `ready-for-work` item, always passes
+/// its per-project `folder_path`) and `run_review_sweep`'s self-repair path
+/// (item #65, re-running the same job on an item already sitting in
+/// "in_review" -- `item_claim` reclaims its existing worktree/branch rather
+/// than starting over, see `item::claim`'s doc comment). `run_review_sweep`
+/// itself is still single-project (`resolve_project`'s cwd-based
+/// resolution), so it has no folder path of its own to pass yet.
+fn enqueue_work_job(
+    queue: &agentflare_jobs::Queue,
+    item: &agentflare_backend::item::Item,
+    agent: agent_registry::Agent,
+    folder_path: Option<&str>,
+) -> Option<agentflare_jobs::JobInfo> {
+    let mut args = vec![item.id.clone(), agent.as_str().to_string()];
+    if let Some(folder_path) = folder_path {
+        args.push(folder_path.to_string());
+    }
+    let job = agentflare_jobs::AgentJob::new("agentflare-work")
+        .args(args)
+        .timeout(WORK_JOB_TIMEOUT_SECS)
+        .in_process();
+    queue.enqueue(&job).ok()
+}
+
 fn dispatch_item(
     mcp: &AgentflareMcp,
     queue: &agentflare_jobs::Queue,
@@ -244,25 +278,7 @@ fn dispatch_item(
     label_id_by_name: &std::collections::HashMap<String, String>,
     ready_id: &str,
 ) -> bool {
-    // Runs in-process via `WorkItemExecutor` (registered on the daemon's
-    // `WorkerPool`, see `dashboard/server.rs::run`) instead of spawning a
-    // fresh `agentflare work` subprocess — item #19. `command` is a display
-    // label only (shown in the dashboard's job list); nothing spawns it, so
-    // master's `current_exe()`-staleness fix (see git history) is moot here:
-    // there's no exe path to resolve at all once dispatch never spawns one.
-    // `args` is `[item_id, agent, folder_path]` — `folder_path` is the
-    // item's own project directory (from `project_dirs`, item #63), so
-    // `WorkItemExecutor::execute` claims/worktrees against the right repo
-    // instead of wherever this daemon process happens to have started.
-    let job = agentflare_jobs::AgentJob::new("agentflare-work")
-        .args([
-            item.id.clone(),
-            agent.as_str().to_string(),
-            folder_path.to_string(),
-        ])
-        .timeout(WORK_JOB_TIMEOUT_SECS)
-        .in_process();
-    let Ok(info) = queue.enqueue(&job) else {
+    let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path)) else {
         return false;
     };
 
@@ -284,6 +300,213 @@ fn dispatch_item(
         action: "create".into(),
         item_id: Some(item.id.clone()),
         body: Some(format!("## supervisor — dispatched\n\njob: {}", info.id)),
+        ..Default::default()
+    });
+    true
+}
+
+/// Marker prefix on a self-repair-dispatch comment (see `self_repair_item`
+/// below) -- `run_review_sweep` counts these on an item to enforce
+/// `quota::decide::SELF_REPAIR_CAP` without a separate persistent counter,
+/// the same way an item's `metadata` isn't otherwise touched by this file.
+const CI_SELF_REPAIR_MARKER: &str = "## supervisor — CI self-repair dispatched";
+
+pub(crate) struct ReviewSweepResult {
+    pub promoted: usize,
+    pub self_repaired: usize,
+    pub skipped: usize,
+}
+
+/// One pass: list items in the "in_review" state group (an open PR), poll
+/// each one's PR/CI status, and promote it to "completed" on a confirmed
+/// merge or dispatch a self-repair job on failing CI (item #65). Unlike
+/// `run_discovery_tick`, there's no label to gate the query on -- state
+/// group is itself the signal, and it's also the concurrency guard: a
+/// self-repair job's `item_claim` moves the item out of "in_review" into
+/// "started" for its duration (see `item::claim`'s doc comment), so an item
+/// with a self-repair already running never shows up here to be
+/// double-dispatched.
+pub(crate) fn run_review_sweep(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    auth_conn: &rusqlite::Connection,
+) -> ReviewSweepResult {
+    let mut result = ReviewSweepResult {
+        promoted: 0,
+        self_repaired: 0,
+        skipped: 0,
+    };
+
+    let fetched = mcp.with_backend_db(|conn| {
+        let project = mcp.resolve_project(conn).ok()?;
+        let items = agentflare_backend::item::list_by_project(conn, &project.id).ok()?;
+        let states = agentflare_backend::state::list_by_project(conn, &project.id).ok()?;
+        let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
+            states.iter().map(|s| (s.id.as_str(), s)).collect();
+        let in_review: Vec<_> = items
+            .into_iter()
+            .filter(|i| {
+                state_by_id
+                    .get(i.state_id.as_str())
+                    .is_some_and(|s| s.group_name == "in_review")
+            })
+            .collect();
+        let labels = agentflare_backend::label::list_by_project(conn, &project.id).ok()?;
+        let mut label_id_by_name = std::collections::HashMap::new();
+        for l in &labels {
+            label_id_by_name.insert(l.name.clone(), l.id.clone());
+        }
+        Some((in_review, label_id_by_name))
+    });
+    let Ok(Some((items, label_id_by_name))) = fetched else {
+        return result;
+    };
+
+    let repo_root = mcp.worktree_repo_root();
+    for item in &items {
+        match crate::worktree::pr_ci_status(item, &repo_root) {
+            crate::worktree::PrCiStatus::Merged => {
+                if promote_merged_item(mcp, item) {
+                    result.promoted += 1;
+                } else {
+                    result.skipped += 1;
+                }
+            }
+            crate::worktree::PrCiStatus::Failing(failed_checks) => {
+                if self_repair_or_gate(
+                    mcp,
+                    queue,
+                    auth_conn,
+                    item,
+                    &failed_checks,
+                    &label_id_by_name,
+                ) {
+                    result.self_repaired += 1;
+                } else {
+                    result.skipped += 1;
+                }
+            }
+            crate::worktree::PrCiStatus::Pending
+            | crate::worktree::PrCiStatus::Passing
+            | crate::worktree::PrCiStatus::Unknown => {
+                result.skipped += 1;
+            }
+        }
+    }
+    result
+}
+
+fn promote_merged_item(mcp: &AgentflareMcp, item: &agentflare_backend::item::Item) -> bool {
+    let Ok(json) = mcp.item_check_merge(ItemRequest {
+        action: "check_merge".into(),
+        id: Some(item.id.clone()),
+        ..Default::default()
+    }) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&json)
+        .ok()
+        .and_then(|v| v["promoted"].as_bool())
+        .unwrap_or(false)
+}
+
+/// Whether an `agentflare-work` job is already queued or running for
+/// `item_id` -- guards the (small) window between `enqueue_work_job`
+/// returning and the job actually reaching `item_claim`, during which the
+/// item's state group hasn't flipped out of "in_review" yet and a second
+/// sweep tick could otherwise dispatch a duplicate.
+fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
+    [
+        agentflare_jobs::JobState::Queued,
+        agentflare_jobs::JobState::Running,
+    ]
+    .into_iter()
+    .filter_map(|state| queue.list(Some(state)).ok())
+    .flatten()
+    .any(|job| job.args.contains(&item_id.to_string()))
+}
+
+/// Dispatches a self-repair job for an item whose PR has failing CI checks,
+/// or -- once `quota::decide::SELF_REPAIR_CAP` prior attempts have been made
+/// with no green build -- gates it for a human instead of retrying forever.
+/// Returns whether a repair job was dispatched.
+fn self_repair_or_gate(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    auth_conn: &rusqlite::Connection,
+    item: &agentflare_backend::item::Item,
+    failed_checks: &[String],
+    label_id_by_name: &std::collections::HashMap<String, String>,
+) -> bool {
+    let already_gated = label_id_by_name
+        .get(NEEDS_HUMAN_GATE_LABEL)
+        .is_some_and(|gate_id| {
+            mcp.with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
+                .ok()
+                .and_then(Result::ok)
+                .is_some_and(|ids| ids.contains(gate_id))
+        });
+    if already_gated || job_in_flight(queue, &item.id) {
+        return false;
+    }
+
+    let prior_attempts = mcp
+        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
+        .ok()
+        .and_then(Result::ok)
+        .map(|comments| {
+            comments
+                .iter()
+                .filter(|c| c.body.starts_with(CI_SELF_REPAIR_MARKER))
+                .count() as u32
+        })
+        .unwrap_or(0);
+
+    if prior_attempts >= crate::quota::decide::SELF_REPAIR_CAP {
+        let _ = mcp.comment_impl(CommentRequest {
+            action: "create".into(),
+            item_id: Some(item.id.clone()),
+            body: Some(format!(
+                "## supervisor — CI self-repair cap reached\n\nFailing checks: {}. \
+                 {} automatic repair attempt(s) already made with no green build — needs a human look.",
+                failed_checks.join(", "),
+                crate::quota::decide::SELF_REPAIR_CAP,
+            )),
+            ..Default::default()
+        });
+        if let Some(gate_id) = label_id_by_name.get(NEEDS_HUMAN_GATE_LABEL) {
+            let _ = mcp.item_add_label(ItemRequest {
+                action: "add_label".into(),
+                id: Some(item.id.clone()),
+                label_id: Some(gate_id.clone()),
+                ..Default::default()
+            });
+        }
+        return false;
+    }
+
+    let Some(agent) = item
+        .assignee_agent
+        .as_deref()
+        .and_then(resolve_confirmed_agent)
+    else {
+        return false;
+    };
+    if crate::auth_db::is_cooling_down(auth_conn, agent.as_str()) {
+        return false;
+    }
+    let Some(info) = enqueue_work_job(queue, item, agent, None) else {
+        return false;
+    };
+    let _ = mcp.comment_impl(CommentRequest {
+        action: "create".into(),
+        item_id: Some(item.id.clone()),
+        body: Some(format!(
+            "{CI_SELF_REPAIR_MARKER}\n\nCI is failing on this PR: {}.\n\n\
+             Please investigate and push a fix.\n\njob: {}",
+            failed_checks.join(", "),
+            info.id,
+        )),
         ..Default::default()
     });
     true
@@ -820,6 +1043,85 @@ mod tests {
         .unwrap()
     }
 
+    // --- run_review_sweep / self_repair_or_gate (item #65) ---
+
+    /// A throwaway git repo with no remote -- same trick
+    /// `item_check_merge_leaves_an_in_review_item_alone_when_merge_status_is_unknown`
+    /// (in `mcp_server::tests::action_tests`) uses: `RepoId::resolve_from_remote`
+    /// soft-fails to `None` against it, so `worktree::pr_ci_status` reports
+    /// `Unknown` without ever touching the network.
+    fn throwaway_repo() -> tempfile::TempDir {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo_dir.path())
+                .output()
+                .unwrap()
+        };
+        run_git(&["init", "-b", "master"]);
+        run_git(&["config", "user.email", "test@test.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["commit", "--allow-empty", "-m", "initial"]);
+        repo_dir
+    }
+
+    fn test_mcp_with_repo(repo_root: std::path::PathBuf) -> AgentflareMcp {
+        AgentflareMcp::for_test(
+            repo_root.join("backend.db"),
+            repo_root.clone(),
+            repo_root.join("project.json"),
+        )
+    }
+
+    /// Seeds an item already sitting in "in_review" -- claimed and moved
+    /// there directly via the backend calls `item_claim`/`item_done` wrap
+    /// (bypassing worktree creation entirely, unlike `seed_ready_item`'s
+    /// real-claim-through-the-MCP-method path), since these tests exercise
+    /// `run_review_sweep`'s decision logic, not the claim/worktree mechanics
+    /// already covered by `mcp_server::tests`.
+    fn seed_in_review_item(mcp: &AgentflareMcp, assignee: Option<&str>) -> String {
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let states = agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+            let state_id = states.iter().find(|s| s.is_default).unwrap().id.clone();
+            let item = agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id.clone(),
+                    state_id,
+                    name: "Fix CI".into(),
+                    description: Some("do it well".into()),
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: assignee.map(str::to_string),
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: None,
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                },
+            )
+            .unwrap();
+            let owner = assignee
+                .map(|a| format!("{a}:prior-job"))
+                .unwrap_or_else(|| "cli".into());
+            agentflare_backend::item::claim(
+                conn,
+                &item.id,
+                &owner,
+                crate::claims::now(),
+                crate::claims::ttl_secs(),
+            )
+            .unwrap();
+            agentflare_backend::item::mark_in_review(conn, &item.id, &owner).unwrap();
+            item.id
+        })
+        .unwrap()
+    }
+
     #[test]
     fn run_discovery_tick_dispatches_ready_items_from_every_registered_project_not_just_one() {
         // Item #63: the daemon's own cwd-resolved project must not be the
@@ -852,6 +1154,209 @@ mod tests {
             job_b.args.contains(&"/repo/b".to_string()),
             "job for proj-b's item must carry proj-b's own folder path, got {:?}",
             job_b.args
+        );
+    }
+
+    fn seed_gate_label(mcp: &AgentflareMcp) -> std::collections::HashMap<String, String> {
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let _ = agentflare_backend::label::create(
+                conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(project.id.clone()),
+                    workspace_id: project.workspace_id.clone(),
+                    name: NEEDS_HUMAN_GATE_LABEL.into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            );
+            let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+            labels.into_iter().map(|l| (l.name, l.id)).collect()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn job_in_flight_detects_a_queued_job_for_the_item() {
+        let queue = test_queue();
+        let job = agentflare_jobs::AgentJob::new("agentflare-work")
+            .args(["item-1".to_string(), "claude-code".to_string()])
+            .in_process();
+        queue.enqueue(&job).unwrap();
+
+        assert!(job_in_flight(&queue, "item-1"));
+        assert!(!job_in_flight(&queue, "item-2"));
+    }
+
+    #[test]
+    fn run_review_sweep_ignores_items_not_in_review() {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let _item_id = seed_ready_item(&mcp, Some("claude-code"));
+
+        let auth_conn = test_auth_conn();
+        let result = run_review_sweep(&mcp, &queue, &auth_conn);
+
+        assert_eq!(result.promoted, 0);
+        assert_eq!(result.self_repaired, 0);
+        assert_eq!(result.skipped, 0);
+    }
+
+    #[test]
+    fn run_review_sweep_skips_an_item_whose_pr_status_cannot_be_determined() {
+        let repo = throwaway_repo();
+        let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+        let queue = test_queue();
+        let _item_id = seed_in_review_item(&mcp, Some("claude-code"));
+
+        let auth_conn = test_auth_conn();
+        let result = run_review_sweep(&mcp, &queue, &auth_conn);
+
+        assert_eq!(result.promoted, 0);
+        assert_eq!(result.self_repaired, 0);
+        assert_eq!(result.skipped, 1);
+        assert!(queue.list(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment() {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap();
+        let label_id_by_name = seed_gate_label(&mcp);
+        let auth_conn = test_auth_conn();
+
+        let dispatched = self_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth_conn,
+            &item,
+            &["clippy".to_string()],
+            &label_id_by_name,
+        );
+
+        assert!(dispatched);
+        let jobs = queue.list(None).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].args.contains(&item_id));
+        let comments = mcp
+            .with_backend_db(|conn| {
+                agentflare_backend::comment::list_by_item(conn, &item_id).unwrap()
+            })
+            .unwrap();
+        assert!(
+            comments
+                .iter()
+                .any(|c| c.body.starts_with(CI_SELF_REPAIR_MARKER))
+        );
+    }
+
+    #[test]
+    fn self_repair_or_gate_gates_instead_of_dispatching_once_the_cap_is_reached() {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+        let label_id_by_name = seed_gate_label(&mcp);
+        let auth_conn = test_auth_conn();
+
+        // Pre-seed SELF_REPAIR_CAP prior marker comments -- as if this many
+        // repair rounds already ran with CI still red.
+        for _ in 0..crate::quota::decide::SELF_REPAIR_CAP {
+            mcp.comment_impl(CommentRequest {
+                action: "create".into(),
+                item_id: Some(item_id.clone()),
+                body: Some(format!("{CI_SELF_REPAIR_MARKER}\n\njob: prior")),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap();
+
+        let dispatched = self_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth_conn,
+            &item,
+            &["clippy".to_string()],
+            &label_id_by_name,
+        );
+
+        assert!(!dispatched);
+        assert!(queue.list(None).unwrap().is_empty());
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
+    }
+
+    #[test]
+    fn self_repair_or_gate_stays_quiet_once_already_gated() {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+        let label_id_by_name = seed_gate_label(&mcp);
+        mcp.item_add_label(ItemRequest {
+            action: "add_label".into(),
+            id: Some(item_id.clone()),
+            label_id: Some(label_id_by_name[NEEDS_HUMAN_GATE_LABEL].clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap();
+        let auth_conn = test_auth_conn();
+
+        let dispatched = self_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth_conn,
+            &item,
+            &["clippy".to_string()],
+            &label_id_by_name,
+        );
+
+        assert!(!dispatched);
+        assert!(queue.list(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn self_repair_or_gate_does_not_double_dispatch_while_a_job_is_already_in_flight() {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+        let label_id_by_name = seed_gate_label(&mcp);
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap();
+        let auth_conn = test_auth_conn();
+        let job = agentflare_jobs::AgentJob::new("agentflare-work")
+            .args([item_id.clone(), "claude-code".to_string()])
+            .in_process();
+        queue.enqueue(&job).unwrap();
+
+        let dispatched = self_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth_conn,
+            &item,
+            &["clippy".to_string()],
+            &label_id_by_name,
+        );
+
+        assert!(!dispatched);
+        assert_eq!(
+            queue.list(None).unwrap().len(),
+            1,
+            "must not enqueue a second job"
         );
     }
 }

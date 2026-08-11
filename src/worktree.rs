@@ -87,6 +87,79 @@ pub fn is_pr_merged(item: &agentflare_backend::item::Item, repo_root: &Path) -> 
     }
 }
 
+/// CI signal the in-review sweep (`supervisor::run_review_sweep`, item #65)
+/// polls per item: merged (promote), failing (self-repair), or nothing
+/// actionable yet. `Unknown` covers every soft-fail case `is_pr_merged`
+/// above also treats as "not merged yet" -- no credentials, no resolvable
+/// remote, no PR found, or a lookup error -- since the caller's fallback is
+/// simply to poll again next tick.
+pub enum PrCiStatus {
+    Merged,
+    Failing(Vec<String>),
+    Pending,
+    Passing,
+    Unknown,
+}
+
+/// Same "total>0 && not pending" gate `cli::git::wait_for_checks` polls on,
+/// applied once instead of in a loop -- the sweep itself provides the retry
+/// cadence across ticks.
+pub fn pr_ci_status(item: &agentflare_backend::item::Item, repo_root: &Path) -> PrCiStatus {
+    let branch = format!("task/{}", item.sequence_id);
+    let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
+        return PrCiStatus::Unknown;
+    };
+    let client = match crate::github::Client::new() {
+        Ok(c) => c,
+        Err(_) => return PrCiStatus::Unknown,
+    };
+    let pr = match crate::github::pulls::find_existing(&client, &repo, &branch) {
+        Ok(Some(pr)) => pr,
+        Ok(None) => return PrCiStatus::Unknown,
+        Err(e) => {
+            eprintln!(
+                "worktree: could not check PR status for item {}: {e}",
+                item.id
+            );
+            return PrCiStatus::Unknown;
+        }
+    };
+    if pr.merged_at.is_some() {
+        return PrCiStatus::Merged;
+    }
+    let Some(sha) = pr.head.as_ref().map(|h| h.sha.clone()) else {
+        return PrCiStatus::Unknown;
+    };
+    let checks = match crate::github::actions::list_check_runs(&client, &repo, &sha) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "worktree: could not fetch check status for item {}: {e}",
+                item.id
+            );
+            return PrCiStatus::Unknown;
+        }
+    };
+    let summary = crate::github::mcp::checks_wait_summary(&checks, 0);
+    let total = summary["total_checks"].as_u64().unwrap_or(0);
+    if total == 0 || summary["pending"].as_bool().unwrap_or(true) {
+        return PrCiStatus::Pending;
+    }
+    let failed: Vec<String> = summary["failed_checks"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if failed.is_empty() {
+        PrCiStatus::Passing
+    } else {
+        PrCiStatus::Failing(failed)
+    }
+}
+
 /// The PR body: `summary` (the agent's own "what changed and why", or an
 /// explicit `summary` on the `done` call) when it's real content, else the
 /// old generic placeholder. A real summary makes for a far more reviewable
