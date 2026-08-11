@@ -46,6 +46,15 @@ pub struct WorkArgs {
     /// Channel recipient for a handoff artifact on outcome.
     #[arg(long)]
     pub notify: Option<String>,
+    /// The claimed item's own project directory, distinct from this
+    /// process's cwd — set by `WorkItemExecutor` from the job args the
+    /// supervisor's `dispatch_item` enqueues (item #63), so a daemon
+    /// dispatching an item from a different project than its own cwd still
+    /// claims/worktrees against the right repo. Not a CLI flag: a human
+    /// running `agentflare work` directly is already standing in the
+    /// right repo, same as before.
+    #[arg(skip)]
+    pub repo_root: Option<std::path::PathBuf>,
 }
 
 /// Cap on how much of the latest handoff asset's content gets inlined into
@@ -493,8 +502,17 @@ fn classify_and_cooldown(agent: &str, failure_message: &str) -> Option<u64> {
 /// progress captured into that job's own log file — the exact same file the
 /// dashboard already tails for subprocess-dispatched jobs — rather than only
 /// working when there's a real subprocess's stdout to capture.
+///
+/// `args.repo_root`, when set (daemon dispatch — see `WorkItemExecutor`),
+/// scopes project/worktree resolution to the claimed item's own project
+/// directory instead of this process's cwd (item #63) — a human running
+/// `agentflare work` directly leaves it unset and keeps the prior
+/// cwd-resolved behavior.
 pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> WorkOutcome {
-    let mcp = AgentflareMcp::default();
+    let mcp = match args.repo_root.clone() {
+        Some(root) => AgentflareMcp::for_project_dir(root),
+        None => AgentflareMcp::default(),
+    };
     let timeout = Duration::from_secs(args.timeout);
     let idle_timeout = Duration::from_secs(args.idle_timeout);
 
@@ -757,8 +775,12 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
 /// Runs an in-process work-item dispatch job for `agentflare_jobs::WorkerPool`
 /// (see `dispatch_item` in `src/supervisor.rs`, which enqueues jobs this
 /// executes) instead of the daemon spawning a fresh `agentflare work`
-/// subprocess per item. `args` is `[item_id, agent]` — see `dispatch_item`
-/// for how it's built.
+/// subprocess per item. `args` is `[item_id, agent, folder_path]` — see
+/// `dispatch_item` for how it's built. `folder_path` is optional on read
+/// (via `args.get(2)`, not destructured like the first two) so a job
+/// already queued from before item #63 — `[item_id, agent]` only — still
+/// runs (against this process's cwd, the pre-#63 behavior) instead of
+/// failing outright on daemon upgrade.
 pub struct WorkItemExecutor;
 
 impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
@@ -774,6 +796,7 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
             )
             .into());
         };
+        let repo_root = args.get(2).map(std::path::PathBuf::from);
         let work_args = WorkArgs {
             target: item_id.clone(),
             agent: Some(agent.clone()),
@@ -782,6 +805,7 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
             max_turns: None,
             max_cost_usd: None,
             notify: None,
+            repo_root,
         };
         // `<agent>:<job-id>` — the job's own queue id is a natural instance
         // discriminator, playing the role a subprocess's unique pid plays
