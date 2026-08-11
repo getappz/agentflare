@@ -178,15 +178,28 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
 /// separate threads so a child that fills the OS pipe buffer can't deadlock
 /// the wait loop; each thread bumps a shared byte counter per chunk read so
 /// the wait loop can observe activity without waiting for EOF.
+///
+/// `stdin`, when `Some`, is piped to the child on its own thread (written in
+/// full, then the handle is dropped to send EOF) rather than passed as an
+/// argv element — stdin has no OS-level length limit, unlike a single argv
+/// string (Linux's `MAX_ARG_STRLEN`, 128 KiB on common configurations; see
+/// item #75). Writing on a dedicated thread, symmetric with the stdout/stderr
+/// readers above, avoids a deadlock if the child starts producing output
+/// before `stdin` is fully written and the OS pipe buffer fills up.
 #[allow(dead_code)]
 pub fn run_captured(
     mut cmd: Command,
     hard_cap: Duration,
     idle_timeout: Duration,
+    stdin: Option<&str>,
 ) -> std::io::Result<Captured> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd.stdin(Stdio::null());
+    if stdin.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
     // Make the child the leader of a new process group so any descendants it
     // spawns (which inherit the group by default) can be killed together via
     // `kill_tree` — see its doc comment for why this matters.
@@ -196,6 +209,16 @@ pub fn run_captured(
         cmd.process_group(0);
     }
     let mut child = cmd.spawn()?;
+
+    if let Some(text) = stdin {
+        let mut pipe = child.stdin.take().expect("stdin piped above");
+        let text = text.to_owned();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = pipe.write_all(text.as_bytes());
+            // `pipe` drops here, closing the write end so the child sees EOF.
+        });
+    }
 
     let activity = Arc::new(AtomicU64::new(0));
 
@@ -277,21 +300,21 @@ pub fn run_captured(
     })
 }
 
-/// Build the full argv for a headless run: `[binary, <print-mode flags…>, prompt]`.
-/// `None` if the agent has no headless print mode.
+/// Build the full argv for a headless run: `[binary, <print-mode flags…>,
+/// <extra args…>]`. `None` if the agent has no headless print mode. The
+/// prompt is deliberately not included here — it's piped over the child's
+/// stdin by `run_headless` instead of appended as an argv element, since a
+/// single argv string is capped at Linux's `MAX_ARG_STRLEN` (128 KiB on
+/// common configurations) while stdin has no such limit (item #75). All four
+/// headless-mapped agents (`claude -p`, `gemini -p`, `codex exec`, `opencode
+/// run`) read the prompt from stdin when none is given positionally.
 #[allow(dead_code)]
-pub fn headless_argv(
-    agent: Agent,
-    binary: &Path,
-    prompt: &str,
-    extra_args: &[String],
-) -> Option<Vec<String>> {
+pub fn headless_argv(agent: Agent, binary: &Path, extra_args: &[String]) -> Option<Vec<String>> {
     let flags = headless_args(agent)?;
-    let mut argv = Vec::with_capacity(flags.len() + extra_args.len() + 2);
+    let mut argv = Vec::with_capacity(flags.len() + extra_args.len() + 1);
     argv.push(binary.to_string_lossy().into_owned());
     argv.extend(flags.iter().map(|s| (*s).to_string()));
     argv.extend(extra_args.iter().cloned());
-    argv.push(prompt.to_string());
     Some(argv)
 }
 
@@ -341,7 +364,7 @@ pub fn run_headless(
             spec.binary_names.join(" / ")
         ));
     };
-    let Some(argv) = headless_argv(spec.id, &binary, prompt, extra_args) else {
+    let Some(argv) = headless_argv(spec.id, &binary, extra_args) else {
         return HeadlessOutcome::NotHeadless(format!(
             "{} has no headless print mode",
             spec.display_name
@@ -361,7 +384,7 @@ pub fn run_headless(
     // process (item #19's in-process dispatch) has no single ambient value
     // that's correct for all of them — only an explicit per-spawn env var is.
     cmd.env("AGENTFLARE_AGENT", spec.id.as_str());
-    match run_captured(cmd, hard_cap, idle_timeout) {
+    match run_captured(cmd, hard_cap, idle_timeout, Some(prompt)) {
         Ok(c) if c.success => HeadlessOutcome::Ok(c.stdout),
         Ok(c) if c.timed_out => {
             let reason = if c.idle_killed {
@@ -484,6 +507,7 @@ mod tests {
             cmd,
             std::time::Duration::from_secs(5),
             std::time::Duration::from_secs(5),
+            None,
         )
         .unwrap();
         assert!(out.success);
@@ -500,6 +524,7 @@ mod tests {
             cmd,
             std::time::Duration::from_millis(150),
             std::time::Duration::from_millis(150),
+            None,
         )
         .unwrap();
         assert!(out.timed_out);
@@ -519,6 +544,7 @@ mod tests {
             cmd,
             std::time::Duration::from_millis(150),
             std::time::Duration::from_millis(150),
+            None,
         )
         .unwrap();
         assert!(out.timed_out, "should report timeout");
@@ -544,6 +570,7 @@ mod tests {
             cmd,
             std::time::Duration::from_secs(30),
             std::time::Duration::from_millis(300),
+            None,
         )
         .unwrap();
         assert!(
@@ -567,6 +594,7 @@ mod tests {
             cmd,
             std::time::Duration::from_secs(30),
             std::time::Duration::from_millis(150),
+            None,
         )
         .unwrap();
         assert!(out.timed_out, "should time out");
@@ -597,6 +625,7 @@ mod tests {
             cmd,
             std::time::Duration::from_millis(150),
             std::time::Duration::from_millis(150),
+            None,
         )
         .unwrap();
         assert!(out.timed_out, "should report timeout");
@@ -730,30 +759,24 @@ mod tests {
     }
 
     #[test]
-    fn headless_argv_puts_flags_before_prompt() {
+    fn headless_argv_carries_no_prompt_element() {
+        // The prompt is piped over stdin by `run_headless`, not appended to
+        // argv (item #75) — argv is just the binary plus print-mode flags.
         let binary = std::path::Path::new("/usr/bin/claude");
         assert_eq!(
-            headless_argv(Agent::ClaudeCode, binary, "hi there", &[]),
-            Some(vec![
-                "/usr/bin/claude".to_string(),
-                "-p".to_string(),
-                "hi there".to_string()
-            ])
+            headless_argv(Agent::ClaudeCode, binary, &[]),
+            Some(vec!["/usr/bin/claude".to_string(), "-p".to_string()])
         );
         assert_eq!(
-            headless_argv(Agent::Codex, std::path::Path::new("/x/codex"), "do it", &[]),
-            Some(vec![
-                "/x/codex".to_string(),
-                "exec".to_string(),
-                "do it".to_string()
-            ])
+            headless_argv(Agent::Codex, std::path::Path::new("/x/codex"), &[]),
+            Some(vec!["/x/codex".to_string(), "exec".to_string()])
         );
     }
 
     #[test]
     fn headless_argv_none_without_print_mode() {
         assert_eq!(
-            headless_argv(Agent::Aider, std::path::Path::new("/x/aider"), "p", &[]),
+            headless_argv(Agent::Aider, std::path::Path::new("/x/aider"), &[]),
             None
         );
     }
@@ -803,6 +826,52 @@ mod tests {
         ) {
             HeadlessOutcome::NotFound(m) => assert!(m.contains("not found")),
             other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    // Item #75: a prompt built from an item's full comment history can
+    // exceed Linux's MAX_ARG_STRLEN (128 KiB on common configurations), the
+    // max length of any single argv element — separate from and much
+    // smaller than total ARG_MAX. Passing the prompt as a trailing argv
+    // element (the old behavior) made `Command::spawn()` fail with E2BIG
+    // once a prompt crossed that ceiling. `sh -p -c 'wc -c'` stands in for a
+    // headless agent binary: `-p` is `headless_args(ClaudeCode)`'s flag
+    // (harmless to `sh`, which treats it as the POSIX "privileged" option),
+    // and `wc -c` reports exactly how many bytes it received on stdin —
+    // proving the whole oversized prompt arrived intact via stdin rather
+    // than argv.
+    #[cfg(unix)]
+    #[test]
+    fn run_headless_pipes_a_prompt_over_the_argv_length_limit_via_stdin() {
+        let reg = vec![AgentSpec {
+            id: Agent::ClaudeCode,
+            display_name: "claude-code",
+            tier: Tier::Cli,
+            binary_names: &["sh"],
+            version_args: &[],
+            package_manager: None,
+            package_name: None,
+        }];
+        // Linux's MAX_ARG_STRLEN is 128 KiB (32 * 4 KiB pages); comfortably
+        // exceed it so this would have hit E2BIG under the old argv-based
+        // prompt delivery.
+        let huge_prompt = "x".repeat(200 * 1024);
+        match run_headless(
+            &reg,
+            "claude-code",
+            &huge_prompt,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            &["-c".to_string(), "wc -c".to_string()],
+        ) {
+            HeadlessOutcome::Ok(out) => {
+                assert_eq!(
+                    out.trim(),
+                    huge_prompt.len().to_string(),
+                    "the full oversized prompt should have arrived via stdin"
+                );
+            }
+            other => panic!("expected Ok, got {other:?}"),
         }
     }
 
