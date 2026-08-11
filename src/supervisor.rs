@@ -116,7 +116,9 @@ pub(crate) fn run_discovery_tick(
                     // tick's discovery query.
                     eprintln!(
                         "agentflare-supervisor: item #{} ({}) is ready-for-work but agent '{}' is cooling down",
-                        item.sequence_id, item.id, agent.as_str()
+                        item.sequence_id,
+                        item.id,
+                        agent.as_str()
                     );
                     result.waiting += 1;
                     continue;
