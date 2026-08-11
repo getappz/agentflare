@@ -392,6 +392,19 @@ fn kill_tree(child: &mut std::process::Child) {
         let _ = Command::new("taskkill")
             .args(["/T", "/F", "/PID", &child.id().to_string()])
             .status();
+        // `taskkill /T` builds its kill list from a single point-in-time
+        // process-tree snapshot. A grandchild spawned in the narrow window
+        // between that snapshot and termination (e.g. this child hadn't yet
+        // exec'd its own subprocess) can survive the call entirely
+        // undetected (item #78). Windows keeps a dead process's original
+        // parent-PID association around for lookups until the PID is
+        // reused, so a second pass a moment later still finds and kills any
+        // such straggler; it's a harmless no-op once the tree is already
+        // gone.
+        std::thread::sleep(Duration::from_millis(250));
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .status();
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -832,6 +845,47 @@ mod tests {
 
     fn init_repo() -> Repo {
         init_repo_with_branch("master")
+    }
+
+    /// item #78: on Windows, `kill_tree` fires `taskkill /T /F` and trusts
+    /// its process-tree snapshot blindly — it never verifies a grandchild
+    /// is actually gone before `run_output_timeout` returns. If that
+    /// snapshot misses a grandchild (spawned in the brief window between
+    /// the snapshot and termination), it keeps running unsupervised, which
+    /// on a resource-constrained CI runner is exactly the kind of
+    /// background load that can starve whatever test nextest schedules
+    /// next (see item #78's investigation). Poll for `image_name`
+    /// processes whose command line contains `cmdline_needle` so a
+    /// regression here fails loudly and locally instead of surfacing as an
+    /// unrelated test's mystery timeout.
+    #[cfg(windows)]
+    fn assert_no_surviving_process(image_name: &str, cmdline_needle: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let ps_query = format!(
+                "(Get-CimInstance Win32_Process -Filter \"Name='{image_name}'\" | \
+                 Where-Object {{ $_.CommandLine -like '*{cmdline_needle}*' }} | \
+                 Select-Object -ExpandProperty ProcessId) -join ','"
+            );
+            let out = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &ps_query])
+                .output();
+            let survivors = out
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if survivors.is_empty() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "kill_tree left {image_name} process(es) matching \
+                     '{cmdline_needle}' running after timeout (pid(s): {survivors}) \
+                     — the process tree was not fully terminated"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     #[test]
@@ -1325,6 +1379,12 @@ mod tests {
             matches!(&result, Err(e) if e.contains("timed out")),
             "{result:?}"
         );
+
+        // Checked immediately, before the natural-duration sleep below can
+        // let a leaked grandchild finish on its own and mask the leak (see
+        // `assert_no_surviving_process`'s doc comment, item #78).
+        #[cfg(windows)]
+        assert_no_surviving_process("ping.exe", "-n 4");
 
         // Give the command's natural (un-killed) duration time to elapse
         // before checking the marker never showed up.
