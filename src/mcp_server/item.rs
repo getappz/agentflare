@@ -536,6 +536,8 @@ impl AgentflareMcp {
             return Err(ErrorData::invalid_params("id is required", None));
         }
         let owner = crate::claims::owner_id();
+        let now = crate::claims::now();
+        let ttl = backend_claim_ttl_secs();
         let repo_root = self.worktree_repo_root();
         // Confirm we still hold the claim, and clean up the worktree,
         // *before* actually releasing -- releasing first (as this used to)
@@ -548,6 +550,30 @@ impl AgentflareMcp {
             let item = agentflare_backend::item::get(conn, &item_id).ok();
             let owns_claim = agentflare_backend::claim::is_owner(conn, &item_id, &owner)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            if !owns_claim {
+                // Not ours -- steal the lease only if it's abandoned, using
+                // the exact same stale-TTL gate `claim()` already uses to
+                // steal on acquire. A live claim held by someone else is a
+                // real identity conflict and must say so -- item #83:
+                // `release` used to return `{"released": false}` either
+                // way, making "nothing to release" indistinguishable from
+                // "someone else is actively using this" and leaving
+                // abandoned claims permanently un-releasable by anyone but
+                // a process that no longer exists.
+                if let agentflare_backend::claim::Acquire::Held {
+                    owner: holder,
+                    age_secs,
+                } = agentflare_backend::claim::acquire(conn, &item_id, &owner, now, ttl)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "item {item_id} is claimed by '{holder}' (active {age_secs}s ago) -- refusing to release someone else's live claim"
+                        ),
+                        None,
+                    ));
+                }
+            }
             Ok::<_, ErrorData>((item_id, item, owns_claim))
         })??;
         // A plain `release` used to leave the worktree behind unconditionally
@@ -576,6 +602,7 @@ impl AgentflareMcp {
         }
         let owner = crate::claims::owner_id();
         let now = crate::claims::now();
+        let ttl = backend_claim_ttl_secs();
         let repo_root = self.worktree_repo_root();
         // Resolve + authorize (DB reads) under the backend lock, then run
         // the blocking git/gh push+PR outside it — `git push`/`gh pr
@@ -587,8 +614,32 @@ impl AgentflareMcp {
         // even when a PR ends up open and unreviewed (item #420).
         let (item_id, owns_claim, item, target_branch) = self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
-            let owns_claim = agentflare_backend::claim::is_owner(conn, &item_id, &owner)
+            let mut owns_claim = agentflare_backend::claim::is_owner(conn, &item_id, &owner)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            if !owns_claim {
+                // Same abandoned-claim steal `item_release` uses (item
+                // #83): a live claim held by someone else is a real
+                // identity conflict (error, don't silently no-op); a
+                // stale/absent one is fair game, and stealing it here
+                // means the rest of `done` below runs exactly as if we'd
+                // claimed it ourselves.
+                owns_claim = match agentflare_backend::claim::acquire(conn, &item_id, &owner, now, ttl)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                {
+                    agentflare_backend::claim::Acquire::Held {
+                        owner: holder,
+                        age_secs,
+                    } => {
+                        return Err(ErrorData::invalid_params(
+                            format!(
+                                "item {item_id} is claimed by '{holder}' (active {age_secs}s ago) -- refusing to complete someone else's live claim"
+                            ),
+                            None,
+                        ));
+                    }
+                    agentflare_backend::claim::Acquire::Acquired => true,
+                };
+            }
             let (item, target_branch) = if owns_claim {
                 // Refresh the lease's heartbeat right before the
                 // potentially long push/PR publish step below, so a

@@ -140,21 +140,43 @@ impl AgentflareMcp {
                         .map_err(map_backend_err)?;
                     // Queue it for autonomous dispatch too, same as the
                     // brand-new-item path below — but only when it's safe:
-                    // genuinely fresh (backlog/unstarted/triage) and nobody
-                    // has ever claimed it. An explicit `item_id` handoff onto
-                    // something already claimed, in progress, in review, or
-                    // completed must NOT be silently re-queued — same danger
-                    // the reply/continuation branch below already guards
-                    // against, just reached via a different path (a caller
-                    // passing `item_id` directly instead of relying on
+                    // genuinely fresh (backlog/unstarted/triage) and no live
+                    // claim is currently held on it. An explicit `item_id`
+                    // handoff onto something already claimed, in progress, in
+                    // review, or completed must NOT be silently re-queued —
+                    // same danger the reply/continuation branch below already
+                    // guards against, just reached via a different path (a
+                    // caller passing `item_id` directly instead of relying on
                     // name/thread matching). Without this, `handoff` onto an
                     // existing item only ever set the assignee — queuing it
                     // needed a separate `item add_label` call every time.
+                    //
+                    // Deliberately NOT `claim::current_owner` (item #82):
+                    // that helper includes stale-but-undone claims by design
+                    // ("so stale locks can be cleaned up" — its own doc
+                    // comment), and the ledger row only ever leaves
+                    // `status = 'claimed'` via `claim::done`, which only runs
+                    // on the normal in_review -> completed promotion. An item
+                    // whose work was interrupted or rescued outside that
+                    // flow (crash, manual takeover) keeps a `claimed` row
+                    // forever, so `current_owner` never goes `None` again —
+                    // permanently vetoing re-labeling on every future handoff
+                    // to that item, silently. A liveness check (TTL-aware,
+                    // same primitive tier 4 of `quota::decide` and the
+                    // bridge's own claim-liveness check already use) treats
+                    // an expired claim as no claim, which is what "safe to
+                    // re-queue" actually means here.
                     let state = agentflare_backend::state::get(conn, &item.state_id)
                         .map_err(map_backend_err)?;
-                    let never_claimed =
-                        agentflare_backend::claim::current_owner(conn, id).is_none();
-                    if never_claimed
+                    let now = crate::claims::now();
+                    let ttl_secs = crate::claims::ttl_secs();
+                    let has_live_claim = agentflare_backend::claim::has_active_claim_by_other(
+                        conn, id, "", now, ttl_secs,
+                    )
+                    // Fail closed: if the claim table can't be read, don't
+                    // silently re-queue something that might be live.
+                    .unwrap_or(true);
+                    if !has_live_claim
                         && matches!(
                             state.group_name.as_str(),
                             "backlog" | "unstarted" | "triage"
@@ -821,6 +843,59 @@ mod tests {
 
         assert!(
             item_label_names(&mcp, &item_id).contains(&crate::supervisor::READY_LABEL.to_string())
+        );
+    }
+
+    #[test]
+    fn an_explicit_item_id_handoff_labels_an_item_with_only_a_stale_claim() {
+        // item #82: a claim row only ever leaves `status = 'claimed'` via
+        // `claim::done`, which only runs on the normal in_review ->
+        // completed promotion. Work interrupted or rescued outside that
+        // flow (crash, manual takeover) leaves the row `claimed` forever —
+        // `claim::current_owner` (deliberately stale-inclusive, for cleanup
+        // tooling) would see that and permanently refuse to relabel this
+        // item on every future handoff, even though the item itself is
+        // still sitting fresh in a backlog-group state and nothing live is
+        // touching it. A liveness-aware check must treat the expired claim
+        // as no claim.
+        let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
+
+        let first = mcp.handoff_impl(base_request()).unwrap();
+        let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        mcp.with_backend_db(|conn| {
+            let label_ids = agentflare_backend::item::list_labels(conn, &item_id).unwrap();
+            for id in label_ids {
+                agentflare_backend::item::remove_label(conn, &item_id, &id).unwrap();
+            }
+        })
+        .unwrap();
+
+        // A stale claim, acquired directly against the ledger (not via
+        // `item::claim`, which would also flip the item's state to
+        // "started" -- this reproduces an item that's still state-wise
+        // fresh but carries an abandoned claim row) with a heartbeat far
+        // enough in the past to be expired under any real TTL.
+        mcp.with_backend_db(|conn| {
+            agentflare_backend::claim::acquire(conn, &item_id, "claude-code:ghost", 1, 1800)
+        })
+        .unwrap()
+        .unwrap();
+
+        let reply = HandoffRequest {
+            item_id: Some(item_id.clone()),
+            completed: "more".to_string(),
+            remaining: "less".to_string(),
+            ..base_request()
+        };
+        mcp.handoff_impl(reply).unwrap();
+
+        assert!(
+            item_label_names(&mcp, &item_id).contains(&crate::supervisor::READY_LABEL.to_string()),
+            "a stale, never-`done`/`released` claim must not permanently block re-labeling"
         );
     }
 }
