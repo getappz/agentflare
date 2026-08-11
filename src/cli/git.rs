@@ -1247,6 +1247,24 @@ mod tests {
         assert_eq!(own_target, None);
         assert_eq!(others.len(), 1);
         assert_eq!(others[0].scopes, vec!["crates/foo/".to_string()]);
+
+        // The regression this test is actually about: that placement in
+        // `others` translates into real enforcement -- a changed path inside
+        // the sibling's declared scope must classify as Overlapping.
+        let verdict = scope::classify_scopes(
+            &["crates/foo/src/lib.rs".to_string()],
+            own_target.as_deref(),
+            false,
+            &others,
+        );
+        assert_eq!(
+            verdict,
+            scope::ScopeVerdict::Overlapping {
+                owner: "claude-code:99999".to_string(),
+                target: "item#2".to_string(),
+                scope: "crates/foo/".to_string(),
+            }
+        );
     }
 
     fn init_repo() -> tempfile::TempDir {
