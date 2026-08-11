@@ -105,12 +105,21 @@ fn embedded_providers() -> Vec<RegistrySpec> {
         .providers
 }
 
-/// Remote/cached entries override an embedded entry with the same
-/// `prefix`, or are appended as a brand-new provider.
+/// Remote/cached entries refresh an embedded entry's quota metadata, or are
+/// appended as a brand-new provider. `REGISTRY_URL` is fetched over HTTPS
+/// from an unpinned branch with no signature or digest check, so a remote
+/// entry for a `prefix` we already ship must never be allowed to change
+/// where that provider's traffic or API key goes — otherwise a compromised
+/// publish path could silently repoint e.g. `anthropic` at an attacker
+/// host. New prefixes (providers this binary doesn't already know about)
+/// carry no such risk: a user has to opt into an unfamiliar prefix via
+/// `MODEL` before it's ever used.
 fn merge(embedded: &mut Vec<RegistrySpec>, overrides: Vec<RegistrySpec>) {
     for spec in overrides {
         if let Some(existing) = embedded.iter_mut().find(|s| s.prefix == spec.prefix) {
-            *existing = spec;
+            existing.free_type = spec.free_type;
+            existing.monthly_tokens = spec.monthly_tokens;
+            existing.credit_tokens = spec.credit_tokens;
         } else {
             embedded.push(spec);
         }
@@ -313,7 +322,6 @@ mod tests {
             "hyperbolic",
             "cerebras",
             "sambanova",
-            "github_models",
             "cohere",
             "ollama",
             "siliconflow",
@@ -354,6 +362,7 @@ mod tests {
 
     #[test]
     fn resolve_template_substitutes_multiple_placeholders() {
+        let _guard = crate::test_env_lock();
         assert_eq!(resolve_template("https://x/{A}/{B}/y"), None);
         std::env::set_var("__FLARE_PROXY_TEST_A", "acct");
         std::env::set_var("__FLARE_PROXY_TEST_B", "gw");
@@ -375,14 +384,14 @@ mod tests {
     }
 
     #[test]
-    fn merge_overrides_matching_prefix_and_appends_new_ones() {
+    fn merge_refreshes_metadata_but_protects_security_fields_and_appends_new_ones() {
         let mut embedded = vec![RegistrySpec {
             prefix: "nvidia_nim".into(),
             id: "nvidia-nim".into(),
             kind: ProviderKind::OpenAiCompatible,
             base_url: Some("https://old.example".into()),
             base_url_template: None,
-            api_key_env: None,
+            api_key_env: Some("NVIDIA_NIM_API_KEY".into()),
             extra_headers: vec![],
             gateway_auth_env: None,
             gateway_auth_header: None,
@@ -395,15 +404,17 @@ mod tests {
                 prefix: "nvidia_nim".into(),
                 id: "nvidia-nim".into(),
                 kind: ProviderKind::OpenAiCompatible,
-                base_url: Some("https://new.example".into()),
+                // A malicious or corrupted remote copy attempting to
+                // redirect an already-known provider's traffic/key.
+                base_url: Some("https://attacker.example".into()),
                 base_url_template: None,
-                api_key_env: None,
+                api_key_env: Some("ATTACKER_CONTROLLED_ENV".into()),
                 extra_headers: vec![],
                 gateway_auth_env: None,
                 gateway_auth_header: None,
-                free_type: None,
+                free_type: Some("one-time-initial".into()),
                 monthly_tokens: None,
-                credit_tokens: None,
+                credit_tokens: Some(42),
             },
             RegistrySpec {
                 prefix: "brand_new".into(),
@@ -422,15 +433,13 @@ mod tests {
         ];
         merge(&mut embedded, overrides);
         assert_eq!(embedded.len(), 2);
-        assert_eq!(
-            embedded
-                .iter()
-                .find(|s| s.prefix == "nvidia_nim")
-                .unwrap()
-                .base_url
-                .as_deref(),
-            Some("https://new.example")
-        );
+
+        let nvidia = embedded.iter().find(|s| s.prefix == "nvidia_nim").unwrap();
+        assert_eq!(nvidia.base_url.as_deref(), Some("https://old.example"));
+        assert_eq!(nvidia.api_key_env.as_deref(), Some("NVIDIA_NIM_API_KEY"));
+        assert_eq!(nvidia.free_type.as_deref(), Some("one-time-initial"));
+        assert_eq!(nvidia.credit_tokens, Some(42));
+
         assert!(embedded.iter().any(|s| s.prefix == "brand_new"));
     }
 

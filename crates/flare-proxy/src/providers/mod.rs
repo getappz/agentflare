@@ -79,6 +79,19 @@ fn parse_model_string(s: &str) -> (String, String) {
     }
 }
 
+/// Map a `MODEL`/`MODEL_OPUS`/... prefix (the registry's `prefix`, e.g.
+/// `nvidia_nim`) to the `ProviderEntry::id` it resolves to (e.g.
+/// `nvidia-nim`) — the two differ for several registry entries, and
+/// `providers` below is keyed by `id`, not `prefix`. Falls back to the raw
+/// prefix, which is unreachable in practice: every prefix passed in here
+/// has already been validated against the registry by
+/// `unsupported_provider_type`.
+fn resolve_provider_id(prefix: &str) -> String {
+    registry::find(prefix)
+        .map(|spec| spec.id.clone())
+        .unwrap_or_else(|| prefix.to_string())
+}
+
 fn unsupported_provider_type(provider_types: &[String]) -> Option<&str> {
     provider_types
         .iter()
@@ -157,7 +170,7 @@ impl ProviderConfig {
         let (def_provider, def_model) = parse_model_string(&default_model);
         routing.push(ModelRoute {
             anthropic_model: String::new(),
-            provider_id: def_provider,
+            provider_id: resolve_provider_id(&def_provider),
             upstream_model: def_model,
             requires_heuristic_tools: true,
             requires_think_parsing: false,
@@ -172,7 +185,7 @@ impl ProviderConfig {
                 let (pid, um) = parse_model_string(m);
                 routing.push(ModelRoute {
                     anthropic_model: keyword.into(),
-                    provider_id: pid,
+                    provider_id: resolve_provider_id(&pid),
                     upstream_model: um,
                     requires_heuristic_tools: true,
                     requires_think_parsing: false,
@@ -377,6 +390,27 @@ mod tests {
             "gemini".to_string(),
         ];
         assert_eq!(unsupported_provider_type(&types), None);
+    }
+
+    #[test]
+    fn from_env_prefix_with_hyphenated_id_resolves_to_its_provider() {
+        // `nvidia_nim` (the registry `prefix`, used in MODEL/env vars) and
+        // `nvidia-nim` (the registry `id`, used as ModelRoute::provider_id
+        // and ProviderEntry::id) differ -- the resolved route must key off
+        // `id`, or `ProviderConfig::provider()` can't find the provider it
+        // just constructed for this exact prefix.
+        let _guard = crate::test_env_lock();
+        std::env::set_var("MODEL", "nvidia_nim/meta/llama-3.1-405b-instruct");
+        std::env::remove_var("MODEL_OPUS");
+        std::env::remove_var("MODEL_SONNET");
+        std::env::remove_var("MODEL_HAIKU");
+
+        let config = ProviderConfig::from_env();
+        std::env::remove_var("MODEL");
+
+        let route = config.resolve_model("claude-sonnet-4-20250514").unwrap();
+        assert_eq!(route.provider_id, "nvidia-nim");
+        assert!(config.provider(&route.provider_id).is_some());
     }
 
     #[test]

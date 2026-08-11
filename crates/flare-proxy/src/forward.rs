@@ -96,15 +96,14 @@ async fn proxy_anthropic(
     let body = crate::providers::anthropic::build_request_body(&anthropic_body, upstream_model);
     let url = provider.base_url.trim_end_matches('/').to_string() + "/v1/messages";
 
-    let resp = match client
+    let mut builder = client
         .post(url)
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
+        .header("Content-Type", "application/json");
+    builder = apply_extra_headers(builder, provider);
+
+    let resp = match builder.json(&body).send().await {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response(),
     };
@@ -137,14 +136,13 @@ async fn proxy_gemini(
         upstream_model
     );
 
-    let resp = match client
+    let mut builder = client
         .post(url)
         .header("x-goog-api-key", api_key)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
+        .header("Content-Type", "application/json");
+    builder = apply_extra_headers(builder, provider);
+
+    let resp = match builder.json(&body).send().await {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response(),
     };
@@ -203,6 +201,20 @@ async fn proxy_openai_compat(
     }
 }
 
+/// Apply a provider's static extra headers (e.g. Cloudflare AI Gateway's
+/// `cf-aig-authorization`) to a request builder. The OpenAI-compatible path
+/// gets this via `openai_compat::apply_auth`; native Anthropic/Gemini build
+/// their own headers inline, so they call this directly.
+fn apply_extra_headers(
+    mut builder: reqwest::RequestBuilder,
+    provider: &ProviderEntry,
+) -> reqwest::RequestBuilder {
+    for (k, v) in &provider.extra_headers {
+        builder = builder.header(k, v);
+    }
+    builder
+}
+
 /// Verify the upstream response succeeded, converting a non-2xx into an
 /// Anthropic-shaped error `Response`. On success, hands back the still-open
 /// `reqwest::Response` so the caller can stream its body.
@@ -229,7 +241,7 @@ fn stream_translated_sse(
     translate_chunk: fn(&Value, &mut AnthropicStreamBuffer) -> Vec<u8>,
     finish: fn(&Value, &mut AnthropicStreamBuffer) -> Vec<u8>,
     needs_heuristic: bool,
-    needs_think: bool,
+    _needs_think: bool,
 ) -> Response {
     let stream = resp.bytes_stream();
     let mut buffer = AnthropicStreamBuffer::default();
@@ -314,17 +326,13 @@ fn stream_translated_sse(
                     }
                 }
 
-                // Think tag stripping on accumulated text. NOTE: the raw
-                // deltas above are already streamed out via `translate_chunk`
-                // before this point runs, so this pass over accumulated_text
-                // cannot retroactively remove think-tag content from what the
-                // client already received. Properly suppressing think tags
-                // requires buffering deltas and delaying emission, which is a
-                // larger change tracked separately; this block intentionally
-                // does not claim to do that suppression.
-                if needs_think && !accumulated_text.is_empty() {
-                    let _ = crate::think::strip_think_tags(&accumulated_text);
-                }
+                // TODO(think-tag suppression): `_needs_think` is currently
+                // unused. The raw deltas above are already streamed out via
+                // `translate_chunk` before this point runs, so stripping
+                // think tags from `accumulated_text` here cannot
+                // retroactively remove them from what the client already
+                // received — that requires buffering deltas and delaying
+                // emission, a larger change tracked separately.
 
                 let finish_bytes = finish(&val, &mut buffer);
                 out.extend_from_slice(&finish_bytes);

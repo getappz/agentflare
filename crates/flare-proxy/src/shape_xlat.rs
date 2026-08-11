@@ -487,6 +487,7 @@ pub fn gemini_chunk_to_anthropic_sse(chunk: &Value, buffer: &mut AnthropicStream
             let idx = buffer.next_index;
             buffer.next_index += 1;
             buffer.open_indices.insert(idx);
+            buffer.has_tool_use = true;
             let tc_id = format!("call_{idx}");
 
             emit_event(
@@ -578,7 +579,11 @@ pub fn finish_stream(chunk: &Value, buffer: &mut AnthropicStreamBuffer) -> Vec<u
 /// Gemini counterpart to `finish_stream` — Gemini's finish reason lives at
 /// `candidates[0].finishReason` (`STOP`/`MAX_TOKENS`/`TOOL_CALLS`, not
 /// OpenAI's lowercase `stop`/`length`/`tool_calls`) and completion usage at
-/// `usageMetadata.candidatesTokenCount`.
+/// `usageMetadata.candidatesTokenCount`. Gemini routinely reports `STOP`
+/// (not `TOOL_CALLS`) on a turn that also contains a `functionCall` part —
+/// `buffer.has_tool_use` (set by `gemini_chunk_to_anthropic_sse` when it
+/// opens a tool_use block) catches that case so the client still sees
+/// `stop_reason: "tool_use"` and knows to execute the call.
 pub fn gemini_finish_stream(chunk: &Value, buffer: &mut AnthropicStreamBuffer) -> Vec<u8> {
     let mut out = Vec::new();
 
@@ -598,10 +603,14 @@ pub fn gemini_finish_stream(chunk: &Value, buffer: &mut AnthropicStreamBuffer) -
         );
     }
 
-    let sr = match finish_reason {
-        "MAX_TOKENS" => "max_tokens",
-        "TOOL_CALLS" => "tool_use",
-        _ => "end_turn",
+    let sr = if buffer.has_tool_use {
+        "tool_use"
+    } else {
+        match finish_reason {
+            "MAX_TOKENS" => "max_tokens",
+            "TOOL_CALLS" => "tool_use",
+            _ => "end_turn",
+        }
     };
     emit_event(
         &mut out,
@@ -636,6 +645,7 @@ pub struct AnthropicStreamBuffer {
     pub next_index: usize,
     pub open_indices: std::collections::BTreeSet<usize>,
     pub tool_index_map: std::collections::HashMap<u64, usize>,
+    pub has_tool_use: bool,
 }
 
 fn emit_event(out: &mut Vec<u8>, event: &str, data: &Value) {
@@ -859,6 +869,25 @@ mod tests {
         assert_eq!(out.matches("event: content_block_stop").count(), 2);
         assert!(out.contains("\"stop_reason\":\"tool_use\""));
         assert!(buffer.open_indices.is_empty());
+    }
+
+    #[test]
+    fn test_gemini_finish_stream_maps_stop_with_tool_call_to_tool_use() {
+        let mut buffer = AnthropicStreamBuffer::default();
+        let call_chunk = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "functionCall": { "name": "get_weather", "args": { "city": "Paris" } } }]
+                }
+            }]
+        });
+        gemini_chunk_to_anthropic_sse(&call_chunk, &mut buffer);
+
+        // Gemini often reports "STOP", not "TOOL_CALLS", on a turn that
+        // also carries a functionCall part.
+        let finish = json!({"candidates": [{"finishReason": "STOP"}]});
+        let out = String::from_utf8(gemini_finish_stream(&finish, &mut buffer)).unwrap();
+        assert!(out.contains("\"stop_reason\":\"tool_use\""));
     }
 
     #[test]

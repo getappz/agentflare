@@ -62,10 +62,14 @@ pub fn build_request_body(anthropic_body: &Value) -> Value {
             .iter()
             .filter_map(|t| {
                 let name = t.get("name")?.as_str()?;
+                let parameters = t
+                    .get("input_schema")
+                    .map(gemini_schema)
+                    .unwrap_or_else(|| json!({"type": "object"}));
                 Some(json!({
                     "name": name,
                     "description": t.get("description").and_then(Value::as_str).unwrap_or(""),
-                    "parameters": t.get("input_schema").cloned().unwrap_or_else(|| json!({"type": "object"})),
+                    "parameters": parameters,
                 }))
             })
             .collect();
@@ -75,6 +79,65 @@ pub fn build_request_body(anthropic_body: &Value) -> Value {
     }
 
     body
+}
+
+/// Gemini's `FunctionDeclaration.parameters` accepts only a subset of JSON
+/// Schema/OpenAPI 3.0 (`type`, `format`, `description`, `nullable`, `enum`,
+/// `items`, `properties`, `required`, `anyOf`, `$ref`, `$defs`, plus
+/// `additionalProperties`). Anthropic tool schemas from JSON-schema
+/// generators commonly also carry `$schema` and other draft-2020 metadata
+/// keywords that Gemini rejects with `INVALID_ARGUMENT` — strip anything
+/// outside the supported set, recursively, since the unsupported fields can
+/// appear at any nesting level (e.g. inside `properties`/`items`).
+const GEMINI_SCHEMA_FIELDS: &[&str] = &[
+    "type",
+    "format",
+    "description",
+    "nullable",
+    "enum",
+    "items",
+    "properties",
+    "required",
+    "anyOf",
+    "$ref",
+    "$defs",
+    "additionalProperties",
+];
+
+fn gemini_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (k, v) in map {
+                if !GEMINI_SCHEMA_FIELDS.contains(&k.as_str()) {
+                    continue;
+                }
+                let filtered = match k.as_str() {
+                    "properties" | "$defs" => Value::Object(
+                        v.as_object()
+                            .map(|obj| {
+                                obj.iter()
+                                    .map(|(pk, pv)| (pk.clone(), gemini_schema(pv)))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    "items" | "additionalProperties" => gemini_schema(v),
+                    "anyOf" => Value::Array(
+                        v.as_array()
+                            .map(|arr| arr.iter().map(gemini_schema).collect())
+                            .unwrap_or_default(),
+                    ),
+                    _ => v.clone(),
+                };
+                out.insert(k.clone(), filtered);
+            }
+            Value::Object(out)
+        }
+        // `additionalProperties`/`items` may legitimately be a bare
+        // `true`/`false` rather than a nested schema object.
+        other => other.clone(),
+    }
 }
 
 fn system_instruction_text(system: Option<&Value>) -> Option<String> {
@@ -180,6 +243,38 @@ fn tool_result_response(content: Option<&Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_unsupported_schema_fields_recursively() {
+        let anthropic = json!({
+            "messages": [{"role": "user", "content": "What's the weather?"}],
+            "tools": [{
+                "name": "get_weather",
+                "description": "Get weather",
+                "input_schema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "city": {
+                            "$schema": "https://json-schema.org/draft/2020-12/schema",
+                            "type": "string",
+                            "description": "City name"
+                        }
+                    },
+                    "required": ["city"]
+                }
+            }]
+        });
+        let body = build_request_body(&anthropic);
+        let params = &body["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert!(params.get("$schema").is_none());
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["additionalProperties"], false);
+        assert!(params["properties"]["city"].get("$schema").is_none());
+        assert_eq!(params["properties"]["city"]["type"], "string");
+        assert_eq!(params["required"][0], "city");
+    }
 
     #[test]
     fn translates_plain_text_turn() {
