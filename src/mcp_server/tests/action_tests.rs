@@ -1260,3 +1260,183 @@ fn next_hint_item_without_trigger_fields_returns_none() {
 fn next_hint_non_object_input_returns_none() {
     assert!(next_hint("item", &serde_json::Value::String("text".into())).is_none());
 }
+
+// --- item #83: release/done must not silently no-op on a caller/assignee
+// identity mismatch -- a live claim held by someone else is a real
+// conflict (error clearly), an abandoned one must not be permanently
+// un-releasable just because the original claiming instance is gone. ---
+
+fn seed_claim(s: &AgentflareMcp, item_id: &str, owner: &str, age_secs: i64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    s.with_backend_db(|conn| {
+        // Force-steal regardless of any existing live claim -- a
+        // sufficiently-future `now` always looks stale to the acquire
+        // gate -- then re-acquire as `owner` at the real target
+        // timestamp: re-acquiring your own row is unconditionally
+        // allowed, so this second call is what actually pins
+        // `heartbeat_at` to `age_secs` in the past.
+        agentflare_backend::claim::acquire(conn, item_id, owner, now + 14_400 + 1, 14_400).unwrap();
+        agentflare_backend::claim::acquire(conn, item_id, owner, now - age_secs, 14_400).unwrap()
+    })
+    .unwrap();
+}
+
+#[test]
+fn item_release_errors_when_a_different_owner_holds_a_live_claim() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    seed_claim(&s, &item_id, "someone-else:1", 0);
+
+    let err = s
+        .item(Parameters(ItemRequest {
+            action: "release".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert_eq!(
+        s.with_backend_db(|conn| agentflare_backend::claim::current_owner(conn, &item_id))
+            .unwrap(),
+        Some("someone-else:1".to_string()),
+        "a live claim held by someone else must be left untouched"
+    );
+}
+
+#[test]
+fn item_release_reclaims_and_releases_a_stale_claim_from_an_abandoned_owner() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    // Well past the 4h default TTL -- the claiming instance is gone.
+    seed_claim(&s, &item_id, "gone:1", 20_000);
+
+    let released: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "release".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(released["released"], true, "{released:?}");
+    assert_eq!(
+        s.with_backend_db(|conn| agentflare_backend::claim::current_owner(conn, &item_id))
+            .unwrap(),
+        None,
+        "a release from a non-owning caller must clear an abandoned claim, not silently no-op"
+    );
+}
+
+#[test]
+fn item_done_errors_when_a_different_owner_holds_a_live_claim() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    seed_claim(&s, &item_id, "someone-else:1", 0);
+
+    let err = s
+        .item(Parameters(ItemRequest {
+            action: "done".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert_eq!(
+        s.with_backend_db(|conn| agentflare_backend::claim::current_owner(conn, &item_id))
+            .unwrap(),
+        Some("someone-else:1".to_string()),
+        "a live claim held by someone else must be left untouched"
+    );
+}
+
+#[test]
+fn item_done_recovers_committed_work_left_behind_by_a_stale_claim() {
+    // Recurrence of #67/#80: the original claiming instance vanished
+    // (crash, session end, daemon restart) with real committed work
+    // sitting in its worktree. A fresh caller's `done` must be able to
+    // pick that work up and finish it, instead of silently no-op'ing
+    // forever because the claim's owner no longer matches anyone alive.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    };
+    run_git(&repo_root, &["init", "-b", "master"]);
+    run_git(&repo_root, &["config", "user.email", "test@test.com"]);
+    run_git(&repo_root, &["config", "user.name", "Test"]);
+    run_git(&repo_root, &["commit", "--allow-empty", "-m", "initial"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root.clone()),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    let sequence_id = created["sequence_id"].as_i64().unwrap();
+
+    let claimed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let worktree_path = std::path::PathBuf::from(claimed["worktree_path"].as_str().unwrap());
+    let branch = format!("task/{sequence_id}");
+    std::fs::write(worktree_path.join("real_work.txt"), "already committed").unwrap();
+    run_git(&worktree_path, &["add", "real_work.txt"]);
+    run_git(&worktree_path, &["commit", "-m", "real committed work"]);
+
+    // Simulate the claiming instance vanishing: the lease now belongs to
+    // an owner nobody in this process is, well past the TTL.
+    seed_claim(&s, &item_id, "gone:1", 20_000);
+    assert_eq!(
+        s.with_backend_db(|conn| agentflare_backend::claim::current_owner(conn, &item_id))
+            .unwrap(),
+        Some("gone:1".to_string())
+    );
+
+    // push: false -- no remote configured in this throwaway repo.
+    let result: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "done".into(),
+            id: Some(item_id.clone()),
+            push: Some(false),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["done"], true, "{result:?}");
+    assert_eq!(result["status"], "completed");
+
+    let log = run_git(
+        &repo_root,
+        &["log", &branch, "--name-only", "--pretty=format:"],
+    );
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("real_work.txt"),
+        "the abandoned claim's real committed work must not be lost"
+    );
+}

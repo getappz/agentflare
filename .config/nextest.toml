@@ -3,3 +3,17 @@
 # 25-minute timeout (see ci.yml) — kill it well before that and let the rest
 # of the suite keep going.
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# windows-latest CI has hit this exact signature 5 times across PRs
+# #436/#438/#441/#443(x2): a *different* test each time, always the run's
+# very last one to complete, always killed at exactly this slow-timeout's
+# 300s boundary while everything else (2100+ other tests) passes. #443
+# hardened kill_tree against a suspected taskkill process-tree race and
+# still hit the identical signature on a different test afterward, which
+# rules that out as the sole cause -- this now reads as generic Windows
+# runner resource contention near the tail of a large parallel run, not a
+# specific broken test. A couple of retries is the standard, targeted
+# mitigation for exactly this shape of flake (as opposed to a genuinely
+# hung/broken test, which would fail every retry too) -- see
+# nexte.st/docs/configuration for the field.
+retries = 2
