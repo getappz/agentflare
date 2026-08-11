@@ -1278,8 +1278,7 @@ fn seed_claim(s: &AgentflareMcp, item_id: &str, owner: &str, age_secs: i64) {
         // timestamp: re-acquiring your own row is unconditionally
         // allowed, so this second call is what actually pins
         // `heartbeat_at` to `age_secs` in the past.
-        agentflare_backend::claim::acquire(conn, item_id, owner, now + 14_400 + 1, 14_400)
-            .unwrap();
+        agentflare_backend::claim::acquire(conn, item_id, owner, now + 14_400 + 1, 14_400).unwrap();
         agentflare_backend::claim::acquire(conn, item_id, owner, now - age_secs, 14_400).unwrap()
     })
     .unwrap();
