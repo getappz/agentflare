@@ -214,6 +214,89 @@ impl AgentflareMcp {
             .map_err(map_backend_err)
     }
 
+    /// Resolve a target state from exactly one of `state_id`, `state_name`
+    /// (case-insensitive exact match), or `state_group`. Errors if none or
+    /// more than one of the three is given, or if a name/group doesn't
+    /// resolve to exactly one state — see #97: silently accepting a
+    /// mis-guessed `state_id` is what caused two wrong live transitions
+    /// before the correct one was found by dumping the `states` table.
+    fn resolve_state_id(
+        &self,
+        conn: &Connection,
+        project_id: &str,
+        state_id: Option<&str>,
+        state_name: Option<&str>,
+        state_group: Option<&str>,
+    ) -> Result<String, ErrorData> {
+        let given = [
+            state_id.is_some(),
+            state_name.is_some(),
+            state_group.is_some(),
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count();
+        if given == 0 {
+            return Err(ErrorData::invalid_params(
+                "one of state_id, state_name, or state_group is required for update_state",
+                None,
+            ));
+        }
+        if given > 1 {
+            return Err(ErrorData::invalid_params(
+                "state_id, state_name, and state_group are mutually exclusive for update_state",
+                None,
+            ));
+        }
+        if let Some(id) = state_id {
+            return Ok(id.to_string());
+        }
+        let states = agentflare_backend::state::list_by_project(conn, project_id)
+            .map_err(map_backend_err)?;
+        if let Some(name) = state_name {
+            let matches: Vec<_> = states
+                .iter()
+                .filter(|s| s.name.eq_ignore_ascii_case(name))
+                .collect();
+            return match matches.as_slice() {
+                [] => Err(ErrorData::invalid_params(
+                    format!("no state named '{name}' in this project"),
+                    None,
+                )),
+                [s] => Ok(s.id.clone()),
+                many => Err(ErrorData::invalid_params(
+                    format!(
+                        "multiple states match name '{name}': {}",
+                        many.iter()
+                            .map(|s| s.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    None,
+                )),
+            };
+        }
+        let group = state_group.expect("exactly one of the three is Some");
+        let matches: Vec<_> = states.iter().filter(|s| s.group_name == group).collect();
+        match matches.as_slice() {
+            [] => Err(ErrorData::invalid_params(
+                format!("no state in group '{group}' in this project"),
+                None,
+            )),
+            [s] => Ok(s.id.clone()),
+            many => Err(ErrorData::invalid_params(
+                format!(
+                    "multiple states match group '{group}': {}",
+                    many.iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None,
+            )),
+        }
+    }
+
     pub(super) fn item_create(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let name = req
             .name
@@ -397,16 +480,21 @@ impl AgentflareMcp {
         let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for update_state", None))?;
-        let state_id = req.state_id.ok_or_else(|| {
-            ErrorData::invalid_params("state_id is required for update_state", None)
-        })?;
-        if raw.trim().is_empty() || state_id.trim().is_empty() {
-            return Err(ErrorData::invalid_params(
-                "id and state_id are required",
-                None,
-            ));
+        if raw.trim().is_empty() {
+            return Err(ErrorData::invalid_params("id is required", None));
         }
         self.with_backend_db(|conn| {
+            let project = self.resolve_project(conn)?;
+            fn non_empty(s: &str) -> Option<&str> {
+                (!s.trim().is_empty()).then_some(s)
+            }
+            let state_id = self.resolve_state_id(
+                conn,
+                &project.id,
+                req.state_id.as_deref().and_then(non_empty),
+                req.state_name.as_deref().and_then(non_empty),
+                req.state_group.as_deref().and_then(non_empty),
+            )?;
             let id = self.resolve_item_id(conn, &raw)?;
             let item = agentflare_backend::item::update_state(conn, &id, &state_id)
                 .map_err(map_backend_err)?;
@@ -672,8 +760,39 @@ impl AgentflareMcp {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("Auto-committed by item done: uncommitted changes at completion");
-            if crate::worktree::commit_uncommitted(item, &repo_root, message) {
-                eprintln!("worktree: auto-committed uncommitted changes for item {item_id}");
+            match crate::worktree::commit_uncommitted(item, &repo_root, message) {
+                crate::worktree::CommitOutcome::Committed => {
+                    eprintln!("worktree: auto-committed uncommitted changes for item {item_id}");
+                }
+                crate::worktree::CommitOutcome::NothingToCommit => {}
+                // A dirty tree existed but `add`/`commit` itself failed
+                // (item #88's read-only `.git` under bwrap was one cause;
+                // disk-full, a rejecting pre-commit hook, or a git config
+                // issue could all reproduce it) -- this must NOT fall
+                // through to `nothing_was_ever_committed` below, which
+                // reads "no new commit" as "genuinely nothing to do" and
+                // releases the claim + cleans up the worktree as if the
+                // tree were clean. The real edits are still sitting
+                // uncommitted in the worktree; surface that loudly instead
+                // (item #92).
+                crate::worktree::CommitOutcome::Failed(err) => {
+                    let comment_body = format!(
+                        "## agentflare work — commit failed\n\nAuto-commit of uncommitted \
+                         changes failed:\n\n```\n{err}\n```\n\nThe work is still sitting \
+                         uncommitted in the item's worktree; it was left in place rather than \
+                         reported as done."
+                    );
+                    let _ = self.comment_impl(CommentRequest {
+                        action: "create".into(),
+                        item_id: Some(item_id.clone()),
+                        body: Some(comment_body),
+                        ..Default::default()
+                    });
+                    return Err(ErrorData::internal_error(
+                        format!("item {item_id}: auto-commit of uncommitted changes failed: {err}"),
+                        None,
+                    ));
+                }
             }
         }
         let pr_url = match (&item, &target_branch) {

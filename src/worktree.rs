@@ -29,7 +29,7 @@ pub fn branch_diverged(
     repo_root: &Path,
     target_branch: &str,
 ) -> bool {
-    let branch = format!("task/{}", item.sequence_id);
+    let branch = flare_git_core::worktree::task_branch_name(item);
     flare_git_core::worktree::branch_diverged(repo_root, &branch, target_branch)
 }
 
@@ -49,13 +49,15 @@ pub fn cleanup_worktree(item: &agentflare_backend::item::Item, repo_root: &Path)
     flare_git_core::worktree::cleanup_item_worktree(item, repo_root);
 }
 
+pub use flare_git_core::worktree::CommitOutcome;
+
 /// Commits any uncommitted changes in `item`'s worktree. See
 /// `flare_git_core::worktree::commit_uncommitted`.
 pub fn commit_uncommitted(
     item: &agentflare_backend::item::Item,
     repo_root: &Path,
     message: &str,
-) -> bool {
+) -> CommitOutcome {
     flare_git_core::worktree::commit_uncommitted(item, repo_root, message)
 }
 
@@ -66,7 +68,7 @@ pub fn commit_uncommitted(
 /// rather than erroring, since the caller's fallback is simply to check
 /// again later.
 pub fn is_pr_merged(item: &agentflare_backend::item::Item, repo_root: &Path) -> bool {
-    let branch = format!("task/{}", item.sequence_id);
+    let branch = flare_git_core::worktree::task_branch_name(item);
     let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
         return false;
     };
@@ -105,7 +107,7 @@ pub enum PrCiStatus {
 /// applied once instead of in a loop -- the sweep itself provides the retry
 /// cadence across ticks.
 pub fn pr_ci_status(item: &agentflare_backend::item::Item, repo_root: &Path) -> PrCiStatus {
-    let branch = format!("task/{}", item.sequence_id);
+    let branch = flare_git_core::worktree::task_branch_name(item);
     let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
         return PrCiStatus::Unknown;
     };

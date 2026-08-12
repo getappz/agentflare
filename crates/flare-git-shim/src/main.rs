@@ -137,11 +137,13 @@ fn snapshots_enabled() -> bool {
     }
 }
 
-/// Deny reason for the canonical-repo HEAD-detach guard, or `None` to let
-/// the op through. Scoped tightly on purpose: agent-invoked (self-reported
-/// via env markers, same as `agentflare-shim`'s own gate) AND an agentflare-
-/// tracked project AND the canonical (non-worktree) checkout AND the command
-/// would actually detach HEAD. Interactive human use, any use inside an
+/// Deny reason for canonical-checkout mutation guards (HEAD detach AND
+/// branch-creation), or `None` to let the op through. Scoped tightly on
+/// purpose: agent-invoked (self-reported via env markers, same as
+/// `agentflare-shim`'s own gate) AND an agentflare-tracked project AND the
+/// canonical (non-worktree) checkout AND the command would actually move
+/// HEAD off its current branch (either by detaching, or by creating a new
+/// branch and checking it out). Interactive human use, any use inside an
 /// isolated worktree, and any project agentflare doesn't track, are all
 /// completely unaffected.
 fn deny_canonical_detach_reason(
@@ -160,6 +162,11 @@ fn deny_canonical_detach_reason(
     }
     if branch::is_linked_worktree(repo_root) {
         return None; // agent worktrees are exactly where this is expected
+    }
+    if classify::is_branch_create(subcommand, args) {
+        return Some(format!(
+            "this would create a new branch in the canonical checkout (not an isolated worktree) while agent-invoked -- feature work belongs in a worktree. Call `item(action=\"claim\", id=<item>)` to provision one, or set {ALLOW_CANONICAL_MUTATE_ENV}=1 to override."
+        ));
     }
     if !classify::would_detach_head(repo_root, subcommand, args) {
         return None;
@@ -358,8 +365,19 @@ fn main() {
         let _ = audit::log_event(&audit_path, &event);
     }
 
+    // Stranded-canonical-checkout recovery (item #441 / vent #386 residual):
+    // a merged worktree leaves the canonical checkout unable to `git switch`
+    // back to the default branch -- that's denied by classify_pure's
+    // protected-branch guard. ALLOW_CANONICAL_MUTATE is the escape hatch for
+    // exactly this class of canonical-checkout mutation, so when it's set in
+    // the canonical checkout, downgrade a checkout/switch deny to passthrough.
+    // Still audited (the original event was already logged above).
+    let canonical_recovery = agentflare_shim::is_set(ALLOW_CANONICAL_MUTATE_ENV)
+        && !branch::is_linked_worktree(&repo_root)
+        && matches!(subcommand.as_str(), "checkout" | "switch");
+
     match &event.disposition {
-        classify::Disposition::Deny { reason } => {
+        classify::Disposition::Deny { reason } if !canonical_recovery => {
             eprintln!("agentflare git shim: denied — {reason}");
             exit(1);
         }
@@ -373,7 +391,9 @@ fn main() {
             );
             exit(1);
         }
-        classify::Disposition::Passthrough | classify::Disposition::SilentExempt => {
+        classify::Disposition::Deny { .. }
+        | classify::Disposition::Passthrough
+        | classify::Disposition::SilentExempt => {
             if matches!(subcommand.as_str(), "commit" | "push")
                 && let Some(reason) = scope_check_deny_reason(&subcommand)
             {
@@ -401,6 +421,11 @@ fn main() {
                         "agentflare git shim: warning -- snapshot before destructive '{subcommand}' failed: {e}"
                     ),
                 }
+            }
+            if let Some(msg) =
+                classify::reset_soft_divergence_warning(&repo_root, &subcommand, &rest)
+            {
+                eprintln!("agentflare git shim: warning -- {msg}");
             }
             exec_real(&tool, filtered_path.as_ref(), &args);
         }

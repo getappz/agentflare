@@ -112,12 +112,45 @@ pub fn agent_invocation_detected() -> bool {
         || std::env::var_os("AGENTFLARE_AGENT").is_some_and(|s| !s.is_empty())
 }
 
+/// `true` if `subcommand`/`args` is a branch-*creating* form: `git checkout
+/// -b/-B/--orphan <name>` and `git switch -c/-C/--create/--force-create/
+/// --orphan <name>` -- including the attached short-option spellings
+/// (`-bname`, `-Cname`, ...) and `--long=name`. These never detach HEAD
+/// (the new branch is checked out instead) but they DO move the canonical
+/// checkout off its current branch onto feature-branch work -- so the shim
+/// keeps blocking them there, with an accurate reason rather than the
+/// misleading "would detach HEAD" message (item #441 / vent #395). Scanning
+/// stops at a bare `--` -- anything after it is a pathspec, not an option.
+#[must_use]
+pub fn is_branch_create(subcommand: &str, args: &[String]) -> bool {
+    let (short_flags, long_flags): (&[&str], &[&str]) = match subcommand {
+        "checkout" => (&["-b", "-B"], &["--orphan"]),
+        "switch" => (&["-c", "-C"], &["--create", "--force-create", "--orphan"]),
+        _ => return false,
+    };
+    for a in args {
+        if a == "--" {
+            break;
+        }
+        let is_short = short_flags.iter().any(|f| a.starts_with(f));
+        let is_long = long_flags
+            .iter()
+            .any(|f| a == f || a.starts_with(&format!("{f}=")));
+        if is_short || is_long {
+            return true;
+        }
+    }
+    false
+}
+
 /// `true` if `subcommand`/`args` would detach HEAD -- `git checkout
 /// <target>` implicitly detaches when `target` isn't an existing local
 /// branch (no `--detach` flag required for that form); `git switch` never
 /// silently detaches, only `switch --detach`/`-d` does. `git checkout --
 /// <pathspec>` (and any form with `--` before the target) restores files
-/// and never touches HEAD at all.
+/// and never touches HEAD at all. Branch-creating forms (`-b`/`-B`/`-c`/
+/// `-C`) check out the new branch and never detach -- handled by
+/// `is_branch_create` instead.
 #[must_use]
 pub fn would_detach_head(repo_root: &Path, subcommand: &str, args: &[String]) -> bool {
     match subcommand {
@@ -127,6 +160,9 @@ pub fn would_detach_head(repo_root: &Path, subcommand: &str, args: &[String]) ->
             }
             if args.iter().any(|a| a == "--detach") {
                 return true;
+            }
+            if is_branch_create(subcommand, args) {
+                return false; // `checkout -b <name>` checks out the new branch
             }
             let Some(target) = args.iter().find(|a| !a.starts_with('-')) else {
                 return false; // e.g. bare `git checkout` -- doesn't move HEAD
@@ -219,6 +255,72 @@ pub fn is_destructive(subcommand: &str, args: &[String]) -> bool {
             .any(|a| a == "-f" || a == "--force" || a == "-B"),
         _ => false,
     }
+}
+
+/// Commits by which `target` and `HEAD` have diverged, when a `reset
+/// --soft`/`--mixed` onto `target` would stage more than the caller's
+/// intended change — i.e. neither ref is an ancestor of the other.
+/// `--soft`/`--mixed` leave the working tree untouched and just move HEAD,
+/// so the diff that ends up staged is `old_HEAD_tree` vs `target_tree`: when
+/// `target` is a strict ancestor or descendant of HEAD (a clean fast-forward
+/// either direction), that diff is exactly the commit(s) between them, which
+/// is what the command is for. Once they've diverged, that same diff also
+/// carries every change unique to `target`'s side — unrelated drift the
+/// caller likely never intended to stage (item #98's live incident: `reset
+/// --soft origin/master` from a stale branch staged a phantom crate deletion
+/// that was actually a refactor on master, not a removal).
+///
+/// `None` if there's no divergence to warn about, or if it can't be
+/// determined (unresolvable target, ...) — fails open, matching this
+/// policy's bias toward never warning on something it can't actually reason
+/// about.
+fn reset_soft_divergence(repo_root: &Path, target: &str) -> Option<u32> {
+    let head_is_ancestor =
+        crate::shell::run_in_ok(repo_root, &["merge-base", "--is-ancestor", "HEAD", target]);
+    let target_is_ancestor =
+        crate::shell::run_in_ok(repo_root, &["merge-base", "--is-ancestor", target, "HEAD"]);
+    if head_is_ancestor || target_is_ancestor {
+        return None; // clean fast-forward in one direction or the other
+    }
+    let counts = crate::shell::run_in(
+        repo_root,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("HEAD...{target}"),
+        ],
+    )
+    .ok()?;
+    let mut counts = counts.split_whitespace();
+    let unique_to_head: u32 = counts.next()?.parse().ok()?;
+    let unique_to_target: u32 = counts.next()?.parse().ok()?;
+    Some(unique_to_head + unique_to_target)
+}
+
+/// `Some(warning)` if `subcommand`/`args` is a `reset --soft`/`--mixed`
+/// targeting a ref that's diverged from HEAD (see `reset_soft_divergence`).
+/// `--hard` is deliberately excluded — that's `is_destructive`'s job (a
+/// working-tree-loss concern, already snapshotted before it runs), and
+/// orthogonal to this one (a staged-diff surprise concern, which `--hard`
+/// can't cause since it discards the index along with everything else).
+#[must_use]
+pub fn reset_soft_divergence_warning(
+    repo_root: &Path,
+    subcommand: &str,
+    args: &[String],
+) -> Option<String> {
+    if subcommand != "reset" || !args.iter().any(|a| a == "--soft" || a == "--mixed") {
+        return None;
+    }
+    let target = args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .find(|a| !a.starts_with('-'))?;
+    let commits = reset_soft_divergence(repo_root, target)?;
+    Some(format!(
+        "'{target}' and HEAD have diverged by {commits} commit(s) — `reset --soft`/`--mixed` will stage the full content diff between them, not just your intended change. Consider `git cherry-pick` onto a fresh branch instead."
+    ))
 }
 
 /// Pure classification core — no I/O, so it's unit-testable with fixed
@@ -340,9 +442,19 @@ pub fn classify_pure(
             if is_read_only {
                 Disposition::Passthrough
             } else {
-                Disposition::Deny {
-                    reason: "'git worktree' is orchestrator-managed by agentflare — call `item(action=\"claim\", id=<item>)` to provision one. (Not the standalone `claim`/`mcp__flare__claim` tool -- that only takes a scope lock and does not create a worktree.)".to_string(),
-                }
+                // Distinguish provisioning (`add`) from teardown (`remove`/
+                // `prune`): an agent denied mid-teardown needs the exact
+                // tool+action that owns cleanup, not the provisioning call.
+                let teardown = matches!(
+                    args.first().map(String::as_str),
+                    Some("remove") | Some("prune")
+                );
+                let reason = if teardown {
+                    "'git worktree remove/prune' is orchestrator-managed by agentflare — to tear down an item's worktree call `item(action=\"check_merge\", id=<item>)` once its PR merges, or `item(action=\"release\", id=<item>)`; to prune stale worktrees run `agentflare git worktree audit --prune`.".to_string()
+                } else {
+                    "'git worktree' is orchestrator-managed by agentflare — call `item(action=\"claim\", id=<item>)` to provision one. (Not the standalone `claim`/`mcp__flare__claim` tool -- that only takes a scope lock and does not create a worktree.)".to_string()
+                };
+                Disposition::Deny { reason }
             }
         }
         // Fail-open: anything not explicitly matched above is allowed through
@@ -861,6 +973,45 @@ mod tests {
     }
 
     #[test]
+    fn worktree_teardown_deny_points_at_the_cleanup_tool() {
+        // Item #441 / vent #350: an agent denied mid-teardown needs the
+        // exact cleanup action, not the provisioning call.
+        let policy = ResolvedGitShimPolicy::baseline();
+        for sub in ["remove", "prune"] {
+            let d = classify_pure(
+                "worktree",
+                &args(&[sub, "../x"]),
+                "master",
+                &TrustRootTouch::Clean,
+                false,
+                &policy,
+            );
+            let Disposition::Deny { reason } = d else {
+                panic!("expected deny for worktree {sub}");
+            };
+            assert!(reason.contains("check_merge"), "{reason}");
+            assert!(reason.contains("audit --prune"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn worktree_provision_deny_points_at_the_claim_tool() {
+        let policy = ResolvedGitShimPolicy::baseline();
+        let d = classify_pure(
+            "worktree",
+            &args(&["add", "../x"]),
+            "master",
+            &TrustRootTouch::Clean,
+            false,
+            &policy,
+        );
+        let Disposition::Deny { reason } = d else {
+            panic!("expected deny for worktree add");
+        };
+        assert!(reason.contains("item(action=\"claim\""), "{reason}");
+    }
+
+    #[test]
     fn worktree_list_is_passthrough() {
         let policy = ResolvedGitShimPolicy::baseline();
         assert_eq!(
@@ -1157,6 +1308,61 @@ mod tests {
     }
 
     #[test]
+    fn branch_create_forms_are_recognized() {
+        assert!(is_branch_create("checkout", &args(&["-b", "feature/x"])));
+        assert!(is_branch_create("checkout", &args(&["-B", "feature/x"])));
+        assert!(is_branch_create("switch", &args(&["-c", "feature/x"])));
+        assert!(is_branch_create("switch", &args(&["-C", "feature/x"])));
+        assert!(!is_branch_create("checkout", &args(&["feature/x"])));
+        assert!(!is_branch_create(
+            "checkout",
+            &args(&["--detach", "feature/x"])
+        ));
+        assert!(!is_branch_create("push", &args(&["origin", "master"])));
+    }
+
+    #[test]
+    fn branch_create_recognizes_attached_and_long_forms() {
+        // Attached short-option spellings (`-bname`, not `-b name`).
+        assert!(is_branch_create("checkout", &args(&["-bfeature/x"])));
+        assert!(is_branch_create("checkout", &args(&["-Bfeature/x"])));
+        assert!(is_branch_create("switch", &args(&["-cfeature/x"])));
+        assert!(is_branch_create("switch", &args(&["-Cfeature/x"])));
+        // `--orphan` on both subcommands.
+        assert!(is_branch_create("checkout", &args(&["--orphan", "root"])));
+        assert!(is_branch_create("switch", &args(&["--orphan", "root"])));
+        // `switch`'s long forms of -c/-C, bare and `=name`.
+        assert!(is_branch_create(
+            "switch",
+            &args(&["--create", "feature/x"])
+        ));
+        assert!(is_branch_create("switch", &args(&["--create=feature/x"])));
+        assert!(is_branch_create(
+            "switch",
+            &args(&["--force-create", "feature/x"])
+        ));
+        // Scanning stops at `--`: nothing after it is an option.
+        assert!(!is_branch_create("checkout", &args(&["--", "-b"])));
+    }
+
+    #[test]
+    fn would_detach_head_false_for_branch_creating_checkout() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        // `checkout -b <name>` creates the branch and checks it out -- HEAD
+        // is never detached, even though the target branch doesn't exist yet.
+        assert!(!would_detach_head(
+            &repo.path,
+            "checkout",
+            &args(&["-b", "feature/x"])
+        ));
+        assert!(!would_detach_head(
+            &repo.path,
+            "switch",
+            &args(&["-c", "feature/x"])
+        ));
+    }
+
+    #[test]
     fn would_detach_head_true_for_explicit_detach_flag() {
         let repo = crate::shell::test_support::init_repo_with_branch("master");
         assert!(would_detach_head(
@@ -1209,6 +1415,84 @@ mod tests {
         assert!(is_destructive("clean", &args(&["-f", "-d"])));
         assert!(!is_destructive("clean", &args(&["-n"])));
         assert!(!is_destructive("clean", &args(&["--dry-run"])));
+    }
+
+    #[test]
+    fn reset_soft_divergence_warning_only_applies_to_soft_or_mixed_reset() {
+        // No I/O needed for these -- both bail out before touching the repo.
+        assert_eq!(
+            reset_soft_divergence_warning(
+                std::path::Path::new("."),
+                "reset",
+                &args(&["origin/master"])
+            ),
+            None
+        );
+        assert_eq!(
+            reset_soft_divergence_warning(
+                std::path::Path::new("."),
+                "reset",
+                &args(&["--hard", "origin/master"])
+            ),
+            None
+        );
+        assert_eq!(
+            reset_soft_divergence_warning(std::path::Path::new("."), "commit", &args(&["-m", "x"])),
+            None
+        );
+    }
+
+    #[test]
+    fn reset_soft_divergence_warning_none_without_explicit_target() {
+        assert_eq!(
+            reset_soft_divergence_warning(std::path::Path::new("."), "reset", &args(&["--soft"])),
+            None
+        );
+    }
+
+    #[test]
+    fn reset_soft_divergence_warning_fires_when_head_and_target_have_diverged() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        crate::shell::run_in(&repo.path, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.path.join("feature.txt"), "feature").unwrap();
+        crate::shell::run_in(&repo.path, &["add", "feature.txt"]).unwrap();
+        crate::shell::run_in(&repo.path, &["commit", "-m", "feature commit"]).unwrap();
+        crate::shell::run_in(&repo.path, &["checkout", "master"]).unwrap();
+        std::fs::write(repo.path.join("master.txt"), "master").unwrap();
+        crate::shell::run_in(&repo.path, &["add", "master.txt"]).unwrap();
+        crate::shell::run_in(&repo.path, &["commit", "-m", "master commit"]).unwrap();
+
+        let msg = reset_soft_divergence_warning(&repo.path, "reset", &args(&["--soft", "feature"]));
+        let msg = msg.expect("HEAD and feature have diverged -- expected a warning");
+        assert!(msg.contains("diverged"), "{msg}");
+        assert!(msg.contains("feature"), "{msg}");
+
+        let msg =
+            reset_soft_divergence_warning(&repo.path, "reset", &args(&["--mixed", "feature"]));
+        assert!(msg.is_some());
+    }
+
+    #[test]
+    fn reset_soft_divergence_warning_silent_on_clean_fast_forward() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        let base_sha = crate::shell::run_in(&repo.path, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(repo.path.join("a.txt"), "a").unwrap();
+        crate::shell::run_in(&repo.path, &["add", "a.txt"]).unwrap();
+        crate::shell::run_in(&repo.path, &["commit", "-m", "second"]).unwrap();
+
+        // `base_sha` is a strict ancestor of HEAD -- a clean fast-forward
+        // reset, not a divergence.
+        assert_eq!(
+            reset_soft_divergence_warning(&repo.path, "reset", &args(&["--soft", &base_sha])),
+            None
+        );
+        // And the reverse direction: HEAD is a strict ancestor of `feature`.
+        crate::shell::run_in(&repo.path, &["branch", "feature"]).unwrap();
+        crate::shell::run_in(&repo.path, &["reset", "--hard", &base_sha]).unwrap();
+        assert_eq!(
+            reset_soft_divergence_warning(&repo.path, "reset", &args(&["--soft", "feature"])),
+            None
+        );
     }
 
     fn single_ref(refs: Option<Vec<PushRef>>) -> PushRef {
