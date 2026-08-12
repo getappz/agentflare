@@ -43,6 +43,11 @@ pub struct WorkArgs {
     /// Max cost in USD before forced stop (Claude Code only).
     #[arg(long)]
     pub max_cost_usd: Option<f64>,
+    /// Model for the agent to use (e.g. `claude-sonnet-5`,
+    /// `anthropic/claude-sonnet-5`) — passed straight through as
+    /// `--model <name>`, no allowlist. Omit to use the agent's own default.
+    #[arg(long)]
+    pub model: Option<String>,
     /// Channel recipient for a handoff artifact on outcome.
     #[arg(long)]
     pub notify: Option<String>,
@@ -390,6 +395,7 @@ fn build_extra_args(
     agent: agent_registry::Agent,
     max_turns: Option<u64>,
     max_cost_usd: Option<f64>,
+    model: Option<&str>,
 ) -> Vec<String> {
     let mut args: Vec<String> = autonomous_args(agent)
         .into_iter()
@@ -410,6 +416,15 @@ fn build_extra_args(
         crate::ui::warning(
             "--max-turns/--max-cost-usd are only supported for claude-code currently — ignored",
         );
+    }
+    // `--model <name>`: confirmed via `claude --help` and `opencode run
+    // --help` that both take this same flag spelling — the only two agents
+    // that currently pass resolve_confirmed_agent. No allowlist: model
+    // catalogs change too often to hardcode, and the underlying CLI already
+    // errors on an unknown name.
+    if let Some(model) = model {
+        args.push("--model".to_string());
+        args.push(model.to_string());
     }
     args
 }
@@ -790,7 +805,12 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
     let prompt = build_prompt(&item_detail, &comments, latest_handoff.as_deref());
 
     // --- Extra args ---
-    let extra_args = build_extra_args(agent_enum, args.max_turns, args.max_cost_usd);
+    let extra_args = build_extra_args(
+        agent_enum,
+        args.max_turns,
+        args.max_cost_usd,
+        args.model.as_deref(),
+    );
 
     // --- Change to worktree dir and run ---
     let original_dir = std::env::current_dir().ok();
@@ -916,12 +936,13 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
 /// Runs an in-process work-item dispatch job for `agentflare_jobs::WorkerPool`
 /// (see `dispatch_item` in `src/supervisor.rs`, which enqueues jobs this
 /// executes) instead of the daemon spawning a fresh `agentflare work`
-/// subprocess per item. `args` is `[item_id, agent, folder_path]` — see
-/// `dispatch_item` for how it's built. `folder_path` is optional on read
-/// (via `args.get(2)`, not destructured like the first two) so a job
-/// already queued from before item #63 — `[item_id, agent]` only — still
-/// runs (against this process's cwd, the pre-#63 behavior) instead of
-/// failing outright on daemon upgrade.
+/// subprocess per item. `args` is `[item_id, agent, folder_path, model]` —
+/// see `dispatch_item`/`enqueue_work_job` for how it's built. `folder_path`
+/// and `model` are optional on read (via `args.get(2)`/`args.get(3)`, not
+/// destructured like the first two) so a job already queued from before
+/// item #63/#103 — `[item_id, agent]` or `[item_id, agent, folder_path]`
+/// only — still runs (against this process's cwd, or with no model
+/// override) instead of failing outright on daemon upgrade.
 pub struct WorkItemExecutor;
 
 impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
@@ -938,6 +959,7 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
             .into());
         };
         let repo_root = args.get(2).map(std::path::PathBuf::from);
+        let model = args.get(3).cloned();
         let work_args = WorkArgs {
             target: item_id.clone(),
             agent: Some(agent.clone()),
@@ -945,6 +967,7 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
             idle_timeout: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turns: None,
             max_cost_usd: None,
+            model,
             notify: None,
             repo_root,
         };
@@ -1487,7 +1510,7 @@ use  = "opencode"
         // object per turn/tool-call as it happens, giving a genuine
         // liveness signal; its final line carries the same {"result":...}
         // shape `parse_claude_reply` already expects.
-        let args = build_extra_args(agent_registry::Agent::ClaudeCode, None, None);
+        let args = build_extra_args(agent_registry::Agent::ClaudeCode, None, None, None);
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(args.contains(&"--output-format".to_string()));
         assert!(args.contains(&"stream-json".to_string()));
@@ -1498,15 +1521,39 @@ use  = "opencode"
 
     #[test]
     fn build_extra_args_passes_through_max_turns_and_cost_for_claude() {
-        let args = build_extra_args(agent_registry::Agent::ClaudeCode, Some(5), Some(2.5));
+        let args = build_extra_args(agent_registry::Agent::ClaudeCode, Some(5), Some(2.5), None);
         assert!(args.contains(&"--max-turns=5".to_string()));
         assert!(args.contains(&"--max-budget-usd=2.5".to_string()));
     }
 
     #[test]
     fn build_extra_args_for_codex_has_bypass_but_no_json_output() {
-        let args = build_extra_args(agent_registry::Agent::Codex, None, None);
+        let args = build_extra_args(agent_registry::Agent::Codex, None, None, None);
         assert_eq!(args, vec!["--full-auto".to_string()]);
+    }
+
+    #[test]
+    fn build_extra_args_passes_through_model_for_any_confirmed_agent() {
+        let args = build_extra_args(
+            agent_registry::Agent::Opencode,
+            None,
+            None,
+            Some("anthropic/claude-sonnet-5"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--auto".to_string(),
+                "--model".to_string(),
+                "anthropic/claude-sonnet-5".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_extra_args_omits_model_flag_when_none() {
+        let args = build_extra_args(agent_registry::Agent::Codex, None, None, None);
+        assert!(!args.iter().any(|a| a == "--model"));
     }
 
     fn seeded_item(
