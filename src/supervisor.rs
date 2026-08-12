@@ -732,7 +732,7 @@ mod tests {
         );
     }
 
-    #[path = "supervisor_host_gate_tests.rs"]
+    #[path = "../../supervisor_host_gate_tests.rs"]
     mod host_gate_tests;
 
     fn seed_ready_item_under_gated_goal(mcp: &AgentflareMcp) -> String {
