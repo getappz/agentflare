@@ -573,6 +573,67 @@ fn create_worktree_reuses_an_existing_worktree_when_called_from_the_repo_root() 
 }
 
 #[test]
+fn create_worktree_reuses_a_legacy_bare_branch_worktree_predating_the_slug_scheme() {
+    // item #447's actual failure: its worktree was created (by hand, or by
+    // an older agentflare build) on the bare `task/<seq>` branch, before
+    // the slugged `task/<seq>-<slug>` naming scheme existed. A later
+    // re-claim recomputes a slugged name from the item's title and, prior
+    // to this fix, missed the existing worktree entirely -- `git worktree
+    // add` then collided with the already-occupied path (item #459).
+    let repo = init_repo();
+    let worktree_path = repo.path.join(".worktrees").join("task").join("1");
+    std::fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
+    run_git_in(
+        &repo.path,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "task/1",
+            worktree_path.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+
+    let item = test_item_named(1, "EPIC: a real title with words to slug");
+    let target = resolve_default_branch(&repo.path);
+    let result = create_worktree(&item, &repo.path, &target, None);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(result.unwrap(), worktree_path);
+    let checked_out = run_git_in(&worktree_path, &["branch", "--show-current"]).unwrap();
+    assert_eq!(
+        checked_out, "task/1",
+        "must reuse the legacy bare branch, not collide trying to create a slugged one"
+    );
+}
+
+#[test]
+fn create_worktree_reuses_an_existing_worktree_when_the_items_title_changed() {
+    // A renamed item's freshly-recomputed slug no longer matches what's
+    // already checked out -- the same collision as the legacy-branch case
+    // above, but triggered by an ordinary title edit instead of an old
+    // naming scheme.
+    let repo = init_repo();
+    let target = resolve_default_branch(&repo.path);
+    let original = test_item_named(1, "original title");
+    let worktree_path = create_worktree(&original, &repo.path, &target, None).unwrap();
+    let original_branch = run_git_in(&worktree_path, &["branch", "--show-current"]).unwrap();
+    assert_eq!(original_branch, "task/1-original-title");
+
+    let renamed = test_item_named(1, "a completely different title");
+    let result = create_worktree(&renamed, &repo.path, &target, None);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(result.unwrap(), worktree_path);
+    let checked_out = run_git_in(&worktree_path, &["branch", "--show-current"]).unwrap();
+    assert_eq!(
+        checked_out, original_branch,
+        "must reuse the branch the worktree is actually on, not the freshly-slugged one"
+    );
+}
+
+#[test]
 fn create_worktree_soft_fails_on_bad_git() {
     let tmp = TempDir::new().unwrap();
     let bad_root = tmp.path().join("not-a-repo");

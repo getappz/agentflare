@@ -268,6 +268,32 @@ pub fn task_branch_name(item: &Item) -> String {
     }
 }
 
+/// The branch `item`'s worktree is (or should be) on: whatever a worktree
+/// already sitting at `worktree_path` is *actually* checked out to, falling
+/// back to the freshly-derived `task_branch_name` only when no worktree
+/// exists there yet.
+///
+/// `task_branch_name` recomputes its slug from `item.name` every call, so it
+/// silently changes if the item gets renamed between claims -- and a
+/// worktree created before this slugged naming scheme existed simply sits on
+/// the bare `task/<sequence_id>`. Either way, re-deriving a slug that
+/// doesn't match what's already checked out makes `create_worktree`'s
+/// re-claim detection miss the existing worktree, so `git worktree add`
+/// collides with the already-occupied path instead of reusing it (item
+/// #459's dispatch-blocking loop on item #447, which predates the slugged
+/// scheme).
+fn resolve_worktree_branch(item: &Item, worktree_path: &Path) -> String {
+    if worktree_path.is_dir()
+        && let Ok(current) = run_git_in(worktree_path, &["branch", "--show-current"])
+        && !current.is_empty()
+        && (current == format!("task/{}", item.sequence_id)
+            || current.starts_with(&format!("task/{}-", item.sequence_id)))
+    {
+        return current;
+    }
+    task_branch_name(item)
+}
+
 /// Creates an isolated git worktree for `item` against `target_branch`.
 ///
 /// Deliberately takes an already-resolved `target_branch` instead of a
@@ -282,11 +308,11 @@ pub fn create_worktree(
     target_branch: &str,
     progress: Option<&dyn Progress>,
 ) -> Result<PathBuf, String> {
-    let branch = task_branch_name(item);
     let worktree_path = repo_root
         .join(".worktrees")
         .join("task")
         .join(item.sequence_id.to_string());
+    let branch = resolve_worktree_branch(item, &worktree_path);
     // Two ways a re-claim can find its own worktree already in place:
     // `already_isolated_for` catches the recursive case (the calling
     // process is itself already running from inside it), but the daemon's
@@ -567,7 +593,6 @@ pub fn push_branch(
     target_branch: &str,
     progress: Option<&dyn Progress>,
 ) -> Option<String> {
-    let branch = task_branch_name(item);
     let worktree_path = repo_root
         .join(".worktrees")
         .join("task")
@@ -575,6 +600,7 @@ pub fn push_branch(
     if !worktree_path.exists() {
         return None; // nothing was ever claimed into a worktree for this item
     }
+    let branch = resolve_worktree_branch(item, &worktree_path);
     // Nothing to push (and nothing worth a PR) if the branch never
     // diverged from its target — e.g. `done` called with no commits made.
     if !branch_diverged(repo_root, &branch, target_branch) {

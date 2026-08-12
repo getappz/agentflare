@@ -4,8 +4,8 @@
 //! migration list is handed to it.
 
 use rusqlite::Connection;
-use rusqlite_migration::Migrations;
-use std::path::Path;
+use rusqlite_migration::{MigrationDefinitionError, Migrations};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -13,6 +13,42 @@ pub enum Error {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Migration(#[from] rusqlite_migration::Error),
+    /// The database's recorded schema version is higher than the newest
+    /// migration this binary knows about. Always means a *different* build
+    /// of agentflare (usually installed over the shared binary via
+    /// `dev-install` from a work-in-progress branch) already applied a
+    /// migration that hasn't reached the branch this binary was built from
+    /// -- rusqlite_migration has no downgrade path, so it refuses to touch
+    /// the database rather than guess.
+    #[error(
+        "{path} is at schema version {applied}, newer than any migration this \
+         agentflare build knows about. This means a different (often WIP/unmerged) \
+         build applied a migration -- usually via `dev-install` from a branch that \
+         adds a `migrations/NNNN_*.sql` file not yet on this binary's branch. Fix: \
+         find and merge/cherry-pick that migration file (and its registration in \
+         this crate's `db.rs`), then rebuild. Do not edit `PRAGMA user_version` by \
+         hand -- the schema on disk already reflects the missing migration."
+    )]
+    SchemaAhead { path: PathBuf, applied: i64 },
+}
+
+/// Runs `migrations.to_latest`, upgrading the generic "too high" error into
+/// [`Error::SchemaAhead`] with the actual recorded version so the message is
+/// actionable instead of a bare rusqlite_migration string with no next step.
+fn migrate(path: &Path, conn: &mut Connection, migrations: &Migrations) -> Result<(), Error> {
+    match migrations.to_latest(conn) {
+        Ok(()) => Ok(()),
+        Err(rusqlite_migration::Error::MigrationDefinition(
+            MigrationDefinitionError::DatabaseTooFarAhead,
+        )) => {
+            let applied: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            Err(Error::SchemaAhead {
+                path: path.to_path_buf(),
+                applied,
+            })
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn open_file(path: &Path, migrations: &Migrations) -> Result<Connection, Error> {
@@ -39,7 +75,7 @@ pub fn open_file(path: &Path, migrations: &Migrations) -> Result<Connection, Err
     // WAL's own guarantees.
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     enforce_foreign_keys(&conn)?;
-    migrations.to_latest(&mut conn)?;
+    migrate(path, &mut conn, migrations)?;
     Ok(conn)
 }
 
@@ -125,5 +161,25 @@ mod tests {
             M::up("DELETE FROM parent WHERE id = 1;"),
         ]);
         assert!(open_memory(&migrations).is_err());
+    }
+
+    /// Reproduces the real-world failure this crate exists to make
+    /// diagnosable: a DB previously opened by a build with more migrations
+    /// (e.g. a WIP branch dev-installed over the shared binary) than the
+    /// build now opening it knows about. Must surface as `SchemaAhead` with
+    /// the actual recorded version, not the bare upstream "too high" string.
+    #[test]
+    fn a_database_migrated_by_a_newer_build_reports_schema_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+
+        let ahead = Migrations::new(vec![M::up(PARENT_CHILD), M::up("-- pretend v2")]);
+        drop(open_file(&path, &ahead).unwrap());
+
+        let err = open_file(&path, &migrations()).unwrap_err();
+        match err {
+            Error::SchemaAhead { applied, .. } => assert_eq!(applied, 2),
+            other => panic!("expected SchemaAhead, got {other:?}"),
+        }
     }
 }
