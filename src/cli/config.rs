@@ -12,18 +12,11 @@ pub struct ConfigArgs {
 #[derive(Subcommand)]
 pub enum ConfigAction {
     /// Set a config value.
-    Set {
-        key: ConfigKey,
-        value: String,
-    },
+    Set { key: ConfigKey, value: String },
     /// Print a config value's resolved (post-fallback) value.
-    Get {
-        key: ConfigKey,
-    },
+    Get { key: ConfigKey },
     /// Remove a config value, reverting to its fallback.
-    Unset {
-        key: ConfigKey,
-    },
+    Unset { key: ConfigKey },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
