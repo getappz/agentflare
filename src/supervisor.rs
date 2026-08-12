@@ -593,8 +593,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_confirmed_agent_rejects_opencode() {
-        assert_eq!(resolve_confirmed_agent("opencode"), None);
+    fn resolve_confirmed_agent_accepts_opencode() {
+        assert_eq!(
+            resolve_confirmed_agent("opencode"),
+            Some(agent_registry::Agent::Opencode)
+        );
     }
 
     #[test]
@@ -1041,7 +1044,10 @@ mod tests {
     fn unconfirmed_agent_gets_skipped_not_dispatched() {
         let mcp = test_mcp();
         let queue = test_queue();
-        let item_id = seed_ready_item(&mcp, Some("opencode"));
+        // cursor has a REGISTRY entry but no autonomous_args mapped, so it's
+        // still "unconfirmed" for autonomous dispatch (unlike opencode, now
+        // that autonomous_args(Agent::Opencode) is Some(&["--auto"])).
+        let item_id = seed_ready_item(&mcp, Some("cursor"));
 
         let auth_conn = test_auth_conn();
         let result = run_discovery_tick(
