@@ -1,6 +1,6 @@
 //! Decision logic — turn raw [`Signals`] + config into a [`Policy`].
 
-use crate::config::{GateConfig, GateMode};
+use crate::config::{DEFAULT_CPU_BUSY_PCT, DEFAULT_CPU_SEVERE_PCT, GateConfig, GateMode};
 use crate::signals::Signals;
 
 /// Why the gate is currently paused. Carried by [`Policy::Paused`] so
@@ -81,8 +81,17 @@ pub fn decide(signals: &Signals, cfg: &GateConfig) -> Policy {
 
     // Clamp config-supplied thresholds so a malformed override can't
     // silently disable or force-throttle dispatch.
-    let cpu_threshold = cfg.cpu_busy_threshold_pct.clamp(0.0, 100.0);
-    let cpu_severe = cfg.cpu_severe_pct.clamp(0.0, 100.0);
+    let mut cpu_threshold = cfg.cpu_busy_threshold_pct.clamp(0.0, 100.0);
+    let mut cpu_severe = cfg.cpu_severe_pct.clamp(0.0, 100.0);
+    // Range-clamping each value independently still admits an inverted pair
+    // (busy >= severe), which collapses the tier ladder: every CPU reading
+    // above `severe` pauses before it can ever be judged merely busy, so
+    // `Throttled` becomes unreachable. `GateConfig`'s fields are public, so
+    // this has to be enforced here rather than only in `from_env`.
+    if cpu_threshold >= cpu_severe {
+        cpu_threshold = DEFAULT_CPU_BUSY_PCT;
+        cpu_severe = DEFAULT_CPU_SEVERE_PCT;
+    }
 
     if signals.cpu_usage_pct >= cpu_severe {
         return Policy::Paused {
@@ -207,14 +216,56 @@ mod tests {
         c.cpu_severe_pct = 200.0;
         let p = decide(&signals(99.9, false), &c);
         assert_eq!(p, Policy::Throttled);
-        // Negative clamps to 0.0 — any positive CPU usage pauses.
+        // A negative severe threshold clamps to 0.0, which puts it at or
+        // below the busy threshold — an inverted pair. Rather than let that
+        // pause dispatch forever on any CPU above zero (the exact
+        // force-throttle failure the clamping exists to prevent), the
+        // ordering guard recovers the default pair.
         c.cpu_severe_pct = -10.0;
-        let p = decide(&signals(0.5, false), &c);
+        assert_eq!(decide(&signals(0.5, false), &c), Policy::Normal);
+    }
+
+    /// An inverted pair (busy >= severe) would otherwise collapse the tier
+    /// ladder — everything above `severe` pauses before it can be judged
+    /// merely busy, making `Throttled` unreachable. Both fields are public,
+    /// so `decide` must defend itself rather than trust `from_env`.
+    #[test]
+    fn inverted_thresholds_fall_back_to_defaults_and_keep_all_three_tiers() {
+        let mut c = cfg(GateMode::Auto);
+        c.cpu_busy_threshold_pct = 95.0;
+        c.cpu_severe_pct = 80.0;
+
+        // Below the default busy threshold — Normal, not Paused.
+        assert_eq!(decide(&signals(10.0, false), &c), Policy::Normal);
+        // Between the default busy and severe thresholds — Throttled stays
+        // reachable, which is the whole point of the fallback.
+        assert_eq!(decide(&signals(85.0, false), &c), Policy::Throttled);
+        // At/above the default severe threshold — Paused.
         assert_eq!(
-            p,
+            decide(&signals(99.0, false), &c),
             Policy::Paused {
                 reason: PauseReason::CpuPressure
             }
+        );
+    }
+
+    #[test]
+    fn equal_thresholds_also_fall_back_rather_than_erasing_throttled() {
+        let mut c = cfg(GateMode::Auto);
+        c.cpu_busy_threshold_pct = 60.0;
+        c.cpu_severe_pct = 60.0;
+        // Without the fallback this would pause; with it, 85 lands in the
+        // default Throttled band.
+        assert_eq!(decide(&signals(85.0, false), &c), Policy::Throttled);
+        assert_eq!(
+            decide(&signals(DEFAULT_CPU_SEVERE_PCT, false), &c),
+            Policy::Paused {
+                reason: PauseReason::CpuPressure
+            }
+        );
+        assert_eq!(
+            decide(&signals(DEFAULT_CPU_BUSY_PCT - 1.0, false), &c),
+            Policy::Normal
         );
     }
 

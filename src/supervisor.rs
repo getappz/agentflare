@@ -348,6 +348,22 @@ pub(crate) struct ReviewSweepResult {
     pub promoted: usize,
     pub self_repaired: usize,
     pub skipped: usize,
+    /// Items a later sweep should retry (agent cooling down, or the host
+    /// resource gate throttling/pausing dispatch) rather than ones this
+    /// sweep decided against. Mirrors `DiscoveryTickResult::waiting` — a
+    /// deferral counted as "skipped" reads to an operator as a decision
+    /// that won't be revisited, which is exactly backwards (item #82).
+    pub waiting: usize,
+}
+
+/// Why `self_repair_or_gate` did or didn't dispatch. A plain `bool` can't
+/// distinguish "decided against this item" from "try again next sweep".
+enum SelfRepairOutcome {
+    Dispatched,
+    /// Retryable: the blocking condition (cooldown, host pressure) is
+    /// expected to clear on its own.
+    Deferred,
+    Skipped,
 }
 
 /// One pass: list items in the "in_review" state group (an open PR), poll
@@ -369,6 +385,7 @@ pub(crate) fn run_review_sweep(
         promoted: 0,
         self_repaired: 0,
         skipped: 0,
+        waiting: 0,
     };
 
     let fetched = mcp.with_backend_db(|conn| {
@@ -407,7 +424,7 @@ pub(crate) fn run_review_sweep(
                 }
             }
             crate::worktree::PrCiStatus::Failing(failed_checks) => {
-                if self_repair_or_gate(
+                match self_repair_or_gate(
                     mcp,
                     queue,
                     auth_conn,
@@ -416,9 +433,9 @@ pub(crate) fn run_review_sweep(
                     &failed_checks,
                     &label_id_by_name,
                 ) {
-                    result.self_repaired += 1;
-                } else {
-                    result.skipped += 1;
+                    SelfRepairOutcome::Dispatched => result.self_repaired += 1,
+                    SelfRepairOutcome::Deferred => result.waiting += 1,
+                    SelfRepairOutcome::Skipped => result.skipped += 1,
                 }
             }
             crate::worktree::PrCiStatus::Pending
@@ -464,7 +481,6 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
 /// Dispatches a self-repair job for an item whose PR has failing CI checks,
 /// or -- once `quota::decide::SELF_REPAIR_CAP` prior attempts have been made
 /// with no green build -- gates it for a human instead of retrying forever.
-/// Returns whether a repair job was dispatched.
 fn self_repair_or_gate(
     mcp: &AgentflareMcp,
     queue: &agentflare_jobs::Queue,
@@ -473,7 +489,7 @@ fn self_repair_or_gate(
     item: &agentflare_backend::item::Item,
     failed_checks: &[String],
     label_id_by_name: &std::collections::HashMap<String, String>,
-) -> bool {
+) -> SelfRepairOutcome {
     let already_gated = label_id_by_name
         .get(NEEDS_HUMAN_GATE_LABEL)
         .is_some_and(|gate_id| {
@@ -483,7 +499,7 @@ fn self_repair_or_gate(
                 .is_some_and(|ids| ids.contains(gate_id))
         });
     if already_gated || job_in_flight(queue, &item.id) {
-        return false;
+        return SelfRepairOutcome::Skipped;
     }
 
     let prior_attempts = mcp
@@ -518,7 +534,7 @@ fn self_repair_or_gate(
                 ..Default::default()
             });
         }
-        return false;
+        return SelfRepairOutcome::Skipped;
     }
 
     let Some(agent) = item
@@ -526,18 +542,18 @@ fn self_repair_or_gate(
         .as_deref()
         .and_then(resolve_confirmed_agent)
     else {
-        return false;
+        return SelfRepairOutcome::Skipped;
     };
     if crate::auth_db::is_cooling_down(auth_conn, agent.as_str()) {
-        return false;
+        return SelfRepairOutcome::Deferred;
     }
     // Independent of the per-agent cooldown above — the host's own
     // CPU-pressure tier. Both gates must pass.
     if host_policy.blocks_dispatch() {
-        return false;
+        return SelfRepairOutcome::Deferred;
     }
     let Some(info) = enqueue_work_job(queue, item, agent, None) else {
-        return false;
+        return SelfRepairOutcome::Skipped;
     };
     let _ = mcp.comment_impl(CommentRequest {
         action: "create".into(),
@@ -550,7 +566,7 @@ fn self_repair_or_gate(
         )),
         ..Default::default()
     });
-    true
+    SelfRepairOutcome::Dispatched
 }
 
 #[cfg(test)]
@@ -732,7 +748,6 @@ mod tests {
         );
     }
 
-    #[path = "../../supervisor_host_gate_tests.rs"]
     mod host_gate_tests;
 
     fn seed_ready_item_under_gated_goal(mcp: &AgentflareMcp) -> String {
@@ -1331,7 +1346,7 @@ mod tests {
         let label_id_by_name = seed_gate_label(&mcp);
         let auth_conn = test_auth_conn();
 
-        let dispatched = self_repair_or_gate(
+        let outcome = self_repair_or_gate(
             &mcp,
             &queue,
             &auth_conn,
@@ -1341,7 +1356,7 @@ mod tests {
             &label_id_by_name,
         );
 
-        assert!(dispatched);
+        assert!(matches!(outcome, SelfRepairOutcome::Dispatched));
         let jobs = queue.list(None).unwrap();
         assert_eq!(jobs.len(), 1);
         assert!(jobs[0].args.contains(&item_id));
@@ -1380,7 +1395,7 @@ mod tests {
             .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
             .unwrap();
 
-        let dispatched = self_repair_or_gate(
+        let outcome = self_repair_or_gate(
             &mcp,
             &queue,
             &auth_conn,
@@ -1390,7 +1405,7 @@ mod tests {
             &label_id_by_name,
         );
 
-        assert!(!dispatched);
+        assert!(matches!(outcome, SelfRepairOutcome::Skipped));
         assert!(queue.list(None).unwrap().is_empty());
         let labels = mcp
             .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
@@ -1416,7 +1431,7 @@ mod tests {
             .unwrap();
         let auth_conn = test_auth_conn();
 
-        let dispatched = self_repair_or_gate(
+        let outcome = self_repair_or_gate(
             &mcp,
             &queue,
             &auth_conn,
@@ -1426,7 +1441,7 @@ mod tests {
             &label_id_by_name,
         );
 
-        assert!(!dispatched);
+        assert!(matches!(outcome, SelfRepairOutcome::Skipped));
         assert!(queue.list(None).unwrap().is_empty());
     }
 
@@ -1445,7 +1460,7 @@ mod tests {
             .in_process();
         queue.enqueue(&job).unwrap();
 
-        let dispatched = self_repair_or_gate(
+        let outcome = self_repair_or_gate(
             &mcp,
             &queue,
             &auth_conn,
@@ -1455,7 +1470,7 @@ mod tests {
             &label_id_by_name,
         );
 
-        assert!(!dispatched);
+        assert!(matches!(outcome, SelfRepairOutcome::Skipped));
         assert_eq!(
             queue.list(None).unwrap().len(),
             1,

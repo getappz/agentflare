@@ -288,10 +288,10 @@ fn spawn_supervisor_review_sweep(
             })
             .await;
             match result {
-                Ok(summary) if summary.promoted > 0 || summary.self_repaired > 0 => {
+                Ok(s) if s.promoted > 0 || s.self_repaired > 0 || s.waiting > 0 => {
                     eprintln!(
-                        "agentflare-supervisor: review sweep promoted {}, self-repaired {}, skipped {}",
-                        summary.promoted, summary.self_repaired, summary.skipped
+                        "agentflare-supervisor: review sweep promoted {}, self-repaired {}, skipped {}, waiting {}",
+                        s.promoted, s.self_repaired, s.skipped, s.waiting
                     );
                 }
                 Ok(_) => {}

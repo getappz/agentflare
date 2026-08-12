@@ -2,6 +2,11 @@
 //! in `~/.agentflare/config.toml` once epic #331's loader exists (don't
 //! block this on that epic landing first).
 
+/// Shared by [`GateConfig::from_env`] and by `policy::decide`'s
+/// inverted-threshold fallback, so both recover to the same sane pair.
+pub const DEFAULT_CPU_BUSY_PCT: f32 = 80.0;
+pub const DEFAULT_CPU_SEVERE_PCT: f32 = 95.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateMode {
     /// Sample signals and decide a tier dynamically (the default).
@@ -30,8 +35,14 @@ impl GateConfig {
                     .ok()
                     .as_deref(),
             ),
-            cpu_busy_threshold_pct: parse_f32_env("AGENTFLARE_DISPATCH_GATE_CPU_BUSY_PCT", 80.0),
-            cpu_severe_pct: parse_f32_env("AGENTFLARE_DISPATCH_GATE_CPU_SEVERE_PCT", 95.0),
+            cpu_busy_threshold_pct: parse_f32_env(
+                "AGENTFLARE_DISPATCH_GATE_CPU_BUSY_PCT",
+                DEFAULT_CPU_BUSY_PCT,
+            ),
+            cpu_severe_pct: parse_f32_env(
+                "AGENTFLARE_DISPATCH_GATE_CPU_SEVERE_PCT",
+                DEFAULT_CPU_SEVERE_PCT,
+            ),
         }
     }
 }
