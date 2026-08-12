@@ -239,7 +239,11 @@ pub fn respawn_from_stale(snapshot: &BinarySnapshot) -> ! {
     let binary = snapshot.path().to_string_lossy().to_string();
     // Must match `start_daemon`'s own spawn call -- both need the installed
     // systemd/launchd units' `serve --_foreground-daemon` invocation.
-    match process::spawn_detached(&binary, &["serve", "--_foreground-daemon"], Some(&daemon_log_path())) {
+    match process::spawn_detached(
+        &binary,
+        &["serve", "--_foreground-daemon"],
+        Some(&daemon_log_path()),
+    ) {
         Ok(pid) => eprintln!("agentflare-daemon: respawned as pid {pid}"),
         Err(e) => eprintln!(
             "agentflare-daemon: failed to respawn ({e}); exiting anyway -- a process \
