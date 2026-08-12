@@ -131,7 +131,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             .await;
 
         let (tx, mut rx) = tokio::sync::oneshot::channel::<EntryResult>();
-        let key = format!("{run_id}:{name}");
+        // Keyed per step instance (not just run+name): two concurrent
+        // `wait_event` steps in the same run sharing an event name must not
+        // collide and silently drop each other's waiter.
+        let key = format!("{run_id}:{}:{name}", step.id);
         self.waiters.lock().insert(key.clone(), tx);
 
         // Wait on the fast-path oneshot AND a periodic journal poll:
@@ -237,7 +240,6 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         name: &str,
         result: EntryResult,
     ) -> WorkflowResult<()> {
-        let key = format!("{run_id}:{name}");
         // Durable: the journaled completion is the source of truth.
         self.state_store
             .append_journal(
@@ -248,9 +250,23 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 },
             )
             .await?;
-        // Fast-path: wake an in-process waiter in this engine.
-        if let Some(tx) = self.waiters.lock().remove(&key) {
-            let _ = tx.send(result);
+        // Fast-path: wake every in-process waiter for this run+event name —
+        // multiple steps may be waiting on the same name concurrently, each
+        // keyed by its own step id.
+        let prefix = format!("{run_id}:");
+        let suffix = format!(":{name}");
+        let matching: Vec<String> = {
+            let waiters = self.waiters.lock();
+            waiters
+                .keys()
+                .filter(|k| k.starts_with(&prefix) && k.ends_with(&suffix))
+                .cloned()
+                .collect()
+        };
+        for key in matching {
+            if let Some(tx) = self.waiters.lock().remove(&key) {
+                let _ = tx.send(result.clone());
+            }
         }
         Ok(())
     }

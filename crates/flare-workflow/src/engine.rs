@@ -144,10 +144,16 @@ pub struct WorkflowEngine<D: WorkflowData, S: StateStore<D> = InMemoryStore<D>> 
     /// Jitter factor applied to retry backoff delays (0.0-1.0).
     jitter: f64,
     /// In-process completions for pending `WaitEvent` steps, keyed by
-    /// `"{run_id}:{name}"`. A completed event is also journaled so it survives
-    /// restart and pre-delivery races.
+    /// `"{run_id}:{step_id}:{name}"`. A completed event is also journaled so
+    /// it survives restart and pre-delivery races.
     pub(crate) waiters:
         Arc<parking_lot::Mutex<HashMap<String, tokio::sync::oneshot::Sender<EntryResult>>>>,
+    /// Runtime to spawn execution/cleanup tasks on. `None` uses the ambient
+    /// `tokio::spawn` (whatever runtime called into the engine); callers that
+    /// must keep workflow execution off a shared/single-threaded runtime
+    /// (e.g. a daemon's MCP handler loop) set this to an isolated runtime via
+    /// [`with_runtime_handle`](Self::with_runtime_handle).
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl<D: WorkflowData> WorkflowEngine<D, InMemoryStore<D>> {
@@ -167,6 +173,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             active_workflows: Arc::new(AtomicUsize::new(0)),
             jitter: 0.0,
             waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            runtime: None,
         }
     }
 
@@ -174,6 +181,27 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     pub fn with_jitter(mut self, jitter: f64) -> Self {
         self.jitter = jitter.clamp(0.0, 1.0);
         self
+    }
+
+    /// Spawn all workflow execution and background tasks on `handle` instead
+    /// of the ambient runtime. Use this when the engine is driven from a
+    /// runtime that must not block (e.g. a daemon's single-threaded MCP
+    /// handler loop) so agent calls and SQLite I/O run on an isolated pool.
+    pub fn with_runtime_handle(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.runtime = Some(handle);
+        self
+    }
+
+    /// Spawn `fut` on the configured runtime, or the ambient one if none was set.
+    fn spawn<F>(&self, fut: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        match &self.runtime {
+            Some(handle) => handle.spawn(fut),
+            None => tokio::spawn(fut),
+        }
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -247,7 +275,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let interval = interval.unwrap_or(Duration::from_secs(300));
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        tokio::spawn(async move {
+        self.spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -339,7 +367,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
         let engine = self.clone_for_execution();
         let def = Arc::clone(&definition);
-        tokio::spawn(async move {
+        self.spawn(async move {
             let _guard = engine.active_workflow_guard();
             if let Err(e) = engine.execute_workflow(run_id, def).await {
                 tracing::error!(run_id = %run_id, error = ?e, "Workflow execution failed");
@@ -372,7 +400,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             let engine = self.clone_for_execution();
             let guard = self.active_workflow_guard();
             let definition = Arc::clone(&definition);
-            tokio::spawn(async move {
+            self.spawn(async move {
                 let _guard = guard;
                 if let Err(e) = engine.execute_workflow(run_id, definition).await {
                     tracing::error!(run_id = %run_id, error = ?e, "Recovered workflow failed to resume");
@@ -514,11 +542,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             }
 
             // Phase 0: drain completion signals so dependents are added.
-            while let Ok((step_id, result)) = rx.try_recv() {
-                if matches!(result, StepResult::Success | StepResult::Skip) {
-                    for &dep_idx in definition.get_dependent_indices(&step_id) {
-                        pending_check.push_back(dep_idx);
-                    }
+            // Forward on *any* terminal result, not just Success/Skip: a
+            // failed step's dependents must still reach Phase 1 so they get
+            // an explicit blocked/Skipped status instead of staying Pending
+            // forever (see the deps_blocked_indices handling below).
+            while let Ok((step_id, _result)) = rx.try_recv() {
+                for &dep_idx in definition.get_dependent_indices(&step_id) {
+                    pending_check.push_back(dep_idx);
                 }
             }
 
@@ -526,31 +556,69 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             let (
                 newly_ready_from_wait,
                 deps_ready_indices,
+                deps_blocked_indices,
                 total_processed,
                 current_running,
                 current_waiting,
             ) = {
                 let t = tracker.read();
                 let wait_ready = t.get_ready_waiting_indices();
-                let deps_ready: Vec<usize> = pending_check
-                    .drain(..)
-                    .filter(|&idx| {
-                        let step = &definition.steps[idx];
-                        t.is_step_processable(&step.id, idx)
-                            && t.are_dependencies_satisfied(&step.depends_on)
-                            && t.is_any_dependency_satisfied(&step.depends_on_any)
-                            && !t.has_failed_dependency(&step.depends_on)
-                            && !t.have_all_any_deps_failed(&step.depends_on_any)
-                    })
-                    .collect();
+                let mut deps_ready = Vec::new();
+                let mut deps_blocked = Vec::new();
+                for idx in pending_check.drain(..) {
+                    let step = &definition.steps[idx];
+                    if !t.is_step_processable(&step.id, idx) {
+                        continue;
+                    }
+                    if t.has_failed_dependency(&step.depends_on)
+                        || t.have_all_any_deps_failed(&step.depends_on_any)
+                    {
+                        deps_blocked.push(idx);
+                    } else if t.are_dependencies_satisfied(&step.depends_on)
+                        && t.is_any_dependency_satisfied(&step.depends_on_any)
+                    {
+                        deps_ready.push(idx);
+                    }
+                }
                 (
                     wait_ready,
                     deps_ready,
+                    deps_blocked,
                     t.total_processed(),
                     t.running.len(),
                     t.waiting_until.len(),
                 )
             };
+
+            // A step blocked by a failed dependency never becomes ready and
+            // was previously just dropped, leaving its `step_states` status
+            // stuck at `Pending` forever. Give it an explicit terminal status
+            // and cascade the same treatment to its own dependents.
+            if !deps_blocked_indices.is_empty() {
+                {
+                    let mut t = tracker.write();
+                    for &idx in &deps_blocked_indices {
+                        t.skipped.insert(definition.steps[idx].id.clone());
+                    }
+                }
+                for &idx in &deps_blocked_indices {
+                    let step_id = definition.steps[idx].id.clone();
+                    let _ = self
+                        .state_store
+                        .update(run_id, |s| {
+                            if let Some(ss) = s.step_states.get_mut(&step_id) {
+                                ss.status = StepStatus::Skipped;
+                                ss.last_error =
+                                    Some("skipped: upstream dependency failed".to_string());
+                                ss.completed_at = Some(Utc::now());
+                            }
+                        })
+                        .await;
+                    for &dep_idx in definition.get_dependent_indices(&step_id) {
+                        pending_check.push_back(dep_idx);
+                    }
+                }
+            }
 
             // Phase 2: process waiting/deps-ready, dedup, launch.
             let (ready_to_launch, steps_added_to_waiting) = {
@@ -600,12 +668,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 && pending_check.is_empty()
             {
                 let mut drained_completion = false;
-                while let Ok((step_id, result)) = rx.try_recv() {
+                while let Ok((step_id, _result)) = rx.try_recv() {
                     drained_completion = true;
-                    if matches!(result, StepResult::Success | StepResult::Skip) {
-                        for &dep_idx in definition.get_dependent_indices(&step_id) {
-                            pending_check.push_back(dep_idx);
-                        }
+                    for &dep_idx in definition.get_dependent_indices(&step_id) {
+                        pending_check.push_back(dep_idx);
                     }
                 }
                 if drained_completion {
@@ -833,9 +899,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             };
 
             if has_running {
-                if let Some((completed_step_id, result)) = rx.recv().await
-                    && matches!(result, StepResult::Success | StepResult::Skip)
-                {
+                if let Some((completed_step_id, _result)) = rx.recv().await {
                     for &dep_idx in definition.get_dependent_indices(&completed_step_id) {
                         pending_check.push_back(dep_idx);
                     }
@@ -1322,6 +1386,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             active_workflows: Arc::clone(&self.active_workflows),
             jitter: self.jitter,
             waiters: Arc::clone(&self.waiters),
+            runtime: self.runtime.clone(),
         }
     }
 }

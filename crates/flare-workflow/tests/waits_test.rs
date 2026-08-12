@@ -148,6 +148,54 @@ async fn wait_event_pre_delivery_before_wait() {
 }
 
 #[tokio::test]
+async fn concurrent_wait_events_same_name_both_resolve() {
+    // Two independent steps waiting on the same event name must not collide:
+    // a single `complete_event` call resolves both, not just whichever
+    // registered its in-process waiter last.
+    let engine = engine();
+    let wf = WorkflowDefinition::new("wf", "wf")
+        .add_step(
+            StepDefinition::new("approve_a", "approve_a", noop_executor::<Ctx>()).with_mode(
+                StepMode::WaitEvent {
+                    name: "approve".into(),
+                    timeout_secs: 10,
+                },
+            ),
+        )
+        .add_step(
+            StepDefinition::new("approve_b", "approve_b", noop_executor::<Ctx>()).with_mode(
+                StepMode::WaitEvent {
+                    name: "approve".into(),
+                    timeout_secs: 10,
+                },
+            ),
+        );
+    let run = start(&engine, wf).await;
+
+    // Let both steps arm on the same event name before completing it once.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    engine
+        .complete_event(run, "approve", EntryResult::Success(b"yes".to_vec()))
+        .await
+        .unwrap();
+
+    engine
+        .wait_for_completion(run, "wf", Duration::from_secs(10))
+        .await
+        .unwrap();
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert_eq!(
+        state.step_states[&StepId::new("approve_a")].status,
+        StepStatus::Succeeded
+    );
+    assert_eq!(
+        state.step_states[&StepId::new("approve_b")].status,
+        StepStatus::Succeeded
+    );
+}
+
+#[tokio::test]
 async fn wait_event_timeout_fails_step() {
     let engine = engine();
     let wf = WorkflowDefinition::new("wf", "wf").add_step(

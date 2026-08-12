@@ -48,15 +48,24 @@ pub fn default_db_path() -> PathBuf {
 /// Wrap the headless agent runner as the engine's `SendMessage` hook.
 pub(crate) fn agent_send_hook() -> SendMessage {
     std::sync::Arc::new(|agent: String, prompt: String| {
-        let outcome = crate::agent_launch::run_headless(
-            agent_registry::REGISTRY,
-            &agent,
-            &prompt,
-            Duration::from_secs(600),
-            Duration::from_secs(300),
-            &[],
-        );
         Box::pin(async move {
+            // `run_headless` blocks synchronously (subprocess, up to 900s) —
+            // it must run inside the async block via `spawn_blocking`, not
+            // before it, or the call already happened on whatever thread
+            // invoked this closure before the returned future was ever
+            // polled/awaited.
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::agent_launch::run_headless(
+                    agent_registry::REGISTRY,
+                    &agent,
+                    &prompt,
+                    Duration::from_secs(600),
+                    Duration::from_secs(300),
+                    &[],
+                )
+            })
+            .await
+            .map_err(|e| format!("agent task panicked: {e}"))?;
             match outcome {
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
                     // Agent CLIs don't report token counts; 0 keeps accounting
@@ -74,6 +83,19 @@ pub(crate) fn agent_send_hook() -> SendMessage {
 
 fn open_store(db_path: &Path) -> Result<SqliteStore<PipelineData>, String> {
     SqliteStore::open_file(db_path).map_err(|e| e.to_string())
+}
+
+/// Build an engine that spawns its execution tasks on [`WORKFLOW_RT`],
+/// regardless of which runtime is calling into it. Needed because
+/// `run_workflow_json_async` (and friends) are `await`ed directly from the
+/// MCP handler on the daemon's own runtime, not just `block_on`'d from
+/// `WORKFLOW_RT` via the CLI's sync wrapper — without this, `start_workflow`'s
+/// internal `tokio::spawn` would land on whichever runtime called in.
+fn engine_for(
+    store: SqliteStore<PipelineData>,
+) -> WorkflowEngine<PipelineData, SqliteStore<PipelineData>> {
+    WorkflowEngine::<PipelineData, _>::with_store(store)
+        .with_runtime_handle(WORKFLOW_RT.handle().clone())
 }
 
 /// Register a JSON workflow and start a run. Returns `{run_id, workflow_id}`.
@@ -108,7 +130,7 @@ pub(crate) async fn run_workflow_json_async(
     let name = wf.name.clone();
 
     let store = open_store(db_path)?;
-    let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
+    let engine = engine_for(store);
     engine
         .register_workflow(wf)
         .map_err(|e| format!("invalid workflow: {e}"))?;

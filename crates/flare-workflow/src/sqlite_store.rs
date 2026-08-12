@@ -111,6 +111,12 @@ impl<D: WorkflowData> SqliteStore<D> {
     }
 
     /// Write a state row plus its step_state/run_vars projections atomically.
+    ///
+    /// `step_states`/`variables` are fixed-growing maps within a run's
+    /// lifetime (steps are seeded once at start, variables are only ever
+    /// inserted/overwritten — see `variables::capture_output`; nothing in
+    /// this crate removes entries), so a targeted UPSERT of each row is
+    /// always sufficient — no per-write DELETE-all pass is needed.
     fn write_state(conn: &Connection, state: &WorkflowState<D>) -> WorkflowResult<()> {
         let json = Self::serialize(state)?;
         let tx = conn
@@ -141,16 +147,15 @@ impl<D: WorkflowData> SqliteStore<D> {
         )
         .map_err(|e| WorkflowError::Store(format!("upsert workflow_runs: {e}")))?;
 
-        tx.execute(
-            "DELETE FROM step_state WHERE run_id = ?1",
-            params![state.run_id.to_string()],
-        )
-        .map_err(|e| WorkflowError::Store(format!("clear step_state: {e}")))?;
         for (step_id, ss) in &state.step_states {
             tx.execute(
                 "INSERT INTO step_state
                    (run_id, step_id, status, attempt, last_error, started_at, completed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(run_id, step_id) DO UPDATE SET
+                   status=excluded.status, attempt=excluded.attempt,
+                   last_error=excluded.last_error, started_at=excluded.started_at,
+                   completed_at=excluded.completed_at",
                 params![
                     state.run_id.to_string(),
                     step_id.to_string(),
@@ -161,20 +166,16 @@ impl<D: WorkflowData> SqliteStore<D> {
                     ss.completed_at.map(|t| t.to_rfc3339()),
                 ],
             )
-            .map_err(|e| WorkflowError::Store(format!("insert step_state: {e}")))?;
+            .map_err(|e| WorkflowError::Store(format!("upsert step_state: {e}")))?;
         }
 
-        tx.execute(
-            "DELETE FROM run_vars WHERE run_id = ?1",
-            params![state.run_id.to_string()],
-        )
-        .map_err(|e| WorkflowError::Store(format!("clear run_vars: {e}")))?;
         for (key, value) in &state.variables {
             tx.execute(
-                "INSERT INTO run_vars (run_id, key, value) VALUES (?1, ?2, ?3)",
+                "INSERT INTO run_vars (run_id, key, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(run_id, key) DO UPDATE SET value=excluded.value",
                 params![state.run_id.to_string(), key, value],
             )
-            .map_err(|e| WorkflowError::Store(format!("insert run_vars: {e}")))?;
+            .map_err(|e| WorkflowError::Store(format!("upsert run_vars: {e}")))?;
         }
 
         tx.commit()
@@ -240,134 +241,195 @@ fn status_from_str(s: &str) -> WorkflowStatus {
     }
 }
 
+/// Run a blocking SQLite closure off the async executor thread. Every trait
+/// method below is `async fn` but performs synchronous `Mutex<Connection>`
+/// locking + rusqlite I/O; without this, that I/O runs directly on whatever
+/// tokio worker thread called in, stalling every other task scheduled on it
+/// (fatal on a single-threaded runtime, e.g. a daemon's MCP handler loop).
+async fn blocking<F, T>(f: F) -> WorkflowResult<T>
+where
+    F: FnOnce() -> WorkflowResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| WorkflowError::Store(format!("blocking task panicked: {e}")))?
+}
+
 #[async_trait]
 impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
     async fn save(&self, state: WorkflowState<D>) -> WorkflowResult<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
-        Self::write_state(&conn, &state)
+        let conn = Arc::clone(&self.conn);
+        blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            Self::write_state(&conn, &state)
+        })
+        .await
     }
 
     async fn load(&self, run_id: WorkflowRunId) -> WorkflowResult<WorkflowState<D>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
-        conn.query_row(
-            "SELECT state_json FROM workflow_runs WHERE id = ?1",
-            params![run_id.to_string()],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|e| WorkflowError::Store(format!("load: {e}")))?
-        .ok_or(WorkflowError::NotFound(run_id))
-        .and_then(|json| Self::deserialize(&json))
+        let conn = Arc::clone(&self.conn);
+        blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            conn.query_row(
+                "SELECT state_json FROM workflow_runs WHERE id = ?1",
+                params![run_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| WorkflowError::Store(format!("load: {e}")))?
+            .ok_or(WorkflowError::NotFound(run_id))
+            .and_then(|json| Self::deserialize(&json))
+        })
+        .await
     }
 
     async fn update<F>(&self, run_id: WorkflowRunId, f: F) -> WorkflowResult<()>
     where
         F: FnOnce(&mut WorkflowState<D>) + Send,
     {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
-        let json = conn
-            .query_row(
+        // `f` is not `'static` (trait-bound, and callers pass closures that
+        // borrow local `&StepDefinition` references), so it can't be moved
+        // into `spawn_blocking`. Split the blocking SQLite I/O either side of
+        // it instead: blocking load -> apply `f` inline (cheap, no I/O) ->
+        // blocking write, of only the owned `state`.
+        let conn = Arc::clone(&self.conn);
+        let json = blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            conn.query_row(
                 "SELECT state_json FROM workflow_runs WHERE id = ?1",
                 params![run_id.to_string()],
                 |row| row.get::<_, String>(0),
             )
             .optional()
             .map_err(|e| WorkflowError::Store(format!("load for update: {e}")))?
-            .ok_or(WorkflowError::NotFound(run_id))?;
+            .ok_or(WorkflowError::NotFound(run_id))
+        })
+        .await?;
+
         let mut state = Self::deserialize(&json)?;
         f(&mut state);
         state.updated_at = Utc::now();
-        Self::write_state(&conn, &state)
+
+        let conn = Arc::clone(&self.conn);
+        blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            Self::write_state(&conn, &state)
+        })
+        .await
     }
 
     async fn delete(&self, run_id: WorkflowRunId) -> WorkflowResult<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
-        Self::delete_state(&conn, &run_id.to_string())
+        let conn = Arc::clone(&self.conn);
+        blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            Self::delete_state(&conn, &run_id.to_string())
+        })
+        .await
     }
 
     async fn list_active(&self) -> WorkflowResult<Vec<WorkflowState<D>>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
-        let mut stmt = conn
-            .prepare("SELECT state_json FROM workflow_runs WHERE status IN ('pending','running')")
-            .map_err(|e| WorkflowError::Store(format!("prepare list_active: {e}")))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| WorkflowError::Store(format!("list_active: {e}")))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let json = row.map_err(|e| WorkflowError::Store(format!("row: {e}")))?;
-            out.push(Self::deserialize(&json)?);
-        }
-        Ok(out)
+        let conn = Arc::clone(&self.conn);
+        blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT state_json FROM workflow_runs WHERE status IN ('pending','running')",
+                )
+                .map_err(|e| WorkflowError::Store(format!("prepare list_active: {e}")))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| WorkflowError::Store(format!("list_active: {e}")))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let json = row.map_err(|e| WorkflowError::Store(format!("row: {e}")))?;
+                out.push(Self::deserialize(&json)?);
+            }
+            Ok(out)
+        })
+        .await
     }
 
     async fn list_all(&self) -> WorkflowResult<Vec<WorkflowState<D>>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
-        let mut stmt = conn
-            .prepare("SELECT state_json FROM workflow_runs")
-            .map_err(|e| WorkflowError::Store(format!("prepare list_all: {e}")))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| WorkflowError::Store(format!("list_all: {e}")))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let json = row.map_err(|e| WorkflowError::Store(format!("row: {e}")))?;
-            out.push(Self::deserialize(&json)?);
-        }
-        Ok(out)
+        let conn = Arc::clone(&self.conn);
+        blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            let mut stmt = conn
+                .prepare("SELECT state_json FROM workflow_runs")
+                .map_err(|e| WorkflowError::Store(format!("prepare list_all: {e}")))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| WorkflowError::Store(format!("list_all: {e}")))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let json = row.map_err(|e| WorkflowError::Store(format!("row: {e}")))?;
+                out.push(Self::deserialize(&json)?);
+            }
+            Ok(out)
+        })
+        .await
     }
 
     async fn is_cancelled(&self, run_id: WorkflowRunId) -> WorkflowResult<bool> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
-        conn.query_row(
-            "SELECT status = 'cancelled' FROM workflow_runs WHERE id = ?1",
-            params![run_id.to_string()],
-            |row| row.get::<_, bool>(0),
-        )
-        .optional()
-        .map_err(|e| WorkflowError::Store(format!("is_cancelled: {e}")))?
-        .ok_or(WorkflowError::NotFound(run_id))
+        let conn = Arc::clone(&self.conn);
+        blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            conn.query_row(
+                "SELECT status = 'cancelled' FROM workflow_runs WHERE id = ?1",
+                params![run_id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|e| WorkflowError::Store(format!("is_cancelled: {e}")))?
+            .ok_or(WorkflowError::NotFound(run_id))
+        })
+        .await
     }
 
     async fn cleanup_old_workflows(&self, ttl: Duration) -> usize {
-        let conn = self.conn.lock().expect("flare-workflow sqlite lock");
-        let cutoff = (Utc::now()
-            - chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::hours(1)))
-        .to_rfc3339();
-        let ids: Vec<String> = {
-            let mut stmt = conn
-                .prepare("SELECT id FROM workflow_runs WHERE status NOT IN ('pending','running','paused') AND updated_at < ?1")
-                .expect("prepare cleanup");
-            let rows = stmt
-                .query_map(params![cutoff], |row| row.get::<_, String>(0))
-                .expect("query cleanup");
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        for id in &ids {
-            let _ = Self::delete_state(&conn, id);
-        }
-        ids.len()
+        let conn = Arc::clone(&self.conn);
+        let result = blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            let cutoff = (Utc::now()
+                - chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::hours(1)))
+            .to_rfc3339();
+            let ids: Vec<String> = {
+                let mut stmt = conn
+                    .prepare("SELECT id FROM workflow_runs WHERE status NOT IN ('pending','running','paused') AND updated_at < ?1")
+                    .map_err(|e| WorkflowError::Store(format!("prepare cleanup: {e}")))?;
+                let rows = stmt
+                    .query_map(params![cutoff], |row| row.get::<_, String>(0))
+                    .map_err(|e| WorkflowError::Store(format!("query cleanup: {e}")))?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
+            for id in &ids {
+                let _ = Self::delete_state(&conn, id);
+            }
+            Ok(ids.len())
+        })
+        .await;
+        result.unwrap_or_else(|e| {
+            tracing::error!(error = ?e, "cleanup_old_workflows failed");
+            0
+        })
     }
 
     async fn get_context(&self, run_id: WorkflowRunId) -> WorkflowResult<WorkflowContext<D>> {
@@ -375,27 +437,35 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
     }
 
     async fn cleanup_if_terminal(&self, run_id: WorkflowRunId) -> bool {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        let status: Option<String> = conn
-            .query_row(
-                "SELECT status FROM workflow_runs WHERE id = ?1",
-                params![run_id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        let terminal = matches!(
-            status.as_deref().map(status_from_str),
-            Some(WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled)
-        );
-        if terminal {
-            let _ = Self::delete_state(&conn, &run_id.to_string());
-        }
-        terminal
+        let conn = Arc::clone(&self.conn);
+        let result = blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            let status: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM workflow_runs WHERE id = ?1",
+                    params![run_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| WorkflowError::Store(format!("cleanup_if_terminal: {e}")))?;
+            let terminal = matches!(
+                status.as_deref().map(status_from_str),
+                Some(
+                    WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+                )
+            );
+            if terminal {
+                let _ = Self::delete_state(&conn, &run_id.to_string());
+            }
+            Ok(terminal)
+        })
+        .await;
+        result.unwrap_or_else(|e| {
+            tracing::error!(error = ?e, "cleanup_if_terminal failed");
+            false
+        })
     }
 
     async fn append_journal(
@@ -403,19 +473,25 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
         run_id: WorkflowRunId,
         entry: JournalEntry,
     ) -> WorkflowResult<u64> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
-        journal::append(&conn, &run_id.to_string(), &entry)
+        let conn = Arc::clone(&self.conn);
+        blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            journal::append(&conn, &run_id.to_string(), &entry)
+        })
+        .await
     }
 
     async fn journal(&self, run_id: WorkflowRunId) -> WorkflowResult<Vec<JournalEntry>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
-        journal::read(&conn, &run_id.to_string())
+        let conn = Arc::clone(&self.conn);
+        blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            journal::read(&conn, &run_id.to_string())
+        })
+        .await
     }
 }
 

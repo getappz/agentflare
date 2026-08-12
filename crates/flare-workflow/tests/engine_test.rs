@@ -214,6 +214,52 @@ async fn terminal_failure_marks_run_failed() {
 }
 
 #[tokio::test]
+async fn dependent_of_failed_step_gets_terminal_status() {
+    let engine = build_engine();
+    let wf = WorkflowDefinition::new("wf", "wf")
+        .add_step(StepDefinition::new(
+            "boom",
+            "boom",
+            Arc::new(FunctionStep::new(|_ctx: &mut WorkflowContext<Ctx>| {
+                Box::pin(async move {
+                    Err(WorkflowError::StepFailed {
+                        step_id: StepId::new("boom"),
+                        message: "boom".into(),
+                    })
+                })
+            })),
+        ))
+        .add_step(step("after", |c| c.data.log.push("after".into())).depends_on(&["boom"]));
+    engine.register_workflow(wf).unwrap();
+
+    let run = engine
+        .start_workflow(
+            WorkflowId::new("wf"),
+            Ctx {
+                count: 0,
+                log: vec![],
+            },
+            "in".into(),
+        )
+        .await
+        .unwrap();
+    let out = engine
+        .wait_for_completion(run, "wf", Duration::from_secs(5))
+        .await;
+    assert!(out.is_err());
+
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    // "after" must not be stuck at Pending forever just because it was
+    // dropped from scheduling when its dependency failed.
+    assert_ne!(
+        state.step_states[&StepId::new("after")].status,
+        StepStatus::Pending,
+        "dependent of a failed step must get an explicit terminal status"
+    );
+}
+
+#[tokio::test]
 async fn journal_records_every_step_result() {
     let engine = build_engine();
     let wf = WorkflowDefinition::new("wf", "wf")
