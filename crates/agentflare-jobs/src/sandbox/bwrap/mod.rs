@@ -105,11 +105,31 @@ fn build_bwrap_args_with_home(
         bwrap_args.push(cwd_str.clone());
 
         let git_dir = cwd.join(".git");
-        if git_dir.exists() && !git_writable {
-            let git_str = path_to_string(&git_dir);
-            bwrap_args.push("--ro-bind".to_string());
-            bwrap_args.push(git_str.clone());
-            bwrap_args.push(git_str);
+        match std::fs::symlink_metadata(&git_dir) {
+            Ok(meta) if meta.is_file() => {
+                // `cwd/.git` is a `git worktree` gitfile (`gitdir: <path>`),
+                // not a real metadata directory -- the actual per-worktree
+                // admin files (HEAD, index, index.lock, logs/HEAD) and the
+                // shared object/ref store `git commit` needs to write into
+                // live under the main repo's `.git`, resolved via the admin
+                // dir's own `commondir` file. That resolved directory sits
+                // outside `cwd` entirely, so it needs its own explicit bind
+                // regardless of `git_writable` -- unlike the plain-repo case
+                // below, it isn't already covered by `cwd`'s `--bind`.
+                if let Some(common_dir) = resolve_worktree_common_dir(cwd, &git_dir) {
+                    let common_str = path_to_string(&common_dir);
+                    bwrap_args.push(if git_writable { "--bind" } else { "--ro-bind" }.to_string());
+                    bwrap_args.push(common_str.clone());
+                    bwrap_args.push(common_str);
+                }
+            }
+            Ok(meta) if meta.is_dir() && !git_writable => {
+                let git_str = path_to_string(&git_dir);
+                bwrap_args.push("--ro-bind".to_string());
+                bwrap_args.push(git_str.clone());
+                bwrap_args.push(git_str);
+            }
+            _ => {}
         }
 
         bwrap_args.push("--chdir".to_string());
@@ -133,6 +153,38 @@ fn build_bwrap_args_with_home(
     bwrap_args.extend(args.iter().cloned());
 
     bwrap_args
+}
+
+/// Resolves a `git worktree` checkout's `cwd/.git` gitfile
+/// (`gitdir: <path-to-worktree-admin-dir>`) to the main repo's real `.git`
+/// directory, following the admin dir's own `commondir` file -- git's
+/// documented mechanism for a worktree to find the common dir shared across
+/// all worktrees (typically `../..` from the admin dir, but not assumed).
+/// Returns `None` on any read/parse/resolve failure, so the caller skips the
+/// bind entirely rather than mounting a wrong or partial path into the
+/// sandbox.
+fn resolve_worktree_common_dir(cwd: &Path, git_file: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(git_file).ok()?;
+    let gitdir_line = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?;
+    let admin_dir = resolve_against(cwd, Path::new(gitdir_line.trim()));
+
+    let commondir_contents = std::fs::read_to_string(admin_dir.join("commondir")).ok()?;
+    let common_dir = resolve_against(&admin_dir, Path::new(commondir_contents.trim()));
+
+    std::fs::canonicalize(common_dir).ok()
+}
+
+/// Joins `path` onto `base` if relative, leaving an already-absolute `path`
+/// untouched -- both the `gitdir:` line and `commondir` file are written
+/// absolute by git in practice, but the format doesn't guarantee it.
+fn resolve_against(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
 }
 
 /// Resolves `path` to a canonical absolute path -- symlinks and `.`/`..`
@@ -302,6 +354,67 @@ mod tests {
             !args.iter().any(|a| a == &git_str),
             ".git must not appear as a separate bind entry when git_writable is true: {args:?}"
         );
+    }
+
+    fn write_worktree_gitfile(cwd: &Path, admin_dir: &Path) {
+        std::fs::write(
+            cwd.join(".git"),
+            format!("gitdir: {}\n", admin_dir.display()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn worktree_gitfile_resolves_main_git_dir_and_binds_it_read_write() {
+        // Item #90: a `git worktree` checkout's `cwd/.git` is a gitfile, not
+        // a real metadata directory -- the actual admin files (HEAD, index,
+        // index.lock, logs) and the shared object/ref store `git commit`
+        // needs to write into live under the main repo's `.git`, reached via
+        // the admin dir's own `commondir` file. That resolved directory sits
+        // outside `cwd` entirely, so with `git_writable = true` it needs its
+        // own explicit `--bind` (not `--ro-bind`) -- otherwise it falls back
+        // to the sandbox's default read-only root and `index.lock` creation
+        // fails with "Read-only file system", exactly as observed live.
+        let main_repo = tempfile::tempdir().unwrap();
+        let main_git_dir = std::fs::canonicalize(main_repo.path())
+            .unwrap()
+            .join(".git");
+        let admin_dir = main_git_dir.join("worktrees").join("task-90");
+        std::fs::create_dir_all(&admin_dir).unwrap();
+        std::fs::write(admin_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(worktree.path()).unwrap();
+        write_worktree_gitfile(&cwd, &admin_dir);
+
+        let args = build_bwrap_args_with_home(Some(cwd.as_path()), "true", &[], None, true);
+
+        let expected = path_to_string(&main_git_dir);
+        let idx = args
+            .iter()
+            .position(|a| a == &expected)
+            .expect("main repo .git dir bound");
+        assert_eq!(args[idx - 1], "--bind");
+    }
+
+    #[test]
+    fn plain_repo_git_dir_is_still_bound_read_only() {
+        // Regression guard: a plain (non-worktree) repo's `.git` is a real
+        // directory sitting inside `cwd`, so it must keep going through the
+        // unchanged directory branch above, not the new gitfile-resolution
+        // path.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+
+        let args = build_bwrap_args_with_home(Some(cwd.as_path()), "true", &[], None, false);
+
+        let expected = path_to_string(&cwd.join(".git"));
+        let idx = args
+            .iter()
+            .position(|a| a == &expected)
+            .expect(".git dir bound");
+        assert_eq!(args[idx - 1], "--ro-bind");
     }
 
     #[test]
