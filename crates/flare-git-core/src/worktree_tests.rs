@@ -318,7 +318,10 @@ fn already_isolated_for_true_inside_the_worktree_it_created() {
     let item = test_item(1);
     let target = resolve_default_branch(&repo.path);
     let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
-    assert!(already_isolated_for(&task_branch_name(&item), &worktree_path));
+    assert!(already_isolated_for(
+        &task_branch_name(&item),
+        &worktree_path
+    ));
 }
 
 #[test]
@@ -462,7 +465,11 @@ fn commit_uncommitted_is_a_noop_on_a_clean_worktree() {
         commit_uncommitted(&item, &repo.path, "auto-committed"),
         CommitOutcome::NothingToCommit
     ));
-    assert!(!branch_diverged(&repo.path, &task_branch_name(&item), &target));
+    assert!(!branch_diverged(
+        &repo.path,
+        &task_branch_name(&item),
+        &target
+    ));
 }
 
 #[test]

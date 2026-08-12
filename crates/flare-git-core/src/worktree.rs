@@ -253,7 +253,13 @@ fn slugify_branch_title(name: &str) -> String {
 /// `already_isolated_for` (above) relies on for its exact-match re-claim
 /// detection. Falls back to the bare `task/<sequence_id>` (no trailing
 /// dash) when `item.name` has nothing sluggable in it.
-pub(crate) fn task_branch_name(item: &Item) -> String {
+///
+/// `pub`, not `pub(crate)`: `src/worktree.rs` (a different crate) also
+/// needs to resolve an item's branch name for `branch_diverged`,
+/// `is_pr_merged`, and `pr_ci_status` -- those independently recomputing
+/// the bare `format!("task/{}", item.sequence_id)` form is exactly the
+/// bug this function exists to prevent (item #89).
+pub fn task_branch_name(item: &Item) -> String {
     let slug = slugify_branch_title(&item.name);
     if slug.is_empty() {
         format!("task/{}", item.sequence_id)

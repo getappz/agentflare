@@ -614,10 +614,10 @@ fn item_done_auto_commits_uncommitted_changes_instead_of_stranding_them() {
         ..Default::default()
     };
 
-    let created: serde_json::Value =
-        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let created_json = s.item(Parameters(empty_item_create("Test"))).unwrap();
+    let created: serde_json::Value = serde_json::from_str(&created_json).unwrap();
+    let created_item: agentflare_backend::item::Item = serde_json::from_str(&created_json).unwrap();
     let item_id = created["id"].as_str().unwrap().to_string();
-    let sequence_id = created["sequence_id"].as_i64().unwrap();
 
     let claimed: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
@@ -649,7 +649,7 @@ fn item_done_auto_commits_uncommitted_changes_instead_of_stranding_them() {
     assert_eq!(result["done"], true, "{result:?}");
     assert_eq!(result["status"], "completed");
 
-    let branch = format!("task/{sequence_id}");
+    let branch = flare_git_core::worktree::task_branch_name(&created_item);
     let log = run_git(
         &repo_root,
         &["log", &branch, "--name-only", "--pretty=format:"],
@@ -759,10 +759,10 @@ fn item_done_with_push_false_never_pushes_the_branch() {
         ..Default::default()
     };
 
-    let created: serde_json::Value =
-        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let created_json = s.item(Parameters(empty_item_create("Test"))).unwrap();
+    let created: serde_json::Value = serde_json::from_str(&created_json).unwrap();
+    let created_item: agentflare_backend::item::Item = serde_json::from_str(&created_json).unwrap();
     let item_id = created["id"].as_str().unwrap().to_string();
-    let sequence_id = created["sequence_id"].as_i64().unwrap();
 
     let claimed: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
@@ -790,7 +790,7 @@ fn item_done_with_push_false_never_pushes_the_branch() {
     .unwrap();
     assert!(result.get("pr_url").is_none());
 
-    let branch = format!("task/{sequence_id}");
+    let branch = flare_git_core::worktree::task_branch_name(&created_item);
     let remote_refs = run_git(remote_dir.path(), &["branch", "--list", &branch]);
     assert!(
         String::from_utf8_lossy(&remote_refs.stdout)
@@ -1388,10 +1388,10 @@ fn item_done_recovers_committed_work_left_behind_by_a_stale_claim() {
         ..Default::default()
     };
 
-    let created: serde_json::Value =
-        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let created_json = s.item(Parameters(empty_item_create("Test"))).unwrap();
+    let created: serde_json::Value = serde_json::from_str(&created_json).unwrap();
+    let created_item: agentflare_backend::item::Item = serde_json::from_str(&created_json).unwrap();
     let item_id = created["id"].as_str().unwrap().to_string();
-    let sequence_id = created["sequence_id"].as_i64().unwrap();
 
     let claimed: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
@@ -1403,7 +1403,7 @@ fn item_done_recovers_committed_work_left_behind_by_a_stale_claim() {
     )
     .unwrap();
     let worktree_path = std::path::PathBuf::from(claimed["worktree_path"].as_str().unwrap());
-    let branch = format!("task/{sequence_id}");
+    let branch = flare_git_core::worktree::task_branch_name(&created_item);
     std::fs::write(worktree_path.join("real_work.txt"), "already committed").unwrap();
     run_git(&worktree_path, &["add", "real_work.txt"]);
     run_git(&worktree_path, &["commit", "-m", "real committed work"]);
