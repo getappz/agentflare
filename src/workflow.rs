@@ -28,6 +28,7 @@ static WORKFLOW_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 });
 
 /// The shared engine runtime (see [`WORKFLOW_RT`]).
+#[cfg(test)]
 fn blocking_runtime() -> &'static tokio::runtime::Runtime {
     &WORKFLOW_RT
 }
@@ -45,10 +46,10 @@ pub fn default_db_path() -> PathBuf {
 }
 
 /// Wrap the headless agent runner as the engine's `SendMessage` hook.
-fn agent_send_hook() -> SendMessage {
+pub(crate) fn agent_send_hook() -> SendMessage {
     std::sync::Arc::new(|agent: String, prompt: String| {
         let outcome = crate::agent_launch::run_headless(
-            &agent_registry::REGISTRY,
+            agent_registry::REGISTRY,
             &agent,
             &prompt,
             Duration::from_secs(600),
@@ -76,17 +77,25 @@ fn open_store(db_path: &Path) -> Result<SqliteStore<PipelineData>, String> {
 }
 
 /// Register a JSON workflow and start a run. Returns `{run_id, workflow_id}`.
+/// Sync wrapper (CLI, sync contexts) — see [`run_workflow_json_async`].
 pub fn run_workflow_json(
     definition_json: &str,
     input: &str,
     db_path: &Path,
 ) -> Result<(WorkflowRunId, WorkflowId), String> {
-    run_workflow_json_with_sender(definition_json, input, db_path, agent_send_hook())
+    WORKFLOW_RT
+        .block_on(run_workflow_json_async(
+            definition_json,
+            input,
+            db_path,
+            agent_send_hook(),
+        ))
+        .map_err(|e| e.to_string())
 }
 
-/// Same as [`run_workflow_json`] with an injectable `SendMessage` hook — used
-/// by tests to drive steps without an installed agent binary.
-pub(crate) fn run_workflow_json_with_sender(
+/// Async core used by the MCP handler (already on a runtime); never nested
+/// `block_on`.
+pub(crate) async fn run_workflow_json_async(
     definition_json: &str,
     input: &str,
     db_path: &Path,
@@ -104,30 +113,54 @@ pub(crate) fn run_workflow_json_with_sender(
         .register_workflow(wf)
         .map_err(|e| format!("invalid workflow: {e}"))?;
 
-    let rt = blocking_runtime();
-    let run_id = rt
-        .block_on(async {
-            engine
-                .start_workflow(workflow_id.clone(), PipelineData, input.to_string())
-                .await
-        })
+    let run_id = engine
+        .start_workflow(workflow_id.clone(), PipelineData, input.to_string())
+        .await
         .map_err(|e| e.to_string())?;
     eprintln!("agentflare-workflow: run {run_id} started for '{name}'");
     Ok((run_id, workflow_id))
 }
 
+/// Same as [`run_workflow_json`] with an injectable `SendMessage` hook — used
+/// by tests to drive steps without an installed agent binary.
+#[cfg(test)]
+pub(crate) fn run_workflow_json_with_sender(
+    definition_json: &str,
+    input: &str,
+    db_path: &Path,
+    send: SendMessage,
+) -> Result<(WorkflowRunId, WorkflowId), String> {
+    WORKFLOW_RT
+        .block_on(run_workflow_json_async(
+            definition_json,
+            input,
+            db_path,
+            send,
+        ))
+        .map_err(|e| e.to_string())
+}
+
 /// Full status of a run: state, per-step results, journal tail, output/error.
+/// Sync wrapper — see [`workflow_status_async`].
 pub fn workflow_status(run_id: &str, db_path: &Path) -> Result<serde_json::Value, String> {
+    WORKFLOW_RT
+        .block_on(workflow_status_async(run_id, db_path))
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn workflow_status_async(
+    run_id: &str,
+    db_path: &Path,
+) -> Result<serde_json::Value, String> {
     let store = open_store(db_path)?;
     let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
     let run_id = parse_run_id(run_id)?;
-    let rt = blocking_runtime();
 
-    let state = rt
-        .block_on(engine.get_status(run_id))
-        .map_err(|e| e.to_string())?;
-    let journal = rt
-        .block_on(engine.state_store().journal(run_id))
+    let state = engine.get_status(run_id).await.map_err(|e| e.to_string())?;
+    let journal = engine
+        .state_store()
+        .journal(run_id)
+        .await
         .map_err(|e| e.to_string())?;
     let journal_tail: Vec<serde_json::Value> = journal
         .iter()
@@ -163,13 +196,20 @@ pub fn workflow_status(run_id: &str, db_path: &Path) -> Result<serde_json::Value
     }))
 }
 
-/// List run summaries.
+/// List run summaries. Sync wrapper — see [`list_workflows_async`].
 pub fn list_workflows(db_path: &Path) -> Result<Vec<serde_json::Value>, String> {
+    WORKFLOW_RT
+        .block_on(list_workflows_async(db_path))
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn list_workflows_async(db_path: &Path) -> Result<Vec<serde_json::Value>, String> {
     let store = open_store(db_path)?;
     let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
-    let rt = blocking_runtime();
-    let all = rt
-        .block_on(engine.state_store().list_all())
+    let all = engine
+        .state_store()
+        .list_all()
+        .await
         .map_err(|e| e.to_string())?;
     Ok(all
         .into_iter()
@@ -185,8 +225,20 @@ pub fn list_workflows(db_path: &Path) -> Result<Vec<serde_json::Value>, String> 
         .collect())
 }
 
-/// Resolve a pending `WaitEvent` on a run.
+/// Resolve a pending `WaitEvent` on a run. Sync wrapper — see
+/// [`complete_workflow_event_async`].
 pub fn complete_workflow_event(
+    run_id: &str,
+    name: &str,
+    result: &str,
+    db_path: &Path,
+) -> Result<(), String> {
+    WORKFLOW_RT
+        .block_on(complete_workflow_event_async(run_id, name, result, db_path))
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn complete_workflow_event_async(
     run_id: &str,
     name: &str,
     result: &str,
@@ -195,13 +247,15 @@ pub fn complete_workflow_event(
     let store = open_store(db_path)?;
     let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
     let run_id = parse_run_id(run_id)?;
-    let rt = blocking_runtime();
-    rt.block_on(engine.complete_event(
-        run_id,
-        name,
-        EntryResult::Success(result.as_bytes().to_vec()),
-    ))
-    .map_err(|e| e.to_string())
+    engine
+        .complete_event(
+            run_id,
+            name,
+            EntryResult::Success(result.as_bytes().to_vec()),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn status_str(s: &WorkflowStatus) -> &'static str {
