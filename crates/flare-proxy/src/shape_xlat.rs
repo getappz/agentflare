@@ -527,6 +527,17 @@ pub fn gemini_chunk_to_anthropic_sse(chunk: &Value, buffer: &mut AnthropicStream
 /// extraction) must do so — and register/close their own indices — before
 /// calling this, since it ends the message.
 pub fn finish_stream(chunk: &Value, buffer: &mut AnthropicStreamBuffer) -> Vec<u8> {
+    // Some OpenAI-compatible upstreams (observed live on OpenRouter) send a
+    // trailing usage-only chunk that repeats `finish_reason` after the chunk
+    // that actually closed the message. Without this guard, that second
+    // chunk re-triggers a full finish, emitting a second `message_stop` --
+    // invalid per Anthropic's Messages streaming protocol, since a stream
+    // must terminate in exactly one `message_stop`.
+    if buffer.finished {
+        return Vec::new();
+    }
+    buffer.finished = true;
+
     let mut out = Vec::new();
 
     let finish_reason = chunk
@@ -585,6 +596,13 @@ pub fn finish_stream(chunk: &Value, buffer: &mut AnthropicStreamBuffer) -> Vec<u
 /// opens a tool_use block) catches that case so the client still sees
 /// `stop_reason: "tool_use"` and knows to execute the call.
 pub fn gemini_finish_stream(chunk: &Value, buffer: &mut AnthropicStreamBuffer) -> Vec<u8> {
+    // See finish_stream's comment: guards against a repeated finish chunk
+    // re-emitting a second message_stop.
+    if buffer.finished {
+        return Vec::new();
+    }
+    buffer.finished = true;
+
     let mut out = Vec::new();
 
     let finish_reason = chunk
@@ -646,6 +664,7 @@ pub struct AnthropicStreamBuffer {
     pub open_indices: std::collections::BTreeSet<usize>,
     pub tool_index_map: std::collections::HashMap<u64, usize>,
     pub has_tool_use: bool,
+    pub finished: bool,
 }
 
 fn emit_event(out: &mut Vec<u8>, event: &str, data: &Value) {
@@ -823,6 +842,37 @@ mod tests {
             last_block_stop_pos < stop_pos,
             "content_block_stop must precede message_stop"
         );
+    }
+
+    #[test]
+    fn test_finish_stream_ignores_repeated_finish_chunk() {
+        // Some OpenAI-compatible upstreams (observed live on OpenRouter)
+        // send a trailing usage-only chunk that repeats finish_reason after
+        // the chunk that actually closed the message.
+        let mut buffer = AnthropicStreamBuffer::default();
+        buffer.open_indices.insert(0);
+
+        let first = json!({"choices": [{"finish_reason": "stop"}], "usage": {"completion_tokens": 0}});
+        let out1 = String::from_utf8(finish_stream(&first, &mut buffer)).unwrap();
+        assert_eq!(out1.matches("event: message_stop").count(), 1);
+
+        let second = json!({"choices": [{"finish_reason": "stop"}], "usage": {"completion_tokens": 62}});
+        let out2 = finish_stream(&second, &mut buffer);
+        assert!(out2.is_empty(), "repeated finish chunk must be a no-op");
+    }
+
+    #[test]
+    fn test_gemini_finish_stream_ignores_repeated_finish_chunk() {
+        let mut buffer = AnthropicStreamBuffer::default();
+        buffer.open_indices.insert(0);
+
+        let first = json!({"candidates": [{"finishReason": "STOP"}]});
+        let out1 = String::from_utf8(gemini_finish_stream(&first, &mut buffer)).unwrap();
+        assert_eq!(out1.matches("event: message_stop").count(), 1);
+
+        let second = json!({"candidates": [{"finishReason": "STOP"}]});
+        let out2 = gemini_finish_stream(&second, &mut buffer);
+        assert!(out2.is_empty(), "repeated finish chunk must be a no-op");
     }
 
     #[test]
