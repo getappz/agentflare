@@ -149,6 +149,12 @@ const SUPERVISOR_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::
 /// merged), against the same token `SUPERVISOR_DISCOVERY_INTERVAL`'s ticks
 /// never touch GitHub at all.
 const SUPERVISOR_REVIEW_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Cadence for `spawn_binary_staleness_watchdog` -- a `stat()` call, so this
+/// can run far more often than the GitHub-touching sweeps above without
+/// meaningful cost. Bounds how long a rebuilt/updated binary can keep
+/// running in-process via the daemon's stale, already-loaded job logic
+/// before self-restarting (item #68).
+const BINARY_STALENESS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Runs for the lifetime of the process (like `snapshot_broadcaster`'s
 /// producer task): wakes on `JOB_CLEANUP_INTERVAL`, deletes finished jobs
@@ -661,6 +667,40 @@ fn work_max_concurrency() -> usize {
     })
 }
 
+/// Runs for the lifetime of the process: wakes on
+/// `BINARY_STALENESS_CHECK_INTERVAL` and compares the on-disk binary this
+/// process was launched from against a fresh `stat()` of the same path.
+/// Since item #19, work items run in-process rather than as a spawned
+/// subprocess, so a rebuild/`agentflare update` that replaces the binary no
+/// longer makes dispatch fail loudly -- it leaves this daemon silently
+/// executing whatever job logic (e.g. `item_done`'s auto-commit safety net)
+/// it happened to load at startup, indefinitely (item #68's second
+/// occurrence: a verified-clean job got marked done with no commit and no
+/// PR because the running daemon predated the fix meant to catch exactly
+/// that). `snapshot` is `None` when `BinarySnapshot::capture()` couldn't
+/// resolve the on-disk binary at startup -- nothing to watch, so this is a
+/// no-op rather than a hard failure.
+fn spawn_binary_staleness_watchdog(snapshot: Option<crate::daemon::BinarySnapshot>) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(BINARY_STALENESS_CHECK_INTERVAL);
+        loop {
+            ticker.tick().await;
+            if snapshot.is_stale() {
+                eprintln!(
+                    "agentflare-daemon: on-disk binary at {} changed since this daemon \
+                     started -- restarting to pick up the new build instead of running \
+                     stale in-process job logic",
+                    snapshot.path().display()
+                );
+                crate::daemon::respawn_from_stale(&snapshot);
+            }
+        }
+    });
+}
+
 pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
     if !is_local_bind(host) && !yes_expose {
         eprintln!(
@@ -688,6 +728,7 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
     let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
         .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor));
     worker_pool.start(work_max_concurrency());
+    spawn_binary_staleness_watchdog(crate::daemon::BinarySnapshot::capture());
     spawn_job_cleanup(queue.clone());
     spawn_supervisor_discovery(
         queue.clone(),
