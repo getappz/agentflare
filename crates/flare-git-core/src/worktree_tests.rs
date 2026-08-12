@@ -442,6 +442,12 @@ fn commit_uncommitted_is_a_noop_when_no_worktree_exists() {
     ));
 }
 
+// Windows' FILE_ATTRIBUTE_READONLY on a *directory* doesn't prevent writes
+// to files inside it (unlike Unix permission bits) -- the readonly-git-dir
+// simulation below relies on that Unix-specific behavior to make `git add`
+// fail deterministically, so on Windows the commit silently succeeds
+// instead of failing, and the test's premise doesn't hold there.
+#[cfg(unix)]
 #[test]
 fn commit_uncommitted_reports_failed_not_nothing_to_commit_when_add_fails() {
     // Item #92: a dirty tree where `git add`/`git commit` itself fails

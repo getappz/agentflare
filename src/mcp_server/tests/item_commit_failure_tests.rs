@@ -1,5 +1,11 @@
 use super::*;
 
+// Windows' FILE_ATTRIBUTE_READONLY on a *directory* doesn't prevent writes
+// to files inside it (unlike Unix permission bits) -- the readonly-git-dir
+// simulation below relies on that Unix-specific behavior to make `git add`
+// fail deterministically, so on Windows the auto-commit silently succeeds
+// instead of failing, and the test's premise doesn't hold there.
+#[cfg(unix)]
 #[test]
 fn item_done_reports_a_hard_error_when_auto_commit_fails_on_a_dirty_tree() {
     // Item #92: unlike the fallback case above (where `status` itself
