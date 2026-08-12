@@ -13,14 +13,20 @@
 //!   promises.
 
 pub mod definition;
+pub mod engine;
+pub mod events;
 pub mod executor;
 pub mod journal;
+pub mod retry;
 pub mod sqlite_store;
 pub mod store;
 pub mod types;
 
 pub use definition::{StepCondition, StepDefinition, ValidationError, WorkflowDefinition};
+pub use engine::WorkflowEngine;
+pub use events::{EventBus, EventSubscriber, LoggingSubscriber, WorkflowEvent};
 pub use executor::{FunctionStep, StepExecutor};
+pub use retry::{apply_jitter, Backoff, Retryable};
 pub use sqlite_store::{SqliteStore, SqliteStoreError};
 pub use store::{InMemoryStore, StateStore};
 pub use types::*;
