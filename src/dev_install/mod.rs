@@ -172,14 +172,27 @@ fn warn_if_off_default_branch() {
     let Some(current) = flare_git_core::branch::current_branch(&cwd) else {
         return;
     };
-    let default = flare_git_core::branch::resolve_default_branch(&cwd);
-    if current != default {
+    // `resolve_default_branch_known` (not `resolve_default_branch`): the
+    // latter falls back to "whatever is currently checked out" when it
+    // can't resolve an authoritative default (no origin/HEAD, no local
+    // main/master) -- which here would just echo `current` back, making
+    // `current != default` trivially false and silently suppressing this
+    // warning in exactly the ambiguous case it should fire for. Treat
+    // "couldn't resolve" as off-default too: better an occasional
+    // unnecessary warning than a silent miss.
+    let default = flare_git_core::branch::resolve_default_branch_known(&cwd);
+    let is_off_default = default.as_deref() != Some(current.as_str());
+    if is_off_default {
+        let default_desc = default.as_deref().map_or_else(
+            || "an undetermined default branch".to_string(),
+            |d| format!("`{d}`"),
+        );
         crate::ui::warning(&format!(
-            "installing from branch `{current}` (not `{default}`) over the one shared \
+            "installing from branch `{current}` (not {default_desc}) over the one shared \
              agentflare binary+db. If this branch adds a crate `migrations/*.sql` file, \
              it will be applied to your live ~/.agentflare/*.db and can't be undone by \
-             reinstalling from `{default}` later -- that binary will refuse to open the \
-             db until the migration is forward-ported."
+             reinstalling the default branch's binary later -- that binary will refuse to \
+             open the db until the migration is forward-ported."
         ));
     }
 }

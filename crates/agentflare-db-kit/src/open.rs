@@ -41,9 +41,7 @@ fn migrate(path: &Path, conn: &mut Connection, migrations: &Migrations) -> Resul
         Err(rusqlite_migration::Error::MigrationDefinition(
             MigrationDefinitionError::DatabaseTooFarAhead,
         )) => {
-            let applied: i64 = conn
-                .query_row("PRAGMA user_version", [], |r| r.get(0))
-                .unwrap_or(-1);
+            let applied: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
             Err(Error::SchemaAhead {
                 path: path.to_path_buf(),
                 applied,
