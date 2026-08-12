@@ -191,6 +191,13 @@ pub struct StepState {
     pub last_error: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Token accounting + duration recorded on the last (successful) attempt.
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 impl Default for StepState {
@@ -201,6 +208,9 @@ impl Default for StepState {
             last_error: None,
             started_at: None,
             completed_at: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            duration_ms: 0,
         }
     }
 }
@@ -295,6 +305,10 @@ impl JournalEntry {
 
 /// Typed context shared between steps. Fully serializable (fields marked
 /// `#[serde(skip)]` are not persisted).
+///
+/// Alongside the typed `data`, the context carries the OpenFang-style string
+/// pipeline: `input` is the current `{{input}}` channel, `output` is what the
+/// step produced (the executor sets it; the engine chains it forward).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "D: Serialize",
@@ -303,11 +317,29 @@ impl JournalEntry {
 pub struct WorkflowContext<D: WorkflowData> {
     pub run_id: WorkflowRunId,
     pub data: D,
+    /// Current `{{input}}` pipeline channel for this step.
+    #[serde(default)]
+    pub input: String,
+    /// What this step produced; the engine reads it back after execution.
+    #[serde(default)]
+    pub output: String,
+    /// Token accounting reported by the executor (for agent-prompt steps).
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
 }
 
 impl<D: WorkflowData> WorkflowContext<D> {
     pub fn new(run_id: WorkflowRunId, data: D) -> Self {
-        Self { run_id, data }
+        Self {
+            run_id,
+            data,
+            input: String::new(),
+            output: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+        }
     }
 }
 

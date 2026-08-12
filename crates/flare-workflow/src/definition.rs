@@ -47,6 +47,9 @@ pub struct StepDefinition<D: WorkflowData> {
     pub scheduled_at: Option<DateTime<Utc>>,
     /// Condition to evaluate; if false, step is skipped.
     pub run_if: Option<StepCondition<D>>,
+    /// Named variable to store this step's output in for later `{{var}}`
+    /// references (OpenFang semantics).
+    pub output_var: Option<String>,
 }
 
 impl<D: WorkflowData> fmt::Debug for StepDefinition<D> {
@@ -84,6 +87,7 @@ impl<D: WorkflowData> StepDefinition<D> {
             delay: None,
             scheduled_at: None,
             run_if: None,
+            output_var: None,
         }
     }
 
@@ -142,6 +146,13 @@ impl<D: WorkflowData> StepDefinition<D> {
         F: Fn(&WorkflowContext<D>) -> bool + Send + Sync + 'static,
     {
         self.run_if = Some(Arc::new(condition));
+        self
+    }
+
+    /// Store this step's output in the named variable for later `{{var}}`
+    /// references.
+    pub fn with_output_var(mut self, name: impl Into<String>) -> Self {
+        self.output_var = Some(name.into());
         self
     }
 

@@ -118,9 +118,13 @@ mod tests {
             base: Duration::from_secs(1),
             max: Duration::from_secs(64),
         });
-        let a = b.next(0.0).unwrap();
-        let c = b.next(0.0).unwrap();
-        assert!(c >= a);
+        // The `backoff` crate randomizes ±50% and can overshoot `max`, so
+        // values are bounded but not strictly; assert a generous ceiling.
+        for _ in 0..20 {
+            let d = b.next(0.0).unwrap();
+            assert!(d >= Duration::from_millis(1));
+            assert!(d <= Duration::from_secs(100));
+        }
     }
 
     #[test]

@@ -405,9 +405,9 @@ mod tests {
             StepState {
                 status: StepStatus::Succeeded,
                 attempt: 2,
-                last_error: None,
                 started_at: Some(Utc::now()),
                 completed_at: Some(Utc::now()),
+                ..StepState::default()
             },
         );
         s.status = WorkflowStatus::Running;

@@ -25,6 +25,7 @@ use crate::events::{EventBus, WorkflowEvent};
 use crate::retry::{self, Backoff};
 use crate::store::{InMemoryStore, StateStore};
 use crate::types::*;
+use crate::variables::capture_output;
 
 /// RAII guard that decrements the active-workflow count on drop.
 struct ActiveWorkflowGuard {
@@ -310,6 +311,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             .append_journal(run_id, JournalEntry::Input { value: input.into_bytes() })
             .await?;
 
+        self.evict_old_runs_if_needed().await?;
+
         self.event_bus
             .publish(WorkflowEvent::WorkflowStarted { run_id, definition_id })
             .await;
@@ -326,6 +329,37 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         });
 
         Ok(run_id)
+    }
+
+    /// Maximum number of retained workflow runs. Oldest completed/failed runs
+    /// are evicted when this limit is exceeded (OpenFang semantics); runs in
+    /// Pending/Running/Paused are never evicted.
+    const MAX_RETAINED_RUNS: usize = 200;
+
+    /// Evict oldest completed/failed runs beyond `MAX_RETAINED_RUNS`.
+    async fn evict_old_runs_if_needed(&self) -> WorkflowResult<()> {
+        let all = self.state_store.list_all().await?;
+        if all.len() <= Self::MAX_RETAINED_RUNS {
+            return Ok(());
+        }
+        let mut evictable: Vec<(WorkflowRunId, chrono::DateTime<Utc>)> = all
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    WorkflowStatus::Completed | WorkflowStatus::Failed
+                )
+            })
+            .map(|s| (s.run_id, s.created_at))
+            .collect();
+        evictable.sort_by_key(|(_, t)| *t);
+
+        let to_remove = all.len() - Self::MAX_RETAINED_RUNS;
+        for (id, _) in evictable.into_iter().take(to_remove) {
+            tracing::debug!(run_id = %id, "Evicted old workflow run");
+            self.state_store.delete(id).await?;
+        }
+        Ok(())
     }
 
     /// Calculate how long a step waits based on delay and/or scheduled_at.
@@ -357,6 +391,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let step_count = definition.steps.len();
 
         let tracker: Arc<RwLock<StepTracker>> = Arc::new(RwLock::new(StepTracker::default()));
+        // OpenFang-style fan-out/collect buffer shared across parallel tasks.
+        let collect_buffer: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (tx, mut rx) = mpsc::channel::<(StepId, StepResult)>(step_count.max(1));
 
         let mut pending_check: VecDeque<usize> = definition
@@ -497,6 +534,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 let step_id = step.id.clone();
                 let tx = tx.clone();
                 let tracker = Arc::clone(&tracker);
+                let collect_buffer = Arc::clone(&collect_buffer);
 
                 tokio::spawn(async move {
                     let step = &def.steps[step_idx];
@@ -544,7 +582,72 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                         }
                     }
 
-                    let result = engine.execute_step_with_retry(run_id, step, &def).await;
+                    // Conditional: skip when the current input channel does not
+                    // contain the condition substring (case-insensitive).
+                    if let StepMode::Conditional { condition } = &step.mode {
+                        let current_input = engine
+                            .state_store
+                            .load(run_id)
+                            .await
+                            .map(|s| s.input)
+                            .unwrap_or_default();
+                        if !current_input.to_lowercase().contains(&condition.to_lowercase()) {
+                            {
+                                let mut t = tracker.write();
+                                t.running.remove(&step_id);
+                                t.skipped.insert(step_id.clone());
+                                let _ = tx.try_send((step_id.clone(), StepResult::Skip));
+                            }
+                            let _ = engine
+                                .state_store
+                                .update(run_id, |s| {
+                                    if let Some(ss) = s.step_states.get_mut(&step_id) {
+                                        ss.status = StepStatus::Skipped;
+                                    }
+                                })
+                                .await;
+                            return;
+                        }
+                    }
+
+                    let result = match &step.mode {
+                        // Data-only: join the fan-out buffer into the input
+                        // channel, no executor runs.
+                        StepMode::Collect => {
+                            let joined = {
+                                let mut buf = collect_buffer.lock();
+                                let joined = buf.join("\n\n---\n\n");
+                                buf.clear();
+                                joined
+                            };
+                            engine
+                                .state_store
+                                .update(run_id, |s| {
+                                    s.input = joined.clone();
+                                    s.output = Some(joined.clone());
+                                    if let Some(ss) = s.step_states.get_mut(&step_id) {
+                                        ss.status = StepStatus::Succeeded;
+                                        ss.completed_at = Some(Utc::now());
+                                    }
+                                })
+                                .await
+                                .map(|_| StepResult::Success)
+                        }
+                        StepMode::Loop { .. } => {
+                            engine.execute_loop(run_id, step, &def).await
+                        }
+                        _ => engine.execute_step_with_retry(run_id, step, &def).await,
+                    };
+
+                    // FanOut steps accumulate their output for the Collect.
+                    if matches!(result, Ok(StepResult::Success))
+                        && matches!(step.mode, StepMode::FanOut)
+                        && let Ok(st) = engine.state_store.load(run_id).await
+                    {
+                        collect_buffer
+                            .lock()
+                            .push(st.output.clone().unwrap_or_default());
+                    }
 
                     let needs_skip_update = {
                         let mut t = tracker.write();
@@ -718,7 +821,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 .publish(WorkflowEvent::StepStarted { run_id, step_id: step.id.clone(), attempt })
                 .await;
 
-            let mut context = self.state_store.get_context(run_id).await?;
+            let state = self.state_store.load(run_id).await?;
+            let mut context = state.context.clone();
+            context.input = state.input.clone();
             let step_start = std::time::Instant::now();
             let result = timeout(step_timeout, step.executor.execute(&mut context)).await;
             let step_duration = step_start.elapsed();
@@ -738,9 +843,19 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 Ok(Ok(StepResult::Success)) => {
                     self.state_store
                         .update(run_id, |s| {
+                            // Chain the string pipeline: step output -> {{input}}.
+                            let out = context.output.clone();
+                            s.input = out.clone();
+                            s.output = Some(out.clone());
+                            if let Some(var) = step.output_var.as_deref() {
+                                capture_output(&mut s.variables, Some(var), &out);
+                            }
                             if let Some(ss) = s.step_states.get_mut(&step.id) {
                                 ss.status = StepStatus::Succeeded;
                                 ss.completed_at = Some(Utc::now());
+                                ss.input_tokens = context.input_tokens;
+                                ss.output_tokens = context.output_tokens;
+                                ss.duration_ms = step_duration.as_millis() as u64;
                             }
                         })
                         .await?;
@@ -838,11 +953,135 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                                 },
                             )
                             .await?;
-                        return Ok(StepResult::Failure);
+                        // ErrorMode::Skip (and FailureAction::ContinueNextStep)
+                        // turn a terminal failure into a skip so the workflow
+                        // continues.
+                        let skip = matches!(step.error_mode, ErrorMode::Skip)
+                            || matches!(step.on_failure, FailureAction::ContinueNextStep);
+                        return Ok(if skip { StepResult::Skip } else { StepResult::Failure });
                     }
                 }
             }
         }
+    }
+
+    /// Execute a `Loop` step: repeat the executor until the output contains
+    /// `until` or `max_iterations` elapse, chaining each iteration's output
+    /// back as the next `{{input}}`.
+    async fn execute_loop(
+        &self,
+        run_id: WorkflowRunId,
+        step: &StepDefinition<D>,
+        definition: &WorkflowDefinition<D>,
+    ) -> WorkflowResult<StepResult> {
+        let StepMode::Loop { max_iterations, until } = &step.mode else {
+            return Ok(StepResult::Skip);
+        };
+        let step_timeout = definition.get_timeout(step);
+        let until_lower = until.to_lowercase();
+        let mut current_output = String::new();
+        let mut executed = 0u32;
+
+        for iter in 1..=*max_iterations {
+            if self.state_store.is_cancelled(run_id).await? {
+                return Err(WorkflowError::Cancelled(run_id));
+            }
+
+            let state = self.state_store.load(run_id).await?;
+            let mut context = state.context.clone();
+            context.input = state.input.clone();
+            context.output.clear();
+            let step_start = std::time::Instant::now();
+
+            self.state_store
+                .update(run_id, |s| {
+                    s.current_step = Some(step.id.clone());
+                    if let Some(ss) = s.step_states.get_mut(&step.id) {
+                        ss.status = StepStatus::Running;
+                        ss.attempt = iter;
+                        ss.started_at = Some(Utc::now());
+                    }
+                })
+                .await?;
+
+            let result = timeout(step_timeout, step.executor.execute(&mut context)).await;
+            let duration_ms = step_start.elapsed().as_millis() as u64;
+
+            match result {
+                Ok(Ok(StepResult::Success)) => {
+                    executed += 1;
+                    let out = context.output.clone();
+                    self.state_store
+                        .update(run_id, |s| {
+                            s.context = context.clone();
+                            s.input = out.clone();
+                            s.output = Some(out.clone());
+                            if let Some(var) = step.output_var.as_deref() {
+                                capture_output(&mut s.variables, Some(var), &out);
+                            }
+                            if let Some(ss) = s.step_states.get_mut(&step.id) {
+                                ss.status = StepStatus::Succeeded;
+                                ss.completed_at = Some(Utc::now());
+                                ss.input_tokens = context.input_tokens;
+                                ss.output_tokens = context.output_tokens;
+                                ss.duration_ms = duration_ms;
+                            }
+                        })
+                        .await?;
+                    current_output = out;
+                    tracing::info!(run_id = %run_id, step = %step.id, iter, "Loop iteration completed");
+                    if !until_lower.is_empty() && current_output.to_lowercase().contains(&until_lower)
+                    {
+                        break;
+                    }
+                }
+                Ok(Ok(StepResult::Skip)) => break,
+                Ok(Ok(StepResult::Failure)) | Ok(Err(_)) | Err(_) => {
+                    let error_msg = match &result {
+                        Err(_) => format!("Step timed out after {step_timeout:?}"),
+                        Ok(Err(e)) => format!("{e}"),
+                        _ => "Step failed".to_string(),
+                    };
+                    self.state_store
+                        .update(run_id, |s| {
+                            if let Some(ss) = s.step_states.get_mut(&step.id) {
+                                ss.status = StepStatus::Failed;
+                                ss.last_error = Some(error_msg.clone());
+                                ss.completed_at = Some(Utc::now());
+                            }
+                        })
+                        .await?;
+                    self.state_store
+                        .append_journal(
+                            run_id,
+                            JournalEntry::StepRun {
+                                step_id: step.id.clone(),
+                                attempt: iter,
+                                result: Some(EntryResult::Failure {
+                                    code: 1,
+                                    message: error_msg,
+                                    metadata: vec![],
+                                }),
+                            },
+                        )
+                        .await?;
+                    return Ok(StepResult::Failure);
+                }
+            }
+        }
+
+        // Journal the loop's terminal success (last output is the payload).
+        self.state_store
+            .append_journal(
+                run_id,
+                JournalEntry::StepRun {
+                    step_id: step.id.clone(),
+                    attempt: executed,
+                    result: Some(EntryResult::Success(current_output.into_bytes())),
+                },
+            )
+            .await?;
+        Ok(StepResult::Success)
     }
 
     /// Cancel a running workflow.

@@ -21,12 +21,14 @@ pub mod retry;
 pub mod sqlite_store;
 pub mod store;
 pub mod types;
+pub mod variables;
 
 pub use definition::{StepCondition, StepDefinition, ValidationError, WorkflowDefinition};
 pub use engine::WorkflowEngine;
 pub use events::{EventBus, EventSubscriber, LoggingSubscriber, WorkflowEvent};
-pub use executor::{FunctionStep, StepExecutor};
+pub use executor::{noop_executor, FunctionStep, StepExecutor};
 pub use retry::{apply_jitter, Backoff, Retryable};
 pub use sqlite_store::{SqliteStore, SqliteStoreError};
 pub use store::{InMemoryStore, StateStore};
 pub use types::*;
+pub use variables::{capture_output, expand_variables};

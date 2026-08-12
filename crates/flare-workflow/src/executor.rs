@@ -3,6 +3,8 @@
 //! Ported from SMG `wfaas` (Apache-2.0). A step is any `StepExecutor<D>`;
 //! `FunctionStep` adapts a plain async closure.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::types::{StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult};
@@ -84,4 +86,12 @@ where
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
         (self.func)(context).await
     }
+}
+
+/// A step that does nothing — used for data-only steps like `Collect`, whose
+/// behavior the engine handles directly.
+pub fn noop_executor<D: WorkflowData>() -> Arc<dyn StepExecutor<D>> {
+    Arc::new(FunctionStep::new(|_: &mut WorkflowContext<D>| {
+        Box::pin(async { Ok(StepResult::Success) })
+    }))
 }
