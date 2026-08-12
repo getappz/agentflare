@@ -214,9 +214,34 @@ fn build_prompt(
          as a background task with a plan to check on them afterward -- your turn will end \
          before that happens and the result will be lost. Run all verification (builds, \
          tests, lints) synchronously in the foreground and wait for it to complete before \
-         ending your turn.\n",
+         ending your turn.\n\
+         \nIf this item genuinely cannot be worked right now because it depends on \
+         something outside your control that isn't ready yet (e.g. an unmerged PR it \
+         builds on), make no file changes and end your reply with a line starting exactly \
+         with `AGENTFLARE_HOLD:` followed by a one-sentence reason, e.g. `AGENTFLARE_HOLD: \
+         blocked on PR #451 merging`. This leaves the item open for redispatch instead of \
+         marking it done. Only use this for a concrete external blocker -- if there's \
+         simply nothing to change, finish normally instead.\n",
     );
     prompt
+}
+
+/// Looks for an `AGENTFLARE_HOLD: <reason>` line in a headless run's final
+/// reply (see the instructions [`build_prompt`] gives the agent) and returns
+/// the reason if found. Distinguishes "the dependency this item needs isn't
+/// ready yet, redispatch me later" from a genuine no-op: both make zero
+/// commits, so `item_done`'s git-diff-based `nothing_was_ever_committed`
+/// check can't tell them apart on its own, and a run that's blocked purely
+/// by branch history it never touched can even land in `item_done`'s real-
+/// completion path (item #91 -- the branch already carried unrelated
+/// commits from an earlier claim, so `branch_diverged` returned true despite
+/// this run changing nothing). Checking the reply for an explicit signal
+/// before ever calling `item_done` sidesteps that entirely.
+fn detect_hold_signal(reply: &str) -> Option<&str> {
+    reply.lines().find_map(|line| {
+        let reason = line.trim().strip_prefix("AGENTFLARE_HOLD:")?.trim();
+        (!reason.is_empty()).then_some(reason)
+    })
 }
 
 /// Claude Code's `--output-format stream-json` reply shape: one JSON object
@@ -800,6 +825,34 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
                     (reply, None, None)
                 };
 
+            // An explicit hold signal (see `build_prompt`) means the agent
+            // looked, made no changes, and is blocked on something outside
+            // its control -- route through `item_release` instead of
+            // `item_done` so the item stays open for redispatch rather than
+            // going through `item_done`'s git-diff-based completion check,
+            // which can't distinguish "blocked, nothing to do yet" from a
+            // genuinely resolved no-op (item #92).
+            if let Some(reason) = detect_hold_signal(&reply_text) {
+                let _ = mcp.item_release(ItemRequest {
+                    action: "release".into(),
+                    id: Some(item_id.into()),
+                    ..Default::default()
+                });
+                let comment_body =
+                    format!("## agentflare work — on hold\n\n{reason}\n\n{reply_text}");
+                let _ = mcp.comment_impl(CommentRequest {
+                    action: "create".into(),
+                    item_id: Some(item_id.into()),
+                    body: Some(comment_body.clone()),
+                    ..Default::default()
+                });
+                if let Some(recipient) = args.notify.as_deref() {
+                    notify(recipient, &comment_body, item_id);
+                }
+                let _ = writeln!(log, "hold: {item_id}: {reason}");
+                return 0.into();
+            }
+
             // The agent may already have called `done` itself with its own
             // `summary` (in which case this second call is a no-op — the
             // claim is already released) -- but the common case is a
@@ -1021,6 +1074,35 @@ mod tests {
         assert!(prompt.contains("commit"));
         assert!(prompt.contains("do not leave edits uncommitted"));
         assert!(prompt.contains("it's fine to finish with zero commits"));
+    }
+
+    #[test]
+    fn build_prompt_teaches_the_hold_signal() {
+        // Item #92 (scope-broadening note, item #91): the prompt must give
+        // the agent an explicit way to say "blocked on a dependency,
+        // redispatch me" distinct from "genuinely nothing to do" -- both
+        // otherwise look identical (zero commits) to `item_done`.
+        let item = test_item();
+        let prompt = build_prompt(&item, &[], None);
+        assert!(prompt.contains("AGENTFLARE_HOLD:"));
+    }
+
+    #[test]
+    fn detect_hold_signal_extracts_the_reason() {
+        assert_eq!(
+            detect_hold_signal("looked into it\nAGENTFLARE_HOLD: blocked on PR #451 merging"),
+            Some("blocked on PR #451 merging")
+        );
+    }
+
+    #[test]
+    fn detect_hold_signal_ignores_a_normal_reply() {
+        assert_eq!(detect_hold_signal("fixed the bug, all tests pass"), None);
+    }
+
+    #[test]
+    fn detect_hold_signal_ignores_an_empty_reason() {
+        assert_eq!(detect_hold_signal("AGENTFLARE_HOLD:   "), None);
     }
 
     #[test]
