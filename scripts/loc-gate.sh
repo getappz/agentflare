@@ -7,7 +7,6 @@ FROZEN_LIMIT=2000
 
 ALLOWLIST=(
   src/mcp_server.rs
-  crates/agentflare-backend/src/item.rs
   src/components.rs
   # Already 1604 lines on master before item #441's git-shim polish touched
   # it -- pre-existing debt, same situation as tick.rs/work.rs above. Frozen
