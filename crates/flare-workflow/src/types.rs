@@ -60,6 +60,13 @@ impl fmt::Display for WorkflowRunId {
     }
 }
 
+impl std::str::FromStr for WorkflowRunId {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(s)?))
+    }
+}
+
 /// Unique identifier for a workflow step.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StepId(String);

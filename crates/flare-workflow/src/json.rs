@@ -111,12 +111,41 @@ pub enum JsonErrorMode {
 
 /// Compile a JSON workflow into an engine-ready definition. Each step's
 /// executor expands `{{input}}`/`{{var}}` and dispatches via `send`.
+///
+/// OpenFang positional ordering is translated to DAG edges: `sequential` and
+/// friends chain onto the previous step; a `fan_out` group runs in parallel
+/// (each member depends only on the step before the group) and the following
+/// `collect` joins them.
 pub fn compile_workflow(
     json: &JsonWorkflow,
     send: SendMessage,
 ) -> Result<WorkflowDefinition<PipelineData>, String> {
     let mut wf = WorkflowDefinition::new(json.name.clone(), json.name.clone());
-    for s in &json.steps {
+
+    // Previous step that produced the input channel, per OpenFang chaining.
+    let mut prev: Option<String> = None;
+    // Fan-out group bookkeeping: step before the group + member indices.
+    let mut fan_group: Vec<String> = Vec::new();
+
+    for s in json.steps.iter() {
+        let is_fan_out = matches!(s.mode, JsonMode::FanOut);
+        let is_collect = matches!(s.mode, JsonMode::Collect);
+
+        // Derive DAG dependencies from position.
+        let deps: Vec<String> = if is_collect {
+            // Collect joins every fan-out step since the group started.
+            std::mem::take(&mut fan_group)
+        } else if is_fan_out {
+            // Every member depends only on the step before the group, so the
+            // whole group runs in parallel; register this member for the
+            // eventual Collect.
+            fan_group.push(s.name.clone());
+            prev.clone().into_iter().collect()
+        } else {
+            prev.clone().into_iter().collect()
+        };
+        let deps: Vec<&str> = deps.iter().map(String::as_str).collect();
+
         let executor = Arc::new(PromptExecutor {
             agent: s.agent.clone(),
             template: s.prompt.clone(),
@@ -153,10 +182,20 @@ pub fn compile_workflow(
                     max_retries: s.max_retries,
                 },
             });
+        if !deps.is_empty() {
+            def = def.depends_on(&deps);
+        }
         if let Some(var) = &s.output_var {
             def = def.with_output_var(var.clone());
         }
         wf = wf.add_step(def);
+
+        // Advance the chain: sequential/collect steps produce the next input;
+        // a fan-out group closes when the following step is not a fan-out.
+        if !is_fan_out {
+            prev = Some(s.name.clone());
+            fan_group.clear();
+        }
     }
     wf.validate()
         .map_err(|e| format!("invalid workflow: {e}"))?;

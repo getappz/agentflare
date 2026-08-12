@@ -88,6 +88,7 @@ flare-docs = { path = "crates/flare-docs" }
 flare-git-core = { path = "crates/flare-git-core" }
 flare-proxy = { path = "crates/flare-proxy" }
 flare-vault = { path = "crates/flare-vault" }
+flare-workflow = { path = "crates/flare-workflow" }
 skill = { version = "0.8", default-features = false, features = ["network"] }
 agentflare-jobs = { path = "crates/agentflare-jobs" }
 agentflare-resource-gate = { path = "crates/agentflare-resource-gate" }

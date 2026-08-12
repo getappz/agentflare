@@ -130,51 +130,52 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             })
             .await;
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<EntryResult>();
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<EntryResult>();
         let key = format!("{run_id}:{name}");
         self.waiters.lock().insert(key.clone(), tx);
 
-        // Close the notify-before-wait race: after registering, re-check the
-        // journal in case complete_event already buffered the result.
-        let journal = self.state_store.journal(run_id).await?;
-        let buffered = journal.iter().rev().find_map(|e| match e {
-            JournalEntry::WaitEvent {
-                name: n,
-                result: Some(r),
-            } if n == name => Some(r.clone()),
-            _ => None,
-        });
-        if let Some(result) = buffered {
-            self.waiters.lock().remove(&key);
-            self.state_store
-                .append_journal(
-                    run_id,
-                    JournalEntry::WaitEvent {
-                        name: name.to_string(),
-                        result: Some(result),
-                    },
-                )
-                .await?;
-            self.state_store
-                .update(run_id, |s| {
-                    if let Some(ss) = s.step_states.get_mut(&step.id) {
-                        ss.status = StepStatus::Succeeded;
-                        ss.completed_at = Some(Utc::now());
-                    }
-                })
-                .await?;
-            return Ok(StepResult::Success);
-        }
-
+        // Wait on the fast-path oneshot AND a periodic journal poll:
+        // `complete_event` may arrive from a *different* engine instance
+        // (MCP call, CLI, recovery) that can't reach this oneshot — the
+        // journaled completion is the durable, cross-engine source of truth.
         let timeout_dur = Duration::from_secs(timeout_secs);
-        let outcome = match tokio::time::timeout(timeout_dur, rx).await {
+        let outcome = tokio::time::timeout(timeout_dur, async {
+            let mut tick = tokio::time::interval(Duration::from_millis(250));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    resolved = &mut rx => {
+                        return resolved.map_err(|_| "wait channel closed".to_string());
+                    }
+                    _ = tick.tick() => {
+                        let journal = self
+                            .state_store
+                            .journal(run_id)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        if let Some(result) = journal.iter().rev().find_map(|e| match e {
+                            JournalEntry::WaitEvent {
+                                name: n,
+                                result: Some(r),
+                            } if n == name => Some(r.clone()),
+                            _ => None,
+                        }) {
+                            return Ok(result);
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        self.waiters.lock().remove(&key);
+
+        let outcome = match outcome {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Err("wait channel closed".to_string()),
+            Ok(Err(msg)) => Err(msg),
             Err(_) => Err(format!(
                 "wait for event '{name}' timed out after {timeout_secs}s"
             )),
         };
-        self.waiters.lock().remove(&key);
 
         match outcome {
             Ok(result) => {
@@ -226,10 +227,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         }
     }
 
-    /// Complete a pending `WaitEvent` from anywhere. Exactly-once: a buffered
-    /// journaled completion is written when no in-process waiter exists, so a
-    /// pre-delivery survives the notify-before-wait race; a racing second
-    /// completion is a no-op.
+    /// Complete a pending `WaitEvent` from anywhere. Exactly-once and
+    /// cross-engine safe: the completion is **always journaled** (so a
+    /// different engine instance or a post-restart recovery sees it), and an
+    /// in-process waiter is woken as a fast-path.
     pub async fn complete_event(
         &self,
         run_id: WorkflowRunId,
@@ -237,22 +238,20 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         result: EntryResult,
     ) -> WorkflowResult<()> {
         let key = format!("{run_id}:{name}");
-        let waiter = self.waiters.lock().remove(&key);
-        if let Some(tx) = waiter {
-            let _ = tx.send(result);
-            return Ok(());
-        }
-        // No in-process waiter: buffer the completion in the journal. Append is
-        // idempotent per name via the pending-entry guard on the wait side.
+        // Durable: the journaled completion is the source of truth.
         self.state_store
             .append_journal(
                 run_id,
                 JournalEntry::WaitEvent {
                     name: name.to_string(),
-                    result: Some(result),
+                    result: Some(result.clone()),
                 },
             )
             .await?;
+        // Fast-path: wake an in-process waiter in this engine.
+        if let Some(tx) = self.waiters.lock().remove(&key) {
+            let _ = tx.send(result);
+        }
         Ok(())
     }
 }

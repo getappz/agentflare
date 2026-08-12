@@ -29,6 +29,7 @@ mod update;
 mod vault;
 mod vent;
 pub(crate) mod work;
+mod workflow;
 
 use clap::{Parser, Subcommand};
 use std::sync::LazyLock;
@@ -85,6 +86,7 @@ pub enum Commands {
     Vent(vent::VentArgs),
     Work(work::WorkArgs),
     Docs(docs::DocsArgs),
+    Workflow(workflow::WorkflowArgs),
 }
 
 impl Commands {
@@ -122,6 +124,7 @@ impl Commands {
             Self::Vent(cmd) => vent::run(cmd),
             Self::Work(cmd) => cmd.run(),
             Self::Docs(cmd) => docs::run(cmd),
+            Self::Workflow(cmd) => cmd.run(),
         }
     }
 }
