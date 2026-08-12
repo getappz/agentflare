@@ -262,6 +262,7 @@ pub enum JournalEntry {
     StateClear { key: String },
     /// Durable timer: fires once wall-clock passes `wake_at`.
     Sleep {
+        step_id: StepId,
         wake_at: DateTime<Utc>,
         result: Option<EntryResult>,
     },

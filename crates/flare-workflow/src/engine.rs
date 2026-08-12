@@ -135,8 +135,8 @@ impl StepTracker {
 /// durable journal.
 pub struct WorkflowEngine<D: WorkflowData, S: StateStore<D> = InMemoryStore<D>> {
     definitions: Arc<RwLock<HashMap<WorkflowId, Arc<WorkflowDefinition<D>>>>>,
-    state_store: S,
-    event_bus: Arc<EventBus>,
+    pub(crate) state_store: S,
+    pub(crate) event_bus: Arc<EventBus>,
     shutdown_tx: Arc<watch::Sender<bool>>,
     active_workflows: Arc<AtomicUsize>,
     /// Jitter factor applied to retry backoff delays (0.0-1.0).
@@ -144,7 +144,7 @@ pub struct WorkflowEngine<D: WorkflowData, S: StateStore<D> = InMemoryStore<D>> 
     /// In-process completions for pending `WaitEvent` steps, keyed by
     /// `"{run_id}:{name}"`. A completed event is also journaled so it survives
     /// restart and pre-delivery races.
-    waiters: Arc<parking_lot::Mutex<HashMap<String, tokio::sync::oneshot::Sender<EntryResult>>>>,
+    pub(crate) waiters: Arc<parking_lot::Mutex<HashMap<String, tokio::sync::oneshot::Sender<EntryResult>>>>,
 }
 
 impl<D: WorkflowData> WorkflowEngine<D, InMemoryStore<D>> {
@@ -336,6 +336,40 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         Ok(run_id)
     }
 
+    /// Resume every `Running`/`Pending` run found in the store after a crash
+    /// or restart. Recovery replays each run's journal, skips steps that
+    /// already completed (memoized), and re-drives the pending remainder.
+    /// Returns the set of resumed run IDs.
+    pub async fn recover(&self) -> WorkflowResult<Vec<WorkflowRunId>> {
+        let active = self.state_store.list_active().await?;
+        let mut resumed = Vec::new();
+        for state in active {
+            let run_id = state.run_id;
+            let definition = match self.definitions.read().get(&state.workflow_id).cloned() {
+                Some(def) => def,
+                None => {
+                    tracing::warn!(run_id = %run_id, workflow_id = %state.workflow_id, "Cannot recover run: definition not registered");
+                    continue;
+                }
+            };
+            self.state_store
+                .update(run_id, |s| s.status = WorkflowStatus::Running)
+                .await?;
+            self.active_workflows.fetch_add(1, Ordering::AcqRel);
+            let engine = self.clone_for_execution();
+            let guard = self.active_workflow_guard();
+            let definition = Arc::clone(&definition);
+            tokio::spawn(async move {
+                let _guard = guard;
+                if let Err(e) = engine.execute_workflow(run_id, definition).await {
+                    tracing::error!(run_id = %run_id, error = ?e, "Recovered workflow failed to resume");
+                }
+            });
+            resumed.push(run_id);
+        }
+        Ok(resumed)
+    }
+
     /// Maximum number of retained workflow runs. Oldest completed/failed runs
     /// are evicted when this limit is exceeded (OpenFang semantics); runs in
     /// Pending/Running/Paused are never evicted.
@@ -401,11 +435,65 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (tx, mut rx) = mpsc::channel::<(StepId, StepResult)>(step_count.max(1));
 
+        // Memoize already-completed steps from the durable journal: a step with
+        // a completed journal entry is never re-executed on recovery. Completed
+        // dependents are scheduled forward so the rest of the DAG proceeds.
         let mut pending_check: VecDeque<usize> = definition
             .get_initial_step_indices()
             .iter()
             .copied()
             .collect();
+
+        {
+            let journal = self.state_store.journal(run_id).await?;
+            let mut t = tracker.write();
+            for step in &definition.steps {
+                let memoized = match &step.mode {
+                    StepMode::WaitEvent { name, .. } => {
+                        // Completed by name (journal entries carry no step id).
+                        journal.iter().any(|e| {
+                            matches!(
+                                e,
+                                JournalEntry::WaitEvent { name: n, result: Some(_) } if n == name
+                            )
+                        })
+                    }
+                    _ => {
+                        // Last entry for this step decides: success -> done,
+                        // failure -> failed, else still pending.
+                        match journal.iter().rev().find(|e| match e {
+                            JournalEntry::StepRun { step_id, .. }
+                            | JournalEntry::Sleep { step_id, .. } => step_id == &step.id,
+                            _ => false,
+                        }) {
+                            Some(JournalEntry::StepRun {
+                                result: Some(EntryResult::Success(_)),
+                                ..
+                            })
+                            | Some(JournalEntry::Sleep { result: Some(_), .. }) => {
+                                t.completed.insert(step.id.clone());
+                                true
+                            }
+                            Some(JournalEntry::StepRun {
+                                result: Some(EntryResult::Failure { .. }),
+                                ..
+                            }) => {
+                                t.failed.insert(step.id.clone());
+                                true
+                            }
+                            // Pending entries (result None) are re-run.
+                            _ => false,
+                        }
+                    }
+                };
+                if memoized {
+                    // Schedule dependents of memoized steps forward.
+                    for &dep in definition.get_dependent_indices(&step.id) {
+                        pending_check.push_back(dep);
+                    }
+                }
+            }
+        }
 
         loop {
             if self.state_store.is_cancelled(run_id).await? {
@@ -1095,239 +1183,6 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             )
             .await?;
         Ok(StepResult::Success)
-    }
-
-    /// Execute a durable `Sleep` step: journal a pending timer, suspend the
-    /// step until wall-clock passes `wake_at`, then journal the fired result.
-    async fn execute_sleep(
-        &self,
-        run_id: WorkflowRunId,
-        step: &StepDefinition<D>,
-        duration_secs: u64,
-    ) -> WorkflowResult<StepResult> {
-        if self.state_store.is_cancelled(run_id).await? {
-            return Err(WorkflowError::Cancelled(run_id));
-        }
-        let wake_at = Utc::now() + chrono::Duration::seconds(duration_secs as i64);
-
-        // Append the pending timer once (idempotent across re-arms).
-        let journal = self.state_store.journal(run_id).await?;
-        if !journal
-            .iter()
-            .any(|e| matches!(e, JournalEntry::Sleep { result: None, .. }))
-        {
-            self.state_store
-                .append_journal(
-                    run_id,
-                    JournalEntry::Sleep {
-                        wake_at,
-                        result: None,
-                    },
-                )
-                .await?;
-        }
-        self.event_bus
-            .publish(WorkflowEvent::StepWaiting {
-                run_id,
-                step_id: step.id.clone(),
-                reason: format!("sleep until {wake_at}"),
-            })
-            .await;
-
-        let delay = (wake_at - Utc::now()).to_std().unwrap_or(Duration::ZERO);
-        tokio::time::sleep(delay).await;
-
-        self.state_store
-            .append_journal(
-                run_id,
-                JournalEntry::Sleep {
-                    wake_at,
-                    result: Some(EntryResult::Success(Vec::new())),
-                },
-            )
-            .await?;
-        self.state_store
-            .update(run_id, |s| {
-                if let Some(ss) = s.step_states.get_mut(&step.id) {
-                    ss.status = StepStatus::Succeeded;
-                    ss.completed_at = Some(Utc::now());
-                }
-            })
-            .await?;
-        Ok(StepResult::Success)
-    }
-
-    /// Execute a durable `WaitEvent` step: journal a pending promise, then
-    /// await `complete_event` (or a journaled pre-delivery) within the timeout.
-    async fn execute_wait_event(
-        &self,
-        run_id: WorkflowRunId,
-        step: &StepDefinition<D>,
-        name: &str,
-        timeout_secs: u64,
-    ) -> WorkflowResult<StepResult> {
-        if self.state_store.is_cancelled(run_id).await? {
-            return Err(WorkflowError::Cancelled(run_id));
-        }
-
-        // Pre-delivered completion already journaled -> succeed immediately.
-        let journal = self.state_store.journal(run_id).await?;
-        if journal.iter().any(|e| {
-            matches!(e, JournalEntry::WaitEvent { name: n, result: Some(_) } if n == name)
-        }) {
-            self.state_store
-                .update(run_id, |s| {
-                    if let Some(ss) = s.step_states.get_mut(&step.id) {
-                        ss.status = StepStatus::Succeeded;
-                        ss.completed_at = Some(Utc::now());
-                    }
-                })
-                .await?;
-            return Ok(StepResult::Success);
-        }
-
-        // Append the pending promise once.
-        if !journal
-            .iter()
-            .any(|e| matches!(e, JournalEntry::WaitEvent { name: n, result: None } if n == name))
-        {
-            self.state_store
-                .append_journal(
-                    run_id,
-                    JournalEntry::WaitEvent {
-                        name: name.to_string(),
-                        result: None,
-                    },
-                )
-                .await?;
-        }
-        self.event_bus
-            .publish(WorkflowEvent::StepWaiting {
-                run_id,
-                step_id: step.id.clone(),
-                reason: format!("wait for event '{name}'"),
-            })
-            .await;
-
-        let (tx, rx) = tokio::sync::oneshot::channel::<EntryResult>();
-        let key = format!("{run_id}:{name}");
-        self.waiters.lock().insert(key.clone(), tx);
-
-        // Close the notify-before-wait race: after registering, re-check the
-        // journal in case complete_event already buffered the result.
-        let journal = self.state_store.journal(run_id).await?;
-        let buffered = journal.iter().rev().find_map(|e| match e {
-            JournalEntry::WaitEvent { name: n, result: Some(r) } if n == name => Some(r.clone()),
-            _ => None,
-        });
-        if let Some(result) = buffered {
-            self.waiters.lock().remove(&key);
-            self.state_store
-                .append_journal(
-                    run_id,
-                    JournalEntry::WaitEvent {
-                        name: name.to_string(),
-                        result: Some(result),
-                    },
-                )
-                .await?;
-            self.state_store
-                .update(run_id, |s| {
-                    if let Some(ss) = s.step_states.get_mut(&step.id) {
-                        ss.status = StepStatus::Succeeded;
-                        ss.completed_at = Some(Utc::now());
-                    }
-                })
-                .await?;
-            return Ok(StepResult::Success);
-        }
-
-        let timeout_dur = Duration::from_secs(timeout_secs);
-        let outcome = match tokio::time::timeout(timeout_dur, rx).await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Err("wait channel closed".to_string()),
-            Err(_) => Err(format!("wait for event '{name}' timed out after {timeout_secs}s")),
-        };
-        self.waiters.lock().remove(&key);
-
-        match outcome {
-            Ok(result) => {
-                self.state_store
-                    .append_journal(
-                        run_id,
-                        JournalEntry::WaitEvent {
-                            name: name.to_string(),
-                            result: Some(result),
-                        },
-                    )
-                    .await?;
-                self.state_store
-                    .update(run_id, |s| {
-                        if let Some(ss) = s.step_states.get_mut(&step.id) {
-                            ss.status = StepStatus::Succeeded;
-                            ss.completed_at = Some(Utc::now());
-                        }
-                    })
-                    .await?;
-                Ok(StepResult::Success)
-            }
-            Err(msg) => {
-                self.state_store
-                    .append_journal(
-                        run_id,
-                        JournalEntry::WaitEvent {
-                            name: name.to_string(),
-                            result: Some(EntryResult::Failure {
-                                code: 2,
-                                message: msg.clone(),
-                                metadata: vec![],
-                            }),
-                        },
-                    )
-                    .await?;
-                self.state_store
-                    .update(run_id, |s| {
-                        s.current_step = Some(step.id.clone());
-                        if let Some(ss) = s.step_states.get_mut(&step.id) {
-                            ss.status = StepStatus::Failed;
-                            ss.last_error = Some(msg);
-                            ss.completed_at = Some(Utc::now());
-                        }
-                    })
-                    .await?;
-                Ok(StepResult::Failure)
-            }
-        }
-    }
-
-    /// Complete a pending `WaitEvent` from anywhere. Exactly-once: a buffered
-    /// journaled completion is written when no in-process waiter exists, so a
-    /// pre-delivery survives the notify-before-wait race; a racing second
-    /// completion is a no-op.
-    pub async fn complete_event(
-        &self,
-        run_id: WorkflowRunId,
-        name: &str,
-        result: EntryResult,
-    ) -> WorkflowResult<()> {
-        let key = format!("{run_id}:{name}");
-        let waiter = self.waiters.lock().remove(&key);
-        if let Some(tx) = waiter {
-            let _ = tx.send(result);
-            return Ok(());
-        }
-        // No in-process waiter: buffer the completion in the journal. Append is
-        // idempotent per name via the pending-entry guard on the wait side.
-        self.state_store
-            .append_journal(
-                run_id,
-                JournalEntry::WaitEvent {
-                    name: name.to_string(),
-                    result: Some(result),
-                },
-            )
-            .await?;
-        Ok(())
     }
 
     /// Cancel a running workflow.

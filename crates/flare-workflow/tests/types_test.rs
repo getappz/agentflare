@@ -92,6 +92,7 @@ fn journal_entry_completable_invariant() {
     assert_eq!(wait.entry_type(), "wait_event");
 
     let sleep = JournalEntry::Sleep {
+        step_id: StepId::new("s"),
         wake_at: Utc::now(),
         result: None,
     };

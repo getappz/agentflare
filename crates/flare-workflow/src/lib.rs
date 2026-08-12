@@ -22,6 +22,7 @@ pub mod sqlite_store;
 pub mod store;
 pub mod types;
 pub mod variables;
+pub mod waits;
 
 pub use definition::{StepCondition, StepDefinition, ValidationError, WorkflowDefinition};
 pub use engine::WorkflowEngine;

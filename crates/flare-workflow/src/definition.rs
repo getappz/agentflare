@@ -52,6 +52,27 @@ pub struct StepDefinition<D: WorkflowData> {
     pub output_var: Option<String>,
 }
 
+impl<D: WorkflowData> Clone for StepDefinition<D> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            executor: Arc::clone(&self.executor),
+            mode: self.mode.clone(),
+            error_mode: self.error_mode.clone(),
+            retry_policy: self.retry_policy.clone(),
+            timeout: self.timeout,
+            on_failure: self.on_failure,
+            depends_on: self.depends_on.clone(),
+            depends_on_any: self.depends_on_any.clone(),
+            delay: self.delay,
+            scheduled_at: self.scheduled_at,
+            run_if: self.run_if.clone(),
+            output_var: self.output_var.clone(),
+        }
+    }
+}
+
 impl<D: WorkflowData> fmt::Debug for StepDefinition<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StepDefinition")
@@ -173,6 +194,20 @@ pub struct WorkflowDefinition<D: WorkflowData> {
     reverse_deps: HashMap<StepId, Vec<usize>>,
     /// Pre-computed indices of steps with no dependencies (can start immediately).
     initial_step_indices: Vec<usize>,
+}
+
+impl<D: WorkflowData> Clone for WorkflowDefinition<D> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            steps: self.steps.clone(),
+            default_retry_policy: self.default_retry_policy.clone(),
+            default_timeout: self.default_timeout,
+            reverse_deps: self.reverse_deps.clone(),
+            initial_step_indices: self.initial_step_indices.clone(),
+        }
+    }
 }
 
 impl<D: WorkflowData> fmt::Debug for WorkflowDefinition<D> {
