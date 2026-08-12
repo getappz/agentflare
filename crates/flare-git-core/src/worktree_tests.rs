@@ -140,6 +140,43 @@ fn test_item(sequence_id: i64) -> Item {
     }
 }
 
+fn test_item_named(sequence_id: i64, name: &str) -> Item {
+    Item {
+        name: name.into(),
+        ..test_item(sequence_id)
+    }
+}
+
+#[test]
+fn task_branch_name_slugs_a_normal_title() {
+    let item = test_item_named(33, "Agentflare code review");
+    assert_eq!(task_branch_name(&item), "task/33-agentflare-code-review");
+}
+
+#[test]
+fn task_branch_name_falls_back_to_bare_form_for_an_empty_title() {
+    let item = test_item_named(33, "");
+    assert_eq!(task_branch_name(&item), "task/33");
+}
+
+#[test]
+fn task_branch_name_falls_back_to_bare_form_for_an_all_symbol_or_unicode_title() {
+    let item = test_item_named(33, "!!! -- 日本語 --- !!!");
+    assert_eq!(task_branch_name(&item), "task/33");
+}
+
+#[test]
+fn task_branch_name_truncates_a_very_long_title() {
+    let item = test_item_named(33, &"word ".repeat(30));
+    let branch = task_branch_name(&item);
+    assert!(
+        branch.len() <= "task/33-".len() + MAX_SLUG_LEN,
+        "branch name not truncated: {branch} ({} chars)",
+        branch.len()
+    );
+    assert!(!branch.ends_with('-'));
+}
+
 #[test]
 fn ensure_worktrees_ignored_is_noop_when_already_ignored() {
     let repo = init_repo();
@@ -281,7 +318,10 @@ fn already_isolated_for_true_inside_the_worktree_it_created() {
     let item = test_item(1);
     let target = resolve_default_branch(&repo.path);
     let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
-    assert!(already_isolated_for("task/1", &worktree_path));
+    assert!(already_isolated_for(
+        &task_branch_name(&item),
+        &worktree_path
+    ));
 }
 
 #[test]
@@ -410,7 +450,7 @@ fn commit_uncommitted_commits_a_dirty_worktree() {
 
     let status = run_git_in(&worktree_path, &["status", "--porcelain"]).unwrap();
     assert!(status.is_empty(), "worktree must be clean after commit");
-    let branch = format!("task/{}", item.sequence_id);
+    let branch = task_branch_name(&item);
     assert!(branch_diverged(&repo.path, &branch, &target));
 }
 
@@ -427,7 +467,7 @@ fn commit_uncommitted_is_a_noop_on_a_clean_worktree() {
     ));
     assert!(!branch_diverged(
         &repo.path,
-        &format!("task/{}", item.sequence_id),
+        &task_branch_name(&item),
         &target
     ));
 }
@@ -491,19 +531,20 @@ fn commit_uncommitted_reports_failed_not_nothing_to_commit_when_add_fails() {
 fn create_worktree_reuses_a_branch_that_exists_with_no_owning_worktree() {
     // The task/29 collision: a plain local branch survives (e.g. from a
     // prior session) with no worktree ever created for it. `-b` alone
-    // would fail here ("a branch named 'task/1' already exists") --
+    // would fail here ("a branch named 'task/1-test' already exists") --
     // create_worktree must detect this and check out the existing
     // branch instead of trying to recreate it.
     let repo = init_repo();
-    run_git_in(&repo.path, &["branch", "task/1"]).unwrap();
-    let worktree_path = repo.path.join(".worktrees").join("task").join("1");
     let item = test_item(1);
+    let branch = task_branch_name(&item);
+    run_git_in(&repo.path, &["branch", &branch]).unwrap();
+    let worktree_path = repo.path.join(".worktrees").join("task").join("1");
     let target = resolve_default_branch(&repo.path);
     let result = create_worktree(&item, &repo.path, &target, None);
     assert!(result.is_ok(), "{:?}", result.err());
     assert!(worktree_path.exists());
     let checked_out = run_git_in(&worktree_path, &["branch", "--show-current"]).unwrap();
-    assert_eq!(checked_out, "task/1");
+    assert_eq!(checked_out, branch);
 }
 
 #[test]
@@ -528,7 +569,7 @@ fn create_worktree_reuses_an_existing_worktree_when_called_from_the_repo_root() 
     assert_eq!(result.unwrap(), worktree_path);
     assert!(worktree_path.exists());
     let checked_out = run_git_in(&worktree_path, &["branch", "--show-current"]).unwrap();
-    assert_eq!(checked_out, "task/1");
+    assert_eq!(checked_out, task_branch_name(&item));
 }
 
 #[test]
@@ -617,9 +658,10 @@ fn push_branch_returns_none_when_branch_content_already_merged() {
     std::fs::write(&test_file, b"hello").unwrap();
     run_git_in(&worktree_path, &["add", "test.txt"]).unwrap();
     run_git_in(&worktree_path, &["commit", "-m", "worktree change"]).unwrap();
-    // task/1 now has a commit master doesn't. Squash-merge: cherry-pick
-    // the *diff* onto master so content matches but ancestry doesn't.
-    run_git_in(&repo.path, &["cherry-pick", "-n", "task/1"]).unwrap();
+    // The item's branch now has a commit master doesn't. Squash-merge:
+    // cherry-pick the *diff* onto master so content matches but
+    // ancestry doesn't.
+    run_git_in(&repo.path, &["cherry-pick", "-n", &task_branch_name(&item)]).unwrap();
     run_git_in(&repo.path, &["commit", "-m", "squash-merge"]).unwrap();
     // Content-diff guard should catch this even though commit-count
     // guard passes.
