@@ -1,0 +1,19 @@
+[package]
+name = "agentflare-resource-gate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Host resource awareness for autonomous dispatch — CPU/memory pool sizing plus a live CPU-pressure gate (Aggressive/Normal/Throttled/Paused)."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+sysinfo = { version = "0.34", default-features = false, features = ["system"] }
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

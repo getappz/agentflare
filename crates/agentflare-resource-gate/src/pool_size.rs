@@ -11,6 +11,7 @@
 //! deliberately keeps RAM full of reclaimable cache. Each platform gets its
 //! own accurate reading below instead of one generic host-wide number.
 
+#[cfg(target_os = "linux")]
 use std::fs;
 
 /// Conservative per-work-item memory footprint. Each concurrency slot runs
@@ -53,7 +54,10 @@ pub fn resolve_pool_size(available_parallelism: usize, memory_budget_bytes: u64)
 }
 
 /// Parses a cgroup numeric value file's content: `None` for `"max"`
-/// (unlimited) or anything unparseable.
+/// (unlimited) or anything unparseable. cgroups are a Linux-only concept —
+/// gated the same as their only caller, `cgroup_memory_available`, so this
+/// doesn't sit as dead code on other platforms.
+#[cfg(target_os = "linux")]
 fn parse_cgroup_bytes(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     if raw == "max" {
@@ -62,6 +66,7 @@ fn parse_cgroup_bytes(raw: &str) -> Option<u64> {
     raw.parse::<u64>().ok()
 }
 
+#[cfg(target_os = "linux")]
 fn read_cgroup_bytes(path: &str) -> Option<u64> {
     fs::read_to_string(path)
         .ok()
@@ -71,6 +76,7 @@ fn read_cgroup_bytes(path: &str) -> Option<u64> {
 /// `inactive_file` bytes from a cgroup `memory.stat` file — reclaimable
 /// page cache the kernel evicts under pressure before touching a worker's
 /// real memory, so it's credited back rather than counted as used.
+#[cfg(target_os = "linux")]
 fn parse_inactive_file(stat: &str) -> u64 {
     stat.lines()
         .find_map(|line| line.strip_prefix("inactive_file "))
@@ -78,6 +84,7 @@ fn parse_inactive_file(stat: &str) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(target_os = "linux")]
 fn read_inactive_file(path: &str) -> u64 {
     fs::read_to_string(path)
         .map(|s| parse_inactive_file(&s))
@@ -212,6 +219,7 @@ mod tests {
         assert_eq!(resolve_pool_size(8, 0), 1);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn parse_cgroup_bytes_handles_max_and_numeric() {
         assert_eq!(parse_cgroup_bytes("max\n"), None);
@@ -219,6 +227,7 @@ mod tests {
         assert_eq!(parse_cgroup_bytes("garbage"), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn parse_inactive_file_finds_the_field_among_others() {
         let stat = "anon 100\ninactive_file 5242880\nactive_file 200\n";

@@ -79,6 +79,7 @@ pub(crate) fn run_discovery_tick(
     mcp: &AgentflareMcp,
     queue: &agentflare_jobs::Queue,
     auth_conn: &rusqlite::Connection,
+    host_policy: agentflare_resource_gate::Policy,
 ) -> DiscoveryTickResult {
     let mut result = DiscoveryTickResult {
         dispatched: 0,
@@ -151,6 +152,19 @@ pub(crate) fn run_discovery_tick(
                             item.sequence_id,
                             item.id,
                             agent.as_str()
+                        );
+                        result.waiting += 1;
+                        continue;
+                    }
+                    // Independent of the per-agent cooldown above: this is
+                    // the host's own CPU-pressure tier, not agent identity.
+                    // Both gates must pass before a dispatch proceeds.
+                    if host_policy.blocks_dispatch() {
+                        eprintln!(
+                            "agentflare-supervisor: item #{} ({}) is ready-for-work but the host resource gate is {}",
+                            item.sequence_id,
+                            item.id,
+                            host_policy.as_str()
                         );
                         result.waiting += 1;
                         continue;
@@ -349,6 +363,7 @@ pub(crate) fn run_review_sweep(
     mcp: &AgentflareMcp,
     queue: &agentflare_jobs::Queue,
     auth_conn: &rusqlite::Connection,
+    host_policy: agentflare_resource_gate::Policy,
 ) -> ReviewSweepResult {
     let mut result = ReviewSweepResult {
         promoted: 0,
@@ -396,6 +411,7 @@ pub(crate) fn run_review_sweep(
                     mcp,
                     queue,
                     auth_conn,
+                    host_policy,
                     item,
                     &failed_checks,
                     &label_id_by_name,
@@ -453,6 +469,7 @@ fn self_repair_or_gate(
     mcp: &AgentflareMcp,
     queue: &agentflare_jobs::Queue,
     auth_conn: &rusqlite::Connection,
+    host_policy: agentflare_resource_gate::Policy,
     item: &agentflare_backend::item::Item,
     failed_checks: &[String],
     label_id_by_name: &std::collections::HashMap<String, String>,
@@ -512,6 +529,11 @@ fn self_repair_or_gate(
         return false;
     };
     if crate::auth_db::is_cooling_down(auth_conn, agent.as_str()) {
+        return false;
+    }
+    // Independent of the per-agent cooldown above — the host's own
+    // CPU-pressure tier. Both gates must pass.
+    if host_policy.blocks_dispatch() {
         return false;
     }
     let Some(info) = enqueue_work_job(queue, item, agent, None) else {
@@ -649,7 +671,12 @@ mod tests {
         let item_id = seed_ready_item(&mcp, Some("claude-code"));
 
         let auth_conn = test_auth_conn();
-        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
 
         assert_eq!(result.dispatched, 1);
         assert_eq!(result.skipped, 0);
@@ -678,7 +705,12 @@ mod tests {
         let item_id = seed_ready_item(&mcp, Some("claude-code"));
         crate::auth_db::set_cooldown(&auth_conn, "claude-code", "__default__", 30, "rate limit");
 
-        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
 
         assert_eq!(result.dispatched, 0);
         assert_eq!(result.skipped, 0);
@@ -697,6 +729,86 @@ mod tests {
         assert!(
             labels_contain_name(&mcp, &labels, "ready-for-work"),
             "the item must stay ready-for-work so a later tick can pick it up once the cooldown clears"
+        );
+    }
+
+    /// Host resource gate (item #435) — independent of, and alongside, the
+    /// per-agent cooldown check above. `host_policy` is an injected
+    /// parameter rather than a live global read specifically so this test
+    /// (and every other test in this module) can't race a background
+    /// sampler thread or leak state across tests in the same binary.
+    #[test]
+    fn host_gate_throttled_is_skipped_not_dispatched() {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let auth_conn = test_auth_conn();
+        let item_id = seed_ready_item(&mcp, Some("claude-code"));
+
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Throttled,
+        );
+
+        assert_eq!(result.dispatched, 0);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(
+            result.waiting, 1,
+            "a throttled host must count the item as waiting, not vanish it"
+        );
+        assert!(
+            queue.list(None).unwrap().is_empty(),
+            "a throttled host must not dispatch"
+        );
+
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(
+            labels_contain_name(&mcp, &labels, "ready-for-work"),
+            "the item must stay ready-for-work so a later tick can pick it up once the host recovers"
+        );
+    }
+
+    #[test]
+    fn host_gate_paused_is_skipped_not_dispatched() {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let auth_conn = test_auth_conn();
+        seed_ready_item(&mcp, Some("claude-code"));
+
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Paused {
+                reason: agentflare_resource_gate::PauseReason::CpuPressure,
+            },
+        );
+
+        assert_eq!(result.dispatched, 0);
+        assert_eq!(result.waiting, 1);
+        assert!(queue.list(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn host_gate_aggressive_does_not_block_an_otherwise_eligible_item() {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let auth_conn = test_auth_conn();
+        seed_ready_item(&mcp, Some("claude-code"));
+
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Aggressive,
+        );
+
+        assert_eq!(
+            result.dispatched, 1,
+            "Aggressive must dispatch exactly like Normal — it's a bypass, not a boost"
         );
     }
 
@@ -794,7 +906,12 @@ mod tests {
         let item_id = seed_ready_item_under_gated_goal(&mcp);
 
         let auth_conn = test_auth_conn();
-        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
 
         assert_eq!(result.dispatched, 0);
         assert!(
@@ -921,7 +1038,12 @@ mod tests {
         let (_item_id, _goal_id) = seed_ready_item_under_active_goal_with_repairs(&mcp, 0);
 
         let auth_conn = test_auth_conn();
-        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
 
         assert_eq!(result.dispatched, 1, "self-repair still dispatches the job");
         assert_eq!(queue.list(None).unwrap().len(), 1);
@@ -937,7 +1059,12 @@ mod tests {
         );
 
         let auth_conn = test_auth_conn();
-        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
 
         assert_eq!(
             result.dispatched, 0,
@@ -959,7 +1086,12 @@ mod tests {
         let item_id = seed_ready_item(&mcp, Some("claude-code"));
 
         let auth_conn = test_auth_conn();
-        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
 
         assert_eq!(result.dispatched, 1);
         assert_eq!(result.skipped, 0);
@@ -974,7 +1106,12 @@ mod tests {
         let item_id = seed_ready_item(&mcp, Some("opencode"));
 
         let auth_conn = test_auth_conn();
-        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
 
         assert_eq!(result.dispatched, 0);
         assert_eq!(result.skipped, 1);
@@ -1158,7 +1295,12 @@ mod tests {
         let item_b = seed_ready_item_in_project(&mcp, "proj-b", "/repo/b");
 
         let auth_conn = test_auth_conn();
-        let result = run_discovery_tick(&mcp, &queue, &auth_conn);
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
 
         assert_eq!(
             result.dispatched, 2,
@@ -1222,7 +1364,12 @@ mod tests {
         let _item_id = seed_ready_item(&mcp, Some("claude-code"));
 
         let auth_conn = test_auth_conn();
-        let result = run_review_sweep(&mcp, &queue, &auth_conn);
+        let result = run_review_sweep(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
 
         assert_eq!(result.promoted, 0);
         assert_eq!(result.self_repaired, 0);
@@ -1237,7 +1384,12 @@ mod tests {
         let _item_id = seed_in_review_item(&mcp, Some("claude-code"));
 
         let auth_conn = test_auth_conn();
-        let result = run_review_sweep(&mcp, &queue, &auth_conn);
+        let result = run_review_sweep(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
 
         assert_eq!(result.promoted, 0);
         assert_eq!(result.self_repaired, 0);
@@ -1260,6 +1412,7 @@ mod tests {
             &mcp,
             &queue,
             &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
             &item,
             &["clippy".to_string()],
             &label_id_by_name,
@@ -1308,6 +1461,7 @@ mod tests {
             &mcp,
             &queue,
             &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
             &item,
             &["clippy".to_string()],
             &label_id_by_name,
@@ -1343,6 +1497,7 @@ mod tests {
             &mcp,
             &queue,
             &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
             &item,
             &["clippy".to_string()],
             &label_id_by_name,
@@ -1371,6 +1526,7 @@ mod tests {
             &mcp,
             &queue,
             &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
             &item,
             &["clippy".to_string()],
             &label_id_by_name,

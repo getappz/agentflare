@@ -75,6 +75,7 @@ dependencies = [
  "agentflare-flare-output",
  "agentflare-gateway-registry",
  "agentflare-jobs",
+ "agentflare-resource-gate",
  "agentflare-skill-registry",
  "agentflare-store",
  "agentflare-workspace-hack",
@@ -249,6 +250,14 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "agentflare-resource-gate"
+version = "0.1.0"
+dependencies = [
+ "agentflare-workspace-hack",
+ "sysinfo 0.34.2",
 ]
 
 [[package]]
