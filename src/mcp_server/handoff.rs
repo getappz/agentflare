@@ -119,7 +119,7 @@ impl AgentflareMcp {
                 Some(id) => self.with_backend_db(|conn| {
                     agentflare_backend::item::get(conn, id)
                         .ok()
-                        .map(|item| format!("task/{}", item.sequence_id))
+                        .map(|item| flare_git_core::worktree::task_branch_name(&item))
                 })?,
                 None => None,
             };

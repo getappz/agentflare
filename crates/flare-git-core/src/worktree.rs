@@ -218,6 +218,56 @@ fn sccache_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Max length of the slug portion of a `task/<sequence_id>-<slug>` branch
+/// name (excludes the `task/<sequence_id>-` prefix).
+const MAX_SLUG_LEN: usize = 40;
+
+/// Lowercase, hyphen-collapsed form of `item.name` for use in a branch
+/// name segment. Non-ASCII-alphanumeric runs (including unicode) collapse
+/// to a single `-`; leading/trailing `-` are trimmed; result is truncated
+/// to `MAX_SLUG_LEN`. Empty for an empty or all-symbol/unicode name.
+fn slugify_branch_title(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out.truncate(MAX_SLUG_LEN);
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Deterministic `task/<sequence_id>[-<slug>]` branch name for `item` --
+/// same sequence_id + same name always yields the same string, which
+/// `already_isolated_for` (above) relies on for its exact-match re-claim
+/// detection. Falls back to the bare `task/<sequence_id>` (no trailing
+/// dash) when `item.name` has nothing sluggable in it.
+///
+/// `pub`, not `pub(crate)`: `src/worktree.rs` (a different crate) also
+/// needs to resolve an item's branch name for `branch_diverged`,
+/// `is_pr_merged`, and `pr_ci_status` -- those independently recomputing
+/// the bare `format!("task/{}", item.sequence_id)` form is exactly the
+/// bug this function exists to prevent (item #89).
+pub fn task_branch_name(item: &Item) -> String {
+    let slug = slugify_branch_title(&item.name);
+    if slug.is_empty() {
+        format!("task/{}", item.sequence_id)
+    } else {
+        format!("task/{}-{slug}", item.sequence_id)
+    }
+}
+
 /// Creates an isolated git worktree for `item` against `target_branch`.
 ///
 /// Deliberately takes an already-resolved `target_branch` instead of a
@@ -232,7 +282,7 @@ pub fn create_worktree(
     target_branch: &str,
     progress: Option<&dyn Progress>,
 ) -> Result<PathBuf, String> {
-    let branch = format!("task/{}", item.sequence_id);
+    let branch = task_branch_name(item);
     let worktree_path = repo_root
         .join(".worktrees")
         .join("task")
@@ -517,7 +567,7 @@ pub fn push_branch(
     target_branch: &str,
     progress: Option<&dyn Progress>,
 ) -> Option<String> {
-    let branch = format!("task/{}", item.sequence_id);
+    let branch = task_branch_name(item);
     let worktree_path = repo_root
         .join(".worktrees")
         .join("task")
