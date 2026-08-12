@@ -216,6 +216,24 @@ impl BinarySnapshot {
 /// pid/lock files *first* so the replacement's own `is_daemon_running()`
 /// gate (`ServeArgs::run`) can't mistake this still-exiting process for a
 /// still-live one and refuse to start.
+///
+/// Deliberately does *not* wait for any in-process job the `WorkerPool` may
+/// have running on another thread right now. That looks like it could
+/// reintroduce the exact silent-failure shape this item exists to close --
+/// but it doesn't, because it's not a new risk: `dashboard::server`'s
+/// `reconcile_orphaned_jobs`, which the replacement daemon runs before its
+/// own `WorkerPool::start` (see that function's doc comment for why the
+/// order matters), already exists to make an abruptly-dead daemon's
+/// in-flight jobs fail loud and release their claim rather than vanish --
+/// built for the ordinary crash/kill -9/OOM case (item #40), and this exit
+/// is just a self-triggered instance of that same case. The one real
+/// difference -- durable side effects a job already committed (a merged
+/// commit, an opened PR) land before this process's own job-row bookkeeping
+/// does -- means the worst case here is a stray "orphaned" comment on an
+/// item that actually succeeded, not a silently-uncommitted, no-PR item
+/// wrongly marked done (item #66/PR #436's failure mode). Waiting instead
+/// would trade a bounded, already-handled cosmetic gap for an unbounded one:
+/// exactly the indefinite stale-logic window this watchdog exists to close.
 pub fn respawn_from_stale(snapshot: &BinarySnapshot) -> ! {
     cleanup_daemon_files();
     let binary = snapshot.path().to_string_lossy().to_string();
