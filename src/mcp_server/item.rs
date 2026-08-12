@@ -701,9 +701,7 @@ impl AgentflareMcp {
                         ..Default::default()
                     });
                     return Err(ErrorData::internal_error(
-                        format!(
-                            "item {item_id}: auto-commit of uncommitted changes failed: {err}"
-                        ),
+                        format!("item {item_id}: auto-commit of uncommitted changes failed: {err}"),
                         None,
                     ));
                 }

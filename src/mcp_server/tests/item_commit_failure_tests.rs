@@ -53,9 +53,10 @@ fn item_done_reports_a_hard_error_when_auto_commit_fails_on_a_dirty_tree() {
     // "gitdir pointer is entirely broken" fallback test above.
     let gitdir_pointer = std::fs::read_to_string(worktree_path.join(".git")).unwrap();
     let git_dir = std::path::PathBuf::from(gitdir_pointer.trim().strip_prefix("gitdir: ").unwrap());
-    let mut perms = std::fs::metadata(&git_dir).unwrap().permissions();
+    let original_perms = std::fs::metadata(&git_dir).unwrap().permissions();
+    let mut perms = original_perms.clone();
     perms.set_readonly(true);
-    std::fs::set_permissions(&git_dir, perms.clone()).unwrap();
+    std::fs::set_permissions(&git_dir, perms).unwrap();
 
     let err = s
         .item(Parameters(ItemRequest {
@@ -67,9 +68,10 @@ fn item_done_reports_a_hard_error_when_auto_commit_fails_on_a_dirty_tree() {
         }))
         .unwrap_err();
 
-    // Restore write permission so the temp dir can be cleaned up.
-    perms.set_readonly(false);
-    std::fs::set_permissions(&git_dir, perms).unwrap();
+    // Restore the original permissions (not a blanket writable toggle,
+    // which on Unix would leave the dir world-writable) so the temp dir
+    // can be cleaned up.
+    std::fs::set_permissions(&git_dir, original_perms).unwrap();
 
     assert!(
         err.message.contains("auto-commit"),
@@ -92,8 +94,10 @@ fn item_done_reports_a_hard_error_when_auto_commit_fails_on_a_dirty_tree() {
     .unwrap();
     let arr = comments.as_array().unwrap();
     assert!(
-        arr.iter()
-            .any(|c| c["body"].as_str().unwrap_or_default().contains("commit failed")),
+        arr.iter().any(|c| c["body"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("commit failed")),
         "a commit-failure comment must be posted on the item: {arr:?}"
     );
 
