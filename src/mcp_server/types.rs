@@ -709,10 +709,15 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) name: Option<String>,
     #[schemars(
-        description = "State ID (create, update_state); omit to use the project's default (Backlog) state"
+        description = "State ID (create, update_state); omit to use the project's default (Backlog) state. For update_state, use state_name or state_group instead if you don't know the id — mutually exclusive with them"
     )]
     #[serde(default)]
     pub(crate) state_id: Option<String>,
+    #[schemars(
+        description = "State name, case-insensitive exact match (update_state only), e.g. \"Backlog\" — an alternative to state_id when you don't know the opaque id. Mutually exclusive with state_id and state_group"
+    )]
+    #[serde(default)]
+    pub(crate) state_name: Option<String>,
     #[schemars(description = "Markdown description body (create, update)")]
     #[serde(default)]
     pub(crate) description: Option<String>,
@@ -742,7 +747,7 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) label_id: Option<String>,
     #[schemars(
-        description = "Filter by state group (list); one of backlog|unstarted|started|in_review|completed|cancelled|triage, or a comma-separated list (e.g. \"backlog,unstarted,started\") to match any"
+        description = "Filter by state group (list): one of backlog|unstarted|started|in_review|completed|cancelled|triage, or a comma-separated list (e.g. \"backlog,unstarted,started\") to match any. Also usable as a target for update_state (single group only) — an alternative to state_id/state_name; errors if zero or more than one state in the project shares that group. Mutually exclusive with state_id and state_name for update_state"
     )]
     #[serde(default)]
     pub(crate) state_group: Option<String>,
