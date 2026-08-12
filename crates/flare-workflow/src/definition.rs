@@ -3,13 +3,21 @@
 //! Ported from SMG `wfaas` definition.rs (Apache-2.0), extended with
 //! OpenFang's `StepMode`/`ErrorMode` step semantics.
 
-use std::{collections::{HashMap, HashSet}, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 
 use crate::{
     executor::StepExecutor,
-    types::{ErrorMode, FailureAction, RetryPolicy, StepId, StepMode, WorkflowContext, WorkflowData, WorkflowId},
+    types::{
+        ErrorMode, FailureAction, RetryPolicy, StepId, StepMode, WorkflowContext, WorkflowData,
+        WorkflowId,
+    },
 };
 
 /// A condition function that determines whether a step should run.
@@ -93,7 +101,11 @@ impl<D: WorkflowData> fmt::Debug for StepDefinition<D> {
 }
 
 impl<D: WorkflowData> StepDefinition<D> {
-    pub fn new(id: impl Into<String>, name: impl Into<String>, executor: Arc<dyn StepExecutor<D>>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        executor: Arc<dyn StepExecutor<D>>,
+    ) -> Self {
         Self {
             id: StepId::new(id.into()),
             name: name.into(),
@@ -252,7 +264,9 @@ impl<D: WorkflowData> WorkflowDefinition<D> {
 
     /// Retry policy for a step (step-specific or default).
     pub fn get_retry_policy<'a>(&'a self, step: &'a StepDefinition<D>) -> &'a RetryPolicy {
-        step.retry_policy.as_ref().unwrap_or(&self.default_retry_policy)
+        step.retry_policy
+            .as_ref()
+            .unwrap_or(&self.default_retry_policy)
     }
 
     /// Timeout for a step (step-specific or default).
@@ -294,7 +308,10 @@ impl<D: WorkflowData> WorkflowDefinition<D> {
         self.reverse_deps.clear();
         for (idx, step) in self.steps.iter().enumerate() {
             for dep_id in step.all_dependencies() {
-                self.reverse_deps.entry(dep_id.clone()).or_default().push(idx);
+                self.reverse_deps
+                    .entry(dep_id.clone())
+                    .or_default()
+                    .push(idx);
             }
         }
 

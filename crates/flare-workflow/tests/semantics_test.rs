@@ -1,9 +1,9 @@
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use flare_workflow::engine::WorkflowEngine;
-use flare_workflow::executor::{noop_executor, FunctionStep};
+use flare_workflow::executor::{FunctionStep, noop_executor};
 use flare_workflow::store::InMemoryStore;
 use flare_workflow::types::*;
 use flare_workflow::{StepDefinition, WorkflowDefinition};
@@ -68,8 +68,9 @@ async fn conditional_skips_when_input_lacks_condition() {
     let wf = WorkflowDefinition::new("wf", "wf")
         .add_step(producer("first".into(), "all good"))
         .add_step(
-            producer("only-if-error".into(), "fixed it")
-                .with_mode(StepMode::Conditional { condition: "ERROR".into() }),
+            producer("only-if-error".into(), "fixed it").with_mode(StepMode::Conditional {
+                condition: "ERROR".into(),
+            }),
         );
     let state = run_and_wait(&engine(), wf).await;
     assert_eq!(state.status, WorkflowStatus::Completed);
@@ -108,7 +109,11 @@ async fn loop_until_condition_terminates_early() {
             Arc::new(FunctionStep::new(move |ctx: &mut WorkflowContext<Ctx>| {
                 let n = cc.fetch_add(1, Ordering::SeqCst);
                 ctx.data.calls.push(format!("iter{n}"));
-                ctx.output = if n >= 2 { "Result: DONE".to_string() } else { "Still working...".to_string() };
+                ctx.output = if n >= 2 {
+                    "Result: DONE".to_string()
+                } else {
+                    "Still working...".to_string()
+                };
                 Box::pin(async move { Ok(StepResult::Success) })
             })),
         )
@@ -181,8 +186,14 @@ async fn output_variables_are_referenced_by_later_steps() {
     // combine's input is the previous step output ("beta"), not the vars.
     assert_eq!(state.input, "echo(beta)");
     // variables captured for reference.
-    assert_eq!(state.variables.get("research").map(String::as_str), Some("alpha"));
-    assert_eq!(state.variables.get("outline").map(String::as_str), Some("beta"));
+    assert_eq!(
+        state.variables.get("research").map(String::as_str),
+        Some("alpha")
+    );
+    assert_eq!(
+        state.variables.get("outline").map(String::as_str),
+        Some("beta")
+    );
 }
 
 #[tokio::test]
@@ -248,18 +259,16 @@ async fn error_mode_retry_succeeds_after_transient_failures() {
 
 #[tokio::test]
 async fn token_accounting_recorded_on_success() {
-    let wf = WorkflowDefinition::new("wf", "wf").add_step(
-        StepDefinition::new(
-            "agent-step",
-            "agent-step",
-            Arc::new(FunctionStep::new(|ctx: &mut WorkflowContext<Ctx>| {
-                ctx.output = "out".to_string();
-                ctx.input_tokens = 100;
-                ctx.output_tokens = 50;
-                Box::pin(async move { Ok(StepResult::Success) })
-            })),
-        ),
-    );
+    let wf = WorkflowDefinition::new("wf", "wf").add_step(StepDefinition::new(
+        "agent-step",
+        "agent-step",
+        Arc::new(FunctionStep::new(|ctx: &mut WorkflowContext<Ctx>| {
+            ctx.output = "out".to_string();
+            ctx.input_tokens = 100;
+            ctx.output_tokens = 50;
+            Box::pin(async move { Ok(StepResult::Success) })
+        })),
+    ));
     let state = run_and_wait(&engine(), wf).await;
     let ss = &state.step_states[&StepId::new("agent-step")];
     assert_eq!(ss.input_tokens, 100);

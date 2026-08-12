@@ -6,7 +6,7 @@
 //! replays the journal and re-executes only pending entries — giving
 //! exactly-once step execution across crashes and retries.
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde_json::Value;
 
 use crate::types::{JournalEntry, WorkflowError, WorkflowResult};

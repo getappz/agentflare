@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
-use rusqlite_migration::{Migrations, M};
+use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite_migration::{M, Migrations};
 
 use crate::journal;
 use crate::store::StateStore;
@@ -106,7 +106,8 @@ impl<D: WorkflowData> SqliteStore<D> {
     }
 
     fn deserialize(json: &str) -> WorkflowResult<WorkflowState<D>> {
-        serde_json::from_str(json).map_err(|e| WorkflowError::Store(format!("deserialize state: {e}")))
+        serde_json::from_str(json)
+            .map_err(|e| WorkflowError::Store(format!("deserialize state: {e}")))
     }
 
     /// Write a state row plus its step_state/run_vars projections atomically.
@@ -140,8 +141,11 @@ impl<D: WorkflowData> SqliteStore<D> {
         )
         .map_err(|e| WorkflowError::Store(format!("upsert workflow_runs: {e}")))?;
 
-        tx.execute("DELETE FROM step_state WHERE run_id = ?1", params![state.run_id.to_string()])
-            .map_err(|e| WorkflowError::Store(format!("clear step_state: {e}")))?;
+        tx.execute(
+            "DELETE FROM step_state WHERE run_id = ?1",
+            params![state.run_id.to_string()],
+        )
+        .map_err(|e| WorkflowError::Store(format!("clear step_state: {e}")))?;
         for (step_id, ss) in &state.step_states {
             tx.execute(
                 "INSERT INTO step_state
@@ -160,8 +164,11 @@ impl<D: WorkflowData> SqliteStore<D> {
             .map_err(|e| WorkflowError::Store(format!("insert step_state: {e}")))?;
         }
 
-        tx.execute("DELETE FROM run_vars WHERE run_id = ?1", params![state.run_id.to_string()])
-            .map_err(|e| WorkflowError::Store(format!("clear run_vars: {e}")))?;
+        tx.execute(
+            "DELETE FROM run_vars WHERE run_id = ?1",
+            params![state.run_id.to_string()],
+        )
+        .map_err(|e| WorkflowError::Store(format!("clear run_vars: {e}")))?;
         for (key, value) in &state.variables {
             tx.execute(
                 "INSERT INTO run_vars (run_id, key, value) VALUES (?1, ?2, ?3)",
@@ -170,7 +177,8 @@ impl<D: WorkflowData> SqliteStore<D> {
             .map_err(|e| WorkflowError::Store(format!("insert run_vars: {e}")))?;
         }
 
-        tx.commit().map_err(|e| WorkflowError::Store(format!("commit: {e}")))?;
+        tx.commit()
+            .map_err(|e| WorkflowError::Store(format!("commit: {e}")))?;
         Ok(())
     }
 
@@ -179,10 +187,14 @@ impl<D: WorkflowData> SqliteStore<D> {
             .unchecked_transaction()
             .map_err(|e| WorkflowError::Store(format!("begin delete tx: {e}")))?;
         for table in ["workflow_runs", "journal", "step_state", "run_vars"] {
-            tx.execute(&format!("DELETE FROM {table} WHERE run_id = ?1"), params![run_id])
-                .map_err(|e| WorkflowError::Store(format!("delete from {table}: {e}")))?;
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE run_id = ?1"),
+                params![run_id],
+            )
+            .map_err(|e| WorkflowError::Store(format!("delete from {table}: {e}")))?;
         }
-        tx.commit().map_err(|e| WorkflowError::Store(format!("commit delete: {e}")))?;
+        tx.commit()
+            .map_err(|e| WorkflowError::Store(format!("commit delete: {e}")))?;
         Ok(())
     }
 }
@@ -231,12 +243,18 @@ fn status_from_str(s: &str) -> WorkflowStatus {
 #[async_trait]
 impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
     async fn save(&self, state: WorkflowState<D>) -> WorkflowResult<()> {
-        let conn = self.conn.lock().map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
         Self::write_state(&conn, &state)
     }
 
     async fn load(&self, run_id: WorkflowRunId) -> WorkflowResult<WorkflowState<D>> {
-        let conn = self.conn.lock().map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
         conn.query_row(
             "SELECT state_json FROM workflow_runs WHERE id = ?1",
             params![run_id.to_string()],
@@ -252,7 +270,10 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
     where
         F: FnOnce(&mut WorkflowState<D>) + Send,
     {
-        let conn = self.conn.lock().map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
         let json = conn
             .query_row(
                 "SELECT state_json FROM workflow_runs WHERE id = ?1",
@@ -269,12 +290,18 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
     }
 
     async fn delete(&self, run_id: WorkflowRunId) -> WorkflowResult<()> {
-        let conn = self.conn.lock().map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
         Self::delete_state(&conn, &run_id.to_string())
     }
 
     async fn list_active(&self) -> WorkflowResult<Vec<WorkflowState<D>>> {
-        let conn = self.conn.lock().map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
         let mut stmt = conn
             .prepare("SELECT state_json FROM workflow_runs WHERE status IN ('pending','running')")
             .map_err(|e| WorkflowError::Store(format!("prepare list_active: {e}")))?;
@@ -290,7 +317,10 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
     }
 
     async fn list_all(&self) -> WorkflowResult<Vec<WorkflowState<D>>> {
-        let conn = self.conn.lock().map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
         let mut stmt = conn
             .prepare("SELECT state_json FROM workflow_runs")
             .map_err(|e| WorkflowError::Store(format!("prepare list_all: {e}")))?;
@@ -306,7 +336,10 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
     }
 
     async fn is_cancelled(&self, run_id: WorkflowRunId) -> WorkflowResult<bool> {
-        let conn = self.conn.lock().map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
         conn.query_row(
             "SELECT status = 'cancelled' FROM workflow_runs WHERE id = ?1",
             params![run_id.to_string()],
@@ -319,8 +352,9 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
 
     async fn cleanup_old_workflows(&self, ttl: Duration) -> usize {
         let conn = self.conn.lock().expect("flare-workflow sqlite lock");
-        let cutoff = (Utc::now() - chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::hours(1)))
-            .to_rfc3339();
+        let cutoff = (Utc::now()
+            - chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::hours(1)))
+        .to_rfc3339();
         let ids: Vec<String> = {
             let mut stmt = conn
                 .prepare("SELECT id FROM workflow_runs WHERE status NOT IN ('pending','running','paused') AND updated_at < ?1")
@@ -369,12 +403,18 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
         run_id: WorkflowRunId,
         entry: JournalEntry,
     ) -> WorkflowResult<u64> {
-        let conn = self.conn.lock().map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
         journal::append(&conn, &run_id.to_string(), &entry)
     }
 
     async fn journal(&self, run_id: WorkflowRunId) -> WorkflowResult<Vec<JournalEntry>> {
-        let conn = self.conn.lock().map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
         journal::read(&conn, &run_id.to_string())
     }
 }
@@ -452,13 +492,18 @@ mod tests {
         let store = SqliteStore::<TestData>::open_memory().unwrap();
         let run = WorkflowRunId::new();
 
-        let e1 = JournalEntry::Input { value: b"in".to_vec() };
+        let e1 = JournalEntry::Input {
+            value: b"in".to_vec(),
+        };
         let e2 = JournalEntry::StepRun {
             step_id: StepId::new("s"),
             attempt: 1,
             result: Some(crate::types::EntryResult::Success(b"out".to_vec())),
         };
-        let e3 = JournalEntry::WaitEvent { name: "approve".into(), result: None };
+        let e3 = JournalEntry::WaitEvent {
+            name: "approve".into(),
+            result: None,
+        };
 
         assert_eq!(store.append_journal(run, e1.clone()).await.unwrap(), 1);
         assert_eq!(store.append_journal(run, e2.clone()).await.unwrap(), 2);

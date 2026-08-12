@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use flare_workflow::engine::WorkflowEngine;
@@ -20,11 +20,18 @@ impl WorkflowData for Ctx {
     }
 }
 
-fn step(id: &str, f: impl Fn(&mut WorkflowContext<Ctx>) + Send + Sync + 'static) -> StepDefinition<Ctx> {
-    StepDefinition::new(id, id, Arc::new(FunctionStep::new(move |ctx: &mut WorkflowContext<Ctx>| {
-        f(ctx);
-        Box::pin(async move { Ok(StepResult::Success) })
-    })))
+fn step(
+    id: &str,
+    f: impl Fn(&mut WorkflowContext<Ctx>) + Send + Sync + 'static,
+) -> StepDefinition<Ctx> {
+    StepDefinition::new(
+        id,
+        id,
+        Arc::new(FunctionStep::new(move |ctx: &mut WorkflowContext<Ctx>| {
+            f(ctx);
+            Box::pin(async move { Ok(StepResult::Success) })
+        })),
+    )
 }
 
 fn build_engine() -> WorkflowEngine<Ctx, InMemoryStore<Ctx>> {
@@ -54,10 +61,20 @@ async fn sequential_chain_executes_in_order() {
     engine.register_workflow(wf).unwrap();
 
     let run = engine
-        .start_workflow(WorkflowId::new("wf"), Ctx { count: 0, log: vec![] }, "in".into())
+        .start_workflow(
+            WorkflowId::new("wf"),
+            Ctx {
+                count: 0,
+                log: vec![],
+            },
+            "in".into(),
+        )
         .await
         .unwrap();
-    let out = engine.wait_for_completion(run, "wf", Duration::from_secs(5)).await.unwrap();
+    let out = engine
+        .wait_for_completion(run, "wf", Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert!(out.contains("completed successfully"));
     let state = engine.get_status(run).await.unwrap();
@@ -79,10 +96,20 @@ async fn dag_parallel_join_orders_dependents() {
     engine.register_workflow(wf).unwrap();
 
     let run = engine
-        .start_workflow(WorkflowId::new("wf"), Ctx { count: 0, log: vec![] }, "in".into())
+        .start_workflow(
+            WorkflowId::new("wf"),
+            Ctx {
+                count: 0,
+                log: vec![],
+            },
+            "in".into(),
+        )
         .await
         .unwrap();
-    engine.wait_for_completion(run, "wf", Duration::from_secs(5)).await.unwrap();
+    engine
+        .wait_for_completion(run, "wf", Duration::from_secs(5))
+        .await
+        .unwrap();
 
     let state = engine.get_status(run).await.unwrap();
     let log = state.context.data.log;
@@ -115,19 +142,30 @@ async fn retries_until_success_with_backoff() {
                         Ok(StepResult::Success)
                     }
                 })
-            })))
-            .with_retry(RetryPolicy {
-                max_attempts: 3,
-                backoff: BackoffStrategy::Fixed(Duration::from_millis(1)),
-            }),
+            })),
+        )
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Fixed(Duration::from_millis(1)),
+        }),
     );
     engine.register_workflow(wf).unwrap();
 
     let run = engine
-        .start_workflow(WorkflowId::new("wf"), Ctx { count: 0, log: vec![] }, "in".into())
+        .start_workflow(
+            WorkflowId::new("wf"),
+            Ctx {
+                count: 0,
+                log: vec![],
+            },
+            "in".into(),
+        )
         .await
         .unwrap();
-    engine.wait_for_completion(run, "wf", Duration::from_secs(5)).await.unwrap();
+    engine
+        .wait_for_completion(run, "wf", Duration::from_secs(5))
+        .await
+        .unwrap();
 
     // 2 failures + 1 success = 3 attempts; step succeeds after retry.
     assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -140,23 +178,29 @@ async fn retries_until_success_with_backoff() {
 #[tokio::test]
 async fn terminal_failure_marks_run_failed() {
     let engine = build_engine();
-    let wf = WorkflowDefinition::new("wf", "wf").add_step(
-        StepDefinition::new(
-            "boom",
-            "boom",
-            Arc::new(FunctionStep::new(|_ctx: &mut WorkflowContext<Ctx>| {
-                Box::pin(async move {
-                    Err(WorkflowError::StepFailed {
-                        step_id: StepId::new("boom"),
-                        message: "boom".into(),
-                    })
+    let wf = WorkflowDefinition::new("wf", "wf").add_step(StepDefinition::new(
+        "boom",
+        "boom",
+        Arc::new(FunctionStep::new(|_ctx: &mut WorkflowContext<Ctx>| {
+            Box::pin(async move {
+                Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("boom"),
+                    message: "boom".into(),
                 })
-            }))),
-    );
+            })
+        })),
+    ));
     engine.register_workflow(wf).unwrap();
 
     let run = engine
-        .start_workflow(WorkflowId::new("wf"), Ctx { count: 0, log: vec![] }, "in".into())
+        .start_workflow(
+            WorkflowId::new("wf"),
+            Ctx {
+                count: 0,
+                log: vec![],
+            },
+            "in".into(),
+        )
         .await
         .unwrap();
     let out = engine
@@ -178,34 +222,66 @@ async fn journal_records_every_step_result() {
     engine.register_workflow(wf).unwrap();
 
     let run = engine
-        .start_workflow(WorkflowId::new("wf"), Ctx { count: 0, log: vec![] }, "in".into())
+        .start_workflow(
+            WorkflowId::new("wf"),
+            Ctx {
+                count: 0,
+                log: vec![],
+            },
+            "in".into(),
+        )
         .await
         .unwrap();
-    engine.wait_for_completion(run, "wf", Duration::from_secs(5)).await.unwrap();
+    engine
+        .wait_for_completion(run, "wf", Duration::from_secs(5))
+        .await
+        .unwrap();
 
     let journal = engine.state_store().journal(run).await.unwrap();
     let step_runs: Vec<_> = journal
         .iter()
         .filter(|e| matches!(e, JournalEntry::StepRun { .. }))
         .collect();
-    assert_eq!(step_runs.len(), 2, "journal should record each completed step");
+    assert_eq!(
+        step_runs.len(),
+        2,
+        "journal should record each completed step"
+    );
     for e in step_runs {
-        assert!(e.is_completed(), "completed step entries must carry a result");
+        assert!(
+            e.is_completed(),
+            "completed step entries must carry a result"
+        );
     }
-    assert!(journal.iter().any(|e| matches!(e, JournalEntry::Input { .. })));
-    assert!(journal.iter().any(|e| matches!(e, JournalEntry::Output { .. })));
+    assert!(
+        journal
+            .iter()
+            .any(|e| matches!(e, JournalEntry::Input { .. }))
+    );
+    assert!(
+        journal
+            .iter()
+            .any(|e| matches!(e, JournalEntry::Output { .. }))
+    );
 }
 
 #[tokio::test]
 async fn cancellation_stops_execution() {
     let engine = build_engine();
-    let wf = WorkflowDefinition::new("wf", "wf").add_step(
-        step("slow", |_| std::thread::sleep(Duration::from_millis(3000))),
-    );
+    let wf = WorkflowDefinition::new("wf", "wf").add_step(step("slow", |_| {
+        std::thread::sleep(Duration::from_millis(3000))
+    }));
     engine.register_workflow(wf).unwrap();
 
     let run = engine
-        .start_workflow(WorkflowId::new("wf"), Ctx { count: 0, log: vec![] }, "in".into())
+        .start_workflow(
+            WorkflowId::new("wf"),
+            Ctx {
+                count: 0,
+                log: vec![],
+            },
+            "in".into(),
+        )
         .await
         .unwrap();
 
@@ -223,17 +299,26 @@ async fn run_if_skip_counts_as_satisfied() {
     let engine = build_engine();
     let wf = WorkflowDefinition::new("wf", "wf")
         .add_step(
-            step("maybe", |c| c.data.log.push("maybe".into()))
-                .run_if(|ctx| ctx.data.count > 10),
+            step("maybe", |c| c.data.log.push("maybe".into())).run_if(|ctx| ctx.data.count > 10),
         )
         .add_step(step("after", |c| c.data.log.push("after".into())).depends_on(&["maybe"]));
     engine.register_workflow(wf).unwrap();
 
     let run = engine
-        .start_workflow(WorkflowId::new("wf"), Ctx { count: 0, log: vec![] }, "in".into())
+        .start_workflow(
+            WorkflowId::new("wf"),
+            Ctx {
+                count: 0,
+                log: vec![],
+            },
+            "in".into(),
+        )
         .await
         .unwrap();
-    engine.wait_for_completion(run, "wf", Duration::from_secs(5)).await.unwrap();
+    engine
+        .wait_for_completion(run, "wf", Duration::from_secs(5))
+        .await
+        .unwrap();
 
     let state = engine.get_status(run).await.unwrap();
     assert_eq!(state.context.data.log, vec!["after".to_string()]);
@@ -271,10 +356,20 @@ async fn event_bus_delivers_lifecycle_events() {
     let wf = WorkflowDefinition::new("wf", "wf").add_step(step("a", |c| c.data.count += 1));
     engine.register_workflow(wf).unwrap();
     let run = engine
-        .start_workflow(WorkflowId::new("wf"), Ctx { count: 0, log: vec![] }, "in".into())
+        .start_workflow(
+            WorkflowId::new("wf"),
+            Ctx {
+                count: 0,
+                log: vec![],
+            },
+            "in".into(),
+        )
         .await
         .unwrap();
-    engine.wait_for_completion(run, "wf", Duration::from_secs(5)).await.unwrap();
+    engine
+        .wait_for_completion(run, "wf", Duration::from_secs(5))
+        .await
+        .unwrap();
     // Wait for fire-and-forget delivery.
     tokio::time::sleep(Duration::from_millis(50)).await;
 

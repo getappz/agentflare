@@ -92,9 +92,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
         // Pre-delivered completion already journaled -> succeed immediately.
         let journal = self.state_store.journal(run_id).await?;
-        if journal.iter().any(|e| {
-            matches!(e, JournalEntry::WaitEvent { name: n, result: Some(_) } if n == name)
-        }) {
+        if journal
+            .iter()
+            .any(|e| matches!(e, JournalEntry::WaitEvent { name: n, result: Some(_) } if n == name))
+        {
             self.state_store
                 .update(run_id, |s| {
                     if let Some(ss) = s.step_states.get_mut(&step.id) {
@@ -137,7 +138,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         // journal in case complete_event already buffered the result.
         let journal = self.state_store.journal(run_id).await?;
         let buffered = journal.iter().rev().find_map(|e| match e {
-            JournalEntry::WaitEvent { name: n, result: Some(r) } if n == name => Some(r.clone()),
+            JournalEntry::WaitEvent {
+                name: n,
+                result: Some(r),
+            } if n == name => Some(r.clone()),
             _ => None,
         });
         if let Some(result) = buffered {
@@ -166,7 +170,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let outcome = match tokio::time::timeout(timeout_dur, rx).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err("wait channel closed".to_string()),
-            Err(_) => Err(format!("wait for event '{name}' timed out after {timeout_secs}s")),
+            Err(_) => Err(format!(
+                "wait for event '{name}' timed out after {timeout_secs}s"
+            )),
         };
         self.waiters.lock().remove(&key);
 

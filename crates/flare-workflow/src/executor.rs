@@ -42,11 +42,10 @@ where
     D: WorkflowData,
     F: Fn(
             &mut WorkflowContext<D>,
-        )
-            -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = WorkflowResult<StepResult>> + Send + '_>,
-            > + Send
-            + Sync,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = WorkflowResult<StepResult>> + Send + '_>,
+        > + Send
+        + Sync,
 {
     func: F,
     _phantom: std::marker::PhantomData<D>,
@@ -57,11 +56,10 @@ where
     D: WorkflowData,
     F: Fn(
             &mut WorkflowContext<D>,
-        )
-            -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = WorkflowResult<StepResult>> + Send + '_>,
-            > + Send
-            + Sync,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = WorkflowResult<StepResult>> + Send + '_>,
+        > + Send
+        + Sync,
 {
     pub fn new(func: F) -> Self {
         Self {
@@ -77,11 +75,10 @@ where
     D: WorkflowData,
     F: Fn(
             &mut WorkflowContext<D>,
-        )
-            -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = WorkflowResult<StepResult>> + Send + '_>,
-            > + Send
-            + Sync,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = WorkflowResult<StepResult>> + Send + '_>,
+        > + Send
+        + Sync,
 {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
         (self.func)(context).await

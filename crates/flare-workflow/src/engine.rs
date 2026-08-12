@@ -9,8 +9,8 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -48,7 +48,10 @@ struct StartGuard<'a, D: WorkflowData, S: StateStore<D> + 'static> {
 impl<'a, D: WorkflowData, S: StateStore<D> + 'static> StartGuard<'a, D, S> {
     fn new(engine: &'a WorkflowEngine<D, S>) -> Self {
         engine.active_workflows.fetch_add(1, Ordering::AcqRel);
-        Self { engine, committed: false }
+        Self {
+            engine,
+            committed: false,
+        }
     }
 
     fn commit(mut self) {
@@ -112,9 +115,9 @@ impl StepTracker {
 
     fn is_any_dependency_satisfied(&self, depends_on_any: &[StepId]) -> bool {
         depends_on_any.is_empty()
-            || depends_on_any.iter().any(|dep| {
-                self.completed.contains(dep) || self.skipped.contains(dep)
-            })
+            || depends_on_any
+                .iter()
+                .any(|dep| self.completed.contains(dep) || self.skipped.contains(dep))
     }
 
     fn has_failed_dependency(&self, depends_on: &[StepId]) -> bool {
@@ -122,8 +125,7 @@ impl StepTracker {
     }
 
     fn have_all_any_deps_failed(&self, depends_on_any: &[StepId]) -> bool {
-        !depends_on_any.is_empty()
-            && depends_on_any.iter().all(|dep| self.failed.contains(dep))
+        !depends_on_any.is_empty() && depends_on_any.iter().all(|dep| self.failed.contains(dep))
     }
 }
 
@@ -144,7 +146,8 @@ pub struct WorkflowEngine<D: WorkflowData, S: StateStore<D> = InMemoryStore<D>> 
     /// In-process completions for pending `WaitEvent` steps, keyed by
     /// `"{run_id}:{name}"`. A completed event is also journaled so it survives
     /// restart and pre-delivery races.
-    pub(crate) waiters: Arc<parking_lot::Mutex<HashMap<String, tokio::sync::oneshot::Sender<EntryResult>>>>,
+    pub(crate) waiters:
+        Arc<parking_lot::Mutex<HashMap<String, tokio::sync::oneshot::Sender<EntryResult>>>>,
 }
 
 impl<D: WorkflowData> WorkflowEngine<D, InMemoryStore<D>> {
@@ -308,18 +311,28 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
         state.step_states.reserve(definition.steps.len());
         for step in &definition.steps {
-            state.step_states.insert(step.id.clone(), StepState::default());
+            state
+                .step_states
+                .insert(step.id.clone(), StepState::default());
         }
 
         self.state_store.save(state).await?;
         self.state_store
-            .append_journal(run_id, JournalEntry::Input { value: input.into_bytes() })
+            .append_journal(
+                run_id,
+                JournalEntry::Input {
+                    value: input.into_bytes(),
+                },
+            )
             .await?;
 
         self.evict_old_runs_if_needed().await?;
 
         self.event_bus
-            .publish(WorkflowEvent::WorkflowStarted { run_id, definition_id })
+            .publish(WorkflowEvent::WorkflowStarted {
+                run_id,
+                definition_id,
+            })
             .await;
 
         guard.commit();
@@ -383,12 +396,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         }
         let mut evictable: Vec<(WorkflowRunId, chrono::DateTime<Utc>)> = all
             .iter()
-            .filter(|s| {
-                matches!(
-                    s.status,
-                    WorkflowStatus::Completed | WorkflowStatus::Failed
-                )
-            })
+            .filter(|s| matches!(s.status, WorkflowStatus::Completed | WorkflowStatus::Failed))
             .map(|s| (s.run_id, s.created_at))
             .collect();
         evictable.sort_by_key(|(_, t)| *t);
@@ -470,7 +478,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                                 result: Some(EntryResult::Success(_)),
                                 ..
                             })
-                            | Some(JournalEntry::Sleep { result: Some(_), .. }) => {
+                            | Some(JournalEntry::Sleep {
+                                result: Some(_), ..
+                            }) => {
                                 t.completed.insert(step.id.clone());
                                 true
                             }
@@ -513,8 +523,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             }
 
             // Phase 1: check waiting steps + deps-ready steps + blocked detection.
-            let (newly_ready_from_wait, deps_ready_indices, total_processed, current_running, current_waiting) =
-            {
+            let (
+                newly_ready_from_wait,
+                deps_ready_indices,
+                total_processed,
+                current_running,
+                current_waiting,
+            ) = {
                 let t = tracker.read();
                 let wait_ready = t.get_ready_waiting_indices();
                 let deps_ready: Vec<usize> = pending_check
@@ -528,7 +543,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                             && !t.have_all_any_deps_failed(&step.depends_on_any)
                     })
                     .collect();
-                (wait_ready, deps_ready, t.total_processed(), t.running.len(), t.waiting_until.len())
+                (
+                    wait_ready,
+                    deps_ready,
+                    t.total_processed(),
+                    t.running.len(),
+                    t.waiting_until.len(),
+                )
             };
 
             // Phase 2: process waiting/deps-ready, dedup, launch.
@@ -606,7 +627,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 self.event_bus
                     .publish(WorkflowEvent::WorkflowFailed {
                         run_id,
-                        failed_step: failed_step.unwrap_or_else(|| StepId::new("internal_scheduler")),
+                        failed_step: failed_step
+                            .unwrap_or_else(|| StepId::new("internal_scheduler")),
                         error: error_message.to_string(),
                     })
                     .await;
@@ -666,7 +688,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                                     .update(run_id, |s| {
                                         if let Some(ss) = s.step_states.get_mut(&step_id) {
                                             ss.status = StepStatus::Failed;
-                                            ss.last_error = Some(format!("run_if context error: {e}"));
+                                            ss.last_error =
+                                                Some(format!("run_if context error: {e}"));
                                         }
                                     })
                                     .await;
@@ -684,7 +707,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                             .await
                             .map(|s| s.input)
                             .unwrap_or_default();
-                        if !current_input.to_lowercase().contains(&condition.to_lowercase()) {
+                        if !current_input
+                            .to_lowercase()
+                            .contains(&condition.to_lowercase())
+                        {
                             {
                                 let mut t = tracker.write();
                                 t.running.remove(&step_id);
@@ -726,9 +752,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                                 .await
                                 .map(|_| StepResult::Success)
                         }
-                        StepMode::Loop { .. } => {
-                            engine.execute_loop(run_id, step, &def).await
-                        }
+                        StepMode::Loop { .. } => engine.execute_loop(run_id, step, &def).await,
                         StepMode::Sleep { duration_secs } => {
                             engine.execute_sleep(run_id, step, *duration_secs).await
                         }
@@ -778,8 +802,12 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                         if let Err(e) = tx.try_send((step_id.clone(), sig)) {
                             use mpsc::error::TrySendError;
                             match e {
-                                TrySendError::Full(_) => tracing::error!(step_id = %step_id, "Channel full sending step completion"),
-                                TrySendError::Closed(_) => tracing::debug!(step_id = %step_id, "Channel closed, workflow likely cancelled"),
+                                TrySendError::Full(_) => {
+                                    tracing::error!(step_id = %step_id, "Channel full sending step completion")
+                                }
+                                TrySendError::Closed(_) => {
+                                    tracing::debug!(step_id = %step_id, "Channel closed, workflow likely cancelled")
+                                }
                             }
                         }
 
@@ -801,10 +829,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
             let (has_running, has_waiting) = {
                 let t = tracker.read();
-                (
-                    !t.running.is_empty(),
-                    !t.waiting_until.is_empty(),
-                )
+                (!t.running.is_empty(), !t.waiting_until.is_empty())
             };
 
             if has_running {
@@ -866,7 +891,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             self.state_store
                 .append_journal(
                     run_id,
-                    JournalEntry::Output { result: EntryResult::Success(output.into_bytes()) },
+                    JournalEntry::Output {
+                        result: EntryResult::Success(output.into_bytes()),
+                    },
                 )
                 .await?;
             self.state_store
@@ -911,7 +938,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 .update(run_id, |s| {
                     s.current_step = Some(step.id.clone());
                     if let Some(ss) = s.step_states.get_mut(&step.id) {
-                        ss.status = if attempt == 1 { StepStatus::Running } else { StepStatus::Retrying };
+                        ss.status = if attempt == 1 {
+                            StepStatus::Running
+                        } else {
+                            StepStatus::Retrying
+                        };
                         ss.attempt = attempt;
                         ss.started_at = Some(Utc::now());
                     }
@@ -919,12 +950,17 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 .await?;
 
             self.event_bus
-                .publish(WorkflowEvent::StepStarted { run_id, step_id: step.id.clone(), attempt })
+                .publish(WorkflowEvent::StepStarted {
+                    run_id,
+                    step_id: step.id.clone(),
+                    attempt,
+                })
                 .await;
 
             let state = self.state_store.load(run_id).await?;
             let mut context = state.context.clone();
             context.input = state.input.clone();
+            context.variables = state.variables.clone();
             let step_start = std::time::Instant::now();
             let result = timeout(step_timeout, step.executor.execute(&mut context)).await;
             let step_duration = step_start.elapsed();
@@ -1000,7 +1036,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     self.state_store
                         .update(run_id, |s| {
                             if let Some(ss) = s.step_states.get_mut(&step.id) {
-                                ss.status = if will_retry { StepStatus::Retrying } else { StepStatus::Failed };
+                                ss.status = if will_retry {
+                                    StepStatus::Retrying
+                                } else {
+                                    StepStatus::Failed
+                                };
                                 ss.last_error = Some(error_msg.clone());
                                 if !will_retry {
                                     ss.completed_at = Some(Utc::now());
@@ -1019,7 +1059,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                         .await;
 
                     if will_retry {
-                        let delay = backoff.next(self.jitter).unwrap_or_else(|| Duration::from_secs(1));
+                        let delay = backoff
+                            .next(self.jitter)
+                            .unwrap_or_else(|| Duration::from_secs(1));
                         self.event_bus
                             .publish(WorkflowEvent::StepRetrying {
                                 run_id,
@@ -1059,7 +1101,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                         // continues.
                         let skip = matches!(step.error_mode, ErrorMode::Skip)
                             || matches!(step.on_failure, FailureAction::ContinueNextStep);
-                        return Ok(if skip { StepResult::Skip } else { StepResult::Failure });
+                        return Ok(if skip {
+                            StepResult::Skip
+                        } else {
+                            StepResult::Failure
+                        });
                     }
                 }
             }
@@ -1075,7 +1121,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         step: &StepDefinition<D>,
         definition: &WorkflowDefinition<D>,
     ) -> WorkflowResult<StepResult> {
-        let StepMode::Loop { max_iterations, until } = &step.mode else {
+        let StepMode::Loop {
+            max_iterations,
+            until,
+        } = &step.mode
+        else {
             return Ok(StepResult::Skip);
         };
         let step_timeout = definition.get_timeout(step);
@@ -1091,6 +1141,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             let state = self.state_store.load(run_id).await?;
             let mut context = state.context.clone();
             context.input = state.input.clone();
+            context.variables = state.variables.clone();
             context.output.clear();
             let step_start = std::time::Instant::now();
 
@@ -1131,7 +1182,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                         .await?;
                     current_output = out;
                     tracing::info!(run_id = %run_id, step = %step.id, iter, "Loop iteration completed");
-                    if !until_lower.is_empty() && current_output.to_lowercase().contains(&until_lower)
+                    if !until_lower.is_empty()
+                        && current_output.to_lowercase().contains(&until_lower)
                     {
                         break;
                     }
@@ -1215,20 +1267,35 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
         loop {
             if start.elapsed() > timeout_duration {
-                return Err(format!("Workflow timeout after {}s for {label}", timeout_duration.as_secs()));
+                return Err(format!(
+                    "Workflow timeout after {}s for {label}",
+                    timeout_duration.as_secs()
+                ));
             }
 
-            let state = self.get_status(run_id).await.map_err(|e| format!("Failed to get status: {e:?}"))?;
+            let state = self
+                .get_status(run_id)
+                .await
+                .map_err(|e| format!("Failed to get status: {e:?}"))?;
 
             let result = match state.status {
-                WorkflowStatus::Completed => Ok(format!("{label} completed successfully via workflow")),
+                WorkflowStatus::Completed => {
+                    Ok(format!("{label} completed successfully via workflow"))
+                }
                 WorkflowStatus::Failed => {
                     let current_step = state.current_step.as_ref();
-                    let step_name = current_step.map(|s| s.to_string()).unwrap_or_else(|| "unknown".to_string());
+                    let step_name = current_step
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
                     let error_msg = current_step
                         .and_then(|step_id| state.step_states.get(step_id))
                         .and_then(|s| s.last_error.clone())
-                        .unwrap_or_else(|| state.error.clone().unwrap_or_else(|| "Unknown error".into()));
+                        .unwrap_or_else(|| {
+                            state
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "Unknown error".into())
+                        });
                     Err(format!("Workflow failed at step {step_name}: {error_msg}"))
                 }
                 WorkflowStatus::Cancelled => Err(format!("Workflow cancelled for {label}")),
@@ -1275,7 +1342,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> std::fmt::Debug for WorkflowEn
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkflowEngine")
             .field("definitions_count", &self.definitions.read().len())
-            .field("active_workflows", &self.active_workflows.load(Ordering::Acquire))
+            .field(
+                "active_workflows",
+                &self.active_workflows.load(Ordering::Acquire),
+            )
             .finish()
     }
 }

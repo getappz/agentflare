@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flare_workflow::engine::WorkflowEngine;
-use flare_workflow::executor::{noop_executor, FunctionStep};
+use flare_workflow::executor::{FunctionStep, noop_executor};
 use flare_workflow::sqlite_store::SqliteStore;
 use flare_workflow::types::*;
 use flare_workflow::{EntryResult, StateStore, StepDefinition, WorkflowDefinition};
@@ -30,10 +30,7 @@ fn producer(id: String, tag: &'static str) -> StepDefinition<Ctx> {
     )
 }
 
-fn register(
-    engine: &WorkflowEngine<Ctx, SqliteStore<Ctx>>,
-    wf: WorkflowDefinition<Ctx>,
-) {
+fn register(engine: &WorkflowEngine<Ctx, SqliteStore<Ctx>>, wf: WorkflowDefinition<Ctx>) {
     engine.register_workflow(wf).unwrap();
 }
 
@@ -94,7 +91,10 @@ async fn crash_mid_run_resumes_from_last_completed_step_without_reexecution() {
     let engine = WorkflowEngine::<Ctx, _>::with_store(SqliteStore::open_file(&path).unwrap());
     register(&engine, wf);
     let resumed = engine.recover().await.unwrap();
-    assert!(resumed.contains(&run), "recover() must resume the crashed run");
+    assert!(
+        resumed.contains(&run),
+        "recover() must resume the crashed run"
+    );
 
     // A human completes the approval; the pipeline proceeds.
     engine
@@ -109,7 +109,10 @@ async fn crash_mid_run_resumes_from_last_completed_step_without_reexecution() {
     let state = engine.get_status(run).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Completed);
     // Step "a" ran exactly once (memoized); "c" ran after approval.
-    assert_eq!(state.context.data.log, vec!["a".to_string(), "c".to_string()]);
+    assert_eq!(
+        state.context.data.log,
+        vec!["a".to_string(), "c".to_string()]
+    );
 }
 
 /// A pending Sleep is re-armed by recovery and fires once its wake time is
@@ -157,7 +160,10 @@ async fn recover_reams_pending_sleep() {
 
     let state = engine.get_status(run).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Completed);
-    assert_eq!(state.step_states[&StepId::new("nap")].status, StepStatus::Succeeded);
+    assert_eq!(
+        state.step_states[&StepId::new("nap")].status,
+        StepStatus::Succeeded
+    );
 
     // Exactly one PENDING entry survives re-arm (idempotent re-arm); the
     // recovery's execution fires it. (A leaked pre-crash task may also fire
@@ -170,7 +176,15 @@ async fn recover_reams_pending_sleep() {
     assert_eq!(pending_sleeps, 1);
     let fired_sleeps = journal
         .iter()
-        .filter(|e| matches!(e, JournalEntry::Sleep { result: Some(_), .. }))
+        .filter(|e| {
+            matches!(
+                e,
+                JournalEntry::Sleep {
+                    result: Some(_),
+                    ..
+                }
+            )
+        })
         .count();
     assert!(fired_sleeps >= 1);
 }
@@ -180,11 +194,12 @@ async fn recover_reams_pending_sleep() {
 async fn racing_completions_resolve_to_one() {
     let engine = WorkflowEngine::<Ctx, _>::with_store(SqliteStore::open_memory().unwrap());
     let wf = WorkflowDefinition::new("wf", "wf").add_step(
-        StepDefinition::new("approve", "approve", noop_executor::<Ctx>())
-            .with_mode(StepMode::WaitEvent {
+        StepDefinition::new("approve", "approve", noop_executor::<Ctx>()).with_mode(
+            StepMode::WaitEvent {
                 name: "approve".into(),
                 timeout_secs: 10,
-            }),
+            },
+        ),
     );
     register(&engine, wf);
     let run = engine
@@ -206,5 +221,8 @@ async fn racing_completions_resolve_to_one() {
         .unwrap();
     let state = engine.get_status(run).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Completed);
-    assert_eq!(state.step_states[&StepId::new("approve")].status, StepStatus::Succeeded);
+    assert_eq!(
+        state.step_states[&StepId::new("approve")].status,
+        StepStatus::Succeeded
+    );
 }

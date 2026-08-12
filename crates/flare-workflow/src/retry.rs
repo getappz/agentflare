@@ -18,16 +18,27 @@ pub trait Retryable {
 
 impl Retryable for WorkflowError {
     fn is_retryable(&self) -> bool {
-        !matches!(self, WorkflowError::ShuttingDown | WorkflowError::NotFound(_))
+        !matches!(
+            self,
+            WorkflowError::ShuttingDown | WorkflowError::NotFound(_)
+        )
     }
 }
 
 /// A backoff sequence. Call `next()` for each delay; `reset()` starts over.
 #[derive(Debug, Clone)]
 pub enum Backoff {
-    Fixed { delay: Duration },
-    Exponential { inner: backoff::ExponentialBackoff },
-    Linear { current: Duration, increment: Duration, max: Duration },
+    Fixed {
+        delay: Duration,
+    },
+    Exponential {
+        inner: backoff::ExponentialBackoff,
+    },
+    Linear {
+        current: Duration,
+        increment: Duration,
+        max: Duration,
+    },
     /// An already-computed delay (used when a strategy resolves to a constant).
     Ready(Duration),
 }
@@ -57,7 +68,11 @@ impl Backoff {
         let base = match self {
             Backoff::Fixed { delay } => Some(*delay),
             Backoff::Exponential { inner } => inner.next_backoff(),
-            Backoff::Linear { current, increment, max } => {
+            Backoff::Linear {
+                current,
+                increment,
+                max,
+            } => {
                 let next = *current;
                 *current = (*current + *increment).min(*max);
                 Some(next)
@@ -139,12 +154,21 @@ mod tests {
 
     #[test]
     fn zero_jitter_identity() {
-        assert_eq!(apply_jitter(Duration::from_secs(10), 0.0), Duration::from_secs(10));
+        assert_eq!(
+            apply_jitter(Duration::from_secs(10), 0.0),
+            Duration::from_secs(10)
+        );
     }
 
     #[test]
     fn retryable_errors_exclude_terminal() {
-        assert!(WorkflowError::StepFailed { step_id: crate::StepId::new("s"), message: "x".into() }.is_retryable());
+        assert!(
+            WorkflowError::StepFailed {
+                step_id: crate::StepId::new("s"),
+                message: "x".into()
+            }
+            .is_retryable()
+        );
         assert!(!WorkflowError::ShuttingDown.is_retryable());
     }
 }

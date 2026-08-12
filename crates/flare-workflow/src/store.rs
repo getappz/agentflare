@@ -53,8 +53,11 @@ pub trait StateStore<D: WorkflowData>: Send + Sync + Clone {
     async fn cleanup_if_terminal(&self, run_id: WorkflowRunId) -> bool;
 
     /// Append an entry to a run's durable journal, returning its sequence.
-    async fn append_journal(&self, run_id: WorkflowRunId, entry: JournalEntry)
-        -> WorkflowResult<u64>;
+    async fn append_journal(
+        &self,
+        run_id: WorkflowRunId,
+        entry: JournalEntry,
+    ) -> WorkflowResult<u64>;
 
     /// Read a run's durable journal in sequence order.
     async fn journal(&self, run_id: WorkflowRunId) -> WorkflowResult<Vec<JournalEntry>>;
@@ -77,7 +80,11 @@ impl<D: WorkflowData> InMemoryStore<D> {
 
     /// Get count of workflows by status.
     pub fn count_by_status(&self, status: WorkflowStatus) -> usize {
-        self.states.read().values().filter(|s| s.status == status).count()
+        self.states
+            .read()
+            .values()
+            .filter(|s| s.status == status)
+            .count()
     }
 
     /// Get total count of all workflows.
@@ -169,7 +176,11 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
 
         let removed_count = initial_count - states.len();
         if removed_count > 0 {
-            tracing::info!(removed = removed_count, remaining = states.len(), "Cleaned up old workflow states");
+            tracing::info!(
+                removed = removed_count,
+                remaining = states.len(),
+                "Cleaned up old workflow states"
+            );
         }
         removed_count
     }

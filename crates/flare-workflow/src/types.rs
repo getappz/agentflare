@@ -11,7 +11,7 @@
 use std::{collections::HashMap, fmt, time::Duration};
 
 use chrono::{DateTime, Utc};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 /// Workflow data passed through steps as the typed shared context.
@@ -255,7 +255,10 @@ pub enum JournalEntry {
         result: Option<EntryResult>,
     },
     /// Read per-run key/value state.
-    StateGet { key: String, value: Option<EntryResult> },
+    StateGet {
+        key: String,
+        value: Option<EntryResult>,
+    },
     /// Write per-run key/value state.
     StateSet { key: String, value: Vec<u8> },
     /// Clear per-run key/value state.
@@ -311,10 +314,7 @@ impl JournalEntry {
 /// pipeline: `input` is the current `{{input}}` channel, `output` is what the
 /// step produced (the executor sets it; the engine chains it forward).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "D: Serialize",
-    deserialize = "D: DeserializeOwned"
-))]
+#[serde(bound(serialize = "D: Serialize", deserialize = "D: DeserializeOwned"))]
 pub struct WorkflowContext<D: WorkflowData> {
     pub run_id: WorkflowRunId,
     pub data: D,
@@ -324,6 +324,9 @@ pub struct WorkflowContext<D: WorkflowData> {
     /// What this step produced; the engine reads it back after execution.
     #[serde(default)]
     pub output: String,
+    /// Named variables for `{{var}}` prompt expansion (mirrors run state).
+    #[serde(default)]
+    pub variables: HashMap<String, String>,
     /// Token accounting reported by the executor (for agent-prompt steps).
     #[serde(default)]
     pub input_tokens: u64,
@@ -338,6 +341,7 @@ impl<D: WorkflowData> WorkflowContext<D> {
             data,
             input: String::new(),
             output: String::new(),
+            variables: HashMap::new(),
             input_tokens: 0,
             output_tokens: 0,
         }
@@ -346,10 +350,7 @@ impl<D: WorkflowData> WorkflowContext<D> {
 
 /// Full state of a running workflow instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "D: Serialize",
-    deserialize = "D: DeserializeOwned"
-))]
+#[serde(bound(serialize = "D: Serialize", deserialize = "D: DeserializeOwned"))]
 pub struct WorkflowState<D: WorkflowData> {
     pub run_id: WorkflowRunId,
     pub workflow_id: WorkflowId,

@@ -16,11 +16,7 @@ pub fn expand_variables(template: &str, input: &str, vars: &HashMap<String, Stri
 
 /// Record a step's output under `output_var` if one is set; returns the
 /// (possibly new) variables map so the caller can persist it.
-pub fn capture_output(
-    vars: &mut HashMap<String, String>,
-    output_var: Option<&str>,
-    output: &str,
-) {
+pub fn capture_output(vars: &mut HashMap<String, String>, output_var: Option<&str>, output: &str) {
     if let Some(name) = output_var {
         vars.insert(name.to_string(), output.to_string());
     }
@@ -36,11 +32,7 @@ mod tests {
         vars.insert("name".to_string(), "Alice".to_string());
         vars.insert("task".to_string(), "code review".to_string());
 
-        let out = expand_variables(
-            "Hello {{name}}, do {{task}} on {{input}}",
-            "main.rs",
-            &vars,
-        );
+        let out = expand_variables("Hello {{name}}, do {{task}} on {{input}}", "main.rs", &vars);
         assert_eq!(out, "Hello Alice, do code review on main.rs");
     }
 
@@ -54,6 +46,9 @@ mod tests {
     fn capture_output_stores_named_var() {
         let mut vars = HashMap::new();
         capture_output(&mut vars, Some("analysis"), "the analysis");
-        assert_eq!(vars.get("analysis").map(String::as_str), Some("the analysis"));
+        assert_eq!(
+            vars.get("analysis").map(String::as_str),
+            Some("the analysis")
+        );
     }
 }

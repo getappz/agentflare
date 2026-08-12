@@ -22,10 +22,16 @@ impl WorkflowData for TestData {
 }
 
 fn ok_step(id: &str) -> StepDefinition<TestData> {
-    StepDefinition::new(id, id, Arc::new(FunctionStep::new(|ctx: &mut flare_workflow::WorkflowContext<TestData>| {
-        ctx.data.value += 1;
-        Box::pin(async move { Ok(flare_workflow::StepResult::Success) })
-    })))
+    StepDefinition::new(
+        id,
+        id,
+        Arc::new(FunctionStep::new(
+            |ctx: &mut flare_workflow::WorkflowContext<TestData>| {
+                ctx.data.value += 1;
+                Box::pin(async move { Ok(flare_workflow::StepResult::Success) })
+            },
+        )),
+    )
 }
 
 #[test]
@@ -119,7 +125,10 @@ fn validate_accepts_valid_dag() {
 fn validate_rejects_missing_dependency() {
     let mut wf = WorkflowDefinition::new("wf", "wf").add_step(ok_step("a").depends_on(&["ghost"]));
     let err = wf.validate().unwrap_err();
-    assert!(matches!(err, flare_workflow::ValidationError::MissingDependency { .. }));
+    assert!(matches!(
+        err,
+        flare_workflow::ValidationError::MissingDependency { .. }
+    ));
 }
 
 #[test]
@@ -128,7 +137,10 @@ fn validate_rejects_cycles() {
         .add_step(ok_step("a").depends_on(&["b"]))
         .add_step(ok_step("b").depends_on(&["a"]));
     let err = wf.validate().unwrap_err();
-    assert!(matches!(err, flare_workflow::ValidationError::CycleDetected(_)));
+    assert!(matches!(
+        err,
+        flare_workflow::ValidationError::CycleDetected(_)
+    ));
 }
 
 #[test]
@@ -147,10 +159,7 @@ fn depends_on_any_initial_steps_excluded() {
 fn retry_policy_defaults_are_exponential() {
     let p = RetryPolicy::default();
     assert_eq!(p.max_attempts, 3);
-    assert!(matches!(
-        p.backoff,
-        BackoffStrategy::Exponential { .. }
-    ));
+    assert!(matches!(p.backoff, BackoffStrategy::Exponential { .. }));
 }
 
 #[test]
@@ -163,8 +172,17 @@ fn builder_configured_step_carries_semantics() {
         .with_error_mode(ErrorMode::Retry { max_retries: 2 })
         .with_failure_action(FailureAction::ContinueNextStep)
         .with_timeout(Duration::from_secs(30));
-    assert!(matches!(step.mode, StepMode::Loop { max_iterations: 4, .. }));
-    assert!(matches!(step.error_mode, ErrorMode::Retry { max_retries: 2 }));
+    assert!(matches!(
+        step.mode,
+        StepMode::Loop {
+            max_iterations: 4,
+            ..
+        }
+    ));
+    assert!(matches!(
+        step.error_mode,
+        ErrorMode::Retry { max_retries: 2 }
+    ));
     assert_eq!(step.on_failure, FailureAction::ContinueNextStep);
     assert_eq!(step.timeout, Some(Duration::from_secs(30)));
 }
