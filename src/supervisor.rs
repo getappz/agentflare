@@ -10,7 +10,10 @@ use crate::mcp_server::types::{CommentRequest, ItemRequest};
 /// with this so the discovery loop below notices it without a human having
 /// to add the label by hand. Single source of truth so the two can't drift.
 pub(crate) const READY_LABEL: &str = "ready-for-work";
-const DISPATCHED_LABEL: &str = "dispatched";
+/// Also read by `dashboard::server::reconcile_orphaned_jobs` to swap a
+/// crash-orphaned item back off `dispatched` -- single source of truth so
+/// the two can't drift, same rationale as `READY_LABEL` above.
+pub(crate) const DISPATCHED_LABEL: &str = "dispatched";
 const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
 const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 

@@ -1,5 +1,6 @@
 mod artifacts;
 mod data;
+mod orphan_reconcile;
 mod server;
 
 pub fn serve(host: &str, port: u16, open: bool, yes_expose: bool) {
