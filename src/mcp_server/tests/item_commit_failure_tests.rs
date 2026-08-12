@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use super::*;
 
 // Windows' FILE_ATTRIBUTE_READONLY on a *directory* doesn't prevent writes

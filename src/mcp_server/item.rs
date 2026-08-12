@@ -1068,7 +1068,7 @@ impl AgentflareMcp {
         // SQLite `IN (...)` parameter list built from it.
         let cap = req.limit.unwrap_or(15).clamp(0, MAX_GROOM_LIMIT) as usize;
         self.with_backend_db(|conn| {
-            let project = self.resolve_project(conn)?;
+            let project = self.resolve_project_for_read(conn, req.project.as_deref())?;
             let mut items = agentflare_backend::item::list_by_project(conn, &project.id)
                 .map_err(map_backend_err)?;
             let states = agentflare_backend::state::list_by_project(conn, &project.id)
@@ -1182,7 +1182,7 @@ impl AgentflareMcp {
         let cutoff_hours = req.cutoff_hours.unwrap_or(24).max(0);
         let stuck_days = req.staleness_days.unwrap_or(7).max(0);
         self.with_backend_db(|conn| {
-            let project = self.resolve_project(conn)?;
+            let project = self.resolve_project_for_read(conn, req.project.as_deref())?;
             let mut items = agentflare_backend::item::list_by_project(conn, &project.id)
                 .map_err(map_backend_err)?;
             let states = agentflare_backend::state::list_by_project(conn, &project.id)
@@ -1268,22 +1268,20 @@ impl AgentflareMcp {
     }
 
     /// One-call health scorecard: velocity (trailing weekly windows, updated_at
-    /// proxy per rubric.md), WIP, stuck, and a bottlenecks placeholder.
+    /// proxy per rubric.md), WIP, stuck, and bottlenecks (items handed between
+    /// agents ≥2× in the window, from the `item_assignment_events` log written
+    /// by `item::update` — history starts at that migration, so transitions
+    /// predating it are not counted).
     ///
-    /// No precomputed/event-populated rollup table backs velocity — checked
-    /// first: `events::emit` (agentflare-backend/src/events.rs) is outbound
-    /// webhook delivery only, not a persisted log, and there's no handoff-
-    /// history table either (`handoff` is assign + asset version + comment,
-    /// not a separate audit log). Building either is real new schema/migration
-    /// work; at this project's actual scale (~40 items) a live scan is
-    /// sub-millisecond (see the groom benchmark), so adding that
-    /// infrastructure now would be speculative. Revisit if item volume grows
-    /// enough that this scan is ever measured as slow — don't estimate it.
+    /// No precomputed rollup table backs velocity — at this project's actual
+    /// scale (~40 items) a live scan is sub-millisecond (see the groom
+    /// benchmark). Revisit if item volume grows enough that this scan is ever
+    /// measured as slow — don't estimate it.
     pub(super) fn item_health(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let window_weeks = req.window_weeks.unwrap_or(4).clamp(1, MAX_WINDOW_WEEKS);
         let stuck_days = req.staleness_days.unwrap_or(7).max(0);
         self.with_backend_db(|conn| {
-            let project = self.resolve_project(conn)?;
+            let project = self.resolve_project_for_read(conn, req.project.as_deref())?;
             let items = agentflare_backend::item::list_by_project(conn, &project.id)
                 .map_err(map_backend_err)?;
             let states = agentflare_backend::state::list_by_project(conn, &project.id)
@@ -1356,6 +1354,42 @@ impl AgentflareMcp {
                 .cloned()
                 .collect();
 
+            let window_start = now - window_weeks.saturating_mul(7 * 86_400);
+            let handoff_stats = agentflare_backend::assignment_events::handoff_stats_since(
+                conn,
+                &project.id,
+                window_start,
+            )
+            .map_err(map_backend_err)?;
+            let item_by_id: std::collections::HashMap<&str, &agentflare_backend::item::Item> =
+                items.iter().map(|i| (i.id.as_str(), i)).collect();
+            let bottlenecks: Vec<String> = handoff_stats
+                .iter()
+                .filter(|s| s.handoffs >= 2)
+                .map(|s| {
+                    let label = item_by_id
+                        .get(s.item_id.as_str())
+                        .map(|i| format!("#{} {}", i.sequence_id, i.name))
+                        .unwrap_or_else(|| s.item_id.clone());
+                    format!(
+                        "{label} — {} handoffs ({})",
+                        s.handoffs,
+                        s.owners.join(" → ")
+                    )
+                })
+                .collect();
+            let bottleneck_note = if bottlenecks.is_empty() {
+                "no item was handed between agents ≥2× in the window (handoff history \
+                 is recorded from the assignment-log migration onward — earlier \
+                 transitions are not counted)"
+                    .to_string()
+            } else {
+                format!(
+                    "items handed between agents ≥2× in the last {window_weeks} week(s) — \
+                     repeated handoffs usually mean unclear ownership or a stuck dependency"
+                )
+            };
+
             let resp = HealthResponse {
                 window_weeks,
                 velocity,
@@ -1365,10 +1399,8 @@ impl AgentflareMcp {
                 stuck_days,
                 stuck_count: stuck.len(),
                 stuck,
-                bottlenecks: Vec::new(),
-                bottleneck_note: "no handoff history — agentflare does not persist a handoff \
-                    log distinct from item state today"
-                    .to_string(),
+                bottlenecks,
+                bottleneck_note,
             };
             Ok(serde_json::to_string_pretty(&resp).unwrap_or_default())
         })?
