@@ -243,7 +243,8 @@ fn spawn_supervisor_discovery(
             let mcp = mcp.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let auth_conn = crate::auth_db::open_or_rebuild();
-                crate::supervisor::run_discovery_tick(&mcp, &queue, &auth_conn)
+                let host_policy = agentflare_resource_gate::current_policy();
+                crate::supervisor::run_discovery_tick(&mcp, &queue, &auth_conn, host_policy)
             })
             .await;
             match result {
@@ -282,14 +283,15 @@ fn spawn_supervisor_review_sweep(
             let mcp = mcp.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let auth_conn = crate::auth_db::open_or_rebuild();
-                crate::supervisor::run_review_sweep(&mcp, &queue, &auth_conn)
+                let host_policy = agentflare_resource_gate::current_policy();
+                crate::supervisor::run_review_sweep(&mcp, &queue, &auth_conn, host_policy)
             })
             .await;
             match result {
-                Ok(summary) if summary.promoted > 0 || summary.self_repaired > 0 => {
+                Ok(s) if s.promoted > 0 || s.self_repaired > 0 || s.waiting > 0 => {
                     eprintln!(
-                        "agentflare-supervisor: review sweep promoted {}, self-repaired {}, skipped {}",
-                        summary.promoted, summary.self_repaired, summary.skipped
+                        "agentflare-supervisor: review sweep promoted {}, self-repaired {}, skipped {}, waiting {}",
+                        s.promoted, s.self_repaired, s.skipped, s.waiting
                     );
                 }
                 Ok(_) => {}
@@ -695,9 +697,9 @@ fn parse_work_max_concurrency(raw: Option<&str>) -> Option<usize> {
 }
 
 /// Defaults to a CPU+memory-aware pool size (ported from codegraph's
-/// `ResolverPool.resolvePoolSize`, see `dashboard::concurrency`) instead of
-/// a flat hardcoded value, so a resource-starved box and a beefy dev box
-/// no longer run the same fixed concurrency.
+/// `ResolverPool.resolvePoolSize`, see `agentflare_resource_gate::pool_size`)
+/// instead of a flat hardcoded value, so a resource-starved box and a beefy
+/// dev box no longer run the same fixed concurrency.
 fn work_max_concurrency() -> usize {
     parse_work_max_concurrency(
         std::env::var("AGENTFLARE_WORK_MAX_CONCURRENCY")
@@ -706,9 +708,9 @@ fn work_max_concurrency() -> usize {
     )
     .unwrap_or_else(|| {
         let available_parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
-        crate::dashboard::concurrency::resolve_pool_size(
+        agentflare_resource_gate::pool_size::resolve_pool_size(
             available_parallelism,
-            crate::dashboard::concurrency::memory_budget_bytes(),
+            agentflare_resource_gate::pool_size::memory_budget_bytes(),
         )
     })
 }
@@ -732,13 +734,11 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
         crate::state::state_dir().join("job-logs"),
     )
     .expect("failed to open job queue");
-    // Before anything below can dequeue a single job (see its own doc
-    // comment for why the ordering matters).
+    // Before anything below can dequeue a single job (see its own doc comment).
     reconcile_orphaned_jobs(&queue);
-    // Kept alive for the rest of `run()` (which never returns in normal
-    // operation) so its worker threads keep polling the queue; there is no
-    // graceful in-process shutdown path today (see `daemon::stop_daemon`,
-    // which relies on SIGTERM/SIGKILL), so neither does this.
+    // Kept alive for `run()` (no graceful shutdown path, see `daemon::stop_daemon`).
+    // init_global() starts the sampler `supervisor` dispatch consults (item #435).
+    agentflare_resource_gate::init_global();
     let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
         .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor));
     worker_pool.start(work_max_concurrency());
