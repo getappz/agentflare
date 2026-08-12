@@ -257,6 +257,72 @@ pub fn is_destructive(subcommand: &str, args: &[String]) -> bool {
     }
 }
 
+/// Commits by which `target` and `HEAD` have diverged, when a `reset
+/// --soft`/`--mixed` onto `target` would stage more than the caller's
+/// intended change — i.e. neither ref is an ancestor of the other.
+/// `--soft`/`--mixed` leave the working tree untouched and just move HEAD,
+/// so the diff that ends up staged is `old_HEAD_tree` vs `target_tree`: when
+/// `target` is a strict ancestor or descendant of HEAD (a clean fast-forward
+/// either direction), that diff is exactly the commit(s) between them, which
+/// is what the command is for. Once they've diverged, that same diff also
+/// carries every change unique to `target`'s side — unrelated drift the
+/// caller likely never intended to stage (item #98's live incident: `reset
+/// --soft origin/master` from a stale branch staged a phantom crate deletion
+/// that was actually a refactor on master, not a removal).
+///
+/// `None` if there's no divergence to warn about, or if it can't be
+/// determined (unresolvable target, ...) — fails open, matching this
+/// policy's bias toward never warning on something it can't actually reason
+/// about.
+fn reset_soft_divergence(repo_root: &Path, target: &str) -> Option<u32> {
+    let head_is_ancestor =
+        crate::shell::run_in_ok(repo_root, &["merge-base", "--is-ancestor", "HEAD", target]);
+    let target_is_ancestor =
+        crate::shell::run_in_ok(repo_root, &["merge-base", "--is-ancestor", target, "HEAD"]);
+    if head_is_ancestor || target_is_ancestor {
+        return None; // clean fast-forward in one direction or the other
+    }
+    let counts = crate::shell::run_in(
+        repo_root,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("HEAD...{target}"),
+        ],
+    )
+    .ok()?;
+    let mut counts = counts.split_whitespace();
+    let unique_to_head: u32 = counts.next()?.parse().ok()?;
+    let unique_to_target: u32 = counts.next()?.parse().ok()?;
+    Some(unique_to_head + unique_to_target)
+}
+
+/// `Some(warning)` if `subcommand`/`args` is a `reset --soft`/`--mixed`
+/// targeting a ref that's diverged from HEAD (see `reset_soft_divergence`).
+/// `--hard` is deliberately excluded — that's `is_destructive`'s job (a
+/// working-tree-loss concern, already snapshotted before it runs), and
+/// orthogonal to this one (a staged-diff surprise concern, which `--hard`
+/// can't cause since it discards the index along with everything else).
+#[must_use]
+pub fn reset_soft_divergence_warning(
+    repo_root: &Path,
+    subcommand: &str,
+    args: &[String],
+) -> Option<String> {
+    if subcommand != "reset" || !args.iter().any(|a| a == "--soft" || a == "--mixed") {
+        return None;
+    }
+    let target = args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .find(|a| !a.starts_with('-'))?;
+    let commits = reset_soft_divergence(repo_root, target)?;
+    Some(format!(
+        "'{target}' and HEAD have diverged by {commits} commit(s) — `reset --soft`/`--mixed` will stage the full content diff between them, not just your intended change. Consider `git cherry-pick` onto a fresh branch instead."
+    ))
+}
+
 /// Pure classification core — no I/O, so it's unit-testable with fixed
 /// inputs. `default_branch` is the repo's resolved default branch.
 /// `trust_root_touch` and `push_targets_default_branch` are pre-resolved by
@@ -1349,6 +1415,84 @@ mod tests {
         assert!(is_destructive("clean", &args(&["-f", "-d"])));
         assert!(!is_destructive("clean", &args(&["-n"])));
         assert!(!is_destructive("clean", &args(&["--dry-run"])));
+    }
+
+    #[test]
+    fn reset_soft_divergence_warning_only_applies_to_soft_or_mixed_reset() {
+        // No I/O needed for these -- both bail out before touching the repo.
+        assert_eq!(
+            reset_soft_divergence_warning(
+                std::path::Path::new("."),
+                "reset",
+                &args(&["origin/master"])
+            ),
+            None
+        );
+        assert_eq!(
+            reset_soft_divergence_warning(
+                std::path::Path::new("."),
+                "reset",
+                &args(&["--hard", "origin/master"])
+            ),
+            None
+        );
+        assert_eq!(
+            reset_soft_divergence_warning(std::path::Path::new("."), "commit", &args(&["-m", "x"])),
+            None
+        );
+    }
+
+    #[test]
+    fn reset_soft_divergence_warning_none_without_explicit_target() {
+        assert_eq!(
+            reset_soft_divergence_warning(std::path::Path::new("."), "reset", &args(&["--soft"])),
+            None
+        );
+    }
+
+    #[test]
+    fn reset_soft_divergence_warning_fires_when_head_and_target_have_diverged() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        crate::shell::run_in(&repo.path, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.path.join("feature.txt"), "feature").unwrap();
+        crate::shell::run_in(&repo.path, &["add", "feature.txt"]).unwrap();
+        crate::shell::run_in(&repo.path, &["commit", "-m", "feature commit"]).unwrap();
+        crate::shell::run_in(&repo.path, &["checkout", "master"]).unwrap();
+        std::fs::write(repo.path.join("master.txt"), "master").unwrap();
+        crate::shell::run_in(&repo.path, &["add", "master.txt"]).unwrap();
+        crate::shell::run_in(&repo.path, &["commit", "-m", "master commit"]).unwrap();
+
+        let msg = reset_soft_divergence_warning(&repo.path, "reset", &args(&["--soft", "feature"]));
+        let msg = msg.expect("HEAD and feature have diverged -- expected a warning");
+        assert!(msg.contains("diverged"), "{msg}");
+        assert!(msg.contains("feature"), "{msg}");
+
+        let msg =
+            reset_soft_divergence_warning(&repo.path, "reset", &args(&["--mixed", "feature"]));
+        assert!(msg.is_some());
+    }
+
+    #[test]
+    fn reset_soft_divergence_warning_silent_on_clean_fast_forward() {
+        let repo = crate::shell::test_support::init_repo_with_branch("master");
+        let base_sha = crate::shell::run_in(&repo.path, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(repo.path.join("a.txt"), "a").unwrap();
+        crate::shell::run_in(&repo.path, &["add", "a.txt"]).unwrap();
+        crate::shell::run_in(&repo.path, &["commit", "-m", "second"]).unwrap();
+
+        // `base_sha` is a strict ancestor of HEAD -- a clean fast-forward
+        // reset, not a divergence.
+        assert_eq!(
+            reset_soft_divergence_warning(&repo.path, "reset", &args(&["--soft", &base_sha])),
+            None
+        );
+        // And the reverse direction: HEAD is a strict ancestor of `feature`.
+        crate::shell::run_in(&repo.path, &["branch", "feature"]).unwrap();
+        crate::shell::run_in(&repo.path, &["reset", "--hard", &base_sha]).unwrap();
+        assert_eq!(
+            reset_soft_divergence_warning(&repo.path, "reset", &args(&["--soft", "feature"])),
+            None
+        );
     }
 
     fn single_ref(refs: Option<Vec<PushRef>>) -> PushRef {

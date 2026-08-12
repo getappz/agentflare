@@ -422,6 +422,11 @@ fn main() {
                     ),
                 }
             }
+            if let Some(msg) =
+                classify::reset_soft_divergence_warning(&repo_root, &subcommand, &rest)
+            {
+                eprintln!("agentflare git shim: warning -- {msg}");
+            }
             exec_real(&tool, filtered_path.as_ref(), &args);
         }
     }
