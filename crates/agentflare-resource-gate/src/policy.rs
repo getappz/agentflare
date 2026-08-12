@@ -1,6 +1,6 @@
 //! Decision logic — turn raw [`Signals`] + config into a [`Policy`].
 
-use crate::config::{DEFAULT_CPU_BUSY_PCT, DEFAULT_CPU_SEVERE_PCT, GateConfig, GateMode};
+use crate::config::{GateConfig, GateMode};
 use crate::signals::Signals;
 
 /// Why the gate is currently paused. Carried by [`Policy::Paused`] so
@@ -79,19 +79,13 @@ pub fn decide(signals: &Signals, cfg: &GateConfig) -> Policy {
         return Policy::Aggressive;
     }
 
-    // Clamp config-supplied thresholds so a malformed override can't
-    // silently disable or force-throttle dispatch.
-    let mut cpu_threshold = cfg.cpu_busy_threshold_pct.clamp(0.0, 100.0);
-    let mut cpu_severe = cfg.cpu_severe_pct.clamp(0.0, 100.0);
-    // Range-clamping each value independently still admits an inverted pair
-    // (busy >= severe), which collapses the tier ladder: every CPU reading
-    // above `severe` pauses before it can ever be judged merely busy, so
-    // `Throttled` becomes unreachable. `GateConfig`'s fields are public, so
-    // this has to be enforced here rather than only in `from_env`.
-    if cpu_threshold >= cpu_severe {
-        cpu_threshold = DEFAULT_CPU_BUSY_PCT;
-        cpu_severe = DEFAULT_CPU_SEVERE_PCT;
-    }
+    // `from_env` already normalizes, but `GateConfig`'s fields are public --
+    // a hand-built config never passed through it. Re-normalizing here is
+    // idempotent and keeps a malformed override from silently disabling or
+    // force-throttling dispatch. See `GateConfig::normalized`.
+    let cfg = cfg.normalized();
+    let cpu_threshold = cfg.cpu_busy_threshold_pct;
+    let cpu_severe = cfg.cpu_severe_pct;
 
     if signals.cpu_usage_pct >= cpu_severe {
         return Policy::Paused {
@@ -109,6 +103,7 @@ pub fn decide(signals: &Signals, cfg: &GateConfig) -> Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DEFAULT_CPU_BUSY_PCT, DEFAULT_CPU_SEVERE_PCT};
 
     fn cfg(mode: GateMode) -> GateConfig {
         GateConfig {

@@ -44,6 +44,28 @@ impl GateConfig {
                 DEFAULT_CPU_SEVERE_PCT,
             ),
         }
+        .normalized()
+    }
+
+    /// Force the thresholds into a usable shape: each into `0..=100`, and
+    /// the pair into a real ordering.
+    ///
+    /// Range-clamping alone still admits an inverted pair (busy >= severe),
+    /// which collapses the tier ladder — every reading at/above `severe`
+    /// pauses before it can be judged merely busy, so `Throttled` becomes
+    /// unreachable. Applied at the env boundary so `from_env` never returns
+    /// a config that misrepresents what the gate will actually do, and
+    /// again in `policy::decide` because these fields are public and a
+    /// caller can hand-build a `GateConfig` that never passed through here.
+    #[must_use]
+    pub fn normalized(mut self) -> Self {
+        self.cpu_busy_threshold_pct = self.cpu_busy_threshold_pct.clamp(0.0, 100.0);
+        self.cpu_severe_pct = self.cpu_severe_pct.clamp(0.0, 100.0);
+        if self.cpu_busy_threshold_pct >= self.cpu_severe_pct {
+            self.cpu_busy_threshold_pct = DEFAULT_CPU_BUSY_PCT;
+            self.cpu_severe_pct = DEFAULT_CPU_SEVERE_PCT;
+        }
+        self
     }
 }
 
@@ -77,6 +99,57 @@ mod tests {
         assert_eq!(parse_mode(Some("always_on")), GateMode::AlwaysOn);
         assert_eq!(parse_mode(Some("ALWAYS-ON")), GateMode::AlwaysOn);
         assert_eq!(parse_mode(Some("off")), GateMode::Off);
+    }
+
+    /// The env boundary must not hand back a config whose thresholds
+    /// disagree with what the gate will actually enforce — `policy::decide`
+    /// re-normalizes defensively, but anything else reading these fields
+    /// (a log line, a future dashboard tile) would otherwise report an
+    /// inverted pair as if it were live.
+    #[test]
+    fn normalized_recovers_defaults_from_an_inverted_or_equal_pair() {
+        let inverted = GateConfig {
+            mode: GateMode::Auto,
+            cpu_busy_threshold_pct: 95.0,
+            cpu_severe_pct: 80.0,
+        }
+        .normalized();
+        assert_eq!(inverted.cpu_busy_threshold_pct, DEFAULT_CPU_BUSY_PCT);
+        assert_eq!(inverted.cpu_severe_pct, DEFAULT_CPU_SEVERE_PCT);
+
+        let equal = GateConfig {
+            mode: GateMode::Auto,
+            cpu_busy_threshold_pct: 60.0,
+            cpu_severe_pct: 60.0,
+        }
+        .normalized();
+        assert_eq!(equal.cpu_busy_threshold_pct, DEFAULT_CPU_BUSY_PCT);
+        assert_eq!(equal.cpu_severe_pct, DEFAULT_CPU_SEVERE_PCT);
+    }
+
+    #[test]
+    fn normalized_clamps_out_of_range_values_and_leaves_a_sane_pair_alone() {
+        let clamped = GateConfig {
+            mode: GateMode::Auto,
+            cpu_busy_threshold_pct: -10.0,
+            cpu_severe_pct: 200.0,
+        }
+        .normalized();
+        assert_eq!(clamped.cpu_busy_threshold_pct, 0.0);
+        assert_eq!(clamped.cpu_severe_pct, 100.0);
+
+        let sane = GateConfig {
+            mode: GateMode::Auto,
+            cpu_busy_threshold_pct: 70.0,
+            cpu_severe_pct: 90.0,
+        };
+        let after = sane.normalized();
+        assert_eq!(after.cpu_busy_threshold_pct, 70.0);
+        assert_eq!(after.cpu_severe_pct, 90.0);
+        // Idempotent — `decide` re-normalizes every call.
+        let twice = after.normalized();
+        assert_eq!(twice.cpu_busy_threshold_pct, 70.0);
+        assert_eq!(twice.cpu_severe_pct, 90.0);
     }
 
     #[test]
