@@ -153,15 +153,24 @@ fn translate_assistant_content(content: &Value) -> Value {
     }
 }
 
+/// OpenAI-compatible `tool_choice` is either the bare string `"none"` /
+/// `"auto"` / `"required"`, or `{"type": "function", "function": {"name":
+/// ...}}` for a specific function -- there is no `{"type": "auto"}` /
+/// `{"type": "required"}` object form. Live-verified against OpenRouter: a
+/// wrapped `{"type": "required"}` gets rejected with "data did not match any
+/// variant of untagged enum ChatCompletionToolChoiceOption", breaking every
+/// forced tool-use request (Anthropic's `tool_choice: {"type": "any"}`,
+/// which Claude Code itself sends for many tool calls).
 fn translate_tool_choice(tc: &Value) -> Value {
     let type_ = tc.get("type").and_then(|v| v.as_str()).unwrap_or("auto");
     match type_ {
-        "any" => json!({ "type": "required" }),
+        "any" => json!("required"),
         "tool" => {
             let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
             json!({ "type": "function", "function": { "name": name } })
         }
-        _ => json!({ "type": type_ }),
+        "none" => json!("none"),
+        _ => json!("auto"),
     }
 }
 
@@ -801,7 +810,36 @@ mod tests {
         });
         let openai = messages_to_chat(&anthropic).unwrap();
         assert_eq!(openai["tools"][0]["function"]["name"], "get_weather");
-        assert_eq!(openai["tool_choice"]["type"], "auto");
+        // Bare string, not {"type": "auto"} -- see translate_tool_choice's
+        // doc comment for why the object form is rejected by real providers.
+        assert_eq!(openai["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn test_translate_tool_choice_any_becomes_bare_required_string() {
+        // Anthropic's "any" (force some tool call) must translate to the
+        // bare string "required", not {"type": "required"} -- OpenRouter
+        // live-verified rejects the object form with "data did not match
+        // any variant of untagged enum ChatCompletionToolChoiceOption".
+        let anthropic = json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "any"}
+        });
+        let openai = messages_to_chat(&anthropic).unwrap();
+        assert_eq!(openai["tool_choice"], "required");
+    }
+
+    #[test]
+    fn test_translate_tool_choice_specific_tool_keeps_object_form() {
+        let anthropic = json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "tool", "name": "get_weather"}
+        });
+        let openai = messages_to_chat(&anthropic).unwrap();
+        assert_eq!(openai["tool_choice"]["type"], "function");
+        assert_eq!(openai["tool_choice"]["function"]["name"], "get_weather");
     }
 
     #[test]
