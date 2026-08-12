@@ -49,13 +49,15 @@ pub fn cleanup_worktree(item: &agentflare_backend::item::Item, repo_root: &Path)
     flare_git_core::worktree::cleanup_item_worktree(item, repo_root);
 }
 
+pub use flare_git_core::worktree::CommitOutcome;
+
 /// Commits any uncommitted changes in `item`'s worktree. See
 /// `flare_git_core::worktree::commit_uncommitted`.
 pub fn commit_uncommitted(
     item: &agentflare_backend::item::Item,
     repo_root: &Path,
     message: &str,
-) -> bool {
+) -> CommitOutcome {
     flare_git_core::worktree::commit_uncommitted(item, repo_root, message)
 }
 

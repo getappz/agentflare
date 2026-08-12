@@ -760,8 +760,39 @@ impl AgentflareMcp {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("Auto-committed by item done: uncommitted changes at completion");
-            if crate::worktree::commit_uncommitted(item, &repo_root, message) {
-                eprintln!("worktree: auto-committed uncommitted changes for item {item_id}");
+            match crate::worktree::commit_uncommitted(item, &repo_root, message) {
+                crate::worktree::CommitOutcome::Committed => {
+                    eprintln!("worktree: auto-committed uncommitted changes for item {item_id}");
+                }
+                crate::worktree::CommitOutcome::NothingToCommit => {}
+                // A dirty tree existed but `add`/`commit` itself failed
+                // (item #88's read-only `.git` under bwrap was one cause;
+                // disk-full, a rejecting pre-commit hook, or a git config
+                // issue could all reproduce it) -- this must NOT fall
+                // through to `nothing_was_ever_committed` below, which
+                // reads "no new commit" as "genuinely nothing to do" and
+                // releases the claim + cleans up the worktree as if the
+                // tree were clean. The real edits are still sitting
+                // uncommitted in the worktree; surface that loudly instead
+                // (item #92).
+                crate::worktree::CommitOutcome::Failed(err) => {
+                    let comment_body = format!(
+                        "## agentflare work — commit failed\n\nAuto-commit of uncommitted \
+                         changes failed:\n\n```\n{err}\n```\n\nThe work is still sitting \
+                         uncommitted in the item's worktree; it was left in place rather than \
+                         reported as done."
+                    );
+                    let _ = self.comment_impl(CommentRequest {
+                        action: "create".into(),
+                        item_id: Some(item_id.clone()),
+                        body: Some(comment_body),
+                        ..Default::default()
+                    });
+                    return Err(ErrorData::internal_error(
+                        format!("item {item_id}: auto-commit of uncommitted changes failed: {err}"),
+                        None,
+                    ));
+                }
             }
         }
         let pr_url = match (&item, &target_branch) {
