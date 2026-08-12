@@ -514,6 +514,58 @@ fn resolve_agent(
         })
 }
 
+/// Best-effort backstop that releases `execute_work`'s claim on drop unless
+/// disarmed — item #94 exited its job cleanly (`agent_jobs.state='exited'`)
+/// while its claim stayed `claimed` forever, because the only release
+/// attempts were the explicit ones threaded through each intentional
+/// bail-out point (`release_and_comment`/`item_release`/`item_done`), and at
+/// least one exit path (`item_done` itself returning `Err`, e.g. a failed
+/// auto-commit) fell through none of them. This guard closes that gap for
+/// every exit out of the claim-holding section of `execute_work`, including
+/// an unwinding panic — Rust runs `Drop` impls while unwinding, so a panic
+/// anywhere after the claim is acquired still releases it immediately
+/// instead of leaving it wedged until the job's timeout (or the claim's own
+/// TTL) eventually reclaims it.
+///
+/// Disarm it only once the claim's fate has been definitively decided —
+/// `item_done` returning `Ok` is the one case where the claim may be
+/// *intentionally* left held (an open PR pending review), so that path
+/// disarms unconditionally; every other path only disarms after a
+/// release attempt it can confirm succeeded, leaving this as the real
+/// fallback when that attempt fails or is skipped entirely.
+struct ClaimGuard<'a> {
+    mcp: &'a AgentflareMcp,
+    item_id: String,
+    armed: bool,
+}
+
+impl<'a> ClaimGuard<'a> {
+    fn new(mcp: &'a AgentflareMcp, item_id: &str) -> Self {
+        Self {
+            mcp,
+            item_id: item_id.to_string(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ClaimGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self.mcp.item_release(ItemRequest {
+            action: "release".into(),
+            id: Some(self.item_id.clone()),
+            ..Default::default()
+        });
+    }
+}
+
 /// Releases the claim and posts a failure comment (+ optional handoff
 /// notify) — the single path every early-exit and headless-failure branch
 /// in `run_work` routes through, so a claimed item never dead-ends silently
@@ -725,6 +777,12 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
         .to_string();
     let item_id = item_id.as_str();
     let _ = writeln!(log, "claimed: {item_id}");
+    // Guaranteed backstop for every exit below this point — see
+    // `ClaimGuard`'s doc comment. Disarmed once the claim's fate is
+    // definitively decided; left armed anywhere the release/done handling
+    // is only best-effort, so its `Drop` provides the guarantee those
+    // sites can't.
+    let mut claim_guard = ClaimGuard::new(&mcp, item_id);
 
     // --- Worktree ---
     let worktree_path = claim["worktree_path"]
@@ -853,11 +911,16 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
             // which can't distinguish "blocked, nothing to do yet" from a
             // genuinely resolved no-op (item #92).
             if let Some(reason) = detect_hold_signal(&reply_text) {
-                let _ = mcp.item_release(ItemRequest {
-                    action: "release".into(),
-                    id: Some(item_id.into()),
-                    ..Default::default()
-                });
+                if mcp
+                    .item_release(ItemRequest {
+                        action: "release".into(),
+                        id: Some(item_id.into()),
+                        ..Default::default()
+                    })
+                    .is_ok()
+                {
+                    claim_guard.disarm();
+                }
                 let comment_body =
                     format!("## agentflare work — on hold\n\n{reason}\n\n{reply_text}");
                 let _ = mcp.comment_impl(CommentRequest {
@@ -888,10 +951,21 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
             }) {
                 Ok(j) => j,
                 Err(e) => {
+                    // `item_done` itself decides the claim's fate internally
+                    // and didn't reach that decision (e.g. a failed
+                    // auto-commit bails out before ever releasing) -- leave
+                    // `claim_guard` armed so its `Drop` releases it instead
+                    // of stranding it `claimed` forever (item #100).
                     crate::ui::error(&format!("item_done failed: {}", e.message));
                     return 1.into();
                 }
             };
+            // `item_done` returning `Ok` means it fully decided the claim's
+            // fate itself -- released (done/no-op), or intentionally left
+            // `claimed` pending PR review (`in_review`) -- so the backstop
+            // must not second-guess that by releasing it out from under a
+            // live review.
+            claim_guard.disarm();
             let done_val: serde_json::Value =
                 serde_json::from_str(&done_resp).unwrap_or(serde_json::Value::Null);
             let pr_url = done_val["pr_url"].as_str().map(str::to_string);
@@ -1648,6 +1722,101 @@ use  = "opencode"
             .unwrap();
         assert_eq!(comments.len(), 1);
         assert!(comments[0].body.contains("claude-code not found on PATH"));
+    }
+
+    /// Sets up a claimed item and returns `(tmp, mcp, item)` with the claim
+    /// held under the calling thread's own `owner_id()` — the same fixture
+    /// the `ClaimGuard` tests below all start from. The caller must keep
+    /// `tmp` alive for as long as `mcp`/`item` are in use.
+    fn claimed_item_fixture() -> (
+        tempfile::TempDir,
+        AgentflareMcp,
+        agentflare_backend::item::Item,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        init_test_repo(&repo_root);
+        let backend_db = tmp.path().join("backend.db");
+        let project_link = tmp.path().join("project.json");
+
+        let mcp = AgentflareMcp::for_test(backend_db, repo_root, project_link);
+        let item = mcp.with_backend_db(|conn| seeded_item(&mcp, conn)).unwrap();
+        let claim_json = mcp
+            .item_claim(ItemRequest {
+                action: "claim".to_string(),
+                id: Some(item.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let claim: serde_json::Value = serde_json::from_str(&claim_json).unwrap();
+        assert_eq!(claim["status"], "acquired");
+        (tmp, mcp, item)
+    }
+
+    /// Whether `item_id` still has a *live* claim, checked directly against
+    /// `item_claims` rather than by attempting to re-claim -- re-claiming
+    /// with this same test process's own `owner_id()` would succeed either
+    /// way (re-acquiring your own live claim is idempotent), which can't
+    /// distinguish "released" from "still held by me".
+    fn claim_is_still_held(mcp: &AgentflareMcp, item_id: &str) -> bool {
+        let owner = crate::claims::owner_id();
+        mcp.with_backend_db(|conn| agentflare_backend::claim::is_owner(conn, item_id, &owner))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn claim_guard_releases_the_claim_on_drop_when_still_armed() {
+        // Item #100: an overlooked early return (or a panic — see the test
+        // below) after a successful claim, with no explicit release call on
+        // that path, must not leave `item_claims` wedged `claimed` forever.
+        let (_tmp, mcp, item) = claimed_item_fixture();
+        {
+            let _guard = ClaimGuard::new(&mcp, &item.id);
+            // Dropped here without ever calling `disarm()` -- simulates any
+            // exit path that isn't one of the intentional, explicit
+            // release/done call sites.
+        }
+        assert!(
+            !claim_is_still_held(&mcp, &item.id),
+            "an armed ClaimGuard must release its claim on drop"
+        );
+    }
+
+    #[test]
+    fn claim_guard_leaves_the_claim_held_when_disarmed() {
+        // The `item_done` success path (including the intentional
+        // in-review hold) must not have its claim decision second-guessed
+        // by the backstop.
+        let (_tmp, mcp, item) = claimed_item_fixture();
+        {
+            let mut guard = ClaimGuard::new(&mcp, &item.id);
+            guard.disarm();
+        }
+        assert!(
+            claim_is_still_held(&mcp, &item.id),
+            "a disarmed ClaimGuard must not touch the claim"
+        );
+    }
+
+    #[test]
+    fn claim_guard_releases_the_claim_even_when_the_scope_unwinds_via_panic() {
+        // The panic-unwind exit path named in item #100: a hang/bug
+        // somewhere between claim and the normal completion handling must
+        // not wedge the claim for the job's full timeout — `Drop` still
+        // runs as the panic unwinds through the guard's scope.
+        let (_tmp, mcp, item) = claimed_item_fixture();
+        let item_id = item.id.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ClaimGuard::new(&mcp, &item_id);
+            panic!("simulated mid-job panic after a successful claim");
+        }));
+        assert!(result.is_err(), "the panic should have propagated");
+        assert!(
+            !claim_is_still_held(&mcp, &item.id),
+            "ClaimGuard must release the claim even when its scope unwinds via panic"
+        );
     }
 
     #[test]
