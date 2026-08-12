@@ -165,7 +165,9 @@ fn build_bwrap_args_with_home(
 /// sandbox.
 fn resolve_worktree_common_dir(cwd: &Path, git_file: &Path) -> Option<PathBuf> {
     let contents = std::fs::read_to_string(git_file).ok()?;
-    let gitdir_line = contents.lines().find_map(|line| line.strip_prefix("gitdir:"))?;
+    let gitdir_line = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?;
     let admin_dir = resolve_against(cwd, Path::new(gitdir_line.trim()));
 
     let commondir_contents = std::fs::read_to_string(admin_dir.join("commondir")).ok()?;
