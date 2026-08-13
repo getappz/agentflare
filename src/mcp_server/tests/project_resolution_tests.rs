@@ -92,7 +92,11 @@ fn resolve_project_does_not_conflate_different_repos_with_the_same_derived_name(
 #[test]
 fn resolve_project_registers_the_worktree_redirected_root_not_the_raw_repo_root() {
     let repo_dir = tempfile::tempdir().unwrap();
-    let repo_root = repo_dir.path().canonicalize().unwrap();
+    // `dunce`, not `std::path::Path::canonicalize` directly — production
+    // code (`register_project_dir`/`register_bridge_repo`) now stores the
+    // dunce-canonicalized root (no Windows `\\?\` UNC prefix), so the
+    // expectation below must be computed the same way.
+    let repo_root = dunce::canonicalize(repo_dir.path()).unwrap();
     let run_git = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)
