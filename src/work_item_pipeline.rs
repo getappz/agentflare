@@ -40,7 +40,12 @@ impl flare_workflow::WorkflowData for WorkItemData {
 }
 
 use flare_workflow::executor::FunctionStep;
-use flare_workflow::{StepDefinition, StepId, StepResult, WorkflowContext, WorkflowError};
+use flare_workflow::sqlite_store::SqliteStore;
+use flare_workflow::{
+    StepDefinition, StepId, StepResult, WorkflowContext, WorkflowEngine, WorkflowError,
+    WorkflowId, WorkflowStatus,
+};
+use std::str::FromStr;
 
 use crate::mcp_server::AgentflareMcp;
 use crate::mcp_server::types::{CommentRequest, ItemRequest};
@@ -331,6 +336,223 @@ pub(crate) fn build_finalize_step(
     })
 }
 
+/// Assembles the full `coder` → `review_or_fix` → `finalize` pipeline as a
+/// registerable `WorkflowDefinition`. Real entry point: dispatches through
+/// `crate::workflow::agent_send_hook()` — see
+/// `build_work_item_pipeline_with_sender` for the test seam.
+pub(crate) fn build_work_item_pipeline(
+    agent: agent_registry::Agent,
+    coder_prompt: String,
+    review_prompt_prefix: String,
+    mcp: std::sync::Arc<AgentflareMcp>,
+    item_id: String,
+    notify_recipient: Option<String>,
+) -> flare_workflow::WorkflowDefinition<WorkItemData> {
+    build_work_item_pipeline_with_sender(
+        agent,
+        coder_prompt,
+        review_prompt_prefix,
+        mcp,
+        item_id,
+        notify_recipient,
+        crate::workflow::agent_send_hook(),
+    )
+}
+
+/// Test seam: same pipeline, one injected `SendMessage` shared by both the
+/// `coder` and `review_or_fix` steps instead of the real headless agent hook
+/// (mirrors `build_coder_step_with_sender`/`build_review_or_fix_step_with_sender`).
+fn build_work_item_pipeline_with_sender(
+    agent: agent_registry::Agent,
+    coder_prompt: String,
+    review_prompt_prefix: String,
+    mcp: std::sync::Arc<AgentflareMcp>,
+    item_id: String,
+    notify_recipient: Option<String>,
+    send: flare_workflow::json::SendMessage,
+) -> flare_workflow::WorkflowDefinition<WorkItemData> {
+    flare_workflow::WorkflowDefinition::new(WORKFLOW_ID, "work item")
+        .add_step(build_coder_step_with_sender(
+            agent.as_str().to_string(),
+            coder_prompt,
+            send.clone(),
+        ))
+        .add_step(
+            build_review_or_fix_step_with_sender(
+                agent.as_str().to_string(),
+                review_prompt_prefix,
+                send,
+            )
+            .depends_on(&["coder"]),
+        )
+        .add_step(
+            build_finalize_step(mcp, item_id, notify_recipient).depends_on(&["review_or_fix"]),
+        )
+}
+
+/// Process-lifetime shared engine — built once, reused by every dispatch
+/// AND by the boot-time `recover()` sweep (Task 8), so a run resumed at
+/// startup and a later `run_or_resume` call for a DIFFERENT item share the
+/// same registered `WorkflowDefinition`/in-memory bookkeeping. A fresh
+/// engine per call (the pattern `src/workflow.rs`'s JSON pipeline uses)
+/// would work for isolated JSON runs but would defeat `recover()`'s
+/// "definition must already be registered on this engine" requirement here.
+pub(crate) fn engine()
+-> &'static WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>> {
+    static ENGINE: std::sync::LazyLock<WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>>> =
+        std::sync::LazyLock::new(|| {
+            let store = SqliteStore::open_file(&crate::workflow::default_db_path())
+                .expect("open workflow store for work-item pipeline");
+            WorkflowEngine::<WorkItemData, _>::with_store(store)
+                .with_runtime_handle(crate::workflow::blocking_runtime_handle())
+        });
+    &ENGINE
+}
+
+/// Resumable entrypoint `execute_work` (Task 7) calls: (re-)registers the
+/// per-dispatch pipeline definition, starts a fresh run or resumes an
+/// in-flight/crashed one recorded on the item's `workflow_run_id` metadata,
+/// and blocks synchronously (via `crate::workflow::blocking_runtime`,
+/// reusing `src/workflow.rs`'s shared runtime) until the run reaches a
+/// terminal state.
+///
+/// Re-registering on every call is safe: `WorkflowEngine::register_workflow`
+/// (`crates/flare-workflow/src/engine.rs`) does a plain `HashMap::insert`
+/// keyed by `WorkflowId` — it does NOT error on a duplicate id, it silently
+/// overwrites the previous `Arc<WorkflowDefinition>`. Runs already in flight
+/// hold their own `Arc` clone captured at `start_workflow` time, so they are
+/// unaffected by a later overwrite. The one caveat (out of scope for this
+/// task): `recover()`'s boot-time replay looks up whatever definition is
+/// CURRENTLY registered for `WORKFLOW_ID`, so if two different items'
+/// dispatches interleave around a crash, recovery could in principle replay
+/// against the wrong item's prompts — Task 8 owns `recover()` wiring and
+/// should account for this.
+pub(crate) fn run_or_resume(
+    mcp: std::sync::Arc<AgentflareMcp>,
+    item: &agentflare_backend::item::Item,
+    agent: agent_registry::Agent,
+    coder_prompt: String,
+    review_prompt_prefix: String,
+    notify_recipient: Option<String>,
+) -> Result<(), String> {
+    run_or_resume_with_sender(
+        mcp,
+        item,
+        agent,
+        coder_prompt,
+        review_prompt_prefix,
+        notify_recipient,
+        crate::workflow::agent_send_hook(),
+    )
+}
+
+/// Test seam: same resumable entrypoint, an injected `SendMessage` instead
+/// of the real headless agent hook (mirrors every other step in this file).
+fn run_or_resume_with_sender(
+    mcp: std::sync::Arc<AgentflareMcp>,
+    item: &agentflare_backend::item::Item,
+    agent: agent_registry::Agent,
+    coder_prompt: String,
+    review_prompt_prefix: String,
+    notify_recipient: Option<String>,
+    send: flare_workflow::json::SendMessage,
+) -> Result<(), String> {
+    let existing_metadata: serde_json::Value = serde_json::from_str(&item.metadata)
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    let existing_run_id = existing_metadata["workflow_run_id"]
+        .as_str()
+        .and_then(|s| flare_workflow::WorkflowRunId::from_str(s).ok());
+
+    let eng = engine();
+    let definition = build_work_item_pipeline_with_sender(
+        agent,
+        coder_prompt,
+        review_prompt_prefix,
+        mcp.clone(),
+        item.id.clone(),
+        notify_recipient,
+        send,
+    );
+    eng.register_workflow(definition).map_err(|e| e.to_string())?;
+
+    crate::workflow::blocking_runtime().block_on(async move {
+        let run_id = match existing_run_id {
+            Some(run_id) => {
+                let state = eng.get_status(run_id).await.map_err(|e| e.to_string())?;
+                if matches!(
+                    state.status,
+                    WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+                ) {
+                    // Terminal — this is a genuine re-dispatch (e.g. a
+                    // fresh self-repair pass), not a crash resume. Start
+                    // over with a new run.
+                    let new_run_id = eng
+                        .start_workflow(
+                            WorkflowId::new(WORKFLOW_ID),
+                            WorkItemData::default(),
+                            String::new(),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    persist_run_id(&mcp, &item.id, &existing_metadata, new_run_id)?;
+                    new_run_id
+                } else {
+                    // Non-terminal: either already resumed by the
+                    // boot-time `recover()` sweep (Task 8) or genuinely
+                    // still running in this same live process. Either
+                    // way, do NOT start a second run against it — just
+                    // await this one.
+                    run_id
+                }
+            }
+            None => {
+                let new_run_id = eng
+                    .start_workflow(
+                        WorkflowId::new(WORKFLOW_ID),
+                        WorkItemData::default(),
+                        String::new(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                persist_run_id(&mcp, &item.id, &existing_metadata, new_run_id)?;
+                new_run_id
+            }
+        };
+
+        loop {
+            let state = eng.get_status(run_id).await.map_err(|e| e.to_string())?;
+            match state.status {
+                WorkflowStatus::Completed => return Ok(()),
+                WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                    return Err(state.error.unwrap_or_else(|| "workflow run failed".to_string()));
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+            }
+        }
+    })
+}
+
+/// Merge `workflow_run_id` into the item's existing metadata JSON and save
+/// it via `item_update` — how a fresh/re-dispatched run's id gets recorded
+/// so `run_or_resume`'s next call (or a boot-time `recover()`) can find it.
+fn persist_run_id(
+    mcp: &AgentflareMcp,
+    item_id: &str,
+    existing_metadata: &serde_json::Value,
+    run_id: flare_workflow::WorkflowRunId,
+) -> Result<(), String> {
+    let mut merged = existing_metadata.clone();
+    merged["workflow_run_id"] = serde_json::Value::String(run_id.to_string());
+    mcp.item_update(ItemRequest {
+        action: "update".into(),
+        id: Some(item_id.to_string()),
+        metadata: Some(merged),
+        ..Default::default()
+    })
+    .map(|_| ())
+    .map_err(|e| e.message.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +794,100 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("finalize step did not complete");
+    }
+
+    // requires a real headless agent binary; run manually / in an
+    // environment with one installed — the mock-sender variant right below
+    // covers the same metadata-persistence assertion unconditionally.
+    //
+    // Deliberately a plain `#[test]` (not `#[tokio::test]`): `run_or_resume`
+    // blocks synchronously via `crate::workflow::blocking_runtime().block_on`
+    // on a *separate* runtime (`WORKFLOW_RT`); calling it from inside an
+    // already-running tokio runtime (as an async test's own executor would
+    // be) panics with "Cannot start a runtime from within a runtime" — the
+    // same reason `src/workflow.rs`'s own `run_workflow_json`-driving tests
+    // are plain `#[test]`s too.
+    #[test]
+    #[ignore]
+    fn run_or_resume_persists_run_id_and_resume_skips_completed_coder_step() {
+        let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
+            crate::mcp_server::tests::mcp_with_claimed_item("Run-or-resume real-agent test item");
+        std::fs::write(worktree_path.join("real_work.txt"), "real work").unwrap();
+        let mcp = Arc::new(mcp);
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
+            .unwrap()
+            .unwrap();
+
+        // See the mock-sender variant below for why `engine()`'s db path
+        // is isolated under a temp HOME.
+        let result = crate::paths::test_support::with_temp_home(|| {
+            run_or_resume(
+                mcp.clone(),
+                &item,
+                agent_registry::Agent::ClaudeCode,
+                "implement it".to_string(),
+                "diff prefix".to_string(),
+                None,
+            )
+        });
+        assert!(result.is_ok());
+
+        let updated = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
+            .unwrap()
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
+        assert!(metadata["workflow_run_id"].as_str().is_some());
+    }
+
+    /// Non-ignored counterpart of the real-agent test above: drives
+    /// `run_or_resume_with_sender` with a mock `SendMessage` (approves the
+    /// review immediately, same as `review_or_fix_step_stops_immediately_when_approved`)
+    /// so it runs unconditionally in CI, and asserts the same
+    /// metadata-persistence behavior.
+    #[test]
+    fn run_or_resume_with_sender_persists_run_id_on_success() {
+        let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
+            crate::mcp_server::tests::mcp_with_claimed_item("Run-or-resume mock-sender test item");
+        // Something real to commit — otherwise `finalize`'s `item_done` call
+        // sees a never-diverged branch and treats it as a no-op rather than
+        // a completion (see `finalize_step_calls_item_done_on_success`).
+        std::fs::write(worktree_path.join("real_work.txt"), "real work").unwrap();
+        let mcp = Arc::new(mcp);
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
+            .unwrap()
+            .unwrap();
+
+        let send: flare_workflow::json::SendMessage =
+            Arc::new(move |_agent: String, _prompt: String| {
+                Box::pin(async move { Ok(("REVIEW_APPROVED".to_string(), 1u64, 0u64)) })
+            });
+
+        // `engine()` is a process-lifetime singleton keyed by
+        // `crate::workflow::default_db_path()` (~/.agentflare/workflows.db)
+        // — isolate it under a temp HOME for this call so the test neither
+        // depends on nor pollutes the real user state dir (and works in
+        // sandboxes where `$HOME` is read-only).
+        let result = crate::paths::test_support::with_temp_home(|| {
+            run_or_resume_with_sender(
+                mcp.clone(),
+                &item,
+                agent_registry::Agent::ClaudeCode,
+                "implement it".to_string(),
+                "diff prefix".to_string(),
+                None,
+                send,
+            )
+        });
+        assert!(result.is_ok(), "{result:?}");
+
+        let updated = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
+            .unwrap()
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
+        assert!(metadata["workflow_run_id"].as_str().is_some());
     }
 }
