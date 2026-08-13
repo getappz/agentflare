@@ -1915,4 +1915,13 @@ use  = "opencode"
             .unwrap();
         assert!(held, "item must show as actively claimed by another owner");
     }
+
+    #[test]
+    fn item_update_is_reachable_from_outside_mcp_server() {
+        // Compile-time proof, not a runtime assertion: if `item_update` were
+        // still `pub(super)`, this file (outside `mcp_server`) would fail to
+        // build. Mirrors how `item_claim`/`item_release` are already
+        // exercised cross-module from `cli::work`.
+        let _ = AgentflareMcp::item_update;
+    }
 }
