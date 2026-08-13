@@ -1,15 +1,18 @@
 //! Retry policy execution: backoff strategies with optional jitter.
 //!
 //! Ported from SMG `wfaas` engine.rs backoff helpers (Apache-2.0), extended
-//! with a jitter factor and retryability predicates. Exponential backoff uses
-//! the `backoff` crate; Fixed and Linear are lightweight local strategies.
+//! with a jitter factor and retryability predicates. All strategies are
+//! lightweight local implementations — randomization is handled uniformly
+//! by `apply_jitter` rather than a strategy-specific crate.
 
 use std::time::Duration;
 
-use backoff::backoff::Backoff as _;
 use rand::Rng;
 
 use crate::types::{BackoffStrategy, WorkflowError};
+
+/// Multiplier applied to the exponential strategy's interval on each step.
+const EXPONENTIAL_MULTIPLIER: f64 = 1.5;
 
 /// Whether an error should be retried, given the policy.
 pub trait Retryable {
@@ -32,7 +35,8 @@ pub enum Backoff {
         delay: Duration,
     },
     Exponential {
-        inner: backoff::ExponentialBackoff,
+        current: Duration,
+        max: Duration,
     },
     Linear {
         current: Duration,
@@ -47,14 +51,10 @@ impl Backoff {
     pub fn from_strategy(strategy: &BackoffStrategy) -> Self {
         match strategy {
             BackoffStrategy::Fixed(delay) => Backoff::Fixed { delay: *delay },
-            BackoffStrategy::Exponential { base, max } => {
-                let inner = backoff::ExponentialBackoffBuilder::new()
-                    .with_initial_interval(*base)
-                    .with_max_interval(*max)
-                    .with_max_elapsed_time(None)
-                    .build();
-                Backoff::Exponential { inner }
-            }
+            BackoffStrategy::Exponential { base, max } => Backoff::Exponential {
+                current: *base,
+                max: *max,
+            },
             BackoffStrategy::Linear { increment, max } => Backoff::Linear {
                 current: *increment,
                 increment: *increment,
@@ -67,7 +67,12 @@ impl Backoff {
     pub fn next(&mut self, jitter: f64) -> Option<Duration> {
         let base = match self {
             Backoff::Fixed { delay } => Some(*delay),
-            Backoff::Exponential { inner } => inner.next_backoff(),
+            Backoff::Exponential { current, max } => {
+                let next = *current;
+                let scaled = current.mul_f64(EXPONENTIAL_MULTIPLIER);
+                *current = scaled.min(*max);
+                Some(next)
+            }
             Backoff::Linear {
                 current,
                 increment,
@@ -133,12 +138,13 @@ mod tests {
             base: Duration::from_secs(1),
             max: Duration::from_secs(64),
         });
-        // The `backoff` crate randomizes ±50% and can overshoot `max`, so
-        // values are bounded but not strictly; assert a generous ceiling.
+        assert_eq!(b.next(0.0), Some(Duration::from_secs(1)));
+        assert_eq!(b.next(0.0), Some(Duration::from_millis(1_500)));
+        assert_eq!(b.next(0.0), Some(Duration::from_millis(2_250)));
+        // Never exceeds `max`, even after many iterations.
         for _ in 0..20 {
             let d = b.next(0.0).unwrap();
-            assert!(d >= Duration::from_millis(1));
-            assert!(d <= Duration::from_secs(100));
+            assert!(d <= Duration::from_secs(64));
         }
     }
 
