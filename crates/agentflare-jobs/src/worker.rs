@@ -7,11 +7,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+/// Called from `run_in_process` when an `in_process` job's `queue.fail`
+/// leaves it permanently `failed` (retries exhausted) rather than requeued
+/// — the job id and its own `AgentJob` (args, in particular) are all a
+/// caller needs to react, e.g. `dashboard::orphan_reconcile`'s
+/// `handle_terminal_job_failure` swapping a stranded item off its
+/// `dispatched` label (item #463). Not invoked for a plain subprocess job or
+/// a retry-and-requeue — only a real terminal failure.
+pub type TerminalFailureHook = dyn Fn(&str, &crate::types::AgentJob) + Send + Sync;
+
 pub struct WorkerPool {
     queue: Arc<Queue>,
     handles: Vec<JoinHandle<()>>,
     running: Arc<AtomicBool>,
     executor: Option<Arc<dyn InProcessExecutor>>,
+    terminal_failure_hook: Option<Arc<TerminalFailureHook>>,
 }
 
 impl WorkerPool {
@@ -21,6 +31,7 @@ impl WorkerPool {
             handles: vec![],
             running: Arc::new(AtomicBool::new(false)),
             executor: None,
+            terminal_failure_hook: None,
         }
     }
 
@@ -35,14 +46,28 @@ impl WorkerPool {
         self
     }
 
+    /// Registers a callback invoked when an `in_process` job reaches
+    /// terminal `failed` state (retries exhausted) — see
+    /// `TerminalFailureHook`'s doc comment.
+    pub fn with_terminal_failure_hook(mut self, hook: Arc<TerminalFailureHook>) -> Self {
+        self.terminal_failure_hook = Some(hook);
+        self
+    }
+
     pub fn start(&mut self, num_workers: usize) {
         self.running.store(true, Ordering::SeqCst);
         for _ in 0..num_workers {
             let queue = self.queue.clone();
             let running = self.running.clone();
             let executor = self.executor.clone();
+            let terminal_failure_hook = self.terminal_failure_hook.clone();
             self.handles.push(std::thread::spawn(move || {
-                worker_loop(&queue, &running, executor.as_ref());
+                worker_loop(
+                    &queue,
+                    &running,
+                    executor.as_ref(),
+                    terminal_failure_hook.as_ref(),
+                );
             }));
         }
     }
@@ -74,11 +99,16 @@ impl WorkerPool {
     }
 }
 
-fn worker_loop(queue: &Queue, running: &AtomicBool, executor: Option<&Arc<dyn InProcessExecutor>>) {
+fn worker_loop(
+    queue: &Queue,
+    running: &AtomicBool,
+    executor: Option<&Arc<dyn InProcessExecutor>>,
+    terminal_failure_hook: Option<&Arc<TerminalFailureHook>>,
+) {
     while running.load(Ordering::SeqCst) {
         match queue.dequeue() {
             Ok(Some((id, job))) if job.in_process => {
-                run_in_process(queue, &id, &job, executor);
+                run_in_process(queue, &id, &job, executor, terminal_failure_hook);
             }
             Ok(Some((id, job))) => {
                 let mut sup = Supervisor::new(
@@ -142,15 +172,33 @@ fn run_in_process(
     id: &str,
     job: &crate::types::AgentJob,
     executor: Option<&Arc<dyn InProcessExecutor>>,
+    terminal_failure_hook: Option<&Arc<TerminalFailureHook>>,
 ) {
+    // Wraps `queue.fail` so every failure exit out of this function — not
+    // just the common "executor returned `Err`" case — runs the same
+    // terminal-failure notification. Missing one of these (e.g. the
+    // no-executor-registered or log-file-open-failure early returns below)
+    // would silently reintroduce item #463 for jobs that never even reached
+    // the executor.
+    let record_fail = |error: &str, retry_after_secs: Option<u64>| match queue.fail(
+        id,
+        error,
+        retry_after_secs,
+    ) {
+        Ok(true) => {
+            if let Some(hook) = terminal_failure_hook {
+                hook(id, job);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => eprintln!("agentflare-jobs: failed to record failure for {id}: {e}"),
+    };
+
     let Some(executor) = executor else {
-        if let Err(e) = queue.fail(
-            id,
+        record_fail(
             "job is marked in_process but no InProcessExecutor is registered on this WorkerPool",
             None,
-        ) {
-            eprintln!("agentflare-jobs: failed to record failure for {id}: {e}");
-        }
+        );
         return;
     };
     let _ = std::fs::create_dir_all(queue.log_dir());
@@ -159,9 +207,7 @@ fn run_in_process(
     let mut log_file = match std::fs::File::create(&stdout_path) {
         Ok(f) => f,
         Err(e) => {
-            if let Err(qe) = queue.fail(id, &format!("failed to open job log file: {e}"), None) {
-                eprintln!("agentflare-jobs: failed to record failure for {id}: {qe}");
-            }
+            record_fail(&format!("failed to open job log file: {e}"), None);
             return;
         }
     };
@@ -194,9 +240,7 @@ fn run_in_process(
             }
         }
         Ok(Err(failure)) => {
-            if let Err(e) = queue.fail(id, &failure.message, failure.retry_after_secs) {
-                eprintln!("agentflare-jobs: failed to record failure for {id}: {e}");
-            }
+            record_fail(&failure.message, failure.retry_after_secs);
         }
         Err(_) => {
             let msg = format!(
@@ -206,9 +250,7 @@ fn run_in_process(
                  what this timeout measures)",
                 job.timeout_secs
             );
-            if let Err(e) = queue.fail(id, &msg, None) {
-                eprintln!("agentflare-jobs: failed to record failure for {id}: {e}");
-            }
+            record_fail(&msg, None);
         }
     }
 }
