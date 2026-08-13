@@ -531,26 +531,27 @@ impl AgentflareMcp {
         // backend lock; `git worktree add` below is a blocking
         // filesystem+subprocess operation that has no business
         // running while the shared DB mutex is held.
-        let (outcome, item_id, item, target_branch, ttl_used) = self.with_backend_db(|conn| {
-            let item_id = self.resolve_item_id(conn, &raw)?;
-            // Read again (cheap) so a `Held` response can report the TTL it
-            // was actually gated by -- `item::claim` computes this internally
-            // for in-review items but doesn't hand it back (item #108).
-            let ttl_used = agentflare_backend::claim::effective_ttl_secs(conn, &item_id, ttl);
-            let outcome = agentflare_backend::item::claim(conn, &item_id, &owner, now, ttl)
-                .map_err(map_backend_err)?;
-            let (item, target_branch) =
-                if outcome == agentflare_backend::item::ClaimOutcome::Acquired {
-                    let item = agentflare_backend::item::get(conn, &item_id).ok();
-                    let target_branch = item
-                        .as_ref()
-                        .map(|i| crate::worktree::resolve_target_branch(conn, i, &repo_root));
-                    (item, target_branch)
-                } else {
-                    (None, None)
-                };
-            Ok::<_, ErrorData>((outcome, item_id, item, target_branch, ttl_used))
-        })??;
+        let (outcome, item_id, item, target_branch, ttl_used) =
+            self.with_backend_db(|conn| {
+                let item_id = self.resolve_item_id(conn, &raw)?;
+                // Read again (cheap) so a `Held` response can report the TTL it
+                // was actually gated by -- `item::claim` computes this internally
+                // for in-review items but doesn't hand it back (item #108).
+                let ttl_used = agentflare_backend::claim::effective_ttl_secs(conn, &item_id, ttl);
+                let outcome = agentflare_backend::item::claim(conn, &item_id, &owner, now, ttl)
+                    .map_err(map_backend_err)?;
+                let (item, target_branch) =
+                    if outcome == agentflare_backend::item::ClaimOutcome::Acquired {
+                        let item = agentflare_backend::item::get(conn, &item_id).ok();
+                        let target_branch = item
+                            .as_ref()
+                            .map(|i| crate::worktree::resolve_target_branch(conn, i, &repo_root));
+                        (item, target_branch)
+                    } else {
+                        (None, None)
+                    };
+                Ok::<_, ErrorData>((outcome, item_id, item, target_branch, ttl_used))
+            })??;
         let worktree_result = match (&item, &target_branch) {
             (Some(item), Some(target)) => Some(
                 PROGRESS_SENDER
