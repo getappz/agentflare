@@ -16,6 +16,7 @@ mod review;
 pub(crate) mod search;
 mod skill;
 pub(crate) mod types;
+mod workflow;
 
 use crate::optimize;
 use crate::progress::{PROGRESS_SENDER, ProgressSender};
@@ -1666,6 +1667,16 @@ impl AgentflareMcp {
         Parameters(req): Parameters<SearchRequest>,
     ) -> Result<String, ErrorData> {
         self.search_impl(req).await
+    }
+
+    #[tool(
+        description = "Workflow operations — durable agent pipelines. Single consolidated tool with `action` field: run (start a JSON-defined workflow), status (run state + per-step results + journal tail), complete_event (resolve a human-in-the-loop WaitEvent), list (run summaries)."
+    )]
+    async fn workflow(
+        &self,
+        Parameters(req): Parameters<WorkflowRequest>,
+    ) -> Result<String, ErrorData> {
+        self.workflow_impl(req).await
     }
 }
 
