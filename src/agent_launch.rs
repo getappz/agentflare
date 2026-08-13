@@ -221,6 +221,16 @@ pub fn run_captured(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    // Suppress the console window that Windows would otherwise flash for
+    // every headless dispatch — the daemon has no console of its own to
+    // attach the child to. Mirrors `Supervisor::spawn()` in
+    // agentflare-jobs/src/supervisor.rs.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     let mut child = cmd.spawn()?;
 
     if let Some(text) = stdin {
