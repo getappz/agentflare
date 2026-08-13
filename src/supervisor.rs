@@ -14,7 +14,11 @@ pub(crate) const READY_LABEL: &str = "ready-for-work";
 /// crash-orphaned item back off `dispatched` -- single source of truth so
 /// the two can't drift, same rationale as `READY_LABEL` above.
 pub(crate) const DISPATCHED_LABEL: &str = "dispatched";
-const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
+/// Also read by `dashboard::orphan_reconcile::handle_terminal_job_failure`
+/// -- a job that fails cleanly after exhausting its retries lands here
+/// rather than back on `READY_LABEL`, so it doesn't just retry-loop against
+/// the same broken agent (item #463).
+pub(crate) const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
 const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 
 /// Since item #19, work items run in-process via `WorkItemExecutor` rather

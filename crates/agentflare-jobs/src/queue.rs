@@ -200,7 +200,17 @@ impl Queue {
         Ok(())
     }
 
-    pub fn fail(&self, id: &str, error: &str, retry_after_secs: Option<u64>) -> Result<(), Error> {
+    /// Returns `true` when this failure was terminal (retries exhausted, row
+    /// left `state = 'failed'`), `false` when it went back to `queued` for
+    /// another attempt — callers that need to react to a job's *permanent*
+    /// failure (e.g. `worker::run_in_process`'s terminal-failure hook) use
+    /// this instead of re-deriving it from a follow-up `get`.
+    pub fn fail(
+        &self,
+        id: &str,
+        error: &str,
+        retry_after_secs: Option<u64>,
+    ) -> Result<bool, Error> {
         let now = db_kit::ids::now();
         let conn = self.conn.lock();
         let (retries, max_retries): (u32, u32) = conn.query_row(
@@ -235,7 +245,7 @@ impl Queue {
         if retried {
             self.wake_workers();
         }
-        Ok(())
+        Ok(!retried)
     }
 
     /// Sweeps every `agent_jobs` row still `state = 'running'` and marks it
