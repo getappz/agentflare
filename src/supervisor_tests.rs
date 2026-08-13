@@ -838,6 +838,11 @@ fn self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment() {
     let jobs = queue.list(None).unwrap();
     assert_eq!(jobs.len(), 1);
     assert!(jobs[0].args.contains(&item_id));
+    assert_eq!(
+        jobs[0].dispatch_reason.as_deref(),
+        Some("self-repair: clippy"),
+        "dashboard needs to badge why this job was fired, not just that it was"
+    );
     let comments = mcp
         .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item_id).unwrap())
         .unwrap();
