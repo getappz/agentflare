@@ -118,6 +118,19 @@ pub fn tool_name_from_exe(exe: &Path) -> Option<String> {
     exe.file_stem().and_then(|s| s.to_str()).map(str::to_string)
 }
 
+/// Suppresses the console window Windows would otherwise auto-allocate for
+/// a spawned child when the parent (e.g. a shim invoked from a console-less
+/// launcher) has none -- doesn't affect stdio inheritance, so interactive
+/// passthrough via `.status()` is unchanged.
+#[cfg(windows)]
+fn no_console_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+#[cfg(not(windows))]
+fn no_console_window(_cmd: &mut Command) {}
+
 /// Resolve `tool` on `filtered_path` (or the current PATH if `None`), exec
 /// it with argv/stdio forwarded, and exit with its exit code. Exits 127 if
 /// the tool can't be found or fails to spawn -- never returns.
@@ -132,7 +145,10 @@ pub fn run_real(tool: &str, filtered_path: Option<&OsString>, args: &[OsString])
         eprintln!("agentflare-shim: command not found: {tool}");
         exit(127);
     };
-    match Command::new(real).args(args).status() {
+    let mut cmd = Command::new(real);
+    cmd.args(args);
+    no_console_window(&mut cmd);
+    match cmd.status() {
         Ok(status) => exit(status.code().unwrap_or(1)),
         Err(e) => {
             eprintln!("agentflare-shim: failed to exec {tool}: {e}");
