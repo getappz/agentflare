@@ -8,11 +8,18 @@ use super::*;
 
 impl AgentflareMcp {
     pub(super) async fn workflow_impl(&self, req: WorkflowRequest) -> Result<String, ErrorData> {
-        let db_path = req
-            .db_path
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(crate::workflow::default_db_path);
+        // `db_path` is a test-only override so fixtures can use isolated
+        // tempdirs (see the tests below); an MCP caller-supplied path is
+        // never honored in production, since that would let any client
+        // point the workflow store at an arbitrary file on disk.
+        let db_path = if cfg!(test) {
+            req.db_path
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(crate::workflow::default_db_path)
+        } else {
+            crate::workflow::default_db_path()
+        };
 
         match req.action.as_str() {
             "run" => {

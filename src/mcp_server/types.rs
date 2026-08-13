@@ -1059,7 +1059,7 @@ pub(crate) struct WorkflowRequest {
     #[serde(default)]
     pub(crate) result: Option<String>,
     #[schemars(
-        description = "Optional SQLite store path override (defaults to ~/.agentflare/workflows.db)"
+        description = "SQLite store path (always ~/.agentflare/workflows.db in production; this field is a test-only override and is ignored outside test builds)"
     )]
     #[serde(default)]
     pub(crate) db_path: Option<String>,

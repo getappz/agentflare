@@ -27,24 +27,37 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         if self.state_store.is_cancelled(run_id).await? {
             return Err(WorkflowError::Cancelled(run_id));
         }
-        let wake_at = Utc::now() + chrono::Duration::seconds(duration_secs as i64);
 
-        // Append the pending timer once (idempotent across re-arms).
+        // Reuse a pending timer's `wake_at` on re-arm (e.g. after a crash
+        // recovery replay) rather than recomputing a fresh deadline — a
+        // durable Sleep must resume the *original* wake time, not restart
+        // the full duration on every restart.
         let journal = self.state_store.journal(run_id).await?;
-        if !journal.iter().any(|e| {
-            matches!(e, JournalEntry::Sleep { step_id, result: None, .. } if step_id == &step.id)
-        }) {
-            self.state_store
-                .append_journal(
-                    run_id,
-                    JournalEntry::Sleep {
-                        step_id: step.id.clone(),
-                        wake_at,
-                        result: None,
-                    },
-                )
-                .await?;
-        }
+        let existing_wake_at = journal.iter().find_map(|e| match e {
+            JournalEntry::Sleep {
+                step_id,
+                wake_at,
+                result: None,
+            } if step_id == &step.id => Some(*wake_at),
+            _ => None,
+        });
+        let wake_at = match existing_wake_at {
+            Some(wake_at) => wake_at,
+            None => {
+                let wake_at = Utc::now() + chrono::Duration::seconds(duration_secs as i64);
+                self.state_store
+                    .append_journal(
+                        run_id,
+                        JournalEntry::Sleep {
+                            step_id: step.id.clone(),
+                            wake_at,
+                            result: None,
+                        },
+                    )
+                    .await?;
+                wake_at
+            }
+        };
         self.event_bus
             .publish(WorkflowEvent::StepWaiting {
                 run_id,

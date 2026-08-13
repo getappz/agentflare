@@ -128,6 +128,7 @@ async fn recover_reams_pending_sleep() {
     );
 
     let run;
+    let original_wake_at;
     {
         let engine = WorkflowEngine::<Ctx, _>::with_store(SqliteStore::open_file(&path).unwrap());
         register(&engine, wf.clone());
@@ -136,16 +137,23 @@ async fn recover_reams_pending_sleep() {
             .await
             .unwrap();
         let store = engine.state_store().clone();
+        let mut wake_at = None;
         for _ in 0..100 {
             let journal = store.journal(run).await.unwrap();
-            if journal
-                .iter()
-                .any(|e| matches!(e, JournalEntry::Sleep { result: None, .. }))
-            {
+            wake_at = journal.iter().find_map(|e| match e {
+                JournalEntry::Sleep {
+                    wake_at,
+                    result: None,
+                    ..
+                } => Some(*wake_at),
+                _ => None,
+            });
+            if wake_at.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        original_wake_at = wake_at.expect("pending Sleep entry journaled before crash");
         // Crash before the sleep fires.
     }
 
@@ -187,6 +195,15 @@ async fn recover_reams_pending_sleep() {
         })
         .count();
     assert!(fired_sleeps >= 1);
+
+    // The re-armed timer must resume the *original* deadline, not a fresh
+    // one computed from the recovery time — otherwise every crash pushes
+    // the wake time out further and a durable Sleep never converges.
+    for e in &journal {
+        if let JournalEntry::Sleep { wake_at, .. } = e {
+            assert_eq!(*wake_at, original_wake_at);
+        }
+    }
 }
 
 /// Racing complete_event calls complete the wait exactly once.

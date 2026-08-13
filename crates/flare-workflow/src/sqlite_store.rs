@@ -32,6 +32,14 @@ pub enum SqliteStoreError {
 #[derive(Clone)]
 pub struct SqliteStore<D: WorkflowData> {
     conn: Arc<Mutex<Connection>>,
+    // Serializes `update()`'s load-mutate-write cycle, which is not atomic
+    // under the connection mutex alone (it's released between the load and
+    // the write so `f` can run outside `blocking`). Without this, two
+    // concurrent updates for the same run — e.g. two fan-out branches
+    // completing around the same time — can race: both load the same
+    // pre-mutation state, and the second write silently overwrites the
+    // first's step-state change.
+    update_lock: Arc<tokio::sync::Mutex<()>>,
     _marker: PhantomData<D>,
 }
 
@@ -40,6 +48,7 @@ impl<D: WorkflowData> SqliteStore<D> {
         let conn = db_kit::open_file(path, &Self::migrations())?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            update_lock: Arc::new(tokio::sync::Mutex::new(())),
             _marker: PhantomData,
         })
     }
@@ -48,6 +57,7 @@ impl<D: WorkflowData> SqliteStore<D> {
         let conn = db_kit::open_memory(&Self::migrations())?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            update_lock: Arc::new(tokio::sync::Mutex::new(())),
             _marker: PhantomData,
         })
     }
@@ -292,6 +302,11 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
     where
         F: FnOnce(&mut WorkflowState<D>) + Send,
     {
+        // Hold this for the whole load-mutate-write cycle below — see the
+        // `update_lock` field doc for why the connection mutex alone isn't
+        // enough to make this atomic.
+        let _guard = self.update_lock.lock().await;
+
         // `f` is not `'static` (trait-bound, and callers pass closures that
         // borrow local `&StepDefinition` references), so it can't be moved
         // into `spawn_blocking`. Split the blocking SQLite I/O either side of
@@ -561,6 +576,34 @@ mod tests {
         let loaded = store.load(original.run_id).await.unwrap();
         assert_eq!(loaded.context.data.value, 99);
         assert_eq!(loaded.status, WorkflowStatus::Completed);
+    }
+
+    /// Concurrent `update()` calls on the same run must not lose mutations —
+    /// each increments `value` by 1, so N concurrent updates must land N
+    /// increments. Without `update_lock`, two updates can both load the
+    /// pre-increment value and the second write clobbers the first.
+    #[tokio::test]
+    async fn concurrent_updates_on_same_run_do_not_lose_writes() {
+        let store = SqliteStore::<TestData>::open_memory().unwrap();
+        let original = state(&store).await;
+
+        const N: usize = 20;
+        let mut tasks = Vec::with_capacity(N);
+        for _ in 0..N {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .update(original.run_id, |s| s.context.data.value += 1)
+                    .await
+                    .unwrap();
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        let loaded = store.load(original.run_id).await.unwrap();
+        assert_eq!(loaded.context.data.value, 1 + N as i32);
     }
 
     #[tokio::test]
