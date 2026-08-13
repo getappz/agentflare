@@ -765,7 +765,8 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
             _ => {
                 let owner = claim["owner"].as_str().unwrap_or("?");
                 let age = claim["age_secs"].as_i64().unwrap_or(0);
-                format!("item held by {owner} ({age}s) — cannot claim")
+                let ttl = claim["ttl_secs"].as_i64().unwrap_or(0);
+                format!("item held by {owner} ({age}s, ttl {ttl}s) — cannot claim")
             }
         };
         crate::ui::error(&msg);
