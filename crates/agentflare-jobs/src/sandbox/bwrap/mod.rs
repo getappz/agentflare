@@ -24,6 +24,30 @@ use std::sync::OnceLock;
 /// defeating the containment this sandbox exists to provide.
 const HOME_CACHE_DIRS: &[&str] = &[".cargo", ".rustup", ".cache", ".npm"];
 
+/// opencode's own data dir, relative to `$HOME` -- unlike claude-code/codex/
+/// gemini's headless modes, `opencode run` unconditionally writes into this
+/// directory on every invocation (an append-mode log file, plus a SQLite
+/// session DB it checkpoints), which crashes outright under the read-only
+/// root (item #106: `FileSystem.open` on `opencode.log`, then a WAL
+/// checkpoint failure once that's worked around). It also holds
+/// `auth.json`, so it can't just go on `HOME_CACHE_DIRS` read-only -- opencode
+/// needs to both read existing credentials/config *and* write. Mounted via
+/// `--overlay-src`+`--tmp-overlay` in `build_bwrap_args_with_home`: reads
+/// see the real directory, writes land in an invisible tmpfs that's
+/// discarded when the sandboxed process exits, so nothing persists back to
+/// the host -- same "no writable state survives past this one job" guarantee
+/// `HOME_CACHE_DIRS` argues for, just via overlay instead of read-only-try
+/// since this one dir needs both.
+const OPENCODE_DATA_DIR_RELATIVE: &str = ".local/share/opencode";
+
+/// Whether `command` (the resolved binary about to be run, e.g.
+/// `/home/user/.opencode/bin/opencode`) is opencode -- matched on the final
+/// path component so it doesn't care whether the caller passed a bare name
+/// or a full resolved path.
+fn is_opencode(command: &str) -> bool {
+    Path::new(command).file_name() == Some(std::ffi::OsStr::new("opencode"))
+}
+
 /// `git_writable` controls whether `cwd/.git` is re-protected read-only
 /// (the default, `false` -- appropriate for an arbitrary job command that
 /// has no business rewriting git history) or left writable under the same
@@ -144,6 +168,27 @@ fn build_bwrap_args_with_home(
                 bwrap_args.push("--ro-bind-try".to_string());
                 bwrap_args.push(path_str.clone());
                 bwrap_args.push(path_str);
+            }
+        }
+
+        if is_opencode(command) {
+            let opencode_dir = Path::new(home).join(OPENCODE_DATA_DIR_RELATIVE);
+            let opencode_str = path_to_string(&opencode_dir);
+            if opencode_dir.exists() {
+                // `--overlay-src` requires its source to already exist;
+                // reads pass through to it, writes go to the implicit tmpfs
+                // `--tmp-overlay` adds on top -- never touching the host.
+                bwrap_args.push("--overlay-src".to_string());
+                bwrap_args.push(opencode_str.clone());
+                bwrap_args.push("--tmp-overlay".to_string());
+                bwrap_args.push(opencode_str);
+            } else {
+                // Never run before under this `$HOME` -- nothing to read,
+                // so a plain writable tmpfs (no read-only source needed)
+                // covers the same "opencode can create+write its own data
+                // dir" case.
+                bwrap_args.push("--tmpfs".to_string());
+                bwrap_args.push(opencode_str);
             }
         }
     }
@@ -466,5 +511,52 @@ mod tests {
             .position(|a| a == &cargo_path)
             .expect(".cargo cache dir bound");
         assert_eq!(args[idx - 1], "--ro-bind-try");
+    }
+
+    #[test]
+    fn opencode_data_dir_overlaid_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join(OPENCODE_DATA_DIR_RELATIVE);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let args = build_bwrap_args_with_home(None, "/usr/bin/opencode", &[], Some(&home), false);
+        let data_str = path_to_string(&data_dir);
+        let src_idx = args
+            .iter()
+            .position(|a| a == "--overlay-src")
+            .expect("--overlay-src present");
+        assert_eq!(args[src_idx + 1], data_str);
+        let overlay_idx = args
+            .iter()
+            .position(|a| a == "--tmp-overlay")
+            .expect("--tmp-overlay present");
+        assert_eq!(args[overlay_idx + 1], data_str);
+    }
+
+    #[test]
+    fn opencode_data_dir_uses_tmpfs_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let args = build_bwrap_args_with_home(None, "/usr/bin/opencode", &[], Some(&home), false);
+        let data_str = path_to_string(&dir.path().join(OPENCODE_DATA_DIR_RELATIVE));
+        let idx = args
+            .iter()
+            .position(|a| a == &data_str)
+            .expect("opencode data dir tmpfs-mounted");
+        assert_eq!(args[idx - 1], "--tmpfs");
+        assert!(!args.iter().any(|a| a == "--overlay-src"));
+    }
+
+    #[test]
+    fn non_opencode_command_gets_no_opencode_specific_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(OPENCODE_DATA_DIR_RELATIVE)).unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let args = build_bwrap_args_with_home(None, "/usr/bin/claude", &[], Some(&home), false);
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--overlay-src" || a == "--tmp-overlay")
+        );
     }
 }
