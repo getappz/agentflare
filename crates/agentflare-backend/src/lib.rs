@@ -1,5 +1,6 @@
 pub mod ask_event;
 pub mod asset;
+pub mod assignment_events;
 pub mod bridge_repo;
 pub mod claim;
 pub mod comment;

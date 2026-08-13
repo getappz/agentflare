@@ -960,6 +960,37 @@ impl AgentflareMcp {
         Ok(project)
     }
 
+    /// Resolves the project a read-only reporting action should run against:
+    /// the `project` override (name, case-insensitive, or UUID — looked up in
+    /// the linked workspace) when given, else the repo's linked project.
+    /// Lookup-only for overrides: none of `resolve_project`'s link-file /
+    /// bridge-registration side effects apply to a project this repo merely
+    /// reports on.
+    pub(crate) fn resolve_project_for_read(
+        &self,
+        conn: &rusqlite::Connection,
+        project_override: Option<&str>,
+    ) -> Result<agentflare_backend::project::Project, ErrorData> {
+        let Some(wanted) = project_override.map(str::trim).filter(|s| !s.is_empty()) else {
+            return self.resolve_project(conn);
+        };
+        let workspace_id = Self::resolve_workspace_id(conn)?;
+        let projects = agentflare_backend::project::list_by_workspace(conn, &workspace_id)
+            .map_err(map_backend_err)?;
+        projects
+            .into_iter()
+            .find(|p| p.id == wanted || p.name.eq_ignore_ascii_case(wanted))
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!(
+                        "project '{wanted}' not found in the linked workspace — \
+                         use `project action=list` to see valid names/ids"
+                    ),
+                    None,
+                )
+            })
+    }
+
     /// Refreshes this repo's row in the local GitHub bridge's repo registry
     /// (`bridge_repos`) — the reverse of `project.json`'s folder→project
     /// link, indexed by repo instead so the daemon (no reliable cwd, so it
@@ -1463,7 +1494,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health). `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck scorecard; `bottlenecks` is currently always empty — no handoff log is persisted yet, see `bottleneck_note`. `done` moves an item to \"in_review\" (not \"completed\") when it results in an open PR, and leaves the worktree in place for follow-up commits; call `check_merge` once the PR is confirmed merged to promote it to \"completed\" and clean up the worktree. Pass `summary` on `done` with what you changed and why — it becomes the PR body; omitting it leaves the PR with a generic placeholder description."
+        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health). `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck/bottlenecks scorecard (`bottlenecks` = items handed between agents ≥2× in the window; history starts at the assignment-log migration). The read-only reporting actions groom|standup|health accept a `project` override (name or UUID from `project action=list`) for portfolio roll-ups. `done` moves an item to \"in_review\" (not \"completed\") when it results in an open PR, and leaves the worktree in place for follow-up commits; call `check_merge` once the PR is confirmed merged to promote it to \"completed\" and clean up the worktree. Pass `summary` on `done` with what you changed and why — it becomes the PR body; omitting it leaves the PR with a generic placeholder description."
     )]
     fn item(&self, Parameters(req): Parameters<ItemRequest>) -> Result<String, ErrorData> {
         self.item_inner(req)
@@ -1638,15 +1669,24 @@ impl AgentflareMcp {
                 let project = self.resolve_project(conn)?;
                 Ok(serde_json::to_string_pretty(&project).unwrap_or_default())
             })?,
+            "list" => self.with_backend_db(|conn| {
+                // Ensure this repo's own project exists/links first so a fresh
+                // workspace still lists at least the current project.
+                let _ = self.resolve_project(conn)?;
+                let workspace_id = Self::resolve_workspace_id(conn)?;
+                let projects = agentflare_backend::project::list_by_workspace(conn, &workspace_id)
+                    .map_err(map_backend_err)?;
+                Ok(serde_json::to_string_pretty(&projects).unwrap_or_default())
+            })?,
             other => Err(ErrorData::invalid_params(
-                format!("unknown project action: '{other}' — expected info"),
+                format!("unknown project action: '{other}' — expected info|list"),
                 None,
             )),
         }
     }
 
     #[tool(
-        description = "Show the workspace/project this repo is currently linked to (auto-created/linked on first use). The `action` field selects the operation (only `info` for now)."
+        description = "Workspace/project linkage. `info` shows the project this repo is linked to (auto-created/linked on first use); `list` shows every project in the linked workspace — the valid targets for the item tool's read-only `project` override (portfolio roll-ups)."
     )]
     fn project(&self, Parameters(req): Parameters<ProjectRequest>) -> Result<String, ErrorData> {
         self.project_inner(req)

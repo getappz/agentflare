@@ -169,6 +169,13 @@ pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
         .assignee_agent
         .as_deref()
         .map(agent_registry::canonicalize);
+    // Snapshot the outgoing assignee before the write so the assignment log
+    // can record the transition (only fetched when the assignee is changing).
+    let previous_assignee = if assignee_agent.is_some() {
+        Some(get(conn, id)?.assignee_agent)
+    } else {
+        None
+    };
     let mut sets = vec!["updated_at = ?2".to_string()];
     let mut param_idx = 3;
     if input.name.is_some() {
@@ -230,6 +237,11 @@ pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
     let changed = stmt.execute(rusqlite::params_from_iter(param_values.iter()))?;
     if changed == 0 {
         return Err(crate::error::Error::NotFound(id.to_string()));
+    }
+    if let (Some(new_assignee), Some(old_assignee)) = (&assignee_agent, &previous_assignee)
+        && old_assignee.as_deref() != Some(new_assignee.as_str())
+    {
+        crate::assignment_events::record(conn, id, old_assignee.as_deref(), new_assignee)?;
     }
     let item = get(conn, id)?;
     if let Ok(wid) = workspace_id_for_project(conn, &item.project_id) {

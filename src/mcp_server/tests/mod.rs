@@ -352,6 +352,7 @@ mod artifact_tests;
 mod asset_tests;
 mod item_commit_failure_tests;
 mod item_tests;
+mod item_tests_reporting;
 mod project_resolution_tests;
 mod search_tests;
 mod state_tests;
