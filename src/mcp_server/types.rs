@@ -792,6 +792,11 @@ pub(crate) struct ItemRequest {
     )]
     #[serde(default)]
     pub(crate) summary: Option<String>,
+    #[schemars(
+        description = "Project override — a project name (case-insensitive) or UUID in the linked workspace. Honored ONLY by the read-only reporting actions groom|standup|health, for portfolio roll-ups; every other action always uses the repo's linked project. Use `project action=list` to enumerate valid targets."
+    )]
+    #[serde(default)]
+    pub(crate) project: Option<String>,
 }
 
 /// Lean per-item projection for `item(list)` — the raw 19-field `Item` (full
@@ -928,8 +933,9 @@ pub(crate) struct HealthResponse {
     pub(crate) stuck_days: i64,
     pub(crate) stuck_count: usize,
     pub(crate) stuck: Vec<StandupItem>,
-    /// Empty today — agentflare has no persisted handoff log distinct from
-    /// item state, so this can't be computed yet (see `bottleneck_note`).
+    /// Items handed between different agents ≥2× in the window, from the
+    /// persisted assignment log (see `bottleneck_note` for the history-start
+    /// caveat).
     pub(crate) bottlenecks: Vec<String>,
     pub(crate) bottleneck_note: String,
 }
@@ -996,7 +1002,7 @@ pub(crate) struct WebhookRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProjectRequest {
-    #[schemars(description = "Action: info")]
+    #[schemars(description = "Action: info|list")]
     pub(crate) action: String,
 }
 

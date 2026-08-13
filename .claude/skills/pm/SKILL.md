@@ -1,6 +1,6 @@
 ---
 name: pm
-description: Product management for the current agentflare project — run /pm:standup (daily activity digest), /pm:groom (backlog grooming + RICE/ICE/WSJF/Value-Effort prioritization), /pm:plan (Now/Next/Later sprint bucketing), or /pm:health (velocity + WIP + bottleneck scorecard). Read-only; operates on agentflare items via MCP.
+description: Product management for the current agentflare project — run /pm:standup (daily activity digest), /pm:groom (backlog grooming + RICE/ICE/WSJF/Value-Effort prioritization), /pm:plan (Now/Next/Later sprint bucketing), /pm:health (velocity + WIP + bottleneck scorecard), or /pm:portfolio (cross-project roll-up). Read-only; operates on agentflare items via MCP.
 ---
 
 # PM Agent — product management over agentflare items
@@ -17,8 +17,10 @@ All content authored from public PM methodologies (RICE, ICE, WSJF, Value-Effort
 
 ## Scope
 
-One project only — whichever project the current repo resolves to. No
-cross-project aggregation.
+Default: one project — whichever project the current repo resolves to.
+`/pm:portfolio` is the one exception: it loops the read-only reports across
+every project in the workspace via the `project` override param (still
+read-only, still one workspace).
 
 ## Workflows
 
@@ -96,9 +98,27 @@ Arg: window in weeks (default 4).
    returns `velocity` (oldest→newest weekly series + `velocity_trend`:
    up/down/flat), `wip` (list + count), `stuck` (WIP older than
    `staleness_days`, default 7), and `bottlenecks`/`bottleneck_note`.
-2. `bottlenecks` is currently always empty — agentflare has no persisted
-   handoff-history log distinct from item state yet, so this can't be
-   computed server-side. Print `bottleneck_note` verbatim ("no handoff
-   history") rather than inventing a signal.
+2. `bottlenecks` lists items handed between different agents ≥2× inside the
+   window, computed server-side from the persisted assignment log (written on
+   every claim/reassignment). Print each entry as returned (`#N name — K
+   handoffs (owner chain)`), plus `bottleneck_note` — it carries the one
+   caveat that matters: history starts at the assignment-log migration, so
+   older transitions are invisible.
 3. One-glance scorecard: Velocity · WIP · Stuck · Bottlenecks.
 4. Print the time-signal caveat. Read-only.
+
+### /pm:portfolio — cross-project roll-up
+
+Args: which report (`health` default, or `standup`); the report's own args
+pass through (window weeks / cutoff hours).
+
+1. One call: `project action="list"` — every project in the linked workspace.
+2. For each project, one call: `item action="<health|standup>"
+   project=<project name>` — the `project` override is honored only by the
+   read-only reporting actions, so this stays mutation-free by construction.
+3. Print one roll-up table, one row per project:
+   - health: project · velocity trend · WIP · stuck · bottleneck count.
+   - standup: project · done · in-progress · stuck counts.
+   Follow with a short "needs attention" list: any project with stuck items,
+   a `down` velocity trend, or non-empty bottlenecks, and why.
+4. Print the time-signal caveat once (it applies to every row). Read-only.
