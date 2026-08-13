@@ -726,7 +726,10 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
     // init_global() starts the sampler `supervisor` dispatch consults (item #435).
     agentflare_resource_gate::init_global();
     let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
-        .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor));
+        .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor))
+        .with_terminal_failure_hook(std::sync::Arc::new(|_job_id, job| {
+            super::orphan_reconcile::handle_terminal_job_failure(job);
+        }));
     worker_pool.start(work_max_concurrency());
     spawn_binary_staleness_watchdog(crate::daemon::BinarySnapshot::capture());
     spawn_job_cleanup(queue.clone());

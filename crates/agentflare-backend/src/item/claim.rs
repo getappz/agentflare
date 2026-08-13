@@ -66,6 +66,7 @@ pub fn claim(
             });
         }
     }
+    let ttl_secs = crate::claim::effective_ttl_secs(&tx, item_id, ttl_secs);
     let outcome = crate::claim::acquire(&tx, item_id, owner, now, ttl_secs)?;
     let result = match outcome {
         crate::claim::Acquire::Acquired => {

@@ -9,4 +9,4 @@ pub use executor::{InProcessExecutor, JobFailure};
 pub use queue::Queue;
 pub use supervisor::Supervisor;
 pub use types::{AgentJob, JobInfo, JobOutput, JobState};
-pub use worker::WorkerPool;
+pub use worker::{TerminalFailureHook, WorkerPool};
