@@ -531,22 +531,27 @@ impl AgentflareMcp {
         // backend lock; `git worktree add` below is a blocking
         // filesystem+subprocess operation that has no business
         // running while the shared DB mutex is held.
-        let (outcome, item_id, item, target_branch) = self.with_backend_db(|conn| {
-            let item_id = self.resolve_item_id(conn, &raw)?;
-            let outcome = agentflare_backend::item::claim(conn, &item_id, &owner, now, ttl)
-                .map_err(map_backend_err)?;
-            let (item, target_branch) =
-                if outcome == agentflare_backend::item::ClaimOutcome::Acquired {
-                    let item = agentflare_backend::item::get(conn, &item_id).ok();
-                    let target_branch = item
-                        .as_ref()
-                        .map(|i| crate::worktree::resolve_target_branch(conn, i, &repo_root));
-                    (item, target_branch)
-                } else {
-                    (None, None)
-                };
-            Ok::<_, ErrorData>((outcome, item_id, item, target_branch))
-        })??;
+        let (outcome, item_id, item, target_branch, ttl_used) =
+            self.with_backend_db(|conn| {
+                let item_id = self.resolve_item_id(conn, &raw)?;
+                // Read again (cheap) so a `Held` response can report the TTL it
+                // was actually gated by -- `item::claim` computes this internally
+                // for in-review items but doesn't hand it back (item #108).
+                let ttl_used = agentflare_backend::claim::effective_ttl_secs(conn, &item_id, ttl);
+                let outcome = agentflare_backend::item::claim(conn, &item_id, &owner, now, ttl)
+                    .map_err(map_backend_err)?;
+                let (item, target_branch) =
+                    if outcome == agentflare_backend::item::ClaimOutcome::Acquired {
+                        let item = agentflare_backend::item::get(conn, &item_id).ok();
+                        let target_branch = item
+                            .as_ref()
+                            .map(|i| crate::worktree::resolve_target_branch(conn, i, &repo_root));
+                        (item, target_branch)
+                    } else {
+                        (None, None)
+                    };
+                Ok::<_, ErrorData>((outcome, item_id, item, target_branch, ttl_used))
+            })??;
         let worktree_result = match (&item, &target_branch) {
             (Some(item), Some(target)) => Some(
                 PROGRESS_SENDER
@@ -586,7 +591,7 @@ impl AgentflareMcp {
             agentflare_backend::item::ClaimOutcome::Held {
                 owner: holder,
                 age_secs,
-            } => serde_json::json!({"status": "held", "item_id": item_id, "owner": holder, "age_secs": age_secs}).to_string(),
+            } => serde_json::json!({"status": "held", "item_id": item_id, "owner": holder, "age_secs": age_secs, "ttl_secs": ttl_used}).to_string(),
             agentflare_backend::item::ClaimOutcome::BlockedByAssignee { assignee } => {
                 serde_json::json!({
                     "status": "blocked",
@@ -648,6 +653,7 @@ impl AgentflareMcp {
                 // "someone else is actively using this" and leaving
                 // abandoned claims permanently un-releasable by anyone but
                 // a process that no longer exists.
+                let ttl = agentflare_backend::claim::effective_ttl_secs(conn, &item_id, ttl);
                 if let agentflare_backend::claim::Acquire::Held {
                     owner: holder,
                     age_secs,
@@ -656,7 +662,7 @@ impl AgentflareMcp {
                 {
                     return Err(ErrorData::invalid_params(
                         format!(
-                            "item {item_id} is claimed by '{holder}' (active {age_secs}s ago) -- refusing to release someone else's live claim"
+                            "item {item_id} is claimed by '{holder}' (active {age_secs}s ago, ttl {ttl}s) -- refusing to release someone else's live claim"
                         ),
                         None,
                     ));
