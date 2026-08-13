@@ -66,6 +66,7 @@ mod uninstall;
 mod update;
 mod vault;
 mod vent;
+mod workflow;
 mod worktree;
 
 use clap::Parser;

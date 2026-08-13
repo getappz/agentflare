@@ -1038,3 +1038,29 @@ pub(crate) struct SearchRequest {
     #[serde(default)]
     pub(crate) limit: Option<usize>,
 }
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct WorkflowRequest {
+    #[schemars(description = "Action: run|status|complete_event|list")]
+    pub(crate) action: String,
+    #[schemars(description = "JSON workflow definition (run) — OpenFang-style {name, steps}")]
+    #[serde(default)]
+    pub(crate) definition: Option<String>,
+    #[schemars(description = "Initial input for the first step (run)")]
+    #[serde(default)]
+    pub(crate) input: Option<String>,
+    #[schemars(description = "Run UUID (status, complete_event)")]
+    #[serde(default)]
+    pub(crate) run_id: Option<String>,
+    #[schemars(description = "WaitEvent name to resolve (complete_event)")]
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    #[schemars(description = "Completion payload text (complete_event)")]
+    #[serde(default)]
+    pub(crate) result: Option<String>,
+    #[schemars(
+        description = "SQLite store path (always ~/.agentflare/workflows.db in production; this field is a test-only override and is ignored outside test builds)"
+    )]
+    #[serde(default)]
+    pub(crate) db_path: Option<String>,
+}

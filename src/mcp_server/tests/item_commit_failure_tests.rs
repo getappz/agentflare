@@ -1,3 +1,6 @@
+// The whole module is cfg(unix)-gated below, so on non-Unix this import is
+// unused; the items it pulls in are still needed on Unix.
+#[allow(unused_imports)]
 use super::*;
 
 // Windows' FILE_ATTRIBUTE_READONLY on a *directory* doesn't prevent writes

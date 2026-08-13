@@ -94,6 +94,7 @@ dependencies = [
  "flare-proxy",
  "flare-search-kit",
  "flare-vault",
+ "flare-workflow",
  "flate2",
  "fs2",
  "hex",
@@ -368,6 +369,7 @@ dependencies = [
  "tracing-core",
  "typenum",
  "ureq 2.12.1",
+ "uuid",
  "winapi",
  "windows 0.62.2",
  "windows-sys 0.61.2",
@@ -1294,6 +1296,27 @@ dependencies = [
  "tempfile",
  "thiserror",
  "zeroize",
+]
+
+[[package]]
+name = "flare-workflow"
+version = "0.1.0"
+dependencies = [
+ "agentflare-db-kit",
+ "agentflare-workspace-hack",
+ "async-trait",
+ "chrono",
+ "parking_lot",
+ "rand 0.8.6",
+ "rusqlite",
+ "rusqlite_migration",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -4078,6 +4101,7 @@ checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

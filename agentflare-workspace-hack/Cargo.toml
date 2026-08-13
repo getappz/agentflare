@@ -49,6 +49,7 @@ tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 ureq = { version = "2", features = ["json"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [build-dependencies]
