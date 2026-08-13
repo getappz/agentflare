@@ -616,8 +616,47 @@ fn notify(recipient: &str, body: &str, item_id: &str) {
 
 impl WorkArgs {
     pub fn run(self) {
+        if let Some(marker) = ai_agent_env_marker() {
+            eprintln!(
+                "error: `agentflare work` is a human-only command — it bypasses the daemon's \
+                 claim/queue tracking that the dashboard and autonomous self-repair depend on \
+                 (detected {marker} set in this process's environment).\n\n\
+                 If you're an AI agent: don't run this directly. Either wait for the daemon's \
+                 discovery tick to dispatch the item (it will, once `ready-for-work` is set and \
+                 nothing blocks it), or ask a human to run this command for you if the item is \
+                 genuinely stuck."
+            );
+            // Known tension (item #113): this deny is strict and has no override. This
+            // session's own recovery of #104/#107 (claims that outlived their TTL past the
+            // daemon's 3-attempt self-repair cap) needed a human-authorized `agentflare work`
+            // run executed by an AI agent after explicit sign-off -- a path this guard now
+            // closes entirely, even with a human in the loop. Left unresolved on purpose; an
+            // override (e.g. `--i-am-a-human`, or a prompt requiring real terminal input) is a
+            // deliberate future decision, not something to route around here.
+            std::process::exit(1);
+        }
         std::process::exit(execute_work(self, &mut std::io::stdout()).exit_code);
     }
+}
+
+/// Name of the first AI-agent marker env var found set (non-empty) in this process's
+/// environment, or `None` on a human's own terminal. Mirrors the marker list
+/// `bashenv.rs`'s shim dispatcher already uses to detect an agent's own tool-execution layer
+/// running the shell -- same signal, same list, kept in sync by hand since one lives in a
+/// bash string template and the other in Rust.
+fn ai_agent_env_marker() -> Option<&'static str> {
+    const MARKERS: &[&str] = &[
+        "CLAUDECODE",
+        "CURSOR_AGENT",
+        "CODEX_CLI_SESSION",
+        "GEMINI_SESSION",
+        "CODEBUDDY",
+        "LEAN_CTX_AGENT",
+    ];
+    MARKERS
+        .iter()
+        .copied()
+        .find(|var| std::env::var(var).is_ok_and(|v| !v.is_empty()))
 }
 
 /// `execute_work`'s result: the process exit code (0 = success), plus — set
@@ -1091,6 +1130,40 @@ mod tests {
             updated_at: 0,
             deleted_at: None,
         }
+    }
+
+    /// Both assertions live in one test (rather than two) because env vars are
+    /// process-global state and `cargo test` runs tests in parallel threads by
+    /// default -- a separate "set CLAUDECODE" test and "assert none set" test
+    /// would race each other's set/remove calls.
+    #[test]
+    fn ai_agent_env_marker_detects_claudecode_and_clears() {
+        let markers = [
+            "CLAUDECODE",
+            "CURSOR_AGENT",
+            "CODEX_CLI_SESSION",
+            "GEMINI_SESSION",
+            "CODEBUDDY",
+            "LEAN_CTX_AGENT",
+        ];
+        // SAFETY: test-only; these env vars aren't touched by any other test in
+        // this process, and set/remove here always run on the same thread.
+        unsafe {
+            for var in markers {
+                std::env::remove_var(var);
+            }
+        }
+        assert_eq!(ai_agent_env_marker(), None);
+
+        unsafe {
+            std::env::set_var("CLAUDECODE", "1");
+        }
+        assert_eq!(ai_agent_env_marker(), Some("CLAUDECODE"));
+
+        unsafe {
+            std::env::remove_var("CLAUDECODE");
+        }
+        assert_eq!(ai_agent_env_marker(), None);
     }
 
     #[test]
