@@ -870,7 +870,12 @@ impl AgentflareMcp {
             return format!("git:{}", crate::claims::normalize_repo(&remote));
         }
         let root = Self::repo_root();
-        let canonical = std::fs::canonicalize(&root).unwrap_or(root);
+        // `dunce`, not `std::fs::canonicalize` directly: on Windows std adds
+        // a `\\?\` UNC prefix that Git for Windows' MSYS layer can't handle
+        // when this path is later fed to `git worktree add` (folder_path
+        // flows into dispatched jobs via `register_project_dir` below) —
+        // same rationale as `code::impact_for_path`'s use of `dunce`.
+        let canonical = dunce::canonicalize(&root).unwrap_or(root);
         format!("path:{}", canonical.to_string_lossy())
     }
 
@@ -1004,7 +1009,10 @@ impl AgentflareMcp {
         let Some(repo_id) = crate::github::RepoId::resolve_from_remote(&repo_root) else {
             return;
         };
-        let folder_path = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
+        // `dunce`, not `std::fs::canonicalize` directly: on Windows std adds
+        // a `\\?\` UNC prefix that Git for Windows' MSYS layer can't handle
+        // once this path reaches `git worktree add` for a dispatched job.
+        let folder_path = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
         let queue_label = crate::github::bridge::config::resolve_project_queue_label(&folder_path);
         let _ = agentflare_backend::bridge_repo::upsert(
             conn,
@@ -1027,7 +1035,12 @@ impl AgentflareMcp {
     /// not break project resolution, which every MCP/CLI call depends on.
     fn register_project_dir(&self, conn: &rusqlite::Connection, project_id: &str) {
         let repo_root = self.worktree_repo_root();
-        let folder_path = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
+        // `dunce`, not `std::fs::canonicalize` directly: on Windows std adds
+        // a `\\?\` UNC prefix that breaks `git worktree add` once this path
+        // is threaded through to a dispatched job as its `folder_path` (see
+        // `worktree::create_worktree`, which is what actually spawns that
+        // command).
+        let folder_path = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
         let _ = agentflare_backend::project_dir::upsert(
             conn,
             project_id,

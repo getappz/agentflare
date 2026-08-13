@@ -13,7 +13,11 @@ pub fn repo_key() -> String {
         }
     }
     let root = repo_root();
-    let canonical = std::fs::canonicalize(&root).unwrap_or(root);
+    // `dunce`, not `std::fs::canonicalize` directly: on Windows std adds a
+    // `\\?\` UNC prefix, which would also desync this key from
+    // `AgentflareMcp::resolve_repo_key`'s (now `dunce`-based) output for the
+    // same repo.
+    let canonical = dunce::canonicalize(&root).unwrap_or(root);
     format!("path:{}", canonical.to_string_lossy())
 }
 
