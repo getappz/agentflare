@@ -101,10 +101,10 @@ fn gui_target() -> String {
 // the passwd entry for the real uid.
 #[cfg(target_os = "linux")]
 fn linux_username() -> Option<String> {
-    if let Ok(user) = std::env::var("USER") {
-        if !user.is_empty() {
-            return Some(user);
-        }
+    if let Ok(user) = std::env::var("USER")
+        && !user.is_empty()
+    {
+        return Some(user);
     }
     unsafe {
         let pw = libc::getpwuid(libc::getuid());
