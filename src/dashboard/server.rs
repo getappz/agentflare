@@ -722,6 +722,52 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
     .expect("failed to open job queue");
     // Before anything below can dequeue a single job (see its own doc comment).
     super::orphan_reconcile::reconcile_orphaned_jobs(&queue);
+    // Same reasoning as `reconcile_orphaned_jobs` above, for the work-item
+    // `flare-workflow` pipeline's own crash story: register a definition
+    // under `work_item_pipeline::WORKFLOW_ID` so `engine().recover()` (a
+    // whole-store sweep — see its doc comment on why it's only ever called
+    // here, once, never per-dispatch) has something to resume non-terminal
+    // runs against, then run it, before `WorkerPool::start` below can
+    // dispatch a fresh job for one of those same items.
+    //
+    // Known limitation: this boot-time definition's `coder`/`review_or_fix`/
+    // `finalize` steps close over placeholder identity (no real item id,
+    // agent, or prompts — those only exist inside the dead process that
+    // crashed, and `flare_workflow`'s step closures aren't reconstructible
+    // from persisted state alone). A run actually resumed through it can't
+    // reproduce the crashed run's real prompts/target item — it fails
+    // closed instead: `finalize` calls `item_done`/`item_release` against
+    // an empty item id, which errors immediately rather than touching any
+    // real item, so this is safe (no wrong-item side effects) but not yet a
+    // real crash-resume — the item stays `claimed` until the bridge's own
+    // claim-TTL reclaim picks it up, exactly like a crash would leave it
+    // pre-#110. Making this a genuine resume needs `WorkItemData` to carry
+    // enough (item id, agent, prompts) for these steps to rebuild their own
+    // `AgentflareMcp`/request at execution time instead of capturing one at
+    // registration time — tracked as follow-up, not attempted here.
+    {
+        let dummy_mcp = std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default());
+        let dummy_definition = crate::work_item_pipeline::build_work_item_pipeline(
+            agent_registry::Agent::ClaudeCode,
+            String::new(),
+            String::new(),
+            dummy_mcp,
+            String::new(),
+            None,
+            std::time::Duration::from_secs(crate::cli::work::DEFAULT_TIMEOUT_SECS),
+            std::time::Duration::from_secs(crate::cli::work::DEFAULT_IDLE_TIMEOUT_SECS),
+            Vec::new(),
+        );
+        if let Err(e) = crate::work_item_pipeline::engine().register_workflow(dummy_definition) {
+            crate::ui::error(&format!(
+                "failed to register work-item pipeline definition at boot: {e}"
+            ));
+        } else if let Err(e) = crate::work_item_pipeline::engine().recover().await {
+            crate::ui::error(&format!(
+                "failed to recover in-flight work-item pipeline runs at boot: {e}"
+            ));
+        }
+    }
     // Kept alive for `run()` (no graceful shutdown path, see `daemon::stop_daemon`).
     // init_global() starts the sampler `supervisor` dispatch consults (item #435).
     agentflare_resource_gate::init_global();
