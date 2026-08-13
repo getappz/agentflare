@@ -946,4 +946,167 @@ mod tests {
         let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
         assert!(metadata["workflow_run_id"].as_str().is_some());
     }
+
+    fn git(repo: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Full `coder` → `review_or_fix` → `finalize` pipeline against a real
+    /// git worktree — mirrors `src/workflow.rs`'s own
+    /// `coder_reviewer_pr_pipeline_runs_real_git_flow` test, one level up
+    /// (this pipeline's steps, not the JSON pipeline's). The injected
+    /// sender role-branches on call count (both `coder` and `review_or_fix`
+    /// share one `SendMessage`, same as every other test in this file):
+    /// call 0 is `coder` (writes+commits a real bug), call 1 is
+    /// `review_or_fix`'s first, reviewer-role iteration (reads the REAL
+    /// `git diff` and flags the bug), call 2 is the fixer-role iteration
+    /// (fixes it for real, commits, and — per `review_or_fix_step_fixes_once_then_approves`'s
+    /// already-observed real-engine behavior — includes the approval marker
+    /// in its own reply so the loop's `until` check fires right there,
+    /// without a dedicated third re-review call).
+    #[tokio::test]
+    async fn full_pipeline_runs_real_git_flow_with_one_fix_cycle() {
+        let (mcp, _backend_tmp, _repo_tmp, item_id, project_id, worktree_path) =
+            crate::mcp_server::tests::mcp_with_claimed_item("Full pipeline real-git-flow test item");
+        let mcp = Arc::new(mcp);
+
+        let call_n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_n2 = call_n.clone();
+        let wpath = worktree_path.clone();
+        // `finalize`'s real `item_done` call may clean up the worktree once
+        // the pipeline completes (same as any other successful dispatch), so
+        // the fixer round captures the commit log itself, real-time, rather
+        // than the test re-reading `worktree_path` after the run finishes.
+        let commit_log = Arc::new(std::sync::Mutex::new(String::new()));
+        let commit_log2 = commit_log.clone();
+        let send: flare_workflow::json::SendMessage = Arc::new(move |_agent, _prompt| {
+            let n = call_n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let wpath = wpath.clone();
+            let commit_log = commit_log2.clone();
+            Box::pin(async move {
+                match n {
+                    0 => {
+                        std::fs::write(
+                            wpath.join("greet.py"),
+                            "def greet(name):\n    return \"hello\"\n",
+                        )
+                        .unwrap();
+                        git(&wpath, &["add", "."]);
+                        git(
+                            &wpath,
+                            &[
+                                "-c",
+                                "user.name=T",
+                                "-c",
+                                "user.email=t@t",
+                                "commit",
+                                "-m",
+                                "add greet",
+                            ],
+                        );
+                        Ok(("implemented greet()".to_string(), 1, 1))
+                    }
+                    1 => {
+                        let diff = git(&wpath, &["diff", "master...HEAD", "--", "greet.py"]);
+                        if diff.contains("return \"hello\"") {
+                            Ok((
+                                "REVIEW_ISSUES:\n- greet() ignores `name`, always returns \"hello\""
+                                    .to_string(),
+                                1,
+                                1,
+                            ))
+                        } else {
+                            Ok(("REVIEW_APPROVED".to_string(), 1, 1))
+                        }
+                    }
+                    _ => {
+                        std::fs::write(
+                            wpath.join("greet.py"),
+                            "def greet(name):\n    return f\"hello {name}\"\n",
+                        )
+                        .unwrap();
+                        git(&wpath, &["add", "."]);
+                        git(
+                            &wpath,
+                            &[
+                                "-c",
+                                "user.name=T",
+                                "-c",
+                                "user.email=t@t",
+                                "commit",
+                                "-m",
+                                "fix greet to use name",
+                            ],
+                        );
+                        *commit_log.lock().unwrap() = git(&wpath, &["log", "--oneline"]);
+                        Ok(("fixed — REVIEW_APPROVED".to_string(), 1, 1))
+                    }
+                }
+            })
+        });
+
+        let definition = build_work_item_pipeline_with_sender(
+            agent_registry::Agent::ClaudeCode,
+            "implement greet()".to_string(),
+            "review the diff".to_string(),
+            mcp.clone(),
+            item_id.clone(),
+            None,
+            send,
+        );
+        let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
+        engine.register_workflow(definition).unwrap();
+        let run_id = engine
+            .start_workflow(WorkflowId::new(WORKFLOW_ID), WorkItemData::default(), String::new())
+            .await
+            .unwrap();
+
+        for _ in 0..100 {
+            let state = engine.get_status(run_id).await.unwrap();
+            if state.status == flare_workflow::WorkflowStatus::Completed {
+                assert!(
+                    state.context.data.review_issues.is_none(),
+                    "the fix cycle should have cleared the reviewer's issues"
+                );
+                let log = commit_log.lock().unwrap().clone();
+                assert!(log.contains("add greet"), "missing original commit: {log}");
+                assert!(
+                    log.contains("fix greet to use name"),
+                    "missing fix commit: {log}"
+                );
+
+                let completed_state_id = mcp
+                    .with_backend_db(|conn| {
+                        agentflare_backend::state::list_by_project(conn, &project_id)
+                            .unwrap()
+                            .into_iter()
+                            .find(|st| st.group_name == "completed")
+                            .unwrap()
+                            .id
+                    })
+                    .unwrap();
+                let item = mcp
+                    .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    item.state_id, completed_state_id,
+                    "finalize must move the item to the project's real 'completed' state"
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("pipeline did not complete");
+    }
 }
