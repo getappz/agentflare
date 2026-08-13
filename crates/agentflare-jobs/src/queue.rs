@@ -200,16 +200,25 @@ impl Queue {
         Ok(())
     }
 
-    /// Returns `true` when this failure was terminal (retries exhausted, row
-    /// left `state = 'failed'`), `false` when it went back to `queued` for
-    /// another attempt — callers that need to react to a job's *permanent*
-    /// failure (e.g. `worker::run_in_process`'s terminal-failure hook) use
-    /// this instead of re-deriving it from a follow-up `get`.
+    /// Returns `true` when this failure was terminal (retries exhausted, or
+    /// `fatal` short-circuited them, row left `state = 'failed'`), `false`
+    /// when it went back to `queued` for another attempt — callers that need
+    /// to react to a job's *permanent* failure (e.g.
+    /// `worker::run_in_process`'s terminal-failure hook) use this instead of
+    /// re-deriving it from a follow-up `get`.
+    ///
+    /// `fatal` skips the retry budget entirely and marks the job `failed`
+    /// regardless of how many retries remain — for a failure classified as
+    /// structural (see `JobFailure::fatal`'s doc comment), retrying would
+    /// just fail identically, so there's no point spending the normal
+    /// transient-failure backoff budget before the terminal-failure recovery
+    /// hook gets a chance to run.
     pub fn fail(
         &self,
         id: &str,
         error: &str,
         retry_after_secs: Option<u64>,
+        fatal: bool,
     ) -> Result<bool, Error> {
         let now = db_kit::ids::now();
         let conn = self.conn.lock();
@@ -218,7 +227,7 @@ impl Queue {
             params![id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        let retried = retries < max_retries;
+        let retried = !fatal && retries < max_retries;
         if retried {
             let not_before = retry_after_secs.map(|s| now + s as i64);
             conn.execute(
@@ -471,7 +480,7 @@ mod tests {
         let job = AgentJob::new("true").max_retries(1);
         let info = queue.enqueue(&job).unwrap();
         queue.dequeue().unwrap();
-        queue.fail(&info.id, "boom", None).unwrap();
+        queue.fail(&info.id, "boom", None, false).unwrap();
         let (id, _) = queue
             .dequeue()
             .unwrap()
@@ -485,7 +494,9 @@ mod tests {
         let job = AgentJob::new("true").max_retries(1);
         let info = queue.enqueue(&job).unwrap();
         queue.dequeue().unwrap();
-        queue.fail(&info.id, "rate limited", Some(3600)).unwrap();
+        queue
+            .fail(&info.id, "rate limited", Some(3600), false)
+            .unwrap();
 
         assert!(
             queue.dequeue().unwrap().is_none(),
@@ -535,7 +546,7 @@ mod tests {
         let failed_job = AgentJob::new("true").max_retries(0);
         let failed_info = queue.enqueue(&failed_job).unwrap();
         queue.dequeue().unwrap();
-        queue.fail(&failed_info.id, "boom", None).unwrap();
+        queue.fail(&failed_info.id, "boom", None, false).unwrap();
 
         // Never dequeued -- not orphaned, must stay queued.
         let queued_info = queue.enqueue(&AgentJob::new("true")).unwrap();
@@ -570,9 +581,35 @@ mod tests {
         let job = AgentJob::new("true").max_retries(0);
         let info = queue.enqueue(&job).unwrap();
         queue.dequeue().unwrap();
-        queue.fail(&info.id, "boom", Some(60)).unwrap();
+        queue.fail(&info.id, "boom", Some(60), false).unwrap();
         let jobs = queue.list(Some(JobState::Failed)).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, info.id);
+    }
+
+    #[test]
+    fn fail_fatal_marks_failed_immediately_even_with_retries_remaining() {
+        // Mirrors a structural setup failure (e.g. `agentflare work`'s "no
+        // worktree was created" path, item #467): the underlying cause can't
+        // change between attempts, so it must reach terminal `state =
+        // 'failed'` on the very first failure instead of consuming the
+        // normal transient-failure retry budget.
+        let (queue, _dir) = test_queue();
+        let job = AgentJob::new("true").max_retries(3);
+        let info = queue.enqueue(&job).unwrap();
+        queue.dequeue().unwrap();
+
+        let terminal = queue.fail(&info.id, "boom", None, true).unwrap();
+
+        assert!(
+            terminal,
+            "a fatal failure must be terminal even though retries remain"
+        );
+        let stored = queue.get(&info.id).unwrap();
+        assert_eq!(stored.state, JobState::Failed);
+        assert_eq!(
+            stored.retries, 0,
+            "retries must not be incremented on a fatal failure"
+        );
     }
 }

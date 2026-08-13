@@ -622,11 +622,19 @@ impl WorkArgs {
 
 /// `execute_work`'s result: the process exit code (0 = success), plus — set
 /// only when the failure was classified as rate-limit shaped — a hint for
-/// how long the job queue should wait before retrying this item.
+/// how long the job queue should wait before retrying this item, and
+/// `fatal` for a structural setup failure (see its doc comment below).
 /// `WorkItemExecutor` converts this into `agentflare_jobs::JobFailure`.
 pub(crate) struct WorkOutcome {
     pub exit_code: i32,
     pub retry_after_secs: Option<u64>,
+    /// Set for a failure that happened while establishing the working
+    /// environment (e.g. "claim succeeded but no worktree was created") as
+    /// opposed to a failure during the agent run itself. The underlying
+    /// cause of a structural setup failure doesn't change between attempts
+    /// — see `agentflare_jobs::JobFailure::fatal`, which this maps onto so
+    /// the job queue fails it straight to terminal instead of retrying.
+    pub fatal: bool,
 }
 
 impl From<i32> for WorkOutcome {
@@ -634,7 +642,22 @@ impl From<i32> for WorkOutcome {
         WorkOutcome {
             exit_code,
             retry_after_secs: None,
+            fatal: false,
         }
+    }
+}
+
+/// `WorkItemExecutor::execute`'s `WorkOutcome` → `agentflare_jobs::JobFailure`
+/// mapping, pulled out so it's unit-testable without going through a real
+/// `execute_work` claim/worktree/agent-launch cycle.
+fn job_failure_for(outcome: &WorkOutcome) -> agentflare_jobs::JobFailure {
+    agentflare_jobs::JobFailure {
+        message: format!(
+            "agentflare work exited with code {} — see the job log for details",
+            outcome.exit_code
+        ),
+        retry_after_secs: outcome.retry_after_secs,
+        fatal: outcome.fatal,
     }
 }
 
@@ -793,7 +816,15 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
         let msg = "claim succeeded but no worktree was created (bad git state?)";
         release_and_comment(&mcp, item_id, msg, args.notify.as_deref());
         crate::ui::error(msg);
-        return 1.into();
+        // Structural: whatever broke the git worktree state (e.g. a stale
+        // "prunable" registration, confirmed live for items #465/#466) won't
+        // heal itself between attempts, so fail straight to terminal instead
+        // of retrying against the same unfixable state (item #467).
+        return WorkOutcome {
+            exit_code: 1,
+            retry_after_secs: None,
+            fatal: true,
+        };
     };
     let _ = writeln!(log, "worktree: {}", wpath.display());
 
@@ -877,7 +908,14 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
         let msg = format!("failed to chdir into {}", wpath.display());
         release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
         crate::ui::error(&msg);
-        return 1.into();
+        // Same structural category as the missing-worktree case above: the
+        // claimed worktree path came back from `item::claim` but doesn't
+        // actually exist/isn't enterable, which won't change on retry.
+        return WorkOutcome {
+            exit_code: 1,
+            retry_after_secs: None,
+            fatal: true,
+        };
     }
 
     let outcome = agent_launch::run_headless(
@@ -1003,6 +1041,7 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
             WorkOutcome {
                 exit_code: 1,
                 retry_after_secs,
+                fatal: false,
             }
         }
     }
@@ -1054,13 +1093,7 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
         if outcome.exit_code == 0 {
             Ok(())
         } else {
-            Err(agentflare_jobs::JobFailure {
-                message: format!(
-                    "agentflare work exited with code {} — see the job log for details",
-                    outcome.exit_code
-                ),
-                retry_after_secs: outcome.retry_after_secs,
-            })
+            Err(job_failure_for(&outcome))
         }
     }
 }
@@ -1068,6 +1101,40 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_failure_for_structural_setup_failure_is_fatal() {
+        // Mirrors the "claim succeeded but no worktree was created" and
+        // "failed to chdir into <worktree>" branches in `execute_work`
+        // (item #467): the underlying git-state cause won't change between
+        // attempts, so `WorkItemExecutor` must mark the resulting
+        // `JobFailure` fatal so `Queue::fail` skips the retry budget.
+        let outcome = WorkOutcome {
+            exit_code: 1,
+            retry_after_secs: None,
+            fatal: true,
+        };
+        let failure = job_failure_for(&outcome);
+        assert!(
+            failure.fatal,
+            "a structural setup failure must map onto a fatal JobFailure"
+        );
+    }
+
+    #[test]
+    fn job_failure_for_agent_run_failure_keeps_normal_retry_behavior() {
+        // A failure during the agent run itself (as opposed to environment
+        // setup) may legitimately be transient -- it must keep going through
+        // the normal retry budget, optionally with a rate-limit cooldown.
+        let outcome = WorkOutcome {
+            exit_code: 1,
+            retry_after_secs: Some(1800),
+            fatal: false,
+        };
+        let failure = job_failure_for(&outcome);
+        assert!(!failure.fatal);
+        assert_eq!(failure.retry_after_secs, Some(1800));
+    }
 
     fn test_item() -> agentflare_backend::item::Item {
         agentflare_backend::item::Item {
