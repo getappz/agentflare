@@ -96,6 +96,67 @@ fn restore_ready_for_work(mcp: &crate::mcp_server::AgentflareMcp, item_id: &str)
     });
 }
 
+/// Registered as the daemon's `WorkerPool::with_terminal_failure_hook` (see
+/// `dashboard::server::run`) -- fires when an `in_process` job reaches
+/// terminal `state = 'failed'` after exhausting its retries, the clean-
+/// failure counterpart to `reconcile_orphaned_jobs` above (which only
+/// catches a job whose *process* died mid-flight). `execute_work` already
+/// released the item's claim and posted a failure comment on its own last
+/// attempt (`cli::work::release_and_comment`) -- the one thing still
+/// missing is undoing `dispatch_item`'s `ready-for-work` -> `dispatched`
+/// label swap. Left alone the item stays labeled `dispatched` forever,
+/// invisible to `run_discovery_tick` (item #463).
+///
+/// Swaps to `needs-manual-dispatch` rather than back to `ready-for-work`
+/// when that label exists on the project: a clean retry-exhaustion is more
+/// often an unretryable problem (bad credentials, no billing balance) than
+/// a transient one, and blindly re-queueing would just retry-loop against
+/// the same broken agent. Falls back to `ready-for-work` when
+/// `needs-manual-dispatch` hasn't been created for this project (unlike
+/// that label, `ready-for-work` is guaranteed to exist -- a project can
+/// only ever have reached `dispatch_item` by already having it) so the item
+/// never ends up worse off than before this hook existed: still stuck, just
+/// unlabeled.
+pub(super) fn handle_terminal_job_failure(job: &agentflare_jobs::AgentJob) {
+    if !job.in_process {
+        return;
+    }
+    let (Some(item_id), Some(_agent)) = (job.args.first(), job.args.get(1)) else {
+        return;
+    };
+    let mcp = match job.args.get(2) {
+        Some(folder_path) => {
+            crate::mcp_server::AgentflareMcp::for_project_dir(std::path::PathBuf::from(folder_path))
+        }
+        None => crate::mcp_server::AgentflareMcp::default(),
+    };
+    let _ = mcp.with_backend_db(|conn| -> Option<()> {
+        let item = agentflare_backend::item::get(conn, item_id).ok()?;
+        let state = agentflare_backend::state::get(conn, &item.state_id).ok()?;
+        if matches!(state.group_name.as_str(), "completed" | "cancelled") {
+            return None;
+        }
+        let project = mcp.resolve_project(conn).ok()?;
+        let labels = agentflare_backend::label::list_by_project(conn, &project.id).ok()?;
+        if let Some(dispatched_id) = labels
+            .iter()
+            .find(|l| l.name == crate::supervisor::DISPATCHED_LABEL)
+        {
+            let _ = agentflare_backend::item::remove_label(conn, item_id, &dispatched_id.id);
+        }
+        let target_id = &labels
+            .iter()
+            .find(|l| l.name == crate::supervisor::NEEDS_MANUAL_LABEL)
+            .or_else(|| {
+                labels
+                    .iter()
+                    .find(|l| l.name == crate::supervisor::READY_LABEL)
+            })?
+            .id;
+        agentflare_backend::item::add_label(conn, item_id, target_id).ok()
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +433,198 @@ mod tests {
                 !labels.contains(&dispatched_label_id),
                 "the stale dispatched label must be removed, not left alongside ready-for-work"
             );
+        });
+    }
+
+    fn seed_labels(
+        mcp: &crate::mcp_server::AgentflareMcp,
+        names: &[&str],
+    ) -> std::collections::HashMap<String, String> {
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            for name in names {
+                agentflare_backend::label::create(
+                    conn,
+                    agentflare_backend::label::CreateLabel {
+                        project_id: Some(project.id.clone()),
+                        workspace_id: project.workspace_id.clone(),
+                        name: (*name).into(),
+                        color: None,
+                        parent_id: None,
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                    },
+                )
+                .unwrap();
+            }
+            agentflare_backend::label::list_by_project(conn, &project.id)
+                .unwrap()
+                .into_iter()
+                .map(|l| (l.name, l.id))
+                .collect()
+        })
+        .unwrap()
+    }
+
+    fn create_dispatched_item(
+        mcp: &crate::mcp_server::AgentflareMcp,
+        dispatched_id: &str,
+    ) -> String {
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let state = agentflare_backend::state::list_by_project(conn, &project.id)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.is_default)
+                .unwrap();
+            let item = agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id,
+                    state_id: state.id,
+                    name: "clean-failure sweep test item".into(),
+                    description: Some("do the thing".into()),
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: None,
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                },
+            )
+            .unwrap();
+            // Mirrors `dispatch_item`'s own label swap: `dispatched` on,
+            // `ready-for-work` never added (removed at dispatch time in the
+            // real flow).
+            agentflare_backend::item::add_label(conn, &item.id, dispatched_id).unwrap();
+            item.id
+        })
+        .unwrap()
+    }
+
+    /// Item #463: a job that runs to completion and cleanly fails after
+    /// exhausting `max_retries` is *not* orphaned (the process never died),
+    /// so `reconcile_orphaned_jobs` above never sees it. Without this hook
+    /// the item stays labeled `dispatched` forever -- invisible to
+    /// `run_discovery_tick`, silently undispatchable. Confirms
+    /// `handle_terminal_job_failure` swaps `dispatched` for
+    /// `needs-manual-dispatch` (not straight back to `ready-for-work`) when
+    /// that label exists, so a broken agent doesn't just retry-loop.
+    #[test]
+    fn handle_terminal_job_failure_swaps_dispatched_for_needs_manual_dispatch() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let label_ids = seed_labels(
+                &mcp,
+                &[
+                    crate::supervisor::READY_LABEL,
+                    crate::supervisor::DISPATCHED_LABEL,
+                    crate::supervisor::NEEDS_MANUAL_LABEL,
+                ],
+            );
+            let dispatched_id = &label_ids[crate::supervisor::DISPATCHED_LABEL];
+            let item_id = create_dispatched_item(&mcp, dispatched_id);
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+
+            handle_terminal_job_failure(&job);
+
+            let labels = mcp
+                .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert!(
+                labels.contains(&label_ids[crate::supervisor::NEEDS_MANUAL_LABEL]),
+                "a clean retry-exhaustion must land on needs-manual-dispatch, not silently vanish (item #463)"
+            );
+            assert!(
+                !labels.contains(dispatched_id),
+                "the stale dispatched label must be removed"
+            );
+            assert!(
+                !labels.contains(&label_ids[crate::supervisor::READY_LABEL]),
+                "needs-manual-dispatch exists on this project, so ready-for-work is the wrong \
+                 target -- it would just retry-loop against the same broken agent"
+            );
+        });
+    }
+
+    /// Same clean-failure path as above, but the project never created a
+    /// `needs-manual-dispatch` label (that label is only ever added by hand
+    /// -- unlike `ready-for-work`/`dispatched`, nothing seeds it). Falling
+    /// back to `ready-for-work` keeps the item dispatchable instead of
+    /// leaving it stuck exactly as before this hook existed.
+    #[test]
+    fn handle_terminal_job_failure_falls_back_to_ready_for_work_without_needs_manual_label() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let label_ids = seed_labels(
+                &mcp,
+                &[
+                    crate::supervisor::READY_LABEL,
+                    crate::supervisor::DISPATCHED_LABEL,
+                ],
+            );
+            let dispatched_id = &label_ids[crate::supervisor::DISPATCHED_LABEL];
+            let item_id = create_dispatched_item(&mcp, dispatched_id);
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+
+            handle_terminal_job_failure(&job);
+
+            let labels = mcp
+                .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert!(
+                labels.contains(&label_ids[crate::supervisor::READY_LABEL]),
+                "with no needs-manual-dispatch label on the project, the item must still \
+                 recover to ready-for-work rather than staying stuck on dispatched"
+            );
+            assert!(!labels.contains(dispatched_id));
+        });
+    }
+
+    /// A plain subprocess job (`POST /api/jobs`) has no work item behind it
+    /// at all -- `job.in_process` is the same guard `reconcile_orphaned_jobs`
+    /// uses to skip those. Confirms the hook is a no-op for one rather than
+    /// misinterpreting `args[0]` as an item id.
+    #[test]
+    fn handle_terminal_job_failure_ignores_non_in_process_jobs() {
+        crate::paths::test_support::with_temp_home(|| {
+            let job = agentflare_jobs::AgentJob::new("some-subprocess-cmd")
+                .args(["not-an-item-id".to_string()]);
+            // No project/backend set up at all -- if this tried to resolve
+            // one it would panic or error; reaching the end without doing so
+            // proves it returned early on the `in_process` guard.
+            handle_terminal_job_failure(&job);
         });
     }
 }

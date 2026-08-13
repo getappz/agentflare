@@ -105,6 +105,53 @@ fn in_process_job_failure_is_recorded_with_the_executors_own_message() {
     assert_eq!(final_info.error.as_deref(), Some("deliberate failure"));
 }
 
+// Item #463: a job that fails cleanly (executor returns `Err`, retries
+// exhausted) needs its own notification path so a caller layered on top
+// (agentflare's `dashboard::orphan_reconcile::handle_terminal_job_failure`)
+// can undo whatever it did when the job was first dispatched -- unlike a
+// crashed-process orphan, nothing else ever observes this transition.
+#[test]
+fn terminal_failure_hook_fires_once_retries_are_exhausted_but_not_on_a_retry() {
+    let q = test_queue();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, Vec<String>)>::new()));
+    let seen_clone = seen.clone();
+    let mut pool = WorkerPool::new(q.clone())
+        .with_executor(Arc::new(FailingExecutor))
+        .with_terminal_failure_hook(Arc::new(move |job_id, job| {
+            seen_clone
+                .lock()
+                .unwrap()
+                .push((job_id.to_string(), job.args.clone()));
+        }));
+    pool.start(1);
+
+    let info = q
+        .enqueue(
+            &AgentJob::new("label-only")
+                .args(["item-123".to_string()])
+                .in_process()
+                .max_retries(2),
+        )
+        .unwrap();
+
+    let final_info = wait_for_terminal(&q, &info.id, 400);
+    pool.shutdown();
+
+    assert_eq!(final_info.state, JobState::Failed);
+    assert_eq!(
+        final_info.retries, 2,
+        "should have retried twice before giving up"
+    );
+
+    let calls = seen.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the hook must fire exactly once, on the terminal failure only -- not on either retry: {calls:?}"
+    );
+    assert_eq!(calls[0], (info.id.clone(), vec!["item-123".to_string()]));
+}
+
 #[test]
 fn in_process_job_fails_fast_when_no_executor_is_registered() {
     let q = test_queue();
