@@ -42,6 +42,9 @@ impl flare_workflow::WorkflowData for WorkItemData {
 use flare_workflow::executor::FunctionStep;
 use flare_workflow::{StepDefinition, StepId, StepResult, WorkflowContext, WorkflowError};
 
+use crate::mcp_server::AgentflareMcp;
+use crate::mcp_server::types::{CommentRequest, ItemRequest};
+
 /// Grep a headless reply for `AGENTFLARE_HOLD: <reason>`, same convention
 /// `cli::work::detect_hold_signal` already uses — duplicated rather than
 /// imported because `cli::work`'s version is a private `fn` and this crate
@@ -213,6 +216,119 @@ fn build_review_or_fix_step_with_sender(
             until: REVIEW_APPROVED_MARKER.to_string(),
         },
     )
+}
+
+/// Wraps `execute_work`'s existing hold/`item_done`/comment/notify tail
+/// (`src/cli/work.rs`'s `HeadlessOutcome::Ok` arm) as the pipeline's last
+/// step. Three outcomes, checked in order:
+///
+/// 1. `ctx.data.hold_reason` set (Task 3's `coder` step detected an
+///    `AGENTFLARE_HOLD:` signal) — release the claim and post an "on hold"
+///    comment instead of calling `item_done`, same as `execute_work`'s hold
+///    branch.
+/// 2. `ctx.data.review_issues` still set (Task 4's `review_or_fix` loop hit
+///    `MAX_REVIEW_CYCLES` without ever reaching approval) — gate for a
+///    human with a comment instead of opening a PR on unreviewed code, since
+///    this step has no access to `supervisor`'s label-id lookups for a real
+///    relabel (that stays the supervisor's job on its next discovery tick).
+/// 3. Otherwise — the success path: `item_done`, then the same
+///    `cap_reply_for_comment`/`format_success_comment`/comment/notify
+///    sequence `execute_work` runs today.
+///
+/// Retried up to 3 times with exponential backoff (`RetryPolicy`) — this
+/// step's own MCP calls (`item_done` etc.) can fail transiently the same
+/// way `coder`/`review_or_fix`'s agent dispatch can, and unlike those two,
+/// a failure here has already done the real work and just needs to land the
+/// result.
+pub(crate) fn build_finalize_step(
+    mcp: std::sync::Arc<AgentflareMcp>,
+    item_id: String,
+    notify_recipient: Option<String>,
+) -> StepDefinition<WorkItemData> {
+    let executor = std::sync::Arc::new(FunctionStep::new(
+        move |ctx: &mut WorkflowContext<WorkItemData>| {
+            let mcp = mcp.clone();
+            let item_id = item_id.clone();
+            let notify_recipient = notify_recipient.clone();
+            Box::pin(async move {
+                if let Some(reason) = ctx.data.hold_reason.clone() {
+                    let _ = mcp.item_release(ItemRequest {
+                        action: "release".into(),
+                        id: Some(item_id.clone()),
+                        ..Default::default()
+                    });
+                    let body = format!("## agentflare work — on hold\n\n{reason}");
+                    let _ = mcp.comment_impl(CommentRequest {
+                        action: "create".into(),
+                        item_id: Some(item_id.clone()),
+                        body: Some(body.clone()),
+                        ..Default::default()
+                    });
+                    if let Some(recipient) = notify_recipient.as_deref() {
+                        crate::cli::work::notify(recipient, &body, &item_id);
+                    }
+                    return Ok(StepResult::Success);
+                }
+
+                if ctx.data.review_issues.is_some() {
+                    let issues = ctx.data.review_issues.clone().unwrap_or_default();
+                    let _ = mcp.comment_impl(CommentRequest {
+                        action: "create".into(),
+                        item_id: Some(item_id.clone()),
+                        body: Some(format!(
+                            "## agentflare work — needs human review\n\n\
+                             Automated review/fix did not converge after {MAX_REVIEW_CYCLES} \
+                             cycles. Latest outstanding issues:\n\n{issues}"
+                        )),
+                        ..Default::default()
+                    });
+                    return Ok(StepResult::Success);
+                }
+
+                let done_resp = mcp
+                    .item_done(ItemRequest {
+                        action: "done".into(),
+                        id: Some(item_id.clone()),
+                        summary: Some(ctx.data.reply_text.clone()),
+                        ..Default::default()
+                    })
+                    .map_err(|e| WorkflowError::StepFailed {
+                        step_id: StepId::new("finalize"),
+                        message: e.message.to_string(),
+                    })?;
+                let done_val: serde_json::Value =
+                    serde_json::from_str(&done_resp).unwrap_or(serde_json::Value::Null);
+                ctx.data.pr_url = done_val["pr_url"].as_str().map(str::to_string);
+
+                let comment_reply =
+                    crate::cli::work::cap_reply_for_comment(&mcp, &item_id, &ctx.data.reply_text);
+                let comment_body = crate::cli::work::format_success_comment(
+                    &comment_reply,
+                    ctx.data.session_id.as_deref(),
+                    ctx.data.cost_usd,
+                    ctx.data.pr_url.as_deref(),
+                );
+                let _ = mcp.comment_impl(CommentRequest {
+                    action: "create".into(),
+                    item_id: Some(item_id.clone()),
+                    body: Some(comment_body.clone()),
+                    ..Default::default()
+                });
+                if let Some(recipient) = notify_recipient.as_deref() {
+                    crate::cli::work::notify(recipient, &comment_body, &item_id);
+                }
+                Ok(StepResult::Success)
+            })
+        },
+    ));
+
+    StepDefinition::new("finalize", "finalize", executor).with_retry(flare_workflow::RetryPolicy {
+        max_attempts: 3,
+        backoff: flare_workflow::BackoffStrategy::Exponential {
+            base: std::time::Duration::from_secs(1),
+            max: std::time::Duration::from_secs(30),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -405,5 +521,56 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("review_or_fix step did not complete");
+    }
+
+    #[tokio::test]
+    async fn finalize_step_calls_item_done_on_success() {
+        let (mcp, _backend_tmp, _repo_tmp, item_id, project_id, worktree_path) =
+            crate::mcp_server::tests::mcp_with_claimed_item("Finalize test item");
+        // Something real to commit — otherwise `item_done` sees a
+        // never-diverged branch and treats it as a no-op ("unchanged")
+        // rather than a completion.
+        std::fs::write(worktree_path.join("real_work.txt"), "real work").unwrap();
+        let mcp = Arc::new(mcp);
+
+        let data = WorkItemData {
+            reply_text: "implemented the thing".into(),
+            ..Default::default()
+        };
+        let step = build_finalize_step(mcp.clone(), item_id.clone(), None);
+        let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
+        let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
+        engine.register_workflow(wf).unwrap();
+        let run_id = engine
+            .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+            .await
+            .unwrap();
+
+        for _ in 0..50 {
+            let state = engine.get_status(run_id).await.unwrap();
+            if state.status == flare_workflow::WorkflowStatus::Completed {
+                let completed_state_id = mcp
+                    .with_backend_db(|conn| {
+                        agentflare_backend::state::list_by_project(conn, &project_id)
+                            .unwrap()
+                            .into_iter()
+                            .find(|st| st.group_name == "completed")
+                            .unwrap()
+                            .id
+                    })
+                    .unwrap();
+                let item = mcp
+                    .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    item.state_id, completed_state_id,
+                    "finalize must move the item to the project's real 'completed' state"
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("finalize step did not complete");
     }
 }

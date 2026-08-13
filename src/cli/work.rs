@@ -276,7 +276,7 @@ fn parse_claude_reply(raw: &str) -> (String, Option<String>, Option<f64>) {
     }
 }
 
-fn format_success_comment(
+pub(crate) fn format_success_comment(
     reply: &str,
     session_id: Option<&str>,
     cost_usd: Option<f64>,
@@ -307,7 +307,7 @@ fn format_success_comment(
 /// unchanged; anything larger is staged and attached to `item_id` as a
 /// versioned asset via [`stage_and_attach_asset`], and the comment carries
 /// only a bounded tail preview plus a pointer to the asset.
-fn cap_reply_for_comment(mcp: &AgentflareMcp, item_id: &str, reply: &str) -> String {
+pub(crate) fn cap_reply_for_comment(mcp: &AgentflareMcp, item_id: &str, reply: &str) -> String {
     let total_chars = reply.chars().count();
     if total_chars <= DIAGNOSTIC_TAIL_CHARS {
         return reply.to_string();
@@ -596,7 +596,7 @@ pub(crate) fn release_and_comment(
     }
 }
 
-fn notify(recipient: &str, body: &str, item_id: &str) {
+pub(crate) fn notify(recipient: &str, body: &str, item_id: &str) {
     let outcome = crate::cli::handoff::HandoffArgs {
         recipient: recipient.to_string(),
         file: None,
