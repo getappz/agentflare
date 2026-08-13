@@ -62,18 +62,6 @@ fn detect_hold_signal(reply: &str) -> Option<&str> {
     })
 }
 
-/// Real entry point: dispatch to `crate::workflow::agent_send_hook()`.
-pub(crate) fn build_coder_step(
-    agent: agent_registry::Agent,
-    prompt: String,
-) -> StepDefinition<WorkItemData> {
-    build_coder_step_with_sender(
-        agent.as_str().to_string(),
-        prompt,
-        crate::workflow::agent_send_hook(),
-    )
-}
-
 /// Test seam: same step, an injected `SendMessage` instead of the real
 /// headless agent hook (mirrors `src/workflow.rs`'s own
 /// `run_workflow_json_with_sender` test seam).
@@ -91,15 +79,28 @@ fn build_coder_step_with_sender(
                 let agent_name = agent_name.clone();
                 let prompt = prompt.clone();
                 Box::pin(async move {
-                    let (reply, in_tok, out_tok) =
-                        send(agent_name, prompt)
-                            .await
-                            .map_err(|message| WorkflowError::StepFailed {
-                                step_id: StepId::new("coder"),
-                                message,
-                            })?;
+                    let (raw_reply, in_tok, out_tok) = send(agent_name.clone(), prompt)
+                        .await
+                        .map_err(|message| WorkflowError::StepFailed {
+                            step_id: StepId::new("coder"),
+                            message,
+                        })?;
                     ctx.input_tokens += in_tok;
                     ctx.output_tokens += out_tok;
+                    // `run_headless`'s raw stdout for Claude Code is a
+                    // `stream-json`-shaped blob whose actual reply text
+                    // (plus session_id/cost) lives in its last line's JSON —
+                    // same parsing `cli::work::execute_work` always applied
+                    // before this pipeline existed. Other agents' raw output
+                    // is already plain text.
+                    let (reply, session_id, cost_usd) =
+                        if agent_name == agent_registry::Agent::ClaudeCode.as_str() {
+                            crate::cli::work::parse_claude_reply(&raw_reply)
+                        } else {
+                            (raw_reply, None, None)
+                        };
+                    ctx.data.session_id = session_id;
+                    ctx.data.cost_usd = cost_usd;
                     if let Some(reason) = detect_hold_signal(&reply) {
                         ctx.data.hold_reason = Some(reason.to_string());
                     } else {
@@ -122,22 +123,10 @@ const REVIEW_APPROVED_MARKER: &str = "REVIEW_APPROVED";
 /// closure below tells reviewer-turn from fixer-turn apart.
 const REVIEW_ISSUES_MARKER: &str = "REVIEW_ISSUES:";
 
-/// Real entry point: dispatch to `crate::workflow::agent_send_hook()`.
-///
 /// `diff_prompt_prefix` is caller-supplied (already contains the diff to
 /// review — built by the pipeline-assembly caller); this step only formats
 /// a prompt around it and does not read files or compute diffs itself.
-pub(crate) fn build_review_or_fix_step(
-    agent_name: String,
-    diff_prompt_prefix: String,
-) -> StepDefinition<WorkItemData> {
-    build_review_or_fix_step_with_sender(
-        agent_name,
-        diff_prompt_prefix,
-        crate::workflow::agent_send_hook(),
-    )
-}
-
+///
 /// Test seam: same step, an injected `SendMessage` instead of the real
 /// headless agent hook (mirrors `build_coder_step_with_sender`).
 ///
@@ -338,8 +327,9 @@ pub(crate) fn build_finalize_step(
 
 /// Assembles the full `coder` → `review_or_fix` → `finalize` pipeline as a
 /// registerable `WorkflowDefinition`. Real entry point: dispatches through
-/// `crate::workflow::agent_send_hook()` — see
-/// `build_work_item_pipeline_with_sender` for the test seam.
+/// [`real_agent_send_hook`] — see `build_work_item_pipeline_with_sender` for
+/// the test seam.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_work_item_pipeline(
     agent: agent_registry::Agent,
     coder_prompt: String,
@@ -347,6 +337,9 @@ pub(crate) fn build_work_item_pipeline(
     mcp: std::sync::Arc<AgentflareMcp>,
     item_id: String,
     notify_recipient: Option<String>,
+    timeout: std::time::Duration,
+    idle_timeout: std::time::Duration,
+    extra_args: Vec<String>,
 ) -> flare_workflow::WorkflowDefinition<WorkItemData> {
     build_work_item_pipeline_with_sender(
         agent,
@@ -355,8 +348,47 @@ pub(crate) fn build_work_item_pipeline(
         mcp,
         item_id,
         notify_recipient,
-        crate::workflow::agent_send_hook(),
+        real_agent_send_hook(timeout, idle_timeout, extra_args),
     )
+}
+
+/// Same headless-agent wiring as `crate::workflow::agent_send_hook()`
+/// (`spawn_blocking`-wrapped `agent_launch::run_headless`), but honoring
+/// `execute_work`'s caller-supplied `--timeout`/`--idle-timeout`/
+/// `--max-turns`/`--max-cost-usd`/`--model` flags instead of that hook's
+/// hardcoded 600s/300s/no-extra-args, which are tuned for the JSON pipeline
+/// feature it serves (`src/workflow.rs`), not a work-item dispatch — using
+/// it unmodified here would silently drop those flags on every daemon- and
+/// CLI-dispatched item.
+fn real_agent_send_hook(
+    timeout: std::time::Duration,
+    idle_timeout: std::time::Duration,
+    extra_args: Vec<String>,
+) -> flare_workflow::json::SendMessage {
+    std::sync::Arc::new(move |agent: String, prompt: String| {
+        let extra_args = extra_args.clone();
+        Box::pin(async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::agent_launch::run_headless(
+                    agent_registry::REGISTRY,
+                    &agent,
+                    &prompt,
+                    timeout,
+                    idle_timeout,
+                    &extra_args,
+                )
+            })
+            .await
+            .map_err(|e| format!("agent task panicked: {e}"))?;
+            match outcome {
+                crate::agent_launch::HeadlessOutcome::Ok(reply) => Ok((reply, 0, 0)),
+                crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
+                | crate::agent_launch::HeadlessOutcome::NotHeadless(e)
+                | crate::agent_launch::HeadlessOutcome::NotFound(e)
+                | crate::agent_launch::HeadlessOutcome::Failed(e) => Err(e),
+            }
+        })
+    })
 }
 
 /// Test seam: same pipeline, one injected `SendMessage` shared by both the
@@ -427,6 +459,7 @@ pub(crate) fn engine()
 /// dispatches interleave around a crash, recovery could in principle replay
 /// against the wrong item's prompts — Task 8 owns `recover()` wiring and
 /// should account for this.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_or_resume(
     mcp: std::sync::Arc<AgentflareMcp>,
     item: &agentflare_backend::item::Item,
@@ -434,6 +467,9 @@ pub(crate) fn run_or_resume(
     coder_prompt: String,
     review_prompt_prefix: String,
     notify_recipient: Option<String>,
+    timeout: std::time::Duration,
+    idle_timeout: std::time::Duration,
+    extra_args: Vec<String>,
 ) -> Result<(), String> {
     run_or_resume_with_sender(
         mcp,
@@ -442,13 +478,16 @@ pub(crate) fn run_or_resume(
         coder_prompt,
         review_prompt_prefix,
         notify_recipient,
-        crate::workflow::agent_send_hook(),
+        real_agent_send_hook(timeout, idle_timeout, extra_args),
     )
 }
 
 /// Test seam: same resumable entrypoint, an injected `SendMessage` instead
 /// of the real headless agent hook (mirrors every other step in this file).
-fn run_or_resume_with_sender(
+/// `pub(crate)`: reused by `cli::work`'s own `execute_work` integration
+/// test, a sibling module that needs to inject a mock sender the same way
+/// this file's own tests do.
+pub(crate) fn run_or_resume_with_sender(
     mcp: std::sync::Arc<AgentflareMcp>,
     item: &agentflare_backend::item::Item,
     agent: agent_registry::Agent,
@@ -530,6 +569,20 @@ fn run_or_resume_with_sender(
             }
         }
     })
+}
+
+/// Unified diff of the worktree's branch against `target_branch` — the
+/// "everything this item has changed so far" scope a human PR reviewer
+/// works from. Reuses `flare_git_core::shell::diff`'s existing three-dot
+/// `base...head` convention (the same one `flare_git_core::classify`
+/// already diffs with) rather than inventing a second base-branch-diff
+/// strategy — `target_branch` itself comes from the caller's existing
+/// `crate::worktree::resolve_target_branch` call (same helper `item_done`
+/// already resolves it with). Best-effort: an error collapses to `None`
+/// (the reviewer step still runs, just with less context) rather than
+/// failing the whole pipeline over a git plumbing hiccup.
+pub(crate) fn worktree_diff(worktree_path: &std::path::Path, target_branch: &str) -> Option<String> {
+    flare_git_core::shell::diff(worktree_path, target_branch, "HEAD").ok()
 }
 
 /// Merge `workflow_run_id` into the item's existing metadata JSON and save
@@ -829,6 +882,9 @@ mod tests {
                 "implement it".to_string(),
                 "diff prefix".to_string(),
                 None,
+                std::time::Duration::from_secs(600),
+                std::time::Duration::from_secs(300),
+                Vec::new(),
             )
         });
         assert!(result.is_ok());

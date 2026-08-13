@@ -1,4 +1,4 @@
-use crate::agent_launch::{self, DIAGNOSTIC_TAIL_CHARS, HeadlessOutcome, tail_str};
+use crate::agent_launch::{DIAGNOSTIC_TAIL_CHARS, tail_str};
 use crate::mcp_server::AgentflareMcp;
 use crate::mcp_server::types::{AssetRequest, CommentRequest, ItemRequest};
 use agent_registry::{self, autonomous_args, headless_args};
@@ -231,24 +231,6 @@ fn build_prompt(
     prompt
 }
 
-/// Looks for an `AGENTFLARE_HOLD: <reason>` line in a headless run's final
-/// reply (see the instructions [`build_prompt`] gives the agent) and returns
-/// the reason if found. Distinguishes "the dependency this item needs isn't
-/// ready yet, redispatch me later" from a genuine no-op: both make zero
-/// commits, so `item_done`'s git-diff-based `nothing_was_ever_committed`
-/// check can't tell them apart on its own, and a run that's blocked purely
-/// by branch history it never touched can even land in `item_done`'s real-
-/// completion path (item #91 -- the branch already carried unrelated
-/// commits from an earlier claim, so `branch_diverged` returned true despite
-/// this run changing nothing). Checking the reply for an explicit signal
-/// before ever calling `item_done` sidesteps that entirely.
-fn detect_hold_signal(reply: &str) -> Option<&str> {
-    reply.lines().find_map(|line| {
-        let reason = line.trim().strip_prefix("AGENTFLARE_HOLD:")?.trim();
-        (!reason.is_empty()).then_some(reason)
-    })
-}
-
 /// Claude Code's `--output-format stream-json` reply shape: one JSON object
 /// per line (system init, tool_use/tool_result, assistant messages, ...),
 /// with only the FINAL line carrying `{"result": "...", "session_id": "...",
@@ -256,7 +238,12 @@ fn detect_hold_signal(reply: &str) -> Option<&str> {
 /// uses for its one and only line, so parsing "the last line" handles both.
 /// Falls back to the raw text unparsed for any agent/output whose last line
 /// isn't that exact JSON shape — never errors, never blocks the caller.
-fn parse_claude_reply(raw: &str) -> (String, Option<String>, Option<f64>) {
+/// `pub(crate)`: reused by `work_item_pipeline`'s `coder` step, a sibling
+/// module (not a descendant) of `cli::work` — this JSON-parsing logic is
+/// non-trivial enough that duplicating it (the way `work_item_pipeline`'s
+/// own `detect_hold_signal` duplicates this file's one-line grep version)
+/// risks the two silently drifting apart, so it's shared instead.
+pub(crate) fn parse_claude_reply(raw: &str) -> (String, Option<String>, Option<f64>) {
     let last_line = raw.trim().lines().next_back().unwrap_or("");
     match serde_json::from_str::<serde_json::Value>(last_line) {
         Ok(v) => {
@@ -359,18 +346,6 @@ fn stage_and_attach_asset(
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| "asset attach response missing id".to_string())
-}
-
-fn failure_message(outcome: &HeadlessOutcome) -> String {
-    match outcome {
-        HeadlessOutcome::UnknownAgent(m)
-        | HeadlessOutcome::NotHeadless(m)
-        | HeadlessOutcome::NotFound(m)
-        | HeadlessOutcome::Failed(m) => m.clone(),
-        HeadlessOutcome::Ok(_) => {
-            unreachable!("Ok is handled by the success path, never passed here")
-        }
-    }
 }
 
 /// Per-agent extra argv inserted before the prompt: the confirmed
@@ -688,10 +663,39 @@ fn classify_and_cooldown(agent: &str, failure_message: &str) -> Option<u64> {
 /// `agentflare work` directly leaves it unset and keeps the prior
 /// cwd-resolved behavior.
 pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> WorkOutcome {
-    let mcp = match args.repo_root.clone() {
+    execute_work_impl(args, log, crate::work_item_pipeline::run_or_resume)
+}
+
+/// Test seam: same as [`execute_work`], with the `coder`/`review_or_fix`→
+/// `finalize` pipeline runner injected — mirrors `work_item_pipeline`'s own
+/// `_with_sender` pattern, one level up (this file doesn't touch
+/// `flare_workflow::json::SendMessage` directly, only whatever runs the
+/// whole pipeline for a given item).
+#[allow(clippy::too_many_arguments)]
+fn execute_work_impl(
+    args: WorkArgs,
+    log: &mut dyn std::io::Write,
+    run_pipeline: impl FnOnce(
+        std::sync::Arc<AgentflareMcp>,
+        &agentflare_backend::item::Item,
+        agent_registry::Agent,
+        String,
+        String,
+        Option<String>,
+        Duration,
+        Duration,
+        Vec<String>,
+    ) -> Result<(), String>,
+) -> WorkOutcome {
+    // `Arc`-wrapped from the start (rather than only around the pipeline
+    // call) so `crate::work_item_pipeline::run_or_resume` — which needs an
+    // owned `Arc<AgentflareMcp>` to hand to its `finalize` step — can just
+    // `.clone()` it; every earlier call site here still works unchanged via
+    // `Arc<T>`'s deref coercion to `&T`/autoref to `T`'s methods.
+    let mcp = std::sync::Arc::new(match args.repo_root.clone() {
         Some(root) => AgentflareMcp::for_project_dir(root),
         None => AgentflareMcp::default(),
-    };
+    });
     let timeout = Duration::from_secs(args.timeout);
     let idle_timeout = Duration::from_secs(args.idle_timeout);
 
@@ -870,7 +874,11 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
         args.model.as_deref(),
     );
 
-    // --- Change to worktree dir and run ---
+    // --- Change to worktree dir and run the coder -> review_or_fix ->
+    // finalize pipeline. The chdir must stay in effect for the whole
+    // `run_or_resume` call, not just a single agent turn: the `review_or_fix`
+    // step's diff prompt is built from `wpath` right below, while still
+    // inside it, and a resumed run's later iterations need it too. ---
     let original_dir = std::env::current_dir().ok();
     if std::env::set_current_dir(wpath).is_err() {
         let msg = format!("failed to chdir into {}", wpath.display());
@@ -879,13 +887,29 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
         return 1.into();
     }
 
-    let outcome = agent_launch::run_headless(
-        agent_registry::REGISTRY,
-        agent_enum.as_str(),
-        &prompt,
+    let repo_root = mcp.worktree_repo_root();
+    let target_branch = mcp
+        .with_backend_db(|conn| {
+            crate::worktree::resolve_target_branch(conn, &item_detail, &repo_root)
+        })
+        .unwrap_or_default();
+    let review_prompt_prefix = format!(
+        "Work item #{} — {}\n\nCurrent diff:\n{}",
+        item_detail.sequence_id,
+        item_detail.name,
+        crate::work_item_pipeline::worktree_diff(wpath, &target_branch).unwrap_or_default(),
+    );
+
+    let result = run_pipeline(
+        mcp.clone(),
+        &item_detail,
+        agent_enum,
+        prompt,
+        review_prompt_prefix,
+        args.notify.clone(),
         timeout,
         idle_timeout,
-        &extra_args,
+        extra_args,
     );
 
     // Restore cwd regardless of outcome.
@@ -893,108 +917,23 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
         let _ = std::env::set_current_dir(d);
     }
 
-    // --- Report ---
-    match outcome {
-        HeadlessOutcome::Ok(reply) => {
-            let (reply_text, session_id, cost_usd) =
-                if agent_enum == agent_registry::Agent::ClaudeCode {
-                    parse_claude_reply(&reply)
-                } else {
-                    (reply, None, None)
-                };
-
-            // An explicit hold signal (see `build_prompt`) means the agent
-            // looked, made no changes, and is blocked on something outside
-            // its control -- route through `item_release` instead of
-            // `item_done` so the item stays open for redispatch rather than
-            // going through `item_done`'s git-diff-based completion check,
-            // which can't distinguish "blocked, nothing to do yet" from a
-            // genuinely resolved no-op (item #92).
-            if let Some(reason) = detect_hold_signal(&reply_text) {
-                if mcp
-                    .item_release(ItemRequest {
-                        action: "release".into(),
-                        id: Some(item_id.into()),
-                        ..Default::default()
-                    })
-                    .is_ok()
-                {
-                    claim_guard.disarm();
-                }
-                let comment_body =
-                    format!("## agentflare work — on hold\n\n{reason}\n\n{reply_text}");
-                let _ = mcp.comment_impl(CommentRequest {
-                    action: "create".into(),
-                    item_id: Some(item_id.into()),
-                    body: Some(comment_body.clone()),
-                    ..Default::default()
-                });
-                if let Some(recipient) = args.notify.as_deref() {
-                    notify(recipient, &comment_body, item_id);
-                }
-                let _ = writeln!(log, "hold: {item_id}: {reason}");
-                return 0.into();
-            }
-
-            // The agent may already have called `done` itself with its own
-            // `summary` (in which case this second call is a no-op — the
-            // claim is already released) -- but the common case is a
-            // headless run that just replies with text and lets this
-            // wrapper handle `done`, so pass the parsed reply through as
-            // the PR body rather than leaving it as the generic
-            // placeholder.
-            let done_resp = match mcp.item_done(ItemRequest {
-                action: "done".into(),
-                id: Some(item_id.into()),
-                summary: Some(reply_text.clone()),
-                ..Default::default()
-            }) {
-                Ok(j) => j,
-                Err(e) => {
-                    // `item_done` itself decides the claim's fate internally
-                    // and didn't reach that decision (e.g. a failed
-                    // auto-commit bails out before ever releasing) -- leave
-                    // `claim_guard` armed so its `Drop` releases it instead
-                    // of stranding it `claimed` forever (item #100).
-                    crate::ui::error(&format!("item_done failed: {}", e.message));
-                    return 1.into();
-                }
-            };
-            // `item_done` returning `Ok` means it fully decided the claim's
-            // fate itself -- released (done/no-op), or intentionally left
-            // `claimed` pending PR review (`in_review`) -- so the backstop
-            // must not second-guess that by releasing it out from under a
-            // live review.
+    // `run_or_resume`'s `finalize` step already performed every bit of
+    // report-back the old inline `HeadlessOutcome::Ok` arm did (hold-signal
+    // release+comment, or `item_done`+comment+notify) — see
+    // `work_item_pipeline::build_finalize_step`. This just maps the run's
+    // terminal status onto `execute_work`'s own `WorkOutcome`/log/claim-guard
+    // contract, same as the old match's two arms did.
+    match result {
+        Ok(()) => {
+            // `finalize` decided the claim's fate itself (released on hold,
+            // released/no-op on done, or intentionally left `claimed`
+            // pending PR review) -- same reasoning as the pre-pipeline
+            // `item_done`/`item_release` call sites this replaces.
             claim_guard.disarm();
-            let done_val: serde_json::Value =
-                serde_json::from_str(&done_resp).unwrap_or(serde_json::Value::Null);
-            let pr_url = done_val["pr_url"].as_str().map(str::to_string);
-
-            let comment_reply = cap_reply_for_comment(&mcp, item_id, &reply_text);
-            let comment_body = format_success_comment(
-                &comment_reply,
-                session_id.as_deref(),
-                cost_usd,
-                pr_url.as_deref(),
-            );
-            let _ = mcp.comment_impl(CommentRequest {
-                action: "create".into(),
-                item_id: Some(item_id.into()),
-                body: Some(comment_body.clone()),
-                ..Default::default()
-            });
-            if let Some(recipient) = args.notify.as_deref() {
-                notify(recipient, &comment_body, item_id);
-            }
-
             let _ = writeln!(log, "done: {item_id}");
-            if let Some(url) = &pr_url {
-                let _ = writeln!(log, "pr: {url}");
-            }
             0.into()
         }
-        other => {
-            let msg = failure_message(&other);
+        Err(msg) => {
             release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
             crate::ui::error(&msg);
             let _ = writeln!(log, "failed: {msg}");
@@ -1182,24 +1121,6 @@ mod tests {
         let item = test_item();
         let prompt = build_prompt(&item, &[], None);
         assert!(prompt.contains("AGENTFLARE_HOLD:"));
-    }
-
-    #[test]
-    fn detect_hold_signal_extracts_the_reason() {
-        assert_eq!(
-            detect_hold_signal("looked into it\nAGENTFLARE_HOLD: blocked on PR #451 merging"),
-            Some("blocked on PR #451 merging")
-        );
-    }
-
-    #[test]
-    fn detect_hold_signal_ignores_a_normal_reply() {
-        assert_eq!(detect_hold_signal("fixed the bug, all tests pass"), None);
-    }
-
-    #[test]
-    fn detect_hold_signal_ignores_an_empty_reason() {
-        assert_eq!(detect_hold_signal("AGENTFLARE_HOLD:   "), None);
     }
 
     #[test]
@@ -1539,22 +1460,6 @@ use  = "opencode"
     }
 
     #[test]
-    fn failure_message_extracts_inner_string() {
-        let outcome = HeadlessOutcome::NotFound("claude not found".into());
-        assert_eq!(failure_message(&outcome), "claude not found");
-    }
-
-    #[test]
-    fn failure_message_includes_diagnostic_suffix_for_plain_failures() {
-        let outcome = HeadlessOutcome::Failed(format!(
-            "claude-code exited non-zero — last stderr before kill:\n{}",
-            "HTTP 429 Too Many Requests"
-        ));
-        let msg = failure_message(&outcome);
-        assert!(msg.contains("HTTP 429 Too Many Requests"));
-    }
-
-    #[test]
     fn classify_and_cooldown_ignores_non_rate_limit_failures() {
         crate::paths::test_support::with_temp_home(|| {
             let retry = classify_and_cooldown("claude-code", "something went wrong");
@@ -1722,6 +1627,84 @@ use  = "opencode"
             .unwrap();
         assert_eq!(comments.len(), 1);
         assert!(comments[0].body.contains("claude-code not found on PATH"));
+    }
+
+    #[test]
+    fn execute_work_runs_through_the_pipeline_and_reports_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        init_test_repo(&repo_root);
+
+        // `AgentflareMcp::for_project_dir` (what `execute_work_impl` builds
+        // internally from `args.repo_root`) only overrides the
+        // project-link/worktree axes, not `backend_db` — that resolves via
+        // `crate::paths::home()`. Seeding through an equivalent instance
+        // inside the same `with_temp_home` scope gets both this fixture's
+        // seed writes and `execute_work_impl`'s own internal instance onto
+        // the same isolated backend db, without touching the real
+        // `~/.agentflare`.
+        crate::paths::test_support::with_temp_home(|| {
+            let seed_mcp = AgentflareMcp::for_project_dir(repo_root.clone());
+            let item = seed_mcp
+                .with_backend_db(|conn| seeded_item(&seed_mcp, conn))
+                .unwrap();
+
+            let work_args = WorkArgs {
+                target: item.id.clone(),
+                agent: Some(agent_registry::Agent::ClaudeCode.as_str().to_string()),
+                timeout: DEFAULT_TIMEOUT_SECS,
+                idle_timeout: DEFAULT_IDLE_TIMEOUT_SECS,
+                max_turns: None,
+                max_cost_usd: None,
+                model: None,
+                notify: None,
+                repo_root: Some(repo_root.clone()),
+            };
+
+            let mut log = Vec::new();
+            let outcome = execute_work_impl(work_args, &mut log, |mcp, item, agent, coder_prompt, review_prompt_prefix, notify, timeout, idle_timeout, extra_args| {
+                // Something real to commit, written into the worktree
+                // `execute_work_impl` already chdir'd into by this point --
+                // otherwise `finalize`'s `item_done` sees a never-diverged
+                // branch and treats the run as a no-op instead of a
+                // completion (see `work_item_pipeline`'s own finalize
+                // tests).
+                std::fs::write(
+                    std::env::current_dir().unwrap().join("real_work.txt"),
+                    "real work",
+                )
+                .unwrap();
+                // Same reply satisfies both roles the shared sender is
+                // invoked as: the coder step stores it as a normal (non-hold)
+                // reply, and the review_or_fix step's first call reads it as
+                // an immediate `REVIEW_APPROVED`.
+                let send: flare_workflow::json::SendMessage = std::sync::Arc::new(move |_a, _p| {
+                    Box::pin(async { Ok(("REVIEW_APPROVED".to_string(), 1u64, 0u64)) })
+                });
+                let _ = (timeout, idle_timeout, extra_args);
+                crate::work_item_pipeline::run_or_resume_with_sender(
+                    mcp,
+                    item,
+                    agent,
+                    coder_prompt,
+                    review_prompt_prefix,
+                    notify,
+                    send,
+                )
+            });
+
+            assert_eq!(outcome.exit_code, 0);
+
+            let comments = seed_mcp
+                .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
+                .unwrap()
+                .unwrap();
+            assert!(
+                comments.iter().any(|c| c.body.contains("complete")),
+                "expected a completion comment, got: {comments:?}"
+            );
+        });
     }
 
     /// Sets up a claimed item and returns `(tmp, mcp, item)` with the claim
