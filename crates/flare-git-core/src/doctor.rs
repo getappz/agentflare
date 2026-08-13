@@ -432,7 +432,7 @@ fn parse_worktree_list(output: &str) -> Vec<WorktreeEntry> {
 /// `run_in_ok` only reflects exit status, and `git status --porcelain`
 /// exits 0 whether the tree is dirty or clean — so dirtiness has to come
 /// from the (trimmed) stdout being non-empty instead.
-fn is_dirty(path: &Path) -> bool {
+pub(crate) fn is_dirty(path: &Path) -> bool {
     run_git_in(path, &["status", "--porcelain"])
         .map(|out| !out.is_empty())
         .unwrap_or(false)
