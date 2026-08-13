@@ -6,6 +6,7 @@ mod channel;
 mod claim;
 mod coaching;
 mod code;
+mod config;
 mod cost;
 mod daemon;
 mod dev_install;
@@ -59,6 +60,7 @@ pub enum Commands {
     Doctor(doctor::DoctorArgs),
     Coaching(coaching::CoachingArgs),
     Code(code::CodeArgs),
+    Config(config::ConfigArgs),
     Gateway(gateway::GatewayArgs),
     Git(git::GitArgs),
     Mcp(mcp::McpArgs),
@@ -99,6 +101,7 @@ impl Commands {
             Self::Doctor(cmd) => cmd.run(),
             Self::Coaching(cmd) => cmd.run(),
             Self::Code(cmd) => code::run(cmd),
+            Self::Config(cmd) => cmd.run(),
             Self::Gateway(cmd) => cmd.run(),
             Self::Git(cmd) => git::run(cmd),
             Self::Mcp(cmd) => cmd.run(),

@@ -350,9 +350,9 @@ pub fn autonomous_args(agent: Agent) -> Option<&'static [&'static str]> {
         Agent::ClaudeCode => Some(&["--dangerously-skip-permissions"]),
         Agent::Codex => Some(&["--full-auto"]),
         Agent::GeminiCli => Some(&["--yolo"]),
-        // Opencode falls through to the `_` wildcard, same as every other
-        // agent with no known bypass flag — listing it separately was
-        // clippy::match_same_arms.
+        // `opencode run --auto`: "auto-approve permissions that are not
+        // explicitly denied" — confirmed via `opencode run --help`.
+        Agent::Opencode => Some(&["--auto"]),
         _ => None,
     }
 }

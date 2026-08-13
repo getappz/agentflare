@@ -13,29 +13,45 @@ pub fn current_branch(repo_root: &Path) -> Option<String> {
     run_in_opt(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])
 }
 
-/// Best-effort resolution of "the" default branch: prefer the remote's own
+/// The default branch, from an authoritative signal only: the remote's own
 /// record of it (`origin/HEAD`'s symbolic ref, which survives a repo default
-/// named anything other than main/master), then whichever of main/master
-/// actually exists as a local branch, then whatever is actually checked out
-/// here — so a repo naming its default branch e.g. `trunk`/`develop` still
-/// resolves instead of falling through to a hardcoded guess that may not
-/// even exist.
+/// named anything other than main/master), or whichever of main/master
+/// actually exists as a local branch. `None` when neither is available --
+/// deliberately does NOT fall back to "whatever is currently checked out"
+/// the way `resolve_default_branch` below does, so a caller that needs to
+/// tell "genuinely resolved" apart from "inconclusive" (e.g. one comparing
+/// against the *current* branch, where that fallback would trivially make
+/// current == default and hide the very thing it's checking for) can do so.
 #[must_use]
-pub fn resolve_default_branch(repo_root: &Path) -> String {
+pub fn resolve_default_branch_known(repo_root: &Path) -> Option<String> {
     if let Some(origin_head) = run_in_opt(
         repo_root,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
     ) && let Some(stripped) = origin_head.strip_prefix("origin/")
     {
-        return stripped.to_string();
+        return Some(stripped.to_string());
     }
     if run_in_ok(repo_root, &["rev-parse", "--verify", "main"]) {
-        return "main".to_string();
+        return Some("main".to_string());
     }
     if run_in_ok(repo_root, &["rev-parse", "--verify", "master"]) {
-        return "master".to_string();
+        return Some("master".to_string());
     }
-    run_in_opt(repo_root, &["symbolic-ref", "--short", "HEAD"])
+    None
+}
+
+/// Best-effort resolution of "the" default branch: [`resolve_default_branch_known`],
+/// then whatever is actually checked out here, then a hardcoded `master`
+/// guess — so a repo naming its default branch e.g. `trunk`/`develop` still
+/// resolves instead of blocking on an unresolvable guess. This "just use the
+/// current branch" fallback is right for callers like branch-protection
+/// guards (never block on a branch we can't identify as protected); a
+/// caller that instead wants to notice "we couldn't actually tell" should
+/// use `resolve_default_branch_known` directly.
+#[must_use]
+pub fn resolve_default_branch(repo_root: &Path) -> String {
+    resolve_default_branch_known(repo_root)
+        .or_else(|| run_in_opt(repo_root, &["symbolic-ref", "--short", "HEAD"]))
         .unwrap_or_else(|| "master".to_string())
 }
 
@@ -215,6 +231,30 @@ mod tests {
         // the repo's real default branch is named something else entirely.
         let repo = init_repo_with_branch("trunk");
         assert_eq!(resolve_default_branch(&repo.path), "trunk");
+    }
+
+    #[test]
+    fn resolve_default_branch_known_none_without_origin_head_main_or_master() {
+        // Same repo shape as the fallback test above, but the `_known`
+        // variant must report "couldn't tell" rather than silently
+        // returning whatever happens to be checked out -- a caller
+        // comparing against the *current* branch (dev-install's
+        // off-default-branch warning) needs to distinguish "genuinely on
+        // the default branch" from "no default branch was resolvable at
+        // all", which `resolve_default_branch`'s own current-branch
+        // fallback would collapse into the same answer.
+        let repo = init_repo_with_branch("trunk");
+        assert_eq!(resolve_default_branch_known(&repo.path), None);
+    }
+
+    #[test]
+    fn resolve_default_branch_known_resolves_main_when_present_regardless_of_current_branch() {
+        let repo = init_repo_with_branch("main");
+        crate::shell::run_in(&repo.path, &["checkout", "-b", "feature/x"]).unwrap();
+        assert_eq!(
+            resolve_default_branch_known(&repo.path).as_deref(),
+            Some("main")
+        );
     }
 
     #[test]

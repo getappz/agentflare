@@ -969,7 +969,7 @@ impl AgentflareMcp {
     /// register. Best-effort — a registry write failure must not break
     /// project resolution, which every MCP/CLI call in this repo depends on.
     fn register_bridge_repo(&self, conn: &rusqlite::Connection, project_id: &str) {
-        let repo_root = Self::repo_root();
+        let repo_root = self.worktree_repo_root();
         let Some(repo_id) = crate::github::RepoId::resolve_from_remote(&repo_root) else {
             return;
         };
@@ -995,7 +995,7 @@ impl AgentflareMcp {
     /// project gets a row here. Best-effort — a registry write failure must
     /// not break project resolution, which every MCP/CLI call depends on.
     fn register_project_dir(&self, conn: &rusqlite::Connection, project_id: &str) {
-        let repo_root = Self::repo_root();
+        let repo_root = self.worktree_repo_root();
         let folder_path = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
         let _ = agentflare_backend::project_dir::upsert(
             conn,
