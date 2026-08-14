@@ -754,6 +754,81 @@ fn parse_task_headings(doc: &str) -> Vec<SddTask> {
     tasks
 }
 
+/// Builds the prompt for the implementer role: given a task, it must implement
+/// it. If `fix_context` is provided (a prior reviewer's findings), the prompt
+/// instructs them to address those issues.
+pub(crate) fn build_implementer_prompt(task: &SddTask, fix_context: Option<&str>) -> String {
+    let mut prompt = format!(
+        "You are implementing one task from a larger plan.\n\nTask: {}\n\n{}\n",
+        task.title, task.body
+    );
+    if let Some(ctx) = fix_context {
+        prompt.push_str(&format!(
+            "\nA reviewer found issues with your prior attempt:\n{ctx}\n\nAddress them, re-run any tests you touched, and reply with your status.\n"
+        ));
+    }
+    prompt.push_str("\nReply with a short status: what you did, tests run, and any concerns.\n");
+    prompt
+}
+
+/// Builds the prompt for the task reviewer role: given a task and the
+/// implementer's report, review it for spec compliance and code quality.
+pub(crate) fn build_task_reviewer_prompt(task: &SddTask, implementer_report: &str) -> String {
+    format!(
+        "Review this task's implementation for spec compliance and code quality.\n\nTask: {}\n{}\n\nImplementer's report:\n{implementer_report}\n\nReply REVIEW_APPROVED if both spec and quality pass, or REVIEW_ISSUES: followed by a bulleted list of findings.\n",
+        task.title, task.body
+    )
+}
+
+/// Builds the prompt for the re-reviewer role: given a task, the original
+/// findings, and a fix report, re-review only those specific findings.
+pub(crate) fn build_re_reviewer_prompt(task: &SddTask, findings: &str, fix_report: &str) -> String {
+    format!(
+        "Re-review a fix for this task's findings only — do not look for new issues.\n\nTask: {}\n\nOriginal findings:\n{findings}\n\nFix report:\n{fix_report}\n\nReply REVIEW_APPROVED if every finding is addressed, or REVIEW_ISSUES: followed by what remains.\n",
+        task.title
+    )
+}
+
+/// Builds the prompt for the final reviewer role: given all tasks and the
+/// ledger of decisions, review the whole branch's diff against the plan.
+pub(crate) fn build_final_reviewer_prompt(tasks: &[SddTask], ledger: &[String]) -> String {
+    let task_list: String = tasks.iter().map(|t| format!("- {}\n", t.title)).collect();
+    let ledger_text: String = ledger.join("\n");
+    format!(
+        "Review the whole branch's diff against this plan's tasks:\n{task_list}\n\nLedger of decisions made during execution:\n{ledger_text}\n\nReply REVIEW_APPROVED or REVIEW_ISSUES: followed by findings.\n"
+    )
+}
+
+/// Builds the prompt for the judge: given the task list, current task index,
+/// ledger history, and the latest role reply, the judge decides what happens next.
+pub(crate) fn build_judge_prompt(
+    tasks: &[SddTask],
+    current_task_index: usize,
+    ledger: &[String],
+    role_reply: &str,
+) -> String {
+    let task_list: String = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            format!(
+                "{}. {}{}",
+                i,
+                t.title,
+                if i == current_task_index {
+                    " <- current"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect();
+    let ledger_text: String = ledger.join("\n");
+    format!(
+        "You are the judge for an autonomous multi-task execution pipeline.\n\nPlan:\n{task_list}\n\nLedger so far:\n{ledger_text}\n\nLatest role reply:\n{role_reply}\n\nDecide what happens next. Reply with ONE JSON object and nothing else, matching exactly:\n{{\"action\": \"continue_task|fix_round|escalate|park_finding|rule_and_continue|insert_task|skip_task|advance_task|complete_pipeline\", \"rationale\": \"...\", \"ledger_line\": \"...\", \"task_model_tier\": \"mechanical|integration|architecture|null\"}}\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1354,6 +1429,46 @@ Add unit tests for the validation.
         let tasks = load_or_synthesize_tasks("Bump dependency version", Some(""));
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].body, "Bump dependency version");
+    }
+}
+
+#[cfg(test)]
+mod prompt_builder_tests {
+    use super::*;
+
+    fn sample_task() -> SddTask {
+        SddTask {
+            id: 0,
+            title: "Add flag".to_string(),
+            body: "Add --verbose".to_string(),
+            model_tier: None,
+        }
+    }
+
+    #[test]
+    fn implementer_prompt_includes_task_body() {
+        let prompt = build_implementer_prompt(&sample_task(), None);
+        assert!(prompt.contains("Add --verbose"));
+    }
+
+    #[test]
+    fn implementer_prompt_includes_fix_context_when_present() {
+        let prompt = build_implementer_prompt(&sample_task(), Some("Reviewer found: missing test"));
+        assert!(prompt.contains("Reviewer found: missing test"));
+    }
+
+    #[test]
+    fn judge_prompt_instructs_json_only_output() {
+        let prompt = build_judge_prompt(&[sample_task()], 0, &[], "DONE: implemented flag");
+        assert!(prompt.contains("JSON"));
+        assert!(prompt.contains("DONE: implemented flag"));
+    }
+
+    #[test]
+    fn judge_prompt_includes_ledger_history() {
+        let ledger = vec!["Task 0: fix round 1/5 (1 addressed)".to_string()];
+        let prompt = build_judge_prompt(&[sample_task()], 0, &ledger, "REVIEW_APPROVED");
+        assert!(prompt.contains("fix round 1/5"));
     }
 }
 
