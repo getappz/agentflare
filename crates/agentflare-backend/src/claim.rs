@@ -50,6 +50,28 @@ pub fn default_ttl_secs() -> i64 {
         .unwrap_or(1800) as i64
 }
 
+/// TTL actually applied to an acquire/steal attempt on `item_id`: normally
+/// `requested_ttl_secs` (the caller's active-work TTL, e.g. the item
+/// binary's 4h default), but capped to `default_ttl_secs()` (30 min) while
+/// the item currently sits in "in_review". Reaching "in_review" means the
+/// claim's owner already pushed and its job exited — `mark_in_review`'s
+/// lease-stays-held contract only needs to block a second concurrent PR
+/// against the same item, not force a legitimate reclaim (a human,
+/// `agentflare work`, or the review-sweep's self-repair dispatch) to wait
+/// out the full active-work TTL just because nobody's heartbeat has
+/// refreshed the lease since the PR went up (item #108).
+pub fn effective_ttl_secs(conn: &Connection, item_id: &str, requested_ttl_secs: i64) -> i64 {
+    let in_review = crate::item::get(conn, item_id)
+        .ok()
+        .and_then(|item| crate::state::get(conn, &item.state_id).ok())
+        .is_some_and(|s| s.group_name == "in_review");
+    if in_review {
+        requested_ttl_secs.min(default_ttl_secs())
+    } else {
+        requested_ttl_secs
+    }
+}
+
 /// Returns the current owner of an active claim on this item, if any.
 /// Includes stale-but-not-done claims so stale locks can be cleaned up.
 pub fn current_owner(conn: &Connection, item_id: &str) -> Option<String> {

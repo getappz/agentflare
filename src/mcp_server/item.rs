@@ -531,22 +531,27 @@ impl AgentflareMcp {
         // backend lock; `git worktree add` below is a blocking
         // filesystem+subprocess operation that has no business
         // running while the shared DB mutex is held.
-        let (outcome, item_id, item, target_branch) = self.with_backend_db(|conn| {
-            let item_id = self.resolve_item_id(conn, &raw)?;
-            let outcome = agentflare_backend::item::claim(conn, &item_id, &owner, now, ttl)
-                .map_err(map_backend_err)?;
-            let (item, target_branch) =
-                if outcome == agentflare_backend::item::ClaimOutcome::Acquired {
-                    let item = agentflare_backend::item::get(conn, &item_id).ok();
-                    let target_branch = item
-                        .as_ref()
-                        .map(|i| crate::worktree::resolve_target_branch(conn, i, &repo_root));
-                    (item, target_branch)
-                } else {
-                    (None, None)
-                };
-            Ok::<_, ErrorData>((outcome, item_id, item, target_branch))
-        })??;
+        let (outcome, item_id, item, target_branch, ttl_used) =
+            self.with_backend_db(|conn| {
+                let item_id = self.resolve_item_id(conn, &raw)?;
+                // Read again (cheap) so a `Held` response can report the TTL it
+                // was actually gated by -- `item::claim` computes this internally
+                // for in-review items but doesn't hand it back (item #108).
+                let ttl_used = agentflare_backend::claim::effective_ttl_secs(conn, &item_id, ttl);
+                let outcome = agentflare_backend::item::claim(conn, &item_id, &owner, now, ttl)
+                    .map_err(map_backend_err)?;
+                let (item, target_branch) =
+                    if outcome == agentflare_backend::item::ClaimOutcome::Acquired {
+                        let item = agentflare_backend::item::get(conn, &item_id).ok();
+                        let target_branch = item
+                            .as_ref()
+                            .map(|i| crate::worktree::resolve_target_branch(conn, i, &repo_root));
+                        (item, target_branch)
+                    } else {
+                        (None, None)
+                    };
+                Ok::<_, ErrorData>((outcome, item_id, item, target_branch, ttl_used))
+            })??;
         let worktree_result = match (&item, &target_branch) {
             (Some(item), Some(target)) => Some(
                 PROGRESS_SENDER
@@ -586,7 +591,7 @@ impl AgentflareMcp {
             agentflare_backend::item::ClaimOutcome::Held {
                 owner: holder,
                 age_secs,
-            } => serde_json::json!({"status": "held", "item_id": item_id, "owner": holder, "age_secs": age_secs}).to_string(),
+            } => serde_json::json!({"status": "held", "item_id": item_id, "owner": holder, "age_secs": age_secs, "ttl_secs": ttl_used}).to_string(),
             agentflare_backend::item::ClaimOutcome::BlockedByAssignee { assignee } => {
                 serde_json::json!({
                     "status": "blocked",
@@ -648,6 +653,7 @@ impl AgentflareMcp {
                 // "someone else is actively using this" and leaving
                 // abandoned claims permanently un-releasable by anyone but
                 // a process that no longer exists.
+                let ttl = agentflare_backend::claim::effective_ttl_secs(conn, &item_id, ttl);
                 if let agentflare_backend::claim::Acquire::Held {
                     owner: holder,
                     age_secs,
@@ -656,7 +662,7 @@ impl AgentflareMcp {
                 {
                     return Err(ErrorData::invalid_params(
                         format!(
-                            "item {item_id} is claimed by '{holder}' (active {age_secs}s ago) -- refusing to release someone else's live claim"
+                            "item {item_id} is claimed by '{holder}' (active {age_secs}s ago, ttl {ttl}s) -- refusing to release someone else's live claim"
                         ),
                         None,
                     ));
@@ -828,6 +834,10 @@ impl AgentflareMcp {
         // no-ops (logging) rather than trusting push/PR success alone as
         // proof nothing would be lost.
         let in_review = owns_claim && pr_url.is_some();
+        let diverged = item
+            .as_ref()
+            .zip(target_branch.as_ref())
+            .is_some_and(|(i, t)| crate::worktree::branch_diverged(i, &repo_root, t));
         // No PR resulted — either nothing was ever committed on the claimed
         // branch, or a real commit's push/PR failed for some other reason.
         // Only the former should block completion: marking an item
@@ -836,14 +846,24 @@ impl AgentflareMcp {
         // merely replies with text, with no tool use, previously exited 0
         // and sailed straight through to `mark_completed` below with zero
         // code changed.
-        let nothing_was_ever_committed = !in_review
-            && owns_claim
-            && item
-                .as_ref()
-                .zip(target_branch.as_ref())
-                .is_none_or(|(item, target)| {
-                    !crate::worktree::branch_diverged(item, &repo_root, target)
-                });
+        let nothing_was_ever_committed = !in_review && owns_claim && !diverged;
+        // A real commit exists but push/PR creation soft-failed and never
+        // produced a PR (item #109) -- hard-error instead of completing.
+        let push_or_pr_failed = !in_review && owns_claim && should_push && diverged;
+        if push_or_pr_failed {
+            let _ = self.comment_impl(CommentRequest {
+                action: "create".into(),
+                item_id: Some(item_id.clone()),
+                body: Some(format!(
+                    "## agentflare work — PR creation failed\n\nThe branch has real commits but no pull request resulted; check server logs for item {item_id}. Left in place rather than completed."
+                )),
+                ..Default::default()
+            });
+            return Err(ErrorData::internal_error(
+                format!("item {item_id}: real commits but no PR resulted -- not marking completed"),
+                None,
+            ));
+        }
         // Shared by both "nothing was ever committed" (worktree is clean by
         // definition, safe to remove) and a real completion: release the
         // lease so the item is genuinely available again — either for a
