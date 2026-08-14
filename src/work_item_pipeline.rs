@@ -634,6 +634,49 @@ fn persist_run_id(
     .map_err(|e| e.message.to_string())
 }
 
+/// Parses `### Task N: <title>` headings (the convention this codebase's
+/// own plans already use — see docs on item #110) into a task list; falls
+/// back to a single synthesized task from the item's own description when
+/// no plan doc is attached or it contains no recognizable task headings.
+pub(crate) fn load_or_synthesize_tasks(item_description: &str, plan_doc: Option<&str>) -> Vec<SddTask> {
+    if let Some(doc) = plan_doc.filter(|d| !d.trim().is_empty()) {
+        let tasks = parse_task_headings(doc);
+        if !tasks.is_empty() {
+            return tasks;
+        }
+    }
+    vec![SddTask {
+        id: 0,
+        title: "Item work".to_string(),
+        body: item_description.to_string(),
+        model_tier: None,
+    }]
+}
+
+fn parse_task_headings(doc: &str) -> Vec<SddTask> {
+    let mut tasks = Vec::new();
+    let mut current: Option<(String, String)> = None;
+
+    for line in doc.lines() {
+        if let Some(title) = line.strip_prefix("### Task ").and_then(|rest| {
+            let (_num, title) = rest.split_once(':')?;
+            Some(title.trim().to_string())
+        }) {
+            if let Some((title, body)) = current.take() {
+                tasks.push(SddTask { id: tasks.len(), title, body: body.trim().to_string(), model_tier: None });
+            }
+            current = Some((title, String::new()));
+        } else if let Some((_, body)) = current.as_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if let Some((title, body)) = current {
+        tasks.push(SddTask { id: tasks.len(), title, body: body.trim().to_string(), model_tier: None });
+    }
+    tasks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1165,5 +1208,45 @@ mod sdd_data_tests {
         assert_eq!(back.tasks[0].title, "Add config flag");
         assert_eq!(back.current_task_index, 0);
         assert_eq!(back.ledger, vec!["Task 0: dispatched".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod task_sourcing_tests {
+    use super::load_or_synthesize_tasks;
+
+    #[test]
+    fn synthesizes_single_task_when_no_plan_doc() {
+        let tasks = load_or_synthesize_tasks("Fix the null pointer in parser.rs", None);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, 0);
+        assert_eq!(tasks[0].body, "Fix the null pointer in parser.rs");
+    }
+
+    #[test]
+    fn parses_task_list_from_plan_doc_headings() {
+        let plan_doc = "\
+# Some Plan
+
+### Task 1: Add validation
+
+Add input validation to the handler.
+
+### Task 2: Add tests
+
+Add unit tests for the validation.
+";
+        let tasks = load_or_synthesize_tasks("ignored when plan_doc present", Some(plan_doc));
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].title, "Add validation");
+        assert_eq!(tasks[1].title, "Add tests");
+        assert!(tasks[1].body.contains("unit tests"));
+    }
+
+    #[test]
+    fn empty_plan_doc_falls_back_to_synthesized_task() {
+        let tasks = load_or_synthesize_tasks("Bump dependency version", Some(""));
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].body, "Bump dependency version");
     }
 }
