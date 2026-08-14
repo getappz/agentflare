@@ -145,6 +145,44 @@ fn latest_handoff_content(mcp: &AgentflareMcp, item_id: &str) -> Option<String> 
     }
 }
 
+/// Most recently attached asset's content as the item's plan doc, if any —
+/// `latest_handoff_content`'s list/get pattern minus its handoff-specific
+/// metadata filter. `None` degenerates `load_or_synthesize_tasks` to a
+/// single synthesized task.
+fn latest_plan_doc_content(mcp: &AgentflareMcp, item_id: &str) -> Option<String> {
+    let list_resp = mcp
+        .asset_impl(AssetRequest {
+            action: "list".into(),
+            id: None,
+            item_id: Some(item_id.to_string()),
+            project_id: None,
+            filename: None,
+            metadata: None,
+        })
+        .ok()?;
+    let assets: Vec<serde_json::Value> = serde_json::from_str(&list_resp).ok()?;
+    let latest = assets
+        .into_iter()
+        .max_by_key(|a| a["created_at"].as_i64().unwrap_or(0))?;
+    let asset_id = latest["id"].as_str()?.to_string();
+
+    let get_resp = mcp
+        .asset_impl(AssetRequest {
+            action: "get".into(),
+            id: Some(asset_id),
+            item_id: None,
+            project_id: None,
+            filename: None,
+            metadata: None,
+        })
+        .ok()?;
+    let fetched: serde_json::Value = serde_json::from_str(&get_resp).ok()?;
+    if fetched["encoding"].as_str() != Some("utf8") {
+        return None;
+    }
+    fetched["content"].as_str().map(str::to_string)
+}
+
 /// Builds the agent prompt from the item's name/description plus any prior
 /// discussion, so a resumed/re-run worker sees what's already been tried.
 ///
@@ -666,8 +704,8 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
     execute_work_impl(args, log, crate::work_item_pipeline::run_or_resume)
 }
 
-/// Test seam: same as [`execute_work`], with the `coder`/`review_or_fix`→
-/// `finalize` pipeline runner injected — mirrors `work_item_pipeline`'s own
+/// Test seam: same as [`execute_work`], with the `sdd_loop`→`finalize`
+/// pipeline runner injected — mirrors `work_item_pipeline`'s own
 /// `_with_sender` pattern, one level up (this file doesn't touch
 /// `flare_workflow::json::SendMessage` directly, only whatever runs the
 /// whole pipeline for a given item).
@@ -680,7 +718,7 @@ fn execute_work_impl(
         &agentflare_backend::item::Item,
         agent_registry::Agent,
         String,
-        String,
+        Option<String>,
         Option<String>,
         Duration,
         Duration,
@@ -800,21 +838,21 @@ fn execute_work_impl(
     };
     let _ = writeln!(log, "worktree: {}", wpath.display());
 
-    // --- Fetch item + prior discussion + labels ---
+    // --- Fetch item + labels (no longer comments -- `sdd_loop` builds its
+    // own per-task prompts from `item_detail.description`/a plan doc) ---
     let fetched = mcp.with_backend_db(|conn| {
         let resolved = mcp.resolve_item_id(conn, item_id).ok()?;
         let item = agentflare_backend::item::get(conn, &resolved).ok()?;
-        let comments = agentflare_backend::comment::list_by_item(conn, &resolved).ok()?;
         let label_ids = agentflare_backend::item::list_labels(conn, &resolved).unwrap_or_default();
         let labels = label_ids
             .iter()
             .filter_map(|id| agentflare_backend::label::get(conn, id).ok())
             .map(|l| l.name)
             .collect::<Vec<_>>();
-        Some((item, comments, labels))
+        Some((item, labels))
     });
-    let (item_detail, comments, labels) = match fetched {
-        Ok(Some(triple)) => triple,
+    let (item_detail, labels) = match fetched {
+        Ok(Some(pair)) => pair,
         _ => {
             let msg = "failed to read item details after claim";
             release_and_comment(&mcp, item_id, msg, args.notify.as_deref());
@@ -863,8 +901,8 @@ fn execute_work_impl(
     }
     let _ = writeln!(log, "agent: {} ({route_reason})", agent_enum.as_str());
 
-    let latest_handoff = latest_handoff_content(&mcp, item_id);
-    let prompt = build_prompt(&item_detail, &comments, latest_handoff.as_deref());
+    let item_description = item_detail.description.clone();
+    let plan_doc = latest_plan_doc_content(&mcp, item_id);
 
     // --- Extra args ---
     let extra_args = build_extra_args(
@@ -874,11 +912,10 @@ fn execute_work_impl(
         args.model.as_deref(),
     );
 
-    // --- Change to worktree dir and run the coder -> review_or_fix ->
-    // finalize pipeline. The chdir must stay in effect for the whole
-    // `run_or_resume` call, not just a single agent turn: the `review_or_fix`
-    // step's diff prompt is built from `wpath` right below, while still
-    // inside it, and a resumed run's later iterations need it too. ---
+    // --- Change to worktree dir and run the sdd_loop -> finalize pipeline;
+    // the chdir must stay in effect for the whole `run_or_resume` call, not
+    // just one turn -- `sdd_loop` reads/commits real files across every
+    // iteration of a resumed run. ---
     let original_dir = std::env::current_dir().ok();
     if std::env::set_current_dir(wpath).is_err() {
         let msg = format!("failed to chdir into {}", wpath.display());
@@ -887,25 +924,12 @@ fn execute_work_impl(
         return 1.into();
     }
 
-    let repo_root = mcp.worktree_repo_root();
-    let target_branch = mcp
-        .with_backend_db(|conn| {
-            crate::worktree::resolve_target_branch(conn, &item_detail, &repo_root)
-        })
-        .unwrap_or_default();
-    let review_prompt_prefix = format!(
-        "Work item #{} — {}\n\nCurrent diff:\n{}",
-        item_detail.sequence_id,
-        item_detail.name,
-        crate::work_item_pipeline::worktree_diff(wpath, &target_branch).unwrap_or_default(),
-    );
-
     let result = run_pipeline(
         mcp.clone(),
         &item_detail,
         agent_enum,
-        prompt,
-        review_prompt_prefix,
+        item_description,
+        plan_doc,
         args.notify.clone(),
         timeout,
         idle_timeout,
@@ -1629,6 +1653,85 @@ use  = "opencode"
         assert!(comments[0].body.contains("claude-code not found on PATH"));
     }
 
+    /// Mock `SendMessage` for `sdd_loop`-driven tests below: answers the
+    /// judge's prompt ("You are the judge") with a `complete_pipeline`
+    /// decision, everything else with a plain role reply.
+    const JUDGE_COMPLETE_DECISION: &str = r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#;
+    fn mock_sdd_send() -> flare_workflow::json::SendMessage {
+        std::sync::Arc::new(move |_a, p: String| {
+            Box::pin(async move {
+                if p.contains("You are the judge") {
+                    Ok((JUDGE_COMPLETE_DECISION.to_string(), 1u64, 0u64))
+                } else {
+                    Ok(("DONE: did the work".to_string(), 1u64, 0u64))
+                }
+            })
+        })
+    }
+
+    /// Shared setup for the two `execute_work_impl` dispatch tests below,
+    /// which differ only in what they assert afterward: seeds a project +
+    /// item under `repo_root`, dispatches it through `execute_work_impl`
+    /// with a mocked `sdd_loop` pipeline (`mock_sdd_send`), and returns the
+    /// seeding `AgentflareMcp` + item + outcome for the caller to inspect.
+    /// Must run inside `crate::paths::test_support::with_temp_home` (see
+    /// callers) -- `AgentflareMcp::for_project_dir` only overrides the
+    /// project-link/worktree axes, not `backend_db`, which resolves via
+    /// `crate::paths::home()`.
+    fn run_dispatch_fixture(
+        repo_root: &std::path::Path,
+    ) -> (AgentflareMcp, agentflare_backend::item::Item, WorkOutcome) {
+        let seed_mcp = AgentflareMcp::for_project_dir(repo_root.to_path_buf());
+        let item = seed_mcp
+            .with_backend_db(|conn| seeded_item(&seed_mcp, conn))
+            .unwrap();
+        let work_args = WorkArgs {
+            target: item.id.clone(),
+            agent: Some(agent_registry::Agent::ClaudeCode.as_str().to_string()),
+            timeout: DEFAULT_TIMEOUT_SECS,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT_SECS,
+            max_turns: None,
+            max_cost_usd: None,
+            model: None,
+            notify: None,
+            repo_root: Some(repo_root.to_path_buf()),
+        };
+        let mut log = Vec::new();
+        let outcome = execute_work_impl(
+            work_args,
+            &mut log,
+            |mcp,
+             item,
+             agent,
+             item_description,
+             plan_doc,
+             notify,
+             timeout,
+             idle_timeout,
+             extra_args| {
+                // Something real to commit -- otherwise `finalize`'s
+                // `item_done` sees a never-diverged branch and treats the
+                // run as a no-op instead of a completion.
+                std::fs::write(
+                    std::env::current_dir().unwrap().join("real_work.txt"),
+                    "real work",
+                )
+                .unwrap();
+                let _ = (timeout, idle_timeout, extra_args);
+                crate::work_item_pipeline::run_or_resume_with_sender(
+                    mcp,
+                    item,
+                    agent,
+                    item_description,
+                    plan_doc,
+                    notify,
+                    mock_sdd_send(),
+                )
+            },
+        );
+        (seed_mcp, item, outcome)
+    }
+
     #[test]
     fn execute_work_runs_through_the_pipeline_and_reports_success() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1636,77 +1739,8 @@ use  = "opencode"
         std::fs::create_dir_all(&repo_root).unwrap();
         init_test_repo(&repo_root);
 
-        // `AgentflareMcp::for_project_dir` (what `execute_work_impl` builds
-        // internally from `args.repo_root`) only overrides the
-        // project-link/worktree axes, not `backend_db` — that resolves via
-        // `crate::paths::home()`. Seeding through an equivalent instance
-        // inside the same `with_temp_home` scope gets both this fixture's
-        // seed writes and `execute_work_impl`'s own internal instance onto
-        // the same isolated backend db, without touching the real
-        // `~/.agentflare`.
         crate::paths::test_support::with_temp_home(|| {
-            let seed_mcp = AgentflareMcp::for_project_dir(repo_root.clone());
-            let item = seed_mcp
-                .with_backend_db(|conn| seeded_item(&seed_mcp, conn))
-                .unwrap();
-
-            let work_args = WorkArgs {
-                target: item.id.clone(),
-                agent: Some(agent_registry::Agent::ClaudeCode.as_str().to_string()),
-                timeout: DEFAULT_TIMEOUT_SECS,
-                idle_timeout: DEFAULT_IDLE_TIMEOUT_SECS,
-                max_turns: None,
-                max_cost_usd: None,
-                model: None,
-                notify: None,
-                repo_root: Some(repo_root.clone()),
-            };
-
-            let mut log = Vec::new();
-            let outcome = execute_work_impl(
-                work_args,
-                &mut log,
-                |mcp,
-                 item,
-                 agent,
-                 coder_prompt,
-                 review_prompt_prefix,
-                 notify,
-                 timeout,
-                 idle_timeout,
-                 extra_args| {
-                    // Something real to commit, written into the worktree
-                    // `execute_work_impl` already chdir'd into by this point --
-                    // otherwise `finalize`'s `item_done` sees a never-diverged
-                    // branch and treats the run as a no-op instead of a
-                    // completion (see `work_item_pipeline`'s own finalize
-                    // tests).
-                    std::fs::write(
-                        std::env::current_dir().unwrap().join("real_work.txt"),
-                        "real work",
-                    )
-                    .unwrap();
-                    // Same reply satisfies both roles the shared sender is
-                    // invoked as: the coder step stores it as a normal (non-hold)
-                    // reply, and the review_or_fix step's first call reads it as
-                    // an immediate `REVIEW_APPROVED`.
-                    let send: flare_workflow::json::SendMessage =
-                        std::sync::Arc::new(move |_a, _p| {
-                            Box::pin(async { Ok(("REVIEW_APPROVED".to_string(), 1u64, 0u64)) })
-                        });
-                    let _ = (timeout, idle_timeout, extra_args);
-                    crate::work_item_pipeline::run_or_resume_with_sender(
-                        mcp,
-                        item,
-                        agent,
-                        coder_prompt,
-                        review_prompt_prefix,
-                        notify,
-                        send,
-                    )
-                },
-            );
-
+            let (seed_mcp, item, outcome) = run_dispatch_fixture(&repo_root);
             assert_eq!(outcome.exit_code, 0);
 
             let comments = seed_mcp
@@ -1717,6 +1751,31 @@ use  = "opencode"
                 comments.iter().any(|c| c.body.contains("complete")),
                 "expected a completion comment, got: {comments:?}"
             );
+        });
+    }
+
+    /// Task 8: `execute_work_impl` dispatches through `run_or_resume`, which
+    /// persists `workflow_run_id` onto the item's metadata before polling
+    /// for completion (see `work_item_pipeline::persist_run_id`) — exercises
+    /// that persistence through the real `execute_work_impl` call site with
+    /// the new `item_description`/`plan_doc` params.
+    #[test]
+    fn execute_work_persists_workflow_run_id_on_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        init_test_repo(&repo_root);
+
+        crate::paths::test_support::with_temp_home(|| {
+            let (seed_mcp, item, outcome) = run_dispatch_fixture(&repo_root);
+            assert_eq!(outcome.exit_code, 0);
+
+            let updated_item = seed_mcp
+                .with_backend_db(|conn| agentflare_backend::item::get(conn, &item.id).ok())
+                .unwrap()
+                .unwrap();
+            let metadata: serde_json::Value = serde_json::from_str(&updated_item.metadata).unwrap();
+            assert!(metadata.get("workflow_run_id").is_some());
         });
     }
 

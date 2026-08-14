@@ -730,9 +730,9 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
     // runs against, then run it, before `WorkerPool::start` below can
     // dispatch a fresh job for one of those same items.
     //
-    // Known limitation: this boot-time definition's `coder`/`review_or_fix`/
-    // `finalize` steps close over placeholder identity (no real item id,
-    // agent, or prompts — those only exist inside the dead process that
+    // Known limitation: this boot-time definition's `sdd_loop`/`finalize`
+    // steps close over placeholder identity (no real item id, agent, or
+    // prompts — those only exist inside the dead process that
     // crashed, and `flare_workflow`'s step closures aren't reconstructible
     // from persisted state alone). A run actually resumed through it can't
     // reproduce the crashed run's real prompts/target item — it fails
@@ -750,7 +750,7 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
         let dummy_definition = crate::work_item_pipeline::build_work_item_pipeline(
             agent_registry::Agent::ClaudeCode,
             String::new(),
-            String::new(),
+            None,
             dummy_mcp,
             String::new(),
             None,

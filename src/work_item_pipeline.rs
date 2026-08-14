@@ -1,8 +1,10 @@
-//! Builds and runs the per-work-item `flare-workflow` pipeline: `coder` →
-//! a bounded `review_or_fix` loop → `finalize`. See
-//! `docs` item #110 for the design; corrected against the crate's real
-//! Rust builder API (not the JSON/OpenFang schema — `finalize` runs real
-//! Rust logic, not an agent prompt).
+//! Builds and runs the per-work-item `flare-workflow` pipeline: a judge-driven
+//! `sdd_loop` (subagent-driven-development task loop) → `finalize`. See
+//! `docs` item #110 for the original design and the durable-sdd-workflow
+//! plan for the `sdd_loop` step that replaced its earlier `coder`/
+//! `review_or_fix` steps; corrected against the crate's real Rust builder
+//! API (not the JSON/OpenFang schema — `finalize` runs real Rust logic, not
+//! an agent prompt).
 
 /// Cap on review/fix cycles before an item is gated for a human instead of
 /// looping forever on an agent that can't converge. Mirrors
@@ -148,58 +150,6 @@ fn detect_hold_signal(reply: &str) -> Option<&str> {
     })
 }
 
-/// Test seam: same step, an injected `SendMessage` instead of the real
-/// headless agent hook (mirrors `src/workflow.rs`'s own
-/// `run_workflow_json_with_sender` test seam).
-fn build_coder_step_with_sender(
-    agent_name: String,
-    prompt: String,
-    send: flare_workflow::json::SendMessage,
-) -> StepDefinition<WorkItemData> {
-    StepDefinition::new(
-        "coder",
-        "coder",
-        std::sync::Arc::new(FunctionStep::new(
-            move |ctx: &mut WorkflowContext<WorkItemData>| {
-                let send = send.clone();
-                let agent_name = agent_name.clone();
-                let prompt = prompt.clone();
-                Box::pin(async move {
-                    let (raw_reply, in_tok, out_tok) = send(agent_name.clone(), prompt)
-                        .await
-                        .map_err(|message| WorkflowError::StepFailed {
-                            step_id: StepId::new("coder"),
-                            message,
-                        })?;
-                    ctx.input_tokens += in_tok;
-                    ctx.output_tokens += out_tok;
-                    // `run_headless`'s raw stdout for Claude Code is a
-                    // `stream-json`-shaped blob whose actual reply text
-                    // (plus session_id/cost) lives in its last line's JSON —
-                    // same parsing `cli::work::execute_work` always applied
-                    // before this pipeline existed. Other agents' raw output
-                    // is already plain text.
-                    let (reply, session_id, cost_usd) =
-                        if agent_name == agent_registry::Agent::ClaudeCode.as_str() {
-                            crate::cli::work::parse_claude_reply(&raw_reply)
-                        } else {
-                            (raw_reply, None, None)
-                        };
-                    ctx.data.session_id = session_id;
-                    ctx.data.cost_usd = cost_usd;
-                    if let Some(reason) = detect_hold_signal(&reply) {
-                        ctx.data.hold_reason = Some(reason.to_string());
-                    } else {
-                        ctx.data.reply_text = reply;
-                    }
-                    ctx.output = ctx.data.reply_text.clone();
-                    Ok(StepResult::Success)
-                })
-            },
-        )),
-    )
-}
-
 /// Marker the reviewer replies with when the diff is approved — matched
 /// (case-insensitive substring) by the `StepMode::Loop`'s `until` field to
 /// stop the loop.
@@ -208,96 +158,6 @@ const REVIEW_APPROVED_MARKER: &str = "REVIEW_APPROVED";
 /// echoed back as `ctx.input` on the next iteration, which is how the
 /// closure below tells reviewer-turn from fixer-turn apart.
 const REVIEW_ISSUES_MARKER: &str = "REVIEW_ISSUES:";
-
-/// `diff_prompt_prefix` is caller-supplied (already contains the diff to
-/// review — built by the pipeline-assembly caller); this step only formats
-/// a prompt around it and does not read files or compute diffs itself.
-///
-/// Test seam: same step, an injected `SendMessage` instead of the real
-/// headless agent hook (mirrors `build_coder_step_with_sender`).
-///
-/// `StepMode::Loop` re-invokes this SAME executor repeatedly, chaining
-/// `output → input` between iterations (see
-/// `flare_workflow::engine::WorkflowEngine::execute_loop`). The closure
-/// decides its role each call from `ctx.input`: if it starts with
-/// `REVIEW_ISSUES_MARKER` (the previous reviewer turn's output, echoed back
-/// as this turn's input) it acts as the fixer; otherwise (empty input on
-/// the first iteration, or `FIXED: ...` from a prior fixer turn) it acts as
-/// the reviewer.
-fn build_review_or_fix_step_with_sender(
-    agent_name: String,
-    diff_prompt_prefix: String,
-    send: flare_workflow::json::SendMessage,
-) -> StepDefinition<WorkItemData> {
-    let executor = std::sync::Arc::new(FunctionStep::new(
-        move |ctx: &mut WorkflowContext<WorkItemData>| {
-            let send = send.clone();
-            let agent_name = agent_name.clone();
-            let diff_prompt_prefix = diff_prompt_prefix.clone();
-            let is_fix_round = ctx.input.starts_with(REVIEW_ISSUES_MARKER);
-            Box::pin(async move {
-                let prompt = if is_fix_round {
-                    format!(
-                        "{diff_prompt_prefix}\n\nAddress this reviewer feedback, commit the \
-                         fix, then reply with a one-line summary:\n{}",
-                        ctx.input
-                    )
-                } else {
-                    format!(
-                        "{diff_prompt_prefix}\n\nReview the diff above. Reply with exactly \
-                         `{REVIEW_APPROVED_MARKER}` if it's correct and ready, or \
-                         `{REVIEW_ISSUES_MARKER}` followed by a bullet list of concrete \
-                         issues to fix."
-                    )
-                };
-                let (reply, in_tok, out_tok) =
-                    send(agent_name, prompt).await.map_err(|message| {
-                        WorkflowError::StepFailed {
-                            step_id: StepId::new("review_or_fix"),
-                            message,
-                        }
-                    })?;
-                ctx.input_tokens += in_tok;
-                ctx.output_tokens += out_tok;
-
-                ctx.output = if is_fix_round {
-                    format!("FIXED: {reply}")
-                } else if reply.trim_start().starts_with(REVIEW_APPROVED_MARKER) {
-                    REVIEW_APPROVED_MARKER.to_string()
-                } else {
-                    ctx.data.review_issues = Some(reply.clone());
-                    reply
-                };
-
-                // The engine's `until` check (see
-                // `WorkflowEngine::execute_loop`) is a case-insensitive
-                // substring match against whatever this iteration's
-                // `ctx.output` ends up being — including a fix round's
-                // echoed reply, if it happens to contain the approval
-                // marker. Mirror that check here so `review_issues` (read
-                // by `finalize`'s cap-exceeded gate comment) only survives
-                // to the end of the loop when it's ACTUALLY stopping
-                // without approval, rather than clearing it unconditionally
-                // on every fix round regardless of why the loop stopped.
-                if ctx
-                    .output
-                    .to_lowercase()
-                    .contains(&REVIEW_APPROVED_MARKER.to_lowercase())
-                {
-                    ctx.data.review_issues = None;
-                }
-                Ok(StepResult::Success)
-            })
-        },
-    ));
-
-    StepDefinition::new("review_or_fix", "review_or_fix", executor).with_mode(
-        flare_workflow::StepMode::Loop {
-            max_iterations: 2 * MAX_REVIEW_CYCLES,
-            until: REVIEW_APPROVED_MARKER.to_string(),
-        },
-    )
-}
 
 /// Cap on fix rounds for a single SDD task before the loop gives up on it —
 /// mirrors `MAX_REVIEW_CYCLES`'s existing cap-constant pattern for the
@@ -596,15 +456,15 @@ pub(crate) fn build_finalize_step(
     })
 }
 
-/// Assembles the full `coder` → `review_or_fix` → `finalize` pipeline as a
-/// registerable `WorkflowDefinition`. Real entry point: dispatches through
+/// Assembles the full `sdd_loop` → `finalize` pipeline as a registerable
+/// `WorkflowDefinition`. Real entry point: dispatches through
 /// [`real_agent_send_hook`] — see `build_work_item_pipeline_with_sender` for
 /// the test seam.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_work_item_pipeline(
     agent: agent_registry::Agent,
-    coder_prompt: String,
-    review_prompt_prefix: String,
+    item_description: String,
+    plan_doc: Option<String>,
     mcp: std::sync::Arc<AgentflareMcp>,
     item_id: String,
     notify_recipient: Option<String>,
@@ -614,8 +474,8 @@ pub(crate) fn build_work_item_pipeline(
 ) -> flare_workflow::WorkflowDefinition<WorkItemData> {
     build_work_item_pipeline_with_sender(
         agent,
-        coder_prompt,
-        review_prompt_prefix,
+        item_description,
+        plan_doc,
         mcp,
         item_id,
         notify_recipient,
@@ -662,35 +522,30 @@ fn real_agent_send_hook(
     })
 }
 
-/// Test seam: same pipeline, one injected `SendMessage` shared by both the
-/// `coder` and `review_or_fix` steps instead of the real headless agent hook
-/// (mirrors `build_coder_step_with_sender`/`build_review_or_fix_step_with_sender`).
+/// Test seam: same pipeline, one injected `SendMessage` shared by the
+/// `sdd_loop` step's implementer/reviewer/judge roles instead of the real
+/// headless agent hook (mirrors `build_sdd_loop_step`'s own test seam
+/// pattern). `item_description`/`plan_doc` aren't consumed directly here —
+/// they exist so this function's signature stays parallel to
+/// `run_or_resume_with_sender`'s, which is the caller that actually needs
+/// them (to compute `WorkItemData::tasks` via `load_or_synthesize_tasks`
+/// before `start_workflow`; see that function).
 fn build_work_item_pipeline_with_sender(
     agent: agent_registry::Agent,
-    coder_prompt: String,
-    review_prompt_prefix: String,
+    _item_description: String,
+    _plan_doc: Option<String>,
     mcp: std::sync::Arc<AgentflareMcp>,
     item_id: String,
     notify_recipient: Option<String>,
     send: flare_workflow::json::SendMessage,
 ) -> flare_workflow::WorkflowDefinition<WorkItemData> {
-    flare_workflow::WorkflowDefinition::new(WORKFLOW_ID, "work item")
-        .add_step(build_coder_step_with_sender(
-            agent.as_str().to_string(),
-            coder_prompt,
-            send.clone(),
-        ))
-        .add_step(
-            build_review_or_fix_step_with_sender(
-                agent.as_str().to_string(),
-                review_prompt_prefix,
-                send,
-            )
-            .depends_on(&["coder"]),
-        )
-        .add_step(
-            build_finalize_step(mcp, item_id, notify_recipient).depends_on(&["review_or_fix"]),
-        )
+    let agent_name = agent.as_str().to_string();
+    let sdd_loop = build_sdd_loop_step(agent_name.clone(), agent_name, send);
+    let finalize = build_finalize_step(mcp, item_id, notify_recipient).depends_on(&["sdd_loop"]);
+
+    flare_workflow::WorkflowDefinition::new(WORKFLOW_ID, "sdd work item")
+        .add_step(sdd_loop)
+        .add_step(finalize)
 }
 
 /// Process-lifetime shared engine — built once, reused by every dispatch
@@ -734,8 +589,8 @@ pub(crate) fn run_or_resume(
     mcp: std::sync::Arc<AgentflareMcp>,
     item: &agentflare_backend::item::Item,
     agent: agent_registry::Agent,
-    coder_prompt: String,
-    review_prompt_prefix: String,
+    item_description: String,
+    plan_doc: Option<String>,
     notify_recipient: Option<String>,
     timeout: std::time::Duration,
     idle_timeout: std::time::Duration,
@@ -745,8 +600,8 @@ pub(crate) fn run_or_resume(
         mcp,
         item,
         agent,
-        coder_prompt,
-        review_prompt_prefix,
+        item_description,
+        plan_doc,
         notify_recipient,
         real_agent_send_hook(timeout, idle_timeout, extra_args),
     )
@@ -761,8 +616,8 @@ pub(crate) fn run_or_resume_with_sender(
     mcp: std::sync::Arc<AgentflareMcp>,
     item: &agentflare_backend::item::Item,
     agent: agent_registry::Agent,
-    coder_prompt: String,
-    review_prompt_prefix: String,
+    item_description: String,
+    plan_doc: Option<String>,
     notify_recipient: Option<String>,
     send: flare_workflow::json::SendMessage,
 ) -> Result<(), String> {
@@ -772,11 +627,17 @@ pub(crate) fn run_or_resume_with_sender(
         .as_str()
         .and_then(|s| flare_workflow::WorkflowRunId::from_str(s).ok());
 
+    // Computed once, up front, from the same inputs passed to
+    // `build_work_item_pipeline_with_sender` below — seeds `WorkItemData::tasks`
+    // on both `start_workflow` call sites so `sdd_loop` (Task 5) has a task
+    // list to work through instead of completing immediately on an empty one.
+    let tasks = load_or_synthesize_tasks(&item_description, plan_doc.as_deref());
+
     let eng = engine();
     let definition = build_work_item_pipeline_with_sender(
         agent,
-        coder_prompt,
-        review_prompt_prefix,
+        item_description,
+        plan_doc,
         mcp.clone(),
         item.id.clone(),
         notify_recipient,
@@ -799,7 +660,10 @@ pub(crate) fn run_or_resume_with_sender(
                     let new_run_id = eng
                         .start_workflow(
                             WorkflowId::new(WORKFLOW_ID),
-                            WorkItemData::default(),
+                            WorkItemData {
+                                tasks: tasks.clone(),
+                                ..Default::default()
+                            },
                             String::new(),
                         )
                         .await
@@ -819,7 +683,10 @@ pub(crate) fn run_or_resume_with_sender(
                 let new_run_id = eng
                     .start_workflow(
                         WorkflowId::new(WORKFLOW_ID),
-                        WorkItemData::default(),
+                        WorkItemData {
+                            tasks: tasks.clone(),
+                            ..Default::default()
+                        },
                         String::new(),
                     )
                     .await
@@ -1041,194 +908,6 @@ mod tests {
     use flare_workflow::{WorkflowDefinition, WorkflowEngine, WorkflowId};
     use std::sync::Arc;
 
-    fn mock_send_ok(reply: &'static str) -> flare_workflow::json::SendMessage {
-        Arc::new(move |_agent: String, _prompt: String| {
-            Box::pin(async move { Ok((reply.to_string(), 10u64, 0u64)) })
-        })
-    }
-
-    #[tokio::test]
-    async fn coder_step_populates_reply_text_and_no_hold_reason() {
-        let step = build_coder_step_with_sender(
-            "agent".to_string(),
-            "Work item #1 — do the thing\n".to_string(),
-            mock_send_ok("implemented it"),
-        );
-        let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
-
-        let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
-        engine.register_workflow(wf).unwrap();
-        let run_id = engine
-            .start_workflow(
-                WorkflowId::new(WORKFLOW_ID),
-                WorkItemData::default(),
-                String::new(),
-            )
-            .await
-            .unwrap();
-
-        for _ in 0..50 {
-            let state = engine.get_status(run_id).await.unwrap();
-            if state.status == flare_workflow::WorkflowStatus::Completed {
-                assert_eq!(state.context.data.reply_text, "implemented it");
-                assert!(state.context.data.hold_reason.is_none());
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("coder step did not complete");
-    }
-
-    #[tokio::test]
-    async fn coder_step_sets_hold_reason_and_leaves_reply_text_empty() {
-        let step = build_coder_step_with_sender(
-            "agent".to_string(),
-            "prompt".to_string(),
-            mock_send_ok("looked into it\nAGENTFLARE_HOLD: waiting on PR #1"),
-        );
-        let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
-        let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
-        engine.register_workflow(wf).unwrap();
-        let run_id = engine
-            .start_workflow(
-                WorkflowId::new(WORKFLOW_ID),
-                WorkItemData::default(),
-                String::new(),
-            )
-            .await
-            .unwrap();
-
-        for _ in 0..50 {
-            let state = engine.get_status(run_id).await.unwrap();
-            if state.status == flare_workflow::WorkflowStatus::Completed {
-                assert_eq!(
-                    state.context.data.hold_reason.as_deref(),
-                    Some("waiting on PR #1")
-                );
-                assert!(state.context.data.reply_text.is_empty());
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("coder step did not complete");
-    }
-
-    #[tokio::test]
-    async fn review_or_fix_step_stops_immediately_when_approved() {
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let calls2 = calls.clone();
-        let send: flare_workflow::json::SendMessage = Arc::new(move |_a, _p| {
-            calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Box::pin(async { Ok(("REVIEW_APPROVED".to_string(), 1u64, 0u64)) })
-        });
-        let step = build_review_or_fix_step_with_sender(
-            "agent".to_string(),
-            "dummy diff prompt".to_string(),
-            send,
-        );
-        let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
-        let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
-        engine.register_workflow(wf).unwrap();
-        let run_id = engine
-            .start_workflow(
-                WorkflowId::new(WORKFLOW_ID),
-                WorkItemData::default(),
-                String::new(),
-            )
-            .await
-            .unwrap();
-
-        for _ in 0..50 {
-            let state = engine.get_status(run_id).await.unwrap();
-            if state.status == flare_workflow::WorkflowStatus::Completed {
-                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-                assert!(state.context.data.review_issues.is_none());
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("review_or_fix step did not complete");
-    }
-
-    #[tokio::test]
-    async fn review_or_fix_step_fixes_once_then_approves() {
-        let call_n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let call_n2 = call_n.clone();
-        let send: flare_workflow::json::SendMessage = Arc::new(move |_a, _p| {
-            let n = call_n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Box::pin(async move {
-                if n == 0 {
-                    Ok(("REVIEW_ISSUES:\n- fix the typo".to_string(), 1, 0))
-                } else {
-                    Ok(("REVIEW_APPROVED".to_string(), 1, 0))
-                }
-            })
-        });
-        let step =
-            build_review_or_fix_step_with_sender("agent".to_string(), "diff".to_string(), send);
-        let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
-        let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
-        engine.register_workflow(wf).unwrap();
-        let run_id = engine
-            .start_workflow(
-                WorkflowId::new(WORKFLOW_ID),
-                WorkItemData::default(),
-                String::new(),
-            )
-            .await
-            .unwrap();
-
-        for _ in 0..50 {
-            let state = engine.get_status(run_id).await.unwrap();
-            if state.status == flare_workflow::WorkflowStatus::Completed {
-                // Observed against the real engine: only 2 calls, not the
-                // brief's modeled 3. Call 1 is the reviewer round
-                // (REVIEW_ISSUES). Call 2 is the fix round, whose reply
-                // ("REVIEW_APPROVED" per this mock) gets echoed verbatim
-                // into this step's `ctx.output` as "FIXED: REVIEW_APPROVED"
-                // — `execute_loop`'s `until` check is a case-insensitive
-                // substring match against that raw output, so it fires
-                // right there and the loop stops before ever issuing a
-                // third, dedicated re-review call.
-                assert_eq!(call_n.load(std::sync::atomic::Ordering::SeqCst), 2);
-                assert!(state.context.data.review_issues.is_none());
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("review_or_fix step did not complete");
-    }
-
-    #[tokio::test]
-    async fn review_or_fix_step_stops_at_cap_with_issues_still_open() {
-        let send: flare_workflow::json::SendMessage = Arc::new(move |_a, _p| {
-            Box::pin(async { Ok(("REVIEW_ISSUES:\n- still broken".to_string(), 1, 0)) })
-        });
-        let step =
-            build_review_or_fix_step_with_sender("agent".to_string(), "diff".to_string(), send);
-        let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
-        let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
-        engine.register_workflow(wf).unwrap();
-        let run_id = engine
-            .start_workflow(
-                WorkflowId::new(WORKFLOW_ID),
-                WorkItemData::default(),
-                String::new(),
-            )
-            .await
-            .unwrap();
-
-        for _ in 0..50 {
-            let state = engine.get_status(run_id).await.unwrap();
-            if state.status == flare_workflow::WorkflowStatus::Completed {
-                assert!(state.context.data.review_issues.is_some());
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("review_or_fix step did not complete");
-    }
-
     #[tokio::test]
     async fn finalize_step_calls_item_done_on_success() {
         let (mcp, _backend_tmp, _repo_tmp, item_id, project_id, worktree_path) =
@@ -1311,7 +990,7 @@ mod tests {
                 &item,
                 agent_registry::Agent::ClaudeCode,
                 "implement it".to_string(),
-                "diff prefix".to_string(),
+                None,
                 None,
                 std::time::Duration::from_secs(600),
                 std::time::Duration::from_secs(300),
@@ -1329,10 +1008,11 @@ mod tests {
     }
 
     /// Non-ignored counterpart of the real-agent test above: drives
-    /// `run_or_resume_with_sender` with a mock `SendMessage` (approves the
-    /// review immediately, same as `review_or_fix_step_stops_immediately_when_approved`)
-    /// so it runs unconditionally in CI, and asserts the same
-    /// metadata-persistence behavior.
+    /// `run_or_resume_with_sender` with a mock `SendMessage` that answers
+    /// `sdd_loop`'s implementer and judge roles (distinguished by prompt
+    /// content, same as `sdd_test_support::mock_send`'s callers) so it runs
+    /// unconditionally in CI, and asserts the same metadata-persistence
+    /// behavior.
     #[test]
     fn run_or_resume_with_sender_persists_run_id_on_success() {
         let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
@@ -1347,10 +1027,22 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let send: flare_workflow::json::SendMessage =
-            Arc::new(move |_agent: String, _prompt: String| {
-                Box::pin(async move { Ok(("REVIEW_APPROVED".to_string(), 1u64, 0u64)) })
-            });
+        let send: flare_workflow::json::SendMessage = Arc::new(
+            move |_agent: String, prompt: String| {
+                Box::pin(async move {
+                    if prompt.contains("You are the judge") {
+                        Ok((
+                            r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#
+                                .to_string(),
+                            1u64,
+                            0u64,
+                        ))
+                    } else {
+                        Ok(("DONE: did the work".to_string(), 1u64, 0u64))
+                    }
+                })
+            },
+        );
 
         // `engine()` is a process-lifetime singleton keyed by
         // `crate::workflow::default_db_path()` (~/.agentflare/workflows.db)
@@ -1363,7 +1055,7 @@ mod tests {
                 &item,
                 agent_registry::Agent::ClaudeCode,
                 "implement it".to_string(),
-                "diff prefix".to_string(),
+                None,
                 None,
                 send,
             )
@@ -1377,174 +1069,29 @@ mod tests {
         let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
         assert!(metadata["workflow_run_id"].as_str().is_some());
     }
+}
 
-    fn git(repo: &std::path::Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .output()
-            .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
+#[cfg(test)]
+mod pipeline_assembly_tests {
+    use super::*;
 
-    /// Full `coder` → `review_or_fix` → `finalize` pipeline against a real
-    /// git worktree — mirrors `src/workflow.rs`'s own
-    /// `coder_reviewer_pr_pipeline_runs_real_git_flow` test, one level up
-    /// (this pipeline's steps, not the JSON pipeline's). The injected
-    /// sender role-branches on call count (both `coder` and `review_or_fix`
-    /// share one `SendMessage`, same as every other test in this file):
-    /// call 0 is `coder` (writes+commits a real bug), call 1 is
-    /// `review_or_fix`'s first, reviewer-role iteration (reads the REAL
-    /// `git diff` and flags the bug), call 2 is the fixer-role iteration
-    /// (fixes it for real, commits, and — per `review_or_fix_step_fixes_once_then_approves`'s
-    /// already-observed real-engine behavior — includes the approval marker
-    /// in its own reply so the loop's `until` check fires right there,
-    /// without a dedicated third re-review call).
-    #[tokio::test]
-    async fn full_pipeline_runs_real_git_flow_with_one_fix_cycle() {
-        let (mcp, _backend_tmp, _repo_tmp, item_id, project_id, worktree_path) =
-            crate::mcp_server::tests::mcp_with_claimed_item(
-                "Full pipeline real-git-flow test item",
-            );
-        let mcp = Arc::new(mcp);
-
-        let call_n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let call_n2 = call_n.clone();
-        let wpath = worktree_path.clone();
-        // `finalize`'s real `item_done` call may clean up the worktree once
-        // the pipeline completes (same as any other successful dispatch), so
-        // the fixer round captures the commit log itself, real-time, rather
-        // than the test re-reading `worktree_path` after the run finishes.
-        let commit_log = Arc::new(std::sync::Mutex::new(String::new()));
-        let commit_log2 = commit_log.clone();
-        let send: flare_workflow::json::SendMessage = Arc::new(move |_agent, _prompt| {
-            let n = call_n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let wpath = wpath.clone();
-            let commit_log = commit_log2.clone();
-            Box::pin(async move {
-                match n {
-                    0 => {
-                        std::fs::write(
-                            wpath.join("greet.py"),
-                            "def greet(name):\n    return \"hello\"\n",
-                        )
-                        .unwrap();
-                        git(&wpath, &["add", "."]);
-                        git(
-                            &wpath,
-                            &[
-                                "-c",
-                                "user.name=T",
-                                "-c",
-                                "user.email=t@t",
-                                "commit",
-                                "-m",
-                                "add greet",
-                            ],
-                        );
-                        Ok(("implemented greet()".to_string(), 1, 1))
-                    }
-                    1 => {
-                        let diff = git(&wpath, &["diff", "master...HEAD", "--", "greet.py"]);
-                        if diff.contains("return \"hello\"") {
-                            Ok((
-                                "REVIEW_ISSUES:\n- greet() ignores `name`, always returns \"hello\""
-                                    .to_string(),
-                                1,
-                                1,
-                            ))
-                        } else {
-                            Ok(("REVIEW_APPROVED".to_string(), 1, 1))
-                        }
-                    }
-                    _ => {
-                        std::fs::write(
-                            wpath.join("greet.py"),
-                            "def greet(name):\n    return f\"hello {name}\"\n",
-                        )
-                        .unwrap();
-                        git(&wpath, &["add", "."]);
-                        git(
-                            &wpath,
-                            &[
-                                "-c",
-                                "user.name=T",
-                                "-c",
-                                "user.email=t@t",
-                                "commit",
-                                "-m",
-                                "fix greet to use name",
-                            ],
-                        );
-                        *commit_log.lock().unwrap() = git(&wpath, &["log", "--oneline"]);
-                        Ok(("fixed — REVIEW_APPROVED".to_string(), 1, 1))
-                    }
-                }
-            })
-        });
-
-        let definition = build_work_item_pipeline_with_sender(
+    #[test]
+    fn sdd_pipeline_has_two_steps_with_correct_dependency() {
+        let send: flare_workflow::json::SendMessage =
+            std::sync::Arc::new(|_a, _p| Box::pin(async { Ok((String::new(), 0, 0)) }));
+        let pipeline = build_work_item_pipeline_with_sender(
             agent_registry::Agent::ClaudeCode,
-            "implement greet()".to_string(),
-            "review the diff".to_string(),
-            mcp.clone(),
-            item_id.clone(),
+            "Fix the null pointer in parser.rs".to_string(),
+            None,
+            std::sync::Arc::new(AgentflareMcp::default()),
+            "item-1".to_string(),
             None,
             send,
         );
-        let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
-        engine.register_workflow(definition).unwrap();
-        let run_id = engine
-            .start_workflow(
-                WorkflowId::new(WORKFLOW_ID),
-                WorkItemData::default(),
-                String::new(),
-            )
-            .await
-            .unwrap();
-
-        for _ in 0..100 {
-            let state = engine.get_status(run_id).await.unwrap();
-            if state.status == flare_workflow::WorkflowStatus::Completed {
-                assert!(
-                    state.context.data.review_issues.is_none(),
-                    "the fix cycle should have cleared the reviewer's issues"
-                );
-                let log = commit_log.lock().unwrap().clone();
-                assert!(log.contains("add greet"), "missing original commit: {log}");
-                assert!(
-                    log.contains("fix greet to use name"),
-                    "missing fix commit: {log}"
-                );
-
-                let completed_state_id = mcp
-                    .with_backend_db(|conn| {
-                        agentflare_backend::state::list_by_project(conn, &project_id)
-                            .unwrap()
-                            .into_iter()
-                            .find(|st| st.group_name == "completed")
-                            .unwrap()
-                            .id
-                    })
-                    .unwrap();
-                let item = mcp
-                    .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    item.state_id, completed_state_id,
-                    "finalize must move the item to the project's real 'completed' state"
-                );
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("pipeline did not complete");
+        assert_eq!(pipeline.steps.len(), 2);
+        assert_eq!(pipeline.steps[0].id.to_string(), "sdd_loop");
+        assert_eq!(pipeline.steps[1].id.to_string(), "finalize");
+        assert_eq!(pipeline.steps[1].depends_on, vec![StepId::new("sdd_loop")]);
     }
 }
 
