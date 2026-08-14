@@ -39,6 +39,12 @@ jobs:
               - 'Cargo.lock'
               - 'build.rs'
               - 'crates/**'
+              # Doc files (README/CHANGELOG/design docs) don't affect the
+              # build, except .md under a crate's src/ — those are
+              # embedded via include_str! (e.g. flare-code's skill docs)
+              # and change compiled behavior, so keep those as code.
+              - '!crates/**/*.md'
+              - 'crates/**/src/**/*.md'
               - 'agentflare-workspace-hack/**'
               - 'src/**'
               - '.config/**'
