@@ -656,8 +656,14 @@ fn test_mcp_with_repo(repo_root: std::path::PathBuf) -> AgentflareMcp {
 /// (bypassing worktree creation entirely, unlike `seed_ready_item`'s
 /// real-claim-through-the-MCP-method path), since these tests exercise
 /// `run_review_sweep`'s decision logic, not the claim/worktree mechanics
-/// already covered by `mcp_server::tests`.
-fn seed_in_review_item(mcp: &AgentflareMcp, assignee: Option<&str>) -> String {
+/// already covered by `mcp_server::tests`. The claim is backdated by
+/// `claim_age_secs` so tests can seed either a fresh (still-live) claim or
+/// one already past its #108-capped in_review TTL (item #114).
+fn seed_in_review_item_with_claim_age(
+    mcp: &AgentflareMcp,
+    assignee: Option<&str>,
+    claim_age_secs: i64,
+) -> String {
     mcp.with_backend_db(|conn| {
         let project = mcp.resolve_project(conn).unwrap();
         let states = agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
@@ -685,11 +691,12 @@ fn seed_in_review_item(mcp: &AgentflareMcp, assignee: Option<&str>) -> String {
         let owner = assignee
             .map(|a| format!("{a}:prior-job"))
             .unwrap_or_else(|| "cli".into());
+        let claimed_at = crate::claims::now() - claim_age_secs;
         agentflare_backend::item::claim(
             conn,
             &item.id,
             &owner,
-            crate::claims::now(),
+            claimed_at,
             crate::claims::ttl_secs(),
         )
         .unwrap();
@@ -697,6 +704,12 @@ fn seed_in_review_item(mcp: &AgentflareMcp, assignee: Option<&str>) -> String {
         item.id
     })
     .unwrap()
+}
+
+/// Fresh (just-claimed) `in_review` item -- the common case for tests that
+/// short-circuit before item #114's claim-liveness check ever runs.
+fn seed_in_review_item(mcp: &AgentflareMcp, assignee: Option<&str>) -> String {
+    seed_in_review_item_with_claim_age(mcp, assignee, 0)
 }
 
 #[test]
@@ -817,7 +830,10 @@ fn run_review_sweep_skips_an_item_whose_pr_status_cannot_be_determined() {
 fn self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment() {
     let mcp = test_mcp();
     let queue = test_queue();
-    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    // Claim backdated past the (default 1800s) in_review TTL cap -- the
+    // "prior job's lease has genuinely gone stale" case, where a
+    // self-repair dispatch has a real chance to acquire the item.
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
     let item = mcp
         .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
         .unwrap();
@@ -956,5 +972,48 @@ fn self_repair_or_gate_does_not_double_dispatch_while_a_job_is_already_in_flight
         queue.list(None).unwrap().len(),
         1,
         "must not enqueue a second job"
+    );
+}
+
+#[test]
+fn self_repair_or_gate_defers_instead_of_dispatching_into_a_still_live_claim() {
+    // Item #114: the original job's claim is still within its (#108-capped)
+    // in_review TTL -- nobody can actually reclaim the item yet, so a
+    // self-repair dispatch here would just die instantly at its own
+    // claim-acquire step. Must defer, not dispatch and not count against
+    // the self-repair cap.
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    let label_id_by_name = seed_gate_label(&mcp);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    let auth_conn = test_auth_conn();
+
+    let outcome = self_repair_or_gate(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        &["clippy".to_string()],
+        &label_id_by_name,
+    );
+
+    assert!(matches!(outcome, SelfRepairOutcome::Deferred));
+    assert!(
+        queue.list(None).unwrap().is_empty(),
+        "must not dispatch a job into a claim that can't be won yet"
+    );
+    let comments = mcp
+        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item_id).unwrap())
+        .unwrap();
+    assert!(
+        !comments
+            .iter()
+            .any(|c| c.body.starts_with(CI_SELF_REPAIR_MARKER)),
+        "a deferred attempt must not post a self-repair-dispatched marker, \
+         or it would count against the cap on a later real attempt"
     );
 }

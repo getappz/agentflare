@@ -697,7 +697,7 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ItemRequest {
     #[schemars(
-        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health"
+        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health|doctor"
     )]
     pub(crate) action: String,
     #[schemars(
@@ -765,7 +765,7 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) query: Option<String>,
     #[schemars(
-        description = "Days since updated_at before an item counts as stale/stuck (groom: default 14; standup/health: default 7)"
+        description = "Days since updated_at before an item counts as stale/stuck (groom: default 14; standup/health: default 7). Also used by doctor as the worktree-staleness threshold (default 14)."
     )]
     #[serde(default)]
     pub(crate) staleness_days: Option<i64>,
@@ -797,6 +797,16 @@ pub(crate) struct ItemRequest {
     )]
     #[serde(default)]
     pub(crate) project: Option<String>,
+    #[schemars(
+        description = "doctor only: also delete clean stale/orphaned worktrees (never the main worktree, and never a dirty one unless `force` is set). Default false: scan-only."
+    )]
+    #[serde(default)]
+    pub(crate) reclaim: Option<bool>,
+    #[schemars(
+        description = "doctor only: with reclaim=true, also delete lanes flagged dirty (uncommitted changes). Default false."
+    )]
+    #[serde(default)]
+    pub(crate) force: Option<bool>,
 }
 
 /// Lean per-item projection for `item(list)` — the raw 19-field `Item` (full

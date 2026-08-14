@@ -571,6 +571,33 @@ fn self_repair_or_gate(
         return SelfRepairOutcome::Skipped;
     }
 
+    // Item #114: while the item's claim is still live (within its
+    // #108-capped in_review TTL), nobody can actually reclaim it yet --
+    // dispatching now would just die instantly at `execute_work`'s own
+    // claim-acquire step, the same check performed here, downstream of
+    // this function. Defer instead so the sweep retries once the claim
+    // goes stale, rather than burning a cap slot (and posting a
+    // self-repair-dispatched comment) on an attempt that never had a
+    // chance to run.
+    let claim_still_live = mcp
+        .with_backend_db(|conn| {
+            let requested_ttl = crate::mcp_server::types::backend_claim_ttl_secs();
+            let ttl = agentflare_backend::claim::effective_ttl_secs(conn, &item.id, requested_ttl);
+            agentflare_backend::claim::has_active_claim_by_other(
+                conn,
+                &item.id,
+                "",
+                crate::claims::now(),
+                ttl,
+            )
+        })
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false);
+    if claim_still_live {
+        return SelfRepairOutcome::Deferred;
+    }
+
     let Some(agent) = item
         .assignee_agent
         .as_deref()
