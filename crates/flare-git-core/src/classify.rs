@@ -450,7 +450,7 @@ pub fn classify_pure(
                     Some("remove") | Some("prune")
                 );
                 let reason = if teardown {
-                    "'git worktree remove/prune' is orchestrator-managed by agentflare — to tear down an item's worktree call `item(action=\"check_merge\", id=<item>)` once its PR merges, or `item(action=\"release\", id=<item>)`; to prune stale worktrees run `agentflare git worktree audit --prune`.".to_string()
+                    "'git worktree remove/prune' is orchestrator-managed by agentflare — to tear down an item's worktree call `item(action=\"check_merge\", id=<item>)` once its PR merges, or `item(action=\"release\", id=<item>)`; to prune stale worktrees run `agentflare git worktree audit --prune`, or from an MCP-only session call `item(action=\"doctor\", reclaim=true)` (same scan/reclaim as `agentflare git doctor --reclaim`).".to_string()
                 } else {
                     "'git worktree' is orchestrator-managed by agentflare — call `item(action=\"claim\", id=<item>)` to provision one. (Not the standalone `claim`/`mcp__flare__claim` tool -- that only takes a scope lock and does not create a worktree.)".to_string()
                 };
