@@ -125,6 +125,9 @@ fn checkout_to_protected_branch_is_denied_and_real_git_never_runs() {
         repo.path(),
         &["checkout", "-b", "feature/x"]
     ));
+    // A clean tree now passes checkout/switch to the default branch through
+    // on its own, so dirty it here to actually exercise the deny path.
+    std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
 
     let out = shim(repo.path(), home.path(), &["checkout", "master"]);
     assert!(!out.status.success());
@@ -226,6 +229,9 @@ fn denied_command_is_logged_to_the_audit_log() {
         repo.path(),
         &["checkout", "-b", "feature/x"]
     ));
+    // A clean tree now passes checkout/switch to the default branch through
+    // on its own, so dirty it here to actually exercise the deny path.
+    std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
     let out = shim(repo.path(), home.path(), &["checkout", "master"]);
     assert!(!out.status.success());
 
@@ -471,6 +477,10 @@ fn protected_branch_checkout_is_denied_for_agent_but_passes_through_for_a_human(
         repo.path(),
         &["checkout", "-b", "feature/x"]
     ));
+    // A clean tree now passes checkout/switch to the default branch through
+    // on its own regardless of agent/human, so dirty it here -- this test
+    // is about the agent-vs-human distinction, not the clean-tree check.
+    std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
 
     // Agent-invoked -- denied (same assertion as
     // checkout_to_protected_branch_is_denied_and_real_git_never_runs, via
