@@ -350,6 +350,7 @@ fn empty_item_create(name: &str) -> ItemRequest {
 mod action_tests;
 mod artifact_tests;
 mod asset_tests;
+mod comment_tests;
 mod item_commit_failure_tests;
 mod item_doctor_tests;
 mod item_pr_failure_tests;

@@ -163,8 +163,59 @@ pub fn list_by_assignee_agent(
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// Reads an item's `parent_id` without the `deleted_at IS NULL` filter `get`
+/// applies, and without erroring on a missing row — an ancestor walk must be
+/// able to cross a soft-deleted ancestor and simply stop when the chain runs
+/// out.
+fn parent_of(conn: &Connection, id: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT parent_id FROM items WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Rejects a re-parent that would make `id` its own ancestor. Only `update`
+/// can create a cycle — `create` writes a parent onto a brand-new id that
+/// nothing can point at yet — and a cycle would hang every ancestor walk in
+/// the tree (`quota::goal::find_goal_ancestor`, the dashboard hierarchy, ...).
+/// Also proves the parent exists, so an unknown id fails as `NotFound` rather
+/// than a raw "FOREIGN KEY constraint failed".
+fn validate_parent(conn: &Connection, id: &str, parent_id: &str) -> Result<()> {
+    if parent_id == id {
+        return Err(crate::error::Error::Validation(format!(
+            "item {id} cannot be its own parent"
+        )));
+    }
+    get(conn, parent_id)?;
+    let mut cursor = parent_of(conn, parent_id)?;
+    // Bounded so a cycle already present in the data (written before this
+    // check existed) errors out instead of looping forever.
+    for _ in 0..256 {
+        let Some(current) = cursor else {
+            return Ok(());
+        };
+        if current == id {
+            return Err(crate::error::Error::Validation(format!(
+                "item {parent_id} is a descendant of {id} — re-parenting would create a cycle"
+            )));
+        }
+        cursor = parent_of(conn, &current)?;
+    }
+    Err(crate::error::Error::Validation(format!(
+        "parent chain above {parent_id} is deeper than 256 items or already cyclic"
+    )))
+}
+
 pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
     let ts = now();
+    if let Some(Some(parent_id)) = input.parent_id.as_ref() {
+        validate_parent(conn, id, parent_id)?;
+    }
     let assignee_agent = input
         .assignee_agent
         .as_deref()
@@ -204,6 +255,10 @@ pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
     }
     if input.metadata.is_some() {
         sets.push(format!("metadata = ?{param_idx}"));
+        param_idx += 1;
+    }
+    if input.parent_id.is_some() {
+        sets.push(format!("parent_id = ?{param_idx}"));
     }
     let sql = format!(
         "UPDATE items SET {} WHERE id = ?1 AND deleted_at IS NULL",
@@ -233,6 +288,9 @@ pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
     }
     if let Some(ref metadata) = input.metadata {
         param_values.push(Box::new(metadata.clone()));
+    }
+    if let Some(ref parent_id) = input.parent_id {
+        param_values.push(Box::new(parent_id.clone()));
     }
     let changed = stmt.execute(rusqlite::params_from_iter(param_values.iter()))?;
     if changed == 0 {

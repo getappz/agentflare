@@ -214,6 +214,28 @@ impl AgentflareMcp {
             .map_err(map_backend_err)
     }
 
+    /// [`Self::resolve_item_id`] plus proof that the item actually exists.
+    /// `resolve_id` passes a non-numeric id straight through, so an unknown
+    /// UUID otherwise reaches the write and surfaces as a raw
+    /// "FOREIGN KEY constraint failed" (#375) that names nothing. Use this
+    /// wherever an id is about to be written as a foreign key rather than
+    /// read back through a call that would 404 on its own.
+    pub(crate) fn resolve_existing_item_id(
+        &self,
+        conn: &Connection,
+        raw: &str,
+    ) -> Result<String, ErrorData> {
+        let id = self.resolve_item_id(conn, raw)?;
+        match agentflare_backend::item::get(conn, &id) {
+            Ok(_) => Ok(id),
+            Err(agentflare_backend::Error::NotFound(_)) => Err(ErrorData::invalid_params(
+                format!("no item matches id '{raw}'"),
+                None,
+            )),
+            Err(e) => Err(map_backend_err(e)),
+        }
+    }
+
     /// Resolve a target state from exactly one of `state_id`, `state_name`
     /// (case-insensitive exact match), or `state_group`. Errors if none or
     /// more than one of the three is given, or if a name/group doesn't
@@ -453,6 +475,14 @@ impl AgentflareMcp {
         }
         self.with_backend_db(|conn| {
             let id = self.resolve_item_id(conn, &raw)?;
+            // `parent_id` used to be accepted and silently dropped here (#377).
+            // An explicit empty string detaches the item; anything else is a
+            // sequence_id or UUID resolved the same way `id` is.
+            let parent_id = match req.parent_id.as_deref() {
+                None => None,
+                Some(p) if p.trim().is_empty() => Some(None),
+                Some(p) => Some(Some(self.resolve_existing_item_id(conn, p)?)),
+            };
             let input = agentflare_backend::item::UpdateItem {
                 name: req.name,
                 description: req.description,
@@ -461,6 +491,7 @@ impl AgentflareMcp {
                 assignee_agent: req.assignee_agent.clone(),
                 sort_order: None,
                 metadata: req.metadata.map(metadata_to_json_string),
+                parent_id,
             };
             let item =
                 agentflare_backend::item::update(conn, &id, input).map_err(map_backend_err)?;
