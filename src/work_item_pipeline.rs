@@ -14,6 +14,24 @@ pub(crate) const MAX_REVIEW_CYCLES: u32 = 3;
 /// referenced by every dispatched item's run.
 pub(crate) const WORKFLOW_ID: &str = "agentflare-work-item";
 
+/// Represents a single task within an SDD (subagent-driven-development) workflow.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SddTask {
+    pub id: usize,
+    pub title: String,
+    pub body: String,
+    pub model_tier: Option<TaskModelTier>,
+}
+
+/// Model capability tier for an SDD task — determines agent dispatch preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaskModelTier {
+    Mechanical,
+    Integration,
+    Architecture,
+}
+
 /// Per-run state threaded through `coder` → `review_or_fix` → `finalize`.
 /// `flare_workflow::WorkflowContext::data` persists and mutates across
 /// steps within a run — this is where step results live, not the
@@ -31,6 +49,16 @@ pub(crate) struct WorkItemData {
     /// cap-exceeded path to post a useful gate comment.
     pub review_issues: Option<String>,
     pub pr_url: Option<String>,
+    /// SDD workflow: list of tasks to be executed.
+    pub tasks: Vec<SddTask>,
+    /// SDD workflow: index of the current task being processed.
+    pub current_task_index: usize,
+    /// SDD workflow: count of fix rounds applied to the current task.
+    pub fix_round: u32,
+    /// SDD workflow: audit log of task lifecycle events.
+    pub ledger: Vec<String>,
+    /// SDD workflow: latest generated report, if any.
+    pub last_report: Option<String>,
 }
 
 impl flare_workflow::WorkflowData for WorkItemData {
@@ -619,6 +647,7 @@ mod tests {
             hold_reason: None,
             review_issues: Some("- fix the thing".into()),
             pr_url: Some("https://github.com/x/y/pull/1".into()),
+            ..Default::default()
         };
         let json = serde_json::to_string(&data).unwrap();
         let back: WorkItemData = serde_json::from_str(&json).unwrap();
@@ -1108,5 +1137,33 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("pipeline did not complete");
+    }
+}
+
+#[cfg(test)]
+mod sdd_data_tests {
+    use super::*;
+
+    #[test]
+    fn work_item_data_roundtrips_sdd_fields() {
+        let data = WorkItemData {
+            tasks: vec![SddTask {
+                id: 0,
+                title: "Add config flag".to_string(),
+                body: "Add --verbose flag to CLI".to_string(),
+                model_tier: Some(TaskModelTier::Mechanical),
+            }],
+            current_task_index: 0,
+            fix_round: 0,
+            ledger: vec!["Task 0: dispatched".to_string()],
+            last_report: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&data).expect("serialize");
+        let back: WorkItemData = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.tasks.len(), 1);
+        assert_eq!(back.tasks[0].title, "Add config flag");
+        assert_eq!(back.current_task_index, 0);
+        assert_eq!(back.ledger, vec!["Task 0: dispatched".to_string()]);
     }
 }
