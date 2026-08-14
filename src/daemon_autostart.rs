@@ -96,6 +96,28 @@ fn gui_target() -> String {
     format!("gui/{uid}")
 }
 
+// loginctl enable-linger needs a username, not a uid. $USER can be unset in
+// non-interactive contexts (cron, some service managers), so fall back to
+// the passwd entry for the real uid.
+#[cfg(target_os = "linux")]
+fn linux_username() -> Option<String> {
+    if let Ok(user) = std::env::var("USER")
+        && !user.is_empty()
+    {
+        return Some(user);
+    }
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr((*pw).pw_name)
+            .to_str()
+            .ok()
+            .map(String::from)
+    }
+}
+
 // -- macOS LaunchAgent --
 
 #[cfg(target_os = "macos")]
@@ -273,6 +295,33 @@ fn install_linux() -> Result<(), String> {
     if !status.success() {
         return Err("systemctl enable --now failed".to_string());
     }
+
+    // A `systemctl --user` unit only starts on login (and can be torn down
+    // after logout) unless linger is enabled for the user, so the
+    // WantedBy=default.target above doesn't actually survive a headless
+    // reboot without this. This can fail under restricted/non-interactive
+    // setups (no polkit agent, containers) -- warn but don't fail install,
+    // since the unit itself is still installed and enabled correctly.
+    match linux_username() {
+        Some(user) => {
+            match std::process::Command::new("loginctl")
+                .args(["enable-linger", &user])
+                .status()
+            {
+                Ok(status) if status.success() => {}
+                Ok(status) => eprintln!(
+                    "warning: loginctl enable-linger failed ({status}); the daemon may not start on a headless reboot until this account logs in"
+                ),
+                Err(e) => eprintln!(
+                    "warning: failed to run loginctl enable-linger: {e}; the daemon may not start on a headless reboot until this account logs in"
+                ),
+            }
+        }
+        None => eprintln!(
+            "warning: could not determine username for loginctl enable-linger; the daemon may not start on a headless reboot until this account logs in"
+        ),
+    }
+
     Ok(())
 }
 
@@ -286,6 +335,12 @@ fn uninstall_linux() -> Result<(), String> {
     let _ = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status();
+
+    // Deliberately not calling `loginctl disable-linger` here: linger is a
+    // per-user, not per-unit, setting, and we have no record of whether it
+    // was already on before install_linux() enabled it (or turned on for an
+    // unrelated reason). Disabling it on uninstall risks breaking other
+    // user services that depend on linger. Leaving it enabled is harmless.
     Ok(())
 }
 

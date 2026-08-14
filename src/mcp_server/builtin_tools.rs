@@ -88,7 +88,7 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "item",
-        "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health).",
+        "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health|doctor). `doctor` scans/reclaims stale or orphaned worktrees in this repo -- the MCP equivalent of `agentflare git doctor --reclaim`.",
     ),
     (
         "comment",
