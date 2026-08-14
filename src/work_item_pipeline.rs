@@ -1590,6 +1590,100 @@ mod sdd_loop_tests {
             "next iteration will see current_task_index >= tasks.len() and complete"
         );
     }
+
+    #[tokio::test]
+    async fn three_task_plan_with_fix_round_escalation_and_skip() {
+        // Task 0: implementer -> reviewer finds issues -> fix round -> re-review approves -> advance.
+        // Task 1: judge decides to skip outright.
+        // Task 2: implementer -> reviewer approves -> advance -> judge completes pipeline.
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        let responses = VecDeque::from(vec![
+            // Task 0, iteration 1: implementer
+            "DONE: task 0 attempt 1",
+            r#"{"action":"continue_task","rationale":"needs review","ledger_line":"Task 0: implementer done","task_model_tier":"mechanical"}"#,
+            // iteration 2: task-reviewer finds issues
+            "REVIEW_ISSUES: missing edge case",
+            r#"{"action":"fix_round","rationale":"real finding","ledger_line":"Task 0: fix round 1/5","task_model_tier":null}"#,
+            // iteration 3: implementer fixes
+            "DONE: fixed edge case",
+            r#"{"action":"continue_task","rationale":"needs re-review","ledger_line":"Task 0: fix applied","task_model_tier":null}"#,
+            // iteration 4: re-reviewer approves
+            "REVIEW_APPROVED",
+            r#"{"action":"advance_task","rationale":"clean","ledger_line":"Task 0: complete","task_model_tier":null}"#,
+            // Task 1, iteration 5: judge skips outright after seeing the role reply
+            "DONE: task 1 attempted",
+            r#"{"action":"skip_task","rationale":"superseded by task 0's fix","ledger_line":"Task 1: skipped","task_model_tier":null}"#,
+            // Task 2, iteration 6: implementer
+            "DONE: task 2 implemented",
+            r#"{"action":"continue_task","rationale":"needs review","ledger_line":"Task 2: implementer done","task_model_tier":null}"#,
+            // iteration 7: reviewer approves
+            "REVIEW_APPROVED",
+            r#"{"action":"advance_task","rationale":"clean","ledger_line":"Task 2: complete","task_model_tier":null}"#,
+        ]);
+        let responses = Arc::new(Mutex::new(responses));
+        let send: flare_workflow::json::SendMessage = Arc::new(move |_agent, _prompt| {
+            let reply = responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default()
+                .to_string();
+            Box::pin(async move { Ok((reply, 5u64, 5u64)) })
+        });
+
+        let step = sdd_step(send);
+        let data = WorkItemData {
+            tasks: vec![
+                SddTask {
+                    id: 0,
+                    title: "Task 0".to_string(),
+                    body: "first".to_string(),
+                    model_tier: None,
+                },
+                SddTask {
+                    id: 1,
+                    title: "Task 1".to_string(),
+                    body: "second".to_string(),
+                    model_tier: None,
+                },
+                SddTask {
+                    id: 2,
+                    title: "Task 2".to_string(),
+                    body: "third".to_string(),
+                    model_tier: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+
+        // Drive iterations manually until PIPELINE_COMPLETE or a safety cap —
+        // this test exercises SddLoopExecutor::execute directly in a loop,
+        // mirroring what the engine's execute_loop would do, without needing
+        // the full WorkflowEngine/state store machinery.
+        for _ in 0..20 {
+            let result = step.executor.execute(&mut ctx).await.expect("executes");
+            assert!(matches!(result, flare_workflow::StepResult::Success));
+            if ctx.output == "PIPELINE_COMPLETE" {
+                break;
+            }
+        }
+
+        assert_eq!(ctx.output, "PIPELINE_COMPLETE");
+        assert!(ctx.data.ledger.iter().any(|l| l.contains("fix round 1/5")));
+        assert!(ctx.data.ledger.iter().any(|l| l.contains("skipped")));
+        assert_eq!(
+            ctx.data
+                .ledger
+                .iter()
+                .filter(|l| l.contains("complete"))
+                .count(),
+            2,
+            "task 0 and task 2 both completed"
+        );
+    }
 }
 #[cfg(test)]
 mod cap_tests {
