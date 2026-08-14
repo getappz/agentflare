@@ -1672,11 +1672,35 @@ use  = "opencode"
     }
 
     #[test]
-    fn execute_work_runs_through_the_pipeline_and_reports_success() {
+    fn execute_work_runs_through_the_pipeline_but_hard_errors_without_a_github_remote() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
         init_test_repo(&repo_root);
+        // A local bare "origin" so the finalize step's `git push` itself
+        // succeeds -- same fixture shape as item_pr_failure_tests.rs. It's
+        // still not a GitHub remote, so `push_and_open_pr` can't resolve a
+        // repo to open a PR against; that's the known, deliberately-tested
+        // soft-fail path (item #109 / PR #482), not this test's concern.
+        let origin_dir = tempfile::tempdir().unwrap();
+        let run_git = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+        };
+        run_git(origin_dir.path(), &["init", "--bare", "-b", "master"]);
+        run_git(
+            &repo_root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin_dir.path().to_str().unwrap(),
+            ],
+        );
+        run_git(&repo_root, &["push", "origin", "master"]);
 
         // `AgentflareMcp::for_project_dir` (what `execute_work_impl` builds
         // internally from `args.repo_root`) only overrides the
@@ -1749,15 +1773,23 @@ use  = "opencode"
                 },
             );
 
-            assert_eq!(outcome.exit_code, 0);
+            // The pipeline itself (coder -> review -> finalize) ran through
+            // successfully and a real commit landed -- but `origin` here is
+            // a local bare repo, not a real GitHub remote, so finalize's
+            // push/PR step correctly soft-fails to open a PR and reports a
+            // hard error (item #109 / PR #482) rather than false-completing
+            // a claim whose work was never actually published.
+            assert_eq!(outcome.exit_code, 1);
 
             let comments = seed_mcp
                 .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
                 .unwrap()
                 .unwrap();
             assert!(
-                comments.iter().any(|c| c.body.contains("complete")),
-                "expected a completion comment, got: {comments:?}"
+                comments
+                    .iter()
+                    .any(|c| c.body.contains("PR creation failed")),
+                "expected a PR-creation-failed comment, got: {comments:?}"
             );
         });
     }
