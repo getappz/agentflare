@@ -67,6 +67,56 @@ impl flare_workflow::WorkflowData for WorkItemData {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum JudgeAction {
+    ContinueTask,
+    FixRound,
+    Escalate,
+    ParkFinding,
+    RuleAndContinue,
+    InsertTask,
+    SkipTask,
+    AdvanceTask,
+    CompletePipeline,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct JudgeDecision {
+    pub action: JudgeAction,
+    pub rationale: String,
+    pub ledger_line: String,
+    pub task_model_tier: Option<TaskModelTier>,
+}
+
+#[derive(Debug)]
+pub(crate) enum JudgeParseError {
+    InvalidJson(String),
+}
+
+impl std::fmt::Display for JudgeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JudgeParseError::InvalidJson(msg) => write!(f, "judge reply is not valid decision JSON: {msg}"),
+        }
+    }
+}
+
+/// The judge is prompted to reply with exactly one JSON object; this
+/// tolerates a reply that wraps the object in a sentence by extracting the
+/// first `{...}` span before parsing, but does not otherwise repair
+/// malformed JSON — a genuine parse failure is a step Failure, retried by
+/// the step's own RetryPolicy.
+pub(crate) fn parse_judge_decision(reply: &str) -> Result<JudgeDecision, JudgeParseError> {
+    let start = reply.find('{').ok_or_else(|| JudgeParseError::InvalidJson("no '{' found".to_string()))?;
+    let end = reply.rfind('}').ok_or_else(|| JudgeParseError::InvalidJson("no '}' found".to_string()))?;
+    if end < start {
+        return Err(JudgeParseError::InvalidJson("unbalanced braces".to_string()));
+    }
+    let candidate = &reply[start..=end];
+    serde_json::from_str(candidate).map_err(|e| JudgeParseError::InvalidJson(e.to_string()))
+}
+
 use flare_workflow::executor::FunctionStep;
 use flare_workflow::sqlite_store::SqliteStore;
 use flare_workflow::{
@@ -1248,5 +1298,40 @@ Add unit tests for the validation.
         let tasks = load_or_synthesize_tasks("Bump dependency version", Some(""));
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].body, "Bump dependency version");
+    }
+}
+
+#[cfg(test)]
+mod judge_decision_tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_decision() {
+        let reply = r#"{"action":"advance_task","rationale":"spec met","ledger_line":"Task 0: complete","task_model_tier":null}"#;
+        let decision = parse_judge_decision(reply).expect("valid JSON parses");
+        assert_eq!(decision.action, JudgeAction::AdvanceTask);
+        assert_eq!(decision.ledger_line, "Task 0: complete");
+    }
+
+    #[test]
+    fn parses_decision_wrapped_in_prose_by_stripping_to_the_json_object() {
+        // Agents sometimes wrap JSON in a sentence despite instructions;
+        // strip to the first {...} span before parsing.
+        let reply = "Here is my decision:\n{\"action\":\"complete_pipeline\",\"rationale\":\"all tasks done\",\"ledger_line\":\"Pipeline: complete\",\"task_model_tier\":null}\nDone.";
+        let decision = parse_judge_decision(reply).expect("parses after stripping");
+        assert_eq!(decision.action, JudgeAction::CompletePipeline);
+    }
+
+    #[test]
+    fn rejects_malformed_json() {
+        let err = parse_judge_decision("not json at all").unwrap_err();
+        assert!(matches!(err, JudgeParseError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn rejects_unknown_action_value() {
+        let reply = r#"{"action":"do_a_barrel_roll","rationale":"x","ledger_line":"x","task_model_tier":null}"#;
+        let err = parse_judge_decision(reply).unwrap_err();
+        assert!(matches!(err, JudgeParseError::InvalidJson(_)));
     }
 }
