@@ -49,3 +49,4 @@ node_modules/
 # ledger/briefs/reports/review packages, not source.
 /.superpowers/
 /.agent-scratch/
+.sccache-cache/
