@@ -1504,6 +1504,58 @@ mod sdd_loop_tests {
             .expect("returns Ok(Failure), not Err");
         assert!(matches!(result, StepResult::Failure));
     }
+
+    #[tokio::test]
+    async fn resumed_iteration_dispatches_next_task_not_a_repeat() {
+        // Simulates the crash-resume mechanism directly at the ctx.data level
+        // (per the spec's corrected Resumability section: the engine's own
+        // loop iteration counter is NOT durable across a crash — only ctx.data
+        // is, via state_store.update() after each completed iteration). This
+        // test proves the closure's own behavior is correct given
+        // already-advanced ctx.data, which is the actual resumability
+        // guarantee — it does not exercise the engine's crash/restart
+        // machinery itself (that's flare-workflow's own test suite's job).
+        let (send, calls) = mock_send(vec![
+            "DONE: task 2 implemented",
+            r#"{"action":"advance_task","rationale":"done","ledger_line":"Task 1: complete","task_model_tier":null}"#,
+        ]);
+        let step = sdd_step(send);
+
+        // ctx.data as it would look immediately after a crash that happened
+        // right after task 0's advance_task was applied and persisted.
+        let data = WorkItemData {
+            tasks: vec![
+                SddTask {
+                    id: 0,
+                    title: "Task 1".to_string(),
+                    body: "first".to_string(),
+                    model_tier: None,
+                },
+                SddTask {
+                    id: 1,
+                    title: "Task 2".to_string(),
+                    body: "second".to_string(),
+                    model_tier: None,
+                },
+            ],
+            current_task_index: 1, // already advanced past task 0
+            ledger: vec!["Task 0: complete".to_string()],
+            ..Default::default()
+        };
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+
+        step.executor.execute(&mut ctx).await.expect("executes");
+
+        let recorded = calls.lock().unwrap();
+        assert!(
+            recorded[0].1.contains("second"),
+            "must dispatch task 1's (index 1) body, not task 0's"
+        );
+        assert!(
+            !recorded[0].1.contains("first"),
+            "must not re-dispatch the already-completed task"
+        );
+    }
 }
 #[cfg(test)]
 mod cap_tests {
