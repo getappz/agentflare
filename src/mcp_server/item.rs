@@ -834,6 +834,10 @@ impl AgentflareMcp {
         // no-ops (logging) rather than trusting push/PR success alone as
         // proof nothing would be lost.
         let in_review = owns_claim && pr_url.is_some();
+        let diverged = item
+            .as_ref()
+            .zip(target_branch.as_ref())
+            .is_some_and(|(i, t)| crate::worktree::branch_diverged(i, &repo_root, t));
         // No PR resulted — either nothing was ever committed on the claimed
         // branch, or a real commit's push/PR failed for some other reason.
         // Only the former should block completion: marking an item
@@ -842,14 +846,24 @@ impl AgentflareMcp {
         // merely replies with text, with no tool use, previously exited 0
         // and sailed straight through to `mark_completed` below with zero
         // code changed.
-        let nothing_was_ever_committed = !in_review
-            && owns_claim
-            && item
-                .as_ref()
-                .zip(target_branch.as_ref())
-                .is_none_or(|(item, target)| {
-                    !crate::worktree::branch_diverged(item, &repo_root, target)
-                });
+        let nothing_was_ever_committed = !in_review && owns_claim && !diverged;
+        // A real commit exists but push/PR creation soft-failed and never
+        // produced a PR (item #109) -- hard-error instead of completing.
+        let push_or_pr_failed = !in_review && owns_claim && should_push && diverged;
+        if push_or_pr_failed {
+            let _ = self.comment_impl(CommentRequest {
+                action: "create".into(),
+                item_id: Some(item_id.clone()),
+                body: Some(format!(
+                    "## agentflare work — PR creation failed\n\nThe branch has real commits but no pull request resulted; check server logs for item {item_id}. Left in place rather than completed."
+                )),
+                ..Default::default()
+            });
+            return Err(ErrorData::internal_error(
+                format!("item {item_id}: real commits but no PR resulted -- not marking completed"),
+                None,
+            ));
+        }
         // Shared by both "nothing was ever committed" (worktree is clean by
         // definition, safe to remove) and a real completion: release the
         // lease so the item is genuinely available again — either for a
