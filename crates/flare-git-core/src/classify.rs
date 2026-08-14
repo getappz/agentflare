@@ -778,13 +778,17 @@ pub fn classify_with_home(
     // outcome: a checkout/switch onto the protected branch. Every other
     // subcommand (and a checkout/switch of anything else) leaves this `true`
     // and `classify_pure` never looks at it outside that one arm.
+    //
+    // `is_dirty_checked` (not `is_dirty`) so a `git status` failure fails
+    // closed -- an unreadable tree state must not be treated as "clean" and
+    // silently wave a protected-branch checkout through.
     let working_tree_clean = if matches!(subcommand, "checkout" | "switch")
         && args
             .iter()
             .find(|a| !a.starts_with('-'))
             .is_some_and(|target| is_protected_branch(target, Some(&default_branch)))
     {
-        !crate::doctor::is_dirty(repo_root)
+        crate::doctor::is_dirty_checked(repo_root) == Some(false)
     } else {
         true
     };

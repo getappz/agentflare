@@ -432,10 +432,23 @@ fn parse_worktree_list(output: &str) -> Vec<WorktreeEntry> {
 /// `run_in_ok` only reflects exit status, and `git status --porcelain`
 /// exits 0 whether the tree is dirty or clean — so dirtiness has to come
 /// from the (trimmed) stdout being non-empty instead.
+///
+/// Reports `false` (not dirty) when `git status` itself fails, so this is a
+/// fail-open diagnostic helper — fine for `doctor`'s reporting use, but
+/// wrong for anything that gates a policy decision on cleanliness. Callers
+/// making an allow/deny call (e.g. the protected-branch checkout guard in
+/// `classify.rs`) must use [`is_dirty_checked`] instead, which fails closed.
 pub(crate) fn is_dirty(path: &Path) -> bool {
+    is_dirty_checked(path).unwrap_or(false)
+}
+
+/// Same check as [`is_dirty`], but `None` when `git status` itself fails —
+/// callers that gate a policy decision on tree cleanliness should treat
+/// `None` as dirty (fail closed) rather than defaulting to "clean".
+pub(crate) fn is_dirty_checked(path: &Path) -> Option<bool> {
     run_git_in(path, &["status", "--porcelain"])
+        .ok()
         .map(|out| !out.is_empty())
-        .unwrap_or(false)
 }
 
 /// Days since the worktree's HEAD commit, or `None` if it can't be read

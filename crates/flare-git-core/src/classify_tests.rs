@@ -1110,8 +1110,10 @@ fn protected_branch_checkout_is_still_denied_in_a_tracked_repo() {
     std::fs::create_dir_all(repo.path.join(".agentflare")).unwrap();
     // Dirty tree, same as the risky case in `checkout_to_protected_branch_is_denied`
     // -- this test is about the tracked-repo gate, not the dirty-tree
-    // check, so it must stay on the deny side of that check too.
+    // check, so it must stay on the deny side of that check too. Staged
+    // (not just untracked) so it exercises a tracked modification.
     std::fs::write(repo.path.join("dirty.txt"), "uncommitted").unwrap();
+    crate::shell::run_in(&repo.path, &["add", "dirty.txt"]).unwrap();
     let event = classify(&repo.path, "checkout", &["master".to_string()]);
     assert!(
         matches!(event.disposition, Disposition::Deny { .. }),
