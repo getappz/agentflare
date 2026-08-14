@@ -211,6 +211,22 @@ impl BinarySnapshot {
     }
 }
 
+/// Polls `snapshot.is_stale()` every `interval`, returning as soon as it's
+/// `true`. Split out from `dashboard::server`'s `spawn_binary_staleness_watchdog`
+/// so the polling *task* itself -- not just `is_stale()`'s comparison logic
+/// in isolation -- has test coverage (item #107: the watchdog silently never
+/// fired in a live daemon despite `is_stale()`'s own unit tests passing,
+/// which unit tests on `is_stale()` alone couldn't have caught).
+pub async fn wait_for_stale(snapshot: &BinarySnapshot, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        ticker.tick().await;
+        if snapshot.is_stale() {
+            return;
+        }
+    }
+}
+
 /// Spawns a replacement daemon from the (now-updated) binary at
 /// `snapshot`'s path and exits this process. Cleans up this process's own
 /// pid/lock files *first* so the replacement's own `is_daemon_running()`
@@ -348,5 +364,42 @@ mod binary_snapshot_tests {
         std::fs::remove_file(&path).unwrap();
 
         assert!(snapshot.is_stale());
+    }
+
+    // Regression coverage for item #107: `is_stale()` itself was already
+    // correct (the three tests above), but the live daemon's watchdog task
+    // never fired anyway. This exercises `wait_for_stale`'s actual polling
+    // loop -- not just the comparison it polls -- to catch that class of bug.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_stale_polls_until_the_file_on_disk_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agentflare");
+        std::fs::write(&path, b"v1").unwrap();
+        let snapshot = snapshot_at(&path);
+        let interval = std::time::Duration::from_secs(60);
+
+        let handle = tokio::spawn(async move {
+            super::wait_for_stale(&snapshot, interval).await;
+        });
+
+        // `interval`'s first tick fires immediately; let that first (not
+        // stale) check happen before advancing the clock.
+        tokio::task::yield_now().await;
+        assert!(!handle.is_finished());
+
+        tokio::time::advance(interval / 2).await;
+        assert!(!handle.is_finished(), "fired before the file changed");
+
+        let staged = dir.path().join("agentflare.new");
+        std::fs::write(&staged, b"v2-longer-content").unwrap();
+        std::fs::rename(&staged, &path).unwrap();
+
+        tokio::time::advance(interval).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            handle.is_finished(),
+            "wait_for_stale never returned after the on-disk binary changed"
+        );
     }
 }
