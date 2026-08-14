@@ -140,6 +140,7 @@ impl Queue {
             finished_at: None,
             output: None,
             in_process: job.in_process,
+            dispatch_reason: job.metadata.get("dispatch_reason").cloned(),
         })
     }
 
@@ -400,9 +401,17 @@ fn map_job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobInfo> {
     // `payload` is our own `serde_json::to_string(&AgentJob)` from `enqueue`,
     // so a parse failure here would mean on-disk corruption, not bad input —
     // fall back to an empty command/args rather than failing the whole read.
-    let (command, args, in_process) = serde_json::from_str::<crate::types::AgentJob>(&payload_json)
-        .map(|job| (job.command, job.args, job.in_process))
-        .unwrap_or_default();
+    let (command, args, in_process, dispatch_reason) =
+        serde_json::from_str::<crate::types::AgentJob>(&payload_json)
+            .map(|job| {
+                (
+                    job.command,
+                    job.args,
+                    job.in_process,
+                    job.metadata.get("dispatch_reason").cloned(),
+                )
+            })
+            .unwrap_or_default();
     Ok(JobInfo {
         id: r.get(0)?,
         command,
@@ -429,6 +438,7 @@ fn map_job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobInfo> {
             stderr_total_bytes: stderr_bytes as u64,
         }),
         in_process,
+        dispatch_reason,
     })
 }
 
@@ -573,6 +583,37 @@ mod tests {
         // again for the life of this process, so this row stays running.
         queue.dequeue().unwrap();
         assert_eq!(queue.get(&info.id).unwrap().state, JobState::Running);
+    }
+
+    #[test]
+    fn dispatch_reason_round_trips_through_enqueue_list_and_get() {
+        let (queue, _dir) = test_queue();
+        let job = AgentJob::new("agentflare-work")
+            .args(["item-1", "claude-code"])
+            .in_process()
+            .dispatch_reason("self-repair: Validate PR title");
+        let info = queue.enqueue(&job).unwrap();
+        assert_eq!(
+            info.dispatch_reason.as_deref(),
+            Some("self-repair: Validate PR title")
+        );
+
+        let listed = queue.list(None).unwrap();
+        assert_eq!(
+            listed[0].dispatch_reason.as_deref(),
+            Some("self-repair: Validate PR title")
+        );
+
+        let got = queue.get(&info.id).unwrap();
+        assert_eq!(
+            got.dispatch_reason.as_deref(),
+            Some("self-repair: Validate PR title")
+        );
+
+        // A plain dispatch (no reason set) must stay `None`, not e.g. `""`.
+        let plain = queue.enqueue(&AgentJob::new("true")).unwrap();
+        assert_eq!(plain.dispatch_reason, None);
+        assert_eq!(queue.get(&plain.id).unwrap().dispatch_reason, None);
     }
 
     #[test]

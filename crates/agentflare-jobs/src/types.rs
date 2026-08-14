@@ -107,6 +107,17 @@ impl AgentJob {
         self.prompt = Some(p.into());
         self
     }
+
+    /// Sets the well-known `dispatch_reason` metadata key, surfaced back on
+    /// `JobInfo::dispatch_reason` — e.g. the failing CI check name(s) that
+    /// triggered a self-repair dispatch (`run_review_sweep` in
+    /// `src/supervisor.rs`), so the dashboard can badge *why* a job ran
+    /// instead of only *that* it ran.
+    pub fn dispatch_reason(mut self, reason: impl Into<String>) -> Self {
+        self.metadata
+            .insert("dispatch_reason".to_string(), reason.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,4 +144,8 @@ pub struct JobInfo {
     pub finished_at: Option<i64>,
     pub output: Option<JobOutput>,
     pub in_process: bool,
+    /// The job's `metadata["dispatch_reason"]`, if set — see
+    /// `AgentJob::dispatch_reason`. Purely additive/display: never read to
+    /// drive queue behavior, so a job with none is just `None` here.
+    pub dispatch_reason: Option<String>,
 }

@@ -74,33 +74,60 @@
           <p class="af-empty">No jobs yet. Submit one via <code>POST /api/jobs</code>.</p>
         </template>
 
-        <!-- Job list table -->
+        <!-- Job list table, grouped by originating item (item #468) -->
         <div class="af-table-wrap" x-show="!selectedId && jobs.length > 0">
           <table class="af-table">
             <thead>
               <tr>
-                <th>ID</th>
-                <th>Command</th>
-                <th>State</th>
+                <th>Item / job</th>
+                <th>Attempts</th>
+                <th>Latest state</th>
+                <th>Reason</th>
                 <th>Created</th>
-                <th>Started</th>
-                <th>Finished</th>
               </tr>
             </thead>
-            <tbody>
-              <template x-for="job in jobs" :key="job.id">
-                <tr class="af-clickable-row" @click="selectJob(job.id)">
-                  <td class="af-mono" x-text="job.id.substring(0, 12) + '…'"></td>
-                  <td class="af-mono af-truncate" x-text="jobCommand(job)"></td>
-                  <td>
-                    <span class="af-badge" :class="stateClass(job.state, job.output?.exit_code)" x-text="stateLabel(job.state, job.output?.exit_code)"></span>
+            <template x-for="group in groupedJobs()" :key="group.key">
+              <tbody>
+                <tr
+                  class="af-clickable-row"
+                  @click="group.jobs.length > 1 ? toggleGroup(group.key) : selectJob(group.jobs[0].id)"
+                >
+                  <td class="af-mono af-truncate">
+                    <span x-show="group.jobs.length > 1" x-text="isExpanded(group.key) ? '▾ ' : '▸ '"></span>
+                    <span x-text="group.itemId ? (group.itemId.substring(0, 12) + '…') : jobCommand(group.jobs[0])"></span>
                   </td>
-                  <td x-text="afFormatTime(job.created_at)"></td>
-                  <td x-text="afFormatTime(job.started_at)"></td>
-                  <td x-text="afFormatTime(job.finished_at)"></td>
+                  <td x-text="group.jobs.length"></td>
+                  <td>
+                    <span
+                      class="af-badge"
+                      :class="stateClass(group.jobs[0].state, group.jobs[0].output?.exit_code)"
+                      x-text="'latest: ' + stateLabel(group.jobs[0].state, group.jobs[0].output?.exit_code)"
+                    ></span>
+                  </td>
+                  <td>
+                    <span class="af-badge af-badge-reason" x-show="group.jobs[0].dispatch_reason" x-text="group.jobs[0].dispatch_reason"></span>
+                  </td>
+                  <td x-text="afFormatTime(group.jobs[0].created_at)"></td>
                 </tr>
-              </template>
-            </tbody>
+                <template x-for="job in (group.jobs.length > 1 ? group.jobs : [])" :key="job.id">
+                  <tr
+                    class="af-clickable-row af-job-subrow"
+                    x-show="isExpanded(group.key)"
+                    @click="selectJob(job.id)"
+                  >
+                    <td class="af-mono af-truncate" x-text="job.id.substring(0, 12) + '…'"></td>
+                    <td></td>
+                    <td>
+                      <span class="af-badge" :class="stateClass(job.state, job.output?.exit_code)" x-text="stateLabel(job.state, job.output?.exit_code)"></span>
+                    </td>
+                    <td>
+                      <span class="af-badge af-badge-reason" x-show="job.dispatch_reason" x-text="job.dispatch_reason"></span>
+                    </td>
+                    <td x-text="afFormatTime(job.created_at)"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </template>
           </table>
         </div>
 
@@ -139,6 +166,11 @@
       font-size: 0.875rem;
       margin-left: var(--af-space-3);
     }
+    .af-job-subrow td:first-child { padding-left: var(--af-space-5); }
+    .af-badge-reason {
+      background: var(--af-bg-hover, rgba(128,128,128,0.12));
+      color: var(--af-text-secondary, inherit);
+    }
     .af-log-output {
       background: var(--af-bg-code, #111);
       color: #0f0;
@@ -162,6 +194,7 @@
         connected: false,
         source: null,
         loading: true,
+        expandedGroups: new Set(),
 
         selectedId: '',
         detailState: '',
@@ -273,6 +306,42 @@
 
         jobCommand(job) {
           return 'command' in job ? job.command : (job.id || '');
+        },
+
+        /**
+         * Groups `this.jobs` (already newest-first from the API) by
+         * originating item id. For an `agentflare-work` job dispatched via
+         * `enqueue_work_job` (src/supervisor.rs), `args[0]` is the item id
+         * (see the comment on that function) — retries and self-repair
+         * re-runs against the same item land in the same group so a failure
+         * later superseded by a success reads as one group, not two
+         * unrelated rows (item #468). Jobs without an item id (rare: a
+         * manually-submitted `POST /api/jobs`) get their own singleton
+         * group keyed by job id.
+         */
+        groupedJobs() {
+          const groups = new Map();
+          for (const job of this.jobs) {
+            const itemId = job.in_process && job.args && job.args.length > 0 ? job.args[0] : null;
+            const key = itemId || job.id;
+            if (!groups.has(key)) {
+              groups.set(key, { key, itemId, jobs: [] });
+            }
+            groups.get(key).jobs.push(job);
+          }
+          return Array.from(groups.values());
+        },
+
+        toggleGroup(key) {
+          if (this.expandedGroups.has(key)) {
+            this.expandedGroups.delete(key);
+          } else {
+            this.expandedGroups.add(key);
+          }
+        },
+
+        isExpanded(key) {
+          return this.expandedGroups.has(key);
         },
 
         stateClass(state, exitCode) {
