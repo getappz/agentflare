@@ -353,11 +353,9 @@ pub(crate) fn build_sdd_loop_step(
                 // 1. Role dispatch — state read from ctx.data decides which
                 // role plays this turn.
                 let (role_agent, role_prompt) = if ctx.data.review_issues.is_some() {
-                    // A fix round just landed pending re-review, or this is
-                    // the very first review of a DONE report — both route
-                    // through the reviewer prompts; re-reviewer only once a
-                    // fix round is actually in progress.
-                    if ctx.data.fix_round > 0 {
+                    if ctx.data.last_report.is_some() {
+                        // A fix has already been submitted for the current
+                        // issues — re-review it.
                         let findings = ctx.data.review_issues.clone().unwrap_or_default();
                         let fix_report = ctx.data.last_report.clone().unwrap_or_default();
                         (
@@ -365,28 +363,24 @@ pub(crate) fn build_sdd_loop_step(
                             build_re_reviewer_prompt(&task, &findings, &fix_report),
                         )
                     } else {
-                        let report = ctx.data.last_report.clone().unwrap_or_default();
+                        // Issues open, no fix attempt yet — dispatch the
+                        // implementer to fix them.
+                        let fix_context = ctx.data.review_issues.as_deref();
                         (
                             agent_name.clone(),
-                            build_task_reviewer_prompt(&task, &report),
+                            build_implementer_prompt(&task, fix_context),
                         )
                     }
-                } else if ctx.data.last_report.is_some() && ctx.data.fix_round == 0 {
-                    // Implementer already reported and no open issues are
-                    // recorded yet for this pass — dispatch the reviewer.
+                } else if ctx.data.last_report.is_some() {
+                    // No open issues; a report is pending review.
                     let report = ctx.data.last_report.clone().unwrap_or_default();
                     (
                         agent_name.clone(),
                         build_task_reviewer_prompt(&task, &report),
                     )
                 } else {
-                    // Fresh task, or a fix round in progress needing
-                    // re-implementation.
-                    let fix_context = ctx.data.review_issues.as_deref();
-                    (
-                        agent_name.clone(),
-                        build_implementer_prompt(&task, fix_context),
-                    )
+                    // Fresh task, nothing dispatched yet.
+                    (agent_name.clone(), build_implementer_prompt(&task, None))
                 };
 
                 let (role_reply, in_tok, out_tok) =
@@ -401,6 +395,7 @@ pub(crate) fn build_sdd_loop_step(
 
                 if let Some(issues) = role_reply.strip_prefix(REVIEW_ISSUES_MARKER) {
                     ctx.data.review_issues = Some(issues.trim().to_string());
+                    ctx.data.last_report = None;
                 } else if role_reply.trim() == REVIEW_APPROVED_MARKER {
                     ctx.data.review_issues = None;
                 } else {
@@ -1839,6 +1834,125 @@ mod sdd_loop_tests {
         let mut ctx = WorkflowContext::new(Default::default(), data);
         step.executor.execute(&mut ctx).await.expect("executes");
         assert_eq!(ctx.output, "PIPELINE_COMPLETE");
+    }
+
+    #[tokio::test]
+    async fn fix_round_dispatches_implementer_not_re_reviewer_next_iteration() {
+        // Round 1: a pending report gets reviewed, the reviewer finds
+        // issues, and the judge issues a `fix_round` decision (which bumps
+        // `fix_round` to 1 in this SAME iteration, before the implementer
+        // ever runs). Round 2 must NOT read `fix_round > 0` as "a fix was
+        // already submitted" — it must dispatch the implementer to actually
+        // attempt the fix, not the re-reviewer to re-review a stale report.
+        let (send, calls) = mock_send(vec![
+            "REVIEW_ISSUES: missing null check on line 12",
+            r#"{"action":"fix_round","rationale":"issues found","ledger_line":"Task 0: fix round 1","task_model_tier":null}"#,
+            "DONE: added the null check",
+            r#"{"action":"continue_task","rationale":"awaiting re-review","ledger_line":"Task 0: fix submitted","task_model_tier":null}"#,
+        ]);
+        let mut data = one_task_data();
+        data.last_report = Some("DONE: initial attempt".to_string());
+        let step = build_sdd_loop_step(
+            "implementer-agent".to_string(),
+            "judge-agent".to_string(),
+            send,
+        );
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+
+        // Round 1: task-reviewer finds issues, judge calls fix_round.
+        step.executor
+            .execute(&mut ctx)
+            .await
+            .expect("round 1 executes");
+        assert_eq!(ctx.data.fix_round, 1);
+        assert_eq!(
+            ctx.data.review_issues.as_deref(),
+            Some("missing null check on line 12")
+        );
+        assert_eq!(
+            ctx.data.last_report, None,
+            "clearing last_report on REVIEW_ISSUES signals no fix attempt exists yet"
+        );
+
+        // Round 2: must dispatch the implementer (with the findings as fix
+        // context), not the re-reviewer.
+        step.executor
+            .execute(&mut ctx)
+            .await
+            .expect("round 2 executes");
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 4);
+        let round2_role_prompt = &recorded[2].1;
+        assert!(
+            round2_role_prompt.contains("You are implementing one task"),
+            "round 2 must dispatch the implementer, got prompt: {round2_role_prompt}"
+        );
+        assert!(
+            round2_role_prompt.contains("missing null check on line 12"),
+            "implementer prompt must carry the reviewer's findings as fix context"
+        );
+        assert!(
+            !round2_role_prompt.contains("Re-review a fix"),
+            "round 2 must NOT dispatch the re-reviewer"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_cycle_dispatches_re_reviewer_after_implementer_fix() {
+        // Extends the above: task-reviewer finds issues -> judge fix_round
+        // -> implementer fixes -> judge continue_task -> the FOLLOWING
+        // iteration must dispatch the re-reviewer (not the task-reviewer
+        // again) with the fix report, proving the `last_report.is_some()`
+        // branch of the fix works too.
+        let (send, calls) = mock_send(vec![
+            "REVIEW_ISSUES: missing null check on line 12",
+            r#"{"action":"fix_round","rationale":"issues found","ledger_line":"Task 0: fix round 1","task_model_tier":null}"#,
+            "DONE: added the null check",
+            r#"{"action":"continue_task","rationale":"awaiting re-review","ledger_line":"Task 0: fix submitted","task_model_tier":null}"#,
+            "REVIEW_APPROVED",
+            r#"{"action":"advance_task","rationale":"fix verified","ledger_line":"Task 0: complete","task_model_tier":null}"#,
+        ]);
+        let mut data = one_task_data();
+        data.last_report = Some("DONE: initial attempt".to_string());
+        let step = build_sdd_loop_step(
+            "implementer-agent".to_string(),
+            "judge-agent".to_string(),
+            send,
+        );
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+
+        step.executor
+            .execute(&mut ctx)
+            .await
+            .expect("round 1 executes"); // task-reviewer -> fix_round
+        step.executor
+            .execute(&mut ctx)
+            .await
+            .expect("round 2 executes"); // implementer -> continue_task
+        assert_eq!(
+            ctx.data.last_report.as_deref(),
+            Some("DONE: added the null check")
+        );
+
+        step.executor
+            .execute(&mut ctx)
+            .await
+            .expect("round 3 executes"); // must be re-reviewer
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 6);
+        let round3_role_prompt = &recorded[4].1;
+        assert!(
+            round3_role_prompt.contains("Re-review a fix for this task's findings only"),
+            "round 3 must dispatch the re-reviewer, got prompt: {round3_role_prompt}"
+        );
+        assert!(
+            round3_role_prompt.contains("missing null check on line 12"),
+            "re-reviewer prompt must carry the original findings"
+        );
+        assert!(
+            round3_role_prompt.contains("DONE: added the null check"),
+            "re-reviewer prompt must carry the fix report"
+        );
     }
 
     #[tokio::test]
