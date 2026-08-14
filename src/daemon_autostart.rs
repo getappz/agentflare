@@ -87,6 +87,16 @@ fn daemon_home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
+// A systemd/launchd-restarted daemon only inherits the service manager's
+// bare default PATH, not the invoking shell's -- capture the real PATH at
+// enable-time (which includes ~/.local/bin, ~/.cargo/bin, etc.) so a
+// crash-restart doesn't strand the daemon without the agent CLIs it needs
+// to dispatch jobs.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn daemon_path_env() -> String {
+    std::env::var("PATH").unwrap_or_default()
+}
+
 // Command::args does not go through a shell, so a literal "gui/$(id -u)"
 // string reaches launchctl unexpanded and every call below fails. Resolve
 // the real uid via the libc dep already present for cfg(unix) targets.
@@ -160,7 +170,7 @@ fn install_macos() -> Result<(), String> {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin</string>
+        <string>{path_env}</string>
     </dict>
 </dict>
 </plist>"#,
@@ -172,6 +182,7 @@ fn install_macos() -> Result<(), String> {
         err = daemon_home_dir()
             .join("Library/Logs/agentflare-daemon.err")
             .display(),
+        path_env = daemon_path_env(),
     );
     std::fs::write(&path, &plist).map_err(|e| format!("write plist: {e}"))?;
 
@@ -266,12 +277,14 @@ fn install_linux() -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
     }
     let binary = agentflare_binary();
+    let path_env = daemon_path_env();
     let unit = format!(
         "[Unit]\n\
          Description=agentflare daemon\n\
          After=network.target\n\n\
          [Service]\n\
          ExecStart={binary} serve --_foreground-daemon\n\
+         Environment=\"PATH={path_env}\"\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          Type=simple\n\n\
