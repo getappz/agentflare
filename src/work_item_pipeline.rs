@@ -299,6 +299,195 @@ fn build_review_or_fix_step_with_sender(
     )
 }
 
+/// Cap on fix rounds for a single SDD task before the loop gives up on it —
+/// mirrors `MAX_REVIEW_CYCLES`'s existing cap-constant pattern for the
+/// `coder`/`review_or_fix` pipeline.
+pub(crate) const MAX_FIX_ROUNDS: u32 = 5;
+/// Safety ceiling on how many tasks a single SDD run can process — plans
+/// realistically have far fewer tasks; this bounds `insert_task` from
+/// producing an unbounded plan.
+pub(crate) const MAX_TASKS_PROCESSED: usize = 50;
+
+/// Marker `ctx.output` is set to when the SDD loop's judge decides the
+/// whole plan is done — the `StepMode::Loop`'s `until` field this step is
+/// registered with (see the bottom of this function).
+const SDD_PIPELINE_COMPLETE_MARKER: &str = "PIPELINE_COMPLETE";
+
+/// The single `StepMode::Loop` step for the SDD (subagent-driven-development)
+/// task pipeline. Each iteration:
+///
+/// 1. Reads `ctx.data` to decide which role to dispatch this turn —
+///    implementer (fresh task or mid-fix-round), task-reviewer (implementer
+///    just reported and no re-review is in progress), or re-reviewer (a fix
+///    landed for previously recorded findings) — and sends that role's
+///    prompt to `agent_name` via `send`.
+/// 2. Sends the judge its own prompt (task list, ledger, latest role reply)
+///    to `judge_agent_name` via `send`, and parses its JSON decision.
+/// 3. Applies the decision to `ctx.data` (advance/skip the task, bump the
+///    fix round, insert a new task, or terminate the pipeline).
+///
+/// Mirrors `build_review_or_fix_step_with_sender`'s shape: a `FunctionStep`
+/// closure over an injected `send`, same test seam pattern.
+pub(crate) fn build_sdd_loop_step(
+    agent_name: String,
+    judge_agent_name: String,
+    send: flare_workflow::json::SendMessage,
+) -> StepDefinition<WorkItemData> {
+    let executor = std::sync::Arc::new(FunctionStep::new(
+        move |ctx: &mut WorkflowContext<WorkItemData>| {
+            let send = send.clone();
+            let agent_name = agent_name.clone();
+            let judge_agent_name = judge_agent_name.clone();
+            Box::pin(async move {
+                if ctx.data.tasks.is_empty() || ctx.data.current_task_index >= ctx.data.tasks.len()
+                {
+                    ctx.output = SDD_PIPELINE_COMPLETE_MARKER.to_string();
+                    return Ok(StepResult::Success);
+                }
+                if ctx.data.current_task_index >= MAX_TASKS_PROCESSED {
+                    return Ok(StepResult::Failure);
+                }
+
+                let task = ctx.data.tasks[ctx.data.current_task_index].clone();
+
+                // 1. Role dispatch — state read from ctx.data decides which
+                // role plays this turn.
+                let (role_agent, role_prompt) = if ctx.data.review_issues.is_some() {
+                    // A fix round just landed pending re-review, or this is
+                    // the very first review of a DONE report — both route
+                    // through the reviewer prompts; re-reviewer only once a
+                    // fix round is actually in progress.
+                    if ctx.data.fix_round > 0 {
+                        let findings = ctx.data.review_issues.clone().unwrap_or_default();
+                        let fix_report = ctx.data.last_report.clone().unwrap_or_default();
+                        (
+                            agent_name.clone(),
+                            build_re_reviewer_prompt(&task, &findings, &fix_report),
+                        )
+                    } else {
+                        let report = ctx.data.last_report.clone().unwrap_or_default();
+                        (
+                            agent_name.clone(),
+                            build_task_reviewer_prompt(&task, &report),
+                        )
+                    }
+                } else if ctx.data.last_report.is_some() && ctx.data.fix_round == 0 {
+                    // Implementer already reported and no open issues are
+                    // recorded yet for this pass — dispatch the reviewer.
+                    let report = ctx.data.last_report.clone().unwrap_or_default();
+                    (
+                        agent_name.clone(),
+                        build_task_reviewer_prompt(&task, &report),
+                    )
+                } else {
+                    // Fresh task, or a fix round in progress needing
+                    // re-implementation.
+                    let fix_context = ctx.data.review_issues.as_deref();
+                    (
+                        agent_name.clone(),
+                        build_implementer_prompt(&task, fix_context),
+                    )
+                };
+
+                let (role_reply, in_tok, out_tok) =
+                    send(role_agent, role_prompt).await.map_err(|message| {
+                        WorkflowError::StepFailed {
+                            step_id: StepId::new("sdd_loop"),
+                            message,
+                        }
+                    })?;
+                ctx.input_tokens += in_tok;
+                ctx.output_tokens += out_tok;
+
+                if let Some(issues) = role_reply.strip_prefix(REVIEW_ISSUES_MARKER) {
+                    ctx.data.review_issues = Some(issues.trim().to_string());
+                } else if role_reply.trim() == REVIEW_APPROVED_MARKER {
+                    ctx.data.review_issues = None;
+                } else {
+                    ctx.data.last_report = Some(role_reply.clone());
+                }
+
+                // 2. Judge dispatch.
+                let judge_prompt = build_judge_prompt(
+                    &ctx.data.tasks,
+                    ctx.data.current_task_index,
+                    &ctx.data.ledger,
+                    &role_reply,
+                );
+                let (judge_reply, jin_tok, jout_tok) =
+                    send(judge_agent_name, judge_prompt)
+                        .await
+                        .map_err(|message| WorkflowError::StepFailed {
+                            step_id: StepId::new("sdd_loop"),
+                            message,
+                        })?;
+                ctx.input_tokens += jin_tok;
+                ctx.output_tokens += jout_tok;
+
+                let decision = match parse_judge_decision(&judge_reply) {
+                    Ok(d) => d,
+                    Err(_) => return Ok(StepResult::Failure),
+                };
+
+                // 3. Apply the decision.
+                ctx.data.ledger.push(decision.ledger_line.clone());
+                match decision.action {
+                    JudgeAction::FixRound => {
+                        ctx.data.fix_round += 1;
+                        if ctx.data.fix_round > MAX_FIX_ROUNDS {
+                            return Ok(StepResult::Failure);
+                        }
+                    }
+                    JudgeAction::Escalate => {
+                        ctx.data.fix_round += 1;
+                    }
+                    JudgeAction::AdvanceTask | JudgeAction::SkipTask => {
+                        ctx.data.current_task_index += 1;
+                        ctx.data.fix_round = 0;
+                        ctx.data.review_issues = None;
+                        ctx.data.last_report = None;
+                    }
+                    JudgeAction::InsertTask => {
+                        if ctx.data.tasks.len() >= MAX_TASKS_PROCESSED {
+                            return Ok(StepResult::Failure);
+                        }
+                        let new_id = ctx.data.tasks.len();
+                        ctx.data.tasks.push(SddTask {
+                            id: new_id,
+                            title: decision.rationale.clone(),
+                            body: decision.rationale.clone(),
+                            model_tier: decision.task_model_tier,
+                        });
+                    }
+                    JudgeAction::CompletePipeline => {
+                        ctx.output = SDD_PIPELINE_COMPLETE_MARKER.to_string();
+                        return Ok(StepResult::Success);
+                    }
+                    JudgeAction::ContinueTask
+                    | JudgeAction::ParkFinding
+                    | JudgeAction::RuleAndContinue => {}
+                }
+
+                ctx.output = "CONTINUE".to_string();
+                Ok(StepResult::Success)
+            })
+        },
+    ));
+
+    StepDefinition::new("sdd_loop", "SDD task loop", executor)
+        .with_mode(flare_workflow::StepMode::Loop {
+            max_iterations: (MAX_TASKS_PROCESSED as u32) * (MAX_FIX_ROUNDS + 2),
+            until: SDD_PIPELINE_COMPLETE_MARKER.to_string(),
+        })
+        .with_retry(flare_workflow::RetryPolicy {
+            max_attempts: 3,
+            backoff: flare_workflow::BackoffStrategy::Exponential {
+                base: std::time::Duration::from_secs(1),
+                max: std::time::Duration::from_secs(30),
+            },
+        })
+}
+
 /// Wraps `execute_work`'s existing hold/`item_done`/comment/notify tail
 /// (`src/cli/work.rs`'s `HeadlessOutcome::Ok` arm) as the pipeline's last
 /// step. Three outcomes, checked in order:
@@ -1552,5 +1741,120 @@ mod judge_decision_tests {
         let reply = r#"{"action":"do_a_barrel_roll","rationale":"x","ledger_line":"x","task_model_tier":null}"#;
         let err = parse_judge_decision(reply).unwrap_err();
         assert!(matches!(err, JudgeParseError::InvalidJson(_)));
+    }
+}
+
+/// Shared fixtures for `sdd_loop_tests` (this task) and later plan tasks'
+/// test modules (Task 6's `cap_tests`, Tasks 11/12) that need the same
+/// mocked `send` and a minimal single-task `WorkItemData` — a sibling
+/// `#[cfg(test)] mod` can't reach into another sibling module's private
+/// items, so these live in their own module and get pulled in via
+/// `use super::sdd_test_support::*;`.
+#[cfg(test)]
+mod sdd_test_support {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    /// Records every `(agent_name, prompt)` call and returns queued replies
+    /// in order.
+    pub(crate) fn mock_send(
+        replies: Vec<&'static str>,
+    ) -> (
+        flare_workflow::json::SendMessage,
+        Arc<Mutex<Vec<(String, String)>>>,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let queue = Arc::new(Mutex::new(replies.into_iter().collect::<VecDeque<_>>()));
+        let calls_clone = calls.clone();
+        let send: flare_workflow::json::SendMessage = Arc::new(move |agent, prompt| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push((agent.clone(), prompt.clone()));
+            let reply = queue.lock().unwrap().pop_front().unwrap_or("").to_string();
+            Box::pin(async move { Ok((reply, 10u64, 10u64)) })
+        });
+        (send, calls)
+    }
+
+    pub(crate) fn one_task_data() -> WorkItemData {
+        WorkItemData {
+            tasks: vec![SddTask {
+                id: 0,
+                title: "Add flag".to_string(),
+                body: "Add --verbose".to_string(),
+                model_tier: None,
+            }],
+            ..Default::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod sdd_loop_tests {
+    use super::sdd_test_support::*;
+    use super::*;
+
+    #[tokio::test]
+    async fn first_iteration_dispatches_implementer_then_judge() {
+        let (send, calls) = mock_send(vec![
+            "DONE: added the flag",
+            r#"{"action":"advance_task","rationale":"looks done","ledger_line":"Task 0: implementer done","task_model_tier":null}"#,
+        ]);
+        let step = build_sdd_loop_step(
+            "implementer-agent".to_string(),
+            "judge-agent".to_string(),
+            send,
+        );
+        let mut ctx = WorkflowContext::new(Default::default(), one_task_data());
+        let result = step.executor.execute(&mut ctx).await.expect("executes");
+        assert!(matches!(result, StepResult::Success));
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded[0].0, "implementer-agent");
+        assert_eq!(recorded[1].0, "judge-agent");
+        assert_eq!(
+            ctx.data.ledger,
+            vec!["Task 0: implementer done".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_pipeline_action_sets_terminator_output() {
+        let (send, _calls) = mock_send(vec![
+            "REVIEW_APPROVED",
+            r#"{"action":"complete_pipeline","rationale":"all done","ledger_line":"Pipeline: complete","task_model_tier":null}"#,
+        ]);
+        let mut data = one_task_data();
+        // A non-empty `last_report` with no open `review_issues` and no fix
+        // round in progress is what routes this iteration to the
+        // task-reviewer role instead of the implementer.
+        data.last_report = Some("DONE: added the flag".to_string());
+        let step = build_sdd_loop_step(
+            "implementer-agent".to_string(),
+            "judge-agent".to_string(),
+            send,
+        );
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+        step.executor.execute(&mut ctx).await.expect("executes");
+        assert_eq!(ctx.output, "PIPELINE_COMPLETE");
+    }
+
+    #[tokio::test]
+    async fn judge_parse_failure_is_step_failure() {
+        let (send, _calls) = mock_send(vec!["DONE: added the flag", "not json"]);
+        let step = build_sdd_loop_step(
+            "implementer-agent".to_string(),
+            "judge-agent".to_string(),
+            send,
+        );
+        let mut ctx = WorkflowContext::new(Default::default(), one_task_data());
+        let result = step
+            .executor
+            .execute(&mut ctx)
+            .await
+            .expect("returns Ok(Failure), not Err");
+        assert!(matches!(result, StepResult::Failure));
     }
 }
