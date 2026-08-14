@@ -812,7 +812,7 @@ pub(crate) fn build_judge_prompt(
         .enumerate()
         .map(|(i, t)| {
             format!(
-                "{}. {}{}",
+                "{}. {}{}\n",
                 i,
                 t.title,
                 if i == current_task_index {
@@ -1469,6 +1469,54 @@ mod prompt_builder_tests {
         let ledger = vec!["Task 0: fix round 1/5 (1 addressed)".to_string()];
         let prompt = build_judge_prompt(&[sample_task()], 0, &ledger, "REVIEW_APPROVED");
         assert!(prompt.contains("fix round 1/5"));
+    }
+
+    #[test]
+    fn judge_prompt_formats_multiple_tasks_on_separate_lines() {
+        let tasks = vec![
+            SddTask {
+                id: 0,
+                title: "Add flag".to_string(),
+                body: "Add --verbose".to_string(),
+                model_tier: None,
+            },
+            SddTask {
+                id: 1,
+                title: "Fix bug".to_string(),
+                body: "Fix null pointer".to_string(),
+                model_tier: None,
+            },
+            SddTask {
+                id: 2,
+                title: "Add docs".to_string(),
+                body: "Document the flag".to_string(),
+                model_tier: None,
+            },
+        ];
+        let prompt = build_judge_prompt(&tasks, 1, &[], "Test role reply");
+
+        // Split the prompt by newlines and verify each task appears on its own line
+        let lines: Vec<&str> = prompt.lines().collect();
+
+        // Find the "Plan:" section and verify tasks are listed with proper line breaks
+        let task_lines: Vec<&str> = lines
+            .iter()
+            .filter(|line| {
+                line.contains("Add flag") || line.contains("Fix bug") || line.contains("Add docs")
+            })
+            .copied()
+            .collect();
+
+        // All three task titles should appear as separate lines (not concatenated)
+        assert_eq!(
+            task_lines.len(),
+            3,
+            "Expected 3 separate lines for 3 tasks, got: {:?}",
+            task_lines
+        );
+        assert!(task_lines[0].contains("Add flag"));
+        assert!(task_lines[1].contains("Fix bug") && task_lines[1].contains("<- current"));
+        assert!(task_lines[2].contains("Add docs"));
     }
 }
 
