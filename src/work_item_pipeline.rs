@@ -1784,6 +1784,17 @@ mod sdd_test_support {
             ..Default::default()
         }
     }
+
+    /// `build_sdd_loop_step` with the fixed agent names `sdd_loop_tests` uses.
+    pub(crate) fn sdd_step(
+        send: flare_workflow::json::SendMessage,
+    ) -> StepDefinition<WorkItemData> {
+        build_sdd_loop_step(
+            "implementer-agent".to_string(),
+            "judge-agent".to_string(),
+            send,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1797,11 +1808,7 @@ mod sdd_loop_tests {
             "DONE: added the flag",
             r#"{"action":"advance_task","rationale":"looks done","ledger_line":"Task 0: implementer done","task_model_tier":null}"#,
         ]);
-        let step = build_sdd_loop_step(
-            "implementer-agent".to_string(),
-            "judge-agent".to_string(),
-            send,
-        );
+        let step = sdd_step(send);
         let mut ctx = WorkflowContext::new(Default::default(), one_task_data());
         let result = step.executor.execute(&mut ctx).await.expect("executes");
         assert!(matches!(result, StepResult::Success));
@@ -1822,15 +1829,10 @@ mod sdd_loop_tests {
             r#"{"action":"complete_pipeline","rationale":"all done","ledger_line":"Pipeline: complete","task_model_tier":null}"#,
         ]);
         let mut data = one_task_data();
-        // A non-empty `last_report` with no open `review_issues` and no fix
-        // round in progress is what routes this iteration to the
-        // task-reviewer role instead of the implementer.
+        // A non-empty `last_report` with no open `review_issues`/fix round
+        // routes this iteration to the task-reviewer, not the implementer.
         data.last_report = Some("DONE: added the flag".to_string());
-        let step = build_sdd_loop_step(
-            "implementer-agent".to_string(),
-            "judge-agent".to_string(),
-            send,
-        );
+        let step = sdd_step(send);
         let mut ctx = WorkflowContext::new(Default::default(), data);
         step.executor.execute(&mut ctx).await.expect("executes");
         assert_eq!(ctx.output, "PIPELINE_COMPLETE");
@@ -1838,12 +1840,11 @@ mod sdd_loop_tests {
 
     #[tokio::test]
     async fn fix_round_dispatches_implementer_not_re_reviewer_next_iteration() {
-        // Round 1: a pending report gets reviewed, the reviewer finds
-        // issues, and the judge issues a `fix_round` decision (which bumps
-        // `fix_round` to 1 in this SAME iteration, before the implementer
-        // ever runs). Round 2 must NOT read `fix_round > 0` as "a fix was
-        // already submitted" — it must dispatch the implementer to actually
-        // attempt the fix, not the re-reviewer to re-review a stale report.
+        // Round 1: the reviewer finds issues and the judge issues a
+        // `fix_round` decision, bumping `fix_round` to 1 in this SAME
+        // iteration, before the implementer ever runs. Round 2 must NOT read
+        // `fix_round > 0` as "a fix was already submitted" — it must
+        // dispatch the implementer, not re-review a stale report.
         let (send, calls) = mock_send(vec![
             "REVIEW_ISSUES: missing null check on line 12",
             r#"{"action":"fix_round","rationale":"issues found","ledger_line":"Task 0: fix round 1","task_model_tier":null}"#,
@@ -1852,11 +1853,7 @@ mod sdd_loop_tests {
         ]);
         let mut data = one_task_data();
         data.last_report = Some("DONE: initial attempt".to_string());
-        let step = build_sdd_loop_step(
-            "implementer-agent".to_string(),
-            "judge-agent".to_string(),
-            send,
-        );
+        let step = sdd_step(send);
         let mut ctx = WorkflowContext::new(Default::default(), data);
 
         // Round 1: task-reviewer finds issues, judge calls fix_round.
@@ -1874,8 +1871,7 @@ mod sdd_loop_tests {
             "clearing last_report on REVIEW_ISSUES signals no fix attempt exists yet"
         );
 
-        // Round 2: must dispatch the implementer (with the findings as fix
-        // context), not the re-reviewer.
+        // Round 2: must dispatch the implementer with the findings as fix context.
         step.executor
             .execute(&mut ctx)
             .await
@@ -1899,11 +1895,9 @@ mod sdd_loop_tests {
 
     #[tokio::test]
     async fn full_cycle_dispatches_re_reviewer_after_implementer_fix() {
-        // Extends the above: task-reviewer finds issues -> judge fix_round
-        // -> implementer fixes -> judge continue_task -> the FOLLOWING
-        // iteration must dispatch the re-reviewer (not the task-reviewer
-        // again) with the fix report, proving the `last_report.is_some()`
-        // branch of the fix works too.
+        // Extends the above: reviewer finds issues -> fix_round -> implementer
+        // fixes -> continue_task -> the FOLLOWING iteration must dispatch the
+        // re-reviewer, proving the `last_report.is_some()` branch works too.
         let (send, calls) = mock_send(vec![
             "REVIEW_ISSUES: missing null check on line 12",
             r#"{"action":"fix_round","rationale":"issues found","ledger_line":"Task 0: fix round 1","task_model_tier":null}"#,
@@ -1914,11 +1908,7 @@ mod sdd_loop_tests {
         ]);
         let mut data = one_task_data();
         data.last_report = Some("DONE: initial attempt".to_string());
-        let step = build_sdd_loop_step(
-            "implementer-agent".to_string(),
-            "judge-agent".to_string(),
-            send,
-        );
+        let step = sdd_step(send);
         let mut ctx = WorkflowContext::new(Default::default(), data);
 
         step.executor
@@ -1958,11 +1948,7 @@ mod sdd_loop_tests {
     #[tokio::test]
     async fn judge_parse_failure_is_step_failure() {
         let (send, _calls) = mock_send(vec!["DONE: added the flag", "not json"]);
-        let step = build_sdd_loop_step(
-            "implementer-agent".to_string(),
-            "judge-agent".to_string(),
-            send,
-        );
+        let step = sdd_step(send);
         let mut ctx = WorkflowContext::new(Default::default(), one_task_data());
         let result = step
             .executor
@@ -1979,22 +1965,35 @@ mod cap_tests {
     async fn sixth_fix_round_fails_the_step() {
         let send: flare_workflow::json::SendMessage = std::sync::Arc::new(move |_, p| {
             Box::pin(async move {
-                let r = if p.contains("judge") { r#"{"action":"fix_round","rationale":"x","ledger_line":"x","task_model_tier":null}"# } else { "REVIEW_ISSUES: x" };
+                let r = if p.contains("judge") {
+                    r#"{"action":"fix_round","rationale":"x","ledger_line":"x","task_model_tier":null}"#
+                } else {
+                    "REVIEW_ISSUES: x"
+                };
                 Ok((r.to_string(), 5u64, 5u64))
             })
         });
         let mut d = one_task_data();
-        d.fix_round = MAX_FIX_ROUNDS; d.review_issues = Some("x".to_string()); d.last_report = Some("x".to_string());
+        d.fix_round = MAX_FIX_ROUNDS;
+        d.review_issues = Some("x".to_string());
+        d.last_report = Some("x".to_string());
         let step = build_sdd_loop_step("a".to_string(), "b".to_string(), send);
         let mut ctx = WorkflowContext::new(Default::default(), d);
-        assert!(matches!(step.executor.execute(&mut ctx).await.expect("x"), StepResult::Failure));
+        assert!(matches!(
+            step.executor.execute(&mut ctx).await.expect("x"),
+            StepResult::Failure
+        ));
     }
     #[tokio::test]
     async fn max_tasks_processed_bound_fails_the_step() {
         let (send, _) = mock_send(vec![]);
-        let mut d = one_task_data(); d.current_task_index = MAX_TASKS_PROCESSED;
+        let mut d = one_task_data();
+        d.current_task_index = MAX_TASKS_PROCESSED;
         let step = build_sdd_loop_step("a".to_string(), "b".to_string(), send);
         let mut ctx = WorkflowContext::new(Default::default(), d);
-        assert!(matches!(step.executor.execute(&mut ctx).await.expect("x"), StepResult::Failure));
+        assert!(matches!(
+            step.executor.execute(&mut ctx).await.expect("x"),
+            StepResult::Failure
+        ));
     }
 }
