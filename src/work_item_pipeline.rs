@@ -1556,6 +1556,40 @@ mod sdd_loop_tests {
             "must not re-dispatch the already-completed task"
         );
     }
+
+    #[test]
+    fn single_task_synthesized_from_item_description_when_no_plan_doc() {
+        let tasks = load_or_synthesize_tasks("Fix the off-by-one in pagination", None);
+        assert_eq!(tasks.len(), 1);
+        // Degenerate case: exactly #110's original shape — one implementer
+        // dispatch, one review, no fix-loop-specific task list machinery
+        // engaged beyond what a single task naturally exercises.
+        assert_eq!(tasks[0].body, "Fix the off-by-one in pagination");
+    }
+
+    #[tokio::test]
+    async fn single_task_plan_reaches_complete_pipeline_after_one_approved_review() {
+        let (send, _calls) = mock_send(vec![
+            "DONE: fixed pagination",
+            r#"{"action":"advance_task","rationale":"impl done, needs review next","ledger_line":"Task 0: implemented","task_model_tier":null}"#,
+        ]);
+        let step = sdd_step(send);
+        let tasks = load_or_synthesize_tasks("Fix the off-by-one in pagination", None);
+        let data = WorkItemData {
+            tasks,
+            ..Default::default()
+        };
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+        step.executor.execute(&mut ctx).await.expect("executes");
+        assert_eq!(
+            ctx.data.current_task_index, 1,
+            "advanced past the only task"
+        );
+        assert_eq!(
+            ctx.output, "CONTINUE",
+            "next iteration will see current_task_index >= tasks.len() and complete"
+        );
+    }
 }
 #[cfg(test)]
 mod cap_tests {
