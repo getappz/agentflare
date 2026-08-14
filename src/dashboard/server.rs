@@ -682,22 +682,30 @@ fn work_max_concurrency() -> usize {
 /// no-op rather than a hard failure.
 fn spawn_binary_staleness_watchdog(snapshot: Option<crate::daemon::BinarySnapshot>) {
     let Some(snapshot) = snapshot else {
+        // `BinarySnapshot::capture()`'s doc comment already explains why this
+        // is a no-op rather than a hard failure -- but a no-op that never
+        // logs anything is indistinguishable from "armed and nothing's
+        // stale yet" from the outside (item #107), so say so explicitly.
+        eprintln!(
+            "agentflare-daemon: binary staleness watchdog disabled -- couldn't resolve the \
+             on-disk binary this process was launched from at startup"
+        );
         return;
     };
+    eprintln!(
+        "agentflare-daemon: binary staleness watchdog armed for {}, checking every {}s",
+        snapshot.path().display(),
+        BINARY_STALENESS_CHECK_INTERVAL.as_secs()
+    );
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(BINARY_STALENESS_CHECK_INTERVAL);
-        loop {
-            ticker.tick().await;
-            if snapshot.is_stale() {
-                eprintln!(
-                    "agentflare-daemon: on-disk binary at {} changed since this daemon \
-                     started -- restarting to pick up the new build instead of running \
-                     stale in-process job logic",
-                    snapshot.path().display()
-                );
-                crate::daemon::respawn_from_stale(&snapshot);
-            }
-        }
+        crate::daemon::wait_for_stale(&snapshot, BINARY_STALENESS_CHECK_INTERVAL).await;
+        eprintln!(
+            "agentflare-daemon: on-disk binary at {} changed since this daemon \
+             started -- restarting to pick up the new build instead of running \
+             stale in-process job logic",
+            snapshot.path().display()
+        );
+        crate::daemon::respawn_from_stale(&snapshot);
     });
 }
 

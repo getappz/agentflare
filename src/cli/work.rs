@@ -616,6 +616,25 @@ fn notify(recipient: &str, body: &str, item_id: &str) {
 
 impl WorkArgs {
     pub fn run(self) {
+        if let Some(agent) = agent_detector::agent_name() {
+            eprintln!(
+                "error: `agentflare work` is a human-only command — it bypasses the daemon's \
+                 claim/queue tracking that the dashboard and autonomous self-repair depend on \
+                 (detected this process is running under the {agent} AI agent).\n\n\
+                 If you're an AI agent: don't run this directly. Either wait for the daemon's \
+                 discovery tick to dispatch the item (it will, once `ready-for-work` is set and \
+                 nothing blocks it), or ask a human to run this command for you if the item is \
+                 genuinely stuck."
+            );
+            // Known tension (item #113): this deny is strict and has no override. This
+            // session's own recovery of #104/#107 (claims that outlived their TTL past the
+            // daemon's 3-attempt self-repair cap) needed a human-authorized `agentflare work`
+            // run executed by an AI agent after explicit sign-off -- a path this guard now
+            // closes entirely, even with a human in the loop. Left unresolved on purpose; an
+            // override (e.g. `--i-am-a-human`, or a prompt requiring real terminal input) is a
+            // deliberate future decision, not something to route around here.
+            std::process::exit(1);
+        }
         std::process::exit(execute_work(self, &mut std::io::stdout()).exit_code);
     }
 }
@@ -765,7 +784,8 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
             _ => {
                 let owner = claim["owner"].as_str().unwrap_or("?");
                 let age = claim["age_secs"].as_i64().unwrap_or(0);
-                format!("item held by {owner} ({age}s) — cannot claim")
+                let ttl = claim["ttl_secs"].as_i64().unwrap_or(0);
+                format!("item held by {owner} ({age}s, ttl {ttl}s) — cannot claim")
             }
         };
         crate::ui::error(&msg);
@@ -1090,6 +1110,28 @@ mod tests {
             updated_at: 0,
             deleted_at: None,
         }
+    }
+
+    /// `WorkArgs::run`'s guard denies whenever `agent_detector::agent_name()` returns
+    /// `Some`, so exercising that same primitive here is what actually proves the guard
+    /// fires -- there's no separate marker list of our own left to drift out of sync.
+    /// Only the "detects" direction is asserted: unlike the env var it sets and clears,
+    /// `agent_detector::agent_name()` also walks the parent process tree, which a sandboxed
+    /// dev session (this one included) can make non-empty even with every marker env var
+    /// cleared, so asserting the "clear -> None" side here would be flaky by environment
+    /// rather than by test bug.
+    #[test]
+    fn agent_detector_flags_the_claudecode_marker_run_denies_on() {
+        // SAFETY: test-only; CLAUDECODE isn't touched by any other test in this
+        // process, and set/remove here always run on the same thread.
+        unsafe {
+            std::env::set_var("CLAUDECODE", "1");
+        }
+        let detected = agent_detector::agent_name();
+        unsafe {
+            std::env::remove_var("CLAUDECODE");
+        }
+        assert_eq!(detected.as_deref(), Some("claude-code"));
     }
 
     #[test]
