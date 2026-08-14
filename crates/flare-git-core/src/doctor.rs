@@ -241,6 +241,15 @@ pub fn scan(
 
 pub fn reclaim(repo_root: &Path, report: &DoctorReport, force: bool) -> Vec<String> {
     let mut reclaimed = Vec::new();
+    // Whether any lane was reclaimed at all -- a single `git worktree prune`
+    // at the end clears every dangling `.git/worktrees/<name>` admin entry
+    // this pass created or inherited. It used to run only after a successful
+    // `remove_dir_all`, so a `MissingWorktree` lane (directory already gone
+    // some other way) was reported reclaimed while its admin entry survived:
+    // `git worktree list` kept calling it prunable and `git branch -d` kept
+    // failing with "used by worktree", with no way out because plain
+    // `git worktree prune` is denied by the shim.
+    let mut needs_prune = false;
     for lane in &report.lanes {
         // Never reclaim the main/canonical worktree, full stop -- not even
         // under `--force`. `git worktree remove` itself refuses to ever
@@ -282,16 +291,23 @@ pub fn reclaim(repo_root: &Path, report: &DoctorReport, force: bool) -> Vec<Stri
             }
             match std::fs::remove_dir_all(path) {
                 Ok(()) => {
-                    let _ = crate::shell::run_in(repo_root, &["worktree", "prune"]);
+                    needs_prune = true;
                     reclaimed.push(lane.name.clone());
                 }
+                // A lane whose directory could not be deleted is NOT
+                // reclaimed -- deliberately no push here, and no prune
+                // either, since its admin entry still points at a live dir.
                 Err(e) => {
                     eprintln!("doctor: failed to reclaim '{}': {}", lane.name, e);
                 }
             }
         } else {
+            needs_prune = true;
             reclaimed.push(lane.name.clone());
         }
+    }
+    if needs_prune {
+        let _ = crate::shell::run_in(repo_root, &["worktree", "prune"]);
     }
     reclaimed
 }
@@ -678,5 +694,65 @@ mod tests {
             !reclaimed.contains(&main_name),
             "main worktree must never be reported as reclaimed"
         );
+    }
+
+    #[test]
+    fn reclaim_prunes_the_admin_entry_of_an_already_deleted_worktree() {
+        // Vent #469: `git worktree prune` used to run only after a
+        // successful `remove_dir_all`, so a lane whose directory was
+        // already gone -- exactly what `MissingWorktree` describes -- got
+        // reported as reclaimed with its `.git/worktrees/<name>` admin
+        // entry left dangling. `git branch -d` then kept failing with
+        // "used by worktree", and the shim denies plain `git worktree
+        // prune`, so there was no way out.
+        let repo = crate::shell::test_support::init_repo_with_branch("main");
+        std::fs::write(repo.path.join(".gitignore"), ".worktrees/\n").unwrap();
+        crate::shell::run_in(&repo.path, &["add", ".gitignore"]).unwrap();
+        crate::shell::run_in(&repo.path, &["commit", "-m", "gitignore worktrees"]).unwrap();
+        let linked_path = repo.path.join(".worktrees").join("linked");
+        crate::shell::run_in(
+            &repo.path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-branch",
+                linked_path.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        // Delete the directory out from under git, the way an agent (or an
+        // `rm -rf`) would -- leaving the admin entry behind.
+        std::fs::remove_dir_all(&linked_path).unwrap();
+
+        let report = scan(&repo.path, 14, &std::collections::HashMap::new());
+        let lane = report
+            .lanes
+            .iter()
+            .find(|l| !l.is_main_worktree)
+            .expect("scan must still report the lane whose directory is gone");
+        assert!(
+            lane.flags
+                .iter()
+                .any(|f| matches!(f, HealthFlag::MissingWorktree)),
+            "test setup assumption: lane should be flagged missing-worktree, got {:?}",
+            lane.flags
+        );
+
+        let reclaimed = reclaim(&repo.path, &report, false);
+        assert!(
+            reclaimed.iter().any(|n| n == "linked-branch"),
+            "the missing lane should be reported reclaimed, got {reclaimed:?}"
+        );
+
+        let listed =
+            crate::shell::run_in(&repo.path, &["worktree", "list", "--porcelain"]).unwrap();
+        assert!(
+            !listed.contains("prunable"),
+            "reclaim must clear the dangling admin entry, still got: {listed}"
+        );
+        // The payoff: the branch is deletable again.
+        crate::shell::run_in(&repo.path, &["branch", "-d", "linked-branch"])
+            .expect("branch must be deletable once its worktree entry is pruned");
     }
 }

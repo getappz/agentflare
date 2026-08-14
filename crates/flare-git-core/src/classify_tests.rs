@@ -199,7 +199,10 @@ fn worktree_teardown_deny_points_at_the_cleanup_tool() {
             panic!("expected deny for worktree {sub}");
         };
         assert!(reason.contains("check_merge"), "{reason}");
-        assert!(reason.contains("audit --prune"), "{reason}");
+        // The CLI it names must be the real one -- `src/cli/git.rs`'s
+        // `worktree_teardown_deny_names_a_parsable_cli` parses this same
+        // constant against the clap definition, so the two can't drift.
+        assert!(reason.contains(WORKTREE_PRUNE_COMMAND), "{reason}");
     }
 }
 
