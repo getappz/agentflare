@@ -26,6 +26,7 @@ use crate::retry::{self, Backoff};
 use crate::store::{InMemoryStore, StateStore};
 use crate::types::*;
 use crate::variables::capture_output;
+use crate::waits::WakeAt;
 
 /// RAII guard that decrements the active-workflow count on drop.
 struct ActiveWorkflowGuard {
@@ -820,7 +821,14 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                         }
                         StepMode::Loop { .. } => engine.execute_loop(run_id, step, &def).await,
                         StepMode::Sleep { duration_secs } => {
-                            engine.execute_sleep(run_id, step, *duration_secs).await
+                            engine
+                                .execute_sleep(run_id, step, WakeAt::Relative(*duration_secs))
+                                .await
+                        }
+                        StepMode::SleepUntil { wake_at } => {
+                            engine
+                                .execute_sleep(run_id, step, WakeAt::Absolute(*wake_at))
+                                .await
                         }
                         StepMode::WaitEvent { name, timeout_secs } => {
                             engine
