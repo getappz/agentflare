@@ -339,13 +339,13 @@ pub(crate) fn build_sdd_loop_step(
             let agent_name = agent_name.clone();
             let judge_agent_name = judge_agent_name.clone();
             Box::pin(async move {
+                if ctx.data.current_task_index >= MAX_TASKS_PROCESSED {
+                    return Ok(StepResult::Failure);
+                }
                 if ctx.data.tasks.is_empty() || ctx.data.current_task_index >= ctx.data.tasks.len()
                 {
                     ctx.output = SDD_PIPELINE_COMPLETE_MARKER.to_string();
                     return Ok(StepResult::Success);
-                }
-                if ctx.data.current_task_index >= MAX_TASKS_PROCESSED {
-                    return Ok(StepResult::Failure);
                 }
 
                 let task = ctx.data.tasks[ctx.data.current_task_index].clone();
@@ -1970,5 +1970,37 @@ mod sdd_loop_tests {
             .await
             .expect("returns Ok(Failure), not Err");
         assert!(matches!(result, StepResult::Failure));
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::{sdd_test_support::*, *};
+    #[tokio::test]
+    async fn sixth_fix_round_fails_the_step() {
+        let send: flare_workflow::json::SendMessage = std::sync::Arc::new(move |_, p| {
+            Box::pin(async move {
+                let r = if p.contains("judge") {
+                    r#"{"action":"fix_round","rationale":"x","ledger_line":"x","task_model_tier":null}"#
+                } else { "REVIEW_ISSUES: x" };
+                Ok((r.to_string(), 5u64, 5u64))
+            })
+        });
+        let mut d = one_task_data();
+        d.fix_round = MAX_FIX_ROUNDS;
+        d.review_issues = Some("x".to_string());
+        d.last_report = Some("x".to_string());
+        let step = build_sdd_loop_step("a".to_string(), "b".to_string(), send);
+        let mut ctx = WorkflowContext::new(Default::default(), d);
+        assert!(matches!(step.executor.execute(&mut ctx).await.expect("x"), StepResult::Failure));
+    }
+    #[tokio::test]
+    async fn max_tasks_processed_bound_fails_the_step() {
+        let (send, _) = mock_send(vec![]);
+        let mut d = one_task_data();
+        d.current_task_index = MAX_TASKS_PROCESSED;
+        let step = build_sdd_loop_step("a".to_string(), "b".to_string(), send);
+        let mut ctx = WorkflowContext::new(Default::default(), d);
+        assert!(matches!(step.executor.execute(&mut ctx).await.expect("x"), StepResult::Failure));
     }
 }
