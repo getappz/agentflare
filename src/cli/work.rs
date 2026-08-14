@@ -1663,36 +1663,49 @@ use  = "opencode"
             };
 
             let mut log = Vec::new();
-            let outcome = execute_work_impl(work_args, &mut log, |mcp, item, agent, coder_prompt, review_prompt_prefix, notify, timeout, idle_timeout, extra_args| {
-                // Something real to commit, written into the worktree
-                // `execute_work_impl` already chdir'd into by this point --
-                // otherwise `finalize`'s `item_done` sees a never-diverged
-                // branch and treats the run as a no-op instead of a
-                // completion (see `work_item_pipeline`'s own finalize
-                // tests).
-                std::fs::write(
-                    std::env::current_dir().unwrap().join("real_work.txt"),
-                    "real work",
-                )
-                .unwrap();
-                // Same reply satisfies both roles the shared sender is
-                // invoked as: the coder step stores it as a normal (non-hold)
-                // reply, and the review_or_fix step's first call reads it as
-                // an immediate `REVIEW_APPROVED`.
-                let send: flare_workflow::json::SendMessage = std::sync::Arc::new(move |_a, _p| {
-                    Box::pin(async { Ok(("REVIEW_APPROVED".to_string(), 1u64, 0u64)) })
-                });
-                let _ = (timeout, idle_timeout, extra_args);
-                crate::work_item_pipeline::run_or_resume_with_sender(
-                    mcp,
-                    item,
-                    agent,
-                    coder_prompt,
-                    review_prompt_prefix,
-                    notify,
-                    send,
-                )
-            });
+            let outcome = execute_work_impl(
+                work_args,
+                &mut log,
+                |mcp,
+                 item,
+                 agent,
+                 coder_prompt,
+                 review_prompt_prefix,
+                 notify,
+                 timeout,
+                 idle_timeout,
+                 extra_args| {
+                    // Something real to commit, written into the worktree
+                    // `execute_work_impl` already chdir'd into by this point --
+                    // otherwise `finalize`'s `item_done` sees a never-diverged
+                    // branch and treats the run as a no-op instead of a
+                    // completion (see `work_item_pipeline`'s own finalize
+                    // tests).
+                    std::fs::write(
+                        std::env::current_dir().unwrap().join("real_work.txt"),
+                        "real work",
+                    )
+                    .unwrap();
+                    // Same reply satisfies both roles the shared sender is
+                    // invoked as: the coder step stores it as a normal (non-hold)
+                    // reply, and the review_or_fix step's first call reads it as
+                    // an immediate `REVIEW_APPROVED`.
+                    let send: flare_workflow::json::SendMessage =
+                        std::sync::Arc::new(move |_a, _p| {
+                            Box::pin(async { Ok(("REVIEW_APPROVED".to_string(), 1u64, 0u64)) })
+                        });
+                    let _ = (timeout, idle_timeout, extra_args);
+                    crate::work_item_pipeline::run_or_resume_with_sender(
+                        mcp,
+                        item,
+                        agent,
+                        coder_prompt,
+                        review_prompt_prefix,
+                        notify,
+                        send,
+                    )
+                },
+            );
 
             assert_eq!(outcome.exit_code, 0);
 
