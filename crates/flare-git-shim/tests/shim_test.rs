@@ -125,6 +125,9 @@ fn checkout_to_protected_branch_is_denied_and_real_git_never_runs() {
         repo.path(),
         &["checkout", "-b", "feature/x"]
     ));
+    // A clean tree now passes checkout/switch to the default branch through
+    // on its own, so dirty it here to actually exercise the deny path.
+    std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
 
     let out = shim(repo.path(), home.path(), &["checkout", "master"]);
     assert!(!out.status.success());
@@ -226,6 +229,9 @@ fn denied_command_is_logged_to_the_audit_log() {
         repo.path(),
         &["checkout", "-b", "feature/x"]
     ));
+    // A clean tree now passes checkout/switch to the default branch through
+    // on its own, so dirty it here to actually exercise the deny path.
+    std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
     let out = shim(repo.path(), home.path(), &["checkout", "master"]);
     assert!(!out.status.success());
 
@@ -260,7 +266,11 @@ fn bypass_agent_env_var_bypasses_only_for_the_matching_agent() {
     assert!(out.status.success(), "{out:?}");
 
     // Back to feature/x, try again with a DIFFERENT agent -- must still deny.
+    // A clean tree now passes checkout/switch to the default branch through
+    // regardless of agent, so dirty it here to actually exercise the
+    // agent-bypass gate rather than the clean-tree passthrough.
     flare_git_core::shell::run_in(repo.path(), &["checkout", "feature/x"]).unwrap();
+    std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_git"))
         .args(["checkout", "master"])
         .current_dir(repo.path())
@@ -280,6 +290,10 @@ fn bypass_until_env_var_respects_the_deadline() {
         repo.path(),
         &["checkout", "-b", "feature/x"]
     ));
+    // A clean tree now passes checkout/switch to the default branch through
+    // on its own, so dirty it here -- both attempts below must actually
+    // exercise the deadline gate, not the clean-tree passthrough.
+    std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -406,6 +420,10 @@ fn canonical_repo_default_branch_return_is_allowed_with_escape_hatch() {
         repo.path(),
         &["checkout", "-b", "feature/x"]
     ));
+    // A clean tree now passes a switch to the default branch through on its
+    // own, so dirty it here -- this test is specifically about the escape
+    // hatch, not the clean-tree passthrough.
+    std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
 
     // Without the escape hatch: switching to the protected default branch
     // in the canonical checkout is denied.
@@ -459,6 +477,10 @@ fn protected_branch_checkout_is_denied_for_agent_but_passes_through_for_a_human(
         repo.path(),
         &["checkout", "-b", "feature/x"]
     ));
+    // A clean tree now passes checkout/switch to the default branch through
+    // on its own regardless of agent/human, so dirty it here -- this test
+    // is about the agent-vs-human distinction, not the clean-tree check.
+    std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
 
     // Agent-invoked -- denied (same assertion as
     // checkout_to_protected_branch_is_denied_and_real_git_never_runs, via
