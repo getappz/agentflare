@@ -129,7 +129,7 @@ fn worker_loop(
                         }
                     }
                     Err(e) => {
-                        if let Err(qe) = queue.fail(&id, &e.to_string(), None) {
+                        if let Err(qe) = queue.fail(&id, &e.to_string(), None, false) {
                             eprintln!("agentflare-jobs: failed to record failure for {id}: {qe}");
                         }
                     }
@@ -180,10 +180,11 @@ fn run_in_process(
     // no-executor-registered or log-file-open-failure early returns below)
     // would silently reintroduce item #463 for jobs that never even reached
     // the executor.
-    let record_fail = |error: &str, retry_after_secs: Option<u64>| match queue.fail(
+    let record_fail = |error: &str, retry_after_secs: Option<u64>, fatal: bool| match queue.fail(
         id,
         error,
         retry_after_secs,
+        fatal,
     ) {
         Ok(true) => {
             if let Some(hook) = terminal_failure_hook {
@@ -198,6 +199,7 @@ fn run_in_process(
         record_fail(
             "job is marked in_process but no InProcessExecutor is registered on this WorkerPool",
             None,
+            false,
         );
         return;
     };
@@ -207,7 +209,7 @@ fn run_in_process(
     let mut log_file = match std::fs::File::create(&stdout_path) {
         Ok(f) => f,
         Err(e) => {
-            record_fail(&format!("failed to open job log file: {e}"), None);
+            record_fail(&format!("failed to open job log file: {e}"), None, false);
             return;
         }
     };
@@ -240,7 +242,7 @@ fn run_in_process(
             }
         }
         Ok(Err(failure)) => {
-            record_fail(&failure.message, failure.retry_after_secs);
+            record_fail(&failure.message, failure.retry_after_secs, failure.fatal);
         }
         Err(_) => {
             let msg = format!(
@@ -250,7 +252,7 @@ fn run_in_process(
                  what this timeout measures)",
                 job.timeout_secs
             );
-            record_fail(&msg, None);
+            record_fail(&msg, None, false);
         }
     }
 }

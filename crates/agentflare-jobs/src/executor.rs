@@ -30,6 +30,15 @@ pub trait InProcessExecutor: Send + Sync {
 pub struct JobFailure {
     pub message: String,
     pub retry_after_secs: Option<u64>,
+    /// Set by a caller that knows the underlying cause can't change between
+    /// attempts (e.g. `agentflare work`'s "claim succeeded but no worktree
+    /// was created" path — a broken git worktree registration doesn't heal
+    /// itself by retrying against it again). `true` sends the job straight
+    /// to terminal `state = 'failed'` in `Queue::fail`, regardless of how
+    /// many retries remain, instead of consuming the normal
+    /// transient-failure retry budget before the existing terminal-failure
+    /// recovery hook can run.
+    pub fatal: bool,
 }
 
 impl From<String> for JobFailure {
@@ -37,6 +46,7 @@ impl From<String> for JobFailure {
         JobFailure {
             message,
             retry_after_secs: None,
+            fatal: false,
         }
     }
 }
@@ -46,6 +56,7 @@ impl From<&str> for JobFailure {
         JobFailure {
             message: message.to_string(),
             retry_after_secs: None,
+            fatal: false,
         }
     }
 }
