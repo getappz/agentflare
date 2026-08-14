@@ -140,6 +140,7 @@ impl Queue {
             finished_at: None,
             output: None,
             in_process: job.in_process,
+            dispatch_reason: job.metadata.get("dispatch_reason").cloned(),
         })
     }
 
@@ -200,16 +201,25 @@ impl Queue {
         Ok(())
     }
 
-    /// Returns `true` when this failure was terminal (retries exhausted, row
-    /// left `state = 'failed'`), `false` when it went back to `queued` for
-    /// another attempt — callers that need to react to a job's *permanent*
-    /// failure (e.g. `worker::run_in_process`'s terminal-failure hook) use
-    /// this instead of re-deriving it from a follow-up `get`.
+    /// Returns `true` when this failure was terminal (retries exhausted, or
+    /// `fatal` short-circuited them, row left `state = 'failed'`), `false`
+    /// when it went back to `queued` for another attempt — callers that need
+    /// to react to a job's *permanent* failure (e.g.
+    /// `worker::run_in_process`'s terminal-failure hook) use this instead of
+    /// re-deriving it from a follow-up `get`.
+    ///
+    /// `fatal` skips the retry budget entirely and marks the job `failed`
+    /// regardless of how many retries remain — for a failure classified as
+    /// structural (see `JobFailure::fatal`'s doc comment), retrying would
+    /// just fail identically, so there's no point spending the normal
+    /// transient-failure backoff budget before the terminal-failure recovery
+    /// hook gets a chance to run.
     pub fn fail(
         &self,
         id: &str,
         error: &str,
         retry_after_secs: Option<u64>,
+        fatal: bool,
     ) -> Result<bool, Error> {
         let now = db_kit::ids::now();
         let conn = self.conn.lock();
@@ -218,7 +228,7 @@ impl Queue {
             params![id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        let retried = retries < max_retries;
+        let retried = !fatal && retries < max_retries;
         if retried {
             let not_before = retry_after_secs.map(|s| now + s as i64);
             conn.execute(
@@ -391,9 +401,17 @@ fn map_job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobInfo> {
     // `payload` is our own `serde_json::to_string(&AgentJob)` from `enqueue`,
     // so a parse failure here would mean on-disk corruption, not bad input —
     // fall back to an empty command/args rather than failing the whole read.
-    let (command, args, in_process) = serde_json::from_str::<crate::types::AgentJob>(&payload_json)
-        .map(|job| (job.command, job.args, job.in_process))
-        .unwrap_or_default();
+    let (command, args, in_process, dispatch_reason) =
+        serde_json::from_str::<crate::types::AgentJob>(&payload_json)
+            .map(|job| {
+                (
+                    job.command,
+                    job.args,
+                    job.in_process,
+                    job.metadata.get("dispatch_reason").cloned(),
+                )
+            })
+            .unwrap_or_default();
     Ok(JobInfo {
         id: r.get(0)?,
         command,
@@ -420,6 +438,7 @@ fn map_job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobInfo> {
             stderr_total_bytes: stderr_bytes as u64,
         }),
         in_process,
+        dispatch_reason,
     })
 }
 
@@ -471,7 +490,7 @@ mod tests {
         let job = AgentJob::new("true").max_retries(1);
         let info = queue.enqueue(&job).unwrap();
         queue.dequeue().unwrap();
-        queue.fail(&info.id, "boom", None).unwrap();
+        queue.fail(&info.id, "boom", None, false).unwrap();
         let (id, _) = queue
             .dequeue()
             .unwrap()
@@ -485,7 +504,9 @@ mod tests {
         let job = AgentJob::new("true").max_retries(1);
         let info = queue.enqueue(&job).unwrap();
         queue.dequeue().unwrap();
-        queue.fail(&info.id, "rate limited", Some(3600)).unwrap();
+        queue
+            .fail(&info.id, "rate limited", Some(3600), false)
+            .unwrap();
 
         assert!(
             queue.dequeue().unwrap().is_none(),
@@ -535,7 +556,7 @@ mod tests {
         let failed_job = AgentJob::new("true").max_retries(0);
         let failed_info = queue.enqueue(&failed_job).unwrap();
         queue.dequeue().unwrap();
-        queue.fail(&failed_info.id, "boom", None).unwrap();
+        queue.fail(&failed_info.id, "boom", None, false).unwrap();
 
         // Never dequeued -- not orphaned, must stay queued.
         let queued_info = queue.enqueue(&AgentJob::new("true")).unwrap();
@@ -565,14 +586,71 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_reason_round_trips_through_enqueue_list_and_get() {
+        let (queue, _dir) = test_queue();
+        let job = AgentJob::new("agentflare-work")
+            .args(["item-1", "claude-code"])
+            .in_process()
+            .dispatch_reason("self-repair: Validate PR title");
+        let info = queue.enqueue(&job).unwrap();
+        assert_eq!(
+            info.dispatch_reason.as_deref(),
+            Some("self-repair: Validate PR title")
+        );
+
+        let listed = queue.list(None).unwrap();
+        assert_eq!(
+            listed[0].dispatch_reason.as_deref(),
+            Some("self-repair: Validate PR title")
+        );
+
+        let got = queue.get(&info.id).unwrap();
+        assert_eq!(
+            got.dispatch_reason.as_deref(),
+            Some("self-repair: Validate PR title")
+        );
+
+        // A plain dispatch (no reason set) must stay `None`, not e.g. `""`.
+        let plain = queue.enqueue(&AgentJob::new("true")).unwrap();
+        assert_eq!(plain.dispatch_reason, None);
+        assert_eq!(queue.get(&plain.id).unwrap().dispatch_reason, None);
+    }
+
+    #[test]
     fn fail_past_max_retries_marks_failed_regardless_of_retry_delay() {
         let (queue, _dir) = test_queue();
         let job = AgentJob::new("true").max_retries(0);
         let info = queue.enqueue(&job).unwrap();
         queue.dequeue().unwrap();
-        queue.fail(&info.id, "boom", Some(60)).unwrap();
+        queue.fail(&info.id, "boom", Some(60), false).unwrap();
         let jobs = queue.list(Some(JobState::Failed)).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, info.id);
+    }
+
+    #[test]
+    fn fail_fatal_marks_failed_immediately_even_with_retries_remaining() {
+        // Mirrors a structural setup failure (e.g. `agentflare work`'s "no
+        // worktree was created" path, item #467): the underlying cause can't
+        // change between attempts, so it must reach terminal `state =
+        // 'failed'` on the very first failure instead of consuming the
+        // normal transient-failure retry budget.
+        let (queue, _dir) = test_queue();
+        let job = AgentJob::new("true").max_retries(3);
+        let info = queue.enqueue(&job).unwrap();
+        queue.dequeue().unwrap();
+
+        let terminal = queue.fail(&info.id, "boom", None, true).unwrap();
+
+        assert!(
+            terminal,
+            "a fatal failure must be terminal even though retries remain"
+        );
+        let stored = queue.get(&info.id).unwrap();
+        assert_eq!(stored.state, JobState::Failed);
+        assert_eq!(
+            stored.retries, 0,
+            "retries must not be incremented on a fatal failure"
+        );
     }
 }

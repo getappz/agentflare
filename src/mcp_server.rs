@@ -11,6 +11,7 @@ mod flare_docs;
 mod flare_git;
 mod handoff;
 pub(crate) mod item;
+mod item_doctor;
 mod memory_tool;
 mod project_resolution;
 mod review;
@@ -1234,9 +1235,10 @@ impl AgentflareMcp {
             "groom" => self.item_groom(req),
             "standup" => self.item_standup(req),
             "health" => self.item_health(req),
+            "doctor" => self.item_doctor(req),
             other => Err(ErrorData::invalid_params(
                 format!(
-                    "unknown item action: '{other}' — expected create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health"
+                    "unknown item action: '{other}' — expected create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health|doctor"
                 ),
                 None,
             )),
@@ -1244,7 +1246,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health). `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck/bottlenecks scorecard (`bottlenecks` = items handed between agents ≥2× in the window; history starts at the assignment-log migration). The read-only reporting actions groom|standup|health accept a `project` override (name or UUID from `project action=list`) for portfolio roll-ups. `done` moves an item to \"in_review\" (not \"completed\") when it results in an open PR, and leaves the worktree in place for follow-up commits; call `check_merge` once the PR is confirmed merged to promote it to \"completed\" and clean up the worktree. Pass `summary` on `done` with what you changed and why — it becomes the PR body; omitting it leaves the PR with a generic placeholder description."
+        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health|doctor). `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck/bottlenecks scorecard (`bottlenecks` = items handed between agents ≥2× in the window; history starts at the assignment-log migration). The read-only reporting actions groom|standup|health accept a `project` override (name or UUID from `project action=list`) for portfolio roll-ups. `done` moves an item to \"in_review\" (not \"completed\") when it results in an open PR, and leaves the worktree in place for follow-up commits; call `check_merge` once the PR is confirmed merged to promote it to \"completed\" and clean up the worktree. Pass `summary` on `done` with what you changed and why — it becomes the PR body; omitting it leaves the PR with a generic placeholder description. `doctor` is the MCP equivalent of `agentflare git doctor`: scans every worktree in this repo for dirty/stale/orphaned/duplicate-branch/missing-upstream health flags (respects `staleness_days`, default 14) and, with `reclaim=true`, deletes the clean stale/orphaned ones (never the main worktree; add `force=true` to also delete dirty ones) — this is the tool to reach for a `git worktree remove/prune` shim denial, not a specific item's `check_merge`/`release`."
     )]
     fn item(&self, Parameters(req): Parameters<ItemRequest>) -> Result<String, ErrorData> {
         self.item_inner(req)

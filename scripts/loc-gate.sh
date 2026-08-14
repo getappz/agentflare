@@ -21,6 +21,12 @@ ALLOWLIST=(
   # small, unrelated fix shouldn't be blocked on splitting. Frozen at
   # <= FROZEN_LIMIT; a real split is separate work.
   src/cli/work.rs
+  # At 1493 lines on master, item #109's push/PR-failure completion gate
+  # (mirroring the existing auto-commit-failure gate right above it) pushed
+  # it over LIMIT. Splitting item.rs's per-action handlers into submodules
+  # is worth doing but is a separate, larger refactor than a completion-
+  # correctness fix should carry. Frozen at <= FROZEN_LIMIT.
+  src/mcp_server/item.rs
 )
 
 cd "$(dirname "$0")/.."
