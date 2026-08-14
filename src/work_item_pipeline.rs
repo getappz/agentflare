@@ -97,7 +97,9 @@ pub(crate) enum JudgeParseError {
 impl std::fmt::Display for JudgeParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            JudgeParseError::InvalidJson(msg) => write!(f, "judge reply is not valid decision JSON: {msg}"),
+            JudgeParseError::InvalidJson(msg) => {
+                write!(f, "judge reply is not valid decision JSON: {msg}")
+            }
         }
     }
 }
@@ -108,10 +110,16 @@ impl std::fmt::Display for JudgeParseError {
 /// malformed JSON — a genuine parse failure is a step Failure, retried by
 /// the step's own RetryPolicy.
 pub(crate) fn parse_judge_decision(reply: &str) -> Result<JudgeDecision, JudgeParseError> {
-    let start = reply.find('{').ok_or_else(|| JudgeParseError::InvalidJson("no '{' found".to_string()))?;
-    let end = reply.rfind('}').ok_or_else(|| JudgeParseError::InvalidJson("no '}' found".to_string()))?;
+    let start = reply
+        .find('{')
+        .ok_or_else(|| JudgeParseError::InvalidJson("no '{' found".to_string()))?;
+    let end = reply
+        .rfind('}')
+        .ok_or_else(|| JudgeParseError::InvalidJson("no '}' found".to_string()))?;
     if end < start {
-        return Err(JudgeParseError::InvalidJson("unbalanced braces".to_string()));
+        return Err(JudgeParseError::InvalidJson(
+            "unbalanced braces".to_string(),
+        ));
     }
     let candidate = &reply[start..=end];
     serde_json::from_str(candidate).map_err(|e| JudgeParseError::InvalidJson(e.to_string()))
@@ -120,8 +128,8 @@ pub(crate) fn parse_judge_decision(reply: &str) -> Result<JudgeDecision, JudgePa
 use flare_workflow::executor::FunctionStep;
 use flare_workflow::sqlite_store::SqliteStore;
 use flare_workflow::{
-    StepDefinition, StepId, StepResult, WorkflowContext, WorkflowEngine, WorkflowError,
-    WorkflowId, WorkflowStatus,
+    StepDefinition, StepId, StepResult, WorkflowContext, WorkflowEngine, WorkflowError, WorkflowId,
+    WorkflowStatus,
 };
 use std::str::FromStr;
 
@@ -242,11 +250,12 @@ fn build_review_or_fix_step_with_sender(
                          issues to fix."
                     )
                 };
-                let (reply, in_tok, out_tok) = send(agent_name, prompt)
-                    .await
-                    .map_err(|message| WorkflowError::StepFailed {
-                        step_id: StepId::new("review_or_fix"),
-                        message,
+                let (reply, in_tok, out_tok) =
+                    send(agent_name, prompt).await.map_err(|message| {
+                        WorkflowError::StepFailed {
+                            step_id: StepId::new("review_or_fix"),
+                            message,
+                        }
                     })?;
                 ctx.input_tokens += in_tok;
                 ctx.output_tokens += out_tok;
@@ -507,8 +516,7 @@ fn build_work_item_pipeline_with_sender(
 /// engine per call (the pattern `src/workflow.rs`'s JSON pipeline uses)
 /// would work for isolated JSON runs but would defeat `recover()`'s
 /// "definition must already be registered on this engine" requirement here.
-pub(crate) fn engine()
--> &'static WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>> {
+pub(crate) fn engine() -> &'static WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>> {
     static ENGINE: std::sync::LazyLock<WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>>> =
         std::sync::LazyLock::new(|| {
             let store = SqliteStore::open_file(&crate::workflow::default_db_path())
@@ -590,7 +598,8 @@ pub(crate) fn run_or_resume_with_sender(
         notify_recipient,
         send,
     );
-    eng.register_workflow(definition).map_err(|e| e.to_string())?;
+    eng.register_workflow(definition)
+        .map_err(|e| e.to_string())?;
 
     crate::workflow::blocking_runtime().block_on(async move {
         let run_id = match existing_run_id {
@@ -641,7 +650,9 @@ pub(crate) fn run_or_resume_with_sender(
             match state.status {
                 WorkflowStatus::Completed => return Ok(()),
                 WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
-                    return Err(state.error.unwrap_or_else(|| "workflow run failed".to_string()));
+                    return Err(state
+                        .error
+                        .unwrap_or_else(|| "workflow run failed".to_string()));
                 }
                 _ => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
             }
@@ -659,7 +670,10 @@ pub(crate) fn run_or_resume_with_sender(
 /// already resolves it with). Best-effort: an error collapses to `None`
 /// (the reviewer step still runs, just with less context) rather than
 /// failing the whole pipeline over a git plumbing hiccup.
-pub(crate) fn worktree_diff(worktree_path: &std::path::Path, target_branch: &str) -> Option<String> {
+pub(crate) fn worktree_diff(
+    worktree_path: &std::path::Path,
+    target_branch: &str,
+) -> Option<String> {
     flare_git_core::shell::diff(worktree_path, target_branch, "HEAD").ok()
 }
 
@@ -688,7 +702,10 @@ fn persist_run_id(
 /// own plans already use — see docs on item #110) into a task list; falls
 /// back to a single synthesized task from the item's own description when
 /// no plan doc is attached or it contains no recognizable task headings.
-pub(crate) fn load_or_synthesize_tasks(item_description: &str, plan_doc: Option<&str>) -> Vec<SddTask> {
+pub(crate) fn load_or_synthesize_tasks(
+    item_description: &str,
+    plan_doc: Option<&str>,
+) -> Vec<SddTask> {
     if let Some(doc) = plan_doc.filter(|d| !d.trim().is_empty()) {
         let tasks = parse_task_headings(doc);
         if !tasks.is_empty() {
@@ -713,7 +730,12 @@ fn parse_task_headings(doc: &str) -> Vec<SddTask> {
             Some(title.trim().to_string())
         }) {
             if let Some((title, body)) = current.take() {
-                tasks.push(SddTask { id: tasks.len(), title, body: body.trim().to_string(), model_tier: None });
+                tasks.push(SddTask {
+                    id: tasks.len(),
+                    title,
+                    body: body.trim().to_string(),
+                    model_tier: None,
+                });
             }
             current = Some((title, String::new()));
         } else if let Some((_, body)) = current.as_mut() {
@@ -722,7 +744,12 @@ fn parse_task_headings(doc: &str) -> Vec<SddTask> {
         }
     }
     if let Some((title, body)) = current {
-        tasks.push(SddTask { id: tasks.len(), title, body: body.trim().to_string(), model_tier: None });
+        tasks.push(SddTask {
+            id: tasks.len(),
+            title,
+            body: body.trim().to_string(),
+            model_tier: None,
+        });
     }
     tasks
 }
@@ -745,7 +772,10 @@ mod tests {
         let json = serde_json::to_string(&data).unwrap();
         let back: WorkItemData = serde_json::from_str(&json).unwrap();
         assert_eq!(back.reply_text, "did the thing");
-        assert_eq!(back.pr_url.as_deref(), Some("https://github.com/x/y/pull/1"));
+        assert_eq!(
+            back.pr_url.as_deref(),
+            Some("https://github.com/x/y/pull/1")
+        );
     }
 
     use flare_workflow::store::InMemoryStore;
@@ -770,7 +800,11 @@ mod tests {
         let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
         engine.register_workflow(wf).unwrap();
         let run_id = engine
-            .start_workflow(WorkflowId::new(WORKFLOW_ID), WorkItemData::default(), String::new())
+            .start_workflow(
+                WorkflowId::new(WORKFLOW_ID),
+                WorkItemData::default(),
+                String::new(),
+            )
             .await
             .unwrap();
 
@@ -797,7 +831,11 @@ mod tests {
         let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
         engine.register_workflow(wf).unwrap();
         let run_id = engine
-            .start_workflow(WorkflowId::new(WORKFLOW_ID), WorkItemData::default(), String::new())
+            .start_workflow(
+                WorkflowId::new(WORKFLOW_ID),
+                WorkItemData::default(),
+                String::new(),
+            )
             .await
             .unwrap();
 
@@ -833,7 +871,11 @@ mod tests {
         let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
         engine.register_workflow(wf).unwrap();
         let run_id = engine
-            .start_workflow(WorkflowId::new(WORKFLOW_ID), WorkItemData::default(), String::new())
+            .start_workflow(
+                WorkflowId::new(WORKFLOW_ID),
+                WorkItemData::default(),
+                String::new(),
+            )
             .await
             .unwrap();
 
@@ -869,7 +911,11 @@ mod tests {
         let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
         engine.register_workflow(wf).unwrap();
         let run_id = engine
-            .start_workflow(WorkflowId::new(WORKFLOW_ID), WorkItemData::default(), String::new())
+            .start_workflow(
+                WorkflowId::new(WORKFLOW_ID),
+                WorkItemData::default(),
+                String::new(),
+            )
             .await
             .unwrap();
 
@@ -905,7 +951,11 @@ mod tests {
         let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
         engine.register_workflow(wf).unwrap();
         let run_id = engine
-            .start_workflow(WorkflowId::new(WORKFLOW_ID), WorkItemData::default(), String::new())
+            .start_workflow(
+                WorkflowId::new(WORKFLOW_ID),
+                WorkItemData::default(),
+                String::new(),
+            )
             .await
             .unwrap();
 
@@ -1099,7 +1149,9 @@ mod tests {
     #[tokio::test]
     async fn full_pipeline_runs_real_git_flow_with_one_fix_cycle() {
         let (mcp, _backend_tmp, _repo_tmp, item_id, project_id, worktree_path) =
-            crate::mcp_server::tests::mcp_with_claimed_item("Full pipeline real-git-flow test item");
+            crate::mcp_server::tests::mcp_with_claimed_item(
+                "Full pipeline real-git-flow test item",
+            );
         let mcp = Arc::new(mcp);
 
         let call_n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1189,7 +1241,11 @@ mod tests {
         let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
         engine.register_workflow(definition).unwrap();
         let run_id = engine
-            .start_workflow(WorkflowId::new(WORKFLOW_ID), WorkItemData::default(), String::new())
+            .start_workflow(
+                WorkflowId::new(WORKFLOW_ID),
+                WorkItemData::default(),
+                String::new(),
+            )
             .await
             .unwrap();
 
