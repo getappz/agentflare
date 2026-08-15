@@ -776,10 +776,8 @@ pub fn gc_orphans(repo_root: &Path, names: &[String]) -> Vec<String> {
             deleted.push(name.clone());
         }
     }
-    // Prune git's worktree metadata after removal
-    if !deleted.is_empty() {
-        let _ = crate::shell::run_in(repo_root, &["worktree", "prune"]);
-    }
+    // Prune git's worktree metadata after removal.
+    crate::shell::prune_worktree_metadata_if(repo_root, !deleted.is_empty());
     deleted
 }
 
