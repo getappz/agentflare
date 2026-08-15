@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 
 use crate::types::{
-    JournalEntry, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult, WorkflowRunId,
-    WorkflowState, WorkflowStatus,
+    JournalEntry, MetricsFilter, StepMetrics, WorkflowContext, WorkflowData, WorkflowError,
+    WorkflowMetrics, WorkflowResult, WorkflowRunId, WorkflowState, WorkflowStatus,
 };
 
 /// Trait for workflow state persistence.
@@ -61,6 +61,9 @@ pub trait StateStore<D: WorkflowData>: Send + Sync + Clone {
 
     /// Read a run's durable journal in sequence order.
     async fn journal(&self, run_id: WorkflowRunId) -> WorkflowResult<Vec<JournalEntry>>;
+
+    /// Aggregate instance/step metrics over runs matching `filter`.
+    async fn workflow_metrics(&self, filter: MetricsFilter) -> WorkflowResult<WorkflowMetrics>;
 }
 
 /// In-memory state storage for workflow instances.
@@ -225,5 +228,72 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
             .get(&run_id)
             .cloned()
             .ok_or(WorkflowError::NotFound(run_id))
+    }
+
+    async fn workflow_metrics(&self, filter: MetricsFilter) -> WorkflowResult<WorkflowMetrics> {
+        let states = self.states.read();
+        let matching: Vec<_> = states
+            .values()
+            .filter(|s| {
+                filter
+                    .workflow_id
+                    .as_ref()
+                    .is_none_or(|id| *id == s.workflow_id)
+                    && filter.status.is_none_or(|status| status == s.status)
+                    && filter.since.is_none_or(|since| s.created_at >= since)
+            })
+            .collect();
+
+        let mut counts_by_status = HashMap::new();
+        for state in &matching {
+            *counts_by_status.entry(state.status).or_insert(0u64) += 1;
+        }
+
+        let durations: Vec<f64> = matching
+            .iter()
+            .map(|s| {
+                s.updated_at
+                    .signed_duration_since(s.created_at)
+                    .num_milliseconds() as f64
+            })
+            .collect();
+        let avg_duration_ms = if durations.is_empty() {
+            None
+        } else {
+            Some(durations.iter().sum::<f64>() / durations.len() as f64)
+        };
+
+        let mut total_input_tokens = 0u64;
+        let mut total_output_tokens = 0u64;
+        let mut step_breakdown: HashMap<crate::types::StepId, StepMetrics> = HashMap::new();
+        let mut step_durations: HashMap<crate::types::StepId, Vec<f64>> = HashMap::new();
+        for state in &matching {
+            for (step_id, ss) in &state.step_states {
+                total_input_tokens += ss.input_tokens;
+                total_output_tokens += ss.output_tokens;
+                *step_breakdown
+                    .entry(step_id.clone())
+                    .or_default()
+                    .counts_by_status
+                    .entry(ss.status)
+                    .or_insert(0u64) += 1;
+                step_durations
+                    .entry(step_id.clone())
+                    .or_default()
+                    .push(ss.duration_ms as f64);
+            }
+        }
+        for (step_id, durations) in step_durations {
+            let avg = durations.iter().sum::<f64>() / durations.len() as f64;
+            step_breakdown.entry(step_id).or_default().avg_duration_ms = Some(avg);
+        }
+
+        Ok(WorkflowMetrics {
+            counts_by_status,
+            avg_duration_ms,
+            total_input_tokens,
+            total_output_tokens,
+            step_breakdown,
+        })
     }
 }
