@@ -1,6 +1,6 @@
+use flare_workflow::StateStore;
 use flare_workflow::sqlite_store::SqliteStore;
 use flare_workflow::types::*;
-use flare_workflow::StateStore;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Ctx {
@@ -66,7 +66,10 @@ async fn workflow_metrics_aggregates_counts_and_step_breakdown() {
         store.save(run.clone()).await.unwrap();
     }
 
-    let metrics = store.workflow_metrics(MetricsFilter::default()).await.unwrap();
+    let metrics = store
+        .workflow_metrics(MetricsFilter::default())
+        .await
+        .unwrap();
 
     assert_eq!(
         metrics.counts_by_status.get(&WorkflowStatus::Completed),
@@ -137,7 +140,10 @@ async fn workflow_metrics_scoped_by_workflow_id() {
 async fn workflow_metrics_empty_store_returns_empty_aggregates() {
     let store = SqliteStore::<Ctx>::open_memory().unwrap();
 
-    let metrics = store.workflow_metrics(MetricsFilter::default()).await.unwrap();
+    let metrics = store
+        .workflow_metrics(MetricsFilter::default())
+        .await
+        .unwrap();
 
     assert!(metrics.counts_by_status.is_empty());
     assert_eq!(metrics.avg_duration_ms, None);
