@@ -40,6 +40,20 @@ const HOME_CACHE_DIRS: &[&str] = &[".cargo", ".rustup", ".cache", ".npm"];
 /// since this one dir needs both.
 const OPENCODE_DATA_DIR_RELATIVE: &str = ".local/share/opencode";
 
+/// The agentflare MCP server's own state dir, relative to `$HOME` -- holds
+/// `agentflare.db`, the sqlite store every `item`/`comment`/`vent` MCP call
+/// writes through. Unlike `HOME_CACHE_DIRS`, this one must be writable: a
+/// dispatched job's whole job-completion signal (`item action=done`,
+/// `comment action=create`, even `vent` for reporting a sandbox problem like
+/// this one) is an MCP call into this same DB, so read-only here means the
+/// agent finishes real work with no way to report it (item #120 -- confirmed
+/// live via `EROFS` on `touch ~/.agentflare/probe` and two dispatched jobs
+/// stuck showing not-done despite merge-ready PRs). Bound with `--bind-try`
+/// (writable, silently skipped if missing) rather than `--bind`, matching
+/// the "missing dir is fine, wrong dir is not" fallback the other optional
+/// home binds use.
+const AGENTFLARE_DATA_DIR_RELATIVE: &str = ".agentflare";
+
 /// Whether `command` (the resolved binary about to be run, e.g.
 /// `/home/user/.opencode/bin/opencode`) is opencode -- matched on the final
 /// path component so it doesn't care whether the caller passed a bare name
@@ -169,6 +183,14 @@ fn build_bwrap_args_with_home(
                 bwrap_args.push(path_str.clone());
                 bwrap_args.push(path_str);
             }
+        }
+
+        let agentflare_dir = Path::new(home).join(AGENTFLARE_DATA_DIR_RELATIVE);
+        if agentflare_dir.exists() {
+            let agentflare_str = path_to_string(&agentflare_dir);
+            bwrap_args.push("--bind-try".to_string());
+            bwrap_args.push(agentflare_str.clone());
+            bwrap_args.push(agentflare_str);
         }
 
         if is_opencode(command) {
@@ -511,6 +533,34 @@ mod tests {
             .position(|a| a == &cargo_path)
             .expect(".cargo cache dir bound");
         assert_eq!(args[idx - 1], "--ro-bind-try");
+    }
+
+    #[test]
+    fn agentflare_data_dir_bound_read_write_when_present() {
+        // Item #120: `~/.agentflare` holds the sqlite DB every `item`/
+        // `comment`/`vent` MCP call writes through, so a dispatched job
+        // needs write access to report its own completion -- read-only (or
+        // missing entirely) means the job finishes real work with no way to
+        // signal it, exactly what happened live on items #112 and #116.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(AGENTFLARE_DATA_DIR_RELATIVE)).unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let args = build_bwrap_args_with_home(None, "true", &[], Some(&home), false);
+        let agentflare_path = path_to_string(&dir.path().join(AGENTFLARE_DATA_DIR_RELATIVE));
+        let idx = args
+            .iter()
+            .position(|a| a == &agentflare_path)
+            .expect(".agentflare dir bound");
+        assert_eq!(args[idx - 1], "--bind-try");
+    }
+
+    #[test]
+    fn agentflare_data_dir_skipped_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let args = build_bwrap_args_with_home(None, "true", &[], Some(&home), false);
+        let agentflare_path = path_to_string(&dir.path().join(AGENTFLARE_DATA_DIR_RELATIVE));
+        assert!(!args.iter().any(|a| a == &agentflare_path));
     }
 
     #[test]
