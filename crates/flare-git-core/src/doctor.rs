@@ -306,9 +306,7 @@ pub fn reclaim(repo_root: &Path, report: &DoctorReport, force: bool) -> Vec<Stri
             reclaimed.push(lane.name.clone());
         }
     }
-    if needs_prune {
-        let _ = crate::shell::run_in(repo_root, &["worktree", "prune"]);
-    }
+    crate::shell::prune_worktree_metadata_if(repo_root, needs_prune);
     reclaimed
 }
 
