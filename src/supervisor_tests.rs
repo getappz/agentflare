@@ -908,11 +908,7 @@ fn run_review_sweep_scans_in_review_items_from_every_registered_project_not_just
     // `project_dirs` at `repo_a`'s path -- the pre-#124 behavior would only
     // ever have scanned this one.
     let _item_a = seed_in_review_item(&mcp, Some("claude-code"));
-    let _item_b = seed_in_review_item_in_project(
-        &mcp,
-        "proj-b",
-        &repo_b.path().to_string_lossy(),
-    );
+    let _item_b = seed_in_review_item_in_project(&mcp, "proj-b", &repo_b.path().to_string_lossy());
 
     let auth_conn = test_auth_conn();
     let result = run_review_sweep(

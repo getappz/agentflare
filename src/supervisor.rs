@@ -443,8 +443,7 @@ pub(crate) fn run_review_sweep(
         let mut batches = Vec::new();
         for dir in dirs {
             let items = agentflare_backend::item::list_by_project(conn, &dir.project_id).ok()?;
-            let states =
-                agentflare_backend::state::list_by_project(conn, &dir.project_id).ok()?;
+            let states = agentflare_backend::state::list_by_project(conn, &dir.project_id).ok()?;
             let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
                 states.iter().map(|s| (s.id.as_str(), s)).collect();
             let in_review: Vec<_> = items
@@ -548,6 +547,7 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
 /// Dispatches a self-repair job for an item whose PR has failing CI checks,
 /// or -- once `quota::decide::SELF_REPAIR_CAP` prior attempts have been made
 /// with no green build -- gates it for a human instead of retrying forever.
+#[allow(clippy::too_many_arguments)]
 fn self_repair_or_gate(
     mcp: &AgentflareMcp,
     queue: &agentflare_jobs::Queue,
