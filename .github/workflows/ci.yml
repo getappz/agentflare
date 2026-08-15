@@ -30,21 +30,31 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
+          # Default predicate-quantifier ('some') matches a filter on ANY
+          # positive pattern and silently ignores negated ('!...') patterns
+          # entirely — the '!crates/*/*.md' line below would be a no-op
+          # without this, and every crate-root doc change (README/CHANGELOG/
+          # design docs) would trigger a full build matrix. 'some-with-
+          # excludes' makes exclusions actually exclude.
+          predicate-quantifier: 'some-with-excludes'
           filters: |
             code:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'build.rs'
               - 'crates/**'
-              # Doc files (README/CHANGELOG/design docs) don't affect the
-              # build, except .md under a crate's src/ — those are
-              # embedded via include_str! (e.g. flare-code's skill docs)
-              # and change compiled behavior, so keep those as code.
-              - '!crates/**/*.md'
-              - 'crates/**/src/**/*.md'
+              # Doc files (README/CHANGELOG/design docs) live directly in a
+              # crate's root, one path segment below crates/**, so this
+              # exclusion can't accidentally match .md under a crate's src/
+              # (those are embedded via include_str!, e.g. flare-code's
+              # skill docs, and change compiled behavior — keep as code).
+              # With some-with-excludes, an exclusion is final and can't be
+              # re-included by a later positive pattern, so this must stay
+              # precise rather than a broad 'crates/**/*.md'.
+              - '!crates/*/*.md'
               - 'agentflare-workspace-hack/**'
               - 'src/**'
               - '.config/**'
