@@ -138,18 +138,6 @@ use std::str::FromStr;
 use crate::mcp_server::AgentflareMcp;
 use crate::mcp_server::types::{CommentRequest, ItemRequest};
 
-/// Grep a headless reply for `AGENTFLARE_HOLD: <reason>`, same convention
-/// `cli::work::detect_hold_signal` already uses — duplicated rather than
-/// imported because `cli::work`'s version is a private `fn` and this crate
-/// module is lower-level than `cli`; keep them in sync by hand if either
-/// changes (both grep the same literal prefix agents are told to use).
-fn detect_hold_signal(reply: &str) -> Option<&str> {
-    reply.lines().find_map(|line| {
-        let reason = line.trim().strip_prefix("AGENTFLARE_HOLD:")?.trim();
-        (!reason.is_empty()).then_some(reason)
-    })
-}
-
 /// Marker the reviewer replies with when the diff is approved — matched
 /// (case-insensitive substring) by the `StepMode::Loop`'s `until` field to
 /// stop the loop.
@@ -621,6 +609,13 @@ pub(crate) fn run_or_resume_with_sender(
     notify_recipient: Option<String>,
     send: flare_workflow::json::SendMessage,
 ) -> Result<(), String> {
+    // Frames the description as untrusted content (BEGIN/END EXTERNAL
+    // CONTENT markers) when the item came from an external GitHub issue —
+    // see `wrap_if_external`'s own doc comment. Wrapped here, once, before
+    // it's parsed into tasks, so every downstream implementer/reviewer/judge
+    // prompt built from those tasks inherits the framing.
+    let item_description = crate::cli::work::wrap_if_external(item, &item_description);
+
     let existing_metadata: serde_json::Value = serde_json::from_str(&item.metadata)
         .unwrap_or(serde_json::Value::Object(Default::default()));
     let existing_run_id = existing_metadata["workflow_run_id"]
@@ -709,23 +704,6 @@ pub(crate) fn run_or_resume_with_sender(
             }
         }
     })
-}
-
-/// Unified diff of the worktree's branch against `target_branch` — the
-/// "everything this item has changed so far" scope a human PR reviewer
-/// works from. Reuses `flare_git_core::shell::diff`'s existing three-dot
-/// `base...head` convention (the same one `flare_git_core::classify`
-/// already diffs with) rather than inventing a second base-branch-diff
-/// strategy — `target_branch` itself comes from the caller's existing
-/// `crate::worktree::resolve_target_branch` call (same helper `item_done`
-/// already resolves it with). Best-effort: an error collapses to `None`
-/// (the reviewer step still runs, just with less context) rather than
-/// failing the whole pipeline over a git plumbing hiccup.
-pub(crate) fn worktree_diff(
-    worktree_path: &std::path::Path,
-    target_branch: &str,
-) -> Option<String> {
-    flare_git_core::shell::diff(worktree_path, target_branch, "HEAD").ok()
 }
 
 /// Merge `workflow_run_id` into the item's existing metadata JSON and save
@@ -837,16 +815,6 @@ pub(crate) fn build_re_reviewer_prompt(task: &SddTask, findings: &str, fix_repor
     format!(
         "Re-review a fix for this task's findings only — do not look for new issues.\n\nTask: {}\n\nOriginal findings:\n{findings}\n\nFix report:\n{fix_report}\n\nReply REVIEW_APPROVED if every finding is addressed, or REVIEW_ISSUES: followed by what remains.\n",
         task.title
-    )
-}
-
-/// Builds the prompt for the final reviewer role: given all tasks and the
-/// ledger of decisions, review the whole branch's diff against the plan.
-pub(crate) fn build_final_reviewer_prompt(tasks: &[SddTask], ledger: &[String]) -> String {
-    let task_list: String = tasks.iter().map(|t| format!("- {}\n", t.title)).collect();
-    let ledger_text: String = ledger.join("\n");
-    format!(
-        "Review the whole branch's diff against this plan's tasks:\n{task_list}\n\nLedger of decisions made during execution:\n{ledger_text}\n\nReply REVIEW_APPROVED or REVIEW_ISSUES: followed by findings.\n"
     )
 }
 
@@ -1300,6 +1268,7 @@ mod sdd_test_support {
 
     /// Records every `(agent_name, prompt)` call and returns queued replies
     /// in order.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn mock_send(
         replies: Vec<&'static str>,
     ) -> (
