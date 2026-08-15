@@ -286,12 +286,16 @@ fn ask_item(
 /// instead of wherever this daemon process happens to have started.
 ///
 /// Shared by `dispatch_item` (a fresh `ready-for-work` item, always passes
-/// its per-project `folder_path`) and `run_review_sweep`'s self-repair path
-/// (item #65, re-running the same job on an item already sitting in
-/// "in_review" -- `item_claim` reclaims its existing worktree/branch rather
-/// than starting over, see `item::claim`'s doc comment). `run_review_sweep`
-/// itself is still single-project (`resolve_project`'s cwd-based
-/// resolution), so it has no folder path of its own to pass yet.
+/// its per-project `folder_path`) and `self_repair_or_gate` (item #65,
+/// re-running the same job on an item already sitting in "in_review" --
+/// `item_claim` reclaims its existing worktree/branch rather than starting
+/// over, see `item::claim`'s doc comment). `run_review_sweep` itself now
+/// also iterates every project in `project_dirs` (item #124, same pattern
+/// `run_discovery_tick` already used for #63) and passes each project's own
+/// `folder_path` down to `self_repair_or_gate`, so a self-repair job is
+/// pinned to the correct project directory at dispatch time instead of
+/// falling back to wherever the daemon process's ambient cwd happens to be
+/// when the job actually runs.
 /// Reads an optional `metadata.model` string override (settable via
 /// `handoff`/`item update`'s `metadata` field) — the model the assigned
 /// agent should use for this item's autonomous dispatch. No allowlist:
@@ -400,15 +404,27 @@ enum SelfRepairOutcome {
     Skipped,
 }
 
-/// One pass: list items in the "in_review" state group (an open PR), poll
-/// each one's PR/CI status, and promote it to "completed" on a confirmed
-/// merge or dispatch a self-repair job on failing CI (item #65). Unlike
-/// `run_discovery_tick`, there's no label to gate the query on -- state
-/// group is itself the signal, and it's also the concurrency guard: a
-/// self-repair job's `item_claim` moves the item out of "in_review" into
-/// "started" for its duration (see `item::claim`'s doc comment), so an item
-/// with a self-repair already running never shows up here to be
-/// double-dispatched.
+/// Everything one project contributes to a review sweep: its own
+/// `in_review` items, label lookup, and the folder its worktrees live
+/// under (from the `project_dirs` registry, not this process's cwd) --
+/// same shape `ProjectBatch` gives `run_discovery_tick`.
+struct ReviewBatch {
+    folder_path: String,
+    items: Vec<agentflare_backend::item::Item>,
+    label_id_by_name: std::collections::HashMap<String, String>,
+}
+
+/// One pass: across every project registered in `project_dirs` (mirrors
+/// `run_discovery_tick`'s item #63 fix -- not just whichever project this
+/// daemon process happens to have been started from) -- list items in the
+/// "in_review" state group (an open PR), poll each one's PR/CI status, and
+/// promote it to "completed" on a confirmed merge or dispatch a self-repair
+/// job on failing CI (item #65). Unlike `run_discovery_tick`, there's no
+/// label to gate the query on -- state group is itself the signal, and it's
+/// also the concurrency guard: a self-repair job's `item_claim` moves the
+/// item out of "in_review" into "started" for its duration (see
+/// `item::claim`'s doc comment), so an item with a self-repair already
+/// running never shows up here to be double-dispatched.
 pub(crate) fn run_review_sweep(
     mcp: &AgentflareMcp,
     queue: &agentflare_jobs::Queue,
@@ -423,59 +439,75 @@ pub(crate) fn run_review_sweep(
     };
 
     let fetched = mcp.with_backend_db(|conn| {
-        let project = mcp.resolve_project(conn).ok()?;
-        let items = agentflare_backend::item::list_by_project(conn, &project.id).ok()?;
-        let states = agentflare_backend::state::list_by_project(conn, &project.id).ok()?;
-        let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
-            states.iter().map(|s| (s.id.as_str(), s)).collect();
-        let in_review: Vec<_> = items
-            .into_iter()
-            .filter(|i| {
-                state_by_id
-                    .get(i.state_id.as_str())
-                    .is_some_and(|s| s.group_name == "in_review")
-            })
-            .collect();
-        let labels = agentflare_backend::label::list_by_project(conn, &project.id).ok()?;
-        let mut label_id_by_name = std::collections::HashMap::new();
-        for l in &labels {
-            label_id_by_name.insert(l.name.clone(), l.id.clone());
+        let dirs = agentflare_backend::project_dir::list(conn).ok()?;
+        let mut batches = Vec::new();
+        for dir in dirs {
+            let items = agentflare_backend::item::list_by_project(conn, &dir.project_id).ok()?;
+            let states = agentflare_backend::state::list_by_project(conn, &dir.project_id).ok()?;
+            let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
+                states.iter().map(|s| (s.id.as_str(), s)).collect();
+            let in_review: Vec<_> = items
+                .into_iter()
+                .filter(|i| {
+                    state_by_id
+                        .get(i.state_id.as_str())
+                        .is_some_and(|s| s.group_name == "in_review")
+                })
+                .collect();
+            let labels = agentflare_backend::label::list_by_project(conn, &dir.project_id).ok()?;
+            let mut label_id_by_name = std::collections::HashMap::new();
+            for l in &labels {
+                label_id_by_name.insert(l.name.clone(), l.id.clone());
+            }
+            batches.push(ReviewBatch {
+                folder_path: dir.folder_path,
+                items: in_review,
+                label_id_by_name,
+            });
         }
-        Some((in_review, label_id_by_name))
+        Some(batches)
     });
-    let Ok(Some((items, label_id_by_name))) = fetched else {
+    let Ok(Some(batches)) = fetched else {
         return result;
     };
 
-    let repo_root = mcp.worktree_repo_root();
-    for item in &items {
-        match crate::worktree::pr_ci_status(item, &repo_root) {
-            crate::worktree::PrCiStatus::Merged => {
-                if promote_merged_item(mcp, item) {
-                    result.promoted += 1;
-                } else {
+    for batch in batches {
+        let ReviewBatch {
+            folder_path,
+            items,
+            label_id_by_name,
+        } = batch;
+        let repo_root = std::path::PathBuf::from(&folder_path);
+        for item in &items {
+            match crate::worktree::pr_ci_status(item, &repo_root) {
+                crate::worktree::PrCiStatus::Merged => {
+                    if promote_merged_item(mcp, item) {
+                        result.promoted += 1;
+                    } else {
+                        result.skipped += 1;
+                    }
+                }
+                crate::worktree::PrCiStatus::Failing(failed_checks) => {
+                    match self_repair_or_gate(
+                        mcp,
+                        queue,
+                        auth_conn,
+                        host_policy,
+                        item,
+                        &failed_checks,
+                        &label_id_by_name,
+                        &folder_path,
+                    ) {
+                        SelfRepairOutcome::Dispatched => result.self_repaired += 1,
+                        SelfRepairOutcome::Deferred => result.waiting += 1,
+                        SelfRepairOutcome::Skipped => result.skipped += 1,
+                    }
+                }
+                crate::worktree::PrCiStatus::Pending
+                | crate::worktree::PrCiStatus::Passing
+                | crate::worktree::PrCiStatus::Unknown => {
                     result.skipped += 1;
                 }
-            }
-            crate::worktree::PrCiStatus::Failing(failed_checks) => {
-                match self_repair_or_gate(
-                    mcp,
-                    queue,
-                    auth_conn,
-                    host_policy,
-                    item,
-                    &failed_checks,
-                    &label_id_by_name,
-                ) {
-                    SelfRepairOutcome::Dispatched => result.self_repaired += 1,
-                    SelfRepairOutcome::Deferred => result.waiting += 1,
-                    SelfRepairOutcome::Skipped => result.skipped += 1,
-                }
-            }
-            crate::worktree::PrCiStatus::Pending
-            | crate::worktree::PrCiStatus::Passing
-            | crate::worktree::PrCiStatus::Unknown => {
-                result.skipped += 1;
             }
         }
     }
@@ -515,6 +547,7 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
 /// Dispatches a self-repair job for an item whose PR has failing CI checks,
 /// or -- once `quota::decide::SELF_REPAIR_CAP` prior attempts have been made
 /// with no green build -- gates it for a human instead of retrying forever.
+#[allow(clippy::too_many_arguments)]
 fn self_repair_or_gate(
     mcp: &AgentflareMcp,
     queue: &agentflare_jobs::Queue,
@@ -523,6 +556,7 @@ fn self_repair_or_gate(
     item: &agentflare_backend::item::Item,
     failed_checks: &[String],
     label_id_by_name: &std::collections::HashMap<String, String>,
+    folder_path: &str,
 ) -> SelfRepairOutcome {
     let already_gated = label_id_by_name
         .get(NEEDS_HUMAN_GATE_LABEL)
@@ -614,7 +648,7 @@ fn self_repair_or_gate(
         return SelfRepairOutcome::Deferred;
     }
     let reason = format!("self-repair: {}", failed_checks.join(", "));
-    let Some(info) = enqueue_work_job(queue, item, agent, None, Some(&reason)) else {
+    let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), Some(&reason)) else {
         return SelfRepairOutcome::Skipped;
     };
     let _ = mcp.comment_impl(CommentRequest {
