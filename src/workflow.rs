@@ -52,10 +52,37 @@ pub fn default_db_path() -> PathBuf {
         .join("workflows.db")
 }
 
-/// Wrap the headless agent runner as the engine's `SendMessage` hook.
+/// Default hard/idle subprocess timeouts when a step doesn't override them.
+const DEFAULT_HARD_CAP_SECS: u64 = 600;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// Wrap the headless agent runner as the engine's `SendMessage` hook. Honors
+/// a `JsonStep`'s `model`/`args`/`hard_cap_secs`/`idle_timeout_secs`
+/// overrides (via `StepInvocation`) so a workflow author can tune all of
+/// them as data, falling back to the defaults above when unset.
 pub(crate) fn agent_send_hook() -> SendMessage {
-    std::sync::Arc::new(|agent: String, prompt: String| {
+    std::sync::Arc::new(|inv: flare_workflow::json::StepInvocation| {
         Box::pin(async move {
+            let flare_workflow::json::StepInvocation {
+                agent,
+                prompt,
+                model,
+                args,
+                hard_cap_secs,
+                idle_timeout_secs,
+            } = inv;
+            // `--model` ahead of any caller-supplied flags, mirroring
+            // `run_launch_env`'s existing `--model` placement for the
+            // interactive launch path.
+            let mut extra_args = Vec::with_capacity(args.len() + 2);
+            if let Some(m) = model {
+                extra_args.push("--model".to_string());
+                extra_args.push(m);
+            }
+            extra_args.extend(args);
+            let hard_cap = Duration::from_secs(hard_cap_secs.unwrap_or(DEFAULT_HARD_CAP_SECS));
+            let idle_timeout =
+                Duration::from_secs(idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS));
             // `run_headless` blocks synchronously (subprocess, up to 900s) —
             // it must run inside the async block via `spawn_blocking`, not
             // before it, or the call already happened on whatever thread
@@ -66,9 +93,9 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                     agent_registry::REGISTRY,
                     &agent,
                     &prompt,
-                    Duration::from_secs(600),
-                    Duration::from_secs(300),
-                    &[],
+                    hard_cap,
+                    idle_timeout,
+                    &extra_args,
                 )
             })
             .await
@@ -86,6 +113,55 @@ pub(crate) fn agent_send_hook() -> SendMessage {
             }
         })
     })
+}
+
+/// Directory a project keeps its custom `flare-workflow` JSON definitions
+/// in, sibling to `.agentflare/config.toml` (see `github::bridge::config`).
+pub(crate) fn project_workflows_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(".agentflare").join("workflows")
+}
+
+/// Resolves a project-local workflow by name: reads
+/// `<repo_root>/.agentflare/workflows/<name>.json` as JSONC (comments and
+/// trailing commas allowed — see `crate::jsonc`) and re-serializes it to
+/// strict JSON for `run_workflow_json_async`, which the MCP `definition`
+/// field also feeds. Rejects any `name` that isn't a single path component,
+/// so a caller can't escape the workflows directory via `..`/`/`.
+pub fn resolve_named_definition(repo_root: &Path, name: &str) -> Result<String, String> {
+    if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." {
+        return Err(format!("invalid workflow name: '{name}'"));
+    }
+    let path = project_workflows_dir(repo_root).join(format!("{name}.json"));
+    if !path.is_file() {
+        return Err(format!(
+            "no workflow named '{name}' in {}",
+            project_workflows_dir(repo_root).display()
+        ));
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let value = crate::jsonc::parse_jsonc(&text)
+        .map_err(|e| format!("{}: invalid workflow JSON: {e}", path.display()))?;
+    serde_json::to_string(&value).map_err(|e| e.to_string())
+}
+
+/// Lists the names (file stems) of every `.json` workflow definition in a
+/// project's `.agentflare/workflows/` directory, sorted.
+pub fn list_workflow_definitions(repo_root: &Path) -> Vec<String> {
+    let dir = project_workflows_dir(repo_root);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|e| {
+            e.path()
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 fn open_store(db_path: &Path) -> Result<SqliteStore<PipelineData>, String> {
@@ -130,6 +206,26 @@ pub(crate) async fn run_workflow_json_async(
     db_path: &Path,
     send: SendMessage,
 ) -> Result<(WorkflowRunId, WorkflowId), String> {
+    run_workflow_json_with_params_async(
+        definition_json,
+        input,
+        serde_json::Value::Null,
+        db_path,
+        send,
+    )
+    .await
+}
+
+/// Same as [`run_workflow_json_async`] with a structured `params` payload —
+/// used by the MCP `workflow` tool's `run` action when a `params` field is
+/// supplied.
+pub(crate) async fn run_workflow_json_with_params_async(
+    definition_json: &str,
+    input: &str,
+    params: serde_json::Value,
+    db_path: &Path,
+    send: SendMessage,
+) -> Result<(WorkflowRunId, WorkflowId), String> {
     let json: JsonWorkflow =
         serde_json::from_str(definition_json).map_err(|e| format!("invalid workflow JSON: {e}"))?;
     let wf = compile_workflow(&json, send).map_err(|e| e.to_string())?;
@@ -143,7 +239,7 @@ pub(crate) async fn run_workflow_json_async(
         .map_err(|e| format!("invalid workflow: {e}"))?;
 
     let run_id = engine
-        .start_workflow(workflow_id.clone(), PipelineData, input.to_string())
+        .start_workflow_with_params(workflow_id.clone(), PipelineData, input.to_string(), params)
         .await
         .map_err(|e| e.to_string())?;
     eprintln!("agentflare-workflow: run {run_id} started for '{name}'");
@@ -316,11 +412,11 @@ mod tests {
     use std::sync::Arc;
 
     fn mock_send() -> SendMessage {
-        Arc::new(|agent: String, prompt: String| {
+        Arc::new(|inv: flare_workflow::json::StepInvocation| {
             Box::pin(async move {
                 Ok((
-                    format!("[{agent} processed: {prompt}]"),
-                    prompt.len() as u64,
+                    format!("[{} processed: {}]", inv.agent, inv.prompt),
+                    inv.prompt.len() as u64,
                     0,
                 ))
             })
@@ -480,7 +576,8 @@ mod tests {
         );
 
         let repo_path = repo.clone();
-        let send: SendMessage = Arc::new(move |agent: String, _prompt: String| {
+        let send: SendMessage = Arc::new(move |inv: flare_workflow::json::StepInvocation| {
+            let agent = inv.agent;
             let repo = repo_path.clone();
             Box::pin(async move {
                 let branch = "feature/greet";
@@ -597,5 +694,57 @@ mod tests {
             .expect("reviewer step recorded");
         assert_eq!(review["attempt"], 1, "loop approved on first real diff");
         assert!(status["input"].as_str().unwrap().contains("PR opened"));
+    }
+
+    #[test]
+    fn resolve_named_definition_finds_a_project_workflow() {
+        let repo = tempfile::tempdir().unwrap();
+        let workflows_dir = project_workflows_dir(repo.path());
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        std::fs::write(
+            workflows_dir.join("release-check.json"),
+            r#"{
+                // a project-authored workflow
+                "name": "release-check",
+                "steps": [
+                    {"name": "a", "agent": "opencode", "prompt": "check"},
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let definition = resolve_named_definition(repo.path(), "release-check").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&definition).unwrap();
+        assert_eq!(parsed["name"], "release-check");
+    }
+
+    #[test]
+    fn resolve_named_definition_rejects_missing_and_traversal_names() {
+        let repo = tempfile::tempdir().unwrap();
+
+        assert!(resolve_named_definition(repo.path(), "nope").is_err());
+        assert!(resolve_named_definition(repo.path(), "../etc/passwd").is_err());
+        assert!(resolve_named_definition(repo.path(), "sub/dir").is_err());
+    }
+
+    #[test]
+    fn list_workflow_definitions_lists_json_files_sorted() {
+        let repo = tempfile::tempdir().unwrap();
+        let workflows_dir = project_workflows_dir(repo.path());
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        std::fs::write(workflows_dir.join("b.json"), "{}").unwrap();
+        std::fs::write(workflows_dir.join("a.json"), "{}").unwrap();
+        std::fs::write(workflows_dir.join("notes.txt"), "ignore me").unwrap();
+
+        assert_eq!(
+            list_workflow_definitions(repo.path()),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn list_workflow_definitions_empty_when_no_directory() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(list_workflow_definitions(repo.path()).is_empty());
     }
 }

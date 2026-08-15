@@ -1386,7 +1386,8 @@ use  = "opencode"
     /// decision, everything else with a plain role reply.
     const JUDGE_COMPLETE_DECISION: &str = r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#;
     fn mock_sdd_send() -> flare_workflow::json::SendMessage {
-        std::sync::Arc::new(move |_a, p: String| {
+        std::sync::Arc::new(move |inv: flare_workflow::json::StepInvocation| {
+            let p = inv.prompt;
             Box::pin(async move {
                 if p.contains("You are the judge") {
                     Ok((JUDGE_COMPLETE_DECISION.to_string(), 1u64, 0u64))

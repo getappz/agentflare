@@ -1059,14 +1059,26 @@ pub(crate) struct SearchRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WorkflowRequest {
-    #[schemars(description = "Action: run|status|complete_event|list")]
+    #[schemars(description = "Action: run|status|complete_event|list|list_definitions")]
     pub(crate) action: String,
-    #[schemars(description = "JSON workflow definition (run) — OpenFang-style {name, steps}")]
+    #[schemars(
+        description = "JSON workflow definition (run) — OpenFang-style {name, steps}. Alternative to workflow_name."
+    )]
     #[serde(default)]
     pub(crate) definition: Option<String>,
+    #[schemars(
+        description = "Name of a project-local workflow (run, list_definitions) — resolves <repo_root>/.agentflare/workflows/<name>.json. Alternative to definition."
+    )]
+    #[serde(default)]
+    pub(crate) workflow_name: Option<String>,
     #[schemars(description = "Initial input for the first step (run)")]
     #[serde(default)]
     pub(crate) input: Option<String>,
+    #[schemars(
+        description = "Structured trigger payload as JSON text, exposed to prompts as {{params.x}} (run, optional)"
+    )]
+    #[serde(default)]
+    pub(crate) params: Option<String>,
     #[schemars(description = "Run UUID (status, complete_event)")]
     #[serde(default)]
     pub(crate) run_id: Option<String>,

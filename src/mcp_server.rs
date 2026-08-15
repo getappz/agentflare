@@ -1462,7 +1462,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Workflow operations — durable agent pipelines. Single consolidated tool with `action` field: run (start a JSON-defined workflow), status (run state + per-step results + journal tail), complete_event (resolve a human-in-the-loop WaitEvent), list (run summaries)."
+        description = "Workflow operations — durable agent pipelines. Single consolidated tool with `action` field: run (start a workflow from an inline `definition` JSON string OR a project-local `workflow_name`, resolved from <repo_root>/.agentflare/workflows/<name>.json), status (run state + per-step results + journal tail), complete_event (resolve a human-in-the-loop WaitEvent), list (run summaries), list_definitions (names of this project's .agentflare/workflows/*.json files)."
     )]
     async fn workflow(
         &self,

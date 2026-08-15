@@ -28,6 +28,16 @@ use crate::types::*;
 use crate::variables::capture_output;
 use crate::waits::WakeAt;
 
+/// What's journaled inside `JournalEntry::Input { value }`: the string
+/// pipeline seed plus the structured trigger payload, kept together so the
+/// journal remains the single record of "how this run was started" without a
+/// second `JournalEntry` variant.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct JournaledInput {
+    input: String,
+    params: serde_json::Value,
+}
+
 /// RAII guard that decrements the active-workflow count on drop.
 struct ActiveWorkflowGuard {
     active_workflows: Arc<AtomicUsize>,
@@ -321,6 +331,22 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         data: D,
         input: String,
     ) -> WorkflowResult<WorkflowRunId> {
+        self.start_workflow_with_params(definition_id, data, input, serde_json::Value::Null)
+            .await
+    }
+
+    /// Start a new workflow run with a structured `params` payload alongside
+    /// the string `input` pipeline — `{{params.x}}` dotted-path prompt
+    /// expansion reads from it. Parallel entrypoint to [`Self::start_workflow`];
+    /// existing callers are unaffected.
+    #[must_use = "run ID should be stored or awaited"]
+    pub async fn start_workflow_with_params(
+        &self,
+        definition_id: WorkflowId,
+        data: D,
+        input: String,
+        params: serde_json::Value,
+    ) -> WorkflowResult<WorkflowRunId> {
         let guard = StartGuard::new(self);
         if self.is_shutting_down() {
             return Err(WorkflowError::ShuttingDown);
@@ -337,6 +363,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let mut state = WorkflowState::new(run_id, definition_id.clone(), data);
         state.status = WorkflowStatus::Running;
         state.input = input.clone();
+        state.context.params = params.clone();
 
         state.step_states.reserve(definition.steps.len());
         for step in &definition.steps {
@@ -346,13 +373,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         }
 
         self.state_store.save(state).await?;
+        let journaled_input = JournaledInput { input, params };
+        let value = serde_json::to_vec(&journaled_input)
+            .map_err(|e| WorkflowError::Journal(format!("serialize input: {e}")))?;
         self.state_store
-            .append_journal(
-                run_id,
-                JournalEntry::Input {
-                    value: input.into_bytes(),
-                },
-            )
+            .append_journal(run_id, JournalEntry::Input { value })
             .await?;
 
         self.evict_old_runs_if_needed().await?;
@@ -1270,6 +1295,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     /// Get workflow status.
     pub async fn get_status(&self, run_id: WorkflowRunId) -> WorkflowResult<WorkflowState<D>> {
         self.state_store.load(run_id).await
+    }
+
+    /// Aggregate instance/step metrics over runs matching `filter`.
+    pub async fn metrics(&self, filter: MetricsFilter) -> WorkflowResult<WorkflowMetrics> {
+        self.state_store.workflow_metrics(filter).await
     }
 
     /// Wait for a workflow to complete with adaptive polling.

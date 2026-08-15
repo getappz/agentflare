@@ -5,17 +5,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flare_workflow::engine::WorkflowEngine;
-use flare_workflow::json::{JsonWorkflow, PipelineData, SendMessage, compile_workflow};
+use flare_workflow::json::{
+    JsonWorkflow, PipelineData, SendMessage, StepInvocation, compile_workflow,
+};
 use flare_workflow::sqlite_store::SqliteStore;
 use flare_workflow::types::{WorkflowId, WorkflowStatus};
 
 fn mock_send() -> SendMessage {
-    Arc::new(|agent: String, prompt: String| {
+    Arc::new(|inv: StepInvocation| {
         Box::pin(async move {
             Ok((
-                format!("[{agent} processed: {prompt}]"),
-                prompt.len() as u64,
-                prompt.len() as u64 / 2,
+                format!("[{} processed: {}]", inv.agent, inv.prompt),
+                inv.prompt.len() as u64,
+                inv.prompt.len() as u64 / 2,
             ))
         })
     })
@@ -98,6 +100,43 @@ async fn brainstorm_fanout_collect() {
     // The collect joined the three fan-out outputs, so synthesizer's input
     // contains multiple processed outputs.
     assert!(out.matches("processed").count() >= 3);
+}
+
+/// `params` flows from `start_workflow_with_params` through `{{params.x}}`
+/// dotted-path expansion into a step's prompt (item #126).
+#[tokio::test]
+async fn params_flow_through_to_prompt_expansion() {
+    let wf_json: JsonWorkflow = serde_json::from_str(
+        r#"{
+            "name": "params-roundtrip",
+            "steps": [
+                {"name": "greet", "agent": "writer", "prompt": "Hello {{params.userId}}, task: {{params.metadata.task}}"}
+            ]
+        }"#,
+    )
+    .unwrap();
+    let wf = compile_workflow(&wf_json, mock_send()).unwrap();
+    let engine = WorkflowEngine::<PipelineData, _>::with_store(SqliteStore::open_memory().unwrap());
+    engine.register_workflow(wf).unwrap();
+
+    let params = serde_json::json!({"userId": "u-42", "metadata": {"task": "review"}});
+    let run = engine
+        .start_workflow_with_params(
+            WorkflowId::new("params-roundtrip"),
+            PipelineData,
+            "seed".into(),
+            params,
+        )
+        .await
+        .unwrap();
+    engine
+        .wait_for_completion(run, "params-roundtrip", Duration::from_secs(15))
+        .await
+        .unwrap();
+
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert!(state.input.contains("Hello u-42, task: review"));
 }
 
 #[tokio::test]
