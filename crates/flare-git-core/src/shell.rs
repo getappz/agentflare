@@ -174,6 +174,83 @@ pub fn diff(repo_root: &Path, base: &str, head: &str) -> Result<String, String> 
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// Why [`run_in_lines_bounded`] came back with an error.
+#[derive(Debug)]
+pub enum BoundedLinesError {
+    /// git itself failed: could not spawn, or exited non-zero (stderr).
+    Git(String),
+    /// The output had more than the requested cap of non-empty lines.
+    TooManyLines,
+}
+
+/// Runs `git <args>` in `repo_root`, streaming stdout line-by-line and
+/// keeping only the first `cap` non-empty lines.
+///
+/// Bounds peak memory for outputs that would otherwise materialize as one
+/// multi-MB string plus a `Vec<String>` clone of it — the pathological case
+/// behind the scope-check child-process OOM (item #472): `git diff
+/// <default>...<head> --name-only` on a branch that diverged massively from
+/// the default branch lists the whole tree, and `Command::output()` buffers
+/// it all before we can even count the lines. Streaming keeps peak usage at
+/// the capped `Vec` plus one line instead.
+///
+/// `Err(BoundedLinesError::TooManyLines)` once `cap` lines are collected —
+/// the child is killed rather than left to block forever on a full stdout
+/// pipe (git is read-only here, so killing it loses nothing).
+pub fn run_in_lines_bounded(
+    repo_root: &Path,
+    args: &[&str],
+    cap: usize,
+) -> Result<Vec<String>, BoundedLinesError> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+
+    let mut cmd = Command::new(git_binary());
+    cmd.args(args)
+        .current_dir(repo_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    no_console_window(&mut cmd);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| BoundedLinesError::Git(format!("git not available: {e}")))?;
+    let mut lines = Vec::new();
+    let mut exceeded = false;
+    if let Some(stdout) = child.stdout.take() {
+        for line in BufReader::new(stdout).lines() {
+            let line = line
+                .map_err(|e| BoundedLinesError::Git(format!("reading git output failed: {e}")))?;
+            if line.is_empty() {
+                continue;
+            }
+            if lines.len() >= cap {
+                exceeded = true;
+                break;
+            }
+            lines.push(line);
+        }
+    }
+    if exceeded {
+        // Drain the pipe, else the child blocks forever on a full stdout
+        // buffer and `wait()` never returns. Killing a read-only `git diff`
+        // is safe.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(BoundedLinesError::TooManyLines);
+    }
+    let mut stderr = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut stderr);
+    }
+    let status = child
+        .wait()
+        .map_err(|e| BoundedLinesError::Git(format!("waiting for git failed: {e}")))?;
+    if !status.success() {
+        return Err(BoundedLinesError::Git(stderr.trim().to_string()));
+    }
+    Ok(lines)
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::run_in;
@@ -233,6 +310,54 @@ mod tests {
         let repo = init_repo_with_branch("master");
         let err = diff(&repo.path, "no-such-branch", "HEAD").unwrap_err();
         assert!(err.contains("no-such-branch"), "{err}");
+    }
+
+    #[test]
+    fn run_in_lines_bounded_returns_lines_up_to_the_cap() {
+        let repo = init_repo_with_branch("master");
+        for n in 1..=5 {
+            std::fs::write(repo.path.join(format!("f{n}.txt")), "x\n").unwrap();
+            run_in(&repo.path, &["add", format!("f{n}.txt").as_str()]).unwrap();
+        }
+        run_in(&repo.path, &["commit", "-m", "add five"]).unwrap();
+        let lines =
+            run_in_lines_bounded(&repo.path, &["diff", "--cached", "--name-only"], 5).unwrap();
+        assert!(
+            lines.is_empty(),
+            "clean tree has no staged paths: {lines:?}"
+        );
+        let all = run_in_lines_bounded(&repo.path, &["ls-files"], 10).unwrap();
+        assert_eq!(all.len(), 5, "{all:?}");
+    }
+
+    #[test]
+    fn run_in_lines_bounded_errors_when_cap_is_exceeded() {
+        let repo = init_repo_with_branch("master");
+        for n in 1..=10 {
+            std::fs::write(repo.path.join(format!("f{n}.txt")), "x\n").unwrap();
+            run_in(&repo.path, &["add", format!("f{n}.txt").as_str()]).unwrap();
+        }
+        run_in(&repo.path, &["commit", "-m", "add ten"]).unwrap();
+        assert!(
+            matches!(
+                run_in_lines_bounded(&repo.path, &["ls-files"], 5),
+                Err(BoundedLinesError::TooManyLines)
+            ),
+            "more tracked files than the cap must error, not silently truncate"
+        );
+        let ok = run_in_lines_bounded(&repo.path, &["ls-files"], 10).unwrap();
+        assert_eq!(ok.len(), 10, "{ok:?}");
+    }
+
+    #[test]
+    fn run_in_lines_bounded_propagates_git_errors() {
+        let repo = init_repo_with_branch("master");
+        match run_in_lines_bounded(&repo.path, &["rev-parse", "--verify", "no-such-branch"], 10) {
+            Err(BoundedLinesError::Git(e)) => {
+                assert!(e.contains("Needed a single revision"), "{e}")
+            }
+            other => panic!("expected a git error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@
 
 use crate::paths::home;
 use clap::{Args, Subcommand};
+use flare_git_core::shell::BoundedLinesError;
 use flare_git_core::{
     audit, branch, classify, doctor, provenance, scope, shell, snapshot, worktree,
 };
@@ -873,8 +874,29 @@ fn run_scope_check(subcommand: &str) -> ScopeCheckResult {
     let owner = crate::claims::owner_id();
     let (own_target, others) = partition_claims_by_owner(&live, &owner);
 
-    let changed = changed_paths(&repo_root, subcommand);
     let in_worktree = branch::is_linked_worktree(&repo_root);
+    // Only compute changed paths when the verdict actually depends on them:
+    // an out-of-tree invoker is denied regardless of paths, and with no
+    // enforceable other-claim scope nothing can overlap. This is also the
+    // memory fix for the scope-check child-process OOM (item #472): `git
+    // diff <default>...<head> --name-only` on a branch that diverged hugely
+    // from the default branch lists the whole tree as a multi-MB pathset,
+    // which previously crashed the child on a memory-constrained environment
+    // and surfaced to the shim as a fake policy denial.
+    let out_of_tree = own_target.is_some() && !in_worktree;
+    let has_enforced_others = others
+        .iter()
+        .any(|c| !scope::scope_is_wildcard_or_empty(&c.scopes));
+    let changed = if out_of_tree || !has_enforced_others {
+        Vec::new()
+    } else {
+        match changed_paths(&repo_root, subcommand) {
+            Ok(p) => p,
+            Err(e) => {
+                return scope_deny(format!("scope-check could not classify changed paths: {e}"));
+            }
+        }
+    };
     match scope::classify_scopes(&changed, own_target.as_deref(), in_worktree, &others) {
         scope::ScopeVerdict::Overlapping {
             owner,
@@ -890,6 +912,19 @@ fn run_scope_check(subcommand: &str) -> ScopeCheckResult {
     }
 }
 
+/// Cap on the number of changed paths a commit/push scope-check will
+/// classify. Beyond this the pathset is too large to classify reliably, and
+/// streaming it unbounded is exactly what OOM'd the scope-check child in the
+/// first place (item #472) -- so the check fails closed with a clear message
+/// instead of crashing the child process.
+const MAX_CHANGED_PATHS: usize = 50_000;
+
+fn too_many_paths_msg(cap: usize) -> String {
+    format!(
+        "the changed pathset exceeds the {cap}-path scope-check limit and cannot be classified; shrink this commit/push and retry"
+    )
+}
+
 /// Changed paths for the mutation about to happen -- staged paths for
 /// `commit` (unioned with the working-tree diff, since `git commit -a`/
 /// `--all` implicitly stages+commits tracked modifications without a prior
@@ -900,19 +935,29 @@ fn run_scope_check(subcommand: &str) -> ScopeCheckResult {
 /// An unreadable diff yields no changed paths (nothing to enforce), matching
 /// this crate's fail-open default for diff resolution specifically -- only
 /// scope RESOLUTION errors (ledger/DB) are fail-closed, per the spec.
-fn changed_paths(repo_root: &Path, subcommand: &str) -> Vec<String> {
+///
+/// `Err` is reserved for the one case where fail-open would be wrong: the
+/// changed pathset is so large it cannot be classified at all (see
+/// `MAX_CHANGED_PATHS`). The diff is streamed with a line cap so a
+/// pathological pathset can't blow the child process's memory first.
+fn changed_paths(repo_root: &Path, subcommand: &str) -> Result<Vec<String>, String> {
+    let cap = MAX_CHANGED_PATHS;
     if subcommand == "commit" {
-        let mut paths: Vec<String> = shell::run_in(repo_root, &["diff", "--cached", "--name-only"])
-            .map(|s| s.lines().map(String::from).collect())
-            .unwrap_or_default();
-        paths.extend(
-            shell::run_in(repo_root, &["diff", "--name-only"])
-                .map(|s| s.lines().map(String::from).collect::<Vec<_>>())
-                .unwrap_or_default(),
-        );
+        let mut paths =
+            match shell::run_in_lines_bounded(repo_root, &["diff", "--cached", "--name-only"], cap)
+            {
+                Ok(p) => p,
+                Err(BoundedLinesError::Git(_)) => Vec::new(), // fail-open on diff resolution
+                Err(BoundedLinesError::TooManyLines) => return Err(too_many_paths_msg(cap)),
+            };
+        match shell::run_in_lines_bounded(repo_root, &["diff", "--name-only"], cap) {
+            Ok(p) => paths.extend(p),
+            Err(BoundedLinesError::Git(_)) => {}
+            Err(BoundedLinesError::TooManyLines) => return Err(too_many_paths_msg(cap)),
+        }
         paths.sort();
         paths.dedup();
-        return paths;
+        return Ok(paths);
     }
     let range_args: Vec<String> = match subcommand {
         "push" => {
@@ -922,12 +967,14 @@ fn changed_paths(repo_root: &Path, subcommand: &str) -> Vec<String> {
             let range = format!("{default_branch}...{current}");
             vec!["diff".to_string(), "--name-only".to_string(), range]
         }
-        _ => return Vec::new(),
+        _ => return Ok(Vec::new()),
     };
     let args: Vec<&str> = range_args.iter().map(String::as_str).collect();
-    shell::run_in(repo_root, &args)
-        .map(|s| s.lines().map(String::from).collect())
-        .unwrap_or_default()
+    match shell::run_in_lines_bounded(repo_root, &args, cap) {
+        Ok(p) => Ok(p),
+        Err(BoundedLinesError::Git(_)) => Ok(Vec::new()), // fail-open on diff resolution
+        Err(BoundedLinesError::TooManyLines) => Err(too_many_paths_msg(cap)),
+    }
 }
 
 /// The "ship it" macro: push the current branch, open (or reuse) its PR,
@@ -1405,7 +1452,7 @@ mod tests {
         // enforcement entirely.
         let repo = init_repo();
         std::fs::write(repo.path().join("tracked.txt"), "v2\n").unwrap();
-        let paths = changed_paths(repo.path(), "commit");
+        let paths = changed_paths(repo.path(), "commit").unwrap();
         assert!(
             paths.iter().any(|p| p == "tracked.txt"),
             "unstaged modification must be included: {paths:?}"
@@ -1417,7 +1464,7 @@ mod tests {
         let repo = init_repo();
         std::fs::write(repo.path().join("new.txt"), "x\n").unwrap();
         run_git(repo.path(), &["add", "new.txt"]);
-        let paths = changed_paths(repo.path(), "commit");
+        let paths = changed_paths(repo.path(), "commit").unwrap();
         assert_eq!(
             paths.iter().filter(|p| *p == "new.txt").count(),
             1,
@@ -1428,6 +1475,6 @@ mod tests {
     #[test]
     fn changed_paths_for_commit_is_empty_when_clean() {
         let repo = init_repo();
-        assert!(changed_paths(repo.path(), "commit").is_empty());
+        assert!(changed_paths(repo.path(), "commit").unwrap().is_empty());
     }
 }
