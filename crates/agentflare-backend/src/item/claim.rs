@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::error::Result;
 
@@ -50,7 +50,18 @@ pub fn claim(
     now: i64,
     ttl_secs: i64,
 ) -> Result<ClaimOutcome> {
-    let tx = conn.unchecked_transaction()?;
+    // IMMEDIATE, not the default DEFERRED: this transaction always ends in a
+    // write, and DEFERRED takes its read snapshot on the first SELECT below,
+    // then only grabs the write lock later. Under concurrent writers that
+    // window lets another connection's commit age out the snapshot, and the
+    // write attempt fails with SQLITE_BUSY_SNAPSHOT — an error the
+    // busy_timeout retry loop does not cover (retrying can't fix a stale
+    // snapshot, only restarting the transaction can), so it surfaces
+    // instantly as "database is locked" instead of waiting its turn like
+    // ordinary lock contention does. Taking the write lock upfront closes
+    // that window and puts this claim's lock wait through the normal,
+    // busy_timeout-honoring path.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let item = get(&tx, item_id)?;
     if let Some(assignee) = &item.assignee_agent
         && agent_part(assignee) != agent_part(owner)
