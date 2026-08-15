@@ -40,6 +40,26 @@ const HOME_CACHE_DIRS: &[&str] = &[".cargo", ".rustup", ".cache", ".npm"];
 /// since this one dir needs both.
 const OPENCODE_DATA_DIR_RELATIVE: &str = ".local/share/opencode";
 
+/// claude-code's own data dir, relative to `$HOME`. It holds
+/// `.credentials.json`, the file claude-code's OAuth refresh machinery both
+/// reads (existing access/refresh tokens) and writes (persisting the rotated
+/// token pair after a successful server-side refresh). The write side is the
+/// part the sandbox breaks: claude-code's refresh flow first creates
+/// `.oauth_refresh.lock` (inside this dir) and later rewrites the credentials
+/// file via a temp-file+rename, and both fail with EROFS when the dir falls
+/// through to the sandbox's read-only root -- the refresh never completes and
+/// the job dies with "Failed to authenticate. API Error: 401 OAuth access
+/// token has expired" against the stale token (item #127, confirmed live:
+/// every sandboxed job hit it while the same token refreshed fine
+/// interactively). Mounted via `--overlay-src`+`--tmp-overlay` in
+/// `build_bwrap_args_with_home`, exactly like `OPENCODE_DATA_DIR_RELATIVE`:
+/// reads see the real dir, writes land in an invisible tmpfs that's discarded
+/// when the sandboxed process exits, so the in-job refresh can complete
+/// without any refreshed token persisting back to the host's real
+/// `~/.claude` -- same "no writable state survives past this one job"
+/// guarantee `HOME_CACHE_DIRS` argues for.
+const CLAUDE_DATA_DIR_RELATIVE: &str = ".claude";
+
 /// The agentflare MCP server's own state dir, relative to `$HOME` -- holds
 /// `agentflare.db`, the sqlite store every `item`/`comment`/`vent` MCP call
 /// writes through. Unlike `HOME_CACHE_DIRS`, this one must be writable: a
@@ -60,6 +80,14 @@ const AGENTFLARE_DATA_DIR_RELATIVE: &str = ".agentflare";
 /// or a full resolved path.
 fn is_opencode(command: &str) -> bool {
     Path::new(command).file_name() == Some(std::ffi::OsStr::new("opencode"))
+}
+
+/// Whether `command` (the resolved binary about to be run) is claude-code --
+/// matched on the final path component `claude` (the CLI's binary name, found
+/// via `find_binary(["claude"])`), so it works for both a bare name and a
+/// full resolved path, the same way `is_opencode` does.
+fn is_claude_code(command: &str) -> bool {
+    Path::new(command).file_name() == Some(std::ffi::OsStr::new("claude"))
 }
 
 /// `git_writable` controls whether `cwd/.git` is re-protected read-only
@@ -211,6 +239,30 @@ fn build_bwrap_args_with_home(
                 // dir" case.
                 bwrap_args.push("--tmpfs".to_string());
                 bwrap_args.push(opencode_str);
+            }
+        }
+
+        if is_claude_code(command) {
+            let claude_dir = Path::new(home).join(CLAUDE_DATA_DIR_RELATIVE);
+            let claude_str = path_to_string(&claude_dir);
+            if claude_dir.exists() {
+                // Same overlay semantics as the opencode dir above: reads
+                // pass through to the host's `~/.claude` (existing
+                // `.credentials.json`), writes -- the `.oauth_refresh.lock`
+                // and rotated-token persist claude-code's refresh flow needs
+                // -- go to the implicit tmpfs `--tmp-overlay` adds on top,
+                // discarded on exit, never touching the host (item #127).
+                bwrap_args.push("--overlay-src".to_string());
+                bwrap_args.push(claude_str.clone());
+                bwrap_args.push("--tmp-overlay".to_string());
+                bwrap_args.push(claude_str);
+            } else {
+                // Never run before under this `$HOME` -- no existing
+                // credentials to read, but claude-code still needs a
+                // writable dir to create `.credentials.json` (it re-auths
+                // into the overlay, discarded after this one job).
+                bwrap_args.push("--tmpfs".to_string());
+                bwrap_args.push(claude_str);
             }
         }
     }
@@ -603,6 +655,62 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(OPENCODE_DATA_DIR_RELATIVE)).unwrap();
         let home = std::ffi::OsString::from(dir.path());
         let args = build_bwrap_args_with_home(None, "/usr/bin/claude", &[], Some(&home), false);
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--overlay-src" || a == "--tmp-overlay")
+        );
+    }
+
+    #[test]
+    fn claude_data_dir_overlaid_when_present() {
+        // Item #127: `~/.claude` holds `.credentials.json`, which claude-code's
+        // OAuth refresh must write (`.oauth_refresh.lock` + rotated-token
+        // persist) -- read-only under the sandbox's root bind means the
+        // refresh never completes and every dispatched job fails auth. A
+        // claude-code command must get `~/.claude` overlaid, not left on the
+        // read-only root.
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join(CLAUDE_DATA_DIR_RELATIVE);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let args = build_bwrap_args_with_home(None, "/usr/local/bin/claude", &[], Some(&home), false);
+        let data_str = path_to_string(&data_dir);
+        let src_idx = args
+            .iter()
+            .position(|a| a == "--overlay-src")
+            .expect("--overlay-src present");
+        assert_eq!(args[src_idx + 1], data_str);
+        let overlay_idx = args
+            .iter()
+            .position(|a| a == "--tmp-overlay")
+            .expect("--tmp-overlay present");
+        assert_eq!(args[overlay_idx + 1], data_str);
+    }
+
+    #[test]
+    fn claude_data_dir_uses_tmpfs_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let args = build_bwrap_args_with_home(None, "/usr/local/bin/claude", &[], Some(&home), false);
+        let data_str = path_to_string(&dir.path().join(CLAUDE_DATA_DIR_RELATIVE));
+        let idx = args
+            .iter()
+            .position(|a| a == &data_str)
+            .expect("claude data dir tmpfs-mounted");
+        assert_eq!(args[idx - 1], "--tmpfs");
+        assert!(!args.iter().any(|a| a == "--overlay-src"));
+    }
+
+    #[test]
+    fn non_claude_command_gets_no_claude_specific_mount() {
+        // The `~/.claude` overlay is gated on the command actually being
+        // claude-code; an opencode job must not get one (opencode gets its own
+        // dir instead).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(CLAUDE_DATA_DIR_RELATIVE)).unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let args = build_bwrap_args_with_home(None, "/usr/bin/opencode", &[], Some(&home), false);
         assert!(
             !args
                 .iter()
