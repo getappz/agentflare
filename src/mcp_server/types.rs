@@ -1059,9 +1059,7 @@ pub(crate) struct SearchRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WorkflowRequest {
-    #[schemars(
-        description = "Action: run|status|complete_event|list|list_definitions"
-    )]
+    #[schemars(description = "Action: run|status|complete_event|list|list_definitions")]
     pub(crate) action: String,
     #[schemars(
         description = "JSON workflow definition (run) — OpenFang-style {name, steps}. Alternative to workflow_name."

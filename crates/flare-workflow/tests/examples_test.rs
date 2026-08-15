@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flare_workflow::engine::WorkflowEngine;
-use flare_workflow::json::{JsonWorkflow, PipelineData, SendMessage, StepInvocation, compile_workflow};
+use flare_workflow::json::{
+    JsonWorkflow, PipelineData, SendMessage, StepInvocation, compile_workflow,
+};
 use flare_workflow::sqlite_store::SqliteStore;
 use flare_workflow::types::{WorkflowId, WorkflowStatus};
 

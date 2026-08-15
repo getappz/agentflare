@@ -231,18 +231,14 @@ pub(crate) fn build_sdd_loop_step(
                     (agent_name.clone(), build_implementer_prompt(&task, None))
                 };
 
-                let (role_reply, in_tok, out_tok) =
-                    send(flare_workflow::json::StepInvocation::simple(
-                        role_agent,
-                        role_prompt,
-                    ))
-                    .await
-                    .map_err(|message| {
-                        WorkflowError::StepFailed {
-                            step_id: StepId::new("sdd_loop"),
-                            message,
-                        }
-                    })?;
+                let (role_reply, in_tok, out_tok) = send(
+                    flare_workflow::json::StepInvocation::simple(role_agent, role_prompt),
+                )
+                .await
+                .map_err(|message| WorkflowError::StepFailed {
+                    step_id: StepId::new("sdd_loop"),
+                    message,
+                })?;
                 ctx.input_tokens += in_tok;
                 ctx.output_tokens += out_tok;
 
@@ -262,16 +258,14 @@ pub(crate) fn build_sdd_loop_step(
                     &ctx.data.ledger,
                     &role_reply,
                 );
-                let (judge_reply, jin_tok, jout_tok) =
-                    send(flare_workflow::json::StepInvocation::simple(
-                        judge_agent_name,
-                        judge_prompt,
-                    ))
-                        .await
-                        .map_err(|message| WorkflowError::StepFailed {
-                            step_id: StepId::new("sdd_loop"),
-                            message,
-                        })?;
+                let (judge_reply, jin_tok, jout_tok) = send(
+                    flare_workflow::json::StepInvocation::simple(judge_agent_name, judge_prompt),
+                )
+                .await
+                .map_err(|message| WorkflowError::StepFailed {
+                    step_id: StepId::new("sdd_loop"),
+                    message,
+                })?;
                 ctx.input_tokens += jin_tok;
                 ctx.output_tokens += jout_tok;
 
@@ -1107,9 +1101,10 @@ mod pipeline_assembly_tests {
 
     #[test]
     fn sdd_pipeline_has_two_steps_with_correct_dependency() {
-        let send: flare_workflow::json::SendMessage = std::sync::Arc::new(|_: flare_workflow::json::StepInvocation| {
-            Box::pin(async { Ok((String::new(), 0, 0)) })
-        });
+        let send: flare_workflow::json::SendMessage =
+            std::sync::Arc::new(|_: flare_workflow::json::StepInvocation| {
+                Box::pin(async { Ok((String::new(), 0, 0)) })
+            });
         let pipeline = build_work_item_pipeline_with_sender(
             agent_registry::Agent::ClaudeCode,
             "Fix the null pointer in parser.rs".to_string(),
@@ -1656,15 +1651,16 @@ mod sdd_loop_tests {
             r#"{"action":"advance_task","rationale":"clean","ledger_line":"Task 2: complete","task_model_tier":null}"#,
         ]);
         let responses = Arc::new(Mutex::new(responses));
-        let send: flare_workflow::json::SendMessage = Arc::new(move |_: flare_workflow::json::StepInvocation| {
-            let reply = responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_default()
-                .to_string();
-            Box::pin(async move { Ok((reply, 5u64, 5u64)) })
-        });
+        let send: flare_workflow::json::SendMessage =
+            Arc::new(move |_: flare_workflow::json::StepInvocation| {
+                let reply = responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_default()
+                    .to_string();
+                Box::pin(async move { Ok((reply, 5u64, 5u64)) })
+            });
 
         let step = sdd_step(send);
         let data = WorkItemData {
@@ -1723,18 +1719,19 @@ mod cap_tests {
     use super::{sdd_test_support::*, *};
     #[tokio::test]
     async fn sixth_fix_round_fails_the_step() {
-        let send: flare_workflow::json::SendMessage =
-            std::sync::Arc::new(move |inv: flare_workflow::json::StepInvocation| {
-            let p = inv.prompt;
-            Box::pin(async move {
-                let r = if p.contains("judge") {
-                    r#"{"action":"fix_round","rationale":"x","ledger_line":"x","task_model_tier":null}"#
-                } else {
-                    "REVIEW_ISSUES: x"
-                };
-                Ok((r.to_string(), 5u64, 5u64))
-            })
-        });
+        let send: flare_workflow::json::SendMessage = std::sync::Arc::new(
+            move |inv: flare_workflow::json::StepInvocation| {
+                let p = inv.prompt;
+                Box::pin(async move {
+                    let r = if p.contains("judge") {
+                        r#"{"action":"fix_round","rationale":"x","ledger_line":"x","task_model_tier":null}"#
+                    } else {
+                        "REVIEW_ISSUES: x"
+                    };
+                    Ok((r.to_string(), 5u64, 5u64))
+                })
+            },
+        );
         let mut d = one_task_data();
         d.fix_round = MAX_FIX_ROUNDS;
         d.review_issues = Some("x".to_string());

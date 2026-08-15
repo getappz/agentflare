@@ -59,7 +59,9 @@ impl StepInvocation {
 /// Hook that sends a step invocation to an agent and returns
 /// `(output, input_tokens, output_tokens)`.
 pub type SendMessage = Arc<
-    dyn Fn(StepInvocation) -> Pin<Box<dyn Future<Output = Result<(String, u64, u64), String>> + Send>>
+    dyn Fn(
+            StepInvocation,
+        ) -> Pin<Box<dyn Future<Output = Result<(String, u64, u64), String>> + Send>>
         + Send
         + Sync,
 >;
