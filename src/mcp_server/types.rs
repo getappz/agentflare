@@ -1067,6 +1067,11 @@ pub(crate) struct WorkflowRequest {
     #[schemars(description = "Initial input for the first step (run)")]
     #[serde(default)]
     pub(crate) input: Option<String>,
+    #[schemars(
+        description = "Structured trigger payload as JSON text, exposed to prompts as {{params.x}} (run, optional)"
+    )]
+    #[serde(default)]
+    pub(crate) params: Option<String>,
     #[schemars(description = "Run UUID (status, complete_event)")]
     #[serde(default)]
     pub(crate) run_id: Option<String>,
