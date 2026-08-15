@@ -1354,3 +1354,127 @@ fn list_by_label_returns_only_items_carrying_that_label() {
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, labeled.id);
 }
+
+#[test]
+fn update_sets_and_clears_parent_id() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let parent = make_item(&conn, &pid, &sid);
+    let child = make_item(&conn, &pid, &sid);
+
+    let reparented = update(
+        &conn,
+        &child.id,
+        UpdateItem {
+            parent_id: Some(Some(parent.id.clone())),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(reparented.parent_id.as_deref(), Some(parent.id.as_str()));
+    assert_eq!(
+        get(&conn, &child.id).unwrap().parent_id.as_deref(),
+        Some(parent.id.as_str())
+    );
+
+    // An unrelated update must leave the parent alone...
+    let renamed = update(
+        &conn,
+        &child.id,
+        UpdateItem {
+            name: Some("Renamed".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(renamed.parent_id.as_deref(), Some(parent.id.as_str()));
+
+    // ...while an explicit Some(None) detaches it.
+    let detached = update(
+        &conn,
+        &child.id,
+        UpdateItem {
+            parent_id: Some(None),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(detached.parent_id, None);
+}
+
+#[test]
+fn update_rejects_self_parent() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    let err = update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            parent_id: Some(Some(item.id.clone())),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::Validation(ref m) if m.contains("its own parent")),
+        "{err:?}"
+    );
+    assert_eq!(get(&conn, &item.id).unwrap().parent_id, None);
+}
+
+#[test]
+fn update_rejects_a_parent_that_would_close_a_cycle() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let grandparent = make_item(&conn, &pid, &sid);
+    let parent = make_item(&conn, &pid, &sid);
+    let child = make_item(&conn, &pid, &sid);
+    for (item, new_parent) in [(&parent, &grandparent), (&child, &parent)] {
+        update(
+            &conn,
+            &item.id,
+            UpdateItem {
+                parent_id: Some(Some(new_parent.id.clone())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    // grandparent -> child would make the chain loop forever.
+    let err = update(
+        &conn,
+        &grandparent.id,
+        UpdateItem {
+            parent_id: Some(Some(child.id.clone())),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::Validation(ref m) if m.contains("cycle")),
+        "{err:?}"
+    );
+    assert_eq!(get(&conn, &grandparent.id).unwrap().parent_id, None);
+}
+
+#[test]
+fn update_rejects_an_unknown_parent_instead_of_leaking_a_foreign_key_error() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    let err = update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            parent_id: Some(Some("no-such-item".into())),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::NotFound(ref m) if m.contains("no-such-item")),
+        "{err:?}"
+    );
+}

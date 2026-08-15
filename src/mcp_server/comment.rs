@@ -20,6 +20,10 @@ impl AgentflareMcp {
                 }
                 let author = crate::claims::owner_id();
                 self.with_backend_db(|conn| {
+                    // `327` / `#327` / the UUID all work, same as every `item`
+                    // action — without this the sequence_id went straight into
+                    // the INSERT and came back as a raw FK error (#375).
+                    let item_id = self.resolve_existing_item_id(conn, &item_id)?;
                     let comment =
                         agentflare_backend::comment::create(conn, &item_id, &author, &body)
                             .map_err(map_backend_err)?;
@@ -150,6 +154,9 @@ impl AgentflareMcp {
                     return Err(ErrorData::invalid_params("item_id is required", None));
                 }
                 self.with_backend_db(|conn| {
+                    // Same resolution as `create` — a sequence_id here quietly
+                    // returned an empty list instead of the item's comments.
+                    let item_id = self.resolve_existing_item_id(conn, &item_id)?;
                     let comments = agentflare_backend::comment::list_by_item(conn, &item_id)
                         .map_err(map_backend_err)?;
                     Ok(serde_json::to_string_pretty(&comments).unwrap_or_default())

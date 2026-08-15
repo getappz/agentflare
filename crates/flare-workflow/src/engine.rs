@@ -1065,6 +1065,15 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             let mut context = state.context.clone();
             context.input = state.input.clone();
             context.variables = state.variables.clone();
+            context.step = StepExecutionMeta {
+                workflow_id: definition.id.to_string(),
+                workflow_name: definition.name.clone(),
+                step_id: step.id.to_string(),
+                step_name: step.name.clone(),
+                attempt,
+                max_attempts,
+                timeout: step_timeout,
+            };
             let step_start = std::time::Instant::now();
             let result = timeout(step_timeout, step.executor.execute(&mut context)).await;
             let step_duration = step_start.elapsed();
@@ -1216,140 +1225,39 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         }
     }
 
-    /// Execute a `Loop` step: repeat the executor until the output contains
-    /// `until` or `max_iterations` elapse, chaining each iteration's output
-    /// back as the next `{{input}}`.
-    async fn execute_loop(
-        &self,
-        run_id: WorkflowRunId,
-        step: &StepDefinition<D>,
-        definition: &WorkflowDefinition<D>,
-    ) -> WorkflowResult<StepResult> {
-        let StepMode::Loop {
-            max_iterations,
-            until,
-        } = &step.mode
-        else {
-            return Ok(StepResult::Skip);
-        };
-        let step_timeout = definition.get_timeout(step);
-        let until_lower = until.to_lowercase();
-        let mut last_context: Option<WorkflowContext<D>> = None;
-        let mut executed = 0u32;
-
-        for iter in 1..=*max_iterations {
-            if self.state_store.is_cancelled(run_id).await? {
-                return Err(WorkflowError::Cancelled(run_id));
-            }
-
-            let state = self.state_store.load(run_id).await?;
-            let mut context = state.context.clone();
-            context.input = state.input.clone();
-            context.variables = state.variables.clone();
-            context.output.clear();
-            let step_start = std::time::Instant::now();
-
-            self.state_store
-                .update(run_id, |s| {
-                    s.current_step = Some(step.id.clone());
-                    if let Some(ss) = s.step_states.get_mut(&step.id) {
-                        ss.status = StepStatus::Running;
-                        ss.attempt = iter;
-                        ss.started_at = Some(Utc::now());
-                    }
-                })
-                .await?;
-
-            let result = timeout(step_timeout, step.executor.execute(&mut context)).await;
-            let duration_ms = step_start.elapsed().as_millis() as u64;
-
-            match result {
-                Ok(Ok(StepResult::Success)) => {
-                    executed += 1;
-                    let out = context.output.clone();
-                    self.state_store
-                        .update(run_id, |s| {
-                            s.context = context.clone();
-                            s.input = out.clone();
-                            s.output = Some(out.clone());
-                            if let Some(var) = step.output_var.as_deref() {
-                                capture_output(&mut s.variables, Some(var), &out);
-                            }
-                            if let Some(ss) = s.step_states.get_mut(&step.id) {
-                                ss.status = StepStatus::Succeeded;
-                                ss.completed_at = Some(Utc::now());
-                                ss.input_tokens = context.input_tokens;
-                                ss.output_tokens = context.output_tokens;
-                                ss.duration_ms = duration_ms;
-                            }
-                        })
-                        .await?;
-                    last_context = Some(context.clone());
-                    tracing::info!(run_id = %run_id, step = %step.id, iter, "Loop iteration completed");
-                    if !until_lower.is_empty() && out.to_lowercase().contains(&until_lower) {
-                        break;
-                    }
-                }
-                Ok(Ok(StepResult::Skip)) => break,
-                Ok(Ok(StepResult::Failure)) | Ok(Err(_)) | Err(_) => {
-                    let error_msg = match &result {
-                        Err(_) => format!("Step timed out after {step_timeout:?}"),
-                        Ok(Err(e)) => format!("{e}"),
-                        _ => "Step failed".to_string(),
-                    };
-                    self.state_store
-                        .update(run_id, |s| {
-                            if let Some(ss) = s.step_states.get_mut(&step.id) {
-                                ss.status = StepStatus::Failed;
-                                ss.last_error = Some(error_msg.clone());
-                                ss.completed_at = Some(Utc::now());
-                            }
-                        })
-                        .await?;
-                    self.state_store
-                        .append_journal(
-                            run_id,
-                            JournalEntry::StepRun {
-                                step_id: step.id.clone(),
-                                attempt: iter,
-                                result: Some(EntryResult::Failure {
-                                    code: 1,
-                                    message: error_msg,
-                                    metadata: vec![],
-                                }),
-                            },
-                        )
-                        .await?;
-                    return Ok(StepResult::Failure);
-                }
-            }
-        }
-
-        // Journal the loop's terminal success carrying the full serialized
-        // context (matching Sequential/FanOut's terminal `StepRun` entry) so
-        // a registered rollback handler can reconstruct this step's own
-        // output from the journal, same as any other supported mode.
-        let final_context = match last_context {
-            Some(ctx) => ctx,
-            None => self.state_store.load(run_id).await?.context,
-        };
-        let context_bytes = serde_json::to_vec(&final_context)
-            .map_err(|e| WorkflowError::Journal(format!("serialize context: {e}")))?;
-        self.state_store
-            .append_journal(
-                run_id,
-                JournalEntry::StepRun {
-                    step_id: step.id.clone(),
-                    attempt: executed,
-                    result: Some(EntryResult::Success(context_bytes)),
-                },
-            )
-            .await?;
-        Ok(StepResult::Success)
+    /// Cancel a running workflow. Already-succeeded steps are left
+    /// uncompensated — use [`cancel_workflow_with_rollback`](Self::cancel_workflow_with_rollback)
+    /// to run their saga rollback handlers first.
+    pub async fn cancel_workflow(&self, run_id: WorkflowRunId) -> WorkflowResult<()> {
+        self.cancel_workflow_impl(run_id, false).await
     }
 
-    /// Cancel a running workflow.
-    pub async fn cancel_workflow(&self, run_id: WorkflowRunId) -> WorkflowResult<()> {
+    /// Cancel a running workflow, first running the saga rollback phase for
+    /// every already-succeeded step with a registered `rollback` handler —
+    /// the cancellation analogue of Cloudflare Workflows'
+    /// `instance.terminate({ rollback: true })`. `failed_step` is passed as
+    /// `None` to [`run_rollback_phase`](Self::run_rollback_phase) since
+    /// cancellation isn't triggered by any particular step.
+    pub async fn cancel_workflow_with_rollback(&self, run_id: WorkflowRunId) -> WorkflowResult<()> {
+        self.cancel_workflow_impl(run_id, true).await
+    }
+
+    async fn cancel_workflow_impl(
+        &self,
+        run_id: WorkflowRunId,
+        rollback: bool,
+    ) -> WorkflowResult<()> {
+        if rollback {
+            let state = self.state_store.load(run_id).await?;
+            let definition = self.definitions.read().get(&state.workflow_id).cloned();
+            if let Some(definition) = definition {
+                if definition.steps.iter().any(|s| s.rollback.is_some()) {
+                    self.run_rollback_phase(run_id, &definition, None).await?;
+                }
+            } else {
+                tracing::warn!(run_id = %run_id, workflow_id = %state.workflow_id, "cancel_workflow_with_rollback: definition not registered, skipping rollback phase");
+            }
+        }
         self.state_store
             .update(run_id, |s| s.status = WorkflowStatus::Cancelled)
             .await?;

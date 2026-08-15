@@ -1,9 +1,11 @@
 # Design-spec: should `StepMode::Loop` adopt Restate's per-step durability primitive?
 
-> Item #115. Written recommendation, no code change — the gap identified here
-> is real but not urgent (item #112 already ships correctly without it via a
-> domain-level workaround). Recorded as a design doc so the concrete shape and
-> cost estimate exist for whoever picks this up next.
+> Item #115. Implemented: `JournalEntry::LoopIteration` ships in `types.rs`,
+> and `execute_loop` in `engine.rs` resumes from the last journaled iteration
+> instead of restarting the counter at 1. Covered by
+> `crash_mid_loop_then_recover_resumes_from_last_iteration` in
+> `tests/semantics_test.rs`. Left as a design doc for the rationale; the
+> "recommendation, no code change" framing below is historical.
 
 Scope: the one gap named in the dispatch — `execute_loop` journals a single
 `JournalEntry::StepRun` after the whole loop exits, not per iteration — not a
