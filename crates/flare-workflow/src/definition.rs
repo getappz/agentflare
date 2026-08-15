@@ -342,6 +342,7 @@ impl<D: WorkflowData> WorkflowDefinition<D> {
                 StepMode::Collect => Some("collect"),
                 StepMode::Conditional { .. } => Some("conditional"),
                 StepMode::Sleep { .. } => Some("sleep"),
+                StepMode::SleepUntil { .. } => Some("sleep_until"),
                 StepMode::WaitEvent { .. } => Some("wait_event"),
             };
             if let Some(mode) = unsupported_mode {
