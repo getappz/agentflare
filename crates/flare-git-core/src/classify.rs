@@ -34,6 +34,16 @@ use std::path::{Path, PathBuf};
 use crate::branch::{current_branch, is_protected_branch, resolve_default_branch};
 use crate::policy_config::ResolvedGitShimPolicy;
 
+/// The exact CLI invocation the worktree-teardown deny message tells a
+/// denied agent to run. Kept as a constant rather than inlined in the
+/// message so the binary crate — the only place the clap definition lives —
+/// can parse it against the real command tree in a test. It previously read
+/// `agentflare git worktree audit --prune`, which never parsed at all: the
+/// subcommand is `audit`, not `worktree audit`, and `prune` is a subcommand
+/// rather than a flag. An agent following the message verbatim hit a clap
+/// error, i.e. exactly the dead-end this message exists to remove.
+pub const WORKTREE_PRUNE_COMMAND: &str = "agentflare git audit prune --all";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Disposition {
     Passthrough,
@@ -451,7 +461,9 @@ pub fn classify_pure(
                     Some("remove") | Some("prune")
                 );
                 let reason = if teardown {
-                    "'git worktree remove/prune' is orchestrator-managed by agentflare — to tear down an item's worktree call `item(action=\"check_merge\", id=<item>)` once its PR merges, or `item(action=\"release\", id=<item>)`; to prune stale worktrees run `agentflare git worktree audit --prune`, or from an MCP-only session call `item(action=\"doctor\", reclaim=true)` (same scan/reclaim as `agentflare git doctor --reclaim`).".to_string()
+                    format!(
+                        "'git worktree remove/prune' is orchestrator-managed by agentflare — to tear down an item's worktree call `item(action=\"check_merge\", id=<item>)` once its PR merges, or `item(action=\"release\", id=<item>)`; to prune stale worktrees run `{WORKTREE_PRUNE_COMMAND}`, or from an MCP-only session call `item(action=\"doctor\", reclaim=true)` (same scan/reclaim as `agentflare git doctor --reclaim`)."
+                    )
                 } else {
                     "'git worktree' is orchestrator-managed by agentflare — call `item(action=\"claim\", id=<item>)` to provision one. (Not the standalone `claim`/`mcp__flare__claim` tool -- that only takes a scope lock and does not create a worktree.)".to_string()
                 };
