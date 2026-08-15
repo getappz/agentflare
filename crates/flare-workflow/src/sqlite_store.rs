@@ -17,8 +17,8 @@ use rusqlite_migration::{M, Migrations};
 use crate::journal;
 use crate::store::StateStore;
 use crate::types::{
-    JournalEntry, StepStatus, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
-    WorkflowRunId, WorkflowState, WorkflowStatus,
+    JournalEntry, MetricsFilter, StepId, StepMetrics, StepStatus, WorkflowContext, WorkflowData,
+    WorkflowError, WorkflowMetrics, WorkflowResult, WorkflowRunId, WorkflowState, WorkflowStatus,
 };
 
 /// Error opening/creating a SQLite store.
@@ -107,6 +107,11 @@ impl<D: WorkflowData> SqliteStore<D> {
                     PRIMARY KEY (run_id, key)
                 );",
             ),
+            M::up(
+                "ALTER TABLE step_state ADD COLUMN duration_ms INTEGER;
+                 ALTER TABLE step_state ADD COLUMN input_tokens INTEGER;
+                 ALTER TABLE step_state ADD COLUMN output_tokens INTEGER;",
+            ),
         ])
     }
 
@@ -160,12 +165,14 @@ impl<D: WorkflowData> SqliteStore<D> {
         for (step_id, ss) in &state.step_states {
             tx.execute(
                 "INSERT INTO step_state
-                   (run_id, step_id, status, attempt, last_error, started_at, completed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                   (run_id, step_id, status, attempt, last_error, started_at, completed_at,
+                    duration_ms, input_tokens, output_tokens)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(run_id, step_id) DO UPDATE SET
                    status=excluded.status, attempt=excluded.attempt,
                    last_error=excluded.last_error, started_at=excluded.started_at,
-                   completed_at=excluded.completed_at",
+                   completed_at=excluded.completed_at, duration_ms=excluded.duration_ms,
+                   input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens",
                 params![
                     state.run_id.to_string(),
                     step_id.to_string(),
@@ -174,6 +181,9 @@ impl<D: WorkflowData> SqliteStore<D> {
                     ss.last_error,
                     ss.started_at.map(|t| t.to_rfc3339()),
                     ss.completed_at.map(|t| t.to_rfc3339()),
+                    ss.duration_ms as i64,
+                    ss.input_tokens as i64,
+                    ss.output_tokens as i64,
                 ],
             )
             .map_err(|e| WorkflowError::Store(format!("upsert step_state: {e}")))?;
@@ -249,6 +259,42 @@ fn status_from_str(s: &str) -> WorkflowStatus {
         "cancelled" => WorkflowStatus::Cancelled,
         _ => WorkflowStatus::Pending,
     }
+}
+
+fn step_status_from_str(s: &str) -> StepStatus {
+    match s {
+        "running" => StepStatus::Running,
+        "succeeded" => StepStatus::Succeeded,
+        "failed" => StepStatus::Failed,
+        "retrying" => StepStatus::Retrying,
+        "skipped" => StepStatus::Skipped,
+        _ => StepStatus::Pending,
+    }
+}
+
+/// Build a `WHERE` clause + bound params for `MetricsFilter` against the
+/// `workflow_runs` table, aliased `wr` (joined-to or queried directly).
+fn metrics_where(filter: &MetricsFilter) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut conditions = Vec::new();
+    let mut sql_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    if let Some(workflow_id) = &filter.workflow_id {
+        conditions.push("wr.workflow_id = ?".to_string());
+        sql_params.push(Box::new(workflow_id.to_string()));
+    }
+    if let Some(status) = filter.status {
+        conditions.push("wr.status = ?".to_string());
+        sql_params.push(Box::new(status.status_as_str()));
+    }
+    if let Some(since) = filter.since {
+        conditions.push("wr.created_at >= ?".to_string());
+        sql_params.push(Box::new(since.to_rfc3339()));
+    }
+    let where_clause = if conditions.is_empty() {
+        "1=1".to_string()
+    } else {
+        conditions.join(" AND ")
+    };
+    (where_clause, sql_params)
 }
 
 /// Run a blocking SQLite closure off the async executor thread. Every trait
@@ -505,6 +551,116 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
                 .lock()
                 .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
             journal::read(&conn, &run_id.to_string())
+        })
+        .await
+    }
+
+    async fn workflow_metrics(&self, filter: MetricsFilter) -> WorkflowResult<WorkflowMetrics> {
+        let conn = Arc::clone(&self.conn);
+        blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            let (where_clause, sql_params) = metrics_where(&filter);
+
+            let mut counts_by_status = std::collections::HashMap::new();
+            {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT wr.status, COUNT(*) FROM workflow_runs wr
+                         WHERE {where_clause} GROUP BY wr.status"
+                    ))
+                    .map_err(|e| WorkflowError::Store(format!("prepare status counts: {e}")))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(sql_params.iter()), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(|e| WorkflowError::Store(format!("status counts: {e}")))?;
+                for row in rows {
+                    let (status, count) = row.map_err(|e| WorkflowError::Store(format!("row: {e}")))?;
+                    counts_by_status.insert(status_from_str(&status), count as u64);
+                }
+            }
+
+            let avg_duration_ms: Option<f64> = conn
+                .query_row(
+                    &format!(
+                        "SELECT AVG((julianday(wr.updated_at) - julianday(wr.created_at)) * 86400000.0)
+                         FROM workflow_runs wr WHERE {where_clause}"
+                    ),
+                    rusqlite::params_from_iter(sql_params.iter()),
+                    |row| row.get(0),
+                )
+                .map_err(|e| WorkflowError::Store(format!("avg duration: {e}")))?;
+
+            let (total_input_tokens, total_output_tokens): (i64, i64) = conn
+                .query_row(
+                    &format!(
+                        "SELECT COALESCE(SUM(ss.input_tokens), 0), COALESCE(SUM(ss.output_tokens), 0)
+                         FROM step_state ss JOIN workflow_runs wr ON wr.id = ss.run_id
+                         WHERE {where_clause}"
+                    ),
+                    rusqlite::params_from_iter(sql_params.iter()),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|e| WorkflowError::Store(format!("token totals: {e}")))?;
+
+            let mut step_breakdown: std::collections::HashMap<StepId, StepMetrics> =
+                std::collections::HashMap::new();
+            {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT ss.step_id, ss.status, COUNT(*)
+                         FROM step_state ss JOIN workflow_runs wr ON wr.id = ss.run_id
+                         WHERE {where_clause} GROUP BY ss.step_id, ss.status"
+                    ))
+                    .map_err(|e| WorkflowError::Store(format!("prepare step counts: {e}")))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(sql_params.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })
+                    .map_err(|e| WorkflowError::Store(format!("step counts: {e}")))?;
+                for row in rows {
+                    let (step_id, status, count) =
+                        row.map_err(|e| WorkflowError::Store(format!("row: {e}")))?;
+                    step_breakdown
+                        .entry(StepId::new(step_id))
+                        .or_default()
+                        .counts_by_status
+                        .insert(step_status_from_str(&status), count as u64);
+                }
+            }
+            {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT ss.step_id, AVG(ss.duration_ms)
+                         FROM step_state ss JOIN workflow_runs wr ON wr.id = ss.run_id
+                         WHERE {where_clause} GROUP BY ss.step_id"
+                    ))
+                    .map_err(|e| WorkflowError::Store(format!("prepare step avg duration: {e}")))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(sql_params.iter()), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?))
+                    })
+                    .map_err(|e| WorkflowError::Store(format!("step avg duration: {e}")))?;
+                for row in rows {
+                    let (step_id, avg) =
+                        row.map_err(|e| WorkflowError::Store(format!("row: {e}")))?;
+                    step_breakdown.entry(StepId::new(step_id)).or_default().avg_duration_ms = avg;
+                }
+            }
+
+            Ok(WorkflowMetrics {
+                counts_by_status,
+                avg_duration_ms,
+                total_input_tokens: total_input_tokens as u64,
+                total_output_tokens: total_output_tokens as u64,
+                step_breakdown,
+            })
         })
         .await
     }
