@@ -66,6 +66,7 @@ mod uninstall;
 mod update;
 mod vault;
 mod vent;
+mod work_item_pipeline;
 mod workflow;
 mod worktree;
 
