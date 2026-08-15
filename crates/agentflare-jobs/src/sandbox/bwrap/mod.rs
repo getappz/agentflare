@@ -674,7 +674,8 @@ mod tests {
         let data_dir = dir.path().join(CLAUDE_DATA_DIR_RELATIVE);
         std::fs::create_dir_all(&data_dir).unwrap();
         let home = std::ffi::OsString::from(dir.path());
-        let args = build_bwrap_args_with_home(None, "/usr/local/bin/claude", &[], Some(&home), false);
+        let args =
+            build_bwrap_args_with_home(None, "/usr/local/bin/claude", &[], Some(&home), false);
         let data_str = path_to_string(&data_dir);
         let src_idx = args
             .iter()
@@ -692,7 +693,8 @@ mod tests {
     fn claude_data_dir_uses_tmpfs_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         let home = std::ffi::OsString::from(dir.path());
-        let args = build_bwrap_args_with_home(None, "/usr/local/bin/claude", &[], Some(&home), false);
+        let args =
+            build_bwrap_args_with_home(None, "/usr/local/bin/claude", &[], Some(&home), false);
         let data_str = path_to_string(&dir.path().join(CLAUDE_DATA_DIR_RELATIVE));
         let idx = args
             .iter()
