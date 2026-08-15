@@ -215,6 +215,134 @@ async fn exhausted_rollback_retries_do_not_abort_the_sweep() {
     );
 }
 
+/// A step that blocks for a while before succeeding, giving a test room to
+/// cancel the run while it's in flight.
+fn slow(id: &str) -> StepDefinition<Ctx> {
+    StepDefinition::new(
+        id,
+        id,
+        Arc::new(FunctionStep::new(|_ctx: &mut WorkflowContext<Ctx>| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Ok(StepResult::Success)
+            })
+        })),
+    )
+}
+
+/// Cloudflare `instance.terminate({ rollback: true })` parity: explicitly
+/// cancelling a run with already-succeeded steps compensates them in reverse
+/// start order, same as the natural-failure path.
+#[tokio::test]
+async fn cancel_with_rollback_compensates_succeeded_steps() {
+    let engine = WorkflowEngine::<Ctx, InMemoryStore<Ctx>>::new();
+    let log: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let wf = WorkflowDefinition::new("wf", "wf")
+        .add_step(producer("a").with_rollback(recording_rollback(Arc::clone(&log), "a"), None))
+        .add_step(
+            producer("b")
+                .depends_on(&["a"])
+                .with_rollback(recording_rollback(Arc::clone(&log), "b"), None),
+        )
+        .add_step(slow("c").depends_on(&["b"]));
+    engine.register_workflow(wf).unwrap();
+
+    let run = engine
+        .start_workflow(WorkflowId::new("wf"), Ctx { log: vec![] }, "in".into())
+        .await
+        .unwrap();
+
+    // Wait until a and b have both durably succeeded (c is now the one
+    // in flight, blocked on its 3s sleep) before cancelling.
+    for _ in 0..200 {
+        let journal = engine.state_store().journal(run).await.unwrap();
+        let done = |id: &str| {
+            journal.iter().any(|e| {
+                matches!(
+                    e,
+                    JournalEntry::StepRun { step_id, result: Some(EntryResult::Success(_)), .. }
+                        if step_id == &StepId::new(id)
+                )
+            })
+        };
+        if done("a") && done("b") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    engine.cancel_workflow_with_rollback(run).await.unwrap();
+
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Cancelled);
+
+    let recorded = log.lock().unwrap().clone();
+    assert_eq!(
+        recorded,
+        vec![
+            ("b".to_string(), "out:b".to_string()),
+            ("a".to_string(), "out:a".to_string()),
+        ],
+        "explicit cancellation should compensate already-succeeded steps in reverse start order"
+    );
+
+    let journal = engine.state_store().journal(run).await.unwrap();
+    for id in ["a", "b"] {
+        assert!(
+            journal.iter().any(|e| matches!(
+                e,
+                JournalEntry::Rollback { step_id, result: Some(EntryResult::Success(_)), .. }
+                    if step_id == &StepId::new(id)
+            )),
+            "step '{id}' should have a completed Rollback journal entry"
+        );
+    }
+}
+
+/// Plain `cancel_workflow` (no rollback requested) must not compensate
+/// succeeded steps — this is the pre-existing behavior `cancel_workflow_with_rollback`
+/// is opt-in on top of.
+#[tokio::test]
+async fn plain_cancel_does_not_trigger_rollback() {
+    let engine = WorkflowEngine::<Ctx, InMemoryStore<Ctx>>::new();
+    let log: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let wf = WorkflowDefinition::new("wf", "wf")
+        .add_step(producer("a").with_rollback(recording_rollback(Arc::clone(&log), "a"), None))
+        .add_step(slow("c").depends_on(&["a"]));
+    engine.register_workflow(wf).unwrap();
+
+    let run = engine
+        .start_workflow(WorkflowId::new("wf"), Ctx { log: vec![] }, "in".into())
+        .await
+        .unwrap();
+
+    for _ in 0..200 {
+        let journal = engine.state_store().journal(run).await.unwrap();
+        let a_done = journal.iter().any(|e| {
+            matches!(
+                e,
+                JournalEntry::StepRun { step_id, result: Some(EntryResult::Success(_)), .. }
+                    if step_id == &StepId::new("a")
+            )
+        });
+        if a_done {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    engine.cancel_workflow(run).await.unwrap();
+
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Cancelled);
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "plain cancel_workflow must not compensate succeeded steps"
+    );
+}
+
 /// (e): registering a rollback handler on an unsupported step mode
 /// (`Collect`/`Sleep`/`WaitEvent`) is rejected at `register_workflow` time.
 #[tokio::test]
