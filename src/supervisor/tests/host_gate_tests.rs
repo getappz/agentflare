@@ -97,6 +97,7 @@ fn self_repair_defers_rather_than_skips_when_the_host_gate_blocks() {
             &item,
             &["clippy".to_string()],
             &label_id_by_name,
+            "/repo",
         );
 
         assert!(
@@ -134,6 +135,7 @@ fn self_repair_defers_rather_than_skips_when_the_agent_is_cooling_down() {
         &item,
         &["clippy".to_string()],
         &label_id_by_name,
+        "/repo",
     );
 
     assert!(matches!(outcome, SelfRepairOutcome::Deferred));

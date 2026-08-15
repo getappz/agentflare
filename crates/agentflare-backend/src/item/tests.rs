@@ -708,6 +708,59 @@ fn claim_on_already_held_item_returns_held_and_leaves_item_unchanged() {
 }
 
 #[test]
+fn release_clears_assignee_agent_so_a_different_agent_type_can_reclaim() {
+    // item #93: a plain `claim::release` only drops the lease row, never
+    // touching `assignee_agent` -- so a claimed-then-released item stayed
+    // pinned to the released owner's agent type, and `claim()`'s
+    // `BlockedByAssignee` guard (only exempts a same-agent-type reclaim)
+    // refused every other agent type forever. `item::release` must clear
+    // the pin so the item is genuinely available again.
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    assert_eq!(
+        claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap(),
+        ClaimOutcome::Acquired
+    );
+    assert_eq!(
+        get(&conn, &item.id).unwrap().assignee_agent.as_deref(),
+        Some("claude-code:1")
+    );
+
+    assert!(release(&conn, &item.id, "claude-code:1").unwrap());
+    assert_eq!(get(&conn, &item.id).unwrap().assignee_agent, None);
+
+    let outcome = claim(&conn, &item.id, "opencode:1", 2000, TTL).unwrap();
+    assert_eq!(outcome, ClaimOutcome::Acquired);
+    assert_eq!(
+        get(&conn, &item.id).unwrap().assignee_agent.as_deref(),
+        Some("opencode:1")
+    );
+}
+
+#[test]
+fn release_with_nothing_to_release_leaves_assignee_agent_untouched() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            assignee_agent: Some("opencode".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(!release(&conn, &item.id, "claude-code:1").unwrap());
+    assert_eq!(
+        get(&conn, &item.id).unwrap().assignee_agent.as_deref(),
+        Some("opencode")
+    );
+}
+
+#[test]
 fn stale_claim_is_stealable_by_a_different_owner() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");

@@ -130,6 +130,26 @@ pub(crate) async fn run_workflow_json_async(
     db_path: &Path,
     send: SendMessage,
 ) -> Result<(WorkflowRunId, WorkflowId), String> {
+    run_workflow_json_with_params_async(
+        definition_json,
+        input,
+        serde_json::Value::Null,
+        db_path,
+        send,
+    )
+    .await
+}
+
+/// Same as [`run_workflow_json_async`] with a structured `params` payload —
+/// used by the MCP `workflow` tool's `run` action when a `params` field is
+/// supplied.
+pub(crate) async fn run_workflow_json_with_params_async(
+    definition_json: &str,
+    input: &str,
+    params: serde_json::Value,
+    db_path: &Path,
+    send: SendMessage,
+) -> Result<(WorkflowRunId, WorkflowId), String> {
     let json: JsonWorkflow =
         serde_json::from_str(definition_json).map_err(|e| format!("invalid workflow JSON: {e}"))?;
     let wf = compile_workflow(&json, send).map_err(|e| e.to_string())?;
@@ -143,7 +163,7 @@ pub(crate) async fn run_workflow_json_async(
         .map_err(|e| format!("invalid workflow: {e}"))?;
 
     let run_id = engine
-        .start_workflow(workflow_id.clone(), PipelineData, input.to_string())
+        .start_workflow_with_params(workflow_id.clone(), PipelineData, input.to_string(), params)
         .await
         .map_err(|e| e.to_string())?;
     eprintln!("agentflare-workflow: run {run_id} started for '{name}'");
