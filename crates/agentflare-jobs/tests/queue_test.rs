@@ -122,19 +122,19 @@ fn fail_retries_then_permanent() {
     let id = info.id;
 
     // First failure → retry (queued again)
-    q.fail(&id, "err1", None).unwrap();
+    q.fail(&id, "err1", None, false).unwrap();
     let info = q.get(&id).unwrap();
     assert_eq!(info.state, JobState::Queued);
     assert_eq!(info.retries, 1);
 
     // Second failure → retry
-    q.fail(&id, "err2", None).unwrap();
+    q.fail(&id, "err2", None, false).unwrap();
     let info = q.get(&id).unwrap();
     assert_eq!(info.state, JobState::Queued);
     assert_eq!(info.retries, 2);
 
     // Third failure → permanent
-    q.fail(&id, "err3", None).unwrap();
+    q.fail(&id, "err3", None, false).unwrap();
     let info = q.get(&id).unwrap();
     assert_eq!(info.state, JobState::Failed);
     assert_eq!(info.error.as_deref(), Some("err3"));
@@ -177,7 +177,7 @@ fn cleanup_removes_old_jobs() {
     let q = test_queue();
     q.enqueue(&AgentJob::new("a")).unwrap();
     let (id, _) = q.dequeue().unwrap().unwrap();
-    q.fail(&id, "done", None).unwrap();
+    q.fail(&id, "done", None, false).unwrap();
 
     // Use a large negative cutoff to simulate "now = 0"
     // The jobs have created_at = now (positive), so anything older than

@@ -629,17 +629,44 @@ pub(crate) fn notify(recipient: &str, body: &str, item_id: &str) {
 
 impl WorkArgs {
     pub fn run(self) {
+        if let Some(agent) = agent_detector::agent_name() {
+            eprintln!(
+                "error: `agentflare work` is a human-only command — it bypasses the daemon's \
+                 claim/queue tracking that the dashboard and autonomous self-repair depend on \
+                 (detected this process is running under the {agent} AI agent).\n\n\
+                 If you're an AI agent: don't run this directly. Either wait for the daemon's \
+                 discovery tick to dispatch the item (it will, once `ready-for-work` is set and \
+                 nothing blocks it), or ask a human to run this command for you if the item is \
+                 genuinely stuck."
+            );
+            // Known tension (item #113): this deny is strict and has no override. This
+            // session's own recovery of #104/#107 (claims that outlived their TTL past the
+            // daemon's 3-attempt self-repair cap) needed a human-authorized `agentflare work`
+            // run executed by an AI agent after explicit sign-off -- a path this guard now
+            // closes entirely, even with a human in the loop. Left unresolved on purpose; an
+            // override (e.g. `--i-am-a-human`, or a prompt requiring real terminal input) is a
+            // deliberate future decision, not something to route around here.
+            std::process::exit(1);
+        }
         std::process::exit(execute_work(self, &mut std::io::stdout()).exit_code);
     }
 }
 
 /// `execute_work`'s result: the process exit code (0 = success), plus — set
 /// only when the failure was classified as rate-limit shaped — a hint for
-/// how long the job queue should wait before retrying this item.
+/// how long the job queue should wait before retrying this item, and
+/// `fatal` for a structural setup failure (see its doc comment below).
 /// `WorkItemExecutor` converts this into `agentflare_jobs::JobFailure`.
 pub(crate) struct WorkOutcome {
     pub exit_code: i32,
     pub retry_after_secs: Option<u64>,
+    /// Set for a failure that happened while establishing the working
+    /// environment (e.g. "claim succeeded but no worktree was created") as
+    /// opposed to a failure during the agent run itself. The underlying
+    /// cause of a structural setup failure doesn't change between attempts
+    /// — see `agentflare_jobs::JobFailure::fatal`, which this maps onto so
+    /// the job queue fails it straight to terminal instead of retrying.
+    pub fatal: bool,
 }
 
 impl From<i32> for WorkOutcome {
@@ -647,7 +674,22 @@ impl From<i32> for WorkOutcome {
         WorkOutcome {
             exit_code,
             retry_after_secs: None,
+            fatal: false,
         }
+    }
+}
+
+/// `WorkItemExecutor::execute`'s `WorkOutcome` → `agentflare_jobs::JobFailure`
+/// mapping, pulled out so it's unit-testable without going through a real
+/// `execute_work` claim/worktree/agent-launch cycle.
+fn job_failure_for(outcome: &WorkOutcome) -> agentflare_jobs::JobFailure {
+    agentflare_jobs::JobFailure {
+        message: format!(
+            "agentflare work exited with code {} — see the job log for details",
+            outcome.exit_code
+        ),
+        retry_after_secs: outcome.retry_after_secs,
+        fatal: outcome.fatal,
     }
 }
 
@@ -807,7 +849,8 @@ fn execute_work_impl(
             _ => {
                 let owner = claim["owner"].as_str().unwrap_or("?");
                 let age = claim["age_secs"].as_i64().unwrap_or(0);
-                format!("item held by {owner} ({age}s) — cannot claim")
+                let ttl = claim["ttl_secs"].as_i64().unwrap_or(0);
+                format!("item held by {owner} ({age}s, ttl {ttl}s) — cannot claim")
             }
         };
         crate::ui::error(&msg);
@@ -834,7 +877,15 @@ fn execute_work_impl(
         let msg = "claim succeeded but no worktree was created (bad git state?)";
         release_and_comment(&mcp, item_id, msg, args.notify.as_deref());
         crate::ui::error(msg);
-        return 1.into();
+        // Structural: whatever broke the git worktree state (e.g. a stale
+        // "prunable" registration, confirmed live for items #465/#466) won't
+        // heal itself between attempts, so fail straight to terminal instead
+        // of retrying against the same unfixable state (item #467).
+        return WorkOutcome {
+            exit_code: 1,
+            retry_after_secs: None,
+            fatal: true,
+        };
     };
     let _ = writeln!(log, "worktree: {}", wpath.display());
 
@@ -921,7 +972,14 @@ fn execute_work_impl(
         let msg = format!("failed to chdir into {}", wpath.display());
         release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
         crate::ui::error(&msg);
-        return 1.into();
+        // Same structural category as the missing-worktree case above: the
+        // claimed worktree path came back from `item::claim` but doesn't
+        // actually exist/isn't enterable, which won't change on retry.
+        return WorkOutcome {
+            exit_code: 1,
+            retry_after_secs: None,
+            fatal: true,
+        };
     }
 
     let result = run_pipeline(
@@ -965,6 +1023,7 @@ fn execute_work_impl(
             WorkOutcome {
                 exit_code: 1,
                 retry_after_secs,
+                fatal: false,
             }
         }
     }
@@ -1016,13 +1075,7 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
         if outcome.exit_code == 0 {
             Ok(())
         } else {
-            Err(agentflare_jobs::JobFailure {
-                message: format!(
-                    "agentflare work exited with code {} — see the job log for details",
-                    outcome.exit_code
-                ),
-                retry_after_secs: outcome.retry_after_secs,
-            })
+            Err(job_failure_for(&outcome))
         }
     }
 }
@@ -1030,6 +1083,40 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_failure_for_structural_setup_failure_is_fatal() {
+        // Mirrors the "claim succeeded but no worktree was created" and
+        // "failed to chdir into <worktree>" branches in `execute_work`
+        // (item #467): the underlying git-state cause won't change between
+        // attempts, so `WorkItemExecutor` must mark the resulting
+        // `JobFailure` fatal so `Queue::fail` skips the retry budget.
+        let outcome = WorkOutcome {
+            exit_code: 1,
+            retry_after_secs: None,
+            fatal: true,
+        };
+        let failure = job_failure_for(&outcome);
+        assert!(
+            failure.fatal,
+            "a structural setup failure must map onto a fatal JobFailure"
+        );
+    }
+
+    #[test]
+    fn job_failure_for_agent_run_failure_keeps_normal_retry_behavior() {
+        // A failure during the agent run itself (as opposed to environment
+        // setup) may legitimately be transient -- it must keep going through
+        // the normal retry budget, optionally with a rate-limit cooldown.
+        let outcome = WorkOutcome {
+            exit_code: 1,
+            retry_after_secs: Some(1800),
+            fatal: false,
+        };
+        let failure = job_failure_for(&outcome);
+        assert!(!failure.fatal);
+        assert_eq!(failure.retry_after_secs, Some(1800));
+    }
 
     fn test_item() -> agentflare_backend::item::Item {
         agentflare_backend::item::Item {
@@ -1053,6 +1140,28 @@ mod tests {
             updated_at: 0,
             deleted_at: None,
         }
+    }
+
+    /// `WorkArgs::run`'s guard denies whenever `agent_detector::agent_name()` returns
+    /// `Some`, so exercising that same primitive here is what actually proves the guard
+    /// fires -- there's no separate marker list of our own left to drift out of sync.
+    /// Only the "detects" direction is asserted: unlike the env var it sets and clears,
+    /// `agent_detector::agent_name()` also walks the parent process tree, which a sandboxed
+    /// dev session (this one included) can make non-empty even with every marker env var
+    /// cleared, so asserting the "clear -> None" side here would be flaky by environment
+    /// rather than by test bug.
+    #[test]
+    fn agent_detector_flags_the_claudecode_marker_run_denies_on() {
+        // SAFETY: test-only; CLAUDECODE isn't touched by any other test in this
+        // process, and set/remove here always run on the same thread.
+        unsafe {
+            std::env::set_var("CLAUDECODE", "1");
+        }
+        let detected = agent_detector::agent_name();
+        unsafe {
+            std::env::remove_var("CLAUDECODE");
+        }
+        assert_eq!(detected.as_deref(), Some("claude-code"));
     }
 
     #[test]

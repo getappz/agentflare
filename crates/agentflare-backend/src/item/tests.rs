@@ -864,6 +864,33 @@ fn mark_in_review_moves_to_in_review_state_and_lease_stays_held() {
 }
 
 #[test]
+fn in_review_claim_past_the_default_ttl_is_reclaimable_even_under_the_full_ttl() {
+    // Item #108: an item's job can finish (exit 0, PR opened, `mark_in_review`
+    // called) and then sit un-heartbeated for longer than the short default
+    // TTL while still well within the long active-work TTL a fresh claim
+    // request asks for. Once in "in_review" there's no more concurrent work
+    // to protect against, so a reclaim shouldn't have to wait out the full
+    // active-work TTL just because nobody's heartbeat refreshed the lease.
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+    assert!(mark_in_review(&conn, &item.id, "agent:1").unwrap());
+
+    let default_ttl = crate::claim::default_ttl_secs();
+    assert!(
+        default_ttl < TTL,
+        "test assumes the short default TTL is stricter than the long active-work TTL"
+    );
+    let now = 1000 + default_ttl + 1;
+    // Still well within the full active-work TTL requested by the caller.
+    assert!(now - 1000 < TTL);
+
+    let outcome = claim(&conn, &item.id, "agent:2", now, TTL).unwrap();
+    assert_eq!(outcome, ClaimOutcome::Acquired);
+}
+
+#[test]
 fn mark_in_review_noop_for_non_owner() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");

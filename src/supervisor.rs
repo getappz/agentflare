@@ -306,11 +306,18 @@ fn item_model_override(metadata: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// `dispatch_reason`, when set, is stashed on the job's `dispatch_reason`
+/// metadata (see `AgentJob::dispatch_reason`) purely for dashboard display —
+/// e.g. `self_repair_or_gate` passes the failing CI check name(s) so the
+/// dashboard can badge *why* this run was fired instead of just that it was.
+/// A fresh `dispatch_item` call passes `None`: it isn't reacting to anything,
+/// it's just working the next ready item.
 fn enqueue_work_job(
     queue: &agentflare_jobs::Queue,
     item: &agentflare_backend::item::Item,
     agent: agent_registry::Agent,
     folder_path: Option<&str>,
+    dispatch_reason: Option<&str>,
 ) -> Option<agentflare_jobs::JobInfo> {
     let mut args = vec![item.id.clone(), agent.as_str().to_string()];
     if let Some(folder_path) = folder_path {
@@ -319,10 +326,13 @@ fn enqueue_work_job(
             args.push(model);
         }
     }
-    let job = agentflare_jobs::AgentJob::new("agentflare-work")
+    let mut job = agentflare_jobs::AgentJob::new("agentflare-work")
         .args(args)
         .timeout(WORK_JOB_TIMEOUT_SECS)
         .in_process();
+    if let Some(reason) = dispatch_reason {
+        job = job.dispatch_reason(reason);
+    }
     queue.enqueue(&job).ok()
 }
 
@@ -335,7 +345,7 @@ fn dispatch_item(
     label_id_by_name: &std::collections::HashMap<String, String>,
     ready_id: &str,
 ) -> bool {
-    let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path)) else {
+    let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), None) else {
         return false;
     };
 
@@ -561,6 +571,33 @@ fn self_repair_or_gate(
         return SelfRepairOutcome::Skipped;
     }
 
+    // Item #114: while the item's claim is still live (within its
+    // #108-capped in_review TTL), nobody can actually reclaim it yet --
+    // dispatching now would just die instantly at `execute_work`'s own
+    // claim-acquire step, the same check performed here, downstream of
+    // this function. Defer instead so the sweep retries once the claim
+    // goes stale, rather than burning a cap slot (and posting a
+    // self-repair-dispatched comment) on an attempt that never had a
+    // chance to run.
+    let claim_still_live = mcp
+        .with_backend_db(|conn| {
+            let requested_ttl = crate::mcp_server::types::backend_claim_ttl_secs();
+            let ttl = agentflare_backend::claim::effective_ttl_secs(conn, &item.id, requested_ttl);
+            agentflare_backend::claim::has_active_claim_by_other(
+                conn,
+                &item.id,
+                "",
+                crate::claims::now(),
+                ttl,
+            )
+        })
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false);
+    if claim_still_live {
+        return SelfRepairOutcome::Deferred;
+    }
+
     let Some(agent) = item
         .assignee_agent
         .as_deref()
@@ -576,7 +613,8 @@ fn self_repair_or_gate(
     if host_policy.blocks_dispatch() {
         return SelfRepairOutcome::Deferred;
     }
-    let Some(info) = enqueue_work_job(queue, item, agent, None) else {
+    let reason = format!("self-repair: {}", failed_checks.join(", "));
+    let Some(info) = enqueue_work_job(queue, item, agent, None, Some(&reason)) else {
         return SelfRepairOutcome::Skipped;
     };
     let _ = mcp.comment_impl(CommentRequest {
