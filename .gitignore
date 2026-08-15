@@ -44,3 +44,9 @@
 # aube workspace (site/ + docs-site/) — installed deps, not source.
 # aube-lock.yaml IS committed (reproducible installs); node_modules isn't.
 node_modules/
+
+# subagent-driven-development scratch workspace for item #112's plan —
+# ledger/briefs/reports/review packages, not source.
+/.superpowers/
+/.agent-scratch/
+.sccache-cache/
