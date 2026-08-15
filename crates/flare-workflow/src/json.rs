@@ -28,13 +28,38 @@ impl WorkflowData for PipelineData {
     }
 }
 
-/// Hook that sends an expanded prompt to an agent and returns
+/// Everything a step needs to invoke an agent: the target and prompt, plus
+/// the per-step overrides a `JsonStep` can carry (model, extra CLI args,
+/// subprocess timeouts) so a workflow author can tune all of them as data
+/// instead of relying on whatever defaults the `SendMessage` hook happens to
+/// hardcode.
+#[derive(Debug, Clone, Default)]
+pub struct StepInvocation {
+    pub agent: String,
+    pub prompt: String,
+    pub model: Option<String>,
+    pub args: Vec<String>,
+    pub hard_cap_secs: Option<u64>,
+    pub idle_timeout_secs: Option<u64>,
+}
+
+impl StepInvocation {
+    /// An invocation with no model/args/timeout overrides — for callers
+    /// (e.g. the work-item SDD loop) that don't originate from a `JsonStep`
+    /// and have no per-step values to carry.
+    pub fn simple(agent: impl Into<String>, prompt: impl Into<String>) -> Self {
+        Self {
+            agent: agent.into(),
+            prompt: prompt.into(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Hook that sends a step invocation to an agent and returns
 /// `(output, input_tokens, output_tokens)`.
 pub type SendMessage = Arc<
-    dyn Fn(
-            String,
-            String,
-        ) -> Pin<Box<dyn Future<Output = Result<(String, u64, u64), String>> + Send>>
+    dyn Fn(StepInvocation) -> Pin<Box<dyn Future<Output = Result<(String, u64, u64), String>> + Send>>
         + Send
         + Sync,
 >;
@@ -65,6 +90,20 @@ pub struct JsonStep {
     pub max_retries: u32,
     #[serde(default)]
     pub output_var: Option<String>,
+    /// Model to request from `agent` for this step (e.g. `"sonnet"`,
+    /// `"gpt-5"`) — expanded to `--model <value>` ahead of `args`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Extra CLI flags passed to `agent`'s headless invocation, verbatim.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Overrides the send hook's default hard subprocess timeout for this
+    /// step.
+    #[serde(default)]
+    pub hard_cap_secs: Option<u64>,
+    /// Overrides the send hook's default idle-output timeout for this step.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
 }
 
 fn default_prompt() -> String {
@@ -150,6 +189,10 @@ pub fn compile_workflow(
             agent: s.agent.clone(),
             template: s.prompt.clone(),
             send: Arc::clone(&send),
+            model: s.model.clone(),
+            args: s.args.clone(),
+            hard_cap_secs: s.hard_cap_secs,
+            idle_timeout_secs: s.idle_timeout_secs,
         });
         let mut def = StepDefinition::new(s.name.clone(), s.name.clone(), executor)
             .with_timeout(std::time::Duration::from_secs(s.timeout_secs))
@@ -207,18 +250,31 @@ struct PromptExecutor {
     agent: String,
     template: String,
     send: SendMessage,
+    model: Option<String>,
+    args: Vec<String>,
+    hard_cap_secs: Option<u64>,
+    idle_timeout_secs: Option<u64>,
 }
 
 #[async_trait]
 impl StepExecutor<PipelineData> for PromptExecutor {
     async fn execute(&self, ctx: &mut WorkflowContext<PipelineData>) -> WorkflowResult<StepResult> {
         let prompt = expand_variables(&self.template, &ctx.input, &ctx.variables);
-        let (output, input_tokens, output_tokens) = (self.send)(self.agent.clone(), prompt)
-            .await
-            .map_err(|e| WorkflowError::StepFailed {
-            step_id: StepId::new(&self.agent),
-            message: e,
-        })?;
+        let invocation = StepInvocation {
+            agent: self.agent.clone(),
+            prompt,
+            model: self.model.clone(),
+            args: self.args.clone(),
+            hard_cap_secs: self.hard_cap_secs,
+            idle_timeout_secs: self.idle_timeout_secs,
+        };
+        let (output, input_tokens, output_tokens) =
+            (self.send)(invocation)
+                .await
+                .map_err(|e| WorkflowError::StepFailed {
+                    step_id: StepId::new(&self.agent),
+                    message: e,
+                })?;
         ctx.output = output;
         ctx.input_tokens = input_tokens;
         ctx.output_tokens = output_tokens;
@@ -238,12 +294,12 @@ mod tests {
     use crate::store::InMemoryStore;
 
     fn mock_send() -> SendMessage {
-        Arc::new(|agent: String, prompt: String| {
+        Arc::new(|inv: StepInvocation| {
             Box::pin(async move {
                 Ok((
-                    format!("[{agent} processed: {prompt}]"),
-                    prompt.len() as u64,
-                    prompt.len() as u64 / 2,
+                    format!("[{} processed: {}]", inv.agent, inv.prompt),
+                    inv.prompt.len() as u64,
+                    inv.prompt.len() as u64 / 2,
                 ))
             })
         })
@@ -306,7 +362,7 @@ mod tests {
     async fn loop_until_approval_workflow() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let cc = std::sync::Arc::clone(&counter);
-        let send: SendMessage = Arc::new(move |_: String, _: String| {
+        let send: SendMessage = Arc::new(move |_: StepInvocation| {
             let cc = std::sync::Arc::clone(&cc);
             Box::pin(async move {
                 let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -355,5 +411,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn step_model_args_and_timeouts_reach_the_send_hook() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<StepInvocation>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = std::sync::Arc::clone(&captured);
+        let send: SendMessage = Arc::new(move |inv: StepInvocation| {
+            *captured_clone.lock().unwrap() = Some(inv);
+            Box::pin(async move { Ok(("ok".to_string(), 0, 0)) })
+        });
+
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "tuned-step",
+                "steps": [
+                    {
+                        "name": "step-a",
+                        "agent": "code-reviewer",
+                        "prompt": "go",
+                        "model": "sonnet",
+                        "args": ["--dangerously-skip-permissions"],
+                        "hard_cap_secs": 42,
+                        "idle_timeout_secs": 7
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let wf = compile_workflow(&json, send).unwrap();
+        let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
+        engine.register_workflow(wf).unwrap();
+        let run = engine
+            .start_workflow(
+                crate::types::WorkflowId::new("tuned-step"),
+                PipelineData,
+                "in".into(),
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_for_completion(run, "wf", std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let inv = captured.lock().unwrap().clone().expect("send was called");
+        assert_eq!(inv.model.as_deref(), Some("sonnet"));
+        assert_eq!(inv.args, vec!["--dangerously-skip-permissions"]);
+        assert_eq!(inv.hard_cap_secs, Some(42));
+        assert_eq!(inv.idle_timeout_secs, Some(7));
     }
 }

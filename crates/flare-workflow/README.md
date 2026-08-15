@@ -64,6 +64,18 @@ Step modes: `sequential` / `fan_out` / `collect` / `conditional` / `loop` /
 `sleep` / `wait_event`; error modes `fail` / `skip` / `retry`; `{{input}}` and
 `{{var}}` templating; per-step token accounting.
 
+Each step also accepts `model`, `args` (extra CLI flags), `hard_cap_secs`, and
+`idle_timeout_secs` — all optional, all forwarded to the `SendMessage` hook
+via `StepInvocation` so a workflow author can tune agent/model/flags/timeouts
+per step as plain JSON, with no crate rebuild.
+
+A project can commit its own workflows to `<repo_root>/.agentflare/workflows/
+<name>.json` (JSONC — comments and trailing commas allowed) and run them by
+name instead of pasting the full definition: `agentflare workflow run <name>`
+or `mcp__flare__workflow(action="run", workflow_name="<name>")`;
+`action="list_definitions"` / `agentflare workflow list-definitions` lists
+what's available. See `agentflare::workflow::resolve_named_definition`.
+
 ## Store backends
 
 - `InMemoryStore<D>` — default, tests/dev.

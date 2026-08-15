@@ -23,9 +23,19 @@ impl AgentflareMcp {
 
         match req.action.as_str() {
             "run" => {
-                let definition = req.definition.ok_or_else(|| {
-                    ErrorData::invalid_params("definition (JSON workflow) is required", None)
-                })?;
+                let definition = match (req.definition, req.workflow_name) {
+                    (Some(d), _) => d,
+                    (None, Some(name)) => {
+                        crate::workflow::resolve_named_definition(&self.worktree_repo_root(), &name)
+                            .map_err(|e| ErrorData::invalid_params(e, None))?
+                    }
+                    (None, None) => {
+                        return Err(ErrorData::invalid_params(
+                            "one of definition or workflow_name is required",
+                            None,
+                        ));
+                    }
+                };
                 let input = req.input.unwrap_or_default();
                 let (run_id, workflow_id) = crate::workflow::run_workflow_json_async(
                     &definition,
@@ -69,6 +79,10 @@ impl AgentflareMcp {
                     .map_err(|e| ErrorData::internal_error(e, None))?;
                 Ok(serde_json::to_string_pretty(&runs).unwrap_or_default())
             }
+            "list_definitions" => {
+                let names = crate::workflow::list_workflow_definitions(&self.worktree_repo_root());
+                Ok(serde_json::to_string_pretty(&names).unwrap_or_default())
+            }
             other => Err(ErrorData::invalid_params(
                 format!("unknown action: {other}"),
                 None,
@@ -98,8 +112,8 @@ mod tests {
     }
 
     fn mock_send() -> flare_workflow::json::SendMessage {
-        Arc::new(|agent: String, prompt: String| {
-            Box::pin(async move { Ok((format!("[{agent}] {prompt}"), 1, 1)) })
+        Arc::new(|inv: flare_workflow::json::StepInvocation| {
+            Box::pin(async move { Ok((format!("[{}] {}", inv.agent, inv.prompt), 1, 1)) })
         })
     }
 
@@ -161,5 +175,61 @@ mod tests {
 
         let list = mcp().workflow(Parameters(req("list", &db))).await.unwrap();
         assert!(list.contains(&run_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn run_resolves_workflow_name_against_the_repo_workflows_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("wf.db");
+        let repo = tempfile::tempdir().unwrap();
+        let workflows_dir = crate::workflow::project_workflows_dir(repo.path());
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        std::fs::write(
+            workflows_dir.join("greet.json"),
+            r#"{"name": "greet", "steps": [{"name": "a", "agent": "opencode", "prompt": "hi"}]}"#,
+        )
+        .unwrap();
+
+        let mcp = AgentflareMcp {
+            worktree_repo_root_override: Some(repo.path().to_path_buf()),
+            ..Default::default()
+        };
+        let mut r = req("run", &db);
+        r.workflow_name = Some("greet".to_string());
+        let out = mcp.workflow(Parameters(r)).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["run_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn run_without_definition_or_workflow_name_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("wf.db");
+        let err = mcp()
+            .workflow(Parameters(req("run", &db)))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("definition or workflow_name"));
+    }
+
+    #[tokio::test]
+    async fn list_definitions_lists_the_repo_workflows_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("wf.db");
+        let repo = tempfile::tempdir().unwrap();
+        let workflows_dir = crate::workflow::project_workflows_dir(repo.path());
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        std::fs::write(workflows_dir.join("greet.json"), "{}").unwrap();
+
+        let mcp = AgentflareMcp {
+            worktree_repo_root_override: Some(repo.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = mcp
+            .workflow(Parameters(req("list_definitions", &db)))
+            .await
+            .unwrap();
+        let names: Vec<String> = serde_json::from_str(&out).unwrap();
+        assert_eq!(names, vec!["greet".to_string()]);
     }
 }
