@@ -108,6 +108,9 @@ pub enum StepMode {
     Loop { max_iterations: u32, until: String },
     /// Durable delay: suspends the run for `duration_secs` (survives restart).
     Sleep { duration_secs: u64 },
+    /// Durable delay: suspends the run until the absolute `wake_at` timestamp
+    /// (survives restart, resuming the original deadline on recovery).
+    SleepUntil { wake_at: DateTime<Utc> },
     /// Durable promise: waits for `complete_event` within `timeout_secs`.
     WaitEvent { name: String, timeout_secs: u64 },
 }
@@ -281,6 +284,15 @@ pub enum JournalEntry {
         name: String,
         result: Option<EntryResult>,
     },
+    /// A memoized saga rollback (compensation) invocation for `step_id`.
+    /// `result` is written once the rollback attempt (or its retries)
+    /// settles; a completed entry means "already compensated, do not
+    /// re-invoke" — checked the same way `StepRun` memoization works.
+    Rollback {
+        step_id: StepId,
+        attempt: u32,
+        result: Option<EntryResult>,
+    },
     /// The run's final output.
     Output { result: EntryResult },
 }
@@ -295,6 +307,7 @@ impl JournalEntry {
             JournalEntry::StateSet { .. } | JournalEntry::StateClear { .. } => true,
             JournalEntry::Sleep { result, .. } => result.is_some(),
             JournalEntry::WaitEvent { result, .. } => result.is_some(),
+            JournalEntry::Rollback { result, .. } => result.is_some(),
             JournalEntry::Output { .. } => true,
         }
     }
@@ -309,6 +322,7 @@ impl JournalEntry {
             JournalEntry::StateClear { .. } => "state_clear",
             JournalEntry::Sleep { .. } => "sleep",
             JournalEntry::WaitEvent { .. } => "wait_event",
+            JournalEntry::Rollback { .. } => "rollback",
             JournalEntry::Output { .. } => "output",
         }
     }
