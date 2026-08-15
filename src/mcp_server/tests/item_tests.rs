@@ -139,6 +139,71 @@ fn item_cancel_releases_the_callers_own_claim() {
     assert_eq!(reclaimed["status"], "acquired");
 }
 
+#[test]
+fn item_release_clears_assignee_agent_via_mcp() {
+    // item #93: `item_release` used to call `agentflare_backend::claim::release`
+    // directly, which only drops the lease row and leaves `assignee_agent`
+    // pinned to the released owner -- so a claimed-then-released item stayed
+    // permanently blocked to every other agent type. Assert the MCP handler
+    // is wired to the composed `agentflare_backend::item::release` that also
+    // clears the pin, not the raw lease-only primitive.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    s.item(Parameters(ItemRequest {
+        action: "claim".into(),
+        id: Some(item_id.clone()),
+        ..Default::default()
+    }))
+    .unwrap();
+    assert!(
+        s.with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id))
+            .unwrap()
+            .unwrap()
+            .assignee_agent
+            .is_some()
+    );
+
+    s.item(Parameters(ItemRequest {
+        action: "release".into(),
+        id: Some(item_id.clone()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    assert_eq!(
+        s.with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id))
+            .unwrap()
+            .unwrap()
+            .assignee_agent,
+        None,
+        "release must clear assignee_agent, not just the lease row"
+    );
+}
+
 ///
 /// `pub(crate)`: reused by `mcp_server::tests::mcp_with_claimed_item`, which
 /// layers item-create+claim logic on top of this shared git-init/`AgentflareMcp`

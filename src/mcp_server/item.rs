@@ -681,8 +681,7 @@ impl AgentflareMcp {
             crate::worktree::cleanup_worktree(item, &repo_root);
         }
         let ok = self.with_backend_db(|conn| {
-            agentflare_backend::claim::release(conn, &item_id, &owner)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            agentflare_backend::item::release(conn, &item_id, &owner).map_err(map_backend_err)
         })??;
         Ok(serde_json::json!({"released": ok, "item_id": item_id}).to_string())
     }
