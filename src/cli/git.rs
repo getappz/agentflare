@@ -1210,6 +1210,35 @@ mod tests {
     }
 
     #[test]
+    fn worktree_teardown_deny_names_a_parsable_cli() {
+        // Vent #469: the shim's teardown deny message used to suggest
+        // `agentflare git worktree audit --prune`, which is not a command
+        // this CLI has -- an agent following it verbatim got a clap parse
+        // error. Parse the suggestion against the real command tree rather
+        // than string-comparing it, so a later rename of `audit`/`prune`
+        // fails here instead of silently rotting the deny message again.
+        use clap::Parser as _;
+        let suggested = classify::WORKTREE_PRUNE_COMMAND;
+        let cli = crate::cli::Cli::try_parse_from(suggested.split_whitespace()).unwrap_or_else(
+            |e| panic!("the worktree-teardown deny message suggests `{suggested}`, which does not parse: {e}"),
+        );
+        let Some(crate::cli::Commands::Git(GitArgs {
+            command:
+                GitCommand::Audit(WorktreeAuditArgs {
+                    command: WorktreeAuditCommand::Prune(prune),
+                }),
+        })) = cli.command
+        else {
+            panic!("`{suggested}` must resolve to `git audit prune`");
+        };
+        assert!(
+            prune.all,
+            "the suggestion must prune every orphan -- a denied agent has no \
+             list of names to pass"
+        );
+    }
+
+    #[test]
     fn partition_claims_by_owner_does_not_treat_a_different_instance_as_mine() {
         // item #444: a claim from a DIFFERENT session of the same agent type
         // (e.g. orphaned by a crashed prior session) must never be
