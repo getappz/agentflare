@@ -108,6 +108,9 @@ pub enum StepMode {
     Loop { max_iterations: u32, until: String },
     /// Durable delay: suspends the run for `duration_secs` (survives restart).
     Sleep { duration_secs: u64 },
+    /// Durable delay: suspends the run until the absolute `wake_at` timestamp
+    /// (survives restart, resuming the original deadline on recovery).
+    SleepUntil { wake_at: DateTime<Utc> },
     /// Durable promise: waits for `complete_event` within `timeout_secs`.
     WaitEvent { name: String, timeout_secs: u64 },
 }
