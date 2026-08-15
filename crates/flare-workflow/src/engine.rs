@@ -1348,8 +1348,35 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         Ok(StepResult::Success)
     }
 
-    /// Cancel a running workflow.
+    /// Cancel a running workflow. Already-succeeded steps are left
+    /// uncompensated — use [`cancel_workflow_with_rollback`](Self::cancel_workflow_with_rollback)
+    /// to run their saga rollback handlers first.
     pub async fn cancel_workflow(&self, run_id: WorkflowRunId) -> WorkflowResult<()> {
+        self.cancel_workflow_impl(run_id, false).await
+    }
+
+    /// Cancel a running workflow, first running the saga rollback phase for
+    /// every already-succeeded step with a registered `rollback` handler —
+    /// the cancellation analogue of Cloudflare Workflows'
+    /// `instance.terminate({ rollback: true })`. `failed_step` is passed as
+    /// `None` to [`run_rollback_phase`](Self::run_rollback_phase) since
+    /// cancellation isn't triggered by any particular step.
+    pub async fn cancel_workflow_with_rollback(&self, run_id: WorkflowRunId) -> WorkflowResult<()> {
+        self.cancel_workflow_impl(run_id, true).await
+    }
+
+    async fn cancel_workflow_impl(&self, run_id: WorkflowRunId, rollback: bool) -> WorkflowResult<()> {
+        if rollback {
+            let state = self.state_store.load(run_id).await?;
+            let definition = self.definitions.read().get(&state.workflow_id).cloned();
+            if let Some(definition) = definition {
+                if definition.steps.iter().any(|s| s.rollback.is_some()) {
+                    self.run_rollback_phase(run_id, &definition, None).await?;
+                }
+            } else {
+                tracing::warn!(run_id = %run_id, workflow_id = %state.workflow_id, "cancel_workflow_with_rollback: definition not registered, skipping rollback phase");
+            }
+        }
         self.state_store
             .update(run_id, |s| s.status = WorkflowStatus::Cancelled)
             .await?;
