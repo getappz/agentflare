@@ -37,9 +37,16 @@ impl AgentflareMcp {
                     }
                 };
                 let input = req.input.unwrap_or_default();
-                let (run_id, workflow_id) = crate::workflow::run_workflow_json_async(
+                let params = match req.params.as_deref().filter(|s| !s.is_empty()) {
+                    Some(text) => serde_json::from_str(text).map_err(|e| {
+                        ErrorData::invalid_params(format!("invalid params JSON: {e}"), None)
+                    })?,
+                    None => serde_json::Value::Null,
+                };
+                let (run_id, workflow_id) = crate::workflow::run_workflow_json_with_params_async(
                     &definition,
                     &input,
+                    params,
                     &db_path,
                     crate::workflow::agent_send_hook(),
                 )
@@ -136,6 +143,56 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("unknown action"));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_invalid_params_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("wf.db");
+        let mut r = req("run", &db);
+        r.definition = Some(r#"{"name": "wf", "steps": [{"name": "a", "agent": "x"}]}"#.into());
+        r.params = Some("{bad json".into());
+        let err = mcp().workflow(Parameters(r)).await.unwrap_err();
+        assert!(format!("{err}").contains("invalid params JSON"));
+    }
+
+    /// The `run_workflow_json_with_params_async` service call the `run`
+    /// action's `params` field is parsed into (with an injectable sender, as
+    /// `list_and_status_roundtrip_a_run` does for `input`) actually expands
+    /// `{{params.x}}` into the prompt.
+    #[tokio::test]
+    async fn run_with_params_expands_into_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("wf.db");
+
+        let (run_id, _) = crate::workflow::run_workflow_json_with_params_async(
+            r#"{
+                "name": "params-pipeline",
+                "steps": [
+                    {"name": "greet", "agent": "opencode", "prompt": "Hello {{params.userId}}"}
+                ]
+            }"#,
+            "seed",
+            serde_json::json!({"userId": "u-7"}),
+            &db,
+            mock_send(),
+        )
+        .await
+        .unwrap();
+
+        let mut v = serde_json::Value::Null;
+        for _ in 0..100 {
+            let mut status_req = req("status", &db);
+            status_req.run_id = Some(run_id.to_string());
+            let status = mcp().workflow(Parameters(status_req)).await.unwrap();
+            v = serde_json::from_str(&status).unwrap();
+            if v["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(v["status"], "completed");
+        assert!(v["input"].as_str().unwrap().contains("Hello u-7"));
     }
 
     #[tokio::test]

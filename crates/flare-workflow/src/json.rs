@@ -259,7 +259,7 @@ struct PromptExecutor {
 #[async_trait]
 impl StepExecutor<PipelineData> for PromptExecutor {
     async fn execute(&self, ctx: &mut WorkflowContext<PipelineData>) -> WorkflowResult<StepResult> {
-        let prompt = expand_variables(&self.template, &ctx.input, &ctx.variables);
+        let prompt = expand_variables(&self.template, &ctx.input, &ctx.variables, &ctx.params);
         let invocation = StepInvocation {
             agent: self.agent.clone(),
             prompt,

@@ -115,6 +115,91 @@ async fn crash_mid_run_resumes_from_last_completed_step_without_reexecution() {
     );
 }
 
+/// `params` set via `start_workflow_with_params` is journaled inside the
+/// `Input` entry alongside `input`; both the journal record and the
+/// recovered run's context carry it across a crash (item #126).
+#[tokio::test]
+async fn params_survive_crash_and_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wf.db");
+
+    let wf = WorkflowDefinition::new("wf", "wf").add_step(
+        StepDefinition::new("approve", "approve", noop_executor::<Ctx>()).with_mode(
+            StepMode::WaitEvent {
+                name: "approve".into(),
+                timeout_secs: 60,
+            },
+        ),
+    );
+
+    let run;
+    let params = serde_json::json!({"userId": "u-9", "metadata": {"foo": "bar"}});
+    {
+        // Engine 1: start the run with params, wait until the Input entry
+        // (carrying params) is journaled, then "crash" (drop the engine).
+        let engine = WorkflowEngine::<Ctx, _>::with_store(SqliteStore::open_file(&path).unwrap());
+        register(&engine, wf.clone());
+        run = engine
+            .start_workflow_with_params(
+                WorkflowId::new("wf"),
+                Ctx { log: vec![] },
+                "seed".into(),
+                params.clone(),
+            )
+            .await
+            .unwrap();
+
+        let store = engine.state_store().clone();
+        for _ in 0..100 {
+            let journal = store.journal(run).await.unwrap();
+            if journal
+                .iter()
+                .any(|e| matches!(e, JournalEntry::Input { .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // Engine 2 over the same file: recover the run.
+    let engine = WorkflowEngine::<Ctx, _>::with_store(SqliteStore::open_file(&path).unwrap());
+    register(&engine, wf);
+    let resumed = engine.recover().await.unwrap();
+    assert!(
+        resumed.contains(&run),
+        "recover() must resume the crashed run"
+    );
+
+    engine
+        .complete_event(run, "approve", EntryResult::Success(b"ok".to_vec()))
+        .await
+        .unwrap();
+    engine
+        .wait_for_completion(run, "wf", Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert_eq!(state.context.params, params);
+
+    // The journaled Input entry itself also carries params, not just the
+    // recovered state row.
+    let journal = engine.state_store().journal(run).await.unwrap();
+    let journal_has_params = journal.iter().any(|e| match e {
+        JournalEntry::Input { value } => {
+            let decoded: serde_json::Value = serde_json::from_slice(value).unwrap();
+            decoded["params"] == params
+        }
+        _ => false,
+    });
+    assert!(
+        journal_has_params,
+        "journaled Input entry must carry params"
+    );
+}
+
 /// A pending Sleep is re-armed by recovery and fires once its wake time is
 /// reached, without a fresh pending entry being appended (idempotent re-arm).
 #[tokio::test]

@@ -100,6 +100,43 @@ async fn brainstorm_fanout_collect() {
     assert!(out.matches("processed").count() >= 3);
 }
 
+/// `params` flows from `start_workflow_with_params` through `{{params.x}}`
+/// dotted-path expansion into a step's prompt (item #126).
+#[tokio::test]
+async fn params_flow_through_to_prompt_expansion() {
+    let wf_json: JsonWorkflow = serde_json::from_str(
+        r#"{
+            "name": "params-roundtrip",
+            "steps": [
+                {"name": "greet", "agent": "writer", "prompt": "Hello {{params.userId}}, task: {{params.metadata.task}}"}
+            ]
+        }"#,
+    )
+    .unwrap();
+    let wf = compile_workflow(&wf_json, mock_send()).unwrap();
+    let engine = WorkflowEngine::<PipelineData, _>::with_store(SqliteStore::open_memory().unwrap());
+    engine.register_workflow(wf).unwrap();
+
+    let params = serde_json::json!({"userId": "u-42", "metadata": {"task": "review"}});
+    let run = engine
+        .start_workflow_with_params(
+            WorkflowId::new("params-roundtrip"),
+            PipelineData,
+            "seed".into(),
+            params,
+        )
+        .await
+        .unwrap();
+    engine
+        .wait_for_completion(run, "params-roundtrip", Duration::from_secs(15))
+        .await
+        .unwrap();
+
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert!(state.input.contains("Hello u-42, task: review"));
+}
+
 #[tokio::test]
 async fn iterative_refinement_loop() {
     let out = run_json(
