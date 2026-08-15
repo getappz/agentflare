@@ -143,7 +143,7 @@ pub struct WorkflowEngine<D: WorkflowData, S: StateStore<D> = InMemoryStore<D>> 
     shutdown_tx: Arc<watch::Sender<bool>>,
     active_workflows: Arc<AtomicUsize>,
     /// Jitter factor applied to retry backoff delays (0.0-1.0).
-    jitter: f64,
+    pub(crate) jitter: f64,
     /// In-process completions for pending `WaitEvent` steps, keyed by
     /// `"{run_id}:{step_id}:{name}"`. A completed event is also journaled so
     /// it survives restart and pre-delivery races.
@@ -685,20 +685,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 } else {
                     "Workflow deadlocked: no steps ready and none running"
                 };
-                self.state_store
-                    .update(run_id, |s| {
-                        s.status = WorkflowStatus::Failed;
-                        s.error = Some(error_message.to_string());
-                    })
-                    .await?;
-                self.event_bus
-                    .publish(WorkflowEvent::WorkflowFailed {
-                        run_id,
-                        failed_step: failed_step
-                            .unwrap_or_else(|| StepId::new("internal_scheduler")),
-                        error: error_message.to_string(),
-                    })
-                    .await;
+                self.finish_workflow_failed(
+                    run_id,
+                    &definition,
+                    failed_step,
+                    error_message.to_string(),
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -938,20 +931,14 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             t.failed.iter().next().cloned()
         };
 
-        if let Some(ref step) = failed_step {
-            self.state_store
-                .update(run_id, |s| {
-                    s.status = WorkflowStatus::Failed;
-                    s.error = Some("One or more steps failed".to_string());
-                })
-                .await?;
-            self.event_bus
-                .publish(WorkflowEvent::WorkflowFailed {
-                    run_id,
-                    failed_step: step.clone(),
-                    error: "One or more steps failed".into(),
-                })
-                .await;
+        if let Some(step) = failed_step {
+            self.finish_workflow_failed(
+                run_id,
+                &definition,
+                Some(step),
+                "One or more steps failed".to_string(),
+            )
+            .await?;
         } else {
             let output = self
                 .state_store
@@ -980,6 +967,51 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 .await;
         }
 
+        Ok(())
+    }
+
+    /// Settle a run to `WorkflowStatus::Failed`, running the saga rollback
+    /// phase first if any step in `definition` registered a `rollback`
+    /// handler. `failed_step` is the specific step whose failure triggered
+    /// the workflow's failure, if any (a genuine deadlock with no failed
+    /// step passes `None`). Zero overhead for workflows with no registered
+    /// rollbacks: the `.any(...)` check short-circuits before any journal
+    /// reads.
+    async fn finish_workflow_failed(
+        &self,
+        run_id: WorkflowRunId,
+        definition: &WorkflowDefinition<D>,
+        failed_step: Option<StepId>,
+        error_message: String,
+    ) -> WorkflowResult<()> {
+        if definition.steps.iter().any(|s| s.rollback.is_some()) {
+            self.run_rollback_phase(run_id, definition, failed_step.as_ref())
+                .await?;
+        }
+        // Status flips to `Failed` only here, after the rollback phase
+        // returns — a crash mid-unwind leaves the run `Running`, so
+        // `recover()` (which only resumes `Running`/`Pending` runs) picks it
+        // back up and `run_rollback_phase` resumes from whatever `Rollback`
+        // entries already exist.
+        self.state_store
+            .update(run_id, |s| {
+                s.status = WorkflowStatus::Failed;
+                // `run_rollback_phase` may have already folded a
+                // compensation-failure note into `s.error` above; append the
+                // primary failure reason rather than clobbering it.
+                s.error = Some(match s.error.take() {
+                    Some(rollback_note) => format!("{error_message}; {rollback_note}"),
+                    None => error_message.clone(),
+                });
+            })
+            .await?;
+        self.event_bus
+            .publish(WorkflowEvent::WorkflowFailed {
+                run_id,
+                failed_step: failed_step.unwrap_or_else(|| StepId::new("internal_scheduler")),
+                error: error_message,
+            })
+            .await;
         Ok(())
     }
 
@@ -1202,7 +1234,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         };
         let step_timeout = definition.get_timeout(step);
         let until_lower = until.to_lowercase();
-        let mut current_output = String::new();
+        let mut last_context: Option<WorkflowContext<D>> = None;
         let mut executed = 0u32;
 
         for iter in 1..=*max_iterations {
@@ -1252,11 +1284,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                             }
                         })
                         .await?;
-                    current_output = out;
+                    last_context = Some(context.clone());
                     tracing::info!(run_id = %run_id, step = %step.id, iter, "Loop iteration completed");
-                    if !until_lower.is_empty()
-                        && current_output.to_lowercase().contains(&until_lower)
-                    {
+                    if !until_lower.is_empty() && out.to_lowercase().contains(&until_lower) {
                         break;
                     }
                 }
@@ -1295,14 +1325,23 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             }
         }
 
-        // Journal the loop's terminal success (last output is the payload).
+        // Journal the loop's terminal success carrying the full serialized
+        // context (matching Sequential/FanOut's terminal `StepRun` entry) so
+        // a registered rollback handler can reconstruct this step's own
+        // output from the journal, same as any other supported mode.
+        let final_context = match last_context {
+            Some(ctx) => ctx,
+            None => self.state_store.load(run_id).await?.context,
+        };
+        let context_bytes = serde_json::to_vec(&final_context)
+            .map_err(|e| WorkflowError::Journal(format!("serialize context: {e}")))?;
         self.state_store
             .append_journal(
                 run_id,
                 JournalEntry::StepRun {
                     step_id: step.id.clone(),
                     attempt: executed,
-                    result: Some(EntryResult::Success(current_output.into_bytes())),
+                    result: Some(EntryResult::Success(context_bytes)),
                 },
             )
             .await?;

@@ -33,6 +33,13 @@ pub enum ValidationError {
     /// A cycle was detected in the workflow DAG.
     #[error("cycle detected involving step '{0}'")]
     CycleDetected(StepId),
+
+    /// A step registered a rollback handler on a mode that never journals a
+    /// full context snapshot on success, so there's nothing to reconstruct
+    /// a rollback context from. Only `Sequential`, `FanOut`, and `Loop`
+    /// support rollback.
+    #[error("step '{step}' registers a rollback handler on unsupported mode '{mode}'")]
+    RollbackUnsupportedMode { step: StepId, mode: &'static str },
 }
 
 /// Definition of a single step within a workflow.
@@ -58,6 +65,14 @@ pub struct StepDefinition<D: WorkflowData> {
     /// Named variable to store this step's output in for later `{{var}}`
     /// references (OpenFang semantics).
     pub output_var: Option<String>,
+    /// Saga compensation handler, invoked during rollback if the workflow
+    /// later fails. Only `Sequential`, `FanOut`, and `Loop` modes support
+    /// this — see `ValidationError::RollbackUnsupportedMode`.
+    pub rollback: Option<Arc<dyn StepExecutor<D>>>,
+    /// Retry policy for the rollback handler itself. Falls back to the
+    /// step's own `retry_policy` (then the workflow default) when unset.
+    /// Reuses the step's own `timeout`.
+    pub rollback_retry_policy: Option<RetryPolicy>,
 }
 
 impl<D: WorkflowData> Clone for StepDefinition<D> {
@@ -77,6 +92,8 @@ impl<D: WorkflowData> Clone for StepDefinition<D> {
             scheduled_at: self.scheduled_at,
             run_if: self.run_if.clone(),
             output_var: self.output_var.clone(),
+            rollback: self.rollback.clone(),
+            rollback_retry_policy: self.rollback_retry_policy.clone(),
         }
     }
 }
@@ -96,6 +113,8 @@ impl<D: WorkflowData> fmt::Debug for StepDefinition<D> {
             .field("delay", &self.delay)
             .field("scheduled_at", &self.scheduled_at)
             .field("run_if", &self.run_if.as_ref().map(|_| "<condition>"))
+            .field("rollback", &self.rollback.as_ref().map(|_| "<rollback>"))
+            .field("rollback_retry_policy", &self.rollback_retry_policy)
             .finish_non_exhaustive()
     }
 }
@@ -121,6 +140,8 @@ impl<D: WorkflowData> StepDefinition<D> {
             scheduled_at: None,
             run_if: None,
             output_var: None,
+            rollback: None,
+            rollback_retry_policy: None,
         }
     }
 
@@ -186,6 +207,22 @@ impl<D: WorkflowData> StepDefinition<D> {
     /// references.
     pub fn with_output_var(mut self, name: impl Into<String>) -> Self {
         self.output_var = Some(name.into());
+        self
+    }
+
+    /// Register a saga compensation handler, invoked during rollback if the
+    /// workflow later fails. `retry_policy` overrides this handler's own
+    /// retry policy; when `None`, it falls back to the step's own
+    /// `retry_policy`, then the workflow default. Only `Sequential`,
+    /// `FanOut`, and `Loop` step modes support rollback — registering it on
+    /// any other mode is rejected by `WorkflowDefinition::validate()`.
+    pub fn with_rollback(
+        mut self,
+        executor: Arc<dyn StepExecutor<D>>,
+        retry_policy: Option<RetryPolicy>,
+    ) -> Self {
+        self.rollback = Some(executor);
+        self.rollback_retry_policy = retry_policy;
         self
     }
 
@@ -291,6 +328,27 @@ impl<D: WorkflowData> WorkflowDefinition<D> {
                         dependency: dep.clone(),
                     });
                 }
+            }
+        }
+
+        for step in &self.steps {
+            if step.rollback.is_none() {
+                continue;
+            }
+            // Only modes whose successful completion journals a full
+            // context snapshot can be reconstructed for a rollback handler.
+            let unsupported_mode = match &step.mode {
+                StepMode::Sequential | StepMode::FanOut | StepMode::Loop { .. } => None,
+                StepMode::Collect => Some("collect"),
+                StepMode::Conditional { .. } => Some("conditional"),
+                StepMode::Sleep { .. } => Some("sleep"),
+                StepMode::WaitEvent { .. } => Some("wait_event"),
+            };
+            if let Some(mode) = unsupported_mode {
+                return Err(ValidationError::RollbackUnsupportedMode {
+                    step: step.id.clone(),
+                    mode,
+                });
             }
         }
 

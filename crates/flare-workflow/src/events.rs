@@ -59,6 +59,22 @@ pub enum WorkflowEvent {
     WorkflowCancelled {
         run_id: WorkflowRunId,
     },
+    /// A saga rollback (compensation) handler exhausted its retries. The
+    /// unwind continues regardless — see `RollbackCompleted` for the final
+    /// tally.
+    RollbackStepFailed {
+        run_id: WorkflowRunId,
+        step_id: StepId,
+        error: String,
+    },
+    /// The rollback phase for a failed run has finished (best-effort): every
+    /// eligible step's compensation was attempted, whether or not it
+    /// succeeded.
+    RollbackCompleted {
+        run_id: WorkflowRunId,
+        compensated: Vec<StepId>,
+        failed: Vec<StepId>,
+    },
 }
 
 /// Trait for subscribing to workflow events.
@@ -230,6 +246,20 @@ impl EventSubscriber for LoggingSubscriber {
             }
             WorkflowEvent::WorkflowCancelled { run_id } => {
                 info!(run_id = %run_id, "Workflow cancelled");
+            }
+            WorkflowEvent::RollbackStepFailed {
+                run_id,
+                step_id,
+                error,
+            } => {
+                warn!(run_id = %run_id, step_id = %step_id, error = error, "Rollback step failed");
+            }
+            WorkflowEvent::RollbackCompleted {
+                run_id,
+                compensated,
+                failed,
+            } => {
+                info!(run_id = %run_id, compensated = compensated.len(), failed = failed.len(), "Rollback phase completed");
             }
         }
     }

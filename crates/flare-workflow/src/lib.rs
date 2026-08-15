@@ -19,6 +19,7 @@ pub mod executor;
 pub mod journal;
 pub mod json;
 pub mod retry;
+pub mod rollback;
 pub mod sqlite_store;
 pub mod store;
 pub mod types;
