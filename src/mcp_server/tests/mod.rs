@@ -347,6 +347,50 @@ fn empty_item_create(name: &str) -> ItemRequest {
     }
 }
 
+/// A claimed item backed by a *real*, still-alive git repo — for tests that
+/// need to write actual files into the worktree and exercise git-backed
+/// `done` flows (auto-commit, push, branch-divergence checks), not just
+/// backend-DB state.
+///
+/// Thin adapter over `item_tests::claim_harness` for the shared git-init/
+/// `AgentflareMcp`-construction scaffolding, layering item-create+claim
+/// logic on top. Both `TempDir` guards `claim_harness` returns are kept
+/// alive by returning them to the caller.
+///
+/// `pub(crate)`: reused by `work_item_pipeline`'s `finalize` step test,
+/// which is a sibling of `mcp_server` (not a descendant) and so can't reach
+/// this module's private items directly.
+pub(crate) fn mcp_with_claimed_item(
+    name: &str,
+) -> (
+    AgentflareMcp,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    String,
+    String,
+    std::path::PathBuf,
+) {
+    let (s, tmp, repo_dir) = item_tests::claim_harness();
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create(name))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    let project_id = created["project_id"].as_str().unwrap().to_string();
+
+    let claimed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let worktree_path = std::path::PathBuf::from(claimed["worktree_path"].as_str().unwrap());
+
+    (s, tmp, repo_dir, item_id, project_id, worktree_path)
+}
+
 mod action_tests;
 mod artifact_tests;
 mod asset_tests;

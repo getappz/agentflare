@@ -1722,5 +1722,9 @@ mod optimize_instructions_tests {
     }
 }
 
+// `pub(crate)`: `work_item_pipeline`'s `finalize` step test (a sibling
+// module, not a descendant of `mcp_server`) needs `tests::mcp_with_claimed_item`
+// — see that function's doc comment for why the existing `claim_harness` in
+// `item_tests.rs` can't be reused as-is.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

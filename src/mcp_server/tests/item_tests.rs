@@ -139,7 +139,11 @@ fn item_cancel_releases_the_callers_own_claim() {
     assert_eq!(reclaimed["status"], "acquired");
 }
 
-fn claim_harness() -> (AgentflareMcp, tempfile::TempDir) {
+///
+/// `pub(crate)`: reused by `mcp_server::tests::mcp_with_claimed_item`, which
+/// layers item-create+claim logic on top of this shared git-init/`AgentflareMcp`
+/// scaffolding instead of reimplementing it.
+pub(crate) fn claim_harness() -> (AgentflareMcp, tempfile::TempDir, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let repo_root = repo_dir.path().to_path_buf();
@@ -160,12 +164,16 @@ fn claim_harness() -> (AgentflareMcp, tempfile::TempDir) {
         worktree_repo_root_override: Some(repo_root),
         ..Default::default()
     };
-    (s, tmp)
+    // Return `repo_dir` alongside `tmp` — dropping it here (as the previous
+    // version did) deletes the git repo before any caller can run real git
+    // operations against it; the caller must keep both `TempDir` guards
+    // alive for the duration of the test.
+    (s, tmp, repo_dir)
 }
 
 #[test]
 fn item_update_assignee_to_different_agent_releases_old_claim() {
-    let (s, _tmp) = claim_harness();
+    let (s, _tmp, _repo_tmp) = claim_harness();
     let created: serde_json::Value =
         serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
     let item_id = created["id"].as_str().unwrap().to_string();
@@ -207,7 +215,7 @@ fn item_update_assignee_to_different_agent_releases_old_claim() {
 
 #[test]
 fn item_update_assignee_to_different_instance_does_not_release_claim() {
-    let (s, _tmp) = claim_harness();
+    let (s, _tmp, _repo_tmp) = claim_harness();
     let created: serde_json::Value =
         serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
     let item_id = created["id"].as_str().unwrap().to_string();

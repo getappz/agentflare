@@ -475,7 +475,7 @@ impl AgentflareMcp {
         })?
     }
 
-    pub(super) fn item_update(&self, req: ItemRequest) -> Result<String, ErrorData> {
+    pub(crate) fn item_update(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for update", None))?;

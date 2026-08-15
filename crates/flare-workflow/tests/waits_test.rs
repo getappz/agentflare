@@ -72,6 +72,50 @@ async fn sleep_step_waits_and_completes() {
 }
 
 #[tokio::test]
+async fn sleep_until_step_waits_and_completes() {
+    let engine = engine();
+    let wake_at = chrono::Utc::now() + chrono::Duration::milliseconds(1000);
+    let wf = WorkflowDefinition::new("wf", "wf").add_step(
+        StepDefinition::new("nap", "nap", noop_executor::<Ctx>())
+            .with_mode(StepMode::SleepUntil { wake_at }),
+    );
+    let run = start(&engine, wf).await;
+
+    let start = std::time::Instant::now();
+    engine
+        .wait_for_completion(run, "wf", Duration::from_secs(10))
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "sleep_until fired too early: {elapsed:?}"
+    );
+
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert_eq!(
+        state.step_states[&StepId::new("nap")].status,
+        StepStatus::Succeeded
+    );
+
+    // Journal holds pending -> completed Sleep entries with the requested wake_at.
+    let journal = engine.state_store().journal(run).await.unwrap();
+    let sleeps: Vec<_> = journal
+        .iter()
+        .filter(|e| matches!(e, JournalEntry::Sleep { .. }))
+        .collect();
+    assert_eq!(sleeps.len(), 2, "pending + fired sleep entries");
+    assert!(!sleeps[0].is_completed());
+    assert!(sleeps[1].is_completed());
+    for e in &sleeps {
+        if let JournalEntry::Sleep { wake_at: w, .. } = e {
+            assert_eq!(*w, wake_at);
+        }
+    }
+}
+
+#[tokio::test]
 async fn wait_event_resolves_via_complete_event() {
     let engine = engine();
     let wf = WorkflowDefinition::new("wf", "wf").add_step(
