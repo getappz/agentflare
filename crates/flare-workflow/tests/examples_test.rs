@@ -5,17 +5,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flare_workflow::engine::WorkflowEngine;
-use flare_workflow::json::{JsonWorkflow, PipelineData, SendMessage, compile_workflow};
+use flare_workflow::json::{
+    JsonWorkflow, PipelineData, SendMessage, StepInvocation, compile_workflow,
+};
 use flare_workflow::sqlite_store::SqliteStore;
 use flare_workflow::types::{WorkflowId, WorkflowStatus};
 
 fn mock_send() -> SendMessage {
-    Arc::new(|agent: String, prompt: String| {
+    Arc::new(|inv: StepInvocation| {
         Box::pin(async move {
             Ok((
-                format!("[{agent} processed: {prompt}]"),
-                prompt.len() as u64,
-                prompt.len() as u64 / 2,
+                format!("[{} processed: {}]", inv.agent, inv.prompt),
+                inv.prompt.len() as u64,
+                inv.prompt.len() as u64 / 2,
             ))
         })
     })

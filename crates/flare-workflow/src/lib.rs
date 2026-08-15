@@ -32,7 +32,8 @@ pub use engine::WorkflowEngine;
 pub use events::{EventBus, EventSubscriber, LoggingSubscriber, WorkflowEvent};
 pub use executor::{FunctionStep, StepExecutor, noop_executor};
 pub use json::{
-    JsonErrorMode, JsonMode, JsonStep, JsonWorkflow, PipelineData, SendMessage, compile_workflow,
+    JsonErrorMode, JsonMode, JsonStep, JsonWorkflow, PipelineData, SendMessage, StepInvocation,
+    compile_workflow,
 };
 pub use retry::{Backoff, Retryable, apply_jitter};
 pub use sqlite_store::{SqliteStore, SqliteStoreError};

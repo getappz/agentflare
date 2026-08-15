@@ -231,13 +231,14 @@ pub(crate) fn build_sdd_loop_step(
                     (agent_name.clone(), build_implementer_prompt(&task, None))
                 };
 
-                let (role_reply, in_tok, out_tok) =
-                    send(role_agent, role_prompt).await.map_err(|message| {
-                        WorkflowError::StepFailed {
-                            step_id: StepId::new("sdd_loop"),
-                            message,
-                        }
-                    })?;
+                let (role_reply, in_tok, out_tok) = send(
+                    flare_workflow::json::StepInvocation::simple(role_agent, role_prompt),
+                )
+                .await
+                .map_err(|message| WorkflowError::StepFailed {
+                    step_id: StepId::new("sdd_loop"),
+                    message,
+                })?;
                 ctx.input_tokens += in_tok;
                 ctx.output_tokens += out_tok;
 
@@ -257,13 +258,14 @@ pub(crate) fn build_sdd_loop_step(
                     &ctx.data.ledger,
                     &role_reply,
                 );
-                let (judge_reply, jin_tok, jout_tok) =
-                    send(judge_agent_name, judge_prompt)
-                        .await
-                        .map_err(|message| WorkflowError::StepFailed {
-                            step_id: StepId::new("sdd_loop"),
-                            message,
-                        })?;
+                let (judge_reply, jin_tok, jout_tok) = send(
+                    flare_workflow::json::StepInvocation::simple(judge_agent_name, judge_prompt),
+                )
+                .await
+                .map_err(|message| WorkflowError::StepFailed {
+                    step_id: StepId::new("sdd_loop"),
+                    message,
+                })?;
                 ctx.input_tokens += jin_tok;
                 ctx.output_tokens += jout_tok;
 
@@ -484,8 +486,9 @@ fn real_agent_send_hook(
     idle_timeout: std::time::Duration,
     extra_args: Vec<String>,
 ) -> flare_workflow::json::SendMessage {
-    std::sync::Arc::new(move |agent: String, prompt: String| {
+    std::sync::Arc::new(move |inv: flare_workflow::json::StepInvocation| {
         let extra_args = extra_args.clone();
+        let flare_workflow::json::StepInvocation { agent, prompt, .. } = inv;
         Box::pin(async move {
             let outcome = tokio::task::spawn_blocking(move || {
                 crate::agent_launch::run_headless(
@@ -1040,7 +1043,8 @@ mod tests {
             .unwrap();
 
         let send: flare_workflow::json::SendMessage = Arc::new(
-            move |_agent: String, prompt: String| {
+            move |inv: flare_workflow::json::StepInvocation| {
+                let prompt = inv.prompt;
                 Box::pin(async move {
                     if prompt.contains("You are the judge") {
                         Ok((
@@ -1098,7 +1102,9 @@ mod pipeline_assembly_tests {
     #[test]
     fn sdd_pipeline_has_two_steps_with_correct_dependency() {
         let send: flare_workflow::json::SendMessage =
-            std::sync::Arc::new(|_a, _p| Box::pin(async { Ok((String::new(), 0, 0)) }));
+            std::sync::Arc::new(|_: flare_workflow::json::StepInvocation| {
+                Box::pin(async { Ok((String::new(), 0, 0)) })
+            });
         let pipeline = build_work_item_pipeline_with_sender(
             agent_registry::Agent::ClaudeCode,
             "Fix the null pointer in parser.rs".to_string(),
@@ -1330,14 +1336,15 @@ mod sdd_test_support {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let queue = Arc::new(Mutex::new(replies.into_iter().collect::<VecDeque<_>>()));
         let calls_clone = calls.clone();
-        let send: flare_workflow::json::SendMessage = Arc::new(move |agent, prompt| {
-            calls_clone
-                .lock()
-                .unwrap()
-                .push((agent.clone(), prompt.clone()));
-            let reply = queue.lock().unwrap().pop_front().unwrap_or("").to_string();
-            Box::pin(async move { Ok((reply, 10u64, 10u64)) })
-        });
+        let send: flare_workflow::json::SendMessage =
+            Arc::new(move |inv: flare_workflow::json::StepInvocation| {
+                calls_clone
+                    .lock()
+                    .unwrap()
+                    .push((inv.agent.clone(), inv.prompt.clone()));
+                let reply = queue.lock().unwrap().pop_front().unwrap_or("").to_string();
+                Box::pin(async move { Ok((reply, 10u64, 10u64)) })
+            });
         (send, calls)
     }
 
@@ -1644,15 +1651,16 @@ mod sdd_loop_tests {
             r#"{"action":"advance_task","rationale":"clean","ledger_line":"Task 2: complete","task_model_tier":null}"#,
         ]);
         let responses = Arc::new(Mutex::new(responses));
-        let send: flare_workflow::json::SendMessage = Arc::new(move |_agent, _prompt| {
-            let reply = responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_default()
-                .to_string();
-            Box::pin(async move { Ok((reply, 5u64, 5u64)) })
-        });
+        let send: flare_workflow::json::SendMessage =
+            Arc::new(move |_: flare_workflow::json::StepInvocation| {
+                let reply = responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_default()
+                    .to_string();
+                Box::pin(async move { Ok((reply, 5u64, 5u64)) })
+            });
 
         let step = sdd_step(send);
         let data = WorkItemData {
@@ -1711,16 +1719,19 @@ mod cap_tests {
     use super::{sdd_test_support::*, *};
     #[tokio::test]
     async fn sixth_fix_round_fails_the_step() {
-        let send: flare_workflow::json::SendMessage = std::sync::Arc::new(move |_, p| {
-            Box::pin(async move {
-                let r = if p.contains("judge") {
-                    r#"{"action":"fix_round","rationale":"x","ledger_line":"x","task_model_tier":null}"#
-                } else {
-                    "REVIEW_ISSUES: x"
-                };
-                Ok((r.to_string(), 5u64, 5u64))
-            })
-        });
+        let send: flare_workflow::json::SendMessage = std::sync::Arc::new(
+            move |inv: flare_workflow::json::StepInvocation| {
+                let p = inv.prompt;
+                Box::pin(async move {
+                    let r = if p.contains("judge") {
+                        r#"{"action":"fix_round","rationale":"x","ledger_line":"x","task_model_tier":null}"#
+                    } else {
+                        "REVIEW_ISSUES: x"
+                    };
+                    Ok((r.to_string(), 5u64, 5u64))
+                })
+            },
+        );
         let mut d = one_task_data();
         d.fix_round = MAX_FIX_ROUNDS;
         d.review_issues = Some("x".to_string());
