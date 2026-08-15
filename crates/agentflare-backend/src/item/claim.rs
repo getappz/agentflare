@@ -1,9 +1,10 @@
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::error::Result;
+use crate::events;
 
 use super::crud::{get, update, update_state};
-use super::{UpdateItem, now};
+use super::{UpdateItem, now, workspace_id_for_project};
 
 /// Outcome of a claim attempt — the raw lease `Acquire` plus the handoff
 /// freeze rule: while an item carries an `assignee_agent` that nobody has
@@ -97,6 +98,46 @@ pub fn claim(
     };
     tx.commit()?;
     Ok(result)
+}
+
+/// Releases the caller's claim lease and, if that succeeded, clears
+/// `assignee_agent` back to unassigned — composes `claim::release` with a
+/// direct clear, the release-side mirror of how `claim()` above composes
+/// `claim::acquire` with an assignee update.
+///
+/// Without this, `claim()`'s `BlockedByAssignee` guard can't tell "a
+/// handoff nobody has accepted yet" apart from "was claimed and released
+/// after a failure" — both leave `assignee_agent` set with no active lease
+/// behind it. The guard only exempts a same-agent-type reclaim, so a
+/// released item stayed permanently blocked to every other agent type
+/// (item #93). A no-op release (nothing to release, or the caller doesn't
+/// own the lease) leaves `assignee_agent` untouched.
+pub fn release(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let released = crate::claim::release(&tx, item_id, owner)?;
+    if released {
+        // Direct SQL, not `update()` -- `UpdateItem.assignee_agent` treats
+        // `None` as "leave untouched" so it has no way to express an
+        // explicit clear back to NULL.
+        let ts = now();
+        tx.execute(
+            "UPDATE items SET assignee_agent = NULL, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![item_id, ts],
+        )?;
+        if let Ok(item) = get(&tx, item_id)
+            && let Ok(wid) = workspace_id_for_project(&tx, &item.project_id)
+        {
+            events::emit(
+                &tx,
+                &wid,
+                "item",
+                "update",
+                serde_json::to_value(&item).unwrap_or_default(),
+            );
+        }
+    }
+    tx.commit()?;
+    Ok(released)
 }
 
 /// Moves a claimed item into the project's "completed" group WITHOUT
