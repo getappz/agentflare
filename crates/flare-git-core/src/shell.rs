@@ -141,6 +141,19 @@ pub fn run_in_ok(repo_root: &Path, args: &[&str]) -> bool {
     run_in(repo_root, args).is_ok()
 }
 
+/// Runs `git worktree prune` when `needed`, clearing dangling
+/// `.git/worktrees/<name>` admin entries left behind after a worktree
+/// directory was removed some other way (e.g. `remove_dir_all`, or because
+/// it was already gone). Best-effort: errors are silently ignored, matching
+/// every existing call site. Shared by `worktree::gc_orphans` and
+/// `doctor::reclaim`, which both batch removals and prune once at the end
+/// rather than after every single deletion.
+pub fn prune_worktree_metadata_if(repo_root: &Path, needed: bool) {
+    if needed {
+        let _ = run_in(repo_root, &["worktree", "prune"]);
+    }
+}
+
 /// Unified diff for `base...head` (three-dot: changes on `head` since it
 /// diverged from `base`). Stdout is returned RAW, not trimmed — diff output
 /// is multi-line and whitespace-significant, unlike the single-value queries

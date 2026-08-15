@@ -65,6 +65,11 @@ pub struct UpdateItem {
     pub assignee_agent: Option<String>,
     pub sort_order: Option<f64>,
     pub metadata: Option<String>,
+    /// Re-parenting is three-valued, unlike every other field here:
+    /// `None` leaves the parent alone, `Some(Some(id))` re-parents, and
+    /// `Some(None)` detaches the item from its parent — otherwise a parent
+    /// set by mistake could never be removed again.
+    pub parent_id: Option<Option<String>>,
 }
 
 fn now() -> i64 {

@@ -724,7 +724,9 @@ pub(crate) struct ItemRequest {
     #[schemars(description = "Priority: none|low|medium|high|urgent (create, update)")]
     #[serde(default)]
     pub(crate) priority: Option<String>,
-    #[schemars(description = "Parent item ID, for sub-items (create)")]
+    #[schemars(
+        description = "Parent item ID or sequence_id, for sub-items (create, update). On update, an empty string detaches the item from its parent"
+    )]
     #[serde(default)]
     pub(crate) parent_id: Option<String>,
     #[schemars(
