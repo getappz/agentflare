@@ -1365,7 +1365,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         self.cancel_workflow_impl(run_id, true).await
     }
 
-    async fn cancel_workflow_impl(&self, run_id: WorkflowRunId, rollback: bool) -> WorkflowResult<()> {
+    async fn cancel_workflow_impl(
+        &self,
+        run_id: WorkflowRunId,
+        rollback: bool,
+    ) -> WorkflowResult<()> {
         if rollback {
             let state = self.state_store.load(run_id).await?;
             let definition = self.definitions.read().get(&state.workflow_id).cloned();

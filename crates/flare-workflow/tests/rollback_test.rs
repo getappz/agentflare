@@ -258,11 +258,13 @@ async fn cancel_with_rollback_compensates_succeeded_steps() {
     for _ in 0..200 {
         let journal = engine.state_store().journal(run).await.unwrap();
         let done = |id: &str| {
-            journal.iter().any(|e| matches!(
-                e,
-                JournalEntry::StepRun { step_id, result: Some(EntryResult::Success(_)), .. }
-                    if step_id == &StepId::new(id)
-            ))
+            journal.iter().any(|e| {
+                matches!(
+                    e,
+                    JournalEntry::StepRun { step_id, result: Some(EntryResult::Success(_)), .. }
+                        if step_id == &StepId::new(id)
+                )
+            })
         };
         if done("a") && done("b") {
             break;
@@ -318,11 +320,13 @@ async fn plain_cancel_does_not_trigger_rollback() {
 
     for _ in 0..200 {
         let journal = engine.state_store().journal(run).await.unwrap();
-        let a_done = journal.iter().any(|e| matches!(
-            e,
-            JournalEntry::StepRun { step_id, result: Some(EntryResult::Success(_)), .. }
-                if step_id == &StepId::new("a")
-        ));
+        let a_done = journal.iter().any(|e| {
+            matches!(
+                e,
+                JournalEntry::StepRun { step_id, result: Some(EntryResult::Success(_)), .. }
+                    if step_id == &StepId::new("a")
+            )
+        });
         if a_done {
             break;
         }
