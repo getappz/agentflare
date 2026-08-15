@@ -1,12 +1,13 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flare_workflow::engine::WorkflowEngine;
 use flare_workflow::executor::{FunctionStep, noop_executor};
+use flare_workflow::sqlite_store::SqliteStore;
 use flare_workflow::store::InMemoryStore;
 use flare_workflow::types::*;
-use flare_workflow::{StepDefinition, WorkflowDefinition};
+use flare_workflow::{StateStore, StepDefinition, WorkflowDefinition};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Ctx {
@@ -273,4 +274,130 @@ async fn token_accounting_recorded_on_success() {
     let ss = &state.step_states[&StepId::new("agent-step")];
     assert_eq!(ss.input_tokens, 100);
     assert_eq!(ss.output_tokens, 50);
+}
+
+/// A crash mid-loop (one iteration hangs forever, so it never journals a
+/// `LoopIteration` entry) followed by `recover()` resumes the loop from the
+/// last durably-recorded iteration instead of restarting the counter at 1.
+/// Also exercises `ctx.step.attempt`, which the resumed executor reads
+/// directly instead of relying on a hand-rolled counter.
+#[tokio::test]
+async fn crash_mid_loop_then_recover_resumes_from_last_iteration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wf.db");
+
+    fn loop_step(
+        log: Arc<Mutex<Vec<u32>>>,
+        hang_started: Arc<AtomicU32>,
+        hang_at_attempt: u32,
+    ) -> StepDefinition<Ctx> {
+        StepDefinition::new(
+            "refine",
+            "refine",
+            Arc::new(FunctionStep::new(move |ctx: &mut WorkflowContext<Ctx>| {
+                let log = Arc::clone(&log);
+                let hang_started = Arc::clone(&hang_started);
+                let attempt = ctx.step.attempt;
+                Box::pin(async move {
+                    if attempt == hang_at_attempt {
+                        // Simulates a crash: this iteration never returns,
+                        // so no `LoopIteration` entry is ever journaled for
+                        // it by this engine.
+                        hang_started.fetch_add(1, Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    }
+                    log.lock().unwrap().push(attempt);
+                    ctx.output = "iteration output".to_string();
+                    Ok(StepResult::Success)
+                })
+            })),
+        )
+        .with_mode(StepMode::Loop {
+            max_iterations: 5,
+            until: "NEVER_MATCH".into(),
+        })
+    }
+
+    let pre_crash_log: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let hang_started = Arc::new(AtomicU32::new(0));
+
+    let run;
+    {
+        let engine = WorkflowEngine::<Ctx, _>::with_store(SqliteStore::open_file(&path).unwrap());
+        let wf_crash = WorkflowDefinition::new("wf", "wf").add_step(loop_step(
+            Arc::clone(&pre_crash_log),
+            Arc::clone(&hang_started),
+            3,
+        ));
+        engine.register_workflow(wf_crash).unwrap();
+        run = engine
+            .start_workflow(WorkflowId::new("wf"), Ctx { calls: vec![] }, "seed".into())
+            .await
+            .unwrap();
+
+        // Wait until iterations 1 and 2 are durably journaled and iteration
+        // 3 has started hanging (the unwind is now stuck mid-loop).
+        let store = engine.state_store().clone();
+        for _ in 0..200 {
+            let journal = store.journal(run).await.unwrap();
+            let journaled = journal
+                .iter()
+                .filter(|e| matches!(e, JournalEntry::LoopIteration { .. }))
+                .count();
+            if journaled >= 2 && hang_started.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(pre_crash_log.lock().unwrap().as_slice(), &[1, 2]);
+
+        let state = engine.get_status(run).await.unwrap();
+        assert_eq!(state.status, WorkflowStatus::Running);
+
+        // "Crash": drop this engine handle. Its loop task is orphaned mid
+        // -iteration-3 and never makes further progress.
+    }
+
+    // Recovery: fresh engine over the same file, with a *working* executor
+    // for iteration 3 onward (no hang_at_attempt match).
+    let post_recovery_log: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let engine = WorkflowEngine::<Ctx, _>::with_store(SqliteStore::open_file(&path).unwrap());
+    let wf_recovered = WorkflowDefinition::new("wf", "wf").add_step(loop_step(
+        Arc::clone(&post_recovery_log),
+        Arc::clone(&hang_started),
+        0, // never hangs
+    ));
+    engine.register_workflow(wf_recovered).unwrap();
+    let resumed = engine.recover().await.unwrap();
+    assert!(resumed.contains(&run));
+
+    for _ in 0..200 {
+        let state = engine.get_status(run).await.unwrap();
+        if state.status == WorkflowStatus::Completed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+
+    // Resumed from the last journaled iteration (2): re-ran 3, 4, 5 only —
+    // iterations 1 and 2 were never re-executed.
+    assert_eq!(post_recovery_log.lock().unwrap().as_slice(), &[3, 4, 5]);
+
+    // Exactly 5 `LoopIteration` entries total, one per iteration, no
+    // duplicates from re-running an already-journaled iteration.
+    let journal = engine.state_store().journal(run).await.unwrap();
+    let iterations: Vec<u32> = journal
+        .iter()
+        .filter_map(|e| match e {
+            JournalEntry::LoopIteration {
+                step_id, iteration, ..
+            } if step_id == &StepId::new("refine") => Some(*iteration),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(iterations, vec![1, 2, 3, 4, 5]);
 }
