@@ -293,6 +293,16 @@ pub enum JournalEntry {
         attempt: u32,
         result: Option<EntryResult>,
     },
+    /// A completed loop iteration for `StepMode::Loop` (item #115): appended
+    /// after each successful iteration so a crash mid-loop resumes from the
+    /// last recorded iteration instead of restarting the counter at 1. Never
+    /// mistaken for step completion by DAG-level memoization, which only
+    /// looks at `StepRun`/`Sleep`.
+    LoopIteration {
+        step_id: StepId,
+        iteration: u32,
+        output: Vec<u8>,
+    },
     /// The run's final output.
     Output { result: EntryResult },
 }
@@ -309,6 +319,7 @@ impl JournalEntry {
             JournalEntry::WaitEvent { result, .. } => result.is_some(),
             JournalEntry::Rollback { result, .. } => result.is_some(),
             JournalEntry::Output { .. } => true,
+            JournalEntry::LoopIteration { .. } => true,
         }
     }
 
@@ -324,8 +335,29 @@ impl JournalEntry {
             JournalEntry::WaitEvent { .. } => "wait_event",
             JournalEntry::Rollback { .. } => "rollback",
             JournalEntry::Output { .. } => "output",
+            JournalEntry::LoopIteration { .. } => "loop_iteration",
         }
     }
+}
+
+/// Runtime metadata about the step currently executing: attempt number,
+/// resolved retry/timeout config, and step/workflow identity — mirrors
+/// Cloudflare Workflows' `WorkflowStepContext`. Recomputed by the engine
+/// immediately before every executor call; never persisted (attempt and
+/// step id are already recorded separately in `JournalEntry::StepRun` /
+/// `StepState`).
+#[derive(Debug, Clone, Default)]
+pub struct StepExecutionMeta {
+    pub workflow_id: String,
+    pub workflow_name: String,
+    pub step_id: String,
+    pub step_name: String,
+    /// 1-indexed: 1 on the first try, 2 on the first retry, and so on (or
+    /// the current iteration for `StepMode::Loop`).
+    pub attempt: u32,
+    /// Resolved retry limit for this step (or iteration budget for `Loop`).
+    pub max_attempts: u32,
+    pub timeout: Duration,
 }
 
 /// Typed context shared between steps. Fully serializable (fields marked
@@ -353,6 +385,9 @@ pub struct WorkflowContext<D: WorkflowData> {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    /// Runtime metadata for the step currently executing. Not persisted.
+    #[serde(skip)]
+    pub step: StepExecutionMeta,
 }
 
 impl<D: WorkflowData> WorkflowContext<D> {
@@ -365,6 +400,7 @@ impl<D: WorkflowData> WorkflowContext<D> {
             variables: HashMap::new(),
             input_tokens: 0,
             output_tokens: 0,
+            step: StepExecutionMeta::default(),
         }
     }
 }
