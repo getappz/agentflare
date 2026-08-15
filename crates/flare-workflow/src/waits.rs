@@ -15,14 +15,34 @@ use crate::events::WorkflowEvent;
 use crate::store::StateStore;
 use crate::types::*;
 
+/// A step's requested wake time, resolved to an absolute deadline only on
+/// first execution — `Sleep` computes `now + duration_secs`, `SleepUntil`
+/// already has an absolute timestamp.
+pub(crate) enum WakeAt {
+    Relative(u64),
+    Absolute(chrono::DateTime<Utc>),
+}
+
+impl WakeAt {
+    fn resolve(self) -> chrono::DateTime<Utc> {
+        match self {
+            WakeAt::Relative(duration_secs) => {
+                Utc::now() + chrono::Duration::seconds(duration_secs as i64)
+            }
+            WakeAt::Absolute(wake_at) => wake_at,
+        }
+    }
+}
+
 impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
-    /// Execute a durable `Sleep` step: journal a pending timer, suspend the
-    /// step until wall-clock passes `wake_at`, then journal the fired result.
+    /// Execute a durable `Sleep`/`SleepUntil` step: journal a pending timer,
+    /// suspend the step until wall-clock passes `wake_at`, then journal the
+    /// fired result.
     pub(crate) async fn execute_sleep(
         &self,
         run_id: WorkflowRunId,
         step: &StepDefinition<D>,
-        duration_secs: u64,
+        wake_at: WakeAt,
     ) -> WorkflowResult<StepResult> {
         if self.state_store.is_cancelled(run_id).await? {
             return Err(WorkflowError::Cancelled(run_id));
@@ -44,7 +64,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let wake_at = match existing_wake_at {
             Some(wake_at) => wake_at,
             None => {
-                let wake_at = Utc::now() + chrono::Duration::seconds(duration_secs as i64);
+                let wake_at = wake_at.resolve();
                 self.state_store
                     .append_journal(
                         run_id,

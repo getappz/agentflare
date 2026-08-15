@@ -206,6 +206,78 @@ async fn recover_reams_pending_sleep() {
     }
 }
 
+/// A pending SleepUntil is re-armed by recovery and fires once its absolute
+/// wake time is reached, resuming the *original* journaled wake_at rather
+/// than the caller-supplied one (which recovery never re-reads).
+#[tokio::test]
+async fn recover_reams_pending_sleep_until() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wf.db");
+
+    let wake_at = chrono::Utc::now() + chrono::Duration::milliseconds(1000);
+    let wf = WorkflowDefinition::new("wf", "wf").add_step(
+        StepDefinition::new("nap", "nap", noop_executor::<Ctx>())
+            .with_mode(StepMode::SleepUntil { wake_at }),
+    );
+
+    let run;
+    let original_wake_at;
+    {
+        let engine = WorkflowEngine::<Ctx, _>::with_store(SqliteStore::open_file(&path).unwrap());
+        register(&engine, wf.clone());
+        run = engine
+            .start_workflow(WorkflowId::new("wf"), Ctx { log: vec![] }, "seed".into())
+            .await
+            .unwrap();
+        let store = engine.state_store().clone();
+        let mut journaled_wake_at = None;
+        for _ in 0..100 {
+            let journal = store.journal(run).await.unwrap();
+            journaled_wake_at = journal.iter().find_map(|e| match e {
+                JournalEntry::Sleep {
+                    wake_at,
+                    result: None,
+                    ..
+                } => Some(*wake_at),
+                _ => None,
+            });
+            if journaled_wake_at.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        original_wake_at =
+            journaled_wake_at.expect("pending SleepUntil entry journaled before crash");
+        assert_eq!(original_wake_at, wake_at);
+        // Crash before the sleep fires.
+    }
+
+    let engine = WorkflowEngine::<Ctx, _>::with_store(SqliteStore::open_file(&path).unwrap());
+    register(&engine, wf);
+    engine.recover().await.unwrap();
+
+    engine
+        .wait_for_completion(run, "wf", Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert_eq!(
+        state.step_states[&StepId::new("nap")].status,
+        StepStatus::Succeeded
+    );
+
+    // The re-armed timer must resume the *original* deadline journaled before
+    // the crash, not a freshly computed one.
+    let journal = engine.state_store().journal(run).await.unwrap();
+    for e in &journal {
+        if let JournalEntry::Sleep { wake_at, .. } = e {
+            assert_eq!(*wake_at, original_wake_at);
+        }
+    }
+}
+
 /// Racing complete_event calls complete the wait exactly once.
 #[tokio::test]
 async fn racing_completions_resolve_to_one() {
