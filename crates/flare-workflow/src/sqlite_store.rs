@@ -125,6 +125,23 @@ impl<D: WorkflowData> SqliteStore<D> {
             .map_err(|e| WorkflowError::Store(format!("deserialize state: {e}")))
     }
 
+    /// Like [`Self::deserialize`], but for multi-row scans (`list_active`,
+    /// `list_all`): `workflow_runs` is shared by every `WorkflowEngine<D, _>`
+    /// pointed at the same database file, so a row written by a *different*
+    /// `D` (e.g. another engine's own pipeline type) is expected to fail to
+    /// deserialize as this engine's `D`. Warn and skip that row instead of
+    /// failing the whole scan — one foreign-typed row must not make every
+    /// other run in the table unreadable.
+    fn deserialize_or_skip(id: &str, json: &str) -> Option<WorkflowState<D>> {
+        match Self::deserialize(json) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                tracing::warn!(run_id = id, error = %e, "skipping unreadable workflow_runs row (likely a different WorkflowData type sharing this store)");
+                None
+            }
+        }
+    }
+
     /// Write a state row plus its step_state/run_vars projections atomically.
     ///
     /// `step_states`/`variables` are fixed-growing maps within a run's
@@ -407,16 +424,16 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
                 .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT state_json FROM workflow_runs WHERE status IN ('pending','running')",
+                    "SELECT id, state_json FROM workflow_runs WHERE status IN ('pending','running')",
                 )
                 .map_err(|e| WorkflowError::Store(format!("prepare list_active: {e}")))?;
             let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
                 .map_err(|e| WorkflowError::Store(format!("list_active: {e}")))?;
             let mut out = Vec::new();
             for row in rows {
-                let json = row.map_err(|e| WorkflowError::Store(format!("row: {e}")))?;
-                out.push(Self::deserialize(&json)?);
+                let (id, json) = row.map_err(|e| WorkflowError::Store(format!("row: {e}")))?;
+                out.extend(Self::deserialize_or_skip(&id, &json));
             }
             Ok(out)
         })
@@ -430,15 +447,17 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
                 .lock()
                 .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
             let mut stmt = conn
-                .prepare("SELECT state_json FROM workflow_runs")
+                .prepare("SELECT id, state_json FROM workflow_runs")
                 .map_err(|e| WorkflowError::Store(format!("prepare list_all: {e}")))?;
             let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
                 .map_err(|e| WorkflowError::Store(format!("list_all: {e}")))?;
             let mut out = Vec::new();
             for row in rows {
-                let json = row.map_err(|e| WorkflowError::Store(format!("row: {e}")))?;
-                out.push(Self::deserialize(&json)?);
+                let (id, json) = row.map_err(|e| WorkflowError::Store(format!("row: {e}")))?;
+                out.extend(Self::deserialize_or_skip(&id, &json));
             }
             Ok(out)
         })
