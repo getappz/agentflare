@@ -28,9 +28,16 @@ static WORKFLOW_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 });
 
 /// The shared engine runtime (see [`WORKFLOW_RT`]).
-#[cfg(test)]
-fn blocking_runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn blocking_runtime() -> &'static tokio::runtime::Runtime {
     &WORKFLOW_RT
+}
+
+/// A cloned [`tokio::runtime::Handle`] onto [`WORKFLOW_RT`] — for engines
+/// (e.g. `work_item_pipeline::engine()`) that need to pin their execution
+/// tasks there via `WorkflowEngine::with_runtime_handle` without holding a
+/// reference to the `Runtime` itself.
+pub(crate) fn blocking_runtime_handle() -> tokio::runtime::Handle {
+    WORKFLOW_RT.handle().clone()
 }
 
 /// Parse a run id string (v7 UUID).
