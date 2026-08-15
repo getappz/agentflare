@@ -644,7 +644,7 @@ impl AgentflareMcp {
         })
     }
 
-    pub(super) fn item_heartbeat(&self, req: ItemRequest) -> Result<String, ErrorData> {
+    pub(crate) fn item_heartbeat(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for heartbeat", None))?;
@@ -936,10 +936,31 @@ impl AgentflareMcp {
             release_claim_and_cleanup(&item);
             false
         } else if in_review {
-            self.with_backend_db(|conn| {
+            let marked = self.with_backend_db(|conn| {
                 agentflare_backend::item::mark_in_review(conn, &item_id, &owner)
                     .map_err(map_backend_err)
-            })??
+            })??;
+            // `mark_in_review` silently no-ops (`Ok(false)`) when its own
+            // ownership check fails -- normally because the claim lease
+            // lapsed (or was reclaimed) between the top of this function and
+            // here. `status` below used to be derived from `in_review`
+            // regardless, so this looked like a clean success even though a
+            // PR now exists (`pr_url` above) while the item's own state
+            // never moved to in_review and the lease was never actually
+            // held on our behalf -- silently stranding it for a stale-sweep
+            // to pick back up. Loud is correct here: the push/PR already
+            // happened, so this can't be quietly retried.
+            if !marked {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "item {item_id}: PR was opened but the claim was lost before the item \
+                         could be marked in_review (owner mismatch) -- item state was NOT \
+                         updated"
+                    ),
+                    None,
+                ));
+            }
+            marked
         } else {
             let moved = self.with_backend_db(|conn| {
                 agentflare_backend::item::mark_completed(conn, &item_id, &owner)

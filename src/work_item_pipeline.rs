@@ -269,7 +269,20 @@ pub(crate) fn build_sdd_loop_step(
 
                 let decision = match parse_judge_decision(&judge_reply) {
                     Ok(d) => d,
-                    Err(_) => return Ok(StepResult::Failure),
+                    // A malformed judge reply is exactly the kind of
+                    // transient hiccup this step's `RetryPolicy` exists for
+                    // — but the engine only consults the policy for a real
+                    // `Err`, never for `Ok(StepResult::Failure)` (see
+                    // `execute_step_with_retry` in
+                    // `crates/flare-workflow/src/engine.rs`, which hardcodes
+                    // `should_retry = false` for the latter). Surfacing this
+                    // as `StepFailed` is what actually gets it retried.
+                    Err(e) => {
+                        return Err(WorkflowError::StepFailed {
+                            step_id: StepId::new("sdd_loop"),
+                            message: e.to_string(),
+                        });
+                    }
                 };
 
                 // 3. Apply the decision.
@@ -691,6 +704,17 @@ pub(crate) fn run_or_resume_with_sender(
             }
         };
 
+        // The claim lease's TTL (30 min default, `crate::claims::ttl_secs`)
+        // is far shorter than a work-item job is allowed to run (~6h05m,
+        // `WORK_JOB_TIMEOUT_SECS`), and the SDD loop below has no heartbeat
+        // of its own — without one here, a run spanning multiple tasks/fix
+        // rounds would let the lease go stale mid-flight, letting another
+        // sweep reclaim the item while this run is still actively working
+        // it. Throttled well inside the TTL so it's negligible DB load
+        // against this loop's 200ms poll cadence.
+        let mut last_heartbeat = std::time::Instant::now();
+        const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
         loop {
             let state = eng.get_status(run_id).await.map_err(|e| e.to_string())?;
             match state.status {
@@ -700,7 +724,17 @@ pub(crate) fn run_or_resume_with_sender(
                         .error
                         .unwrap_or_else(|| "workflow run failed".to_string()));
                 }
-                _ => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+                _ => {
+                    if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                        let _ = mcp.item_heartbeat(ItemRequest {
+                            action: "heartbeat".into(),
+                            id: Some(item.id.clone()),
+                            ..Default::default()
+                        });
+                        last_heartbeat = std::time::Instant::now();
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
             }
         }
     })
@@ -1514,16 +1548,22 @@ mod sdd_loop_tests {
     }
 
     #[tokio::test]
-    async fn judge_parse_failure_is_step_failure() {
+    async fn judge_parse_failure_is_retryable_step_error() {
+        // Must be a real `Err`, not `Ok(StepResult::Failure)` — the engine's
+        // `execute_step_with_retry` (`crates/flare-workflow/src/engine.rs`)
+        // only ever consults the step's `RetryPolicy` for a genuine `Err`;
+        // `Ok(StepResult::Failure)` is hardcoded non-retryable regardless of
+        // policy. A malformed judge reply is exactly the transient case
+        // `sdd_loop`'s attached `RetryPolicy` (3 attempts) exists for.
         let (send, _calls) = mock_send(vec!["DONE: added the flag", "not json"]);
         let step = sdd_step(send);
         let mut ctx = WorkflowContext::new(Default::default(), one_task_data());
-        let result = step
+        let err = step
             .executor
             .execute(&mut ctx)
             .await
-            .expect("returns Ok(Failure), not Err");
-        assert!(matches!(result, StepResult::Failure));
+            .expect_err("malformed judge reply must surface as Err to be retried");
+        assert!(matches!(err, WorkflowError::StepFailed { .. }));
     }
 
     #[tokio::test]
