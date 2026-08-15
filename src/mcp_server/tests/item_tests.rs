@@ -845,6 +845,41 @@ fn item_update_rejects_self_parent_cycles_and_unknown_parents() {
     }
 }
 
+/// `create`'s `parent_id` must resolve a sequence_id the same way `update`'s
+/// does (#375/#377) — otherwise it reaches the INSERT's FK column raw and
+/// fails as an opaque "FOREIGN KEY constraint failed" instead of naming the
+/// bad id.
+#[test]
+fn item_create_resolves_parent_id_sequence_id_and_rejects_unknown() {
+    let (_tmp, s) = harness();
+    let epic: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Epic"))).unwrap()).unwrap();
+    let epic_id = epic["id"].as_str().unwrap().to_string();
+    let epic_seq = epic["sequence_id"].as_i64().unwrap();
+
+    let child: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("Child".into()),
+            parent_id: Some(format!("#{epic_seq}")),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(child["parent_id"], serde_json::json!(epic_id));
+
+    let err = s
+        .item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("Orphan".into()),
+            parent_id: Some("9999".into()),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
 #[test]
 fn item_groom_reads_size_and_flags_unestimated() {
     let (_tmp, s) = harness();

@@ -341,13 +341,22 @@ impl AgentflareMcp {
                         .id
                 }
             };
+            // A sequence_id or `#`-prefixed id must resolve the same way
+            // `update`'s parent_id does (#375/#377) — otherwise it reaches
+            // the INSERT's FK column raw and fails as an opaque "FOREIGN
+            // KEY constraint failed" instead of naming the bad id.
+            let parent_id = match req.parent_id.as_deref() {
+                None => None,
+                Some(p) if p.trim().is_empty() => None,
+                Some(p) => Some(self.resolve_existing_item_id(conn, p)?),
+            };
             let input = agentflare_backend::item::CreateItem {
                 project_id: project.id,
                 state_id,
                 name,
                 description: req.description,
                 priority: req.priority,
-                parent_id: req.parent_id,
+                parent_id,
                 assignee_agent: req.assignee_agent,
                 sort_order: None,
                 external_source: None,
