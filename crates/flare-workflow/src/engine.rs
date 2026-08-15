@@ -1272,6 +1272,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         self.state_store.load(run_id).await
     }
 
+    /// Aggregate instance/step metrics over runs matching `filter`.
+    pub async fn metrics(&self, filter: MetricsFilter) -> WorkflowResult<WorkflowMetrics> {
+        self.state_store.workflow_metrics(filter).await
+    }
+
     /// Wait for a workflow to complete with adaptive polling.
     pub async fn wait_for_completion(
         &self,

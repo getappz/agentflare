@@ -170,7 +170,7 @@ pub enum BackoffStrategy {
 }
 
 /// Workflow execution status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowStatus {
     Pending,
@@ -182,7 +182,7 @@ pub enum WorkflowStatus {
 }
 
 /// Step execution status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
     Pending,
@@ -488,3 +488,32 @@ pub enum WorkflowError {
 }
 
 pub type WorkflowResult<T> = Result<T, WorkflowError>;
+
+/// Filter for `StateStore::workflow_metrics`. All fields are conjunctive
+/// (AND'd together); `None` means "don't filter on this dimension".
+#[derive(Debug, Clone, Default)]
+pub struct MetricsFilter {
+    pub workflow_id: Option<WorkflowId>,
+    pub status: Option<WorkflowStatus>,
+    pub since: Option<DateTime<Utc>>,
+}
+
+/// Per-step aggregate metrics within a `WorkflowMetrics` breakdown.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StepMetrics {
+    pub counts_by_status: HashMap<StepStatus, u64>,
+    pub avg_duration_ms: Option<f64>,
+}
+
+/// Aggregate instance and step metrics, mirroring Cloudflare Workflows'
+/// metrics-analytics shape (instance counts by status, per-step
+/// duration/token outcome), computed via SQL aggregation over data the
+/// engine already records — see `StateStore::workflow_metrics`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkflowMetrics {
+    pub counts_by_status: HashMap<WorkflowStatus, u64>,
+    pub avg_duration_ms: Option<f64>,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub step_breakdown: HashMap<StepId, StepMetrics>,
+}
