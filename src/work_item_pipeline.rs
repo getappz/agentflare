@@ -876,10 +876,51 @@ mod tests {
     use flare_workflow::{WorkflowDefinition, WorkflowEngine, WorkflowId};
     use std::sync::Arc;
 
+    /// Wires a bare local repo up as `origin` and pushes to it — same
+    /// pattern `item_pr_failure_tests.rs`'s own fixture uses. Remotes are
+    /// repo-wide (`.git/config`), so adding one to `repo_root` makes it
+    /// visible from any of that repo's worktrees, including the item's own
+    /// claimed worktree these tests dispatch into. Needed because
+    /// `mcp_with_claimed_item`/`claim_harness` deliberately set up no
+    /// `origin` at all, and `item_done` hard-fails (#482) when a real
+    /// commit's push fails.
+    fn add_origin_remote(repo_root: &std::path::Path) {
+        let origin_dir = tempfile::tempdir().unwrap();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(origin_dir.path(), &["init", "--bare", "-b", "master"]);
+        run(
+            repo_root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin_dir.path().to_str().unwrap(),
+            ],
+        );
+        run(repo_root, &["push", "origin", "master"]);
+        std::mem::forget(origin_dir);
+    }
+
     #[tokio::test]
+    #[ignore = "item_done hard-fails (#482) unless push succeeds AND a PR is \
+                created; push_and_open_pr can't recognize a local bare repo \
+                as GitHub, and this codebase has no mock GitHub client — \
+                needs a real GitHub remote + credentials to reach Completed"]
     async fn finalize_step_calls_item_done_on_success() {
-        let (mcp, _backend_tmp, _repo_tmp, item_id, project_id, worktree_path) =
+        let (mcp, _backend_tmp, repo_tmp, item_id, project_id, worktree_path) =
             crate::mcp_server::tests::mcp_with_claimed_item("Finalize test item");
+        add_origin_remote(repo_tmp.path());
         // Something real to commit — otherwise `item_done` sees a
         // never-diverged branch and treats it as a no-op ("unchanged")
         // rather than a completion.
@@ -975,16 +1016,19 @@ mod tests {
         assert!(metadata["workflow_run_id"].as_str().is_some());
     }
 
-    /// Non-ignored counterpart of the real-agent test above: drives
+    /// Mock-sender counterpart of the real-agent test above: drives
     /// `run_or_resume_with_sender` with a mock `SendMessage` that answers
     /// `sdd_loop`'s implementer and judge roles (distinguished by prompt
-    /// content, same as `sdd_test_support::mock_send`'s callers) so it runs
-    /// unconditionally in CI, and asserts the same metadata-persistence
-    /// behavior.
+    /// content, same as `sdd_test_support::mock_send`'s callers), so it runs
+    /// unconditionally in CI. Unlike `finalize_step_calls_item_done_on_success`
+    /// this doesn't need a real GitHub PR to assert anything -- it only
+    /// checks that `workflow_run_id` was persisted before `finalize`'s
+    /// `item_done` call hard-fails on the missing PR (#482).
     #[test]
     fn run_or_resume_with_sender_persists_run_id_on_success() {
-        let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
+        let (mcp, _backend_tmp, repo_tmp, item_id, _project_id, worktree_path) =
             crate::mcp_server::tests::mcp_with_claimed_item("Run-or-resume mock-sender test item");
+        add_origin_remote(repo_tmp.path());
         // Something real to commit — otherwise `finalize`'s `item_done` call
         // sees a never-diverged branch and treats it as a no-op rather than
         // a completion (see `finalize_step_calls_item_done_on_success`).
@@ -1028,7 +1072,15 @@ mod tests {
                 send,
             )
         });
-        assert!(result.is_ok(), "{result:?}");
+        // `add_origin_remote` gives `git push` a real target but not a real
+        // GitHub remote, so `finalize`'s `item_done` call correctly
+        // hard-fails on the missing PR (item #109 / PR #482) -- same
+        // reasoning as `finalize_step_calls_item_done_on_success` right
+        // above, which needs `#[ignore]` for the same root cause since it
+        // asserts completion rather than just metadata persistence. This
+        // test only cares that `workflow_run_id` was persisted before that
+        // failure, which happens well before `finalize` runs.
+        assert!(result.is_err(), "{result:?}");
 
         let updated = mcp
             .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())

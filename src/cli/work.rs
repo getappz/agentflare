@@ -1293,6 +1293,46 @@ use  = "opencode"
         run(&["commit", "--allow-empty", "-m", "initial"]);
     }
 
+    /// Same as [`init_test_repo`], plus a bare local repo wired up as
+    /// `origin` and pushed to -- same pattern
+    /// `item_pr_failure_tests.rs::item_done_reports_a_hard_error_when_push_succeeds_but_no_pr_results`
+    /// already uses. Needed by any test that runs a real dispatch through
+    /// to `finalize`'s `item_done` call: `item_done` hard-fails (#482) when
+    /// a real commit's push fails, and a plain `init_test_repo` repo has no
+    /// `origin` at all, so `push_branch` fails with "does not appear to be
+    /// a git repository" rather than the soft-failable "not a GitHub
+    /// remote" case `item_pr_failure_tests.rs` covers.
+    fn init_test_repo_with_origin(root: &std::path::Path) {
+        init_test_repo(root);
+        let origin_dir = tempfile::tempdir().unwrap();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(origin_dir.path(), &["init", "--bare", "-b", "master"]);
+        run(
+            root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin_dir.path().to_str().unwrap(),
+            ],
+        );
+        run(root, &["push", "origin", "master"]);
+        // Leak the tempdir: it must outlive the test's git operations
+        // against it, and the OS reclaims /tmp on its own.
+        std::mem::forget(origin_dir);
+    }
+
     #[test]
     fn claim_then_headless_not_found_releases_claim_and_posts_error_comment() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1421,23 +1461,36 @@ use  = "opencode"
     }
 
     #[test]
-    fn execute_work_runs_through_the_pipeline_and_reports_success() {
+    fn execute_work_runs_through_the_pipeline_but_hard_errors_without_a_github_remote() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
-        init_test_repo(&repo_root);
+        // A local bare "origin" so `git push` itself succeeds -- same
+        // fixture shape as item_pr_failure_tests.rs. It's still not a
+        // GitHub remote, so `push_and_open_pr` can't resolve a repo to
+        // open a PR against; that's the known, deliberately-tested
+        // soft-fail path (item #109 / PR #482), not this test's concern.
+        init_test_repo_with_origin(&repo_root);
 
         crate::paths::test_support::with_temp_home(|| {
             let (seed_mcp, item, outcome) = run_dispatch_fixture(&repo_root);
-            assert_eq!(outcome.exit_code, 0);
+            // The pipeline itself (coder -> review -> finalize) ran through
+            // successfully and a real commit landed -- but `origin` here is
+            // a local bare repo, not a real GitHub remote, so finalize's
+            // push/PR step correctly soft-fails to open a PR and reports a
+            // hard error (item #109 / PR #482) rather than false-completing
+            // a claim whose work was never actually published.
+            assert_eq!(outcome.exit_code, 1);
 
             let comments = seed_mcp
                 .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
                 .unwrap()
                 .unwrap();
             assert!(
-                comments.iter().any(|c| c.body.contains("complete")),
-                "expected a completion comment, got: {comments:?}"
+                comments
+                    .iter()
+                    .any(|c| c.body.contains("PR creation failed")),
+                "expected a PR-creation-failed comment, got: {comments:?}"
             );
         });
     }
@@ -1446,17 +1499,21 @@ use  = "opencode"
     /// persists `workflow_run_id` onto the item's metadata before polling
     /// for completion (see `work_item_pipeline::persist_run_id`) — exercises
     /// that persistence through the real `execute_work_impl` call site with
-    /// the new `item_description`/`plan_doc` params.
+    /// the new `item_description`/`plan_doc` params. `persist_run_id` runs
+    /// at dispatch time, well before `finalize`'s push/PR step, so the
+    /// metadata write survives even though this fixture's `origin` (a local
+    /// bare repo, not a real GitHub remote) makes `finalize` hard-error the
+    /// same way the sibling test above does (item #109 / PR #482).
     #[test]
     fn execute_work_persists_workflow_run_id_on_dispatch() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
-        init_test_repo(&repo_root);
+        init_test_repo_with_origin(&repo_root);
 
         crate::paths::test_support::with_temp_home(|| {
             let (seed_mcp, item, outcome) = run_dispatch_fixture(&repo_root);
-            assert_eq!(outcome.exit_code, 0);
+            assert_eq!(outcome.exit_code, 1);
 
             let updated_item = seed_mcp
                 .with_backend_db(|conn| agentflare_backend::item::get(conn, &item.id).ok())
