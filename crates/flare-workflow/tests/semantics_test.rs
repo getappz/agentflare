@@ -1,5 +1,5 @@
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flare_workflow::engine::WorkflowEngine;
@@ -324,8 +324,7 @@ async fn crash_mid_loop_then_recover_resumes_from_last_iteration() {
 
     let run;
     {
-        let engine =
-            WorkflowEngine::<Ctx, _>::with_store(SqliteStore::open_file(&path).unwrap());
+        let engine = WorkflowEngine::<Ctx, _>::with_store(SqliteStore::open_file(&path).unwrap());
         let wf_crash = WorkflowDefinition::new("wf", "wf").add_step(loop_step(
             Arc::clone(&pre_crash_log),
             Arc::clone(&hang_started),
