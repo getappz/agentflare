@@ -335,6 +335,33 @@ fn create_worktree_creates_worktree_and_branch() {
     assert!(worktree_path.exists());
 }
 
+/// item #123: two items claimed in the same daemon dispatch batch call
+/// `create_worktree` against the same `repo_root` at essentially the same
+/// instant. `git worktree add` takes its own lock on `.git/config`/
+/// `.git/worktrees` admin state, so without in-process serialization the
+/// loser used to fail outright with no retry ("could not lock config
+/// file"). Both must now succeed.
+#[test]
+fn create_worktree_handles_concurrent_calls_against_the_same_repo() {
+    let repo = init_repo();
+    let target = resolve_default_branch(&repo.path);
+    let item_a = test_item(1);
+    let item_b = test_item(2);
+
+    let handle = {
+        let repo_path = repo.path.clone();
+        let target = target.clone();
+        std::thread::spawn(move || create_worktree(&item_a, &repo_path, &target, None))
+    };
+    let result_b = create_worktree(&item_b, &repo.path, &target, None);
+    let result_a = handle.join().unwrap();
+
+    assert!(result_a.is_ok(), "item a failed: {result_a:?}");
+    assert!(result_b.is_ok(), "item b failed: {result_b:?}");
+    assert!(result_a.unwrap().exists());
+    assert!(result_b.unwrap().exists());
+}
+
 #[test]
 fn cleanup_item_worktree_removes_a_clean_one() {
     let repo = init_repo();

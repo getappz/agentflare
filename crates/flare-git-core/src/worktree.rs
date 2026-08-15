@@ -25,6 +25,11 @@ pub trait Progress {
     fn send(&self, progress: f64, total: Option<f64>, message: Option<String>);
 }
 
+/// Serializes `git worktree add` invocations against `.git/config`/
+/// `.git/worktrees` admin state -- see the comment at its use site in
+/// `create_worktree` below.
+static WORKTREE_ADD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn resolve_target_branch(conn: &rusqlite::Connection, item: &Item, repo_root: &Path) -> String {
     if let Some(ref parent_id) = item.parent_id
         && let Ok(parent) = agentflare_backend::item::get(conn, parent_id)
@@ -469,7 +474,20 @@ pub fn create_worktree(
         ]
     };
     let arg_refs: Vec<&str> = worktree_add_args.iter().map(String::as_str).collect();
-    match run_git_in(repo_root, &arg_refs) {
+    // `git worktree add` takes its own lock on `.git/config`/`.git/worktrees`
+    // admin state; two calls against the same repo at the same instant race
+    // on that lock and the loser fails outright with no retry ("could not
+    // lock config file .git/config: File exists"). Serialize in-process so
+    // concurrent claims from the same daemon (e.g. two items dispatched in
+    // the same supervisor tick) queue instead of racing. Deliberately a
+    // separate lock from `with_backend_db`'s -- this is a subprocess call,
+    // not DB access, and item.rs already runs it outside that lock on
+    // purpose.
+    let git_result = {
+        let _guard = WORKTREE_ADD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        run_git_in(repo_root, &arg_refs)
+    };
+    match git_result {
         Ok(_) => {
             if let Some(p) = progress {
                 p.send(1.0, Some(1.0), Some("Worktree created".into()));
