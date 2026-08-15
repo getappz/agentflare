@@ -750,6 +750,144 @@ fn item_update_sets_metadata() {
     );
 }
 
+/// #377: `parent_id` on update was accepted and silently discarded — the
+/// response even echoed the *old* parent, so only a diff of the returned body
+/// against what was sent could catch it.
+#[test]
+fn item_update_persists_parent_id_and_accepts_a_sequence_id() {
+    let (_tmp, s) = harness();
+    let update_parent = |id: &str, parent: &str| -> serde_json::Value {
+        serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                action: "update".into(),
+                id: Some(id.to_string()),
+                parent_id: Some(parent.to_string()),
+                ..Default::default()
+            }))
+            .unwrap_or_else(|e| panic!("update parent_id={parent:?} failed: {e:?}")),
+        )
+        .unwrap()
+    };
+    let epic: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Epic"))).unwrap()).unwrap();
+    let child: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Child"))).unwrap()).unwrap();
+    let epic_id = epic["id"].as_str().unwrap().to_string();
+    let epic_seq = epic["sequence_id"].as_i64().unwrap();
+    let child_id = child["id"].as_str().unwrap().to_string();
+
+    // By UUID, then re-read to prove it is the row that changed, not just
+    // the response body.
+    let updated = update_parent(&child_id, &epic_id);
+    assert_eq!(updated["parent_id"], serde_json::json!(epic_id));
+    let fetched: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "get".into(),
+            id: Some(child_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fetched["parent_id"], serde_json::json!(epic_id));
+
+    // A sequence_id names the same parent.
+    update_parent(&child_id, "");
+    let by_seq = update_parent(&child_id, &format!("#{epic_seq}"));
+    assert_eq!(by_seq["parent_id"], serde_json::json!(epic_id));
+
+    // An empty string detaches; an omitted parent_id leaves it alone.
+    let renamed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "update".into(),
+            id: Some(child_id.clone()),
+            name: Some("Child renamed".into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(renamed["parent_id"], serde_json::json!(epic_id));
+    assert_eq!(
+        update_parent(&child_id, "")["parent_id"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn item_update_rejects_self_parent_cycles_and_unknown_parents() {
+    let (_tmp, s) = harness();
+    let epic: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Epic"))).unwrap()).unwrap();
+    let child: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Child"))).unwrap()).unwrap();
+    let epic_id = epic["id"].as_str().unwrap().to_string();
+    let child_id = child["id"].as_str().unwrap().to_string();
+    s.item(Parameters(ItemRequest {
+        action: "update".into(),
+        id: Some(child_id.clone()),
+        parent_id: Some(epic_id.clone()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    for (id, parent) in [
+        (&child_id, &child_id),           // self-parent
+        (&epic_id, &child_id),            // cycle: epic -> child -> epic
+        (&child_id, &"9999".to_string()), // unknown sequence_id
+        (&child_id, &"nope-uuid".to_string()),
+    ] {
+        let err = s
+            .item(Parameters(ItemRequest {
+                action: "update".into(),
+                id: Some(id.clone()),
+                parent_id: Some(parent.clone()),
+                ..Default::default()
+            }))
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "parent_id {parent:?} should be rejected"
+        );
+    }
+}
+
+/// `create`'s `parent_id` must resolve a sequence_id the same way `update`'s
+/// does (#375/#377) — otherwise it reaches the INSERT's FK column raw and
+/// fails as an opaque "FOREIGN KEY constraint failed" instead of naming the
+/// bad id.
+#[test]
+fn item_create_resolves_parent_id_sequence_id_and_rejects_unknown() {
+    let (_tmp, s) = harness();
+    let epic: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Epic"))).unwrap()).unwrap();
+    let epic_id = epic["id"].as_str().unwrap().to_string();
+    let epic_seq = epic["sequence_id"].as_i64().unwrap();
+
+    let child: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("Child".into()),
+            parent_id: Some(format!("#{epic_seq}")),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(child["parent_id"], serde_json::json!(epic_id));
+
+    let err = s
+        .item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("Orphan".into()),
+            parent_id: Some("9999".into()),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
 #[test]
 fn item_groom_reads_size_and_flags_unestimated() {
     let (_tmp, s) = harness();
