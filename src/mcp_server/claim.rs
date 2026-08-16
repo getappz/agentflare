@@ -13,6 +13,42 @@ impl AgentflareMcp {
         }
     }
 
+    /// Confirms `owner` can act on `(repo, target)` before a `release`/`done`
+    /// call, steals the lease if it's abandoned (stale or never claimed), and
+    /// errors loudly if someone else's live claim is in the way — the same
+    /// fix `item_release`/`item_done` already apply to the `item_claims`
+    /// ledger (item #83), applied here to this tool's own `claims` ledger.
+    /// Without this, a claim whose owner doesn't match the caller's current
+    /// `owner_id()` (e.g. because it was created by a different process/
+    /// session — see `claims::owner_id`'s doc comment) left `release`/`done`
+    /// silently returning `false` with no way to tell "nothing to release"
+    /// apart from "someone else is actively using this", and no path to
+    /// actually let go of a claim attributed to the caller but not created
+    /// by the caller's own session.
+    fn claim_confirm_or_steal(
+        conn: &rusqlite::Connection,
+        repo: &str,
+        target: &str,
+        owner: &str,
+        now: i64,
+        ttl: i64,
+    ) -> Result<(), ErrorData> {
+        if let crate::claims::Acquire::Held {
+            owner: holder,
+            age_secs,
+        } = crate::claims::acquire(conn, repo, target, owner, None, None, now, ttl)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "target '{target}' in repo '{repo}' is claimed by '{holder}' (active {age_secs}s ago, ttl {ttl}s) -- refusing to release someone else's live claim"
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
     pub fn claim_impl(&self, req: ClaimRequest) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "acquire" => {
@@ -88,6 +124,9 @@ impl AgentflareMcp {
                 let target = self.resolve_claim_target(&target)?;
                 let (conn, repo) = Self::claim_ctx(&target, req.repo)?;
                 let owner = crate::claims::owner_id();
+                let now = crate::claims::now();
+                let ttl = crate::claims::ttl_secs();
+                Self::claim_confirm_or_steal(&conn, &repo, &target, &owner, now, ttl)?;
                 let ok = crate::claims::release(&conn, &repo, &target, &owner)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(
@@ -102,7 +141,10 @@ impl AgentflareMcp {
                 let target = self.resolve_claim_target(&target)?;
                 let (conn, repo) = Self::claim_ctx(&target, req.repo)?;
                 let owner = crate::claims::owner_id();
-                let ok = crate::claims::done(&conn, &repo, &target, &owner, crate::claims::now())
+                let now = crate::claims::now();
+                let ttl = crate::claims::ttl_secs();
+                Self::claim_confirm_or_steal(&conn, &repo, &target, &owner, now, ttl)?;
+                let ok = crate::claims::done(&conn, &repo, &target, &owner, now)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(serde_json::json!({ "done": ok, "repo": repo, "target": target }).to_string())
             }

@@ -66,6 +66,15 @@ const ALLOW_CANONICAL_MUTATE_ENV: &str = "AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE"
 /// caller-supplied override.
 const ESCAPE_HATCH_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree"];
 
+/// Subcommands let through even with an `ESCAPE_HATCH_FLAGS` override
+/// present -- read-only, can't mutate anything this shim's policy exists to
+/// protect, so there's nothing to classify against the (unresolvable) target
+/// repo in the first place. A `git -C <path> log`/`status`/`diff`/`show` is
+/// exec'd straight to real git, same as it would be with no `-C` at all;
+/// anything else (including a subcommand this list doesn't recognize) still
+/// falls through to the deny below.
+const READ_ONLY_ESCAPE_SUBCOMMANDS: &[&str] = &["log", "status", "diff", "show"];
+
 /// Global flags that consume the following argument as their value, so
 /// subcommand detection can skip past both tokens.
 const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
@@ -207,20 +216,35 @@ fn scope_check_deny_reason(subcommand: &str) -> Option<String> {
         Ok(o) => o,
         Err(e) => {
             return Some(format!(
-                "scope-check could not run ('agentflare' on PATH?): {e}"
+                "scope-check FAILED TO RUN, not a policy denial ('agentflare' on PATH?): {e} -- \
+                 failing closed per this feature's spec; set AGENTFLARE_GIT_BYPASS=1 to get \
+                 unblocked while you diagnose, or to confirm this is the cause"
             ));
         }
     };
     if !output.status.success() {
         return Some(format!(
-            "scope-check exited non-zero: {}",
+            "scope-check CRASHED (exit {}), not a policy denial -- the `agentflare git \
+             scope-check` subprocess itself failed to run to completion: {}. Failing closed per \
+             this feature's spec; set AGENTFLARE_GIT_BYPASS=1 to get unblocked while you \
+             diagnose, or to confirm this is the cause",
+            output
+                .status
+                .code()
+                .map_or_else(|| "unknown".to_string(), |c| c.to_string()),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let result: ScopeCheckResult = match serde_json::from_str(stdout.trim()) {
         Ok(r) => r,
-        Err(e) => return Some(format!("scope-check returned unparseable output: {e}")),
+        Err(e) => {
+            return Some(format!(
+                "scope-check returned unparseable output, not a policy denial: {e} -- failing \
+                 closed per this feature's spec; set AGENTFLARE_GIT_BYPASS=1 to get unblocked \
+                 while you diagnose, or to confirm this is the cause"
+            ));
+        }
     };
     if result.deny {
         Some(
@@ -332,8 +356,15 @@ fn main() {
     let (subcommand_idx, escape_hatch) = parse_global_flags(&str_args);
 
     if escape_hatch {
+        let is_read_only = subcommand_idx
+            .map(|idx| str_args[idx].as_str())
+            .is_some_and(|sc| READ_ONLY_ESCAPE_SUBCOMMANDS.contains(&sc));
+        if is_read_only {
+            exec_real(&tool, filtered_path.as_ref(), &args);
+        }
         eprintln!(
-            "agentflare git shim: denied — this invocation uses -C/--git-dir/--work-tree to target a different repository, which this shim cannot classify safely."
+            "agentflare git shim: denied — this invocation uses -C/--git-dir/--work-tree to target a different repository, which this shim cannot classify safely (read-only subcommands -- {} -- are let through; anything else is not).",
+            READ_ONLY_ESCAPE_SUBCOMMANDS.join(", ")
         );
         exit(1);
     }

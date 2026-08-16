@@ -152,13 +152,34 @@ fn unrecognized_subcommand_passes_through_to_real_git() {
 }
 
 #[test]
-fn escape_hatch_flags_are_denied() {
+fn escape_hatch_flags_are_denied_for_mutating_subcommands() {
     let repo = init_repo();
     let home = tempfile::TempDir::new().unwrap();
-    let out = shim(repo.path(), home.path(), &["-C", "/tmp", "status"]);
+    let out = shim(
+        repo.path(),
+        home.path(),
+        &["-C", "/tmp", "commit", "-m", "x"],
+    );
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("denied"), "{stderr}");
+}
+
+#[test]
+fn escape_hatch_flags_are_allowed_for_read_only_subcommands() {
+    // A read-only `git -C <path> log`/`status`/`diff`/`show` can't mutate
+    // anything this shim's policy protects, so it passes straight through
+    // instead of being denied outright for "cannot classify safely".
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let out = shim(
+        repo.path(),
+        home.path(),
+        &["-C", repo.path().to_str().unwrap(), "log", "-1"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("denied"), "{stderr}");
 }
 
 #[test]
