@@ -1064,7 +1064,7 @@ pub(crate) struct SearchRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WorkflowRequest {
-    #[schemars(description = "Action: run|status|complete_event|list|list_definitions")]
+    #[schemars(description = "Action: run|status|complete_event|list|list_definitions|metrics")]
     pub(crate) action: String,
     #[schemars(
         description = "JSON workflow definition (run) — OpenFang-style {name, steps}. Alternative to workflow_name."
@@ -1098,4 +1098,17 @@ pub(crate) struct WorkflowRequest {
     )]
     #[serde(default)]
     pub(crate) db_path: Option<String>,
+    #[schemars(description = "Filter: only this workflow definition's runs (metrics, optional)")]
+    #[serde(default)]
+    pub(crate) workflow_id: Option<String>,
+    #[schemars(
+        description = "Filter: only runs in this status — pending|running|paused|completed|failed|cancelled (metrics, optional)"
+    )]
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[schemars(
+        description = "Filter: only runs created at or after this RFC 3339 timestamp (metrics, optional)"
+    )]
+    #[serde(default)]
+    pub(crate) since: Option<String>,
 }
