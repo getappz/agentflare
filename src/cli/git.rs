@@ -875,19 +875,23 @@ fn run_scope_check(subcommand: &str) -> ScopeCheckResult {
     let (own_target, others) = partition_claims_by_owner(&live, &owner);
 
     let in_worktree = branch::is_linked_worktree(&repo_root);
-    // Only compute changed paths when the verdict actually depends on them:
-    // an out-of-tree invoker is denied regardless of paths, and with no
-    // enforceable other-claim scope nothing can overlap. This is also the
-    // memory fix for the scope-check child-process OOM (item #472): `git
-    // diff <default>...<head> --name-only` on a branch that diverged hugely
-    // from the default branch lists the whole tree as a multi-MB pathset,
-    // which previously crashed the child on a memory-constrained environment
-    // and surfaced to the shim as a fake policy denial.
+    // Only skip computing changed paths when nothing downstream depends on
+    // them: with no enforceable other-claim scope, nothing can overlap. An
+    // out-of-tree invoker must still get a *non-empty* pathset here --
+    // `classify_scopes` only reaches its `OutOfTree` check past its
+    // `changed_paths.is_empty() -> Clear` short-circuit, so skipping the
+    // diff for `out_of_tree` would silently turn a real OutOfTree denial
+    // into a pass. This is also the memory fix for the scope-check
+    // child-process OOM (item #472): `git diff <default>...<head>
+    // --name-only` on a branch that diverged hugely from the default branch
+    // lists the whole tree as a multi-MB pathset, which previously crashed
+    // the child on a memory-constrained environment and surfaced to the
+    // shim as a fake policy denial.
     let out_of_tree = own_target.is_some() && !in_worktree;
     let has_enforced_others = others
         .iter()
         .any(|c| !scope::scope_is_wildcard_or_empty(&c.scopes));
-    let changed = if out_of_tree || !has_enforced_others {
+    let changed = if !out_of_tree && !has_enforced_others {
         Vec::new()
     } else {
         match changed_paths(&repo_root, subcommand) {

@@ -263,13 +263,16 @@ fn interpret_scope_check(
 /// checked earlier in `main`) remain the escape hatch for a persistently
 /// broken `agentflare` binary, same as any other misclassification.
 fn scope_check_outcome(subcommand: &str) -> ScopeCheckOutcome {
-    // Test-only override for the scope-check binary, honored only alongside
+    // Test-only override for the scope-check binary, compiled out of release
+    // builds entirely (so the override can never exist in a shipped binary,
+    // regardless of env vars) and, in debug builds, honored only alongside
     // `AGENTFLARE_HOME_OVERRIDE` (which is itself the test-mode marker this
     // crate's tests set to keep the audit log out of the real home
     // directory) so a stray env var can never silently redirect production
     // scope-checks at an arbitrary binary. The integration tests use it to
     // point the check at this shim binary itself, producing a genuine
     // "child died without a verdict" crash.
+    #[cfg(debug_assertions)]
     let bin = match (
         env::var("AGENTFLARE_GIT_SCOPE_CHECK_BIN"),
         env::var_os("AGENTFLARE_HOME_OVERRIDE"),
@@ -277,6 +280,8 @@ fn scope_check_outcome(subcommand: &str) -> ScopeCheckOutcome {
         (Ok(b), Some(_)) if !b.is_empty() => b,
         _ => "agentflare".to_string(),
     };
+    #[cfg(not(debug_assertions))]
+    let bin = "agentflare".to_string();
     let mut cmd = std::process::Command::new(&bin);
     cmd.args(["git", "scope-check", "--subcommand", subcommand]);
     // Runs on every git invocation through this shim; without this flag,
