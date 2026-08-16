@@ -102,7 +102,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             let mut backoff = Backoff::from_strategy(&retry_policy.backoff);
             let mut retry_attempt = 1;
             let result = loop {
-                let attempt_result = timeout(step_timeout, step.executor.execute(&mut context)).await;
+                let attempt_result =
+                    timeout(step_timeout, step.executor.execute(&mut context)).await;
                 let is_failure = matches!(
                     attempt_result,
                     Ok(Ok(StepResult::Failure)) | Ok(Err(_)) | Err(_)
