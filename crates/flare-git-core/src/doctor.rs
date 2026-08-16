@@ -291,6 +291,14 @@ pub fn reclaim_scoped(
         {
             continue;
         }
+        // A lane with no flags at all is healthy -- nothing to reclaim.
+        // Without this, `lane.flags.iter().all(..)` below is vacuously true
+        // on an empty iterator, so a perfectly clean lane would pass the
+        // "is_safe" check and get deleted just for being named as `target`,
+        // even with `force=false`.
+        if lane.flags.is_empty() {
+            continue;
+        }
         let has_dirty = lane.flags.iter().any(|f| matches!(f, HealthFlag::Dirty));
         if has_dirty && !force {
             continue;
@@ -839,5 +847,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn targeting_a_healthy_worktree_does_not_reclaim_it() {
+        // CodeRabbit finding on PR #515: `lane.flags.iter().all(..)` is
+        // vacuously true for a lane with no flags at all, so a perfectly
+        // healthy worktree named as `target` was reclaim-eligible even with
+        // `force=false` -- naming a lane was, by itself, enough to delete it.
+        // Built by hand rather than via `scan()`: a real linked worktree in
+        // a local-only test repo always picks up `MissingUpstream` (no
+        // remote configured), so it can never actually reach zero flags
+        // through `scan()` -- this constructs the exact zero-flag case
+        // directly instead.
+        let repo = crate::shell::test_support::init_repo_with_branch("main");
+        let healthy_path = repo.path.join(".worktrees").join("healthy");
+        std::fs::create_dir_all(&healthy_path).unwrap();
+        std::fs::write(healthy_path.join("marker.txt"), "still here\n").unwrap();
+
+        let report = DoctorReport {
+            lanes: vec![
+                LaneHealth {
+                    name: "main".to_string(),
+                    path: repo.path.to_string_lossy().to_string(),
+                    sequence_id: None,
+                    flags: vec![],
+                    is_main_worktree: true,
+                },
+                LaneHealth {
+                    name: "healthy".to_string(),
+                    path: healthy_path.to_string_lossy().to_string(),
+                    sequence_id: None,
+                    flags: vec![],
+                    is_main_worktree: false,
+                },
+            ],
+            violations: vec![],
+            summary: Summary {
+                total: 2,
+                flagged: 0,
+                dirty: 0,
+                stale: 0,
+                missing_worktree: 0,
+                duplicate_branch: 0,
+                missing_upstream: 0,
+                orphaned: 0,
+                zombie: 0,
+                clean: 2,
+            },
+        };
+
+        let reclaimed = reclaim_scoped(&repo.path, &report, true, Some("healthy"));
+
+        assert!(
+            reclaimed.is_empty(),
+            "a healthy lane must never be reclaimed just for being targeted"
+        );
+        assert!(healthy_path.exists(), "healthy worktree must survive");
     }
 }
