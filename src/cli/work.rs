@@ -375,6 +375,25 @@ fn resolve_agent(
     Ok((decision.agent, decision.reason, fallback_agent))
 }
 
+/// Combines `resolve_agent`'s router-derived fallback candidate with the
+/// live usage-threshold check into the agent actually used for the
+/// implementer role. `over_threshold` is only invoked when a fallback
+/// exists and the primary decision is claude-code — see
+/// `pick_implementer_agent_does_not_call_over_threshold_when_no_fallback_exists`
+/// for why that short-circuit matters.
+fn pick_implementer_agent(
+    agent: agent_registry::Agent,
+    fallback_agent: Option<agent_registry::Agent>,
+    over_threshold: impl FnOnce() -> bool,
+) -> agent_registry::Agent {
+    match fallback_agent {
+        Some(fallback) if agent == agent_registry::Agent::ClaudeCode && over_threshold() => {
+            fallback
+        }
+        _ => agent,
+    }
+}
+
 /// Best-effort backstop that releases `execute_work`'s claim on drop unless
 /// disarmed — item #94 exited its job cleanly (`agent_jobs.state='exited'`)
 /// while its claim stayed `claimed` forever, because the only release
@@ -779,7 +798,7 @@ fn execute_work_impl(
     } else {
         (Vec::new(), agent_registry::RouterConfig::default())
     };
-    let (agent_enum, route_reason, _fallback_agent) = match resolve_agent(
+    let (agent_enum, route_reason, fallback_agent) = match resolve_agent(
         args.agent.as_deref(),
         &item_detail,
         &labels,
@@ -793,6 +812,11 @@ fn execute_work_impl(
             return 1.into();
         }
     };
+    let implementer_agent = pick_implementer_agent(
+        agent_enum,
+        fallback_agent,
+        crate::claude_usage::claude_over_threshold,
+    );
     if headless_args(agent_enum).is_none() {
         let msg = format!("agent {} has no headless print mode", agent_enum.as_str());
         release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
@@ -834,7 +858,7 @@ fn execute_work_impl(
     let result = run_pipeline(
         mcp.clone(),
         &item_detail,
-        agent_enum,
+        implementer_agent,
         agent_enum,
         item_description,
         plan_doc,
@@ -1290,6 +1314,61 @@ use  = "opencode"
         .unwrap();
         assert_eq!(agent, agent_registry::Agent::Opencode);
         assert_eq!(fallback, None);
+    }
+
+    #[test]
+    fn pick_implementer_agent_falls_back_when_over_threshold() {
+        let agent = pick_implementer_agent(
+            agent_registry::Agent::ClaudeCode,
+            Some(agent_registry::Agent::Opencode),
+            || true,
+        );
+        assert_eq!(agent, agent_registry::Agent::Opencode);
+    }
+
+    #[test]
+    fn pick_implementer_agent_stays_on_claude_code_when_under_threshold() {
+        let agent = pick_implementer_agent(
+            agent_registry::Agent::ClaudeCode,
+            Some(agent_registry::Agent::Opencode),
+            || false,
+        );
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+    }
+
+    #[test]
+    fn pick_implementer_agent_stays_on_claude_code_when_no_fallback_available() {
+        let agent = pick_implementer_agent(agent_registry::Agent::ClaudeCode, None, || true);
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+    }
+
+    #[test]
+    fn pick_implementer_agent_never_touches_a_non_claude_code_primary() {
+        let agent = pick_implementer_agent(
+            agent_registry::Agent::Opencode,
+            Some(agent_registry::Agent::Codex),
+            || true,
+        );
+        assert_eq!(
+            agent,
+            agent_registry::Agent::Opencode,
+            "usage-fallback only ever applies when the primary decision is claude-code"
+        );
+    }
+
+    #[test]
+    fn pick_implementer_agent_does_not_call_over_threshold_when_no_fallback_exists() {
+        // Short-circuit check: with no fallback candidate, `over_threshold`
+        // must never run — this is what keeps the usage endpoint off the hot
+        // path for items that route to a non-claude-code agent or that have
+        // nothing else installed to fall back to.
+        let mut called = false;
+        let agent = pick_implementer_agent(agent_registry::Agent::ClaudeCode, None, || {
+            called = true;
+            true
+        });
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+        assert!(!called);
     }
 
     #[test]
