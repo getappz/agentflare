@@ -765,6 +765,7 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
             std::time::Duration::from_secs(crate::cli::work::DEFAULT_TIMEOUT_SECS),
             std::time::Duration::from_secs(crate::cli::work::DEFAULT_IDLE_TIMEOUT_SECS),
             Vec::new(),
+            None,
         );
         if let Err(e) = crate::work_item_pipeline::engine().register_workflow(dummy_definition) {
             crate::ui::error(&format!(
