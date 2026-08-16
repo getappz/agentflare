@@ -1,6 +1,79 @@
 use std::path::Path;
 
+use crate::audit;
+use crate::classify::{Disposition, Event};
 use crate::shell::{run_in as run_git_in, run_in_ok};
+
+/// How many of the most recent commit/push scope-checks to look at when
+/// deciding whether scope enforcement is sustained-broken vs. one-off.
+pub const SCOPE_CHECK_HEALTH_WINDOW: usize = 10;
+/// Crashes within that window at or above this count count as "sustained"
+/// (an `agentflare` binary crashing on nearly every scope-check has, from
+/// the caller's perspective, disabled scope enforcement) rather than the
+/// occasional isolated crash (e.g. a mid-upgrade binary swap) that's
+/// expected and not actionable on its own.
+pub const SCOPE_CHECK_HEALTH_THRESHOLD: usize = 3;
+
+/// Looks for a sustained scope-check breakage in the git-shim's audit
+/// events (item #483 bug #2 followup): the shim fails OPEN when
+/// `agentflare git scope-check` crashes mid-run (a single crash must not
+/// brick a legitimate push), logging `Disposition::ScopeCheckError` each
+/// time it does. A one-off crash is routine noise, but if most of the
+/// *recent* commit/push attempts crashed, scope enforcement is effectively
+/// off even though every one of those git operations appeared to succeed.
+///
+/// Only looks at `commit`/`push` events (the only subcommands that ever
+/// invoke scope-check) and only at the most recent `window` of them,
+/// oldest-first `events` slice (as returned by `audit::read_events`)
+/// scanned from the tail. Returns `None` when fewer than `threshold` of
+/// them crashed.
+#[must_use]
+pub fn sustained_scope_check_failure(
+    events: &[Event],
+    window: usize,
+    threshold: usize,
+) -> Option<String> {
+    let recent: Vec<&Event> = events
+        .iter()
+        .rev()
+        .filter(|e| matches!(e.subcommand.as_str(), "commit" | "push"))
+        .take(window)
+        .collect();
+    let crashes = recent
+        .iter()
+        .filter(|e| matches!(e.disposition, Disposition::ScopeCheckError { .. }))
+        .count();
+    if crashes < threshold {
+        return None;
+    }
+    Some(format!(
+        "scope-check crashed on {crashes} of the last {} commit/push invocations -- \
+         scope enforcement is effectively OFF, not just occasionally flaky. Check the \
+         'agentflare' binary on PATH (mid-upgrade? corrupted install?) and see \
+         ~/.agentflare/audit/git.jsonl for crash details.",
+        recent.len()
+    ))
+}
+
+/// Reads `~/.agentflare/audit/git.jsonl` and pushes a
+/// [`sustained_scope_check_failure`] violation onto `report`, if any. A
+/// missing/unreadable log is silently skipped (best-effort, matching this
+/// module's other doctor-report enrichment).
+pub fn append_scope_check_violation(report: &mut DoctorReport) {
+    let Some(audit_path) = audit::default_path("git.jsonl") else {
+        return;
+    };
+    let Ok(events) = audit::read_events::<Event>(&audit_path) else {
+        return;
+    };
+    if let Some(violation) = sustained_scope_check_failure(
+        &events,
+        SCOPE_CHECK_HEALTH_WINDOW,
+        SCOPE_CHECK_HEALTH_THRESHOLD,
+    ) {
+        report.violations.push(violation);
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -530,6 +603,90 @@ fn has_upstream(repo_root: &Path, branch: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scope_event(subcommand: &str, disposition: Disposition) -> Event {
+        Event {
+            subcommand: subcommand.to_string(),
+            args: vec![],
+            disposition,
+        }
+    }
+
+    fn crash_event(subcommand: &str) -> Event {
+        scope_event(
+            subcommand,
+            Disposition::ScopeCheckError {
+                message: "crashed".to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn no_events_is_healthy() {
+        assert!(sustained_scope_check_failure(&[], 10, 3).is_none());
+    }
+
+    #[test]
+    fn a_single_isolated_crash_is_not_sustained() {
+        let events = vec![
+            crash_event("push"),
+            scope_event("push", Disposition::Passthrough),
+            scope_event("commit", Disposition::Passthrough),
+            scope_event("push", Disposition::Passthrough),
+        ];
+        assert!(
+            sustained_scope_check_failure(&events, 10, 3).is_none(),
+            "one crash among several healthy checks must not alert"
+        );
+    }
+
+    #[test]
+    fn crashes_at_or_above_threshold_within_the_window_are_sustained() {
+        let events = vec![
+            scope_event("push", Disposition::Passthrough),
+            crash_event("commit"),
+            crash_event("push"),
+            crash_event("commit"),
+        ];
+        let msg = sustained_scope_check_failure(&events, 10, 3)
+            .expect("3 crashes at threshold 3 must alert");
+        assert!(msg.contains("3 of the last 4"), "{msg}");
+        assert!(
+            msg.contains("scope enforcement is effectively OFF"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn crashes_outside_the_window_are_ignored() {
+        // 3 crashes total, but only the most recent `window` (2) are
+        // considered, and neither of those crashed.
+        let events = vec![
+            crash_event("push"),
+            crash_event("commit"),
+            crash_event("push"),
+            scope_event("commit", Disposition::Passthrough),
+            scope_event("push", Disposition::Passthrough),
+        ];
+        assert!(
+            sustained_scope_check_failure(&events, 2, 1).is_none(),
+            "crashes outside the recent window must not count"
+        );
+    }
+
+    #[test]
+    fn non_scope_checked_subcommands_do_not_dilute_the_window() {
+        // `fetch`/`status`/etc. never invoke scope-check, so they must not
+        // count toward the window and quietly push real crashes out of it.
+        let mut events = vec![crash_event("push"), crash_event("commit")];
+        for _ in 0..20 {
+            events.push(scope_event("status", Disposition::Passthrough));
+        }
+        events.push(crash_event("push"));
+        let msg = sustained_scope_check_failure(&events, 10, 3)
+            .expect("3 commit/push crashes must still alert despite 20 unrelated events");
+        assert!(msg.contains("3 of the last 3"), "{msg}");
+    }
 
     #[test]
     fn parse_worktree_list_two_entries_with_branches() {

@@ -568,7 +568,8 @@ fn doctor_cmd(args: DoctorArgs) {
         return;
     };
     let item_states = item_state_groups();
-    let report = doctor::scan(&repo_root, args.staleness_days, &item_states);
+    let mut report = doctor::scan(&repo_root, args.staleness_days, &item_states);
+    doctor::append_scope_check_violation(&mut report);
     if args.reclaim {
         let reclaimed = doctor::reclaim(&repo_root, &report, args.force);
         // Status lines go to stderr, not stdout -- `--format json` output on
