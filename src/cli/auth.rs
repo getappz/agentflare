@@ -2,12 +2,14 @@ use clap::{Args, Subcommand};
 
 #[derive(Subcommand)]
 pub enum AuthAction {
+    /// Snapshot an agent's live credentials into a named profile.
     Backup {
         agent: String,
         profile: String,
         #[arg(long)]
         json: bool,
     },
+    /// Make a saved profile the agent's live credentials.
     Activate {
         agent: String,
         profile: String,
@@ -16,31 +18,37 @@ pub enum AuthAction {
         #[arg(long)]
         reload_daemon: bool,
     },
+    /// Show which profile is active and its quota/cooldown state.
     Status {
         #[arg(long)]
         json: bool,
         agent: Option<String>,
     },
+    /// List every agent kind agentflare knows how to manage credentials for.
     Catalog {
         #[arg(long)]
         json: bool,
     },
+    /// List saved profiles for an agent.
     Ls {
         agent: String,
         #[arg(long)]
         json: bool,
     },
+    /// Clear an agent's live credentials without deleting saved profiles.
     Clear {
         agent: String,
         #[arg(long)]
         json: bool,
     },
+    /// Delete a saved profile.
     Delete {
         agent: String,
         profile: String,
         #[arg(long)]
         json: bool,
     },
+    /// Rename a saved profile.
     Rename {
         agent: String,
         old: String,
@@ -48,6 +56,7 @@ pub enum AuthAction {
         #[arg(long)]
         json: bool,
     },
+    /// Switch to the next profile by rotation algorithm and activate it.
     Rotate {
         agent: String,
         #[arg(long, default_value = "smart")]
@@ -55,6 +64,7 @@ pub enum AuthAction {
         #[arg(long)]
         json: bool,
     },
+    /// Show which profile rotation would pick next, without activating it.
     Next {
         agent: String,
         #[arg(long, default_value = "smart")]
@@ -62,13 +72,16 @@ pub enum AuthAction {
         #[arg(long)]
         json: bool,
     },
+    /// Interactively choose a profile to activate.
     Pick {
         agent: String,
     },
+    /// Manage per-profile rotation cooldowns.
     Cooldown {
         #[command(subcommand)]
         action: CooldownAction,
     },
+    /// Give a profile a human-readable alias.
     Alias {
         agent: String,
         profile: String,
@@ -76,10 +89,12 @@ pub enum AuthAction {
         #[arg(long)]
         json: bool,
     },
+    /// Manage which profile a project directory should use by default.
     Project {
         #[command(subcommand)]
         action: ProjectAction,
     },
+    /// Run the agent's CLI with its currently active credentials.
     Run {
         agent: String,
         #[arg(long)]
@@ -87,10 +102,12 @@ pub enum AuthAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Manage credential isolation (per-profile sandboxed auth state).
     Isolate {
         #[command(subcommand)]
         action: IsolateAction,
     },
+    /// Run the agent's CLI under a specific saved profile, without activating it.
     Exec {
         agent: String,
         profile: String,
@@ -99,6 +116,7 @@ pub enum AuthAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run the agent's interactive login flow and save the result as a profile.
     Login {
         agent: String,
         profile: String,
@@ -111,6 +129,7 @@ pub enum AuthAction {
 
 #[derive(Subcommand)]
 pub enum CooldownAction {
+    /// Set a rotation cooldown, in minutes, on a profile.
     Set {
         target: String,
         #[arg(long)]
@@ -118,11 +137,13 @@ pub enum CooldownAction {
         #[arg(long)]
         json: bool,
     },
+    /// List active cooldowns.
     List {
         #[arg(long)]
         json: bool,
         agent: Option<String>,
     },
+    /// Clear a profile's cooldown, making it eligible for rotation again.
     Clear {
         target: String,
         #[arg(long)]
@@ -132,12 +153,14 @@ pub enum CooldownAction {
 
 #[derive(Subcommand)]
 pub enum ProjectAction {
+    /// Pin the current project directory to a profile.
     Set {
         agent: String,
         profile: String,
         #[arg(long)]
         json: bool,
     },
+    /// Unpin the current project directory from its profile.
     Unset {
         agent: String,
         #[arg(long)]
@@ -147,6 +170,7 @@ pub enum ProjectAction {
 
 #[derive(Subcommand)]
 pub enum IsolateAction {
+    /// Isolate a profile's credential state from the others.
     Add {
         agent: String,
         profile: String,
@@ -155,11 +179,13 @@ pub enum IsolateAction {
         #[arg(long)]
         shallow: bool,
     },
+    /// List isolated profiles.
     Ls {
         #[arg(long)]
         json: bool,
         agent: Option<String>,
     },
+    /// Remove a profile's isolation, folding it back into shared state.
     Delete {
         agent: String,
         profile: String,
@@ -168,6 +194,8 @@ pub enum IsolateAction {
     },
 }
 
+/// Manage per-agent credentials: backup/activate/rotate profiles, run agents
+/// under a specific profile, and isolate or pin credentials per project.
 #[derive(Args)]
 pub struct AuthArgs {
     #[command(subcommand)]

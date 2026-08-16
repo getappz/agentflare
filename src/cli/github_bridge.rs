@@ -43,7 +43,7 @@ fn repo_root_or_exit() -> std::path::PathBuf {
     match flare_git_core::branch::repo_toplevel(&cwd) {
         Some(root) => root,
         None => {
-            eprintln!("error: not inside a git repository");
+            crate::ui::error("not inside a git repository");
             std::process::exit(1);
         }
     }
@@ -51,7 +51,7 @@ fn repo_root_or_exit() -> std::path::PathBuf {
 
 fn cmd_set(repo: Option<String>, queue_label: Option<String>) {
     if repo.is_none() && queue_label.is_none() {
-        eprintln!("error: pass --repo and/or --queue-label");
+        crate::ui::error("pass --repo and/or --queue-label");
         std::process::exit(1);
     }
     // Validate before persisting -- an unparseable `--repo` written as-is
@@ -60,7 +60,7 @@ fn cmd_set(repo: Option<String>, queue_label: Option<String>) {
     if let Some(r) = &repo
         && crate::github::RepoId::parse(r).is_none()
     {
-        eprintln!("error: --repo {r:?} is not a valid owner/repo");
+        crate::ui::error(&format!("--repo {r:?} is not a valid owner/repo"));
         std::process::exit(1);
     }
     let root = repo_root_or_exit();
@@ -69,9 +69,9 @@ fn cmd_set(repo: Option<String>, queue_label: Option<String>) {
         repo.as_deref(),
         queue_label.as_deref(),
     ) {
-        Ok(path) => println!("wrote {}", path.display()),
+        Ok(path) => crate::ui::success(&format!("wrote {}", path.display())),
         Err(e) => {
-            eprintln!("error: {e}");
+            crate::ui::error(&e.to_string());
             std::process::exit(1);
         }
     }
@@ -80,9 +80,9 @@ fn cmd_set(repo: Option<String>, queue_label: Option<String>) {
 fn cmd_unset() {
     let root = repo_root_or_exit();
     match crate::github::bridge::config::clear_project_bridge_settings(&root) {
-        Ok(path) => println!("cleared [bridge] overrides in {}", path.display()),
+        Ok(path) => crate::ui::success(&format!("cleared [bridge] overrides in {}", path.display())),
         Err(e) => {
-            eprintln!("error: {e}");
+            crate::ui::error(&e.to_string());
             std::process::exit(1);
         }
     }
@@ -102,9 +102,9 @@ fn cmd_status() {
     );
     println!("queue_label: {queue_label}");
     println!();
-    println!("note: this is what CLI/MCP calls (e.g. handoff) resolve from this repo.");
-    println!(
-        "      the background daemon's claiming loop is unaffected -- it only reads \
-         AGENTFLARE_BRIDGE_ENABLED/_REPO env vars, since it has no cwd to resolve this file from."
+    crate::ui::info(
+        "this is what CLI/MCP calls (e.g. handoff) resolve from this repo. \
+         The background daemon's claiming loop is unaffected -- it only reads \
+         AGENTFLARE_BRIDGE_ENABLED/_REPO env vars, since it has no cwd to resolve this file from.",
     );
 }

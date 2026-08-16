@@ -2,29 +2,35 @@ use clap::{Args, Subcommand};
 
 #[derive(Subcommand)]
 pub enum AgentsAction {
+    /// List every AI coding agent detected on PATH.
     List {
         #[arg(long)]
         json: bool,
     },
+    /// Check each detected agent's config wiring for problems.
     Doctor {
         #[arg(long)]
         json: bool,
     },
+    /// Install an agent's CLI onto this machine.
     Install {
         agent: String,
         #[arg(long)]
         dry_run: bool,
     },
+    /// Update an already-installed agent's CLI to the latest version.
     Update {
         agent: String,
         #[arg(long)]
         dry_run: bool,
     },
+    /// Remove an agent's CLI from this machine.
     Uninstall {
         agent: String,
         #[arg(long)]
         dry_run: bool,
     },
+    /// Start a session with the given agent.
     Launch {
         agent: String,
         #[arg(long)]
@@ -36,6 +42,7 @@ pub enum AgentsAction {
     },
 }
 
+/// Detect, install, update, and launch AI coding agent CLIs.
 #[derive(Args)]
 pub struct AgentsArgs {
     #[command(subcommand)]

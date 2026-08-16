@@ -1,5 +1,6 @@
 use clap::Args;
 
+/// Wire agentflare into a coding agent (hooks, MCP server, config).
 #[derive(Args)]
 pub struct InitArgs {
     #[arg(long, value_enum)]

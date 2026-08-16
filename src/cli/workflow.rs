@@ -3,11 +3,11 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Subcommand};
 
 use crate::ui;
 
-#[derive(Parser)]
+#[derive(Args)]
 pub struct WorkflowArgs {
     #[command(subcommand)]
     pub command: WorkflowCommand,
@@ -31,7 +31,7 @@ pub enum WorkflowCommand {
     Metrics(MetricsArgs),
 }
 
-#[derive(Parser)]
+#[derive(Args)]
 pub struct RunArgs {
     /// Path to a workflow JSON file, or the name of a workflow committed to
     /// this project's `.agentflare/workflows/<name>.json` (tried when
@@ -45,7 +45,7 @@ pub struct RunArgs {
     pub db_path: Option<PathBuf>,
 }
 
-#[derive(Parser)]
+#[derive(Args)]
 pub struct StatusArgs {
     /// Run UUID.
     pub run_id: String,
@@ -54,7 +54,7 @@ pub struct StatusArgs {
     pub db_path: Option<PathBuf>,
 }
 
-#[derive(Parser)]
+#[derive(Args)]
 pub struct CompleteEventArgs {
     /// Run UUID.
     pub run_id: String,
@@ -68,14 +68,14 @@ pub struct CompleteEventArgs {
     pub db_path: Option<PathBuf>,
 }
 
-#[derive(Parser)]
+#[derive(Args)]
 pub struct ListArgs {
     /// SQLite store path (defaults to ~/.agentflare/workflows.db).
     #[arg(long)]
     pub db_path: Option<PathBuf>,
 }
 
-#[derive(Parser)]
+#[derive(Args)]
 pub struct MetricsArgs {
     /// Only runs of this workflow definition.
     #[arg(long)]

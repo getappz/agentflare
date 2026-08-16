@@ -1,5 +1,6 @@
 use clap::{Args, Subcommand};
 
+/// Query and manage agentflare's long-term memory (sessions, observations, embeddings).
 #[derive(Args)]
 pub struct MemoryArgs {
     #[command(subcommand)]
@@ -130,13 +131,13 @@ impl MemoryArgs {
                                             &conn, id, &vec, &model,
                                         ) {
                                             Ok(()) => ok += 1,
-                                            Err(e) => eprintln!("obs {id}: store failed: {e}"),
+                                            Err(e) => crate::ui::warning(&format!("obs {id}: store failed: {e}")),
                                         }
                                     }
-                                    None => eprintln!("obs {id}: embed failed"),
+                                    None => crate::ui::warning(&format!("obs {id}: embed failed")),
                                 }
                             }
-                            println!("backfilled {ok}/{total} embeddings (model: {model})");
+                            crate::ui::success(&format!("backfilled {ok}/{total} embeddings (model: {model})"));
                         }
                     },
                 }

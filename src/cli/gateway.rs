@@ -2,6 +2,7 @@ use clap::{Args, Subcommand};
 
 #[derive(Subcommand)]
 pub enum GatewayAction {
+    /// Deprecated: use `agentflare vault` instead.
     Secret {
         #[command(subcommand)]
         action: GatewaySecretAction,
@@ -19,6 +20,7 @@ pub enum GatewaySecretAction {
     Remove { name: String },
 }
 
+/// Deprecated: secret management moved to `agentflare vault`.
 #[derive(Args)]
 pub struct GatewayArgs {
     #[command(subcommand)]

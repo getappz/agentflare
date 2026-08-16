@@ -56,10 +56,10 @@ impl RunArgs {
         if let Some(prompt) = self.print.as_deref() {
             let conflicts = self.print_flag_conflicts();
             if !conflicts.is_empty() {
-                eprintln!(
-                    "error: --print does not support {} yet (interactive `run` only) — drop it or omit --print",
+                crate::ui::error(&format!(
+                    "--print does not support {} yet (interactive `run` only) — drop it or omit --print",
                     conflicts.join(", ")
-                );
+                ));
                 std::process::exit(1);
             }
             let code = crate::agents::cli_run_headless(

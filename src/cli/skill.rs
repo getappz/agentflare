@@ -12,16 +12,21 @@ use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
 pub enum SkillAction {
+    /// Search the indexed skill catalog by name or description.
     Search {
         query: String,
     },
+    /// Install a skill by name into this agent's config.
     Install {
         name: String,
     },
+    /// List installed skills.
     List,
+    /// Remove an installed skill.
     Remove {
         name: String,
     },
+    /// Manage skill registries (remote sources to pull skills from).
     Registry {
         #[command(subcommand)]
         action: RegistryAction,
@@ -76,11 +81,15 @@ pub enum HubAction {
 
 #[derive(Subcommand)]
 pub enum RegistryAction {
+    /// Add a remote registry URL to pull skills from.
     Add { url: String },
+    /// Remove a registry URL.
     Remove { url: String },
+    /// List configured registry URLs.
     List,
 }
 
+/// Search, install, and manage skills (packaged instructions for a task).
 #[derive(Args)]
 pub struct SkillArgs {
     #[command(subcommand)]
@@ -182,7 +191,7 @@ async fn try_install_from_source(
 
 async fn run_install(name: &str) -> Result<(), skill::error::SkillError> {
     if home_skills().join(name).join("SKILL.md").exists() {
-        println!("'{name}' already installed");
+        crate::ui::skip(&format!("'{name}' already installed"));
         return Ok(());
     }
 
@@ -191,12 +200,12 @@ async fn run_install(name: &str) -> Result<(), skill::error::SkillError> {
 
     for url in &sources {
         if try_install_from_source(&manager, url, name).await? {
-            println!("✓ installed '{name}'");
+            crate::ui::success(&format!("installed '{name}'"));
             return Ok(());
         }
     }
 
-    eprintln!("skill '{name}' not found in any registry");
+    crate::ui::error(&format!("skill '{name}' not found in any registry"));
     std::process::exit(1);
 }
 
@@ -208,7 +217,7 @@ async fn run_list() -> Result<(), skill::error::SkillError> {
     };
     let installed = manager.list_installed(&opts).await?;
     if installed.is_empty() {
-        println!("no skills installed");
+        crate::ui::info("no skills installed");
         return Ok(());
     }
     for s in &installed {
@@ -225,7 +234,7 @@ async fn run_remove(name: &str) -> Result<(), skill::error::SkillError> {
         ..Default::default()
     };
     manager.remove_skills(&[name.to_string()], &opts).await?;
-    println!("✓ removed '{name}'");
+    crate::ui::success(&format!("removed '{name}'"));
     Ok(())
 }
 
@@ -253,7 +262,7 @@ fn run_search(query: &str) {
     for r in load_registries() {
         println!("  {r}");
     }
-    println!("use `agentflare skill install <name>` to install");
+    crate::ui::info("use `agentflare skill install <name>` to install");
 }
 
 fn run_registry(action: RegistryAction) {
@@ -262,27 +271,27 @@ fn run_registry(action: RegistryAction) {
         RegistryAction::Add { url } => {
             let url = url.trim().to_string();
             if reg.contains(&url) {
-                println!("already configured: {url}");
+                crate::ui::skip(&format!("already configured: {url}"));
                 return;
             }
             reg.push(url.clone());
             save_registries(&reg);
-            println!("added: {url}");
+            crate::ui::success(&format!("added: {url}"));
         }
         RegistryAction::Remove { url } => {
             let n = reg.len();
             reg.retain(|r| r != &url);
             if reg.len() < n {
                 save_registries(&reg);
-                println!("removed: {url}");
+                crate::ui::success(&format!("removed: {url}"));
             } else {
-                eprintln!("registry not found: {url}");
+                crate::ui::error(&format!("registry not found: {url}"));
                 std::process::exit(1);
             }
         }
         RegistryAction::List => {
             if reg.is_empty() {
-                println!("no registries configured");
+                crate::ui::info("no registries configured");
                 return;
             }
             for r in &reg {
@@ -587,7 +596,7 @@ fn run_export(output: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let bundle = skill_registry::SkillBundle::new(&entries);
     let path = output.unwrap_or("skills-bundle.json");
     std::fs::write(path, bundle.to_json()?)?;
-    println!("exported {} skills to {path}", entries.len());
+    crate::ui::success(&format!("exported {} skills to {path}", entries.len()));
     Ok(())
 }
 
@@ -596,7 +605,7 @@ fn run_import(path: &str) -> Result<usize, Box<dyn std::error::Error>> {
     let mut bundle = skill_registry::SkillBundle::from_json(&json)?;
     let deduped = bundle.dedup();
     if deduped > 0 {
-        eprintln!("note: removed {deduped} duplicate entries during import");
+        crate::ui::info(&format!("removed {deduped} duplicate entries during import"));
     }
     let db_path = crate::paths::skills_db_path();
     let mut conn = skill_registry::db::open_db(&db_path)?;
@@ -669,12 +678,12 @@ fn run_hub(action: HubAction) -> Result<String, Box<dyn std::error::Error>> {
 
 fn run_snooze(name: &str, days: i64) {
     crate::skill_proactive::snooze(name, days);
-    println!("✓ snoozed '{name}' for {days} day(s)");
+    crate::ui::success(&format!("snoozed '{name}' for {days} day(s)"));
 }
 
 fn run_dismiss(name: &str) {
     crate::skill_proactive::dismiss(name);
-    println!("✓ dismissed '{name}' — will not be suggested again");
+    crate::ui::success(&format!("dismissed '{name}' — will not be suggested again"));
 }
 
 /// Manifest files/layout that identify a repo's stack. Pure and side-effect
@@ -746,28 +755,28 @@ fn run_provision(path: &str, yes: bool) -> Result<(), Box<dyn std::error::Error>
     let repo_path = Path::new(path);
     let stack = detect_stack(repo_path);
     if stack.is_empty() {
-        println!(
+        crate::ui::info(&format!(
             "no recognized stack detected at '{path}' (looked for Cargo.toml/package.json/pyproject.toml/requirements.txt/go.mod)"
-        );
+        ));
         return Ok(());
     }
-    println!("detected stack: {}", stack.join(", "));
+    crate::ui::info(&format!("detected stack: {}", stack.join(", ")));
 
     let db_path = crate::paths::skills_db_path();
     let mut conn = skill_registry::db::open_db(&db_path)?;
     let ranked = rank_candidates(&conn, &stack);
     if ranked.is_empty() {
-        println!(
-            "no matching skills found for detected stack — run `agentflare skill list`/`search` first to populate the index"
+        crate::ui::info(
+            "no matching skills found for detected stack — run `agentflare skill list`/`search` first to populate the index",
         );
         return Ok(());
     }
 
     let total_tokens: i64 = ranked.iter().map(|h| h.est_tokens).sum();
-    println!(
+    crate::ui::step(&format!(
         "recommended skills ({} candidates, ~{total_tokens} tokens):",
         ranked.len()
-    );
+    ));
     for hit in &ranked {
         println!(
             "  {} — {} (confidence {:.0}%, ~{} tokens)",
@@ -779,7 +788,7 @@ fn run_provision(path: &str, yes: bool) -> Result<(), Box<dyn std::error::Error>
     }
 
     if !yes {
-        println!("\n(dry run — pass --yes to install)");
+        crate::ui::info("dry run — pass --yes to install");
         return Ok(());
     }
 
@@ -851,7 +860,9 @@ fn run_provision(path: &str, yes: bool) -> Result<(), Box<dyn std::error::Error>
     }
 
     skill_registry::db::rebuild(&mut conn, &all)?;
-    println!("✓ provisioned {installed} skill(s) for '{path}' under source '{provisioned_source}'");
+    crate::ui::success(&format!(
+        "provisioned {installed} skill(s) for '{path}' under source '{provisioned_source}'"
+    ));
     Ok(())
 }
 
@@ -862,42 +873,42 @@ impl SkillArgs {
             SkillAction::Search { query } => run_search(&query),
             SkillAction::Install { name } => {
                 if let Err(e) = rt.block_on(run_install(&name)) {
-                    eprintln!("error: {e}");
+                    crate::ui::error(&e.to_string());
                     std::process::exit(1);
                 }
             }
             SkillAction::List => {
                 if let Err(e) = rt.block_on(run_list()) {
-                    eprintln!("error: {e}");
+                    crate::ui::error(&e.to_string());
                     std::process::exit(1);
                 }
             }
             SkillAction::Remove { name } => {
                 if let Err(e) = rt.block_on(run_remove(&name)) {
-                    eprintln!("error: {e}");
+                    crate::ui::error(&e.to_string());
                     std::process::exit(1);
                 }
             }
             SkillAction::Registry { action } => run_registry(action),
             SkillAction::Export { output } => {
                 if let Err(e) = run_export(output.as_deref()) {
-                    eprintln!("export error: {e}");
+                    crate::ui::error(&format!("export failed: {e}"));
                     std::process::exit(1);
                 }
             }
             SkillAction::Import { path } => match run_import(&path) {
                 Err(e) => {
-                    eprintln!("import error: {e}");
+                    crate::ui::error(&format!("import failed: {e}"));
                     std::process::exit(1);
                 }
-                Ok(count) => println!("imported {count} skills"),
+                Ok(count) => crate::ui::success(&format!("imported {count} skills")),
             },
             SkillAction::Hub { action } => match run_hub(action) {
                 Err(e) => {
-                    eprintln!("hub error: {e}");
+                    crate::ui::error(&format!("hub operation failed: {e}"));
                     std::process::exit(1);
                 }
-                Ok(msg) => println!("{msg}"),
+                Ok(msg) => crate::ui::success(&msg),
             },
             SkillAction::Eval => match run_eval() {
                 Ok(report) => {
@@ -907,7 +918,7 @@ impl SkillArgs {
                     }
                 }
                 Err(e) => {
-                    eprintln!("eval error: {e}");
+                    crate::ui::error(&format!("eval failed: {e}"));
                     std::process::exit(1);
                 }
             },
@@ -915,7 +926,7 @@ impl SkillArgs {
             SkillAction::Dismiss { name } => run_dismiss(&name),
             SkillAction::Provision { path, yes } => {
                 if let Err(e) = run_provision(&path, yes) {
-                    eprintln!("provision error: {e}");
+                    crate::ui::error(&format!("provision failed: {e}"));
                     std::process::exit(1);
                 }
             }

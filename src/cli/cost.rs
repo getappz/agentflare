@@ -1,5 +1,6 @@
 use clap::Args;
 
+/// Show AI agent token/dollar cost, optionally broken down by project.
 #[derive(Args)]
 pub struct CostArgs {
     #[arg(long)]

@@ -1,5 +1,6 @@
 use clap::{Args, Subcommand};
 
+/// Search and fetch cached third-party API documentation.
 #[derive(Args)]
 pub struct DocsArgs {
     #[command(subcommand)]
@@ -60,7 +61,7 @@ pub fn run(args: DocsArgs) {
         match agentflare_store::maintenance::sweep_legacy_blobs(root, *dry_run) {
             Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
             Err(e) => {
-                eprintln!("flare-docs: legacy blob sweep failed: {e}");
+                crate::ui::error(&format!("legacy blob sweep failed: {e}"));
                 std::process::exit(1);
             }
         }
@@ -70,7 +71,7 @@ pub fn run(args: DocsArgs) {
     let store = match flare_docs::DocsStore::open_default() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("flare-docs: failed to open store: {e}");
+            crate::ui::error(&format!("failed to open store: {e}"));
             std::process::exit(1);
         }
     };
@@ -79,14 +80,14 @@ pub fn run(args: DocsArgs) {
         DocsCmd::Search { query, limit } => match store.search(&query, limit) {
             Ok(hits) => println!("{}", serde_json::to_string_pretty(&hits).unwrap()),
             Err(e) => {
-                eprintln!("flare-docs: search failed: {e}");
+                crate::ui::error(&format!("search failed: {e}"));
                 std::process::exit(1);
             }
         },
         DocsCmd::List => match store.list() {
             Ok(docs) => println!("{}", serde_json::to_string_pretty(&docs).unwrap()),
             Err(e) => {
-                eprintln!("flare-docs: list failed: {e}");
+                crate::ui::error(&format!("list failed: {e}"));
                 std::process::exit(1);
             }
         },
@@ -99,7 +100,7 @@ pub fn run(args: DocsArgs) {
             let cached = match store.get_by_path(&eco.docs_id_path(&package, &version)) {
                 Ok(cached) => cached,
                 Err(e) => {
-                    eprintln!("flare-docs: cache lookup failed: {e}");
+                    crate::ui::error(&format!("cache lookup failed: {e}"));
                     std::process::exit(1);
                 }
             };
@@ -129,7 +130,7 @@ fn resolve_ecosystem(explicit: Option<&str>, package: &str) -> flare_docs::Ecosy
     match flare_docs::Ecosystem::resolve(explicit, package) {
         Ok(eco) => eco,
         Err(e) => {
-            eprintln!("flare-docs: {e}");
+            crate::ui::error(&e.to_string());
             std::process::exit(2);
         }
     }
@@ -165,14 +166,14 @@ fn fetch_and_print(
                 println!("{}", serde_json::to_string_pretty(&outcome.doc).unwrap());
             }
             if let Some(err) = &outcome.items_error {
-                eprintln!("flare-docs: per-item indexing failed: {err}");
+                crate::ui::warning(&format!("per-item indexing failed: {err}"));
             }
         }
         Err(e) => {
-            eprintln!(
-                "flare-docs: fetch failed: {e} — {}",
+            crate::ui::error(&format!(
+                "fetch failed: {e} — {}",
                 eco.other_ecosystem_hint(package)
-            );
+            ));
             std::process::exit(1);
         }
     }

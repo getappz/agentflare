@@ -32,21 +32,21 @@ impl ServeArgs {
         {
             let guard = crate::daemon::acquire_singleton_lock();
             if let Err(ref e) = guard {
-                eprintln!(
-                    "warning: failed to acquire daemon singleton lock ({e}); proceeding without race protection against a concurrent `serve` invocation."
-                );
+                crate::ui::warning(&format!(
+                    "failed to acquire daemon singleton lock ({e}); proceeding without race protection against a concurrent `serve` invocation."
+                ));
             }
             if let Some(pid) = crate::daemon::is_daemon_running() {
-                eprintln!("agentflare dashboard is already running (pid {pid}).");
-                eprintln!(
-                    "stop it first with `agentflare daemon stop`, or use the running instance instead of starting another."
+                crate::ui::error(&format!("agentflare dashboard is already running (pid {pid})."));
+                crate::ui::info(
+                    "stop it first with `agentflare daemon stop`, or use the running instance instead of starting another.",
                 );
                 std::process::exit(1);
             }
             if let Err(e) = crate::daemon::write_pid_file() {
-                eprintln!(
-                    "warning: failed to record daemon pid ({e}); `agentflare daemon status`/`stop` won't see this instance."
-                );
+                crate::ui::warning(&format!(
+                    "failed to record daemon pid ({e}); `agentflare daemon status`/`stop` won't see this instance."
+                ));
             }
         }
         // Optional; a no-op unless AGENTFLARE_BRIDGE_ENABLED is set.

@@ -1,5 +1,6 @@
 use clap::Args;
 
+/// Remove agentflare's hooks, config, and installed binary.
 #[derive(Args)]
 pub struct UninstallArgs {
     #[arg(long)]
