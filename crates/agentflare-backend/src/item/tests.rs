@@ -1531,3 +1531,105 @@ fn update_rejects_an_unknown_parent_instead_of_leaking_a_foreign_key_error() {
         "{err:?}"
     );
 }
+
+fn make_label(conn: &Connection, pid: &str, name: &str) -> crate::label::Label {
+    let ws_id = crate::project::get(conn, pid).unwrap().workspace_id;
+    crate::label::create(
+        conn,
+        crate::label::CreateLabel {
+            project_id: Some(pid.to_string()),
+            workspace_id: ws_id,
+            name: name.to_string(),
+            color: None,
+            parent_id: None,
+            sort_order: None,
+            external_source: None,
+            external_id: None,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn redispatch_resets_state_clears_stale_labels_reattaches_ready_and_normalizes_assignee() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    let ready = make_label(&conn, &pid, "ready-for-work");
+    let dispatched = make_label(&conn, &pid, "dispatched");
+    let needs_manual = make_label(&conn, &pid, "needs-manual-dispatch");
+
+    // Simulate the stuck post-failure shape: claimed (started state,
+    // instance-suffixed assignee), left carrying the "dispatched" label
+    // from the attempt that failed.
+    claim(&conn, &item.id, "claude-code:abc123", 1000, TTL).unwrap();
+    add_label(&conn, &item.id, &dispatched.id).unwrap();
+    add_label(&conn, &item.id, &needs_manual.id).unwrap();
+
+    let outcome = redispatch(&conn, &item.id, None).unwrap();
+    assert_eq!(
+        outcome,
+        RedispatchOutcome::Ready {
+            assignee_agent: "claude-code".to_string()
+        }
+    );
+
+    let updated = get(&conn, &item.id).unwrap();
+    assert_eq!(updated.state_id, state_in_group(&conn, &pid, "backlog"));
+    assert_eq!(updated.assignee_agent.as_deref(), Some("claude-code"));
+
+    let labels = list_labels(&conn, &item.id).unwrap();
+    assert!(labels.contains(&ready.id));
+    assert!(!labels.contains(&dispatched.id));
+    assert!(!labels.contains(&needs_manual.id));
+}
+
+#[test]
+fn redispatch_explicit_assignee_overrides_the_items_existing_one() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    claim(&conn, &item.id, "opencode:1", 1000, TTL).unwrap();
+
+    let outcome = redispatch(&conn, &item.id, Some("claude-code:override")).unwrap();
+    assert_eq!(
+        outcome,
+        RedispatchOutcome::Ready {
+            assignee_agent: "claude-code".to_string()
+        }
+    );
+    assert_eq!(
+        get(&conn, &item.id).unwrap().assignee_agent.as_deref(),
+        Some("claude-code")
+    );
+}
+
+#[test]
+fn redispatch_with_no_assignee_anywhere_returns_no_assignee_and_makes_no_changes() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    let before = get(&conn, &item.id).unwrap();
+
+    let outcome = redispatch(&conn, &item.id, None).unwrap();
+    assert_eq!(outcome, RedispatchOutcome::NoAssignee);
+
+    let after = get(&conn, &item.id).unwrap();
+    assert_eq!(after.state_id, before.state_id);
+    assert_eq!(after.assignee_agent, before.assignee_agent);
+}
+
+#[test]
+fn redispatch_rejects_a_completed_item() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
+    mark_completed(&conn, &item.id, "claude-code:1").unwrap();
+
+    let err = redispatch(&conn, &item.id, Some("claude-code")).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::Validation(ref m) if m.contains("completed")),
+        "{err:?}"
+    );
+}
