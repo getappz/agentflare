@@ -189,6 +189,13 @@ fn deny_canonical_detach_reason(
 struct ScopeCheckResult {
     deny: bool,
     reason: Option<String>,
+    /// Set when scope-check itself couldn't classify the change (tooling
+    /// limitation, e.g. the pathset exceeded its cap) rather than reaching a
+    /// real policy verdict -- distinct from `deny`/`reason` (item #494).
+    /// Defaulted so an older `agentflare` binary that never emits this field
+    /// still deserializes.
+    #[serde(default)]
+    error: Option<String>,
 }
 
 /// Outcome of consulting `agentflare git scope-check`. Not a bare
@@ -208,10 +215,12 @@ enum ScopeCheckOutcome {
     /// with a warning, since a transient tooling crash must not silently
     /// transform into a denial that bricks the agent's push.
     Crash(String),
-    /// The check could not be run at all, or its output was not a valid
-    /// verdict (binary missing, garbage output). Enforcement cannot run,
-    /// so the op is blocked (fail-closed, item #234) with a message that
-    /// is explicit about NOT being a policy denial.
+    /// The check could not be run at all, its output was not a valid
+    /// verdict (binary missing, garbage output), or it ran but couldn't
+    /// classify the change (e.g. the pathset exceeded its cap, item #494).
+    /// Enforcement cannot run, so the op is blocked (fail-closed, item
+    /// #234) with a message that is explicit about NOT being a policy
+    /// denial.
     Unavailable(String),
 }
 
@@ -251,6 +260,14 @@ fn interpret_scope_check(
             ));
         }
     };
+    if let Some(err) = result.error {
+        // scope-check ran but couldn't reach a verdict (tooling limitation,
+        // e.g. cap-exceeded pathset) -- not a policy decision, even though
+        // `deny` is also set for backward compat with older shim builds.
+        return ScopeCheckOutcome::Unavailable(format!(
+            "scope-check could not produce a verdict: {err} -- this is NOT a policy denial; set AGENTFLARE_GIT_BYPASS=1 to bypass scope enforcement entirely."
+        ));
+    }
     if result.deny {
         ScopeCheckOutcome::Deny(
             result
@@ -540,14 +557,17 @@ fn main() {
                     }
                     ScopeCheckOutcome::Unavailable(msg) => {
                         // Scope enforcement cannot run at all (binary
-                        // missing, unparseable output): fail closed (item
-                        // #234), but phrased so it is unmistakably NOT a
-                        // policy verdict on the changes.
+                        // missing, unparseable output) or ran but couldn't
+                        // classify the change (cap-exceeded pathset, item
+                        // #494): fail closed (item #234), but audited as
+                        // `ScopeCheckError`, not `Deny` -- this was never a
+                        // policy verdict on the changes, just enforcement
+                        // that couldn't run.
                         let scope_event = classify::Event {
                             subcommand: subcommand.clone(),
                             args: rest.clone(),
-                            disposition: classify::Disposition::Deny {
-                                reason: msg.clone(),
+                            disposition: classify::Disposition::ScopeCheckError {
+                                message: msg.clone(),
                             },
                         };
                         if let Some(audit_path) = audit::default_path("git.jsonl") {
@@ -649,6 +669,41 @@ mod tests {
                 assert!(msg.contains("NOT a policy denial"), "{msg}");
             }
             other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// Item #494: a response carrying `error` (e.g. changed_paths() hit
+    /// `MAX_CHANGED_PATHS`) must classify as `Unavailable`, not `Deny` --
+    /// even though `deny:true` is also set for backward compat -- because
+    /// this is a scope-check tooling limitation, not a real policy verdict.
+    #[test]
+    fn exit_zero_with_error_field_is_unavailable_not_a_deny() {
+        match interpret_scope_check(
+            true,
+            Some(0),
+            br#"{"deny":true,"reason":"x","error":"the changed pathset exceeds the 50000-path scope-check limit and cannot be classified; shrink this commit/push and retry"}"#,
+            b"",
+        ) {
+            ScopeCheckOutcome::Unavailable(msg) => {
+                assert!(msg.contains("NOT a policy denial"), "{msg}");
+                assert!(msg.contains("50000-path"), "{msg}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// A response with `error: null` (or omitted, for backward compat with
+    /// an older `agentflare` binary) must still classify by `deny` as before.
+    #[test]
+    fn exit_zero_with_null_error_field_falls_back_to_deny() {
+        match interpret_scope_check(
+            true,
+            Some(0),
+            br#"{"deny":true,"reason":"overlapping claim","error":null}"#,
+            b"",
+        ) {
+            ScopeCheckOutcome::Deny(reason) => assert_eq!(reason, "overlapping claim"),
+            other => panic!("expected Deny, got {other:?}"),
         }
     }
 }
