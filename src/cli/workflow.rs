@@ -3,11 +3,11 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Subcommand};
 
 use crate::ui;
 
-#[derive(Parser)]
+#[derive(Args)]
 pub struct WorkflowArgs {
     #[command(subcommand)]
     pub command: WorkflowCommand,
@@ -26,9 +26,12 @@ pub enum WorkflowCommand {
     List(ListArgs),
     /// List this project's `.agentflare/workflows/*.json` definitions.
     ListDefinitions,
+    /// Aggregate instance/step metrics across runs — counts by status,
+    /// average duration, token totals, per-step breakdown.
+    Metrics(MetricsArgs),
 }
 
-#[derive(Parser)]
+#[derive(Args)]
 pub struct RunArgs {
     /// Path to a workflow JSON file, or the name of a workflow committed to
     /// this project's `.agentflare/workflows/<name>.json` (tried when
@@ -42,7 +45,7 @@ pub struct RunArgs {
     pub db_path: Option<PathBuf>,
 }
 
-#[derive(Parser)]
+#[derive(Args)]
 pub struct StatusArgs {
     /// Run UUID.
     pub run_id: String,
@@ -51,7 +54,7 @@ pub struct StatusArgs {
     pub db_path: Option<PathBuf>,
 }
 
-#[derive(Parser)]
+#[derive(Args)]
 pub struct CompleteEventArgs {
     /// Run UUID.
     pub run_id: String,
@@ -65,8 +68,24 @@ pub struct CompleteEventArgs {
     pub db_path: Option<PathBuf>,
 }
 
-#[derive(Parser)]
+#[derive(Args)]
 pub struct ListArgs {
+    /// SQLite store path (defaults to ~/.agentflare/workflows.db).
+    #[arg(long)]
+    pub db_path: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct MetricsArgs {
+    /// Only runs of this workflow definition.
+    #[arg(long)]
+    pub workflow_id: Option<String>,
+    /// Only runs in this status (pending|running|paused|completed|failed|cancelled).
+    #[arg(long)]
+    pub status: Option<String>,
+    /// Only runs created at or after this RFC 3339 timestamp.
+    #[arg(long)]
+    pub since: Option<String>,
     /// SQLite store path (defaults to ~/.agentflare/workflows.db).
     #[arg(long)]
     pub db_path: Option<PathBuf>,
@@ -167,6 +186,23 @@ impl WorkflowArgs {
             WorkflowCommand::ListDefinitions => {
                 for name in crate::workflow::list_workflow_definitions(&repo_root_or_exit()) {
                     println!("{name}");
+                }
+            }
+            WorkflowCommand::Metrics(args) => {
+                match crate::workflow::workflow_metrics(
+                    args.workflow_id.as_deref(),
+                    args.status.as_deref(),
+                    args.since.as_deref(),
+                    &db_path(&args.db_path),
+                ) {
+                    Ok(metrics) => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&metrics).unwrap_or_default()
+                    ),
+                    Err(e) => {
+                        ui::error(&e);
+                        std::process::exit(1);
+                    }
                 }
             }
         }

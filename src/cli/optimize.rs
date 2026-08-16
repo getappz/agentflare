@@ -51,7 +51,10 @@ impl OutputAction {
                     Some(path) => match std::fs::read_to_string(path) {
                         Ok(spec) => crate::optimize::output::Prompt::Custom(spec),
                         Err(e) => {
-                            eprintln!("failed to read spec file {}: {e}", path.display());
+                            crate::ui::error(&format!(
+                                "failed to read spec file {}: {e}",
+                                path.display()
+                            ));
                             std::process::exit(1);
                         }
                     },
@@ -61,7 +64,9 @@ impl OutputAction {
                     Some("sibling") => crate::optimize::output::BackupMode::Sibling,
                     Some("out-of-tree") | None => crate::optimize::output::BackupMode::OutOfTree,
                     Some(other) => {
-                        eprintln!("--backup must be 'sibling' or 'out-of-tree', got '{other}'");
+                        crate::ui::error(&format!(
+                            "--backup must be 'sibling' or 'out-of-tree', got '{other}'"
+                        ));
                         std::process::exit(1);
                     }
                 };
@@ -92,7 +97,7 @@ impl OutputAction {
                         );
                     }
                     Err(e) => {
-                        eprintln!("{e}");
+                        crate::ui::error(&e.to_string());
                         std::process::exit(1);
                     }
                 }
@@ -107,31 +112,43 @@ impl OutputAction {
 
 #[derive(Subcommand)]
 pub enum CodeAction {
+    /// Print the active code-review mode for this session.
     Status,
-    Set {
-        mode: String,
-    },
-    Default {
-        mode: String,
-    },
+    /// Set the code-review mode for the current session.
+    Set { mode: String },
+    /// Set the code-review mode used for new sessions going forward.
+    Default { mode: String },
+    /// Turn code-review mode off for the current session.
     Off,
+    /// Print the review-mode skill text.
     Review,
+    /// Print the audit-mode skill text.
     Audit,
+    /// Print the debt-mode skill text.
     Debt,
+    /// Print the gain-mode skill text.
     Gain,
+    /// Print a summary of what code-review mode does.
     Info,
+    /// Print the code-review playbook.
     Playbook,
+    /// Print the no-hallucination skill text.
     NoHallucination,
+    /// Internal: emit the skill text for a lifecycle hook event. Not meant for direct use.
     Hook {
         #[command(subcommand)]
         event: CodeHookEvent,
     },
 }
 
+/// Internal: which agent lifecycle event `code hook` is firing for.
 #[derive(Subcommand)]
 pub enum CodeHookEvent {
+    /// Fired when a new agent session starts.
     SessionStart,
+    /// Fired when a subagent starts.
     SubagentStart,
+    /// Fired when the user submits a prompt.
     PromptSubmit,
     Statusline,
 }
@@ -221,11 +238,11 @@ impl CodeAction {
             CodeAction::Set { mode } => {
                 let normalized = crate::optimize::code::normalize_config_mode(&mode)
                     .unwrap_or_else(|| {
-                        eprintln!("error: invalid mode: {mode}");
+                        crate::ui::error(&format!("invalid mode: {mode}"));
                         std::process::exit(1);
                     });
                 crate::optimize::code::set_active(normalized).unwrap_or_else(|e| {
-                    eprintln!("error: {e}");
+                    crate::ui::error(&e.to_string());
                     std::process::exit(1);
                 });
                 println!("{normalized}");
@@ -233,11 +250,11 @@ impl CodeAction {
             CodeAction::Default { mode } => {
                 let normalized = crate::optimize::code::normalize_config_mode(&mode)
                     .unwrap_or_else(|| {
-                        eprintln!("error: invalid mode: {mode}");
+                        crate::ui::error(&format!("invalid mode: {mode}"));
                         std::process::exit(1);
                     });
                 crate::optimize::code::set_default_mode(normalized).unwrap_or_else(|e| {
-                    eprintln!("error: {e}");
+                    crate::ui::error(&e.to_string());
                     std::process::exit(1);
                 });
                 crate::optimize::code::set_active(normalized).ok();
@@ -433,6 +450,8 @@ pub enum ContextAction {
     },
 }
 
+/// Reduce AI agent token/cost overhead: output compression, code minimalism,
+/// context compaction, and status/retrieval for what got compressed away.
 #[derive(Args)]
 pub struct OptimizeArgs {
     #[command(subcommand)]
@@ -466,7 +485,7 @@ impl OptimizeArgs {
                 let content = match std::fs::read_to_string(transcript) {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("error reading transcript: {e}");
+                        crate::ui::error(&format!("reading transcript: {e}"));
                         std::process::exit(1);
                     }
                 };
@@ -493,7 +512,7 @@ impl OptimizeArgs {
                         }
                     }
                     Err(e) => {
-                        eprintln!("scoring error: {e}");
+                        crate::ui::error(&format!("scoring: {e}"));
                         std::process::exit(1);
                     }
                 }
@@ -534,12 +553,12 @@ impl OptimizeArgs {
             Some(id) => match retrieve::retrieve(id) {
                 Ok(content) => print!("{content}"),
                 Err(e) => {
-                    eprintln!("{e}");
+                    crate::ui::error(&e.to_string());
                     std::process::exit(1);
                 }
             },
             None => {
-                eprintln!("provide an id, or pass --list to enumerate");
+                crate::ui::error("provide an id, or pass --list to enumerate");
                 std::process::exit(1);
             }
         }

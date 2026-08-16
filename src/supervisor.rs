@@ -32,7 +32,7 @@ const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 /// margin for the claim/worktree/done steps around it, exactly as when it
 /// wrapped a real subprocess: it must never fire before the work being
 /// watched would have stopped on its own.
-const WORK_JOB_TIMEOUT_SECS: u64 = 21_900;
+pub(crate) const WORK_JOB_TIMEOUT_SECS: u64 = 21_900;
 
 /// Returns the matching `Agent` only if `agent_registry::autonomous_args`
 /// confirms it has a headless permission-bypass flag — the same gate

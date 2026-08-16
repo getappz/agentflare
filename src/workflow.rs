@@ -277,11 +277,29 @@ pub(crate) async fn workflow_status_async(
     run_id: &str,
     db_path: &Path,
 ) -> Result<serde_json::Value, String> {
-    let store = open_store(db_path)?;
-    let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
     let run_id = parse_run_id(run_id)?;
 
-    let state = engine.get_status(run_id).await.map_err(|e| e.to_string())?;
+    // Read the raw state generically rather than through
+    // `StateStore::load::<D>()` (`engine.get_status`) -- this store is
+    // shared by several `WorkflowData` types (`PipelineData`,
+    // `WorkItemData`, ...) and deserializing through a fixed `D` hard-fails
+    // on any run whose `context.data` doesn't match it, e.g. "storage
+    // error: deserialize state: invalid type: map, expected unit struct
+    // PipelineData" for a real `agentflare-work-item` run. Every field this
+    // view reports (run_id, workflow_id, status, current_step,
+    // step_states, input, output, error, variables) lives outside
+    // `context.data`, so a generic read never needs to know `D` — same
+    // reasoning as `recent_failures_async`'s raw-SQL query.
+    let db_path_owned = db_path.to_path_buf();
+    let run_id_owned = run_id;
+    let state = tokio::task::spawn_blocking(move || {
+        load_state_generic_blocking(&run_id_owned, &db_path_owned)
+    })
+    .await
+    .map_err(|e| format!("load state task panicked: {e}"))??;
+
+    let store = open_store(db_path)?;
+    let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
     let journal = engine
         .state_store()
         .journal(run_id)
@@ -299,26 +317,57 @@ pub(crate) async fn workflow_status_async(
         })
         .collect();
 
+    let steps: Vec<serde_json::Value> = state["step_states"]
+        .as_object()
+        .map(|steps| {
+            steps
+                .iter()
+                .map(|(id, ss)| {
+                    serde_json::json!({
+                        "step_id": id,
+                        "status": ss["status"],
+                        "attempt": ss["attempt"],
+                        "last_error": ss["last_error"],
+                        "input_tokens": ss["input_tokens"],
+                        "output_tokens": ss["output_tokens"],
+                        "duration_ms": ss["duration_ms"],
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(serde_json::json!({
-        "run_id": state.run_id.to_string(),
-        "workflow_id": state.workflow_id.to_string(),
-        "status": status_str(&state.status),
-        "current_step": state.current_step.map(|s| s.to_string()),
-        "input": state.input,
-        "output": state.output,
-        "error": state.error,
-        "steps": state.step_states.iter().map(|(id, ss)| serde_json::json!({
-            "step_id": id.to_string(),
-            "status": step_status_str(&ss.status),
-            "attempt": ss.attempt,
-            "last_error": ss.last_error,
-            "input_tokens": ss.input_tokens,
-            "output_tokens": ss.output_tokens,
-            "duration_ms": ss.duration_ms,
-        })).collect::<Vec<_>>(),
-        "variables": state.variables,
+        "run_id": state["run_id"],
+        "workflow_id": state["workflow_id"],
+        "status": state["status"],
+        "current_step": state["current_step"],
+        "input": state["input"],
+        "output": state["output"],
+        "error": state["error"],
+        "steps": steps,
+        "variables": state["variables"],
         "journal_tail": journal_tail,
     }))
+}
+
+/// Reads a run's raw `state_json` and parses it as a generic
+/// [`serde_json::Value`] rather than a typed `WorkflowState<D>` — see
+/// [`workflow_status_async`]'s doc comment for why. Blocking; call from
+/// inside `spawn_blocking` (see [`open_conn_blocking`]'s doc comment).
+fn load_state_generic_blocking(
+    run_id: &WorkflowRunId,
+    db_path: &Path,
+) -> Result<serde_json::Value, String> {
+    let conn = open_conn_blocking(db_path)?;
+    let state_json: String = conn
+        .query_row(
+            "SELECT state_json FROM workflow_runs WHERE id = ?",
+            rusqlite::params![run_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("run '{run_id}' not found: {e}"))?;
+    serde_json::from_str(&state_json).map_err(|e| format!("corrupt state for run '{run_id}': {e}"))
 }
 
 /// List run summaries. Sync wrapper — see [`list_workflows_async`].
@@ -348,6 +397,207 @@ pub(crate) async fn list_workflows_async(db_path: &Path) -> Result<Vec<serde_jso
             })
         })
         .collect())
+}
+
+/// Aggregate instance/step metrics (counts by status, average duration,
+/// token totals, per-step breakdown) across runs matching the given filters
+/// — the visibility the engine already computes (see
+/// `flare_workflow::types::WorkflowMetrics`) but that, until now, had no
+/// caller outside `flare-workflow`'s own tests. Sync wrapper — see
+/// [`workflow_metrics_async`].
+pub fn workflow_metrics(
+    workflow_id: Option<&str>,
+    status: Option<&str>,
+    since: Option<&str>,
+    db_path: &Path,
+) -> Result<serde_json::Value, String> {
+    WORKFLOW_RT.block_on(workflow_metrics_async(workflow_id, status, since, db_path))
+}
+
+pub(crate) async fn workflow_metrics_async(
+    workflow_id: Option<&str>,
+    status: Option<&str>,
+    since: Option<&str>,
+    db_path: &Path,
+) -> Result<serde_json::Value, String> {
+    let filter = flare_workflow::types::MetricsFilter {
+        workflow_id: workflow_id.map(WorkflowId::new),
+        status: status.map(parse_status_str).transpose()?,
+        since: since
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .map_err(|e| format!("invalid 'since' timestamp '{s}' (want RFC 3339): {e}"))
+            })
+            .transpose()?,
+    };
+
+    let store = open_store(db_path)?;
+    let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
+    let metrics = engine.metrics(filter).await.map_err(|e| e.to_string())?;
+
+    // Counts alone don't say *why* something failed; a caller filtering out
+    // failures entirely (e.g. status=completed) has no use for this list, so
+    // skip the extra query in that case.
+    let recent_failures = if status.is_none_or(|s| s == "failed") {
+        recent_failures_async(workflow_id, since, 5, db_path).await?
+    } else {
+        Vec::new()
+    };
+
+    let step_breakdown: std::collections::BTreeMap<String, serde_json::Value> = metrics
+        .step_breakdown
+        .iter()
+        .map(|(step_id, sm)| {
+            let counts: std::collections::BTreeMap<&str, u64> = sm
+                .counts_by_status
+                .iter()
+                .map(|(k, v)| (step_status_str(k), *v))
+                .collect();
+            (
+                step_id.to_string(),
+                serde_json::json!({
+                    "counts_by_status": counts,
+                    "avg_duration_ms": sm.avg_duration_ms,
+                }),
+            )
+        })
+        .collect();
+    let counts_by_status: std::collections::BTreeMap<&str, u64> = metrics
+        .counts_by_status
+        .iter()
+        .map(|(k, v)| (status_str(k), *v))
+        .collect();
+
+    Ok(serde_json::json!({
+        "counts_by_status": counts_by_status,
+        "avg_duration_ms": metrics.avg_duration_ms,
+        "total_input_tokens": metrics.total_input_tokens,
+        "total_output_tokens": metrics.total_output_tokens,
+        "step_breakdown": step_breakdown,
+        "recent_failures": recent_failures,
+    }))
+}
+
+/// The most recent `limit` failed runs (optionally scoped by `workflow_id`
+/// / `since`, same as `MetricsFilter`), each with its failing step and that
+/// step's actual error message — the "why", which the aggregate counts in
+/// `workflow_metrics` alone can't answer.
+///
+/// Queries `workflow_runs`/`step_state` directly by raw SQL rather than
+/// going through `StateStore::list_all::<D>()` — this store is shared by
+/// several distinct `WorkflowData` types (`PipelineData`, `WorkItemData`,
+/// ...), and deserializing through a fixed `D` silently skips every run of
+/// a different type (see the 2026-08-16 `list_active`/`list_all`
+/// cross-type fix). `workflow_metrics`'s own SQL aggregation already takes
+/// this same type-agnostic approach for the same reason.
+async fn recent_failures_async(
+    workflow_id: Option<&str>,
+    since: Option<&str>,
+    limit: usize,
+    db_path: &Path,
+) -> Result<Vec<serde_json::Value>, String> {
+    // `since` means the same thing here as in `MetricsFilter` (which this
+    // shares a caller-facing meaning with): a `created_at` floor, not
+    // `updated_at` -- see `sqlite_store::metrics_where`.
+    let since_dt = since
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| format!("invalid 'since' timestamp '{s}' (want RFC 3339): {e}"))
+        })
+        .transpose()?;
+
+    let workflow_id = workflow_id.map(str::to_string);
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let conn = open_conn_blocking(&db_path)?;
+
+        let mut run_where = vec!["status = 'failed'".to_string()];
+        let mut run_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(w) = &workflow_id {
+            run_where.push("workflow_id = ?".to_string());
+            run_params.push(Box::new(w.clone()));
+        }
+        if let Some(dt) = since_dt {
+            run_where.push("created_at >= ?".to_string());
+            run_params.push(Box::new(dt.to_rfc3339()));
+        }
+        run_params.push(Box::new(limit as i64));
+
+        // LIMIT must bound the number of distinct *runs*, not the joined
+        // run x failed-step rows below -- a run with several failed steps
+        // (e.g. a fan-out) would otherwise consume more than one slot of
+        // `limit` and could crowd out other, more recent failed runs.
+        // Select the bounded set of runs first, using only run-level
+        // predicates, then join to their failed step states.
+        let sql = format!(
+            "SELECT wr.id, wr.workflow_id, wr.updated_at, ss.step_id, ss.last_error
+             FROM (
+                 SELECT id, workflow_id, updated_at
+                 FROM workflow_runs
+                 WHERE {}
+                 ORDER BY updated_at DESC
+                 LIMIT ?
+             ) wr
+             JOIN step_state ss ON wr.id = ss.run_id AND ss.status = 'failed'
+             ORDER BY wr.updated_at DESC",
+            run_where.join(" AND ")
+        );
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("prepare recent failures query: {e}"))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(run_params.iter().map(std::convert::AsRef::as_ref)),
+                |row| {
+                    Ok(serde_json::json!({
+                        "run_id": row.get::<_, String>(0)?,
+                        "workflow_id": row.get::<_, String>(1)?,
+                        "updated_at": row.get::<_, String>(2)?,
+                        "failing_step": row.get::<_, String>(3)?,
+                        "failing_step_error": row.get::<_, Option<String>>(4)?,
+                    }))
+                },
+            )
+            .map_err(|e| format!("recent failures query: {e}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("recent failures row: {e}"))
+    })
+    .await
+    .map_err(|e| format!("recent failures task panicked: {e}"))?
+}
+
+/// Opens a blocking `rusqlite::Connection` with the same 5-second busy
+/// timeout `agentflare-db-kit::open_file` configures — this file is written
+/// to by live workflow runs, so a bare `Connection::open` with SQLite's
+/// default (no wait, immediate `SQLITE_BUSY`) can spuriously fail a read
+/// under write contention. Must only ever be called from inside
+/// `spawn_blocking`: `Connection` is a blocking API, and this raw path
+/// (unlike `open_store`) has no async wrapper of its own.
+fn open_conn_blocking(db_path: &Path) -> Result<rusqlite::Connection, String> {
+    let conn =
+        rusqlite::Connection::open(db_path).map_err(|e| format!("open workflows db: {e}"))?;
+    conn.busy_timeout(std::time::Duration::from_millis(5000))
+        .map_err(|e| format!("set busy_timeout: {e}"))?;
+    Ok(conn)
+}
+
+/// Parse a status filter string (same spellings `status_str` produces) into
+/// a `WorkflowStatus` — the reverse of `status_str`.
+fn parse_status_str(s: &str) -> Result<WorkflowStatus, String> {
+    match s {
+        "pending" => Ok(WorkflowStatus::Pending),
+        "running" => Ok(WorkflowStatus::Running),
+        "paused" => Ok(WorkflowStatus::Paused),
+        "completed" => Ok(WorkflowStatus::Completed),
+        "failed" => Ok(WorkflowStatus::Failed),
+        "cancelled" => Ok(WorkflowStatus::Cancelled),
+        other => Err(format!(
+            "unknown status '{other}' (want one of: pending, running, paused, completed, failed, cancelled)"
+        )),
+    }
 }
 
 /// Resolve a pending `WaitEvent` on a run. Sync wrapper — see
@@ -468,6 +718,163 @@ mod tests {
         let runs = list_workflows(&db).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0]["status"], "completed");
+    }
+
+    #[test]
+    fn workflow_metrics_reports_counts_and_recent_failure_error_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wf.db");
+
+        let failing_send: SendMessage = Arc::new(|_inv| {
+            Box::pin(async move { Err("boom: simulated step failure".to_string()) })
+        });
+
+        let (run_id, workflow_id) = run_workflow_json_with_sender(
+            r#"{
+                "name": "flaky",
+                "steps": [
+                    {"name": "a", "agent": "opencode", "prompt": "Do: {{input}}"}
+                ]
+            }"#,
+            "seed",
+            &db,
+            failing_send,
+        )
+        .unwrap();
+
+        let rt = blocking_runtime();
+        rt.block_on(async {
+            for _ in 0..200 {
+                let store = SqliteStore::<PipelineData>::open_file(&db).unwrap();
+                let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
+                if let Ok(s) = engine.get_status(run_id).await
+                    && s.status == WorkflowStatus::Failed
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("workflow did not reach Failed status");
+        });
+
+        let metrics = workflow_metrics(None, None, None, &db).unwrap();
+        assert_eq!(metrics["counts_by_status"]["failed"], 1, "{metrics:?}");
+        assert_eq!(
+            metrics["step_breakdown"]["a"]["counts_by_status"]["failed"], 1,
+            "{metrics:?}"
+        );
+
+        let failures = metrics["recent_failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0]["run_id"], run_id.to_string());
+        assert_eq!(failures[0]["workflow_id"], workflow_id.to_string());
+        assert_eq!(failures[0]["failing_step"], "a");
+        assert!(
+            failures[0]["failing_step_error"]
+                .as_str()
+                .unwrap()
+                .contains("boom"),
+            "{:?}",
+            failures[0]
+        );
+
+        // A status filter that excludes failures must suppress the extra
+        // recent-failures query rather than return stale/irrelevant data.
+        let completed_only = workflow_metrics(None, Some("completed"), None, &db).unwrap();
+        assert_eq!(
+            completed_only["recent_failures"].as_array().unwrap().len(),
+            0
+        );
+
+        // workflow_id filter: the real id matches, an unrelated one doesn't
+        // — exercises recent_failures_async's parameter binding order.
+        let scoped = workflow_metrics(Some(&workflow_id.to_string()), None, None, &db).unwrap();
+        assert_eq!(scoped["recent_failures"].as_array().unwrap().len(), 1);
+        let other = workflow_metrics(Some("no-such-workflow"), None, None, &db).unwrap();
+        assert_eq!(other["recent_failures"].as_array().unwrap().len(), 0);
+
+        // since filter: a future timestamp excludes the run that already
+        // happened.
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let later = workflow_metrics(None, None, Some(&future), &db).unwrap();
+        assert_eq!(later["recent_failures"].as_array().unwrap().len(), 0);
+
+        // Invalid filter inputs are rejected with actionable messages.
+        assert!(
+            workflow_metrics(None, None, Some("not-a-time"), &db)
+                .unwrap_err()
+                .contains("RFC 3339")
+        );
+        assert!(
+            workflow_metrics(None, Some("nope"), None, &db)
+                .unwrap_err()
+                .contains("unknown status")
+        );
+    }
+
+    #[test]
+    fn workflow_status_reads_a_run_of_a_different_workflowdata_type() {
+        // Regression: `status` used to hard-fail for any run whose
+        // WorkflowData type wasn't PipelineData -- this store is shared
+        // across types (e.g. the internal SDD work-item pipeline's
+        // WorkItemData) -- with "storage error: deserialize state: invalid
+        // type: map, expected unit struct PipelineData". Mirrors
+        // flare-workflow's own cross_type_store_test.rs idiom.
+        use flare_workflow::executor::FunctionStep;
+        use flare_workflow::types::{StepResult, WorkflowContext, WorkflowData};
+        use flare_workflow::{StepDefinition, WorkflowDefinition};
+
+        #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+        struct StructPayload {
+            note: String,
+        }
+        impl WorkflowData for StructPayload {
+            fn workflow_type() -> &'static str {
+                "struct-payload"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wf.db");
+
+        let rt = blocking_runtime();
+        let run_id = rt.block_on(async {
+            let engine = WorkflowEngine::<StructPayload, _>::with_store(
+                SqliteStore::open_file(&db).unwrap(),
+            );
+            engine
+                .register_workflow(WorkflowDefinition::new("other", "other").add_step(
+                    StepDefinition::new(
+                        "only",
+                        "only",
+                        Arc::new(FunctionStep::new(
+                            |_ctx: &mut WorkflowContext<StructPayload>| {
+                                Box::pin(async move { Ok(StepResult::Success) })
+                            },
+                        )),
+                    ),
+                ))
+                .unwrap();
+            let run = engine
+                .start_workflow(
+                    WorkflowId::new("other"),
+                    StructPayload { note: "hi".into() },
+                    "seed".into(),
+                )
+                .await
+                .unwrap();
+            engine
+                .wait_for_completion(run, "other", std::time::Duration::from_secs(10))
+                .await
+                .unwrap();
+            run
+        });
+
+        let status = workflow_status(&run_id.to_string(), &db)
+            .expect("status must succeed for a non-PipelineData run");
+        assert_eq!(status["status"], "completed");
+        assert_eq!(status["workflow_id"], "other");
+        assert_eq!(status["steps"].as_array().unwrap().len(), 1);
     }
 
     #[test]

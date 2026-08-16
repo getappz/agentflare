@@ -57,9 +57,9 @@ fn get_value(key: ConfigKey) -> String {
 
 fn cmd_set(key: ConfigKey, value: &str) {
     match set_result(key, value) {
-        Ok(path) => println!("wrote {}", path.display()),
+        Ok(path) => crate::ui::success(&format!("wrote {}", path.display())),
         Err(e) => {
-            eprintln!("error: {e}");
+            crate::ui::error(&e.to_string());
             std::process::exit(1);
         }
     }
@@ -71,9 +71,9 @@ fn cmd_get(key: ConfigKey) {
 
 fn cmd_unset(key: ConfigKey) {
     match unset_result(key) {
-        Ok(path) => println!("cleared in {}", path.display()),
+        Ok(path) => crate::ui::success(&format!("cleared in {}", path.display())),
         Err(e) => {
-            eprintln!("error: {e}");
+            crate::ui::error(&e.to_string());
             std::process::exit(1);
         }
     }

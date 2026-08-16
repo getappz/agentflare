@@ -139,6 +139,64 @@ async fn params_flow_through_to_prompt_expansion() {
     assert!(state.input.contains("Hello u-42, task: review"));
 }
 
+/// Structural port of OpenFang's bundled `researcher` Hand (item #491):
+/// scope -> {web,news,academic} fan_out -> collect -> fact-check ->
+/// conditional follow-up -> report. Proves the ported DAG compiles and runs
+/// to completion. The mock send hook echoes each step's expanded prompt
+/// verbatim, and fact-check's own prompt literally contains the
+/// instructional text "FOLLOWUP_NEEDED" (the marker it's told to emit), so
+/// the conditional edge into `follow-up` correctly fires under the mock --
+/// this proves the conditional-gate mechanism itself, not just the happy
+/// path.
+#[tokio::test]
+async fn researcher_hand_port_compiles_and_runs() {
+    let wf_json: JsonWorkflow = serde_json::from_str(
+        r#"{
+            "name": "researcher",
+            "description": "Structural port of OpenFang's bundled 'researcher' Hand onto flare-workflow's durable DAG engine.",
+            "steps": [
+                {"name": "scope", "agent": "claude-code", "prompt": "Topic: {{input}}. Break this into 3-5 concrete sub-questions, and note which of three source types each depends on: general web, news, or academic literature.", "timeout_secs": 120, "error_mode": "retry", "max_retries": 1, "output_var": "brief"},
+                {"name": "web-sweep", "agent": "claude-code", "prompt": "Brief:\n{{brief}}\n\nUsing mcp__flare__search (type=web), answer the web-dependent sub-questions above, with a source URL per claim.", "mode": "fan_out", "timeout_secs": 240, "error_mode": "retry", "max_retries": 1},
+                {"name": "news-sweep", "agent": "claude-code", "prompt": "Brief:\n{{brief}}\n\nUsing mcp__flare__search (type=news), answer the news-dependent sub-questions above, with a source URL per claim.", "mode": "fan_out", "timeout_secs": 240, "error_mode": "retry", "max_retries": 1},
+                {"name": "academic-sweep", "agent": "claude-code", "prompt": "Brief:\n{{brief}}\n\nUsing mcp__flare__search (type=academic), answer the academic-dependent sub-questions above, with a source URL per claim.", "mode": "fan_out", "timeout_secs": 240, "error_mode": "retry", "max_retries": 1},
+                {"name": "gather-sources", "agent": "claude-code", "prompt": "unused (collect step is data-only)", "mode": "collect"},
+                {"name": "fact-check", "agent": "claude-code", "prompt": "Combined findings:\n\n{{input}}\n\nApply a CRAAP-test pass and cross-reference claims across sweeps. If any sub-question is still unresolved, end with the exact line 'FOLLOWUP_NEEDED: <what is missing>'. Otherwise end with 'FOLLOWUP_NOT_NEEDED'.", "timeout_secs": 200, "error_mode": "retry", "max_retries": 1, "output_var": "verified"},
+                {"name": "follow-up", "agent": "claude-code", "prompt": "Gap flagged:\n\n{{input}}\n\nRun one targeted follow-up search to resolve it.", "mode": {"conditional": {"condition": "FOLLOWUP_NEEDED"}}, "timeout_secs": 200, "error_mode": "skip", "output_var": "followup"},
+                {"name": "report", "agent": "claude-code", "prompt": "Brief:\n{{brief}}\n\nVerified:\n{{verified}}\n\nFollow-up:\n{{followup}}\n\nWrite the final research report with inline source citations.", "timeout_secs": 200, "error_mode": "retry", "max_retries": 1}
+            ]
+        }"#,
+    )
+    .unwrap();
+    let wf = compile_workflow(&wf_json, mock_send()).unwrap();
+    let engine = WorkflowEngine::<PipelineData, _>::with_store(SqliteStore::open_memory().unwrap());
+    engine.register_workflow(wf).unwrap();
+
+    let run = engine
+        .start_workflow(
+            WorkflowId::new("researcher"),
+            PipelineData,
+            "durable workflow engines".into(),
+        )
+        .await
+        .unwrap();
+    engine
+        .wait_for_completion(run, "researcher", Duration::from_secs(15))
+        .await
+        .unwrap();
+
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    // scope + fact-check both set output_var; the three fan_out sweeps
+    // joined through collect into fact-check's input.
+    assert!(state.variables.contains_key("brief"));
+    assert!(state.variables.contains_key("verified"));
+    assert!(state.variables["verified"].matches("processed").count() >= 3);
+    // fact-check's own prompt contains the literal "FOLLOWUP_NEEDED" marker
+    // text, so the mock's echoed output trips the conditional edge and
+    // follow-up actually runs.
+    assert!(state.variables.contains_key("followup"));
+}
+
 #[tokio::test]
 async fn iterative_refinement_loop() {
     let out = run_json(

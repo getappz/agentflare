@@ -105,3 +105,71 @@ fn item_doctor_reclaims_a_stale_clean_linked_worktree() {
         "reclaim=true must delete a clean stale linked worktree"
     );
 }
+
+#[test]
+fn item_doctor_force_reclaim_scoped_by_worktree_spares_other_dirty_lanes() {
+    // Regression for the 2026-08-16 incident: dispatching one item's
+    // `doctor(reclaim=true, force=true)` to fix its own broken worktree
+    // deleted two other, unrelated items' dirty worktrees along with it.
+    // Passing `worktree` must scope the force-reclaim to that one lane only.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    };
+    run_git(&repo_root, &["init", "-b", "master"]);
+    run_git(&repo_root, &["config", "user.email", "test@test.com"]);
+    run_git(&repo_root, &["config", "user.name", "Test"]);
+    run_git(&repo_root, &["commit", "--allow-empty", "-m", "initial"]);
+
+    let mut dirty_paths = Vec::new();
+    for name in ["target-branch", "bystander-branch"] {
+        let path = repo_dir.path().join(name);
+        run_git(
+            &repo_root,
+            &["worktree", "add", "-b", name, path.to_str().unwrap()],
+        );
+        std::fs::write(path.join("scratch.txt"), "uncommitted\n").unwrap();
+        dirty_paths.push((name.to_string(), path));
+    }
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let report: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "doctor".into(),
+            reclaim: Some(true),
+            force: Some(true),
+            worktree: Some("target-branch".into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let reclaimed = report["reclaimed"].as_array().unwrap();
+    assert_eq!(
+        reclaimed,
+        &vec![serde_json::json!("target-branch")],
+        "{report:?}"
+    );
+    for (name, path) in &dirty_paths {
+        if name == "target-branch" {
+            assert!(!path.exists(), "targeted dirty lane must be deleted");
+        } else {
+            assert!(
+                path.exists(),
+                "bystander lane '{name}' must survive a worktree-scoped force reclaim"
+            );
+        }
+    }
+}

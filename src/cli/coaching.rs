@@ -3,7 +3,9 @@ use clap::{Args, Subcommand};
 
 #[derive(Subcommand)]
 pub enum CoachingAction {
+    /// List every coaching rule and its current tier/trigger.
     List,
+    /// Add or update a coaching rule.
     Apply {
         id: String,
         #[arg(long)]
@@ -28,9 +30,8 @@ pub enum CoachingAction {
         #[arg(long, value_delimiter = ',')]
         sync: Vec<String>,
     },
-    Remove {
-        id: String,
-    },
+    /// Delete a coaching rule.
+    Remove { id: String },
     /// Mark a rule MANDATORY (hard-denied by the PreToolUse hook when
     /// violated) or, with --off, demote it back to advisory.
     Enforce {
@@ -46,6 +47,7 @@ pub enum CoachingAction {
     },
 }
 
+/// Manage coaching rules nudged to agents mid-session.
 #[derive(Args)]
 pub struct CoachingArgs {
     #[command(subcommand)]

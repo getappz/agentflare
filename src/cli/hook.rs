@@ -2,19 +2,23 @@ use clap::{Args, Subcommand};
 
 #[derive(Subcommand)]
 pub enum HookEvent {
+    /// Fires when an agent session starts; injects the agentflare context banner.
     SessionStart {
         /// Omit to auto-detect the launching host (parent process walk + env fingerprints).
         #[arg(long, value_enum)]
         agent: Option<agent_registry::Agent>,
     },
+    /// Fires when the user submits a prompt; extracts intent and adds routing context.
     PromptSubmit {
         #[arg(long, value_enum)]
         agent: Option<agent_registry::Agent>,
     },
+    /// Fires before a tool call executes; can block/redirect via a hook decision.
     PreToolUse {
         #[arg(long, value_enum)]
         agent: Option<agent_registry::Agent>,
     },
+    /// Fires after a tool call fails; classifies the failure and nudges the agent, rate-limited.
     PostToolFailure {
         #[arg(long, value_enum)]
         agent: Option<agent_registry::Agent>,
@@ -36,6 +40,7 @@ pub enum HookEvent {
     },
 }
 
+/// Internal hook entry point invoked by an agent's lifecycle events. Not meant for direct use.
 #[derive(Args)]
 pub struct HookArgs {
     #[command(subcommand)]

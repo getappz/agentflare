@@ -697,11 +697,11 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ItemRequest {
     #[schemars(
-        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health|doctor"
+        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|redispatch|groom|standup|health|doctor"
     )]
     pub(crate) action: String,
     #[schemars(
-        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label"
+        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, redispatch"
     )]
     #[serde(default)]
     pub(crate) id: Option<String>,
@@ -730,7 +730,7 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) parent_id: Option<String>,
     #[schemars(
-        description = "Agent ID to assign (create, update), or to filter by (list — matches items assigned to this agent plus unassigned ones, sorted open+assigned-to-you first)"
+        description = "Agent ID to assign (create, update), or to filter by (list — matches items assigned to this agent plus unassigned ones, sorted open+assigned-to-you first). redispatch: optional override — omit to reuse the item's existing assignee_agent"
     )]
     #[serde(default)]
     pub(crate) assignee_agent: Option<String>,
@@ -805,10 +805,15 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) reclaim: Option<bool>,
     #[schemars(
-        description = "doctor only: with reclaim=true, also delete lanes flagged dirty (uncommitted changes). Default false."
+        description = "doctor only: with reclaim=true, also delete lanes flagged dirty (uncommitted changes). Default false. DANGEROUS when `worktree` is omitted: it force-deletes EVERY dirty lane in the repo, not just the one you're trying to fix — always pass `worktree` alongside `force=true` unless you genuinely intend a repo-wide sweep."
     )]
     #[serde(default)]
     pub(crate) force: Option<bool>,
+    #[schemars(
+        description = "doctor only: with reclaim=true, scope reclaim to a single lane by name (e.g. \"task/110\") or its worktree path. Omit to reclaim across every eligible lane repo-wide (the default). Strongly recommended whenever `force=true` is set, to avoid deleting unrelated dirty worktrees."
+    )]
+    #[serde(default)]
+    pub(crate) worktree: Option<String>,
 }
 
 /// Lean per-item projection for `item(list)` — the raw 19-field `Item` (full
@@ -1059,7 +1064,7 @@ pub(crate) struct SearchRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WorkflowRequest {
-    #[schemars(description = "Action: run|status|complete_event|list|list_definitions")]
+    #[schemars(description = "Action: run|status|complete_event|list|list_definitions|metrics")]
     pub(crate) action: String,
     #[schemars(
         description = "JSON workflow definition (run) — OpenFang-style {name, steps}. Alternative to workflow_name."
@@ -1093,4 +1098,17 @@ pub(crate) struct WorkflowRequest {
     )]
     #[serde(default)]
     pub(crate) db_path: Option<String>,
+    #[schemars(description = "Filter: only this workflow definition's runs (metrics, optional)")]
+    #[serde(default)]
+    pub(crate) workflow_id: Option<String>,
+    #[schemars(
+        description = "Filter: only runs in this status — pending|running|paused|completed|failed|cancelled (metrics, optional)"
+    )]
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[schemars(
+        description = "Filter: only runs created at or after this RFC 3339 timestamp (metrics, optional)"
+    )]
+    #[serde(default)]
+    pub(crate) since: Option<String>,
 }

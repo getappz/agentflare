@@ -840,11 +840,13 @@ impl AgentflareMcp {
                 }
             }
         }
+        let agent = crate::claims::agent_of(&owner);
         let pr_url = match (&item, &target_branch) {
             (Some(item), Some(target)) if should_push => PROGRESS_SENDER
                 .try_with(|ps| {
                     crate::worktree::push_and_open_pr(
                         item,
+                        agent,
                         &repo_root,
                         target,
                         ps.as_ref(),
@@ -852,7 +854,9 @@ impl AgentflareMcp {
                     )
                 })
                 .unwrap_or_else(|_| {
-                    crate::worktree::push_and_open_pr(item, &repo_root, target, None, summary)
+                    crate::worktree::push_and_open_pr(
+                        item, agent, &repo_root, target, None, summary,
+                    )
                 }),
             _ => None,
         };
@@ -1034,6 +1038,7 @@ impl AgentflareMcp {
         })??;
         if promoted {
             crate::worktree::cleanup_worktree(&item, &repo_root);
+            crate::worktree::relabel_pr_completed(&item, &repo_root);
         }
         Ok(serde_json::json!({"item_id": item_id, "promoted": promoted}).to_string())
     }
@@ -1129,6 +1134,48 @@ impl AgentflareMcp {
                 serde_json::json!({"removed": true, "item_id": item_id, "label_id": label_id})
                     .to_string(),
             )
+        })?
+    }
+
+    /// AI-agent-safe alternative to `agentflare work <id>` (which is
+    /// human-only-gated): re-arms a stuck or failed item so the daemon's own
+    /// supervisor discovery tick dispatches it, instead of the caller trying
+    /// to dispatch it directly. See `agentflare_backend::item::redispatch`
+    /// for exactly what it resets.
+    pub(crate) fn item_redispatch(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for redispatch", None))?;
+        if raw.trim().is_empty() {
+            return Err(ErrorData::invalid_params("id is required", None));
+        }
+        let assignee_agent = req.assignee_agent.clone();
+        self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
+            let outcome = agentflare_backend::item::redispatch(
+                conn,
+                &item_id,
+                assignee_agent.as_deref(),
+            )
+            .map_err(map_backend_err)?;
+            match outcome {
+                agentflare_backend::item::RedispatchOutcome::Ready { assignee_agent } => Ok(
+                    serde_json::json!({
+                        "item_id": item_id,
+                        "ready": true,
+                        "assignee_agent": assignee_agent,
+                    })
+                    .to_string(),
+                ),
+                agentflare_backend::item::RedispatchOutcome::NoAssignee => {
+                    Err(ErrorData::invalid_params(
+                        format!(
+                            "item {item_id} has no assignee_agent to redispatch to -- pass one explicitly (assignee_agent=\"claude-code\") or set it first via item(action=\"update\")"
+                        ),
+                        None,
+                    ))
+                }
+            }
         })?
     }
 
