@@ -840,11 +840,13 @@ impl AgentflareMcp {
                 }
             }
         }
+        let agent = crate::claims::agent_of(&owner);
         let pr_url = match (&item, &target_branch) {
             (Some(item), Some(target)) if should_push => PROGRESS_SENDER
                 .try_with(|ps| {
                     crate::worktree::push_and_open_pr(
                         item,
+                        agent,
                         &repo_root,
                         target,
                         ps.as_ref(),
@@ -852,7 +854,9 @@ impl AgentflareMcp {
                     )
                 })
                 .unwrap_or_else(|_| {
-                    crate::worktree::push_and_open_pr(item, &repo_root, target, None, summary)
+                    crate::worktree::push_and_open_pr(
+                        item, agent, &repo_root, target, None, summary,
+                    )
                 }),
             _ => None,
         };
@@ -1034,6 +1038,7 @@ impl AgentflareMcp {
         })??;
         if promoted {
             crate::worktree::cleanup_worktree(&item, &repo_root);
+            crate::worktree::relabel_pr_completed(&item, &repo_root);
         }
         Ok(serde_json::json!({"item_id": item_id, "promoted": promoted}).to_string())
     }

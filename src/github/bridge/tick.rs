@@ -516,6 +516,20 @@ fn record_claim(
         issue.number,
         &[format!("{CLAIMED_LABEL_PREFIX}{}", ctx.config.instance_id)],
     )?;
+    if let Err(e) = issues::add_labels(
+        &ctx.client,
+        &ctx.repo,
+        issue.number,
+        &[format!(
+            "beacon:{}",
+            crate::github::bridge::config::machine_label()
+        )],
+    ) {
+        eprintln!(
+            "github bridge: could not add beacon label to #{}: {e}",
+            issue.number
+        );
+    }
     Ok(true)
 }
 
@@ -875,6 +889,46 @@ mod tests {
         // been told to work it -- assignee stays the bridge's own instance
         // id, not a real dispatchable agent name.
         assert_eq!(item.assignee_agent.as_deref(), Some("me:1"));
+    }
+
+    #[test]
+    fn winning_a_claim_also_adds_the_beacon_label() {
+        crate::paths::test_support::with_temp_home(|| {
+            let server = MockServer::start(vec![
+                MockResponse::json(
+                    200,
+                    r#"[{"number":7,"html_url":"u","state":"open","title":"Do the thing","body":"","labels":[{"name":"agentflare"}],"author_association":"OWNER"}]"#,
+                ),
+                MockResponse::json(200, "[]"),
+                MockResponse::json(201, r#"{"id":100}"#),
+                MockResponse::json(
+                    200,
+                    &format!(
+                        r#"[{{"id":100,"user":{{"login":"u"}},"body":{}}}]"#,
+                        serde_json::to_string(&marker_body(Action::Claim, "me:1", NOW)).unwrap()
+                    ),
+                ),
+                MockResponse::json(200, r#"{"id":100}"#),
+                MockResponse::json(200, "[]"), // claimed: label
+                MockResponse::json(200, "[]"), // beacon: label
+            ]);
+            let (conn, project_id) = test_db();
+            let ctx = ctx_with_project(test_ctx(&server, 3), project_id.clone());
+            let report = run_once(&ctx, &conn, NOW).unwrap();
+
+            assert_eq!(report.claimed, vec![7]);
+            let reqs = server.requests();
+            let beacon_call = reqs
+                .iter()
+                .filter(|r| r.method == "POST" && r.path.ends_with("/issues/7/labels"))
+                .nth(1)
+                .expect("expected a second labels POST for the beacon label");
+            assert!(
+                beacon_call.body.contains("beacon:"),
+                "expected a beacon:<machine> label, got: {}",
+                beacon_call.body
+            );
+        });
     }
 
     #[test]

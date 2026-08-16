@@ -158,6 +158,99 @@ async fn loop_respects_max_iterations() {
 }
 
 #[tokio::test]
+async fn loop_iteration_retries_transient_failure_then_succeeds() {
+    // item #486: `execute_loop` used to ignore the step's `RetryPolicy`
+    // entirely, hard-failing the whole loop on the very first error.
+    let calls = Arc::new(AtomicU32::new(0));
+    let cc = Arc::clone(&calls);
+    let wf = WorkflowDefinition::new("wf", "wf").add_step(
+        StepDefinition::new(
+            "flaky",
+            "flaky",
+            Arc::new(FunctionStep::new(move |ctx: &mut WorkflowContext<Ctx>| {
+                let n = cc.fetch_add(1, Ordering::SeqCst);
+                let fail = n < 2;
+                if !fail {
+                    ctx.data.calls.push(format!("attempt{n}"));
+                    ctx.output = "Result: DONE".to_string();
+                }
+                Box::pin(async move {
+                    if fail {
+                        Err(WorkflowError::StepFailed {
+                            step_id: StepId::new("flaky"),
+                            message: "transient".into(),
+                        })
+                    } else {
+                        Ok(StepResult::Success)
+                    }
+                })
+            })),
+        )
+        .with_mode(StepMode::Loop {
+            max_iterations: 5,
+            until: "DONE".into(),
+        })
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Fixed(Duration::from_millis(1)),
+        }),
+    );
+    let state = run_and_wait(&engine(), wf).await;
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    // 2 failures + 1 success, all retried within the SAME loop iteration
+    // (the loop's iteration counter never advances on a retried attempt).
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(state.context.data.calls, vec!["attempt2"]);
+    assert!(state.input.contains("DONE"));
+}
+
+#[tokio::test]
+async fn loop_iteration_fails_after_exhausting_retries() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let cc = Arc::clone(&calls);
+    let wf = WorkflowDefinition::new("wf", "wf").add_step(
+        StepDefinition::new(
+            "always-fails",
+            "always-fails",
+            Arc::new(FunctionStep::new(move |_ctx: &mut WorkflowContext<Ctx>| {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    Err(WorkflowError::StepFailed {
+                        step_id: StepId::new("always-fails"),
+                        message: "always broken".into(),
+                    })
+                })
+            })),
+        )
+        .with_mode(StepMode::Loop {
+            max_iterations: 5,
+            until: "DONE".into(),
+        })
+        .with_retry(RetryPolicy {
+            max_attempts: 2,
+            backoff: BackoffStrategy::Fixed(Duration::from_millis(1)),
+        }),
+    );
+    let e = engine();
+    e.register_workflow(wf).unwrap();
+    let run = e
+        .start_workflow(WorkflowId::new("wf"), Ctx { calls: vec![] }, "seed".into())
+        .await
+        .unwrap();
+    let out = e
+        .wait_for_completion(run, "wf", Duration::from_secs(10))
+        .await;
+    assert!(out.is_err());
+
+    // Exactly `max_attempts` executor calls -- retries exhausted within
+    // the first iteration, no further iterations attempted, and it still
+    // terminates the workflow as a failure (preserving prior behavior).
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let state = e.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+}
+
+#[tokio::test]
 async fn fan_out_collect_joins_outputs() {
     let wf = WorkflowDefinition::new("wf", "wf")
         .add_step(producer("task-a".into(), "Done: Task A").with_mode(StepMode::FanOut))
