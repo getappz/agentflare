@@ -392,6 +392,21 @@ pub(crate) fn build_sdd_loop_step(
                 max: std::time::Duration::from_secs(30),
             },
         })
+        // `flare_workflow::WorkflowDefinition::new`'s builder default
+        // (300s) is `execute_loop`'s per-iteration cap (`loops.rs` wraps
+        // each iteration's `send` calls -- implementer/reviewer AND judge --
+        // in `tokio::time::timeout(step_timeout, ..)`), not a cap on the
+        // whole loop. A real implementer/reviewer/judge dispatch can
+        // legitimately run for the same order of magnitude as
+        // `supervisor::WORK_JOB_TIMEOUT_SECS` (the outer job's own hard-cap,
+        // itself sized off `WorkArgs::DEFAULT_TIMEOUT_SECS` plus margin --
+        // see that constant's doc comment), so reuse it here rather than
+        // leaving the 300s library default in place: anything shorter than
+        // the outer job timeout just moves the premature-kill point inward
+        // without fixing it.
+        .with_timeout(std::time::Duration::from_secs(
+            crate::supervisor::WORK_JOB_TIMEOUT_SECS,
+        ))
 }
 
 /// Wraps `execute_work`'s existing hold/`item_done`/comment/notify tail
@@ -1200,6 +1215,33 @@ mod pipeline_assembly_tests {
         assert_eq!(pipeline.steps[0].id.to_string(), "sdd_loop");
         assert_eq!(pipeline.steps[1].id.to_string(), "finalize");
         assert_eq!(pipeline.steps[1].depends_on, vec![StepId::new("sdd_loop")]);
+    }
+
+    /// Regression test: `sdd_loop`'s per-iteration engine timeout must not
+    /// fall back to `flare_workflow::WorkflowDefinition::new`'s 300s
+    /// library default -- a real implementer/reviewer/judge dispatch
+    /// routinely exceeds that, and `execute_loop` (`loops.rs`) kills the
+    /// whole iteration the instant it's hit ("Step timed out after 300s"),
+    /// which is exactly the failure every SDD-dispatched item hit before
+    /// this fix. It must instead line up with `supervisor::WORK_JOB_TIMEOUT_SECS`,
+    /// the outer job's own hard-cap budget this step runs inside.
+    #[test]
+    fn sdd_loop_timeout_matches_work_job_timeout_not_library_default() {
+        let send: flare_workflow::json::SendMessage =
+            std::sync::Arc::new(|_: flare_workflow::json::StepInvocation| {
+                Box::pin(async { Ok((String::new(), 0, 0)) })
+            });
+        let step = build_sdd_loop_step("agent".to_string(), "agent".to_string(), send);
+        let configured_timeout = step.timeout.expect("sdd_loop must set an explicit timeout");
+        assert_eq!(
+            configured_timeout,
+            std::time::Duration::from_secs(crate::supervisor::WORK_JOB_TIMEOUT_SECS)
+        );
+        assert_ne!(
+            configured_timeout,
+            std::time::Duration::from_secs(300),
+            "sdd_loop must not fall back to the flare-workflow library's 300s default"
+        );
     }
 }
 

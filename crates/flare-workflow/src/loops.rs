@@ -12,6 +12,7 @@ use tokio::time::timeout;
 
 use crate::definition::{StepDefinition, WorkflowDefinition};
 use crate::engine::WorkflowEngine;
+use crate::retry::{self, Backoff};
 use crate::store::StateStore;
 use crate::types::*;
 use crate::variables::capture_output;
@@ -81,7 +82,53 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 })
                 .await?;
 
-            let result = timeout(step_timeout, step.executor.execute(&mut context)).await;
+            // Retry the executor within this loop iteration per the step's
+            // `RetryPolicy` (falling back to the workflow's default, which
+            // is itself `max_attempts: 3` — see `RetryPolicy::default()`).
+            // Loop-mode steps used to ignore this entirely: `execute_loop`
+            // journaled and returned on the very first failure, so a
+            // step's configured retries never fired (item #486). Reuse the
+            // same in-memory `context` across attempts rather than
+            // reloading from `state_store` — a failed attempt's partial
+            // progress (e.g. `sdd_loop`'s role-agent reply already
+            // obtained before its judge call failed) isn't persisted
+            // either way, so keeping it in memory means a retry only
+            // redoes the part that actually failed.
+            let retry_policy = definition.get_retry_policy(step);
+            let max_retry_attempts = retry::effective_max_attempts(
+                retry_policy.max_attempts,
+                matches!(step.on_failure, FailureAction::RetryIndefinitely),
+            );
+            let mut backoff = Backoff::from_strategy(&retry_policy.backoff);
+            let mut retry_attempt = 1;
+            let result = loop {
+                let attempt_result =
+                    timeout(step_timeout, step.executor.execute(&mut context)).await;
+                let is_failure = matches!(
+                    attempt_result,
+                    Ok(Ok(StepResult::Failure)) | Ok(Err(_)) | Err(_)
+                );
+                if !is_failure {
+                    break attempt_result;
+                }
+                let retryable = match &attempt_result {
+                    Ok(Err(e)) => step.executor.is_retryable(e),
+                    Err(_) => true,
+                    _ => false,
+                };
+                if !retryable || retry_attempt >= max_retry_attempts {
+                    break attempt_result;
+                }
+                let delay = backoff
+                    .next(self.jitter)
+                    .unwrap_or_else(|| std::time::Duration::from_secs(1));
+                tracing::warn!(
+                    run_id = %run_id, step = %step.id, iter, retry_attempt, ?delay,
+                    "Loop iteration step failed, retrying"
+                );
+                tokio::time::sleep(delay).await;
+                retry_attempt += 1;
+            };
             let duration_ms = step_start.elapsed().as_millis() as u64;
 
             match result {

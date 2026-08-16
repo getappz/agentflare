@@ -4,6 +4,7 @@ use crate::error::Result;
 use crate::events;
 
 use super::crud::{get, update, update_state};
+use super::relations::{add_label, remove_label};
 use super::{UpdateItem, now, workspace_id_for_project};
 
 /// Outcome of a claim attempt — the raw lease `Acquire` plus the handoff
@@ -232,4 +233,102 @@ pub fn promote_in_review_to_completed(conn: &Connection, item_id: &str) -> Resul
     }
     tx.commit()?;
     Ok(true)
+}
+
+/// Labels the daemon's own `run_discovery_tick` (`src/supervisor.rs`)
+/// treats as part of a dispatch's lifecycle rather than a plain worklist
+/// marker — cleared on redispatch so a stale one left over from a failed
+/// attempt doesn't shadow the fresh `READY_LABEL` re-attached below.
+const REDISPATCH_CLEARED_LABELS: &[&str] = &["dispatched", "needs-manual-dispatch"];
+const READY_LABEL: &str = "ready-for-work";
+
+/// Outcome of `redispatch` — mirrors `ClaimOutcome`'s style of an
+/// informative non-error variant for "nothing to do" rather than
+/// forcing every caller through error-handling for an expected case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedispatchOutcome {
+    Ready { assignee_agent: String },
+    NoAssignee,
+}
+
+/// Re-arms a stuck or failed `ready-for-work` item for the daemon's own
+/// `run_discovery_tick` to pick back up, atomically: resets state to the
+/// project's "backlog" group, strips any `dispatched`/`needs-manual-dispatch`
+/// labels a previous failed attempt left behind, re-attaches
+/// `ready-for-work`, and normalizes `assignee_agent` to its canonical agent
+/// type via `agent_part` (stripping a stale claim's `<agent>:<instance>`
+/// suffix, which `run_discovery_tick`'s `resolve_confirmed_agent` can't
+/// match).
+///
+/// `agentflare work <id>` is deliberately human-only-gated — this is the
+/// AI-agent-safe alternative: it never claims or dispatches anything
+/// itself, only re-arms the item so the daemon's own supervisor does.
+/// Deliberately does NOT touch the claim ledger (`crate::claim`): a job
+/// that's still genuinely in flight should keep blocking a fresh dispatch
+/// rather than get raced by this.
+///
+/// Returns `NoAssignee` (not an error) when neither `assignee_agent` nor
+/// the item's existing one is available — the caller needs to supply one
+/// before this can do anything useful, but that's an ordinary expected
+/// case, not exceptional.
+pub fn redispatch(
+    conn: &Connection,
+    item_id: &str,
+    assignee_agent: Option<&str>,
+) -> Result<RedispatchOutcome> {
+    let tx = conn.unchecked_transaction()?;
+    let item = get(&tx, item_id)?;
+    let state = crate::state::get(&tx, &item.state_id)?;
+    if matches!(state.group_name.as_str(), "completed" | "cancelled") {
+        return Err(crate::error::Error::Validation(format!(
+            "item {item_id} is {}, not redispatchable",
+            state.group_name
+        )));
+    }
+
+    let agent = match assignee_agent
+        .or(item.assignee_agent.as_deref())
+        .map(agent_part)
+    {
+        Some(agent) => agent,
+        None => return Ok(RedispatchOutcome::NoAssignee),
+    };
+
+    let backlog_state = crate::state::first_in_group(&tx, &item.project_id, "backlog")?;
+    update_state(&tx, item_id, &backlog_state.id)?;
+    update(
+        &tx,
+        item_id,
+        UpdateItem {
+            assignee_agent: Some(agent.clone()),
+            ..Default::default()
+        },
+    )?;
+
+    let labels = crate::label::list_by_project(&tx, &item.project_id)?;
+    for label in &labels {
+        if REDISPATCH_CLEARED_LABELS.contains(&label.name.as_str()) {
+            remove_label(&tx, item_id, &label.id)?;
+        }
+    }
+    if let Some(ready) = labels.iter().find(|l| l.name == READY_LABEL) {
+        add_label(&tx, item_id, &ready.id)?;
+    }
+
+    if let Ok(item) = get(&tx, item_id)
+        && let Ok(wid) = workspace_id_for_project(&tx, &item.project_id)
+    {
+        events::emit(
+            &tx,
+            &wid,
+            "item",
+            "update",
+            serde_json::to_value(&item).unwrap_or_default(),
+        );
+    }
+
+    tx.commit()?;
+    Ok(RedispatchOutcome::Ready {
+        assignee_agent: agent,
+    })
 }
