@@ -1043,6 +1043,7 @@ impl AgentflareMcp {
         })??;
         if promoted {
             crate::worktree::cleanup_worktree(&item, &repo_root);
+            crate::worktree::relabel_pr_completed(&item, &repo_root);
         }
         Ok(serde_json::json!({"item_id": item_id, "promoted": promoted}).to_string())
     }

@@ -89,6 +89,53 @@ pub fn is_pr_merged(item: &agentflare_backend::item::Item, repo_root: &Path) -> 
     }
 }
 
+/// Swaps a merged PR's stage label from `agentflare:in-review` to
+/// `agentflare:completed` once `check_merge` has confirmed the merge and
+/// promoted the item in the DB. The `beacon:` machine label is left alone
+/// -- it identifies who did the work, not what stage it's in. Best-effort
+/// like the rest of this module: a label failure here must never undo (or
+/// even appear to block) a DB promotion that has already happened.
+pub fn relabel_pr_completed(item: &agentflare_backend::item::Item, repo_root: &Path) {
+    let branch = flare_git_core::worktree::task_branch_name(item);
+    let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
+        return;
+    };
+    let client = match crate::github::Client::new() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let pr = match crate::github::pulls::find_existing(&client, &repo, &branch) {
+        Ok(Some(pr)) => pr,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!(
+                "worktree: could not look up PR to relabel for item {}: {e}",
+                item.id
+            );
+            return;
+        }
+    };
+    if let Err(e) =
+        crate::github::issues::remove_label(&client, &repo, pr.number, "agentflare:in-review")
+    {
+        eprintln!(
+            "worktree: could not remove agentflare:in-review from PR #{}: {e}",
+            pr.number
+        );
+    }
+    if let Err(e) = crate::github::issues::add_labels(
+        &client,
+        &repo,
+        pr.number,
+        &["agentflare:completed".to_string()],
+    ) {
+        eprintln!(
+            "worktree: could not add agentflare:completed to PR #{}: {e}",
+            pr.number
+        );
+    }
+}
+
 /// CI signal the in-review sweep (`supervisor::run_review_sweep`, item #65)
 /// polls per item: merged (promote), failing (self-repair), or nothing
 /// actionable yet. `Unknown` covers every soft-fail case `is_pr_merged`
@@ -333,5 +380,34 @@ mod tests {
             pr_footer("claude-code", "kumar-laptop", 42),
             "---\n_Opened by `claude-code` on **kumar-laptop** for item #42 via agentflare._"
         );
+    }
+
+    #[test]
+    fn relabel_pr_completed_is_a_noop_without_a_resolvable_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = agentflare_backend::item::Item {
+            id: "item-1".into(),
+            project_id: "p".into(),
+            state_id: "s".into(),
+            name: "n".into(),
+            description: String::new(),
+            priority: "none".into(),
+            parent_id: None,
+            assignee_agent: None,
+            sequence_id: 9,
+            sort_order: 0.0,
+            started_at: None,
+            completed_at: None,
+            archived_at: None,
+            external_source: None,
+            external_id: None,
+            metadata: "{}".into(),
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        };
+        // No git repo at `dir.path()`, so `RepoId::resolve_from_remote`
+        // returns `None` -- must return without panicking.
+        relabel_pr_completed(&item, dir.path());
     }
 }
