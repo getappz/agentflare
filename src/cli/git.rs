@@ -961,6 +961,13 @@ fn changed_paths(repo_root: &Path, subcommand: &str) -> Result<Vec<String>, Stri
         }
         paths.sort();
         paths.dedup();
+        // Each diff above is capped individually, so a disjoint staged set
+        // and working-tree set can each land at `cap` and union past it --
+        // enforce the documented `MAX_CHANGED_PATHS` limit on the merged,
+        // deduplicated set too.
+        if paths.len() > cap {
+            return Err(too_many_paths_msg(cap));
+        }
         return Ok(paths);
     }
     let range_args: Vec<String> = match subcommand {

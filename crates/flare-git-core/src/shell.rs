@@ -214,12 +214,28 @@ pub fn run_in_lines_bounded(
     let mut child = cmd
         .spawn()
         .map_err(|e| BoundedLinesError::Git(format!("git not available: {e}")))?;
+    // Drain stderr on its own thread: reading stdout to EOF first would
+    // deadlock if git fills the stderr pipe buffer (~64 KiB) while this
+    // still-piped stdout read is blocked waiting for more lines.
+    let stderr_handle = child.stderr.take().map(|mut e| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = e.read_to_string(&mut buf);
+            buf
+        })
+    });
     let mut lines = Vec::new();
     let mut exceeded = false;
+    let mut read_err = None;
     if let Some(stdout) = child.stdout.take() {
         for line in BufReader::new(stdout).lines() {
-            let line = line
-                .map_err(|e| BoundedLinesError::Git(format!("reading git output failed: {e}")))?;
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    read_err = Some(format!("reading git output failed: {e}"));
+                    break;
+                }
+            };
             if line.is_empty() {
                 continue;
             }
@@ -230,18 +246,20 @@ pub fn run_in_lines_bounded(
             lines.push(line);
         }
     }
-    if exceeded {
+    if exceeded || read_err.is_some() {
         // Drain the pipe, else the child blocks forever on a full stdout
         // buffer and `wait()` never returns. Killing a read-only `git diff`
         // is safe.
         let _ = child.kill();
         let _ = child.wait();
+        if let Some(e) = read_err {
+            return Err(BoundedLinesError::Git(e));
+        }
         return Err(BoundedLinesError::TooManyLines);
     }
-    let mut stderr = String::new();
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut stderr);
-    }
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
     let status = child
         .wait()
         .map_err(|e| BoundedLinesError::Git(format!("waiting for git failed: {e}")))?;

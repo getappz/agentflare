@@ -560,4 +560,16 @@ fn crashed_scope_check_child_passes_through_with_a_warning_not_a_denial() {
     assert!(!stderr.contains("denied"), "{stderr}");
     let log = flare_git_core::shell::run_in(repo.path(), &["log", "--oneline", "-1"]).unwrap();
     assert!(log.contains("regression commit"), "{log}");
+
+    // The audit record must classify this as a scope-check crash, not a
+    // policy `Deny` -- otherwise the audit trail can't distinguish "tooling
+    // broke" from "a real denial happened", defeating the point of the
+    // dedicated `ScopeCheckError` disposition.
+    let audit_log = home
+        .path()
+        .join(".agentflare")
+        .join("audit")
+        .join("git.jsonl");
+    let audit_content = std::fs::read_to_string(&audit_log).expect("audit log must exist");
+    assert!(audit_content.contains("ScopeCheckError"), "{audit_content}");
 }
