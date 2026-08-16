@@ -27,7 +27,26 @@ fn try_lean_ctx_grep(dir: &Path, pattern: &str) -> Option<Vec<ConfirmHit>> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
+    // `lean-ctx grep` exits 0 even when it printed an error instead of a
+    // real result -- e.g. "ERROR: path escapes project root: ..." for a
+    // directory outside its configured roots (~/.config/lean-ctx/config.toml)
+    // exits 0 with that message as the only output. Trusting exit status
+    // alone would parse that as "0 matches, 0 hits" and silently skip the
+    // fallback scan instead of actually searching `dir`. Gate on the
+    // documented summary-line shape instead.
+    if !text.lines().next().is_some_and(is_grep_summary_line) {
+        return None;
+    }
     Some(parse_lean_ctx_grep_output(&text, dir))
+}
+
+/// Whether `line` looks like `lean-ctx grep`'s documented summary line
+/// (`"<N> match(es) ... <M> file(s)..."`) rather than an error message --
+/// checked structurally (leading digit) instead of matching literal wording,
+/// since the exact phrasing already varies between the "N matches in M
+/// files:" (hits) and "N matches for '<pattern>' in M files" (no hits) forms.
+fn is_grep_summary_line(line: &str) -> bool {
+    line.trim_start().starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// `lean-ctx grep` prints a `N matches in M files [...]:` summary line, then
@@ -125,6 +144,22 @@ mod tests {
     fn parses_empty_output_as_no_hits() {
         let hits = parse_lean_ctx_grep_output("0 matches in 0 files []:\n", Path::new("/ws"));
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn recognizes_both_documented_summary_line_shapes() {
+        assert!(is_grep_summary_line("17 matches in 1 files:"));
+        assert!(is_grep_summary_line("0 matches for '\\bfoo::' in 3 files"));
+    }
+
+    #[test]
+    fn rejects_an_error_message_exiting_zero_as_a_summary_line() {
+        // `lean-ctx grep` exits 0 even for a directory outside its
+        // configured project root, printing this message instead of a real
+        // summary -- must not be mistaken for "0 hits".
+        assert!(!is_grep_summary_line(
+            "ERROR: path escapes project root: /tmp/x (root: /repo)"
+        ));
     }
 
     #[test]
