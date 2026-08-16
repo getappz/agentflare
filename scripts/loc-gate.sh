@@ -37,6 +37,11 @@ ALLOWLIST=(
   # is worth doing but is a separate, larger refactor than a completion-
   # correctness fix should carry. Frozen at <= FROZEN_LIMIT.
   src/mcp_server/item.rs
+  # Already 1533 lines on master before item #490's `redispatch` action
+  # tests were added, same situation as item.rs above -- a small, scoped
+  # feature's own tests shouldn't have to carry a pre-existing test-module
+  # split. Frozen at <= FROZEN_LIMIT; a real split is separate work.
+  crates/agentflare-backend/src/item/tests.rs
 )
 
 cd "$(dirname "$0")/.."
