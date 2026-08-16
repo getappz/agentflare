@@ -191,16 +191,107 @@ struct ScopeCheckResult {
     reason: Option<String>,
 }
 
+/// Outcome of consulting `agentflare git scope-check`. Not a bare
+/// `Option<String>` deny-reason: `main` must be able to tell a genuine
+/// policy verdict (deny/pass) from a broken scope-check (crashed /
+/// unavailable), because the two must NOT be surfaced the same way (item
+/// #472). The scope-check protocol is: always exit 0, verdict lives in the
+/// JSON. Anything else means the check did not produce a verdict.
+#[derive(Debug)]
+enum ScopeCheckOutcome {
+    /// The check ran to completion and nothing is out of scope.
+    Pass,
+    /// Genuine policy denial: the check ran and returned `deny:true`.
+    Deny(String),
+    /// The check child ran but died before producing a verdict (e.g. an
+    /// OOM/abort, non-zero exit). Not a policy decision -- passed through
+    /// with a warning, since a transient tooling crash must not silently
+    /// transform into a denial that bricks the agent's push.
+    Crash(String),
+    /// The check could not be run at all, or its output was not a valid
+    /// verdict (binary missing, garbage output). Enforcement cannot run,
+    /// so the op is blocked (fail-closed, item #234) with a message that
+    /// is explicit about NOT being a policy denial.
+    Unavailable(String),
+}
+
+fn scope_check_crash_message(status_code: Option<i32>, stderr: &[u8]) -> String {
+    let code = status_code.map_or_else(|| "signal/killed".to_string(), |c| c.to_string());
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    if stderr.is_empty() {
+        format!(
+            "scope-check itself crashed before producing a verdict (exit {code}) -- this is NOT a policy denial; the git command passed through. Set AGENTFLARE_GIT_BYPASS=1 to bypass scope enforcement entirely."
+        )
+    } else {
+        format!(
+            "scope-check itself crashed before producing a verdict (exit {code}): {stderr} -- this is NOT a policy denial; the git command passed through. Set AGENTFLARE_GIT_BYPASS=1 to bypass scope enforcement entirely."
+        )
+    }
+}
+
+/// Interprets the child process's outcome per the scope-check contract
+/// (exit 0 + one JSON line; denial lives in the JSON, never the exit code).
+/// Split out from the spawning wrapper so it can be unit-tested against
+/// synthetic status/stdout/stderr.
+fn interpret_scope_check(
+    status_success: bool,
+    status_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> ScopeCheckOutcome {
+    if !status_success {
+        return ScopeCheckOutcome::Crash(scope_check_crash_message(status_code, stderr));
+    }
+    let stdout = String::from_utf8_lossy(stdout);
+    let result: ScopeCheckResult = match serde_json::from_str(stdout.trim()) {
+        Ok(r) => r,
+        Err(e) => {
+            return ScopeCheckOutcome::Unavailable(format!(
+                "scope-check returned unparseable output: {e} -- this is NOT a policy denial; set AGENTFLARE_GIT_BYPASS=1 to bypass scope enforcement entirely."
+            ));
+        }
+    };
+    if result.deny {
+        ScopeCheckOutcome::Deny(
+            result
+                .reason
+                .unwrap_or_else(|| "scope-check denied (no reason given)".to_string()),
+        )
+    } else {
+        ScopeCheckOutcome::Pass
+    }
+}
+
 /// Path-scope enforcement (item #234): shells out to `agentflare git
 /// scope-check`, since this shim has no direct DB access to live claims.
-/// Deliberately FAIL-CLOSED here, unlike the rest of this crate's fail-open
-/// default -- any error resolving scope (binary missing, bad JSON,
-/// non-zero exit) is treated as a deny. The existing bypass envs
-/// (`AGENTFLARE_GIT_BYPASS` and friends, checked earlier in `main`) remain
-/// the escape hatch for a broken/missing `agentflare` binary, same as any
-/// other misclassification.
-fn scope_check_deny_reason(subcommand: &str) -> Option<String> {
-    let mut cmd = std::process::Command::new("agentflare");
+/// Fail-closed on "scope-check cannot run at all" (binary missing,
+/// unparseable output) -- but fail-open on a mid-run crash (item #472): a
+/// crashed child never produced a policy verdict, so blocking the caller on
+/// it would surface a transient tooling failure identically to a real
+/// denial. The existing bypass envs (`AGENTFLARE_GIT_BYPASS` and friends,
+/// checked earlier in `main`) remain the escape hatch for a persistently
+/// broken `agentflare` binary, same as any other misclassification.
+fn scope_check_outcome(subcommand: &str) -> ScopeCheckOutcome {
+    // Test-only override for the scope-check binary, compiled out of release
+    // builds entirely (so the override can never exist in a shipped binary,
+    // regardless of env vars) and, in debug builds, honored only alongside
+    // `AGENTFLARE_HOME_OVERRIDE` (which is itself the test-mode marker this
+    // crate's tests set to keep the audit log out of the real home
+    // directory) so a stray env var can never silently redirect production
+    // scope-checks at an arbitrary binary. The integration tests use it to
+    // point the check at this shim binary itself, producing a genuine
+    // "child died without a verdict" crash.
+    #[cfg(debug_assertions)]
+    let bin = match (
+        env::var("AGENTFLARE_GIT_SCOPE_CHECK_BIN"),
+        env::var_os("AGENTFLARE_HOME_OVERRIDE"),
+    ) {
+        (Ok(b), Some(_)) if !b.is_empty() => b,
+        _ => "agentflare".to_string(),
+    };
+    #[cfg(not(debug_assertions))]
+    let bin = "agentflare".to_string();
+    let mut cmd = std::process::Command::new(&bin);
     cmd.args(["git", "scope-check", "--subcommand", subcommand]);
     // Runs on every git invocation through this shim; without this flag,
     // whenever the invoking parent has no inherited console (e.g. spawned by
@@ -215,46 +306,17 @@ fn scope_check_deny_reason(subcommand: &str) -> Option<String> {
     let output = match cmd.output() {
         Ok(o) => o,
         Err(e) => {
-            return Some(format!(
-                "scope-check FAILED TO RUN, not a policy denial ('agentflare' on PATH?): {e} -- \
-                 failing closed per this feature's spec; set AGENTFLARE_GIT_BYPASS=1 to get \
-                 unblocked while you diagnose, or to confirm this is the cause"
+            return ScopeCheckOutcome::Unavailable(format!(
+                "scope-check could not run ('agentflare' on PATH?): {e} -- this is NOT a policy denial; set AGENTFLARE_GIT_BYPASS=1 to bypass scope enforcement entirely."
             ));
         }
     };
-    if !output.status.success() {
-        return Some(format!(
-            "scope-check CRASHED (exit {}), not a policy denial -- the `agentflare git \
-             scope-check` subprocess itself failed to run to completion: {}. Failing closed per \
-             this feature's spec; set AGENTFLARE_GIT_BYPASS=1 to get unblocked while you \
-             diagnose, or to confirm this is the cause",
-            output
-                .status
-                .code()
-                .map_or_else(|| "unknown".to_string(), |c| c.to_string()),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let result: ScopeCheckResult = match serde_json::from_str(stdout.trim()) {
-        Ok(r) => r,
-        Err(e) => {
-            return Some(format!(
-                "scope-check returned unparseable output, not a policy denial: {e} -- failing \
-                 closed per this feature's spec; set AGENTFLARE_GIT_BYPASS=1 to get unblocked \
-                 while you diagnose, or to confirm this is the cause"
-            ));
-        }
-    };
-    if result.deny {
-        Some(
-            result
-                .reason
-                .unwrap_or_else(|| "scope-check denied (no reason given)".to_string()),
-        )
-    } else {
-        None
-    }
+    interpret_scope_check(
+        output.status.success(),
+        output.status.code(),
+        &output.stdout,
+        &output.stderr,
+    )
 }
 
 /// Hands off to the real git binary, first clearing `RECURSION_ENV`.
@@ -327,12 +389,15 @@ fn main() {
         run_real(&tool, filtered_path.as_ref(), &args);
     }
 
-    let cwd = env::current_dir().unwrap_or_default();
-    let Some(repo_root) = branch::repo_toplevel(&cwd) else {
-        // Not inside a git repo at all -- nothing to classify (e.g. `git
-        // init`, `git clone` into a fresh directory, `git --version`).
-        exec_real(&tool, filtered_path.as_ref(), &args);
-    };
+    // Parse global flags (and the escape-hatch flag) up front, BEFORE the
+    // "not in a repo" fast path below: a `git -C <repo> commit` invoked from
+    // a non-repository directory would otherwise skip straight to `exec_real`
+    // and bypass the mutating-command deny (CodeRabbit finding on #527).
+    let str_args: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let (subcommand_idx, escape_hatch) = parse_global_flags(&str_args);
 
     if bypass_active() {
         if let Some(audit_path) = audit::default_path("git.jsonl") {
@@ -349,17 +414,17 @@ fn main() {
         exec_real(&tool, filtered_path.as_ref(), &args);
     }
 
-    let str_args: Vec<String> = args
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let (subcommand_idx, escape_hatch) = parse_global_flags(&str_args);
-
     if escape_hatch {
         let is_read_only = subcommand_idx
             .map(|idx| str_args[idx].as_str())
             .is_some_and(|sc| READ_ONLY_ESCAPE_SUBCOMMANDS.contains(&sc));
-        if is_read_only {
+        // `diff`/`log`/`show` are nominally read-only, but each accepts
+        // `--output=<file>`, which writes the filesystem -- a "read-only"
+        // escape can't be allowed to mutate anything (CodeRabbit finding).
+        let writes_file = str_args
+            .iter()
+            .any(|a| a == "--output" || a.starts_with("--output="));
+        if is_read_only && !writes_file {
             exec_real(&tool, filtered_path.as_ref(), &args);
         }
         eprintln!(
@@ -368,6 +433,13 @@ fn main() {
         );
         exit(1);
     }
+
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(repo_root) = branch::repo_toplevel(&cwd) else {
+        // Not inside a git repo at all -- nothing to classify (e.g. `git
+        // init`, `git clone` into a fresh directory, `git --version`).
+        exec_real(&tool, filtered_path.as_ref(), &args);
+    };
 
     let Some(idx) = subcommand_idx else {
         exec_real(&tool, filtered_path.as_ref(), &args); // e.g. bare `git --version`
@@ -422,24 +494,69 @@ fn main() {
             );
             exit(1);
         }
+        classify::Disposition::ScopeCheckError { message } => {
+            // classify() never produces this disposition -- only the shim's
+            // own scope-check handling constructs it. If one ever leaks
+            // through here, fail closed with the message rather than guess.
+            eprintln!("agentflare git shim: denied — {message}");
+            exit(1);
+        }
         classify::Disposition::Deny { .. }
         | classify::Disposition::Passthrough
         | classify::Disposition::SilentExempt => {
-            if matches!(subcommand.as_str(), "commit" | "push")
-                && let Some(reason) = scope_check_deny_reason(&subcommand)
-            {
-                let scope_event = classify::Event {
-                    subcommand: subcommand.clone(),
-                    args: rest.clone(),
-                    disposition: classify::Disposition::Deny {
-                        reason: reason.clone(),
-                    },
-                };
-                if let Some(audit_path) = audit::default_path("git.jsonl") {
-                    let _ = audit::log_event(&audit_path, &scope_event);
+            if matches!(subcommand.as_str(), "commit" | "push") {
+                match scope_check_outcome(&subcommand) {
+                    ScopeCheckOutcome::Pass => {}
+                    ScopeCheckOutcome::Deny(reason) => {
+                        let scope_event = classify::Event {
+                            subcommand: subcommand.clone(),
+                            args: rest.clone(),
+                            disposition: classify::Disposition::Deny {
+                                reason: reason.clone(),
+                            },
+                        };
+                        if let Some(audit_path) = audit::default_path("git.jsonl") {
+                            let _ = audit::log_event(&audit_path, &scope_event);
+                        }
+                        eprintln!("agentflare git shim: denied — {reason}");
+                        exit(1);
+                    }
+                    ScopeCheckOutcome::Crash(msg) => {
+                        // The check died before reaching a verdict (item
+                        // #472) -- NOT a policy decision. Pass the op
+                        // through but surface + audit it so the failure is
+                        // not silent.
+                        let scope_event = classify::Event {
+                            subcommand: subcommand.clone(),
+                            args: rest.clone(),
+                            disposition: classify::Disposition::ScopeCheckError {
+                                message: msg.clone(),
+                            },
+                        };
+                        if let Some(audit_path) = audit::default_path("git.jsonl") {
+                            let _ = audit::log_event(&audit_path, &scope_event);
+                        }
+                        eprintln!("agentflare git shim: warning -- {msg}");
+                    }
+                    ScopeCheckOutcome::Unavailable(msg) => {
+                        // Scope enforcement cannot run at all (binary
+                        // missing, unparseable output): fail closed (item
+                        // #234), but phrased so it is unmistakably NOT a
+                        // policy verdict on the changes.
+                        let scope_event = classify::Event {
+                            subcommand: subcommand.clone(),
+                            args: rest.clone(),
+                            disposition: classify::Disposition::Deny {
+                                reason: msg.clone(),
+                            },
+                        };
+                        if let Some(audit_path) = audit::default_path("git.jsonl") {
+                            let _ = audit::log_event(&audit_path, &scope_event);
+                        }
+                        eprintln!("agentflare git shim: denied — {msg}");
+                        exit(1);
+                    }
                 }
-                eprintln!("agentflare git shim: denied — {reason}");
-                exit(1);
             }
             if snapshots_enabled() && classify::is_destructive(&subcommand, &rest) {
                 let reason = format!("pre-{subcommand} snapshot ({})", rest.join(" "));
@@ -459,6 +576,79 @@ fn main() {
                 eprintln!("agentflare git shim: warning -- {msg}");
             }
             exec_real(&tool, filtered_path.as_ref(), &args);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_zero_and_deny_false_is_a_pass() {
+        match interpret_scope_check(true, Some(0), br#"{"deny":false}"#, b"") {
+            ScopeCheckOutcome::Pass => {}
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exit_zero_and_deny_true_returns_the_reason() {
+        match interpret_scope_check(
+            true,
+            Some(0),
+            br#"{"deny":true,"reason":"overlapping claim"}"#,
+            b"",
+        ) {
+            ScopeCheckOutcome::Deny(reason) => assert_eq!(reason, "overlapping claim"),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exit_zero_and_deny_true_without_reason_has_a_default() {
+        match interpret_scope_check(true, Some(0), br#"{"deny":true}"#, b"") {
+            ScopeCheckOutcome::Deny(reason) => {
+                assert!(reason.contains("no reason given"), "{reason}")
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_zero_exit_is_a_crash_not_a_policy_denial() {
+        // The exact regression from issue #483 bug #2: the scope-check child
+        // OOM'd ("memory allocation of 6176784 bytes failed") and the shim
+        // surfaced it as if the policy had denied the push.
+        let stderr = b"memory allocation of 6176784 bytes failed";
+        match interpret_scope_check(false, None, b"", stderr) {
+            ScopeCheckOutcome::Crash(msg) => {
+                assert!(msg.contains("NOT a policy denial"), "{msg}");
+                assert!(msg.contains("memory allocation"), "{msg}");
+                assert!(msg.contains("passed through"), "{msg}");
+            }
+            other => panic!("expected Crash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn crash_message_without_stderr_still_explains_the_outcome() {
+        match interpret_scope_check(false, Some(134), b"", b"") {
+            ScopeCheckOutcome::Crash(msg) => {
+                assert!(msg.contains("exit 134"), "{msg}");
+                assert!(msg.contains("NOT a policy denial"), "{msg}");
+            }
+            other => panic!("expected Crash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exit_zero_with_garbage_stdout_is_unavailable_not_a_pass() {
+        match interpret_scope_check(true, Some(0), b"garbage", b"") {
+            ScopeCheckOutcome::Unavailable(msg) => {
+                assert!(msg.contains("NOT a policy denial"), "{msg}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
         }
     }
 }

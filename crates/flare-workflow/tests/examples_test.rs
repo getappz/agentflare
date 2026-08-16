@@ -148,6 +148,17 @@ async fn params_flow_through_to_prompt_expansion() {
 /// the conditional edge into `follow-up` correctly fires under the mock --
 /// this proves the conditional-gate mechanism itself, not just the happy
 /// path.
+///
+/// The fan_out sweeps use `error_mode: "skip"`, not `"retry"` (item #492,
+/// confirmed live against a real agent): a step's terminal failure only
+/// lands the whole workflow in `WorkflowStatus::Failed` when it lands in
+/// the engine's `failed` set, and `error_mode: "retry"`'s exhaustion does
+/// exactly that (`engine.rs` execute_workflow / execute_step_with_retry) --
+/// even though every downstream step still runs fine on the partial output,
+/// since `are_dependencies_satisfied` treats a skipped dependency the same
+/// as a completed one. `error_mode: "skip"` converts that same terminal
+/// failure into a `Skip` instead, so one slow/flaky source degrades the
+/// report instead of failing the whole run.
 #[tokio::test]
 async fn researcher_hand_port_compiles_and_runs() {
     let wf_json: JsonWorkflow = serde_json::from_str(
@@ -156,9 +167,9 @@ async fn researcher_hand_port_compiles_and_runs() {
             "description": "Structural port of OpenFang's bundled 'researcher' Hand onto flare-workflow's durable DAG engine.",
             "steps": [
                 {"name": "scope", "agent": "claude-code", "prompt": "Topic: {{input}}. Break this into 3-5 concrete sub-questions, and note which of three source types each depends on: general web, news, or academic literature.", "timeout_secs": 120, "error_mode": "retry", "max_retries": 1, "output_var": "brief"},
-                {"name": "web-sweep", "agent": "claude-code", "prompt": "Brief:\n{{brief}}\n\nUsing mcp__flare__search (type=web), answer the web-dependent sub-questions above, with a source URL per claim.", "mode": "fan_out", "timeout_secs": 240, "error_mode": "retry", "max_retries": 1},
-                {"name": "news-sweep", "agent": "claude-code", "prompt": "Brief:\n{{brief}}\n\nUsing mcp__flare__search (type=news), answer the news-dependent sub-questions above, with a source URL per claim.", "mode": "fan_out", "timeout_secs": 240, "error_mode": "retry", "max_retries": 1},
-                {"name": "academic-sweep", "agent": "claude-code", "prompt": "Brief:\n{{brief}}\n\nUsing mcp__flare__search (type=academic), answer the academic-dependent sub-questions above, with a source URL per claim.", "mode": "fan_out", "timeout_secs": 240, "error_mode": "retry", "max_retries": 1},
+                {"name": "web-sweep", "agent": "claude-code", "prompt": "Brief:\n{{brief}}\n\nUsing mcp__flare__search (type=web), answer the web-dependent sub-questions above, with a source URL per claim.", "mode": "fan_out", "timeout_secs": 240, "error_mode": "skip"},
+                {"name": "news-sweep", "agent": "claude-code", "prompt": "Brief:\n{{brief}}\n\nUsing mcp__flare__search (type=news), answer the news-dependent sub-questions above, with a source URL per claim.", "mode": "fan_out", "timeout_secs": 240, "error_mode": "skip"},
+                {"name": "academic-sweep", "agent": "claude-code", "prompt": "Brief:\n{{brief}}\n\nUsing mcp__flare__search (type=academic), answer the academic-dependent sub-questions above, with a source URL per claim.", "mode": "fan_out", "timeout_secs": 240, "error_mode": "skip"},
                 {"name": "gather-sources", "agent": "claude-code", "prompt": "unused (collect step is data-only)", "mode": "collect"},
                 {"name": "fact-check", "agent": "claude-code", "prompt": "Combined findings:\n\n{{input}}\n\nApply a CRAAP-test pass and cross-reference claims across sweeps. If any sub-question is still unresolved, end with the exact line 'FOLLOWUP_NEEDED: <what is missing>'. Otherwise end with 'FOLLOWUP_NOT_NEEDED'.", "timeout_secs": 200, "error_mode": "retry", "max_retries": 1, "output_var": "verified"},
                 {"name": "follow-up", "agent": "claude-code", "prompt": "Gap flagged:\n\n{{input}}\n\nRun one targeted follow-up search to resolve it.", "mode": {"conditional": {"condition": "FOLLOWUP_NEEDED"}}, "timeout_secs": 200, "error_mode": "skip", "output_var": "followup"},

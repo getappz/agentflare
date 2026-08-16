@@ -126,8 +126,20 @@ impl AgentflareMcp {
                 let owner = crate::claims::owner_id();
                 let now = crate::claims::now();
                 let ttl = crate::claims::ttl_secs();
-                Self::claim_confirm_or_steal(&conn, &repo, &target, &owner, now, ttl)?;
-                let ok = crate::claims::release(&conn, &repo, &target, &owner)
+                // Confirm-or-steal + release in ONE write transaction (IMMEDIATE
+                // so the write lock is taken up front) so a lease that goes stale
+                // between the confirm and the release can't be stolen by a
+                // concurrent owner, leaving their claim active while we report
+                // success (CodeRabbit finding on #527).
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                Self::claim_confirm_or_steal(&tx, &repo, &target, &owner, now, ttl)?;
+                let ok = crate::claims::release(&tx, &repo, &target, &owner)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                tx.commit()
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(
                     serde_json::json!({ "released": ok, "repo": repo, "target": target })
@@ -143,8 +155,16 @@ impl AgentflareMcp {
                 let owner = crate::claims::owner_id();
                 let now = crate::claims::now();
                 let ttl = crate::claims::ttl_secs();
-                Self::claim_confirm_or_steal(&conn, &repo, &target, &owner, now, ttl)?;
-                let ok = crate::claims::done(&conn, &repo, &target, &owner, now)
+                // Same single-write-transaction guarantee as `release` above.
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                Self::claim_confirm_or_steal(&tx, &repo, &target, &owner, now, ttl)?;
+                let ok = crate::claims::done(&tx, &repo, &target, &owner, now)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                tx.commit()
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(serde_json::json!({ "done": ok, "repo": repo, "target": target }).to_string())
             }
