@@ -319,7 +319,10 @@ pub fn push_and_open_pr(
                 &client,
                 &repo,
                 pr.number,
-                &["agentflare:in-review".to_string(), format!("beacon:{machine}")],
+                &[
+                    "agentflare:in-review".to_string(),
+                    format!("beacon:{machine}"),
+                ],
             ) {
                 eprintln!(
                     "worktree: could not label PR #{} for item {}: {e}",

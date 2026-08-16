@@ -855,12 +855,7 @@ impl AgentflareMcp {
                 })
                 .unwrap_or_else(|_| {
                     crate::worktree::push_and_open_pr(
-                        item,
-                        agent,
-                        &repo_root,
-                        target,
-                        None,
-                        summary,
+                        item, agent, &repo_root, target, None, summary,
                     )
                 }),
             _ => None,
