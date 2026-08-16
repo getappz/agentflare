@@ -323,20 +323,13 @@ fn resolve_agent(
     labels: &[String],
     config: &agent_registry::RouterConfig,
     installed: &[agent_registry::Agent],
-) -> Result<(agent_registry::Agent, String), String> {
+) -> Result<(agent_registry::Agent, String, Option<agent_registry::Agent>), String> {
     if let Some(name) = explicit {
         return agent_registry::agent_by_name(name)
-            .map(|agent| (agent, "explicit --agent flag".to_string()))
+            .map(|agent| (agent, "explicit --agent flag".to_string(), None))
             .ok_or_else(|| format!("unknown agent: {name} — use `agentflare agents list`"));
     }
 
-    // `assignee_agent` may carry an instance suffix (`<agent>:<instance>`)
-    // once the item has been claimed at least once — `item::claim` stores
-    // the raw claim owner there deliberately (see its doc comment). Strip it
-    // via the same `agent_part` the claim/handoff-freeze logic already uses
-    // internally, so a previously-claimed item still routes to its own
-    // assignee instead of silently falling through to the router's other
-    // rules.
     let assigned_agent = item
         .assignee_agent
         .as_deref()
@@ -350,13 +343,36 @@ fn resolve_agent(
         repo: None,
         assigned_agent,
     };
-    agent_registry::route(&task, config, installed)
-        .map(|decision| (decision.agent, decision.reason))
-        .ok_or_else(|| {
-            "no --agent given, and no route decision (item has no assignee and no router \
-             rule matched) — pass --agent explicitly"
-                .to_string()
-        })
+    let decision = agent_registry::route(&task, config, installed).ok_or_else(|| {
+        "no --agent given, and no route decision (item has no assignee and no router \
+         rule matched) — pass --agent explicitly"
+            .to_string()
+    })?;
+
+    // Usage-threshold fallback candidate: only meaningful when the primary
+    // decision landed on claude-code. Re-running `route()` with claude-code
+    // excluded from `installed` reuses the exact rule that matched this
+    // item (same `task`), so the fallback honors whatever `[router]`
+    // preference order the user configured instead of hardcoding an agent.
+    // The `!= ClaudeCode` filter catches the case where the primary
+    // decision was an explicit human pin (`assigned_agent`) — `route()`
+    // returns that unconditionally regardless of `installed`, so the
+    // second call would otherwise just return claude-code again and look
+    // like a real fallback when there isn't one.
+    let fallback_agent = if decision.agent == agent_registry::Agent::ClaudeCode {
+        let installed_minus_claude: Vec<_> = installed
+            .iter()
+            .copied()
+            .filter(|a| *a != agent_registry::Agent::ClaudeCode)
+            .collect();
+        agent_registry::route(&task, config, &installed_minus_claude)
+            .map(|d| d.agent)
+            .filter(|fb| *fb != agent_registry::Agent::ClaudeCode)
+    } else {
+        None
+    };
+
+    Ok((decision.agent, decision.reason, fallback_agent))
 }
 
 /// Best-effort backstop that releases `execute_work`'s claim on drop unless
@@ -763,7 +779,7 @@ fn execute_work_impl(
     } else {
         (Vec::new(), agent_registry::RouterConfig::default())
     };
-    let (agent_enum, route_reason) = match resolve_agent(
+    let (agent_enum, route_reason, _fallback_agent) = match resolve_agent(
         args.agent.as_deref(),
         &item_detail,
         &labels,
@@ -1033,7 +1049,8 @@ mod tests {
         let mut item = test_item();
         item.assignee_agent = Some("opencode".to_string());
         let config = agent_registry::RouterConfig::default();
-        let (agent, reason) = resolve_agent(Some("codex"), &item, &[], &config, &[]).unwrap();
+        let (agent, reason, _fallback) =
+            resolve_agent(Some("codex"), &item, &[], &config, &[]).unwrap();
         assert_eq!(agent, agent_registry::Agent::Codex);
         assert_eq!(reason, "explicit --agent flag");
     }
@@ -1044,7 +1061,7 @@ mod tests {
         // — the explicit path must accept it the same as assignee_agent does.
         let item = test_item();
         let config = agent_registry::RouterConfig::default();
-        let (agent, _) = resolve_agent(Some("claude"), &item, &[], &config, &[]).unwrap();
+        let (agent, _, _) = resolve_agent(Some("claude"), &item, &[], &config, &[]).unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
     }
 
@@ -1061,7 +1078,7 @@ mod tests {
         let mut item = test_item();
         item.assignee_agent = Some("claude".to_string()); // alias, agent_by_name() maps it
         let config = agent_registry::RouterConfig::default();
-        let (agent, reason) = resolve_agent(None, &item, &[], &config, &[]).unwrap();
+        let (agent, reason, _fallback) = resolve_agent(None, &item, &[], &config, &[]).unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
         assert_eq!(reason, "explicit assignment on task");
     }
@@ -1075,7 +1092,7 @@ mod tests {
         let mut item = test_item();
         item.assignee_agent = Some("claude-code:some-job-id".to_string());
         let config = agent_registry::RouterConfig::default();
-        let (agent, reason) = resolve_agent(None, &item, &[], &config, &[]).unwrap();
+        let (agent, reason, _fallback) = resolve_agent(None, &item, &[], &config, &[]).unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
         assert_eq!(reason, "explicit assignment on task");
     }
@@ -1108,7 +1125,7 @@ use  = "opencode"
 "#,
         )
         .unwrap();
-        let (agent, _) = resolve_agent(
+        let (agent, _, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -1132,7 +1149,7 @@ use  = "opencode"
 "#,
         )
         .unwrap();
-        let (agent, _) = resolve_agent(
+        let (agent, _, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -1141,6 +1158,138 @@ use  = "opencode"
         )
         .unwrap();
         assert_eq!(agent, agent_registry::Agent::Opencode);
+    }
+
+    #[test]
+    fn resolve_agent_fallback_is_none_when_explicit_flag_used() {
+        let item = test_item();
+        let config = agent_registry::parse_router_config(
+            r#"
+[router]
+[[router.rule]]
+when = { size = "S" }
+use  = "opencode"
+"#,
+        )
+        .unwrap();
+        let (agent, _, fallback) = resolve_agent(
+            Some("claude"),
+            &item,
+            &[],
+            &config,
+            &[
+                agent_registry::Agent::ClaudeCode,
+                agent_registry::Agent::Opencode,
+            ],
+        )
+        .unwrap();
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+        assert_eq!(fallback, None);
+    }
+
+    #[test]
+    fn resolve_agent_fallback_is_none_when_item_assignee_pins_claude_code() {
+        let mut item = test_item();
+        item.assignee_agent = Some("claude-code".to_string());
+        let config = agent_registry::RouterConfig::default();
+        let (agent, _, fallback) = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &[
+                agent_registry::Agent::ClaudeCode,
+                agent_registry::Agent::Opencode,
+            ],
+        )
+        .unwrap();
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+        assert_eq!(
+            fallback, None,
+            "an explicit item assignment must not produce a usage-fallback candidate"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_fallback_picks_the_next_installed_router_preference() {
+        let mut item = test_item();
+        item.metadata = r#"{"size":"S"}"#.to_string();
+        let config = agent_registry::parse_router_config(
+            r#"
+[router]
+[[router.rule]]
+when = { size = "S" }
+use  = ["claude-code", "codex", "opencode"]
+"#,
+        )
+        .unwrap();
+        let (agent, _, fallback) = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &[
+                agent_registry::Agent::ClaudeCode,
+                agent_registry::Agent::Opencode,
+            ],
+        )
+        .unwrap();
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+        assert_eq!(
+            fallback,
+            Some(agent_registry::Agent::Opencode),
+            "codex isn't installed, so opencode (next in the rule's preference list) is the fallback"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_fallback_is_none_when_nothing_else_is_installed() {
+        let mut item = test_item();
+        item.metadata = r#"{"size":"S"}"#.to_string();
+        let config = agent_registry::parse_router_config(
+            r#"
+[router]
+[[router.rule]]
+when = { size = "S" }
+use  = "claude-code"
+"#,
+        )
+        .unwrap();
+        let (agent, _, fallback) = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &[agent_registry::Agent::ClaudeCode],
+        )
+        .unwrap();
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+        assert_eq!(fallback, None);
+    }
+
+    #[test]
+    fn resolve_agent_fallback_is_none_when_primary_decision_is_not_claude_code() {
+        let mut item = test_item();
+        item.metadata = r#"{"size":"S"}"#.to_string();
+        let config = agent_registry::parse_router_config(
+            r#"
+[router]
+[[router.rule]]
+when = { size = "S" }
+use  = "opencode"
+"#,
+        )
+        .unwrap();
+        let (agent, _, fallback) = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &[agent_registry::Agent::Opencode],
+        )
+        .unwrap();
+        assert_eq!(agent, agent_registry::Agent::Opencode);
+        assert_eq!(fallback, None);
     }
 
     #[test]
