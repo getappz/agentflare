@@ -541,7 +541,8 @@ pub(crate) fn build_finalize_step(
 /// the test seam.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_work_item_pipeline(
-    agent: agent_registry::Agent,
+    implementer_agent: agent_registry::Agent,
+    review_agent: agent_registry::Agent,
     item_description: String,
     plan_doc: Option<String>,
     mcp: std::sync::Arc<AgentflareMcp>,
@@ -553,7 +554,8 @@ pub(crate) fn build_work_item_pipeline(
     extra_args: Vec<String>,
 ) -> flare_workflow::WorkflowDefinition<WorkItemData> {
     build_work_item_pipeline_with_sender(
-        agent,
+        implementer_agent,
+        review_agent,
         item_description,
         plan_doc,
         mcp,
@@ -614,7 +616,8 @@ fn real_agent_send_hook(
 /// before `start_workflow`; see that function).
 #[allow(clippy::too_many_arguments)]
 fn build_work_item_pipeline_with_sender(
-    agent: agent_registry::Agent,
+    implementer_agent: agent_registry::Agent,
+    review_agent: agent_registry::Agent,
     _item_description: String,
     _plan_doc: Option<String>,
     mcp: std::sync::Arc<AgentflareMcp>,
@@ -623,8 +626,11 @@ fn build_work_item_pipeline_with_sender(
     notify_recipient: Option<String>,
     send: flare_workflow::json::SendMessage,
 ) -> flare_workflow::WorkflowDefinition<WorkItemData> {
-    let agent_name = agent.as_str().to_string();
-    let sdd_loop = build_sdd_loop_step(agent_name.clone(), agent_name, send);
+    let sdd_loop = build_sdd_loop_step(
+        implementer_agent.as_str().to_string(),
+        review_agent.as_str().to_string(),
+        send,
+    );
     let finalize =
         build_finalize_step(mcp, item_id, notify_recipient, owner).depends_on(&["sdd_loop"]);
 
@@ -673,7 +679,8 @@ pub(crate) fn engine() -> &'static WorkflowEngine<WorkItemData, SqliteStore<Work
 pub(crate) fn run_or_resume(
     mcp: std::sync::Arc<AgentflareMcp>,
     item: &agentflare_backend::item::Item,
-    agent: agent_registry::Agent,
+    implementer_agent: agent_registry::Agent,
+    review_agent: agent_registry::Agent,
     item_description: String,
     plan_doc: Option<String>,
     notify_recipient: Option<String>,
@@ -684,7 +691,8 @@ pub(crate) fn run_or_resume(
     run_or_resume_with_sender(
         mcp,
         item,
-        agent,
+        implementer_agent,
+        review_agent,
         item_description,
         plan_doc,
         notify_recipient,
@@ -697,10 +705,12 @@ pub(crate) fn run_or_resume(
 /// `pub(crate)`: reused by `cli::work`'s own `execute_work` integration
 /// test, a sibling module that needs to inject a mock sender the same way
 /// this file's own tests do.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_or_resume_with_sender(
     mcp: std::sync::Arc<AgentflareMcp>,
     item: &agentflare_backend::item::Item,
-    agent: agent_registry::Agent,
+    implementer_agent: agent_registry::Agent,
+    review_agent: agent_registry::Agent,
     item_description: String,
     plan_doc: Option<String>,
     notify_recipient: Option<String>,
@@ -734,7 +744,8 @@ pub(crate) fn run_or_resume_with_sender(
     // re-resolving `owner_id()` itself.
     let owner = crate::claims::owner_id();
     let definition = build_work_item_pipeline_with_sender(
-        agent,
+        implementer_agent,
+        review_agent,
         item_description,
         plan_doc,
         mcp.clone(),
@@ -1129,6 +1140,7 @@ mod tests {
                 mcp.clone(),
                 &item,
                 agent_registry::Agent::ClaudeCode,
+                agent_registry::Agent::ClaudeCode,
                 "implement it".to_string(),
                 None,
                 None,
@@ -1198,6 +1210,7 @@ mod tests {
                 mcp.clone(),
                 &item,
                 agent_registry::Agent::ClaudeCode,
+                agent_registry::Agent::ClaudeCode,
                 "implement it".to_string(),
                 None,
                 None,
@@ -1235,6 +1248,7 @@ mod pipeline_assembly_tests {
             });
         let pipeline = build_work_item_pipeline_with_sender(
             agent_registry::Agent::ClaudeCode,
+            agent_registry::Agent::ClaudeCode,
             "Fix the null pointer in parser.rs".to_string(),
             None,
             std::sync::Arc::new(AgentflareMcp::default()),
@@ -1247,6 +1261,42 @@ mod pipeline_assembly_tests {
         assert_eq!(pipeline.steps[0].id.to_string(), "sdd_loop");
         assert_eq!(pipeline.steps[1].id.to_string(), "finalize");
         assert_eq!(pipeline.steps[1].depends_on, vec![StepId::new("sdd_loop")]);
+    }
+
+    #[tokio::test]
+    async fn sdd_loop_dispatches_implementer_and_review_roles_on_their_own_agents() {
+        let (send, calls) = super::sdd_test_support::mock_send(vec![
+            "DONE: added the flag",
+            r#"{"action":"advance_task","rationale":"looks done","ledger_line":"Task 0: implementer done","task_model_tier":null}"#,
+        ]);
+        let pipeline = build_work_item_pipeline_with_sender(
+            agent_registry::Agent::Opencode,
+            agent_registry::Agent::ClaudeCode,
+            "Fix the null pointer in parser.rs".to_string(),
+            None,
+            std::sync::Arc::new(AgentflareMcp::default()),
+            "item-1".to_string(),
+            "opencode:test".to_string(),
+            None,
+            send,
+        );
+        let mut ctx =
+            WorkflowContext::new(Default::default(), super::sdd_test_support::one_task_data());
+        pipeline.steps[0]
+            .executor
+            .execute(&mut ctx)
+            .await
+            .expect("executes");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded[0].0, "opencode",
+            "implementer role must dispatch on implementer_agent"
+        );
+        assert_eq!(
+            recorded[1].0, "claude-code",
+            "judge role must dispatch on review_agent"
+        );
     }
 
     /// Regression test: `sdd_loop`'s per-iteration engine timeout must not
