@@ -248,6 +248,12 @@ pub(crate) fn build_sdd_loop_step(
 
                 // 1. Role dispatch — state read from ctx.data decides which
                 // role plays this turn.
+                // Reviewer branches (task-reviewer, re-reviewer) dispatch on
+                // `judge_agent_name`, not `agent_name` — that's the agent
+                // reserved for every non-implementer role (see the judge
+                // dispatch further down), so a usage-threshold fallback that
+                // swaps `agent_name` to another CLI still leaves real code
+                // review running on the reserved agent.
                 let (role_agent, role_prompt) = if ctx.data.review_issues.is_some() {
                     if ctx.data.last_report.is_some() {
                         // A fix has already been submitted for the current
@@ -255,7 +261,7 @@ pub(crate) fn build_sdd_loop_step(
                         let findings = ctx.data.review_issues.clone().unwrap_or_default();
                         let fix_report = ctx.data.last_report.clone().unwrap_or_default();
                         (
-                            agent_name.clone(),
+                            judge_agent_name.clone(),
                             build_re_reviewer_prompt(&task, &findings, &fix_report),
                         )
                     } else {
@@ -271,7 +277,7 @@ pub(crate) fn build_sdd_loop_step(
                     // No open issues; a report is pending review.
                     let report = ctx.data.last_report.clone().unwrap_or_default();
                     (
-                        agent_name.clone(),
+                        judge_agent_name.clone(),
                         build_task_reviewer_prompt(&task, &report),
                     )
                 } else {
@@ -1593,6 +1599,54 @@ mod sdd_loop_tests {
         assert_eq!(
             ctx.data.ledger,
             vec!["Task 0: implementer done".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_reviewer_dispatches_on_the_judge_agent_not_the_implementer_agent() {
+        let (send, calls) = mock_send(vec![
+            "REVIEW_APPROVED",
+            r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#,
+        ]);
+        let mut data = one_task_data();
+        // A non-empty `last_report` with no open `review_issues` routes this
+        // iteration to the task-reviewer, not the implementer.
+        data.last_report = Some("DONE: added the flag".to_string());
+        let step = sdd_step(send);
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+        step.executor.execute(&mut ctx).await.expect("executes");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded[0].0, "judge-agent",
+            "task-reviewer must dispatch on the reserved judge/review agent, not the implementer agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_reviewer_dispatches_on_the_judge_agent_not_the_implementer_agent() {
+        let (send, calls) = mock_send(vec![
+            "REVIEW_ISSUES: missing null check on line 12",
+            r#"{"action":"fix_round","rationale":"issues found","ledger_line":"Task 0: fix round 1","task_model_tier":null}"#,
+            "DONE: added the null check",
+            r#"{"action":"continue_task","rationale":"awaiting re-review","ledger_line":"Task 0: fix submitted","task_model_tier":null}"#,
+            "REVIEW_APPROVED",
+            r#"{"action":"advance_task","rationale":"fix verified","ledger_line":"Task 0: complete","task_model_tier":null}"#,
+        ]);
+        let mut data = one_task_data();
+        data.last_report = Some("DONE: initial attempt".to_string());
+        let step = sdd_step(send);
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+
+        step.executor.execute(&mut ctx).await.expect("round 1"); // task-reviewer -> fix_round
+        step.executor.execute(&mut ctx).await.expect("round 2"); // implementer -> continue_task
+        step.executor.execute(&mut ctx).await.expect("round 3"); // re-reviewer
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 6);
+        assert_eq!(
+            recorded[4].0, "judge-agent",
+            "re-reviewer must dispatch on the reserved judge/review agent, not the implementer agent"
         );
     }
 
