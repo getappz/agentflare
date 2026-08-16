@@ -47,9 +47,21 @@ pub const WORKTREE_PRUNE_COMMAND: &str = "agentflare git audit prune --all";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Disposition {
     Passthrough,
-    RedirectToWorktree { path: PathBuf },
+    RedirectToWorktree {
+        path: PathBuf,
+    },
     SilentExempt,
-    Deny { reason: String },
+    Deny {
+        reason: String,
+    },
+    /// The scope-check subprocess itself failed to reach a verdict (crashed,
+    /// could not be spawned, or returned garbage) -- distinct from `Deny`,
+    /// which is a deliberate policy verdict. Kept as its own serialized
+    /// variant so the audit trail can tell "policy denied" apart from
+    /// "scope-check itself broke" (item #472).
+    ScopeCheckError {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
