@@ -517,3 +517,59 @@ fn push_of_default_branch_is_denied_for_agent_but_passes_through_for_a_human() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stderr.contains("denied"), "{stderr}");
 }
+
+/// The exact issue #483 bug #2 regression: when the `agentflare git
+/// scope-check` child crashes, the shim must NOT surface it as a policy
+/// denial that blocks the git operation -- it warns, audits, and passes
+/// through so the legitimate commit can proceed.
+///
+/// The scope-check child is normally spawned as `Command::new("agentflare")`.
+/// `AGENTFLARE_GIT_SCOPE_CHECK_BIN` (honored only alongside the test-mode
+/// `AGENTFLARE_HOME_OVERRIDE`) repoints that spawn at this shim binary
+/// itself: asked for the `git scope-check` subcommand it doesn't recognize,
+/// it passes through to real git (`git git scope-check ...`), which exits
+/// non-zero with an unknown-command error -- a scope-check child that died
+/// without ever producing a verdict, exactly the crash shape issue #483
+/// bug #2 reported.
+#[test]
+fn crashed_scope_check_child_passes_through_with_a_warning_not_a_denial() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+
+    // Seed a tracked file, then modify it so `commit -a` has something to
+    // commit (untracked files are ignored by `commit -a`).
+    std::fs::write(repo.path().join("work.txt"), "v1\n").unwrap();
+    flare_git_core::shell::run_in(repo.path(), &["add", "work.txt"]).unwrap();
+    flare_git_core::shell::run_in(repo.path(), &["commit", "-q", "-m", "seed work"]).unwrap();
+    std::fs::write(repo.path().join("work.txt"), "v2\n").unwrap();
+
+    let shim_exe = env!("CARGO_BIN_EXE_git");
+    let out = Command::new(shim_exe)
+        .args(["commit", "-a", "-m", "regression commit"])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("CLAUDECODE", "1")
+        .env("AGENTFLARE_GIT_SCOPE_CHECK_BIN", shim_exe)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{out:?}");
+    assert!(stderr.contains("NOT a policy denial"), "{stderr}");
+    assert!(stderr.contains("scope-check itself crashed"), "{stderr}");
+    assert!(!stderr.contains("denied"), "{stderr}");
+    let log = flare_git_core::shell::run_in(repo.path(), &["log", "--oneline", "-1"]).unwrap();
+    assert!(log.contains("regression commit"), "{log}");
+
+    // The audit record must classify this as a scope-check crash, not a
+    // policy `Deny` -- otherwise the audit trail can't distinguish "tooling
+    // broke" from "a real denial happened", defeating the point of the
+    // dedicated `ScopeCheckError` disposition.
+    let audit_log = home
+        .path()
+        .join(".agentflare")
+        .join("audit")
+        .join("git.jsonl");
+    let audit_content = std::fs::read_to_string(&audit_log).expect("audit log must exist");
+    assert!(audit_content.contains("ScopeCheckError"), "{audit_content}");
+}
