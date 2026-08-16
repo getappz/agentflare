@@ -350,6 +350,176 @@ pub(crate) async fn list_workflows_async(db_path: &Path) -> Result<Vec<serde_jso
         .collect())
 }
 
+/// Aggregate instance/step metrics (counts by status, average duration,
+/// token totals, per-step breakdown) across runs matching the given filters
+/// — the visibility the engine already computes (see
+/// `flare_workflow::types::WorkflowMetrics`) but that, until now, had no
+/// caller outside `flare-workflow`'s own tests. Sync wrapper — see
+/// [`workflow_metrics_async`].
+pub fn workflow_metrics(
+    workflow_id: Option<&str>,
+    status: Option<&str>,
+    since: Option<&str>,
+    db_path: &Path,
+) -> Result<serde_json::Value, String> {
+    WORKFLOW_RT.block_on(workflow_metrics_async(workflow_id, status, since, db_path))
+}
+
+pub(crate) async fn workflow_metrics_async(
+    workflow_id: Option<&str>,
+    status: Option<&str>,
+    since: Option<&str>,
+    db_path: &Path,
+) -> Result<serde_json::Value, String> {
+    let filter = flare_workflow::types::MetricsFilter {
+        workflow_id: workflow_id.map(WorkflowId::new),
+        status: status.map(parse_status_str).transpose()?,
+        since: since
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .map_err(|e| format!("invalid 'since' timestamp '{s}' (want RFC 3339): {e}"))
+            })
+            .transpose()?,
+    };
+
+    let store = open_store(db_path)?;
+    let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
+    let metrics = engine.metrics(filter).await.map_err(|e| e.to_string())?;
+
+    // Counts alone don't say *why* something failed; a caller filtering out
+    // failures entirely (e.g. status=completed) has no use for this list, so
+    // skip the extra query in that case.
+    let recent_failures = if status.is_none_or(|s| s == "failed") {
+        recent_failures_async(workflow_id, since, 5, db_path).await?
+    } else {
+        Vec::new()
+    };
+
+    let step_breakdown: std::collections::BTreeMap<String, serde_json::Value> = metrics
+        .step_breakdown
+        .iter()
+        .map(|(step_id, sm)| {
+            let counts: std::collections::BTreeMap<&str, u64> = sm
+                .counts_by_status
+                .iter()
+                .map(|(k, v)| (step_status_str(k), *v))
+                .collect();
+            (
+                step_id.to_string(),
+                serde_json::json!({
+                    "counts_by_status": counts,
+                    "avg_duration_ms": sm.avg_duration_ms,
+                }),
+            )
+        })
+        .collect();
+    let counts_by_status: std::collections::BTreeMap<&str, u64> = metrics
+        .counts_by_status
+        .iter()
+        .map(|(k, v)| (status_str(k), *v))
+        .collect();
+
+    Ok(serde_json::json!({
+        "counts_by_status": counts_by_status,
+        "avg_duration_ms": metrics.avg_duration_ms,
+        "total_input_tokens": metrics.total_input_tokens,
+        "total_output_tokens": metrics.total_output_tokens,
+        "step_breakdown": step_breakdown,
+        "recent_failures": recent_failures,
+    }))
+}
+
+/// The most recent `limit` failed runs (optionally scoped by `workflow_id`
+/// / `since`, same as `MetricsFilter`), each with its failing step and that
+/// step's actual error message — the "why", which the aggregate counts in
+/// `workflow_metrics` alone can't answer.
+///
+/// Queries `workflow_runs`/`step_state` directly by raw SQL rather than
+/// going through `StateStore::list_all::<D>()` — this store is shared by
+/// several distinct `WorkflowData` types (`PipelineData`, `WorkItemData`,
+/// ...), and deserializing through a fixed `D` silently skips every run of
+/// a different type (see the 2026-08-16 `list_active`/`list_all`
+/// cross-type fix). `workflow_metrics`'s own SQL aggregation already takes
+/// this same type-agnostic approach for the same reason.
+async fn recent_failures_async(
+    workflow_id: Option<&str>,
+    since: Option<&str>,
+    limit: usize,
+    db_path: &Path,
+) -> Result<Vec<serde_json::Value>, String> {
+    let since_dt = since
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| format!("invalid 'since' timestamp '{s}' (want RFC 3339): {e}"))
+        })
+        .transpose()?;
+
+    let conn =
+        rusqlite::Connection::open(db_path).map_err(|e| format!("open workflows db: {e}"))?;
+
+    let mut where_clauses = vec![
+        "wr.status = 'failed'".to_string(),
+        "ss.status = 'failed'".to_string(),
+    ];
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(w) = workflow_id {
+        where_clauses.push("wr.workflow_id = ?".to_string());
+        params.push(Box::new(w.to_string()));
+    }
+    if let Some(dt) = since_dt {
+        where_clauses.push("wr.updated_at >= ?".to_string());
+        params.push(Box::new(dt.to_rfc3339()));
+    }
+    params.push(Box::new(limit as i64));
+
+    let sql = format!(
+        "SELECT wr.id, wr.workflow_id, wr.updated_at, ss.step_id, ss.last_error
+         FROM workflow_runs wr JOIN step_state ss ON wr.id = ss.run_id
+         WHERE {}
+         ORDER BY wr.updated_at DESC
+         LIMIT ?",
+        where_clauses.join(" AND ")
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("prepare recent failures query: {e}"))?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(params.iter().map(std::convert::AsRef::as_ref)),
+            |row| {
+                Ok(serde_json::json!({
+                    "run_id": row.get::<_, String>(0)?,
+                    "workflow_id": row.get::<_, String>(1)?,
+                    "updated_at": row.get::<_, String>(2)?,
+                    "failing_step": row.get::<_, String>(3)?,
+                    "failing_step_error": row.get::<_, Option<String>>(4)?,
+                }))
+            },
+        )
+        .map_err(|e| format!("recent failures query: {e}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("recent failures row: {e}"))
+}
+
+/// Parse a status filter string (same spellings `status_str` produces) into
+/// a `WorkflowStatus` — the reverse of `status_str`.
+fn parse_status_str(s: &str) -> Result<WorkflowStatus, String> {
+    match s {
+        "pending" => Ok(WorkflowStatus::Pending),
+        "running" => Ok(WorkflowStatus::Running),
+        "paused" => Ok(WorkflowStatus::Paused),
+        "completed" => Ok(WorkflowStatus::Completed),
+        "failed" => Ok(WorkflowStatus::Failed),
+        "cancelled" => Ok(WorkflowStatus::Cancelled),
+        other => Err(format!(
+            "unknown status '{other}' (want one of: pending, running, paused, completed, failed, cancelled)"
+        )),
+    }
+}
+
 /// Resolve a pending `WaitEvent` on a run. Sync wrapper — see
 /// [`complete_workflow_event_async`].
 pub fn complete_workflow_event(
@@ -468,6 +638,73 @@ mod tests {
         let runs = list_workflows(&db).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0]["status"], "completed");
+    }
+
+    #[test]
+    fn workflow_metrics_reports_counts_and_recent_failure_error_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wf.db");
+
+        let failing_send: SendMessage = Arc::new(|_inv| {
+            Box::pin(async move { Err("boom: simulated step failure".to_string()) })
+        });
+
+        let (run_id, workflow_id) = run_workflow_json_with_sender(
+            r#"{
+                "name": "flaky",
+                "steps": [
+                    {"name": "a", "agent": "opencode", "prompt": "Do: {{input}}"}
+                ]
+            }"#,
+            "seed",
+            &db,
+            failing_send,
+        )
+        .unwrap();
+
+        let rt = blocking_runtime();
+        rt.block_on(async {
+            for _ in 0..200 {
+                let store = SqliteStore::<PipelineData>::open_file(&db).unwrap();
+                let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
+                if let Ok(s) = engine.get_status(run_id).await
+                    && s.status == WorkflowStatus::Failed
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("workflow did not reach Failed status");
+        });
+
+        let metrics = workflow_metrics(None, None, None, &db).unwrap();
+        assert_eq!(metrics["counts_by_status"]["failed"], 1, "{metrics:?}");
+        assert_eq!(
+            metrics["step_breakdown"]["a"]["counts_by_status"]["failed"], 1,
+            "{metrics:?}"
+        );
+
+        let failures = metrics["recent_failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0]["run_id"], run_id.to_string());
+        assert_eq!(failures[0]["workflow_id"], workflow_id.to_string());
+        assert_eq!(failures[0]["failing_step"], "a");
+        assert!(
+            failures[0]["failing_step_error"]
+                .as_str()
+                .unwrap()
+                .contains("boom"),
+            "{:?}",
+            failures[0]
+        );
+
+        // A status filter that excludes failures must suppress the extra
+        // recent-failures query rather than return stale/irrelevant data.
+        let completed_only = workflow_metrics(None, Some("completed"), None, &db).unwrap();
+        assert_eq!(
+            completed_only["recent_failures"].as_array().unwrap().len(),
+            0
+        );
     }
 
     #[test]

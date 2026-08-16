@@ -90,6 +90,17 @@ impl AgentflareMcp {
                 let names = crate::workflow::list_workflow_definitions(&self.worktree_repo_root());
                 Ok(serde_json::to_string_pretty(&names).unwrap_or_default())
             }
+            "metrics" => {
+                let metrics = crate::workflow::workflow_metrics_async(
+                    req.workflow_id.as_deref(),
+                    req.status.as_deref(),
+                    req.since.as_deref(),
+                    &db_path,
+                )
+                .await
+                .map_err(|e| ErrorData::invalid_params(e, None))?;
+                Ok(serde_json::to_string_pretty(&metrics).unwrap_or_default())
+            }
             other => Err(ErrorData::invalid_params(
                 format!("unknown action: {other}"),
                 None,
