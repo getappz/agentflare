@@ -42,7 +42,12 @@ impl AgentflareMcp {
         let item_states = self.item_state_groups_for_doctor();
         let report = flare_git_core::doctor::scan(&repo_root, staleness_days, &item_states);
         let reclaimed = if req.reclaim.unwrap_or(false) {
-            flare_git_core::doctor::reclaim(&repo_root, &report, req.force.unwrap_or(false))
+            flare_git_core::doctor::reclaim_scoped(
+                &repo_root,
+                &report,
+                req.force.unwrap_or(false),
+                req.worktree.as_deref(),
+            )
         } else {
             Vec::new()
         };
