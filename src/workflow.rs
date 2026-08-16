@@ -277,11 +277,23 @@ pub(crate) async fn workflow_status_async(
     run_id: &str,
     db_path: &Path,
 ) -> Result<serde_json::Value, String> {
-    let store = open_store(db_path)?;
-    let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
     let run_id = parse_run_id(run_id)?;
 
-    let state = engine.get_status(run_id).await.map_err(|e| e.to_string())?;
+    // Read the raw state generically rather than through
+    // `StateStore::load::<D>()` (`engine.get_status`) -- this store is
+    // shared by several `WorkflowData` types (`PipelineData`,
+    // `WorkItemData`, ...) and deserializing through a fixed `D` hard-fails
+    // on any run whose `context.data` doesn't match it, e.g. "storage
+    // error: deserialize state: invalid type: map, expected unit struct
+    // PipelineData" for a real `agentflare-work-item` run. Every field this
+    // view reports (run_id, workflow_id, status, current_step,
+    // step_states, input, output, error, variables) lives outside
+    // `context.data`, so a generic read never needs to know `D` — same
+    // reasoning as `recent_failures_async`'s raw-SQL query.
+    let state = load_state_generic(&run_id, db_path)?;
+
+    let store = open_store(db_path)?;
+    let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
     let journal = engine
         .state_store()
         .journal(run_id)
@@ -299,26 +311,54 @@ pub(crate) async fn workflow_status_async(
         })
         .collect();
 
+    let steps: Vec<serde_json::Value> = state["step_states"]
+        .as_object()
+        .map(|steps| {
+            steps
+                .iter()
+                .map(|(id, ss)| {
+                    serde_json::json!({
+                        "step_id": id,
+                        "status": ss["status"],
+                        "attempt": ss["attempt"],
+                        "last_error": ss["last_error"],
+                        "input_tokens": ss["input_tokens"],
+                        "output_tokens": ss["output_tokens"],
+                        "duration_ms": ss["duration_ms"],
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(serde_json::json!({
-        "run_id": state.run_id.to_string(),
-        "workflow_id": state.workflow_id.to_string(),
-        "status": status_str(&state.status),
-        "current_step": state.current_step.map(|s| s.to_string()),
-        "input": state.input,
-        "output": state.output,
-        "error": state.error,
-        "steps": state.step_states.iter().map(|(id, ss)| serde_json::json!({
-            "step_id": id.to_string(),
-            "status": step_status_str(&ss.status),
-            "attempt": ss.attempt,
-            "last_error": ss.last_error,
-            "input_tokens": ss.input_tokens,
-            "output_tokens": ss.output_tokens,
-            "duration_ms": ss.duration_ms,
-        })).collect::<Vec<_>>(),
-        "variables": state.variables,
+        "run_id": state["run_id"],
+        "workflow_id": state["workflow_id"],
+        "status": state["status"],
+        "current_step": state["current_step"],
+        "input": state["input"],
+        "output": state["output"],
+        "error": state["error"],
+        "steps": steps,
+        "variables": state["variables"],
         "journal_tail": journal_tail,
     }))
+}
+
+/// Reads a run's raw `state_json` and parses it as a generic
+/// [`serde_json::Value`] rather than a typed `WorkflowState<D>` — see
+/// [`workflow_status_async`]'s doc comment for why.
+fn load_state_generic(run_id: &WorkflowRunId, db_path: &Path) -> Result<serde_json::Value, String> {
+    let conn =
+        rusqlite::Connection::open(db_path).map_err(|e| format!("open workflows db: {e}"))?;
+    let state_json: String = conn
+        .query_row(
+            "SELECT state_json FROM workflow_runs WHERE id = ?",
+            rusqlite::params![run_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("run '{run_id}' not found: {e}"))?;
+    serde_json::from_str(&state_json).map_err(|e| format!("corrupt state for run '{run_id}': {e}"))
 }
 
 /// List run summaries. Sync wrapper — see [`list_workflows_async`].
@@ -705,6 +745,71 @@ mod tests {
             completed_only["recent_failures"].as_array().unwrap().len(),
             0
         );
+    }
+
+    #[test]
+    fn workflow_status_reads_a_run_of_a_different_workflowdata_type() {
+        // Regression: `status` used to hard-fail for any run whose
+        // WorkflowData type wasn't PipelineData -- this store is shared
+        // across types (e.g. the internal SDD work-item pipeline's
+        // WorkItemData) -- with "storage error: deserialize state: invalid
+        // type: map, expected unit struct PipelineData". Mirrors
+        // flare-workflow's own cross_type_store_test.rs idiom.
+        use flare_workflow::executor::FunctionStep;
+        use flare_workflow::types::{StepResult, WorkflowContext, WorkflowData};
+        use flare_workflow::{StepDefinition, WorkflowDefinition};
+
+        #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+        struct StructPayload {
+            note: String,
+        }
+        impl WorkflowData for StructPayload {
+            fn workflow_type() -> &'static str {
+                "struct-payload"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wf.db");
+
+        let rt = blocking_runtime();
+        let run_id = rt.block_on(async {
+            let engine = WorkflowEngine::<StructPayload, _>::with_store(
+                SqliteStore::open_file(&db).unwrap(),
+            );
+            engine
+                .register_workflow(WorkflowDefinition::new("other", "other").add_step(
+                    StepDefinition::new(
+                        "only",
+                        "only",
+                        Arc::new(FunctionStep::new(
+                            |_ctx: &mut WorkflowContext<StructPayload>| {
+                                Box::pin(async move { Ok(StepResult::Success) })
+                            },
+                        )),
+                    ),
+                ))
+                .unwrap();
+            let run = engine
+                .start_workflow(
+                    WorkflowId::new("other"),
+                    StructPayload { note: "hi".into() },
+                    "seed".into(),
+                )
+                .await
+                .unwrap();
+            engine
+                .wait_for_completion(run, "other", std::time::Duration::from_secs(10))
+                .await
+                .unwrap();
+            run
+        });
+
+        let status = workflow_status(&run_id.to_string(), &db)
+            .expect("status must succeed for a non-PipelineData run");
+        assert_eq!(status["status"], "completed");
+        assert_eq!(status["workflow_id"], "other");
+        assert_eq!(status["steps"].as_array().unwrap().len(), 1);
     }
 
     #[test]
