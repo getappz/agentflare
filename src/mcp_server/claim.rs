@@ -172,3 +172,71 @@ impl AgentflareMcp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::claims::migrate(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn claim_confirm_or_steal_acquires_when_unclaimed() {
+        let conn = mem_conn();
+        AgentflareMcp::claim_confirm_or_steal(&conn, "o/r", "issue#1", "me:1", 1000, 1800).unwrap();
+        assert!(crate::claims::release(&conn, "o/r", "issue#1", "me:1").unwrap());
+    }
+
+    #[test]
+    fn claim_confirm_or_steal_ok_on_own_live_claim() {
+        let conn = mem_conn();
+        crate::claims::acquire(&conn, "o/r", "issue#1", "me:1", None, None, 1000, 1800).unwrap();
+        AgentflareMcp::claim_confirm_or_steal(&conn, "o/r", "issue#1", "me:1", 1100, 1800).unwrap();
+        assert!(crate::claims::done(&conn, "o/r", "issue#1", "me:1", 1100).unwrap());
+    }
+
+    #[test]
+    fn claim_confirm_or_steal_steals_a_stale_foreign_claim() {
+        let conn = mem_conn();
+        crate::claims::acquire(&conn, "o/r", "issue#1", "gone:1", None, None, 1000, 1800).unwrap();
+        // Well past the TTL -- the claiming instance is gone.
+        AgentflareMcp::claim_confirm_or_steal(&conn, "o/r", "issue#1", "me:1", 10_000, 1800)
+            .unwrap();
+        assert!(
+            crate::claims::release(&conn, "o/r", "issue#1", "me:1").unwrap(),
+            "a release must succeed after stealing an abandoned claim"
+        );
+    }
+
+    #[test]
+    fn claim_confirm_or_steal_errors_naming_the_holder_of_a_live_foreign_claim() {
+        let conn = mem_conn();
+        crate::claims::acquire(
+            &conn,
+            "o/r",
+            "issue#1",
+            "someone-else:1",
+            None,
+            None,
+            1000,
+            1800,
+        )
+        .unwrap();
+        let err =
+            AgentflareMcp::claim_confirm_or_steal(&conn, "o/r", "issue#1", "me:1", 1100, 1800)
+                .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("someone-else:1"),
+            "message: {}",
+            err.message
+        );
+        assert!(
+            crate::claims::release(&conn, "o/r", "issue#1", "someone-else:1").unwrap(),
+            "a live claim held by someone else must be left untouched"
+        );
+    }
+}
