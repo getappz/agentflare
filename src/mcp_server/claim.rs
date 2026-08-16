@@ -41,7 +41,7 @@ impl AgentflareMcp {
         {
             return Err(ErrorData::invalid_params(
                 format!(
-                    "target '{target}' in repo '{repo}' is claimed by '{holder}' (active {age_secs}s ago, ttl {ttl}s) -- refusing to release someone else's live claim"
+                    "target '{target}' in repo '{repo}' is claimed by '{holder}' (active {age_secs}s ago, ttl {ttl}s) -- refusing to modify someone else's live claim"
                 ),
                 None,
             ));
