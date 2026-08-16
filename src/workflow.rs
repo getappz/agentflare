@@ -290,7 +290,13 @@ pub(crate) async fn workflow_status_async(
     // step_states, input, output, error, variables) lives outside
     // `context.data`, so a generic read never needs to know `D` — same
     // reasoning as `recent_failures_async`'s raw-SQL query.
-    let state = load_state_generic(&run_id, db_path)?;
+    let db_path_owned = db_path.to_path_buf();
+    let run_id_owned = run_id;
+    let state = tokio::task::spawn_blocking(move || {
+        load_state_generic_blocking(&run_id_owned, &db_path_owned)
+    })
+    .await
+    .map_err(|e| format!("load state task panicked: {e}"))??;
 
     let store = open_store(db_path)?;
     let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
@@ -347,10 +353,13 @@ pub(crate) async fn workflow_status_async(
 
 /// Reads a run's raw `state_json` and parses it as a generic
 /// [`serde_json::Value`] rather than a typed `WorkflowState<D>` — see
-/// [`workflow_status_async`]'s doc comment for why.
-fn load_state_generic(run_id: &WorkflowRunId, db_path: &Path) -> Result<serde_json::Value, String> {
-    let conn =
-        rusqlite::Connection::open(db_path).map_err(|e| format!("open workflows db: {e}"))?;
+/// [`workflow_status_async`]'s doc comment for why. Blocking; call from
+/// inside `spawn_blocking` (see [`open_conn_blocking`]'s doc comment).
+fn load_state_generic_blocking(
+    run_id: &WorkflowRunId,
+    db_path: &Path,
+) -> Result<serde_json::Value, String> {
+    let conn = open_conn_blocking(db_path)?;
     let state_json: String = conn
         .query_row(
             "SELECT state_json FROM workflow_runs WHERE id = ?",
@@ -488,6 +497,9 @@ async fn recent_failures_async(
     limit: usize,
     db_path: &Path,
 ) -> Result<Vec<serde_json::Value>, String> {
+    // `since` means the same thing here as in `MetricsFilter` (which this
+    // shares a caller-facing meaning with): a `created_at` floor, not
+    // `updated_at` -- see `sqlite_store::metrics_where`.
     let since_dt = since
         .map(|s| {
             chrono::DateTime::parse_from_rfc3339(s)
@@ -495,53 +507,81 @@ async fn recent_failures_async(
         })
         .transpose()?;
 
+    let workflow_id = workflow_id.map(str::to_string);
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let conn = open_conn_blocking(&db_path)?;
+
+        let mut run_where = vec!["status = 'failed'".to_string()];
+        let mut run_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(w) = &workflow_id {
+            run_where.push("workflow_id = ?".to_string());
+            run_params.push(Box::new(w.clone()));
+        }
+        if let Some(dt) = since_dt {
+            run_where.push("created_at >= ?".to_string());
+            run_params.push(Box::new(dt.to_rfc3339()));
+        }
+        run_params.push(Box::new(limit as i64));
+
+        // LIMIT must bound the number of distinct *runs*, not the joined
+        // run x failed-step rows below -- a run with several failed steps
+        // (e.g. a fan-out) would otherwise consume more than one slot of
+        // `limit` and could crowd out other, more recent failed runs.
+        // Select the bounded set of runs first, using only run-level
+        // predicates, then join to their failed step states.
+        let sql = format!(
+            "SELECT wr.id, wr.workflow_id, wr.updated_at, ss.step_id, ss.last_error
+             FROM (
+                 SELECT id, workflow_id, updated_at
+                 FROM workflow_runs
+                 WHERE {}
+                 ORDER BY updated_at DESC
+                 LIMIT ?
+             ) wr
+             JOIN step_state ss ON wr.id = ss.run_id AND ss.status = 'failed'
+             ORDER BY wr.updated_at DESC",
+            run_where.join(" AND ")
+        );
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("prepare recent failures query: {e}"))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(run_params.iter().map(std::convert::AsRef::as_ref)),
+                |row| {
+                    Ok(serde_json::json!({
+                        "run_id": row.get::<_, String>(0)?,
+                        "workflow_id": row.get::<_, String>(1)?,
+                        "updated_at": row.get::<_, String>(2)?,
+                        "failing_step": row.get::<_, String>(3)?,
+                        "failing_step_error": row.get::<_, Option<String>>(4)?,
+                    }))
+                },
+            )
+            .map_err(|e| format!("recent failures query: {e}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("recent failures row: {e}"))
+    })
+    .await
+    .map_err(|e| format!("recent failures task panicked: {e}"))?
+}
+
+/// Opens a blocking `rusqlite::Connection` with the same 5-second busy
+/// timeout `agentflare-db-kit::open_file` configures — this file is written
+/// to by live workflow runs, so a bare `Connection::open` with SQLite's
+/// default (no wait, immediate `SQLITE_BUSY`) can spuriously fail a read
+/// under write contention. Must only ever be called from inside
+/// `spawn_blocking`: `Connection` is a blocking API, and this raw path
+/// (unlike `open_store`) has no async wrapper of its own.
+fn open_conn_blocking(db_path: &Path) -> Result<rusqlite::Connection, String> {
     let conn =
         rusqlite::Connection::open(db_path).map_err(|e| format!("open workflows db: {e}"))?;
-
-    let mut where_clauses = vec![
-        "wr.status = 'failed'".to_string(),
-        "ss.status = 'failed'".to_string(),
-    ];
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    if let Some(w) = workflow_id {
-        where_clauses.push("wr.workflow_id = ?".to_string());
-        params.push(Box::new(w.to_string()));
-    }
-    if let Some(dt) = since_dt {
-        where_clauses.push("wr.updated_at >= ?".to_string());
-        params.push(Box::new(dt.to_rfc3339()));
-    }
-    params.push(Box::new(limit as i64));
-
-    let sql = format!(
-        "SELECT wr.id, wr.workflow_id, wr.updated_at, ss.step_id, ss.last_error
-         FROM workflow_runs wr JOIN step_state ss ON wr.id = ss.run_id
-         WHERE {}
-         ORDER BY wr.updated_at DESC
-         LIMIT ?",
-        where_clauses.join(" AND ")
-    );
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| format!("prepare recent failures query: {e}"))?;
-    let rows = stmt
-        .query_map(
-            rusqlite::params_from_iter(params.iter().map(std::convert::AsRef::as_ref)),
-            |row| {
-                Ok(serde_json::json!({
-                    "run_id": row.get::<_, String>(0)?,
-                    "workflow_id": row.get::<_, String>(1)?,
-                    "updated_at": row.get::<_, String>(2)?,
-                    "failing_step": row.get::<_, String>(3)?,
-                    "failing_step_error": row.get::<_, Option<String>>(4)?,
-                }))
-            },
-        )
-        .map_err(|e| format!("recent failures query: {e}"))?;
-
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("recent failures row: {e}"))
+    conn.busy_timeout(std::time::Duration::from_millis(5000))
+        .map_err(|e| format!("set busy_timeout: {e}"))?;
+    Ok(conn)
 }
 
 /// Parse a status filter string (same spellings `status_str` produces) into
@@ -744,6 +784,31 @@ mod tests {
         assert_eq!(
             completed_only["recent_failures"].as_array().unwrap().len(),
             0
+        );
+
+        // workflow_id filter: the real id matches, an unrelated one doesn't
+        // — exercises recent_failures_async's parameter binding order.
+        let scoped = workflow_metrics(Some(&workflow_id.to_string()), None, None, &db).unwrap();
+        assert_eq!(scoped["recent_failures"].as_array().unwrap().len(), 1);
+        let other = workflow_metrics(Some("no-such-workflow"), None, None, &db).unwrap();
+        assert_eq!(other["recent_failures"].as_array().unwrap().len(), 0);
+
+        // since filter: a future timestamp excludes the run that already
+        // happened.
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let later = workflow_metrics(None, None, Some(&future), &db).unwrap();
+        assert_eq!(later["recent_failures"].as_array().unwrap().len(), 0);
+
+        // Invalid filter inputs are rejected with actionable messages.
+        assert!(
+            workflow_metrics(None, None, Some("not-a-time"), &db)
+                .unwrap_err()
+                .contains("RFC 3339")
+        );
+        assert!(
+            workflow_metrics(None, Some("nope"), None, &db)
+                .unwrap_err()
+                .contains("unknown status")
         );
     }
 
