@@ -73,9 +73,7 @@ pub enum AuthAction {
         json: bool,
     },
     /// Interactively choose a profile to activate.
-    Pick {
-        agent: String,
-    },
+    Pick { agent: String },
     /// Manage per-profile rotation cooldowns.
     Cooldown {
         #[command(subcommand)]

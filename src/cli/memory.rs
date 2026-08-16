@@ -131,13 +131,17 @@ impl MemoryArgs {
                                             &conn, id, &vec, &model,
                                         ) {
                                             Ok(()) => ok += 1,
-                                            Err(e) => crate::ui::warning(&format!("obs {id}: store failed: {e}")),
+                                            Err(e) => crate::ui::warning(&format!(
+                                                "obs {id}: store failed: {e}"
+                                            )),
                                         }
                                     }
                                     None => crate::ui::warning(&format!("obs {id}: embed failed")),
                                 }
                             }
-                            crate::ui::success(&format!("backfilled {ok}/{total} embeddings (model: {model})"));
+                            crate::ui::success(&format!(
+                                "backfilled {ok}/{total} embeddings (model: {model})"
+                            ));
                         }
                     },
                 }

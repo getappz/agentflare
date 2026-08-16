@@ -37,7 +37,9 @@ impl ServeArgs {
                 ));
             }
             if let Some(pid) = crate::daemon::is_daemon_running() {
-                crate::ui::error(&format!("agentflare dashboard is already running (pid {pid})."));
+                crate::ui::error(&format!(
+                    "agentflare dashboard is already running (pid {pid})."
+                ));
                 crate::ui::info(
                     "stop it first with `agentflare daemon stop`, or use the running instance instead of starting another.",
                 );

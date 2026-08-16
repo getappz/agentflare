@@ -13,19 +13,13 @@ use std::path::{Path, PathBuf};
 #[derive(Subcommand)]
 pub enum SkillAction {
     /// Search the indexed skill catalog by name or description.
-    Search {
-        query: String,
-    },
+    Search { query: String },
     /// Install a skill by name into this agent's config.
-    Install {
-        name: String,
-    },
+    Install { name: String },
     /// List installed skills.
     List,
     /// Remove an installed skill.
-    Remove {
-        name: String,
-    },
+    Remove { name: String },
     /// Manage skill registries (remote sources to pull skills from).
     Registry {
         #[command(subcommand)]
@@ -58,9 +52,7 @@ pub enum SkillAction {
         days: i64,
     },
     /// Permanently suppress proactive skill-advisory suggestions for a skill.
-    Dismiss {
-        name: String,
-    },
+    Dismiss { name: String },
     /// Detect a target repo's stack and recommend indexed skills for it.
     /// Prints a dry-run report only, unless `--yes` is passed.
     Provision {
@@ -605,7 +597,9 @@ fn run_import(path: &str) -> Result<usize, Box<dyn std::error::Error>> {
     let mut bundle = skill_registry::SkillBundle::from_json(&json)?;
     let deduped = bundle.dedup();
     if deduped > 0 {
-        crate::ui::info(&format!("removed {deduped} duplicate entries during import"));
+        crate::ui::info(&format!(
+            "removed {deduped} duplicate entries during import"
+        ));
     }
     let db_path = crate::paths::skills_db_path();
     let mut conn = skill_registry::db::open_db(&db_path)?;

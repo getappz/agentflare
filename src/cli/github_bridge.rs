@@ -80,7 +80,9 @@ fn cmd_set(repo: Option<String>, queue_label: Option<String>) {
 fn cmd_unset() {
     let root = repo_root_or_exit();
     match crate::github::bridge::config::clear_project_bridge_settings(&root) {
-        Ok(path) => crate::ui::success(&format!("cleared [bridge] overrides in {}", path.display())),
+        Ok(path) => {
+            crate::ui::success(&format!("cleared [bridge] overrides in {}", path.display()))
+        }
         Err(e) => {
             crate::ui::error(&e.to_string());
             std::process::exit(1);

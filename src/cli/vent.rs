@@ -91,7 +91,9 @@ pub fn run(args: VentArgs) {
                     for g in &batch {
                         println!("  [{}] seen×{} {}", g.severity, g.seen_count, g.message);
                     }
-                    crate::ui::info("re-run with --title and --body to file these as one GitHub issue");
+                    crate::ui::info(
+                        "re-run with --title and --body to file these as one GitHub issue",
+                    );
                     return;
                 }
                 (title, body) => {
@@ -108,7 +110,9 @@ pub fn run(args: VentArgs) {
                     let keys: Vec<String> = batch.iter().map(|g| g.topic_key.clone()).collect();
                     let now = chrono::Utc::now().timestamp();
                     match crate::vent::file::mark_filed(&filed, &keys, &url, now) {
-                        Ok(()) => crate::ui::success(&format!("filed {url} ({} vent(s))", keys.len())),
+                        Ok(()) => {
+                            crate::ui::success(&format!("filed {url} ({} vent(s))", keys.len()))
+                        }
                         Err(e) => crate::ui::warning(&format!(
                             "filed {url} but failed to record state ({e}) — re-filing will \
                              create a duplicate issue until this is reconciled by hand"
@@ -138,7 +142,9 @@ pub fn run(args: VentArgs) {
                         .and_then(|p| p.as_str().map(String::from))
                 });
             let Some(pid) = project_id else {
-                crate::ui::info("no linked project — run an agentflare item/memory command here first");
+                crate::ui::info(
+                    "no linked project — run an agentflare item/memory command here first",
+                );
                 return;
             };
             match agentflare_backend::vent::list(&conn, &pid, actionable) {

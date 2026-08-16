@@ -31,9 +31,7 @@ pub enum CoachingAction {
         sync: Vec<String>,
     },
     /// Delete a coaching rule.
-    Remove {
-        id: String,
-    },
+    Remove { id: String },
     /// Mark a rule MANDATORY (hard-denied by the PreToolUse hook when
     /// violated) or, with --off, demote it back to advisory.
     Enforce {

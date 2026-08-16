@@ -115,13 +115,9 @@ pub enum CodeAction {
     /// Print the active code-review mode for this session.
     Status,
     /// Set the code-review mode for the current session.
-    Set {
-        mode: String,
-    },
+    Set { mode: String },
     /// Set the code-review mode used for new sessions going forward.
-    Default {
-        mode: String,
-    },
+    Default { mode: String },
     /// Turn code-review mode off for the current session.
     Off,
     /// Print the review-mode skill text.
