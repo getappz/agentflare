@@ -361,7 +361,7 @@ pub fn create_worktree(
         // Soft-fails like every other network step in this file: no remote,
         // offline, or never pushed all fall through to the brand-new-branch
         // path below, unchanged from today's behavior.
-        let _ = run_output_timeout(
+        let _ = fetch_with_retry(
             crate::shell::git_binary(),
             &["fetch", "origin", &branch],
             repo_root,
@@ -397,12 +397,13 @@ pub fn create_worktree(
         // reachability. Routed through `run_output_timeout` (not the plain
         // blocking `run_git_in`): an unreachable remote or a credential
         // prompt must not be able to hang a claim indefinitely.
-        let start_point = match run_output_timeout(
+        let fetch_result = fetch_with_retry(
             crate::shell::git_binary(),
             &["fetch", "origin", target_branch],
             repo_root,
             fetch_timeout_secs,
-        ) {
+        );
+        let start_point = match &fetch_result {
             Ok(out)
                 if out.status.success()
                     && run_git_in_ok(
@@ -413,8 +414,18 @@ pub fn create_worktree(
                 format!("origin/{target_branch}")
             }
             _ => {
+                let reason = match &fetch_result {
+                    Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                    Err(e) => e.clone(),
+                };
                 eprintln!(
-                    "worktree: could not fetch '{target_branch}' from origin, branching off the local ref instead"
+                    "worktree: could not fetch '{target_branch}' from origin, branching off \
+                     the local ref instead ({})",
+                    if reason.is_empty() {
+                        "no error detail"
+                    } else {
+                        &reason
+                    }
                 );
                 target_branch.to_string()
             }
@@ -551,6 +562,40 @@ pub(crate) fn run_output_timeout(
         stdout: stdout_reader.join().unwrap_or_default(),
         stderr: stderr_reader.join().unwrap_or_default(),
     })
+}
+
+/// Fixed pause between the two attempts in [`fetch_with_retry`] — long enough
+/// to ride out a one-off DNS/TCP blip, short enough not to meaningfully delay
+/// a claim on top of `fetch_timeout_secs`.
+const FETCH_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// [`run_output_timeout`], retried once on failure (a non-zero exit counts as
+/// a failure worth retrying, same as a spawn/timeout error).
+///
+/// The fetches this wraps run once per worktree creation, on the critical
+/// path of claiming a work item, against a remote this process doesn't
+/// control the reachability of — a single dropped DNS query or transient TCP
+/// reset (observed on real workstations, not hypothetical) would otherwise
+/// silently seed a new branch off a stale local ref, exactly the staleness
+/// this fetch exists to prevent. One retry is deliberately not a full
+/// exponential-backoff loop: `fetch_timeout_secs` already bounds each
+/// attempt, so retrying more still can't hang a claim indefinitely, but it
+/// isn't worth adding unbounded delay chasing a remote that is genuinely
+/// unreachable — the caller's existing fallback-to-local-ref handles that
+/// case correctly, it just needs to be logged instead of silent.
+fn fetch_with_retry(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+    cwd: &Path,
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
+    let program = program.as_ref().to_owned();
+    let first = run_output_timeout(&program, args, cwd, timeout_secs);
+    if matches!(&first, Ok(out) if out.status.success()) {
+        return first;
+    }
+    std::thread::sleep(FETCH_RETRY_DELAY);
+    run_output_timeout(&program, args, cwd, timeout_secs)
 }
 
 /// Whether `branch` has committed content `target_branch` doesn't already

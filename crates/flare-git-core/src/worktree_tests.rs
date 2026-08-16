@@ -778,3 +778,61 @@ fn run_output_timeout_kills_the_child_not_just_abandons_it() {
         "child kept running after the timeout — it was abandoned, not killed"
     );
 }
+
+#[test]
+fn fetch_with_retry_recovers_from_a_single_transient_failure() {
+    // Item #495/#483 incident: a one-off failed `git fetch` silently seeded
+    // a new branch off a stale local ref, because there was no retry. This
+    // pins the fix — a command that fails once and succeeds the second time
+    // must come back `Ok` with a successful exit status, not the first
+    // attempt's failure.
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = tmp.path().join("attempted");
+    #[cfg(unix)]
+    let (program, owned_args): (&str, Vec<String>) = (
+        "sh",
+        vec![
+            "-c".into(),
+            format!(
+                "if [ -f {0} ]; then exit 0; else touch {0}; exit 1; fi",
+                marker.display()
+            ),
+        ],
+    );
+    #[cfg(windows)]
+    let (program, owned_args): (&str, Vec<String>) = (
+        "cmd",
+        vec![
+            "/C".into(),
+            format!(
+                "if exist {0} (exit /b 0) else (echo x > {0} & exit /b 1)",
+                marker.display()
+            ),
+        ],
+    );
+    let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+
+    let result = fetch_with_retry(program, &args, tmp.path(), 5);
+    let out = result.expect("second attempt must succeed and be returned");
+    assert!(
+        out.status.success(),
+        "retry must return the SECOND attempt's success, not the first attempt's failure"
+    );
+}
+
+#[test]
+fn fetch_with_retry_returns_the_final_failure_when_every_attempt_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    let (program, owned_args): (&str, Vec<String>) = ("sh", vec!["-c".into(), "exit 1".into()]);
+    #[cfg(windows)]
+    let (program, owned_args): (&str, Vec<String>) = ("cmd", vec!["/C".into(), "exit /b 1".into()]);
+    let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+
+    let result = fetch_with_retry(program, &args, tmp.path(), 5);
+    let out = result.expect("a completed process is Ok even on non-zero exit");
+    assert!(
+        !out.status.success(),
+        "a persistently-failing fetch must still surface as a failure after the retry"
+    );
+}
