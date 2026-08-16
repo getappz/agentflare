@@ -1,5 +1,6 @@
 use clap::Args;
 
+/// Update the agentflare binary to the latest, or a specific, version.
 #[derive(Args)]
 pub struct UpdateArgs {
     pub version: Option<String>,

@@ -21,6 +21,7 @@ pub enum VaultAction {
     Remove { name: String },
 }
 
+/// Manage the local secret vault (passphrase-locked store for project secrets).
 #[derive(Args)]
 pub struct VaultArgs {
     #[command(subcommand)]

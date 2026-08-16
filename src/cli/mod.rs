@@ -32,6 +32,7 @@ mod vent;
 pub(crate) mod work;
 mod workflow;
 
+use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
 use std::sync::LazyLock;
 
@@ -44,8 +45,26 @@ pub static AGENTFLARE_VERSION: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// Shared help/usage/error theme, applied to every subcommand's `--help`
+/// automatically since clap derives them from the root `Command`.
+fn cli_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Green.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Cyan.on_default())
+        .error(AnsiColor::Red.on_default() | Effects::BOLD)
+        .valid(AnsiColor::Green.on_default())
+        .invalid(AnsiColor::Yellow.on_default())
+}
+
 #[derive(Parser)]
-#[command(name = "agentflare", version = AGENTFLARE_VERSION.as_str(), about = "Optimize AI CLI agents for cost and performance")]
+#[command(
+    name = "agentflare",
+    version = AGENTFLARE_VERSION.as_str(),
+    about = "Optimize AI CLI agents for cost and performance",
+    styles = cli_styles(),
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -53,41 +72,75 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Wire agentflare into a coding agent (hooks, MCP server, config).
     Init(init::InitArgs),
+    /// Internal hook entry point invoked by an agent's lifecycle events. Not meant for direct use.
     Hook(hook::HookArgs),
+    /// Show AI agent token/dollar cost, optionally broken down by project.
     Cost(cost::CostArgs),
+    /// Build the current source tree and install it over the running binary.
     DevInstall(dev_install::DevInstallArgs),
+    /// Diagnose agent config wiring and report problems.
     Doctor(doctor::DoctorArgs),
+    /// Manage coaching rules nudged to agents mid-session.
     Coaching(coaching::CoachingArgs),
+    /// Static analysis for the current repo (currently: change-impact).
     Code(code::CodeArgs),
+    /// Manage `~/.agentflare/config.toml` settings that aren't repo-scoped.
     Config(config::ConfigArgs),
+    /// Manage credentials and connections for third-party gateways.
     Gateway(gateway::GatewayArgs),
+    /// Git helpers for agent worktrees and branch hygiene.
     Git(git::GitArgs),
+    /// Manage the agentflare MCP server registration for coding agents.
     Mcp(mcp::McpArgs),
+    /// Inspect and manage detected coding-agent installs.
     Agents(agents::AgentsArgs),
+    /// Launch an agent through mise with `.dev.vars` env vars injected.
     Run(run::RunArgs),
+    /// Manage shell aliases installed for agentflare commands.
     Alias(alias::AliasArgs),
+    /// Update agentflare to the latest release.
     Update(update::UpdateArgs),
+    /// Remove agentflare's hooks, config, and installed files.
     Uninstall(uninstall::UninstallArgs),
+    /// Manage secrets stored in agentflare's encrypted vault.
     Vault(vault::VaultArgs),
+    /// Manage authentication credentials for connected services.
     Auth(auth::AuthArgs),
+    /// Serve live-shareable artifact pages from AI agent sessions.
     Artifacts(artifacts::ArtifactsArgs),
+    /// Hand a work product to another agent's inbox.
     Handoff(handoff::HandoffArgs),
+    /// Configure the GitHub work-item bridge for this repo.
     GithubBridge(github_bridge::GithubBridgeArgs),
     #[command(alias = "flare", visible_alias = "opt")]
+    /// Optimize prompts, context, and instructions for cost and quality.
     Optimize(optimize::OptimizeArgs),
     #[command(visible_alias = "logo")]
+    /// Print the agentflare banner and version info.
     About(crate::about::AboutArgs),
+    /// Manage the agentflare background daemon (dashboard, bridge, watchers).
     Daemon(daemon::DaemonArgs),
+    /// Send and inspect messages on agent coordination channels.
     Channel(channel::ChannelArgs),
+    /// Claim a work item for the current agent session.
     Claim(claim::ClaimArgs),
+    /// Review a diff, PR, or branch for correctness and simplification.
     Review(review::ReviewArgs),
+    /// Discover, install, and manage skills for coding agents.
     Skill(skill::SkillArgs),
+    /// Read and write agentflare's cross-session agent memory.
     Memory(memory::MemoryArgs),
+    /// Serve the read-only agentflare dashboard.
     Serve(serve::ServeArgs),
+    /// Vent friction or feedback encountered during an agent session.
     Vent(vent::VentArgs),
+    /// Manage work items in the agentflare project queue.
     Work(work::WorkArgs),
+    /// Search and fetch cached third-party API documentation.
     Docs(docs::DocsArgs),
+    /// Run and inspect durable agent pipelines through the workflow engine.
     Workflow(workflow::WorkflowArgs),
 }
 

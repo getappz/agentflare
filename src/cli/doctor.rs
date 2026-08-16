@@ -1,5 +1,6 @@
 use clap::Args;
 
+/// Diagnose agent config wiring and report problems.
 #[derive(Args)]
 pub struct DoctorArgs {
     /// Check only this agent's config wiring instead of every agent detected on PATH.

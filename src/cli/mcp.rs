@@ -1,5 +1,6 @@
 use clap::Args;
 
+/// Run the agentflare MCP server over stdio (for editor/agent MCP clients).
 #[derive(Args)]
 pub struct McpArgs;
 

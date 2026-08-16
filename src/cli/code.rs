@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::exit;
 
+/// Static analysis for the current repo (currently: change-impact).
 #[derive(Args)]
 pub struct CodeArgs {
     #[command(subcommand)]
@@ -53,7 +54,7 @@ fn impact_cmd(opts: ImpactArgs) {
         match opts.target {
             Some(t) => vec![t],
             None => {
-                eprintln!("agentflare code impact: pass a file path, or --stdin");
+                crate::ui::error("agentflare code impact: pass a file path, or --stdin");
                 exit(2);
             }
         }
@@ -64,7 +65,7 @@ fn impact_cmd(opts: ImpactArgs) {
         match crate::code::impact_for_path(&repo_root, target) {
             Ok(report) => reports.push(report),
             Err(e) => {
-                eprintln!("agentflare code impact: {e}");
+                crate::ui::error(&format!("agentflare code impact: {e}"));
                 exit(1);
             }
         }

@@ -1,5 +1,6 @@
 use clap::{Args, Subcommand};
 
+/// Capture and triage friction points hit during a session.
 #[derive(Args)]
 pub struct VentArgs {
     #[command(subcommand)]
@@ -42,16 +43,16 @@ pub fn run(args: VentArgs) {
         } => {
             let severity = crate::vent::classify::normalize_severity(Some(&severity));
             match crate::vent::capture::append_routed(None, severity, &tags, message.trim()) {
-                Ok((id, true)) => {
-                    println!("vent {id} suppressed (same friction already vented recently)")
-                }
-                Ok((id, false)) => println!("vented {id}"),
-                Err(e) => eprintln!("vent failed: {e}"),
+                Ok((id, true)) => crate::ui::skip(&format!(
+                    "vent {id} suppressed (same friction already vented recently)"
+                )),
+                Ok((id, false)) => crate::ui::success(&format!("vented {id}")),
+                Err(e) => crate::ui::error(&format!("vent failed: {e}")),
             }
         }
         VentCmd::Consolidate => {
             let r = crate::vent::consolidate::consolidate();
-            println!(
+            crate::ui::success(&format!(
                 "consolidated {} vent(s) → {} item(s){}",
                 r.consolidated,
                 r.items_created.len(),
@@ -63,15 +64,15 @@ pub fn run(args: VentArgs) {
                 } else {
                     String::new()
                 }
-            );
+            ));
             for id in r.items_created {
-                println!("  filed item {id}");
+                crate::ui::step(&format!("filed item {id}"));
             }
             if r.escalated + r.acknowledged + r.resolved > 0 {
-                println!(
+                crate::ui::info(&format!(
                     "escalations: {} re-escalated, {} acknowledged, {} resolved",
                     r.escalated, r.acknowledged, r.resolved
-                );
+                ));
             }
         }
         VentCmd::File { title, body } => {
@@ -80,7 +81,7 @@ pub fn run(args: VentArgs) {
             let batch =
                 crate::vent::file::pending_batch(&log, &filed, chrono::Utc::now().timestamp());
             if batch.is_empty() {
-                println!("nothing to file");
+                crate::ui::skip("nothing to file");
                 return;
             }
             let (title, body) = match (title, body) {
@@ -90,15 +91,17 @@ pub fn run(args: VentArgs) {
                     for g in &batch {
                         println!("  [{}] seen×{} {}", g.severity, g.seen_count, g.message);
                     }
-                    println!("re-run with --title and --body to file these as one GitHub issue");
+                    crate::ui::info(
+                        "re-run with --title and --body to file these as one GitHub issue",
+                    );
                     return;
                 }
                 (title, body) => {
-                    eprintln!(
+                    crate::ui::error(&format!(
                         "vent file: need both --title and --body to file (got title={}, body={})",
                         title.is_some(),
                         body.is_some()
-                    );
+                    ));
                     return;
                 }
             };
@@ -107,14 +110,16 @@ pub fn run(args: VentArgs) {
                     let keys: Vec<String> = batch.iter().map(|g| g.topic_key.clone()).collect();
                     let now = chrono::Utc::now().timestamp();
                     match crate::vent::file::mark_filed(&filed, &keys, &url, now) {
-                        Ok(()) => println!("filed {url} ({} vent(s))", keys.len()),
-                        Err(e) => eprintln!(
+                        Ok(()) => {
+                            crate::ui::success(&format!("filed {url} ({} vent(s))", keys.len()))
+                        }
+                        Err(e) => crate::ui::warning(&format!(
                             "filed {url} but failed to record state ({e}) — re-filing will \
                              create a duplicate issue until this is reconciled by hand"
-                        ),
+                        )),
                     }
                 }
-                Err(e) => eprintln!("gh issue create failed: {e}"),
+                Err(e) => crate::ui::error(&format!("gh issue create failed: {e}")),
             }
         }
         VentCmd::List { actionable } => {
@@ -122,7 +127,7 @@ pub fn run(args: VentArgs) {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("cannot open backend: {e}");
+                    crate::ui::error(&format!("cannot open backend: {e}"));
                     return;
                 }
             };
@@ -137,7 +142,9 @@ pub fn run(args: VentArgs) {
                         .and_then(|p| p.as_str().map(String::from))
                 });
             let Some(pid) = project_id else {
-                println!("no linked project — run an agentflare item/memory command here first");
+                crate::ui::info(
+                    "no linked project — run an agentflare item/memory command here first",
+                );
                 return;
             };
             match agentflare_backend::vent::list(&conn, &pid, actionable) {
@@ -160,7 +167,7 @@ pub fn run(args: VentArgs) {
                         );
                     }
                 }
-                Err(e) => eprintln!("list failed: {e}"),
+                Err(e) => crate::ui::error(&format!("list failed: {e}")),
             }
         }
     }
