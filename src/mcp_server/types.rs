@@ -697,11 +697,11 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ItemRequest {
     #[schemars(
-        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|groom|standup|health|doctor"
+        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|redispatch|groom|standup|health|doctor"
     )]
     pub(crate) action: String,
     #[schemars(
-        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label"
+        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, redispatch"
     )]
     #[serde(default)]
     pub(crate) id: Option<String>,
@@ -730,7 +730,7 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) parent_id: Option<String>,
     #[schemars(
-        description = "Agent ID to assign (create, update), or to filter by (list — matches items assigned to this agent plus unassigned ones, sorted open+assigned-to-you first)"
+        description = "Agent ID to assign (create, update), or to filter by (list — matches items assigned to this agent plus unassigned ones, sorted open+assigned-to-you first). redispatch: optional override — omit to reuse the item's existing assignee_agent"
     )]
     #[serde(default)]
     pub(crate) assignee_agent: Option<String>,
