@@ -240,6 +240,30 @@ pub fn scan(
 }
 
 pub fn reclaim(repo_root: &Path, report: &DoctorReport, force: bool) -> Vec<String> {
+    reclaim_scoped(repo_root, report, force, None)
+}
+
+/// Same as `reclaim`, but when `target` is `Some`, only the lane whose name
+/// or path matches it is even considered -- every other lane is skipped
+/// outright, regardless of its flags or `force`.
+///
+/// **Why this exists (2026-08-16 incident):** an agent ran
+/// `reclaim(repo_root, &report, true)` (unscoped, `force=true`) to fix a
+/// single broken worktree (`task/479`) and it deleted two OTHER, unrelated
+/// dirty worktrees (`task/110`, `task/473`) along with it -- their
+/// uncommitted work was lost. `force=true` bypasses the one thing (the
+/// `Dirty` flag) that would normally protect a worktree from deletion, so an
+/// unscoped call to it is repo-wide by construction: it does not just "also
+/// allow" the target lane to be force-deleted, it force-deletes *every*
+/// dirty lane in the report. Callers that mean "fix this one worktree" must
+/// pass `target`; leaving it `None` is only correct for a genuine repo-wide
+/// sweep (e.g. a scheduled hygiene pass), never for repairing one broken lane.
+pub fn reclaim_scoped(
+    repo_root: &Path,
+    report: &DoctorReport,
+    force: bool,
+    target: Option<&str>,
+) -> Vec<String> {
     let mut reclaimed = Vec::new();
     // Whether any lane was reclaimed at all -- a single `git worktree prune`
     // at the end clears every dangling `.git/worktrees/<name>` admin entry
@@ -259,6 +283,20 @@ pub fn reclaim(repo_root: &Path, report: &DoctorReport, force: bool) -> Vec<Stri
         // every other lane along with it) whenever the main worktree
         // happened to pick up a flag like `MissingUpstream` or `Stale`.
         if lane.is_main_worktree {
+            continue;
+        }
+        if let Some(t) = target
+            && lane.name != t
+            && lane.path != t
+        {
+            continue;
+        }
+        // A lane with no flags at all is healthy -- nothing to reclaim.
+        // Without this, `lane.flags.iter().all(..)` below is vacuously true
+        // on an empty iterator, so a perfectly clean lane would pass the
+        // "is_safe" check and get deleted just for being named as `target`,
+        // even with `force=false`.
+        if lane.flags.is_empty() {
             continue;
         }
         let has_dirty = lane.flags.iter().any(|f| matches!(f, HealthFlag::Dirty));
@@ -752,5 +790,119 @@ mod tests {
         // The payoff: the branch is deletable again.
         crate::shell::run_in(&repo.path, &["branch", "-d", "linked-branch"])
             .expect("branch must be deletable once its worktree entry is pruned");
+    }
+
+    #[test]
+    fn scoped_force_reclaim_touches_only_the_named_target() {
+        // Regression for the 2026-08-16 incident: `reclaim(.., force=true)`
+        // with no target deleted every dirty lane, not just the one the
+        // caller meant to fix -- wiping two unrelated worktrees' uncommitted
+        // work. `reclaim_scoped` with `target` set must leave every other
+        // dirty lane alone even under `force=true`.
+        let repo = crate::shell::test_support::init_repo_with_branch("main");
+        std::fs::write(repo.path.join(".gitignore"), ".worktrees/\n").unwrap();
+        crate::shell::run_in(&repo.path, &["add", ".gitignore"]).unwrap();
+        crate::shell::run_in(&repo.path, &["commit", "-m", "gitignore worktrees"]).unwrap();
+
+        let mut dirty_paths = Vec::new();
+        for name in ["target", "bystander-a", "bystander-b"] {
+            let path = repo.path.join(".worktrees").join(name);
+            std::fs::create_dir_all(repo.path.join(".worktrees")).unwrap();
+            crate::shell::run_in(
+                &repo.path,
+                &["worktree", "add", "-b", name, path.to_str().unwrap()],
+            )
+            .unwrap();
+            std::fs::write(path.join("scratch.txt"), "uncommitted\n").unwrap();
+            dirty_paths.push((name.to_string(), path));
+        }
+
+        let report = scan(&repo.path, 14, &std::collections::HashMap::new());
+        assert_eq!(
+            report
+                .lanes
+                .iter()
+                .filter(|l| l.flags.iter().any(|f| matches!(f, HealthFlag::Dirty)))
+                .count(),
+            3,
+            "test setup assumption: all three linked lanes should be dirty, got {:?}",
+            report.lanes
+        );
+
+        let reclaimed = reclaim_scoped(&repo.path, &report, true, Some("target"));
+
+        assert_eq!(
+            reclaimed,
+            vec!["target".to_string()],
+            "only the targeted lane should be reported reclaimed"
+        );
+        for (name, path) in &dirty_paths {
+            if name == "target" {
+                assert!(!path.exists(), "targeted dirty lane must be deleted");
+            } else {
+                assert!(
+                    path.exists(),
+                    "bystander lane '{name}' must survive a scoped force reclaim, \
+                     even though it is also flagged dirty"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn targeting_a_healthy_worktree_does_not_reclaim_it() {
+        // CodeRabbit finding on PR #515: `lane.flags.iter().all(..)` is
+        // vacuously true for a lane with no flags at all, so a perfectly
+        // healthy worktree named as `target` was reclaim-eligible even with
+        // `force=false` -- naming a lane was, by itself, enough to delete it.
+        // Built by hand rather than via `scan()`: a real linked worktree in
+        // a local-only test repo always picks up `MissingUpstream` (no
+        // remote configured), so it can never actually reach zero flags
+        // through `scan()` -- this constructs the exact zero-flag case
+        // directly instead.
+        let repo = crate::shell::test_support::init_repo_with_branch("main");
+        let healthy_path = repo.path.join(".worktrees").join("healthy");
+        std::fs::create_dir_all(&healthy_path).unwrap();
+        std::fs::write(healthy_path.join("marker.txt"), "still here\n").unwrap();
+
+        let report = DoctorReport {
+            lanes: vec![
+                LaneHealth {
+                    name: "main".to_string(),
+                    path: repo.path.to_string_lossy().to_string(),
+                    sequence_id: None,
+                    flags: vec![],
+                    is_main_worktree: true,
+                },
+                LaneHealth {
+                    name: "healthy".to_string(),
+                    path: healthy_path.to_string_lossy().to_string(),
+                    sequence_id: None,
+                    flags: vec![],
+                    is_main_worktree: false,
+                },
+            ],
+            violations: vec![],
+            summary: Summary {
+                total: 2,
+                flagged: 0,
+                dirty: 0,
+                stale: 0,
+                missing_worktree: 0,
+                duplicate_branch: 0,
+                missing_upstream: 0,
+                orphaned: 0,
+                zombie: 0,
+                clean: 2,
+            },
+        };
+
+        let reclaimed = reclaim_scoped(&repo.path, &report, true, Some("healthy"));
+
+        assert!(
+            reclaimed.is_empty(),
+            "a healthy lane must never be reclaimed just for being targeted"
+        );
+        assert!(healthy_path.exists(), "healthy worktree must survive");
     }
 }

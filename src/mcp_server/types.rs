@@ -805,10 +805,15 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) reclaim: Option<bool>,
     #[schemars(
-        description = "doctor only: with reclaim=true, also delete lanes flagged dirty (uncommitted changes). Default false."
+        description = "doctor only: with reclaim=true, also delete lanes flagged dirty (uncommitted changes). Default false. DANGEROUS when `worktree` is omitted: it force-deletes EVERY dirty lane in the repo, not just the one you're trying to fix — always pass `worktree` alongside `force=true` unless you genuinely intend a repo-wide sweep."
     )]
     #[serde(default)]
     pub(crate) force: Option<bool>,
+    #[schemars(
+        description = "doctor only: with reclaim=true, scope reclaim to a single lane by name (e.g. \"task/110\") or its worktree path. Omit to reclaim across every eligible lane repo-wide (the default). Strongly recommended whenever `force=true` is set, to avoid deleting unrelated dirty worktrees."
+    )]
+    #[serde(default)]
+    pub(crate) worktree: Option<String>,
 }
 
 /// Lean per-item projection for `item(list)` — the raw 19-field `Item` (full
