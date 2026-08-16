@@ -435,80 +435,87 @@ pub(crate) fn build_finalize_step(
     mcp: std::sync::Arc<AgentflareMcp>,
     item_id: String,
     notify_recipient: Option<String>,
+    owner: String,
 ) -> StepDefinition<WorkItemData> {
     let executor = std::sync::Arc::new(FunctionStep::new(
         move |ctx: &mut WorkflowContext<WorkItemData>| {
             let mcp = mcp.clone();
             let item_id = item_id.clone();
             let notify_recipient = notify_recipient.clone();
+            let owner = owner.clone();
             Box::pin(async move {
-                if let Some(reason) = ctx.data.hold_reason.clone() {
-                    let _ = mcp.item_release(ItemRequest {
-                        action: "release".into(),
-                        id: Some(item_id.clone()),
-                        ..Default::default()
-                    });
-                    let body = format!("## agentflare work — on hold\n\n{reason}");
+                crate::claims::with_owner_override(owner, || {
+                    if let Some(reason) = ctx.data.hold_reason.clone() {
+                        let _ = mcp.item_release(ItemRequest {
+                            action: "release".into(),
+                            id: Some(item_id.clone()),
+                            ..Default::default()
+                        });
+                        let body = format!("## agentflare work — on hold\n\n{reason}");
+                        let _ = mcp.comment_impl(CommentRequest {
+                            action: "create".into(),
+                            item_id: Some(item_id.clone()),
+                            body: Some(body.clone()),
+                            ..Default::default()
+                        });
+                        if let Some(recipient) = notify_recipient.as_deref() {
+                            crate::cli::work::notify(recipient, &body, &item_id);
+                        }
+                        return Ok(StepResult::Success);
+                    }
+
+                    if ctx.data.review_issues.is_some() {
+                        let issues = ctx.data.review_issues.clone().unwrap_or_default();
+                        let _ = mcp.comment_impl(CommentRequest {
+                            action: "create".into(),
+                            item_id: Some(item_id.clone()),
+                            body: Some(format!(
+                                "## agentflare work — needs human review\n\n\
+                             Automated review/fix did not converge after {MAX_REVIEW_CYCLES} \
+                             cycles. Latest outstanding issues:\n\n{issues}"
+                            )),
+                            ..Default::default()
+                        });
+                        return Ok(StepResult::Success);
+                    }
+
+                    let done_resp = mcp
+                        .item_done(ItemRequest {
+                            action: "done".into(),
+                            id: Some(item_id.clone()),
+                            summary: Some(ctx.data.reply_text.clone()),
+                            ..Default::default()
+                        })
+                        .map_err(|e| WorkflowError::StepFailed {
+                            step_id: StepId::new("finalize"),
+                            message: e.message.to_string(),
+                        })?;
+                    let done_val: serde_json::Value =
+                        serde_json::from_str(&done_resp).unwrap_or(serde_json::Value::Null);
+                    ctx.data.pr_url = done_val["pr_url"].as_str().map(str::to_string);
+
+                    let comment_reply = crate::cli::work::cap_reply_for_comment(
+                        &mcp,
+                        &item_id,
+                        &ctx.data.reply_text,
+                    );
+                    let comment_body = crate::cli::work::format_success_comment(
+                        &comment_reply,
+                        ctx.data.session_id.as_deref(),
+                        ctx.data.cost_usd,
+                        ctx.data.pr_url.as_deref(),
+                    );
                     let _ = mcp.comment_impl(CommentRequest {
                         action: "create".into(),
                         item_id: Some(item_id.clone()),
-                        body: Some(body.clone()),
+                        body: Some(comment_body.clone()),
                         ..Default::default()
                     });
                     if let Some(recipient) = notify_recipient.as_deref() {
-                        crate::cli::work::notify(recipient, &body, &item_id);
+                        crate::cli::work::notify(recipient, &comment_body, &item_id);
                     }
-                    return Ok(StepResult::Success);
-                }
-
-                if ctx.data.review_issues.is_some() {
-                    let issues = ctx.data.review_issues.clone().unwrap_or_default();
-                    let _ = mcp.comment_impl(CommentRequest {
-                        action: "create".into(),
-                        item_id: Some(item_id.clone()),
-                        body: Some(format!(
-                            "## agentflare work — needs human review\n\n\
-                             Automated review/fix did not converge after {MAX_REVIEW_CYCLES} \
-                             cycles. Latest outstanding issues:\n\n{issues}"
-                        )),
-                        ..Default::default()
-                    });
-                    return Ok(StepResult::Success);
-                }
-
-                let done_resp = mcp
-                    .item_done(ItemRequest {
-                        action: "done".into(),
-                        id: Some(item_id.clone()),
-                        summary: Some(ctx.data.reply_text.clone()),
-                        ..Default::default()
-                    })
-                    .map_err(|e| WorkflowError::StepFailed {
-                        step_id: StepId::new("finalize"),
-                        message: e.message.to_string(),
-                    })?;
-                let done_val: serde_json::Value =
-                    serde_json::from_str(&done_resp).unwrap_or(serde_json::Value::Null);
-                ctx.data.pr_url = done_val["pr_url"].as_str().map(str::to_string);
-
-                let comment_reply =
-                    crate::cli::work::cap_reply_for_comment(&mcp, &item_id, &ctx.data.reply_text);
-                let comment_body = crate::cli::work::format_success_comment(
-                    &comment_reply,
-                    ctx.data.session_id.as_deref(),
-                    ctx.data.cost_usd,
-                    ctx.data.pr_url.as_deref(),
-                );
-                let _ = mcp.comment_impl(CommentRequest {
-                    action: "create".into(),
-                    item_id: Some(item_id.clone()),
-                    body: Some(comment_body.clone()),
-                    ..Default::default()
-                });
-                if let Some(recipient) = notify_recipient.as_deref() {
-                    crate::cli::work::notify(recipient, &comment_body, &item_id);
-                }
-                Ok(StepResult::Success)
+                    Ok(StepResult::Success)
+                })
             })
         },
     ));
@@ -533,6 +540,7 @@ pub(crate) fn build_work_item_pipeline(
     plan_doc: Option<String>,
     mcp: std::sync::Arc<AgentflareMcp>,
     item_id: String,
+    owner: String,
     notify_recipient: Option<String>,
     timeout: std::time::Duration,
     idle_timeout: std::time::Duration,
@@ -544,6 +552,7 @@ pub(crate) fn build_work_item_pipeline(
         plan_doc,
         mcp,
         item_id,
+        owner,
         notify_recipient,
         real_agent_send_hook(timeout, idle_timeout, extra_args),
     )
@@ -597,18 +606,21 @@ fn real_agent_send_hook(
 /// `run_or_resume_with_sender`'s, which is the caller that actually needs
 /// them (to compute `WorkItemData::tasks` via `load_or_synthesize_tasks`
 /// before `start_workflow`; see that function).
+#[allow(clippy::too_many_arguments)]
 fn build_work_item_pipeline_with_sender(
     agent: agent_registry::Agent,
     _item_description: String,
     _plan_doc: Option<String>,
     mcp: std::sync::Arc<AgentflareMcp>,
     item_id: String,
+    owner: String,
     notify_recipient: Option<String>,
     send: flare_workflow::json::SendMessage,
 ) -> flare_workflow::WorkflowDefinition<WorkItemData> {
     let agent_name = agent.as_str().to_string();
     let sdd_loop = build_sdd_loop_step(agent_name.clone(), agent_name, send);
-    let finalize = build_finalize_step(mcp, item_id, notify_recipient).depends_on(&["sdd_loop"]);
+    let finalize =
+        build_finalize_step(mcp, item_id, notify_recipient, owner).depends_on(&["sdd_loop"]);
 
     flare_workflow::WorkflowDefinition::new(WORKFLOW_ID, "sdd work item")
         .add_step(sdd_loop)
@@ -708,12 +720,20 @@ pub(crate) fn run_or_resume_with_sender(
     let tasks = load_or_synthesize_tasks(&item_description, plan_doc.as_deref());
 
     let eng = engine();
+    // Captured on the caller thread (still inside `with_owner_override` for
+    // in-process dispatch, or on the env-derived identity for the CLI
+    // subprocess path) BEFORE the workflow runs on `WORKFLOW_RT`'s worker
+    // threads — `finalize` executes there, where the thread-local override
+    // is absent, so it needs the owner passed down explicitly rather than
+    // re-resolving `owner_id()` itself.
+    let owner = crate::claims::owner_id();
     let definition = build_work_item_pipeline_with_sender(
         agent,
         item_description,
         plan_doc,
         mcp.clone(),
         item.id.clone(),
+        owner,
         notify_recipient,
         send,
     );
@@ -1031,7 +1051,12 @@ mod tests {
             reply_text: "implemented the thing".into(),
             ..Default::default()
         };
-        let step = build_finalize_step(mcp.clone(), item_id.clone(), None);
+        let step = build_finalize_step(
+            mcp.clone(),
+            item_id.clone(),
+            None,
+            crate::claims::owner_id(),
+        );
         let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
         let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
         engine.register_workflow(wf).unwrap();
@@ -1208,6 +1233,7 @@ mod pipeline_assembly_tests {
             None,
             std::sync::Arc::new(AgentflareMcp::default()),
             "item-1".to_string(),
+            "opencode:test".to_string(),
             None,
             send,
         );

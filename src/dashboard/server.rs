@@ -761,6 +761,7 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
             None,
             dummy_mcp,
             String::new(),
+            String::new(),
             None,
             std::time::Duration::from_secs(crate::cli::work::DEFAULT_TIMEOUT_SECS),
             std::time::Duration::from_secs(crate::cli::work::DEFAULT_IDLE_TIMEOUT_SECS),
