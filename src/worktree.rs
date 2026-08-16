@@ -174,6 +174,16 @@ fn pr_body(item_id: &str, summary: Option<&str>) -> String {
     }
 }
 
+/// Human-readable attribution appended to the PR body -- who opened it and
+/// on which machine, so a reviewer never has to guess whether a PR came
+/// from agentflare. Unlike `bridge::marker::Marker`, this is not a
+/// parseable format: nothing reads a PR footer back (the bridge doesn't
+/// poll PRs for claim state the way it polls issues), so there is no
+/// format to keep stable.
+fn pr_footer(agent: &str, machine: &str, sequence_id: i64) -> String {
+    format!("---\n_Opened by `{agent}` on **{machine}** for item #{sequence_id} via agentflare._")
+}
+
 /// Pushes `item`'s isolated worktree branch and opens a PR against
 /// `target_branch` — the `done`-side counterpart to `create_worktree`.
 /// Deliberately never merges: unreviewed code should never land on the
@@ -184,6 +194,7 @@ fn pr_body(item_id: &str, summary: Option<&str>) -> String {
 /// item's completion is already committed to the DB by the time this runs.
 pub fn push_and_open_pr(
     item: &agentflare_backend::item::Item,
+    agent: &str,
     repo_root: &Path,
     target_branch: &str,
     progress: Option<&ProgressSender>,
@@ -198,7 +209,12 @@ pub fn push_and_open_pr(
     if let Some(p) = progress {
         p.send(0.5, Some(1.0), Some("Creating PR...".into()));
     }
-    let body = pr_body(&item.id, summary);
+    let machine = crate::github::bridge::config::machine_label();
+    let body = format!(
+        "{}\n\n{}",
+        pr_body(&item.id, summary),
+        pr_footer(agent, &machine, item.sequence_id)
+    );
     let repo = match RepoId::resolve_from_remote(repo_root) {
         Some(r) => r,
         None => {
@@ -252,6 +268,17 @@ pub fn push_and_open_pr(
         Some(&body),
     ) {
         Ok(pr) => {
+            if let Err(e) = crate::github::issues::add_labels(
+                &client,
+                &repo,
+                pr.number,
+                &["agentflare:in-review".to_string(), format!("beacon:{machine}")],
+            ) {
+                eprintln!(
+                    "worktree: could not label PR #{} for item {}: {e}",
+                    pr.number, item.id
+                );
+            }
             if let Some(p) = progress {
                 p.send(1.0, Some(1.0), Some("PR created".into()));
             }
@@ -297,6 +324,14 @@ mod tests {
         assert_eq!(
             pr_body("item-1", Some("   ")),
             "Auto-opened on `item done` for item-1."
+        );
+    }
+
+    #[test]
+    fn pr_footer_names_agent_machine_and_item() {
+        assert_eq!(
+            pr_footer("claude-code", "kumar-laptop", 42),
+            "---\n_Opened by `claude-code` on **kumar-laptop** for item #42 via agentflare._"
         );
     }
 }
