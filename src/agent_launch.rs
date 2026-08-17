@@ -460,7 +460,10 @@ pub fn run_headless(
     // `.ps1`) are launched through `powershell.exe -WindowStyle Hidden`
     // rather than the shim itself — see `launch_command`. The rest (native
     // `.exe`) run directly under `CREATE_NO_WINDOW` below.
+    #[cfg(windows)]
     let (launch_cmd, launch_args, hidden_console) = launch_command(&binary, &argv[1..]);
+    #[cfg(not(windows))]
+    let (launch_cmd, launch_args, _hidden_console) = launch_command(&binary, &argv[1..]);
     let (sandboxed_command, sandboxed_args) =
         agentflare_jobs::sandbox::wrap(&launch_cmd, &launch_args, cwd.as_deref(), true);
     let mut cmd = Command::new(&sandboxed_command);
