@@ -1,0 +1,14 @@
+[package]
+name = "flare-sandbox"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+description = "Reusable, configurable process sandboxing for AI coding-agent CLIs. Linux/WSL2 via bubblewrap (bwrap); other platforms pass commands through unchanged. Agent-agnostic — callers supply which $HOME state directories each agent CLI needs mounted, and under what write policy."
+publish = false
+
+[dependencies]
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
+
+[dev-dependencies]
+tempfile = "3"
