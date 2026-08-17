@@ -353,29 +353,28 @@ fn resolve_agent(
     })?;
 
     // Usage-threshold fallback candidate: only meaningful when the primary
-    // decision landed on claude-code. Re-running `route()` with claude-code
-    // excluded from `installed` reuses the exact rule that matched this
-    // item (same `task`), so the fallback honors whatever `[router]`
-    // preference order the user configured instead of hardcoding an agent.
-    // The `!= ClaudeCode` filter catches the case where the primary
-    // decision was an explicit human pin (`assigned_agent`) — `route()`
-    // returns that unconditionally regardless of `installed`, so the
-    // second call would otherwise just return claude-code again and look
-    // like a real fallback when there isn't one. Reuses the same `rotation`
-    // map as the primary call — this probe is a what-if, not a real pick,
-    // but a `rotate = true` rule's counter still needs to reflect it if the
-    // fallback is the one that actually runs (`pick_implementer_agent`).
-    let fallback_agent = if decision.agent == agent_registry::Agent::ClaudeCode {
-        let installed_minus_claude: Vec<_> = installed
-            .iter()
-            .copied()
-            .filter(|a| *a != agent_registry::Agent::ClaudeCode)
-            .collect();
-        agent_registry::route(&task, config, &installed_minus_claude, rotation)
-            .map(|d| d.agent)
-            .filter(|fb| *fb != agent_registry::Agent::ClaudeCode)
-    } else {
-        None
+    // decision landed on a usage-gated agent (claude-code or opencode).
+    // Re-running `route()` with that agent excluded from `installed` reuses
+    // the exact rule that matched this item, so the fallback honors the
+    // configured `[router]` preference order instead of hardcoding an agent.
+    // The `*fb != excluded` filter catches an explicit human pin
+    // (`assigned_agent`) — `route()` returns that regardless of `installed`,
+    // so the second call would otherwise return the same agent again. The
+    // probe routes on a clone — a what-if must not advance the counter.
+    let fallback_agent = match decision.agent {
+        agent_registry::Agent::ClaudeCode | agent_registry::Agent::Opencode => {
+            let excluded = decision.agent;
+            let rest: Vec<_> = installed
+                .iter()
+                .copied()
+                .filter(|a| *a != excluded)
+                .collect();
+            let mut fallback_rotation = rotation.clone();
+            agent_registry::route(&task, config, &rest, &mut fallback_rotation)
+                .map(|d| d.agent)
+                .filter(|fb| *fb != excluded)
+        }
+        _ => None,
     };
 
     Ok((decision.agent, decision.reason, fallback_agent))
@@ -384,7 +383,9 @@ fn resolve_agent(
 /// Combines `resolve_agent`'s router-derived fallback candidate with the
 /// live usage-threshold check into the agent actually used for the
 /// implementer role. `over_threshold` is only invoked when a fallback
-/// exists and the primary decision is claude-code — see
+/// exists; the caller picks which subscription's check to run based on the
+/// primary decision (`claude_over_threshold` for claude-code,
+/// `opencode_go_over_threshold` for opencode) — see
 /// `pick_implementer_agent_does_not_call_over_threshold_when_no_fallback_exists`
 /// for why that short-circuit matters.
 fn pick_implementer_agent(
@@ -393,9 +394,7 @@ fn pick_implementer_agent(
     over_threshold: impl FnOnce() -> bool,
 ) -> agent_registry::Agent {
     match fallback_agent {
-        Some(fallback) if agent == agent_registry::Agent::ClaudeCode && over_threshold() => {
-            fallback
-        }
+        Some(fallback) if over_threshold() => fallback,
         _ => agent,
     }
 }
@@ -829,11 +828,12 @@ fn execute_work_impl(
             return 1.into();
         }
     };
-    let implementer_agent = pick_implementer_agent(
-        agent_enum,
-        fallback_agent,
-        crate::claude_usage::claude_over_threshold,
-    );
+    let over_threshold: fn() -> bool = match agent_enum {
+        agent_registry::Agent::ClaudeCode => crate::claude_usage::claude_over_threshold,
+        agent_registry::Agent::Opencode => crate::opencode_go_usage::opencode_go_over_threshold,
+        _ => || false,
+    };
+    let implementer_agent = pick_implementer_agent(agent_enum, fallback_agent, over_threshold);
     // Judge/reviewer gets its own `role = "judge"` resolution, so a
     // `[router]` rule can pin it independently of the implementer's
     // rotation/usage-threshold fallback. No such rule (the common case)
@@ -850,23 +850,25 @@ fn execute_work_impl(
     .map(|(agent, _, _)| agent)
     .unwrap_or(agent_enum);
     crate::state::save(&state);
-    if headless_args(agent_enum).is_none() {
-        let msg = format!("agent {} has no headless print mode", agent_enum.as_str());
+    let name = implementer_agent.as_str();
+    let agent_unchanged = implementer_agent == agent_enum;
+    if headless_args(implementer_agent).is_none() {
+        let msg = format!("agent {name} has no headless print mode");
         release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
         crate::ui::error(&msg);
         return 1.into();
     }
-    let _ = writeln!(log, "agent: {} ({route_reason})", agent_enum.as_str());
+    let _ = writeln!(log, "agent: {name} ({route_reason})");
 
     let item_description = item_detail.description.clone();
     let plan_doc = latest_plan_doc_content(&mcp, item_id);
 
     // --- Extra args ---
     let extra_args = build_extra_args(
-        agent_enum,
+        implementer_agent,
         args.max_turns,
         args.max_cost_usd,
-        args.model.as_deref(),
+        args.model.as_deref().filter(|_| agent_unchanged),
     );
 
     // --- Change to worktree dir and run the sdd_loop -> finalize pipeline;
@@ -926,7 +928,7 @@ fn execute_work_impl(
             release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
             crate::ui::error(&msg);
             let _ = writeln!(log, "failed: {msg}");
-            let retry_after_secs = classify_and_cooldown(agent_enum.as_str(), &msg);
+            let retry_after_secs = classify_and_cooldown(implementer_agent.as_str(), &msg);
             WorkOutcome {
                 exit_code: 1,
                 retry_after_secs,
@@ -1383,16 +1385,13 @@ use  = "claude-code"
     }
 
     #[test]
-    fn resolve_agent_fallback_is_none_when_primary_decision_is_not_claude_code() {
+    fn resolve_agent_fallback_picks_claude_code_when_opencode_is_primary() {
+        // Symmetric to the claude-code->opencode gate: an opencode primary
+        // yields a fallback candidate from the same rule's preference order.
         let mut item = test_item();
         item.metadata = r#"{"size":"S"}"#.to_string();
         let config = agent_registry::parse_router_config(
-            r#"
-[router]
-[[router.rule]]
-when = { size = "S" }
-use  = "opencode"
-"#,
+            "[router]\n[[router.rule]]\nwhen = { size = \"S\" }\nuse  = [\"opencode\", \"claude-code\"]\n",
         )
         .unwrap();
         let (agent, _, fallback) = resolve_agent(
@@ -1400,13 +1399,16 @@ use  = "opencode"
             &item,
             &[],
             &config,
-            &[agent_registry::Agent::Opencode],
+            &[
+                agent_registry::Agent::Opencode,
+                agent_registry::Agent::ClaudeCode,
+            ],
             None,
             &mut Default::default(),
         )
         .unwrap();
         assert_eq!(agent, agent_registry::Agent::Opencode);
-        assert_eq!(fallback, None);
+        assert_eq!(fallback, Some(agent_registry::Agent::ClaudeCode));
     }
 
     #[test]
@@ -1480,17 +1482,17 @@ rotate = true
     }
 
     #[test]
-    fn pick_implementer_agent_never_touches_a_non_claude_code_primary() {
+    fn pick_implementer_agent_falls_back_for_opencode_primary_too() {
+        // `pick_implementer_agent` is agent-agnostic: the per-agent gate
+        // lives at the call site (claude_over_threshold vs
+        // opencode_go_over_threshold). An opencode primary over threshold
+        // falls back exactly like a claude-code one.
         let agent = pick_implementer_agent(
             agent_registry::Agent::Opencode,
-            Some(agent_registry::Agent::Codex),
+            Some(agent_registry::Agent::ClaudeCode),
             || true,
         );
-        assert_eq!(
-            agent,
-            agent_registry::Agent::Opencode,
-            "usage-fallback only ever applies when the primary decision is claude-code"
-        );
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
     }
 
     #[test]
