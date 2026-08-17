@@ -780,12 +780,19 @@ fn ref_transaction_log() {
 struct ScopeCheckResult {
     deny: bool,
     reason: Option<String>,
+    /// Set when scope-check itself could not classify the change (e.g. the
+    /// pathset exceeds `MAX_CHANGED_PATHS`) -- a tooling limitation, not a
+    /// deliberate policy verdict. Kept distinct from `deny`/`reason` so the
+    /// shim can audit this as `ScopeCheckOutcome::Unavailable` /
+    /// `Disposition::ScopeCheckError` rather than a real `Deny` (item #494).
+    error: Option<String>,
 }
 
 fn scope_pass() -> ScopeCheckResult {
     ScopeCheckResult {
         deny: false,
         reason: None,
+        error: None,
     }
 }
 
@@ -793,6 +800,22 @@ fn scope_deny(reason: String) -> ScopeCheckResult {
     ScopeCheckResult {
         deny: true,
         reason: Some(reason),
+        error: None,
+    }
+}
+
+/// Like `scope_deny`, but for when scope-check itself couldn't reach a
+/// verdict (a tooling limitation, e.g. the changed pathset exceeds
+/// `MAX_CHANGED_PATHS`) rather than actually classifying the change. Still
+/// blocks the operation (`deny: true`) since enforcement can't be skipped
+/// just because classification failed, but sets `error` so the shim files
+/// this under `Disposition::ScopeCheckError` instead of a real policy
+/// `Deny` (item #494).
+fn scope_error(reason: String) -> ScopeCheckResult {
+    ScopeCheckResult {
+        deny: true,
+        reason: Some(reason.clone()),
+        error: Some(reason),
     }
 }
 
@@ -898,7 +921,7 @@ fn run_scope_check(subcommand: &str) -> ScopeCheckResult {
         match changed_paths(&repo_root, subcommand) {
             Ok(p) => p,
             Err(e) => {
-                return scope_deny(format!("scope-check could not classify changed paths: {e}"));
+                return scope_error(format!("scope-check could not classify changed paths: {e}"));
             }
         }
     };
@@ -1488,5 +1511,27 @@ mod tests {
     fn changed_paths_for_commit_is_empty_when_clean() {
         let repo = init_repo();
         assert!(changed_paths(repo.path(), "commit").unwrap().is_empty());
+    }
+
+    /// Item #494: `scope_error` (used when `changed_paths()` can't classify
+    /// the change, e.g. cap-exceeded) must still block via `deny: true`, but
+    /// carry `error` too -- distinct from `scope_deny`'s real policy
+    /// verdict -- so the shim can tell the two apart on the wire.
+    #[test]
+    fn scope_error_sets_both_deny_and_error() {
+        let result = scope_error("too many paths".to_string());
+        assert!(result.deny);
+        assert_eq!(result.reason.as_deref(), Some("too many paths"));
+        assert_eq!(result.error.as_deref(), Some("too many paths"));
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains(r#""error":"too many paths""#), "{json}");
+    }
+
+    #[test]
+    fn scope_deny_leaves_error_unset() {
+        let result = scope_deny("overlapping claim".to_string());
+        assert!(result.deny);
+        assert_eq!(result.error, None);
     }
 }

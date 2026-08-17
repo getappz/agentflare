@@ -42,6 +42,12 @@ ALLOWLIST=(
   # feature's own tests shouldn't have to carry a pre-existing test-module
   # split. Frozen at <= FROZEN_LIMIT; a real split is separate work.
   crates/agentflare-backend/src/item/tests.rs
+  # Already 1491 lines on master before item #494's scope-check `error`
+  # field (a protocol-classification fix, not a feature) pushed it over
+  # LIMIT. Splitting the scope-check block into its own submodule is worth
+  # doing but is a separate, larger refactor than this nitpick-followup fix
+  # should carry. Frozen at <= FROZEN_LIMIT; a real split is separate work.
+  src/cli/git.rs
 )
 
 cd "$(dirname "$0")/.."
