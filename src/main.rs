@@ -15,6 +15,7 @@ mod bashenv;
 mod build_time;
 mod channels;
 mod claims;
+mod claude_usage;
 mod cli;
 mod coaching;
 mod code;

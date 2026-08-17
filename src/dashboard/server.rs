@@ -757,6 +757,7 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
         let dummy_mcp = std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default());
         let dummy_definition = crate::work_item_pipeline::build_work_item_pipeline(
             agent_registry::Agent::ClaudeCode,
+            agent_registry::Agent::ClaudeCode,
             String::new(),
             None,
             dummy_mcp,

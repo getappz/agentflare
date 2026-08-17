@@ -323,20 +323,13 @@ fn resolve_agent(
     labels: &[String],
     config: &agent_registry::RouterConfig,
     installed: &[agent_registry::Agent],
-) -> Result<(agent_registry::Agent, String), String> {
+) -> Result<(agent_registry::Agent, String, Option<agent_registry::Agent>), String> {
     if let Some(name) = explicit {
         return agent_registry::agent_by_name(name)
-            .map(|agent| (agent, "explicit --agent flag".to_string()))
+            .map(|agent| (agent, "explicit --agent flag".to_string(), None))
             .ok_or_else(|| format!("unknown agent: {name} — use `agentflare agents list`"));
     }
 
-    // `assignee_agent` may carry an instance suffix (`<agent>:<instance>`)
-    // once the item has been claimed at least once — `item::claim` stores
-    // the raw claim owner there deliberately (see its doc comment). Strip it
-    // via the same `agent_part` the claim/handoff-freeze logic already uses
-    // internally, so a previously-claimed item still routes to its own
-    // assignee instead of silently falling through to the router's other
-    // rules.
     let assigned_agent = item
         .assignee_agent
         .as_deref()
@@ -350,13 +343,55 @@ fn resolve_agent(
         repo: None,
         assigned_agent,
     };
-    agent_registry::route(&task, config, installed)
-        .map(|decision| (decision.agent, decision.reason))
-        .ok_or_else(|| {
-            "no --agent given, and no route decision (item has no assignee and no router \
-             rule matched) — pass --agent explicitly"
-                .to_string()
-        })
+    let decision = agent_registry::route(&task, config, installed).ok_or_else(|| {
+        "no --agent given, and no route decision (item has no assignee and no router \
+         rule matched) — pass --agent explicitly"
+            .to_string()
+    })?;
+
+    // Usage-threshold fallback candidate: only meaningful when the primary
+    // decision landed on claude-code. Re-running `route()` with claude-code
+    // excluded from `installed` reuses the exact rule that matched this
+    // item (same `task`), so the fallback honors whatever `[router]`
+    // preference order the user configured instead of hardcoding an agent.
+    // The `!= ClaudeCode` filter catches the case where the primary
+    // decision was an explicit human pin (`assigned_agent`) — `route()`
+    // returns that unconditionally regardless of `installed`, so the
+    // second call would otherwise just return claude-code again and look
+    // like a real fallback when there isn't one.
+    let fallback_agent = if decision.agent == agent_registry::Agent::ClaudeCode {
+        let installed_minus_claude: Vec<_> = installed
+            .iter()
+            .copied()
+            .filter(|a| *a != agent_registry::Agent::ClaudeCode)
+            .collect();
+        agent_registry::route(&task, config, &installed_minus_claude)
+            .map(|d| d.agent)
+            .filter(|fb| *fb != agent_registry::Agent::ClaudeCode)
+    } else {
+        None
+    };
+
+    Ok((decision.agent, decision.reason, fallback_agent))
+}
+
+/// Combines `resolve_agent`'s router-derived fallback candidate with the
+/// live usage-threshold check into the agent actually used for the
+/// implementer role. `over_threshold` is only invoked when a fallback
+/// exists and the primary decision is claude-code — see
+/// `pick_implementer_agent_does_not_call_over_threshold_when_no_fallback_exists`
+/// for why that short-circuit matters.
+fn pick_implementer_agent(
+    agent: agent_registry::Agent,
+    fallback_agent: Option<agent_registry::Agent>,
+    over_threshold: impl FnOnce() -> bool,
+) -> agent_registry::Agent {
+    match fallback_agent {
+        Some(fallback) if agent == agent_registry::Agent::ClaudeCode && over_threshold() => {
+            fallback
+        }
+        _ => agent,
+    }
 }
 
 /// Best-effort backstop that releases `execute_work`'s claim on drop unless
@@ -591,6 +626,7 @@ fn execute_work_impl(
         std::sync::Arc<AgentflareMcp>,
         &agentflare_backend::item::Item,
         agent_registry::Agent,
+        agent_registry::Agent,
         String,
         Option<String>,
         Option<String>,
@@ -762,7 +798,7 @@ fn execute_work_impl(
     } else {
         (Vec::new(), agent_registry::RouterConfig::default())
     };
-    let (agent_enum, route_reason) = match resolve_agent(
+    let (agent_enum, route_reason, fallback_agent) = match resolve_agent(
         args.agent.as_deref(),
         &item_detail,
         &labels,
@@ -776,6 +812,11 @@ fn execute_work_impl(
             return 1.into();
         }
     };
+    let implementer_agent = pick_implementer_agent(
+        agent_enum,
+        fallback_agent,
+        crate::claude_usage::claude_over_threshold,
+    );
     if headless_args(agent_enum).is_none() {
         let msg = format!("agent {} has no headless print mode", agent_enum.as_str());
         release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
@@ -817,6 +858,7 @@ fn execute_work_impl(
     let result = run_pipeline(
         mcp.clone(),
         &item_detail,
+        implementer_agent,
         agent_enum,
         item_description,
         plan_doc,
@@ -1031,7 +1073,8 @@ mod tests {
         let mut item = test_item();
         item.assignee_agent = Some("opencode".to_string());
         let config = agent_registry::RouterConfig::default();
-        let (agent, reason) = resolve_agent(Some("codex"), &item, &[], &config, &[]).unwrap();
+        let (agent, reason, _fallback) =
+            resolve_agent(Some("codex"), &item, &[], &config, &[]).unwrap();
         assert_eq!(agent, agent_registry::Agent::Codex);
         assert_eq!(reason, "explicit --agent flag");
     }
@@ -1042,7 +1085,7 @@ mod tests {
         // — the explicit path must accept it the same as assignee_agent does.
         let item = test_item();
         let config = agent_registry::RouterConfig::default();
-        let (agent, _) = resolve_agent(Some("claude"), &item, &[], &config, &[]).unwrap();
+        let (agent, _, _) = resolve_agent(Some("claude"), &item, &[], &config, &[]).unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
     }
 
@@ -1059,7 +1102,7 @@ mod tests {
         let mut item = test_item();
         item.assignee_agent = Some("claude".to_string()); // alias, agent_by_name() maps it
         let config = agent_registry::RouterConfig::default();
-        let (agent, reason) = resolve_agent(None, &item, &[], &config, &[]).unwrap();
+        let (agent, reason, _fallback) = resolve_agent(None, &item, &[], &config, &[]).unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
         assert_eq!(reason, "explicit assignment on task");
     }
@@ -1073,7 +1116,7 @@ mod tests {
         let mut item = test_item();
         item.assignee_agent = Some("claude-code:some-job-id".to_string());
         let config = agent_registry::RouterConfig::default();
-        let (agent, reason) = resolve_agent(None, &item, &[], &config, &[]).unwrap();
+        let (agent, reason, _fallback) = resolve_agent(None, &item, &[], &config, &[]).unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
         assert_eq!(reason, "explicit assignment on task");
     }
@@ -1106,7 +1149,7 @@ use  = "opencode"
 "#,
         )
         .unwrap();
-        let (agent, _) = resolve_agent(
+        let (agent, _, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -1130,7 +1173,7 @@ use  = "opencode"
 "#,
         )
         .unwrap();
-        let (agent, _) = resolve_agent(
+        let (agent, _, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -1139,6 +1182,193 @@ use  = "opencode"
         )
         .unwrap();
         assert_eq!(agent, agent_registry::Agent::Opencode);
+    }
+
+    #[test]
+    fn resolve_agent_fallback_is_none_when_explicit_flag_used() {
+        let item = test_item();
+        let config = agent_registry::parse_router_config(
+            r#"
+[router]
+[[router.rule]]
+when = { size = "S" }
+use  = "opencode"
+"#,
+        )
+        .unwrap();
+        let (agent, _, fallback) = resolve_agent(
+            Some("claude"),
+            &item,
+            &[],
+            &config,
+            &[
+                agent_registry::Agent::ClaudeCode,
+                agent_registry::Agent::Opencode,
+            ],
+        )
+        .unwrap();
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+        assert_eq!(fallback, None);
+    }
+
+    #[test]
+    fn resolve_agent_fallback_is_none_when_item_assignee_pins_claude_code() {
+        let mut item = test_item();
+        item.assignee_agent = Some("claude-code".to_string());
+        let config = agent_registry::RouterConfig::default();
+        let (agent, _, fallback) = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &[
+                agent_registry::Agent::ClaudeCode,
+                agent_registry::Agent::Opencode,
+            ],
+        )
+        .unwrap();
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+        assert_eq!(
+            fallback, None,
+            "an explicit item assignment must not produce a usage-fallback candidate"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_fallback_picks_the_next_installed_router_preference() {
+        let mut item = test_item();
+        item.metadata = r#"{"size":"S"}"#.to_string();
+        let config = agent_registry::parse_router_config(
+            r#"
+[router]
+[[router.rule]]
+when = { size = "S" }
+use  = ["claude-code", "codex", "opencode"]
+"#,
+        )
+        .unwrap();
+        let (agent, _, fallback) = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &[
+                agent_registry::Agent::ClaudeCode,
+                agent_registry::Agent::Opencode,
+            ],
+        )
+        .unwrap();
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+        assert_eq!(
+            fallback,
+            Some(agent_registry::Agent::Opencode),
+            "codex isn't installed, so opencode (next in the rule's preference list) is the fallback"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_fallback_is_none_when_nothing_else_is_installed() {
+        let mut item = test_item();
+        item.metadata = r#"{"size":"S"}"#.to_string();
+        let config = agent_registry::parse_router_config(
+            r#"
+[router]
+[[router.rule]]
+when = { size = "S" }
+use  = "claude-code"
+"#,
+        )
+        .unwrap();
+        let (agent, _, fallback) = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &[agent_registry::Agent::ClaudeCode],
+        )
+        .unwrap();
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+        assert_eq!(fallback, None);
+    }
+
+    #[test]
+    fn resolve_agent_fallback_is_none_when_primary_decision_is_not_claude_code() {
+        let mut item = test_item();
+        item.metadata = r#"{"size":"S"}"#.to_string();
+        let config = agent_registry::parse_router_config(
+            r#"
+[router]
+[[router.rule]]
+when = { size = "S" }
+use  = "opencode"
+"#,
+        )
+        .unwrap();
+        let (agent, _, fallback) = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &[agent_registry::Agent::Opencode],
+        )
+        .unwrap();
+        assert_eq!(agent, agent_registry::Agent::Opencode);
+        assert_eq!(fallback, None);
+    }
+
+    #[test]
+    fn pick_implementer_agent_falls_back_when_over_threshold() {
+        let agent = pick_implementer_agent(
+            agent_registry::Agent::ClaudeCode,
+            Some(agent_registry::Agent::Opencode),
+            || true,
+        );
+        assert_eq!(agent, agent_registry::Agent::Opencode);
+    }
+
+    #[test]
+    fn pick_implementer_agent_stays_on_claude_code_when_under_threshold() {
+        let agent = pick_implementer_agent(
+            agent_registry::Agent::ClaudeCode,
+            Some(agent_registry::Agent::Opencode),
+            || false,
+        );
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+    }
+
+    #[test]
+    fn pick_implementer_agent_stays_on_claude_code_when_no_fallback_available() {
+        let agent = pick_implementer_agent(agent_registry::Agent::ClaudeCode, None, || true);
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+    }
+
+    #[test]
+    fn pick_implementer_agent_never_touches_a_non_claude_code_primary() {
+        let agent = pick_implementer_agent(
+            agent_registry::Agent::Opencode,
+            Some(agent_registry::Agent::Codex),
+            || true,
+        );
+        assert_eq!(
+            agent,
+            agent_registry::Agent::Opencode,
+            "usage-fallback only ever applies when the primary decision is claude-code"
+        );
+    }
+
+    #[test]
+    fn pick_implementer_agent_does_not_call_over_threshold_when_no_fallback_exists() {
+        // Short-circuit check: with no fallback candidate, `over_threshold`
+        // must never run — this is what keeps the usage endpoint off the hot
+        // path for items that route to a non-claude-code agent or that have
+        // nothing else installed to fall back to.
+        let mut called = false;
+        let agent = pick_implementer_agent(agent_registry::Agent::ClaudeCode, None, || {
+            called = true;
+            true
+        });
+        assert_eq!(agent, agent_registry::Agent::ClaudeCode);
+        assert!(!called);
     }
 
     #[test]
@@ -1431,7 +1661,8 @@ use  = "opencode"
             &mut log,
             |mcp,
              item,
-             agent,
+             implementer_agent,
+             review_agent,
              item_description,
              plan_doc,
              notify,
@@ -1450,7 +1681,8 @@ use  = "opencode"
                 crate::work_item_pipeline::run_or_resume_with_sender(
                     mcp,
                     item,
-                    agent,
+                    implementer_agent,
+                    review_agent,
                     item_description,
                     plan_doc,
                     notify,

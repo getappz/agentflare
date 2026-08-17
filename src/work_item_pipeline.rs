@@ -248,6 +248,12 @@ pub(crate) fn build_sdd_loop_step(
 
                 // 1. Role dispatch — state read from ctx.data decides which
                 // role plays this turn.
+                // Reviewer branches (task-reviewer, re-reviewer) dispatch on
+                // `judge_agent_name`, not `agent_name` — that's the agent
+                // reserved for every non-implementer role (see the judge
+                // dispatch further down), so a usage-threshold fallback that
+                // swaps `agent_name` to another CLI still leaves real code
+                // review running on the reserved agent.
                 let (role_agent, role_prompt) = if ctx.data.review_issues.is_some() {
                     if ctx.data.last_report.is_some() {
                         // A fix has already been submitted for the current
@@ -255,7 +261,7 @@ pub(crate) fn build_sdd_loop_step(
                         let findings = ctx.data.review_issues.clone().unwrap_or_default();
                         let fix_report = ctx.data.last_report.clone().unwrap_or_default();
                         (
-                            agent_name.clone(),
+                            judge_agent_name.clone(),
                             build_re_reviewer_prompt(&task, &findings, &fix_report),
                         )
                     } else {
@@ -271,7 +277,7 @@ pub(crate) fn build_sdd_loop_step(
                     // No open issues; a report is pending review.
                     let report = ctx.data.last_report.clone().unwrap_or_default();
                     (
-                        agent_name.clone(),
+                        judge_agent_name.clone(),
                         build_task_reviewer_prompt(&task, &report),
                     )
                 } else {
@@ -535,7 +541,8 @@ pub(crate) fn build_finalize_step(
 /// the test seam.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_work_item_pipeline(
-    agent: agent_registry::Agent,
+    implementer_agent: agent_registry::Agent,
+    review_agent: agent_registry::Agent,
     item_description: String,
     plan_doc: Option<String>,
     mcp: std::sync::Arc<AgentflareMcp>,
@@ -547,7 +554,8 @@ pub(crate) fn build_work_item_pipeline(
     extra_args: Vec<String>,
 ) -> flare_workflow::WorkflowDefinition<WorkItemData> {
     build_work_item_pipeline_with_sender(
-        agent,
+        implementer_agent,
+        review_agent,
         item_description,
         plan_doc,
         mcp,
@@ -608,7 +616,8 @@ fn real_agent_send_hook(
 /// before `start_workflow`; see that function).
 #[allow(clippy::too_many_arguments)]
 fn build_work_item_pipeline_with_sender(
-    agent: agent_registry::Agent,
+    implementer_agent: agent_registry::Agent,
+    review_agent: agent_registry::Agent,
     _item_description: String,
     _plan_doc: Option<String>,
     mcp: std::sync::Arc<AgentflareMcp>,
@@ -617,8 +626,11 @@ fn build_work_item_pipeline_with_sender(
     notify_recipient: Option<String>,
     send: flare_workflow::json::SendMessage,
 ) -> flare_workflow::WorkflowDefinition<WorkItemData> {
-    let agent_name = agent.as_str().to_string();
-    let sdd_loop = build_sdd_loop_step(agent_name.clone(), agent_name, send);
+    let sdd_loop = build_sdd_loop_step(
+        implementer_agent.as_str().to_string(),
+        review_agent.as_str().to_string(),
+        send,
+    );
     let finalize =
         build_finalize_step(mcp, item_id, notify_recipient, owner).depends_on(&["sdd_loop"]);
 
@@ -667,7 +679,8 @@ pub(crate) fn engine() -> &'static WorkflowEngine<WorkItemData, SqliteStore<Work
 pub(crate) fn run_or_resume(
     mcp: std::sync::Arc<AgentflareMcp>,
     item: &agentflare_backend::item::Item,
-    agent: agent_registry::Agent,
+    implementer_agent: agent_registry::Agent,
+    review_agent: agent_registry::Agent,
     item_description: String,
     plan_doc: Option<String>,
     notify_recipient: Option<String>,
@@ -678,7 +691,8 @@ pub(crate) fn run_or_resume(
     run_or_resume_with_sender(
         mcp,
         item,
-        agent,
+        implementer_agent,
+        review_agent,
         item_description,
         plan_doc,
         notify_recipient,
@@ -691,10 +705,12 @@ pub(crate) fn run_or_resume(
 /// `pub(crate)`: reused by `cli::work`'s own `execute_work` integration
 /// test, a sibling module that needs to inject a mock sender the same way
 /// this file's own tests do.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_or_resume_with_sender(
     mcp: std::sync::Arc<AgentflareMcp>,
     item: &agentflare_backend::item::Item,
-    agent: agent_registry::Agent,
+    implementer_agent: agent_registry::Agent,
+    review_agent: agent_registry::Agent,
     item_description: String,
     plan_doc: Option<String>,
     notify_recipient: Option<String>,
@@ -728,7 +744,8 @@ pub(crate) fn run_or_resume_with_sender(
     // re-resolving `owner_id()` itself.
     let owner = crate::claims::owner_id();
     let definition = build_work_item_pipeline_with_sender(
-        agent,
+        implementer_agent,
+        review_agent,
         item_description,
         plan_doc,
         mcp.clone(),
@@ -1123,6 +1140,7 @@ mod tests {
                 mcp.clone(),
                 &item,
                 agent_registry::Agent::ClaudeCode,
+                agent_registry::Agent::ClaudeCode,
                 "implement it".to_string(),
                 None,
                 None,
@@ -1192,6 +1210,7 @@ mod tests {
                 mcp.clone(),
                 &item,
                 agent_registry::Agent::ClaudeCode,
+                agent_registry::Agent::ClaudeCode,
                 "implement it".to_string(),
                 None,
                 None,
@@ -1229,6 +1248,7 @@ mod pipeline_assembly_tests {
             });
         let pipeline = build_work_item_pipeline_with_sender(
             agent_registry::Agent::ClaudeCode,
+            agent_registry::Agent::ClaudeCode,
             "Fix the null pointer in parser.rs".to_string(),
             None,
             std::sync::Arc::new(AgentflareMcp::default()),
@@ -1241,6 +1261,42 @@ mod pipeline_assembly_tests {
         assert_eq!(pipeline.steps[0].id.to_string(), "sdd_loop");
         assert_eq!(pipeline.steps[1].id.to_string(), "finalize");
         assert_eq!(pipeline.steps[1].depends_on, vec![StepId::new("sdd_loop")]);
+    }
+
+    #[tokio::test]
+    async fn sdd_loop_dispatches_implementer_and_review_roles_on_their_own_agents() {
+        let (send, calls) = super::sdd_test_support::mock_send(vec![
+            "DONE: added the flag",
+            r#"{"action":"advance_task","rationale":"looks done","ledger_line":"Task 0: implementer done","task_model_tier":null}"#,
+        ]);
+        let pipeline = build_work_item_pipeline_with_sender(
+            agent_registry::Agent::Opencode,
+            agent_registry::Agent::ClaudeCode,
+            "Fix the null pointer in parser.rs".to_string(),
+            None,
+            std::sync::Arc::new(AgentflareMcp::default()),
+            "item-1".to_string(),
+            "opencode:test".to_string(),
+            None,
+            send,
+        );
+        let mut ctx =
+            WorkflowContext::new(Default::default(), super::sdd_test_support::one_task_data());
+        pipeline.steps[0]
+            .executor
+            .execute(&mut ctx)
+            .await
+            .expect("executes");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded[0].0, "opencode",
+            "implementer role must dispatch on implementer_agent"
+        );
+        assert_eq!(
+            recorded[1].0, "claude-code",
+            "judge role must dispatch on review_agent"
+        );
     }
 
     /// Regression test: `sdd_loop`'s per-iteration engine timeout must not
@@ -1593,6 +1649,54 @@ mod sdd_loop_tests {
         assert_eq!(
             ctx.data.ledger,
             vec!["Task 0: implementer done".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_reviewer_dispatches_on_the_judge_agent_not_the_implementer_agent() {
+        let (send, calls) = mock_send(vec![
+            "REVIEW_APPROVED",
+            r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#,
+        ]);
+        let mut data = one_task_data();
+        // A non-empty `last_report` with no open `review_issues` routes this
+        // iteration to the task-reviewer, not the implementer.
+        data.last_report = Some("DONE: added the flag".to_string());
+        let step = sdd_step(send);
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+        step.executor.execute(&mut ctx).await.expect("executes");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded[0].0, "judge-agent",
+            "task-reviewer must dispatch on the reserved judge/review agent, not the implementer agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_reviewer_dispatches_on_the_judge_agent_not_the_implementer_agent() {
+        let (send, calls) = mock_send(vec![
+            "REVIEW_ISSUES: missing null check on line 12",
+            r#"{"action":"fix_round","rationale":"issues found","ledger_line":"Task 0: fix round 1","task_model_tier":null}"#,
+            "DONE: added the null check",
+            r#"{"action":"continue_task","rationale":"awaiting re-review","ledger_line":"Task 0: fix submitted","task_model_tier":null}"#,
+            "REVIEW_APPROVED",
+            r#"{"action":"advance_task","rationale":"fix verified","ledger_line":"Task 0: complete","task_model_tier":null}"#,
+        ]);
+        let mut data = one_task_data();
+        data.last_report = Some("DONE: initial attempt".to_string());
+        let step = sdd_step(send);
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+
+        step.executor.execute(&mut ctx).await.expect("round 1"); // task-reviewer -> fix_round
+        step.executor.execute(&mut ctx).await.expect("round 2"); // implementer -> continue_task
+        step.executor.execute(&mut ctx).await.expect("round 3"); // re-reviewer
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 6);
+        assert_eq!(
+            recorded[4].0, "judge-agent",
+            "re-reviewer must dispatch on the reserved judge/review agent, not the implementer agent"
         );
     }
 
