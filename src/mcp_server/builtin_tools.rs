@@ -78,8 +78,8 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
         "vent_file",
         "List or file agentflare's own tooling bugs (git shim, af-guard, item-tracker friction) as ONE batched GitHub issue on getappz/agentflare.",
     ),
-    (
-        "git",
+(
+        "git", // flipped flare_git -> git (MCP prefix flake)
         "GitHub repo management via the flare_git module. action=pr_create|pr_list|pr_get|pr_status|pr_merge|pr_comment|pr_request_review|issue_create|issue_list|issue_get|issue_comment|issue_close|issue_label|release_list|release_get|release_latest|release_create|run_list|run_get|run_rerun|workflow_dispatch.",
     ),
     (
