@@ -8,9 +8,10 @@ it is that subcommand's arguments.
 
 ## Bare `/pm` (no arguments) — start the PM day
 
-1. Load the `pm-mode` skill and stay in PM mode (create and dispatch work
-   instead of implementing it yourself) until `/pm mode off`.
-2. Load the `pm` skill and run the daily kickoff, in this order:
+1. Load the `pm` skill (covers both reporting and PM mode) and enter PM
+   mode — Part 2 of the skill: create and dispatch work instead of
+   implementing it yourself — until `/pm mode off`.
+2. Run the daily kickoff, in this order:
    a. **Standup** — `/pm:standup` workflow (last 24h): what shipped, what's in
       flight per assignee, what's stuck.
    b. **Intake triage** — `/pm:groom` workflow's flag lists only: new/unassigned
@@ -34,10 +35,17 @@ it is that subcommand's arguments.
 - **health** `[window-weeks]` — `/pm:health`; window default 4.
 - **portfolio** `[standup|health] [args]` — `/pm:portfolio`: the chosen report
   (default `health`) rolled up across every project in the workspace.
-- **mode on** — enable PM mode without the daily kickoff.
-- **mode off** — leave PM mode: stop following `pm-mode`, return to normal
+- **mode on** — enable PM mode (Part 2 of the `pm` skill) without the daily
+  kickoff.
+- **mode off** — leave PM mode: stop following Part 2, return to normal
   implementation behavior, confirm in one line.
 
-The `pm` skill's report workflows are read-only over items — item mutations
-happen only through PM-mode dispatch actions the user has approved. Unknown
-subcommand → one-line usage summary, then stop.
+Typing the literal `/pm`, `/pm mode on`, or `/pm mode off` also sets/clears a
+session-scoped flag in agentflare's own hook — the running session gets a "PM
+MODE ACTIVE" reminder on every subsequent turn until `/pm mode off`, so the
+mode holds even across context compaction, not just while the model happens
+to remember it.
+
+The `pm` skill's Part 1 report workflows are read-only over items — item
+mutations happen only through Part 2's PM-mode dispatch actions the user has
+approved. Unknown subcommand → one-line usage summary, then stop.

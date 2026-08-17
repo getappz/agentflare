@@ -276,7 +276,17 @@ pub fn validate_entry(e: &SkillEntry) -> Vec<String> {
 /// non-Claude roots are contributed only for detected agents and only if the
 /// directory exists.
 pub fn default_sources(home: &Path, cwd: &Path, detected_agents: &[String]) -> Vec<Source> {
+    // Skills compiled into the binary (see `crate::builtin`) — materialized
+    // to disk here so they can reuse the FlatDir scan path unchanged.
+    // Unconditional: no cwd/.claude dependency, so it's the one source that
+    // reaches every project and every MCP client, not just Claude Code's.
+    let builtin_dir = home.join(".agentflare").join("builtin-skills");
+    let _ = crate::builtin::materialize(&builtin_dir);
     let mut v = vec![
+        Source {
+            id: "agentflare-builtin".into(),
+            kind: SourceKind::FlatDir(builtin_dir),
+        },
         Source {
             id: "claude-user".into(),
             kind: SourceKind::FlatDir(home.join(".claude").join("skills")),
@@ -547,5 +557,23 @@ mod tests {
         let srcs = default_sources(home, home, &["codex".into()]);
         assert!(srcs.iter().any(|s| s.id == "codex"));
         assert!(!srcs.iter().any(|s| s.id == "cursor"));
+    }
+
+    #[test]
+    fn default_sources_always_includes_builtin_pm_skill_even_with_no_claude_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // No .claude/skills anywhere — cwd need not even exist.
+        let cwd = tmp.path().join("some-other-unrelated-project");
+        let srcs = default_sources(home, &cwd, &[]);
+        let builtin = srcs
+            .iter()
+            .find(|s| s.id == "agentflare-builtin")
+            .expect("agentflare-builtin source must always be present");
+        let out = scan_sources(std::slice::from_ref(builtin));
+        assert!(
+            out.entries.iter().any(|e| e.name == "pm"),
+            "builtin pm skill must be discoverable regardless of cwd/home .claude state"
+        );
     }
 }

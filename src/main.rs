@@ -48,6 +48,7 @@ mod mise_install;
 mod nudge_pace;
 mod optimize;
 mod paths;
+mod pm_mode;
 mod pricing;
 mod progress;
 mod quota;
