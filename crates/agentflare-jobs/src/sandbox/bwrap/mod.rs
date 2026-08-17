@@ -60,6 +60,22 @@ const OPENCODE_DATA_DIR_RELATIVE: &str = ".local/share/opencode";
 /// guarantee `HOME_CACHE_DIRS` argues for.
 const CLAUDE_DATA_DIR_RELATIVE: &str = ".claude";
 
+/// cursor-agent's own config/state dir, relative to `$HOME`. It holds
+/// `mcp.json`/`hooks.json` (read) plus a per-project tracking directory
+/// cursor-agent creates on demand under `.cursor/projects/<slug>` for
+/// whatever cwd it's launched against -- item #130, confirmed live: with
+/// `.cursor` left off the sandbox entirely (falling through to the
+/// `--ro-bind / /` read-only root, same as any other unlisted `$HOME`
+/// subdir), that `mkdir` failed and every cursor-agent job died immediately
+/// with "cursor exited non-zero -- ENOENT ... mkdir
+/// '.../.cursor/projects/<slug>'" before doing any real work. Mounted via
+/// `--overlay-src`+`--tmp-overlay` in `build_bwrap_args_with_home`, exactly
+/// like `CLAUDE_DATA_DIR_RELATIVE`/`OPENCODE_DATA_DIR_RELATIVE`: reads see
+/// the real dir (existing `mcp.json`/`hooks.json`/auth), writes -- including
+/// that per-project tracking dir -- land in an invisible tmpfs discarded
+/// when the sandboxed process exits, so nothing persists back to the host.
+const CURSOR_DATA_DIR_RELATIVE: &str = ".cursor";
+
 /// The agentflare MCP server's own state dir, relative to `$HOME` -- holds
 /// `agentflare.db`, the sqlite store every `item`/`comment`/`vent` MCP call
 /// writes through. Unlike `HOME_CACHE_DIRS`, this one must be writable: a
@@ -88,6 +104,14 @@ fn is_opencode(command: &str) -> bool {
 /// full resolved path, the same way `is_opencode` does.
 fn is_claude_code(command: &str) -> bool {
     Path::new(command).file_name() == Some(std::ffi::OsStr::new("claude"))
+}
+
+/// Whether `command` (the resolved binary about to be run) is cursor-agent --
+/// matched on the final path component `cursor-agent` (the binary name from
+/// `agent-registry`'s `binary_names: &["cursor-agent"]`), the same way
+/// `is_opencode`/`is_claude_code` do.
+fn is_cursor(command: &str) -> bool {
+    Path::new(command).file_name() == Some(std::ffi::OsStr::new("cursor-agent"))
 }
 
 /// `git_writable` controls whether `cwd/.git` is re-protected read-only
@@ -263,6 +287,30 @@ fn build_bwrap_args_with_home(
                 // into the overlay, discarded after this one job).
                 bwrap_args.push("--tmpfs".to_string());
                 bwrap_args.push(claude_str);
+            }
+        }
+
+        if is_cursor(command) {
+            let cursor_dir = Path::new(home).join(CURSOR_DATA_DIR_RELATIVE);
+            let cursor_str = path_to_string(&cursor_dir);
+            if cursor_dir.exists() {
+                // Same overlay semantics as claude/opencode above: reads
+                // pass through to the host's `~/.cursor` (existing
+                // `mcp.json`/`hooks.json`/auth), writes -- including the
+                // per-project tracking dir cursor-agent creates on demand --
+                // go to the implicit tmpfs `--tmp-overlay` adds on top,
+                // discarded on exit, never touching the host (item #130).
+                bwrap_args.push("--overlay-src".to_string());
+                bwrap_args.push(cursor_str.clone());
+                bwrap_args.push("--tmp-overlay".to_string());
+                bwrap_args.push(cursor_str);
+            } else {
+                // Never run before under this `$HOME` -- nothing to read,
+                // but cursor-agent still needs a writable dir to create its
+                // project-tracking subdirectory (re-created into the
+                // overlay, discarded after this one job).
+                bwrap_args.push("--tmpfs".to_string());
+                bwrap_args.push(cursor_str);
             }
         }
     }
@@ -711,6 +759,73 @@ mod tests {
         // dir instead).
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(CLAUDE_DATA_DIR_RELATIVE)).unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let args = build_bwrap_args_with_home(None, "/usr/bin/opencode", &[], Some(&home), false);
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--overlay-src" || a == "--tmp-overlay")
+        );
+    }
+
+    #[test]
+    fn cursor_data_dir_overlaid_when_present() {
+        // Item #130: `~/.cursor` holds `mcp.json`/`hooks.json` plus a
+        // per-project tracking dir cursor-agent creates on demand -- left
+        // off the sandbox entirely (falling through to the read-only root),
+        // that `mkdir` failed and every cursor-agent job died immediately.
+        // A cursor command must get `~/.cursor` overlaid, not left on the
+        // read-only root.
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join(CURSOR_DATA_DIR_RELATIVE);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let args = build_bwrap_args_with_home(
+            None,
+            "/usr/local/bin/cursor-agent",
+            &[],
+            Some(&home),
+            false,
+        );
+        let data_str = path_to_string(&data_dir);
+        let src_idx = args
+            .iter()
+            .position(|a| a == "--overlay-src")
+            .expect("--overlay-src present");
+        assert_eq!(args[src_idx + 1], data_str);
+        let overlay_idx = args
+            .iter()
+            .position(|a| a == "--tmp-overlay")
+            .expect("--tmp-overlay present");
+        assert_eq!(args[overlay_idx + 1], data_str);
+    }
+
+    #[test]
+    fn cursor_data_dir_uses_tmpfs_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let args = build_bwrap_args_with_home(
+            None,
+            "/usr/local/bin/cursor-agent",
+            &[],
+            Some(&home),
+            false,
+        );
+        let data_str = path_to_string(&dir.path().join(CURSOR_DATA_DIR_RELATIVE));
+        let idx = args
+            .iter()
+            .position(|a| a == &data_str)
+            .expect("cursor data dir tmpfs-mounted");
+        assert_eq!(args[idx - 1], "--tmpfs");
+        assert!(!args.iter().any(|a| a == "--overlay-src"));
+    }
+
+    #[test]
+    fn non_cursor_command_gets_no_cursor_specific_mount() {
+        // The `~/.cursor` overlay is gated on the command actually being
+        // cursor-agent; a claude/opencode job must not get one.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(CURSOR_DATA_DIR_RELATIVE)).unwrap();
         let home = std::ffi::OsString::from(dir.path());
         let args = build_bwrap_args_with_home(None, "/usr/bin/opencode", &[], Some(&home), false);
         assert!(
