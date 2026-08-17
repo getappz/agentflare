@@ -1,3 +1,4 @@
+pub mod builtin;
 pub mod db;
 pub mod frontmatter;
 pub mod hub;
