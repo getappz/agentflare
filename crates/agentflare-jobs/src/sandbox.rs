@@ -48,14 +48,24 @@ const CLAUDE_STATE: &[AgentStateMount] = &[mount(".claude")];
 const OPENCODE_STATE: &[AgentStateMount] =
     &[mount(".config/opencode"), mount(".local/share/opencode")];
 
-/// cursor-agent's own config/state dir. Holds `mcp.json`/`hooks.json` (read)
-/// plus a per-project tracking directory cursor-agent creates on demand
-/// under `.cursor/projects/<slug>` for whatever cwd it's launched against --
-/// item #130, confirmed live: with `.cursor` left off the sandbox entirely,
-/// that `mkdir` failed and every cursor-agent job died immediately with
-/// "cursor exited non-zero -- ENOENT ... mkdir '.../.cursor/projects/<slug>'"
-/// before doing any real work.
-const CURSOR_STATE: &[AgentStateMount] = &[mount(".cursor")];
+/// cursor-agent's own config/state dirs. `.cursor` holds `mcp.json`/
+/// `hooks.json` (read) plus a per-project tracking directory cursor-agent
+/// creates on demand under `.cursor/projects/<slug>` for whatever cwd it's
+/// launched against -- item #130, confirmed live: with `.cursor` left off
+/// the sandbox entirely, that `mkdir` failed and every cursor-agent job died
+/// immediately with "cursor exited non-zero -- ENOENT ... mkdir
+/// '.../.cursor/projects/<slug>'" before doing any real work.
+///
+/// `.config/cursor` is a *separate* dir cursor-agent also writes to
+/// unconditionally in `-p`/headless mode: `auth.json` plus a per-chat
+/// session directory under `.config/cursor/chats/<id>/<id>` it creates on
+/// every dispatch. Confirmed live: with only `.cursor` mounted, that
+/// `mkdir` failed with "RetriableError: [internal] ENOENT: no such file or
+/// directory, mkdir '.../.config/cursor/chats/<id>/<id>'", which
+/// cursor-agent treats as retriable and loops reconnecting to
+/// `api5.cursor.sh` until the job times out -- every headless cursor-agent
+/// job died this way despite `.cursor` already being mounted.
+const CURSOR_STATE: &[AgentStateMount] = &[mount(".cursor"), mount(".config/cursor")];
 
 const CODEX_STATE: &[AgentStateMount] = &[mount(".codex")];
 const GEMINI_STATE: &[AgentStateMount] = &[mount(".gemini")];
