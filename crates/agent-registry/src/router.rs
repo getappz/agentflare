@@ -8,6 +8,7 @@
 // `TaskContext`/`RouteDecision`/`RouterConfig` rather than reusing
 // `Router`/`RouteContext` so the two don't collide.
 use crate::registry::{Agent, agent_by_name};
+use std::collections::HashMap;
 
 /// Attributes of a claimed task available to route on.
 #[derive(Debug, Clone, Default)]
@@ -19,6 +20,14 @@ pub struct TaskContext {
     /// A human (or a prior process) already named an agent for this task —
     /// always wins over every rule and the default.
     pub assigned_agent: Option<Agent>,
+    /// The SDD pipeline stage this route is for (`"implementer"`,
+    /// `"judge"`, ...) — lets one `[router]` config assign a different
+    /// agent/model per role of the same work item instead of one agent
+    /// playing every role (see `work_item_pipeline::build_sdd_loop_step`,
+    /// which already takes an independent agent per role but had nothing
+    /// upstream populating them differently until this field existed).
+    /// `None` for callers that route a whole task as one unit.
+    pub role: Option<String>,
 }
 
 /// What a route decided, and why. The reason is what a dashboard would show
@@ -39,11 +48,14 @@ pub struct RuleMatch {
     pub labels: Vec<String>,
     pub kind: Option<String>,
     pub size: Option<String>,
+    /// Matches `TaskContext::role` (`"implementer"`, `"judge"`, ...) —
+    /// unset matches any role, same as every other field here.
+    pub role: Option<String>,
 }
 
 impl RuleMatch {
     fn is_empty(&self) -> bool {
-        self.labels.is_empty() && self.kind.is_none() && self.size.is_none()
+        self.labels.is_empty() && self.kind.is_none() && self.size.is_none() && self.role.is_none()
     }
 
     fn matches(&self, task: &TaskContext) -> bool {
@@ -62,16 +74,28 @@ impl RuleMatch {
                     _ => false,
                 }
         };
-        labels_ok && matches_field(&self.kind, &task.kind) && matches_field(&self.size, &task.size)
+        labels_ok
+            && matches_field(&self.kind, &task.kind)
+            && matches_field(&self.size, &task.size)
+            && matches_field(&self.role, &task.role)
     }
 }
 
 /// One user-configured routing rule: fire on `when`, prefer the first
-/// installed agent in `use_agents`.
+/// installed agent in `use_agents` — unless `rotate` is set, in which case
+/// `route()` round-robins across every installed agent in `use_agents`
+/// instead, splitting matching tasks across all of them rather than always
+/// preferring the first.
 #[derive(Debug, Clone)]
 pub struct RouterRule {
     pub when: RuleMatch,
     pub use_agents: Vec<Agent>,
+    pub rotate: bool,
+    /// Model to request from whichever agent this rule picks (passed
+    /// through as `RouteDecision::model`) — e.g. a role-specific rule can
+    /// pin the judge to a stronger model than the implementer without
+    /// needing a different agent. `None` leaves the caller's own default.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -107,6 +131,8 @@ struct RawWhen {
     kind: Option<String>,
     #[serde(default)]
     size: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -115,6 +141,10 @@ struct RawRule {
     when: RawWhen,
     #[serde(rename = "use")]
     use_agents: OneOrMany,
+    #[serde(default)]
+    rotate: bool,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -157,6 +187,7 @@ pub fn parse_router_config(text: &str) -> Result<RouterConfig, String> {
                 labels: r.when.labels,
                 kind: r.when.kind,
                 size: r.when.size,
+                role: r.when.role,
             },
             use_agents: r
                 .use_agents
@@ -164,6 +195,8 @@ pub fn parse_router_config(text: &str) -> Result<RouterConfig, String> {
                 .iter()
                 .filter_map(|s| agent_by_name(s))
                 .collect(),
+            rotate: r.rotate,
+            model: r.model,
         })
         .collect();
     Ok(RouterConfig { default, rules })
@@ -185,11 +218,18 @@ pub fn parse_router_config(text: &str) -> Result<RouterConfig, String> {
 /// be installed) — an assignment that's wrong instead fails downstream
 /// (e.g. `run_headless`'s `NotFound`) with a clearer error than a silent
 /// route-level `None` would give.
+///
+/// `rotation` persists round-robin position across calls for rules with
+/// `rotate = true` — keyed by the rule's index in `config.rules` (`"rule_
+/// <idx>"`), so it stays stable as long as the caller's config file's rule
+/// order doesn't change. Callers that never use `rotate` can pass an empty,
+/// throwaway map; `route()` never reads a key it didn't itself write.
 #[must_use]
 pub fn route(
     task: &TaskContext,
     config: &RouterConfig,
     installed: &[Agent],
+    rotation: &mut HashMap<String, u64>,
 ) -> Option<RouteDecision> {
     if let Some(agent) = task.assigned_agent {
         return Some(RouteDecision {
@@ -199,20 +239,43 @@ pub fn route(
         });
     }
 
-    for rule in &config.rules {
+    for (idx, rule) in config.rules.iter().enumerate() {
         if !rule.when.matches(task) {
             continue;
         }
-        if let Some(agent) = rule.use_agents.iter().find(|a| installed.contains(a)) {
-            return Some(RouteDecision {
-                agent: *agent,
-                model: None,
-                reason: format!(
-                    "matched rule (labels={:?}, kind={:?}, size={:?})",
-                    rule.when.labels, rule.when.kind, rule.when.size
-                ),
-            });
+        let candidates: Vec<Agent> = rule
+            .use_agents
+            .iter()
+            .copied()
+            .filter(|a| installed.contains(a))
+            .collect();
+        if candidates.is_empty() {
+            continue;
         }
+        let agent = if rule.rotate && candidates.len() > 1 {
+            let counter = rotation.entry(format!("rule_{idx}")).or_insert(0);
+            let picked = candidates[(*counter as usize) % candidates.len()];
+            *counter = counter.wrapping_add(1);
+            picked
+        } else {
+            candidates[0]
+        };
+        let reason = if rule.rotate && candidates.len() > 1 {
+            format!(
+                "round-robin among {candidates:?} (labels={:?}, kind={:?}, size={:?})",
+                rule.when.labels, rule.when.kind, rule.when.size
+            )
+        } else {
+            format!(
+                "matched rule (labels={:?}, kind={:?}, size={:?})",
+                rule.when.labels, rule.when.kind, rule.when.size
+            )
+        };
+        return Some(RouteDecision {
+            agent,
+            model: rule.model.clone(),
+            reason,
+        });
     }
 
     let default = config.default?;
@@ -233,9 +296,33 @@ mod tests {
                 labels: labels.iter().map(|s| s.to_string()).collect(),
                 kind: None,
                 size: None,
+                role: None,
             },
             use_agents: use_agents.to_vec(),
+            rotate: false,
+            model: None,
         }
+    }
+
+    fn rotating_rule(labels: &[&str], use_agents: &[Agent]) -> RouterRule {
+        RouterRule {
+            rotate: true,
+            ..rule(labels, use_agents)
+        }
+    }
+
+    fn role_rule(role: &str, use_agents: &[Agent]) -> RouterRule {
+        RouterRule {
+            when: RuleMatch {
+                role: Some(role.to_string()),
+                ..Default::default()
+            },
+            ..rule(&[], use_agents)
+        }
+    }
+
+    fn no_rotation() -> HashMap<String, u64> {
+        HashMap::new()
     }
 
     #[test]
@@ -250,7 +337,7 @@ mod tests {
         };
         // Codex is deliberately absent from `installed` here: an explicit
         // assignment is the one path that bypasses the installed check.
-        let decision = route(&task, &config, &[Agent::ClaudeCode]).unwrap();
+        let decision = route(&task, &config, &[Agent::ClaudeCode], &mut no_rotation()).unwrap();
         assert_eq!(decision.agent, Agent::Codex);
         assert_eq!(decision.reason, "explicit assignment on task");
     }
@@ -266,7 +353,7 @@ mod tests {
             rules: vec![rule(&["docs"], &[Agent::Codex, Agent::Opencode])],
         };
         // Codex not installed, Opencode is -> second preference wins.
-        let decision = route(&task, &config, &[Agent::Opencode]).unwrap();
+        let decision = route(&task, &config, &[Agent::Opencode], &mut no_rotation()).unwrap();
         assert_eq!(decision.agent, Agent::Opencode);
     }
 
@@ -284,7 +371,7 @@ mod tests {
             default: None,
             rules: vec![rule(&["security", "auth"], &[Agent::ClaudeCode])],
         };
-        assert!(route(&task, &config, &[Agent::ClaudeCode]).is_some());
+        assert!(route(&task, &config, &[Agent::ClaudeCode], &mut no_rotation()).is_some());
     }
 
     #[test]
@@ -300,7 +387,7 @@ mod tests {
                 rule(&["docs"], &[Agent::Opencode]),
             ],
         };
-        let decision = route(&task, &config, &[Agent::Opencode]).unwrap();
+        let decision = route(&task, &config, &[Agent::Opencode], &mut no_rotation()).unwrap();
         assert_eq!(decision.agent, Agent::Opencode);
     }
 
@@ -312,9 +399,11 @@ mod tests {
             rules: vec![RouterRule {
                 when: RuleMatch::default(),
                 use_agents: vec![Agent::ClaudeCode],
+                rotate: false,
+                model: None,
             }],
         };
-        assert!(route(&task, &config, &[Agent::ClaudeCode]).is_none());
+        assert!(route(&task, &config, &[Agent::ClaudeCode], &mut no_rotation()).is_none());
     }
 
     #[test]
@@ -324,8 +413,11 @@ mod tests {
                 labels: vec![],
                 kind: Some("locate".to_string()),
                 size: Some("S".to_string()),
+                role: None,
             },
             use_agents: vec![Agent::Opencode],
+            rotate: false,
+            model: None,
         };
         let config = RouterConfig {
             default: None,
@@ -337,14 +429,14 @@ mod tests {
             size: Some("S".to_string()),
             ..Default::default()
         };
-        assert!(route(&matching, &config, &[Agent::Opencode]).is_some());
+        assert!(route(&matching, &config, &[Agent::Opencode], &mut no_rotation()).is_some());
 
         let wrong_size = TaskContext {
             kind: Some("locate".to_string()),
             size: Some("L".to_string()),
             ..Default::default()
         };
-        assert!(route(&wrong_size, &config, &[Agent::Opencode]).is_none());
+        assert!(route(&wrong_size, &config, &[Agent::Opencode], &mut no_rotation()).is_none());
     }
 
     #[test]
@@ -354,7 +446,7 @@ mod tests {
             default: Some(Agent::ClaudeCode),
             rules: vec![],
         };
-        let decision = route(&task, &config, &[Agent::ClaudeCode]).unwrap();
+        let decision = route(&task, &config, &[Agent::ClaudeCode], &mut no_rotation()).unwrap();
         assert_eq!(decision.agent, Agent::ClaudeCode);
         assert_eq!(decision.reason, "default");
     }
@@ -366,14 +458,153 @@ mod tests {
             default: Some(Agent::ClaudeCode),
             rules: vec![],
         };
-        assert!(route(&task, &config, &[Agent::Opencode]).is_none());
+        assert!(route(&task, &config, &[Agent::Opencode], &mut no_rotation()).is_none());
+    }
+
+    #[test]
+    fn rotating_rule_alternates_across_installed_candidates() {
+        let task = TaskContext {
+            labels: vec!["implementor".to_string()],
+            ..Default::default()
+        };
+        let config = RouterConfig {
+            default: None,
+            rules: vec![rotating_rule(
+                &["implementor"],
+                &[Agent::Opencode, Agent::Cursor],
+            )],
+        };
+        let installed = [Agent::Opencode, Agent::Cursor];
+        let mut rotation = no_rotation();
+
+        let first = route(&task, &config, &installed, &mut rotation)
+            .unwrap()
+            .agent;
+        let second = route(&task, &config, &installed, &mut rotation)
+            .unwrap()
+            .agent;
+        let third = route(&task, &config, &installed, &mut rotation)
+            .unwrap()
+            .agent;
+
+        assert_eq!(first, Agent::Opencode);
+        assert_eq!(second, Agent::Cursor);
+        assert_eq!(third, Agent::Opencode, "counter wraps back around");
+    }
+
+    #[test]
+    fn rotating_rule_with_one_installed_candidate_always_picks_it() {
+        let task = TaskContext {
+            labels: vec!["implementor".to_string()],
+            ..Default::default()
+        };
+        let config = RouterConfig {
+            default: None,
+            rules: vec![rotating_rule(
+                &["implementor"],
+                &[Agent::Opencode, Agent::Cursor],
+            )],
+        };
+        // Only Opencode installed -> nothing to rotate between.
+        let mut rotation = no_rotation();
+        let decision = route(&task, &config, &[Agent::Opencode], &mut rotation).unwrap();
+        assert_eq!(decision.agent, Agent::Opencode);
+    }
+
+    #[test]
+    fn non_rotating_rule_ignores_rotation_state() {
+        let task = TaskContext {
+            labels: vec!["docs".to_string()],
+            ..Default::default()
+        };
+        let config = RouterConfig {
+            default: None,
+            rules: vec![rule(&["docs"], &[Agent::Opencode, Agent::Cursor])],
+        };
+        let installed = [Agent::Opencode, Agent::Cursor];
+        let mut rotation = no_rotation();
+        for _ in 0..3 {
+            let decision = route(&task, &config, &installed, &mut rotation).unwrap();
+            assert_eq!(decision.agent, Agent::Opencode, "always the first preference");
+        }
+    }
+
+    #[test]
+    fn role_specific_rules_pick_independent_agents_for_the_same_task() {
+        // Same underlying task (e.g. one SDD work item), routed once per
+        // role — implementer rotates across two cheap agents, judge always
+        // gets the one configured, stronger agent.
+        let config = RouterConfig {
+            default: None,
+            rules: vec![
+                role_rule("implementer", &[Agent::Opencode, Agent::Cursor]),
+                role_rule("judge", &[Agent::ClaudeCode]),
+            ],
+        };
+        let installed = [Agent::Opencode, Agent::Cursor, Agent::ClaudeCode];
+        let mut rotation = no_rotation();
+
+        let implementer_task = TaskContext {
+            role: Some("implementer".to_string()),
+            ..Default::default()
+        };
+        let judge_task = TaskContext {
+            role: Some("judge".to_string()),
+            ..Default::default()
+        };
+
+        let implementer = route(&implementer_task, &config, &installed, &mut rotation)
+            .unwrap()
+            .agent;
+        let judge = route(&judge_task, &config, &installed, &mut rotation)
+            .unwrap()
+            .agent;
+
+        assert_eq!(implementer, Agent::Opencode);
+        assert_eq!(judge, Agent::ClaudeCode);
+    }
+
+    #[test]
+    fn role_mismatch_falls_through_to_next_rule() {
+        let config = RouterConfig {
+            default: None,
+            rules: vec![
+                role_rule("judge", &[Agent::ClaudeCode]),
+                rule(&[], &[Agent::Opencode]), // placeholder, never matches (empty when)
+            ],
+        };
+        let task = TaskContext {
+            role: Some("implementer".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            route(&task, &config, &[Agent::ClaudeCode], &mut no_rotation()).is_none(),
+            "a rule scoped to a different role must not fire"
+        );
+    }
+
+    #[test]
+    fn rule_model_passes_through_to_the_route_decision() {
+        let config = RouterConfig {
+            default: None,
+            rules: vec![RouterRule {
+                model: Some("claude-opus-4-8".to_string()),
+                ..role_rule("judge", &[Agent::ClaudeCode])
+            }],
+        };
+        let task = TaskContext {
+            role: Some("judge".to_string()),
+            ..Default::default()
+        };
+        let decision = route(&task, &config, &[Agent::ClaudeCode], &mut no_rotation()).unwrap();
+        assert_eq!(decision.model.as_deref(), Some("claude-opus-4-8"));
     }
 
     #[test]
     fn no_rules_no_default_yields_no_decision() {
         let task = TaskContext::default();
         let config = RouterConfig::default();
-        assert!(route(&task, &config, &[Agent::ClaudeCode]).is_none());
+        assert!(route(&task, &config, &[Agent::ClaudeCode], &mut no_rotation()).is_none());
     }
 
     // ---- parse_router_config ----
@@ -411,6 +642,21 @@ use  = ["codex", "opencode"]
     }
 
     #[test]
+    fn parse_reads_role_and_model_from_a_rule() {
+        let text = r#"
+[router]
+
+[[router.rule]]
+when = { role = "judge" }
+use  = "claude-code"
+model = "claude-opus-4-8"
+"#;
+        let config = parse_router_config(text).unwrap();
+        assert_eq!(config.rules[0].when.role.as_deref(), Some("judge"));
+        assert_eq!(config.rules[0].model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
     fn parse_defaults_to_empty_config_when_router_table_is_absent() {
         let config = parse_router_config("[some_other_feature]\nkey = 1\n").unwrap();
         assert!(config.default.is_none());
@@ -444,6 +690,25 @@ use  = ["not-a-real-agent", "opencode"]
             vec![Agent::Opencode],
             "unknown name filtered out, known one kept"
         );
+    }
+
+    #[test]
+    fn parse_reads_rotate_flag_defaulting_to_false() {
+        let text = r#"
+[router]
+
+[[router.rule]]
+when = { labels = ["implementor"] }
+use  = ["opencode", "cursor"]
+rotate = true
+
+[[router.rule]]
+when = { labels = ["docs"] }
+use  = "opencode"
+"#;
+        let config = parse_router_config(text).unwrap();
+        assert!(config.rules[0].rotate);
+        assert!(!config.rules[1].rotate, "rotate defaults to false");
     }
 
     #[test]
