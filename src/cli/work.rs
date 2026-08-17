@@ -359,8 +359,8 @@ fn resolve_agent(
     // configured `[router]` preference order instead of hardcoding an agent.
     // The `*fb != excluded` filter catches an explicit human pin
     // (`assigned_agent`) — `route()` returns that regardless of `installed`,
-    // so the second call would otherwise return the same agent again. Reuses
-    // the same `rotation` map; this probe is a what-if, not a real pick.
+    // so the second call would otherwise return the same agent again. Probe
+    // on a rotation clone so a what-if never advances the counter.
     let fallback_agent = match decision.agent {
         agent_registry::Agent::ClaudeCode | agent_registry::Agent::Opencode => {
             let excluded = decision.agent;
@@ -369,7 +369,8 @@ fn resolve_agent(
                 .copied()
                 .filter(|a| *a != excluded)
                 .collect();
-            agent_registry::route(&task, config, &rest, rotation)
+            let mut fallback_rotation = rotation.clone();
+            agent_registry::route(&task, config, &rest, &mut fallback_rotation)
                 .map(|d| d.agent)
                 .filter(|fb| *fb != excluded)
         }
@@ -849,20 +850,22 @@ fn execute_work_impl(
     .map(|(agent, _, _)| agent)
     .unwrap_or(agent_enum);
     crate::state::save(&state);
-    if headless_args(agent_enum).is_none() {
-        let msg = format!("agent {} has no headless print mode", agent_enum.as_str());
+    // Post-fallback: key setup off implementer_agent, not agent_enum.
+    let name = implementer_agent.as_str();
+    if headless_args(implementer_agent).is_none() {
+        let msg = format!("agent {name} has no headless print mode");
         release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
         crate::ui::error(&msg);
         return 1.into();
     }
-    let _ = writeln!(log, "agent: {} ({route_reason})", agent_enum.as_str());
+    let _ = writeln!(log, "agent: {name} ({route_reason})");
 
     let item_description = item_detail.description.clone();
     let plan_doc = latest_plan_doc_content(&mcp, item_id);
 
     // --- Extra args ---
     let extra_args = build_extra_args(
-        agent_enum,
+        implementer_agent,
         args.max_turns,
         args.max_cost_usd,
         args.model.as_deref(),
@@ -925,7 +928,7 @@ fn execute_work_impl(
             release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
             crate::ui::error(&msg);
             let _ = writeln!(log, "failed: {msg}");
-            let retry_after_secs = classify_and_cooldown(agent_enum.as_str(), &msg);
+            let retry_after_secs = classify_and_cooldown(implementer_agent.as_str(), &msg);
             WorkOutcome {
                 exit_code: 1,
                 retry_after_secs,
