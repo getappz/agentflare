@@ -2,7 +2,7 @@
 // Finds the agent binary on PATH, maps --model/--mode to agent-native
 // flags, and executes with pass-through args and inherited stdio.
 use agent_registry::detect::find_binary;
-use agent_registry::{Agent, AgentSpec, Tier, headless_args};
+use agent_registry::{Agent, AgentSpec, Tier, headless_args, json_output_args};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -389,10 +389,17 @@ fn launch_command(binary: &Path, args: &[String]) -> (String, Vec<String>, bool)
 
 /// Outcome of a headless (non-interactive, output-captured) agent invocation.
 #[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HeadlessReply {
+    pub text: String,
+    pub session_id: Option<String>,
+    pub cost_usd: Option<f64>,
+}
+
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum HeadlessOutcome {
-    /// The agent ran and exited 0; carries captured stdout (the reply).
-    Ok(String),
+    Ok(HeadlessReply),
     UnknownAgent(String),
     /// The agent has no non-interactive print mode.
     NotHeadless(String),
@@ -400,6 +407,30 @@ pub enum HeadlessOutcome {
     NotFound(String),
     /// The agent ran but failed (non-zero exit or timed out).
     Failed(String),
+}
+
+fn parse_json_reply(stdout: &str) -> HeadlessReply {
+    match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        Ok(value) => HeadlessReply {
+            text: value
+                .get("result")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(stdout)
+                .to_string(),
+            session_id: value
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            cost_usd: value
+                .get("total_cost_usd")
+                .and_then(serde_json::Value::as_f64),
+        },
+        Err(_) => HeadlessReply {
+            text: stdout.to_string(),
+            session_id: None,
+            cost_usd: None,
+        },
+    }
 }
 
 /// Run an agent non-interactively with `prompt` and capture its reply, killing
@@ -415,6 +446,7 @@ pub fn run_headless(
     hard_cap: Duration,
     idle_timeout: Duration,
     extra_args: &[String],
+    request_json: bool,
 ) -> HeadlessOutcome {
     let Some(spec) = registry.iter().find(|s| s.id.as_str() == agent) else {
         return HeadlessOutcome::UnknownAgent(format!("unknown agent: {agent}"));
@@ -433,7 +465,12 @@ pub fn run_headless(
             spec.binary_names.join(" / ")
         ));
     };
-    let Some(argv) = headless_argv(spec.id, &binary, extra_args) else {
+    let mut full_args: Vec<String> = Vec::with_capacity(extra_args.len() + 2);
+    if request_json && let Some(flags) = json_output_args(spec.id) {
+        full_args.extend(flags.iter().map(|s| (*s).to_string()));
+    }
+    full_args.extend(extra_args.iter().cloned());
+    let Some(argv) = headless_argv(spec.id, &binary, &full_args) else {
         return HeadlessOutcome::NotHeadless(format!(
             "{} has no headless print mode",
             spec.display_name
@@ -492,7 +529,17 @@ pub fn run_headless(
     // that's correct for all of them — only an explicit per-spawn env var is.
     cmd.env("AGENTFLARE_AGENT", spec.id.as_str());
     match run_captured(cmd, hard_cap, idle_timeout, Some(prompt)) {
-        Ok(c) if c.success => HeadlessOutcome::Ok(c.stdout),
+        Ok(c) if c.success => {
+            if request_json && json_output_args(spec.id).is_some() {
+                HeadlessOutcome::Ok(parse_json_reply(&c.stdout))
+            } else {
+                HeadlessOutcome::Ok(HeadlessReply {
+                    text: c.stdout,
+                    session_id: None,
+                    cost_usd: None,
+                })
+            }
+        }
         Ok(c) if c.timed_out => {
             let reason = if c.idle_killed {
                 format!("went idle for {idle_timeout:?} (no new output)")
@@ -955,6 +1002,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(1),
             &[],
+            false,
         ) {
             HeadlessOutcome::UnknownAgent(m) => assert!(m.contains("nope")),
             other => panic!("expected UnknownAgent, got {other:?}"),
@@ -971,6 +1019,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(1),
             &[],
+            false,
         ) {
             HeadlessOutcome::NotHeadless(m) => assert!(m.contains("aider")),
             other => panic!("expected NotHeadless, got {other:?}"),
@@ -1006,6 +1055,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(1),
             &[],
+            false,
         ) {
             HeadlessOutcome::NotFound(m) => assert!(m.contains("not found")),
             other => panic!("expected NotFound, got {other:?}"),
@@ -1046,10 +1096,11 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(10),
             &["-c".to_string(), "wc -c".to_string()],
+            false,
         ) {
-            HeadlessOutcome::Ok(out) => {
+            HeadlessOutcome::Ok(reply) => {
                 assert_eq!(
-                    out.trim(),
+                    reply.text.trim(),
                     huge_prompt.len().to_string(),
                     "the full oversized prompt should have arrived via stdin"
                 );
@@ -1188,5 +1239,58 @@ mod tests {
             msg.contains("HTTP 429 Too Many Requests"),
             "expected captured stderr in the failure message, got: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_json_reply_extracts_result_session_and_cost() {
+        let reply = parse_json_reply(r#"{"type":"result","result":"pong","session_id":"abc-123","total_cost_usd":0.05}"#);
+        assert_eq!(reply.text, "pong");
+        assert_eq!(reply.session_id.as_deref(), Some("abc-123"));
+        assert_eq!(reply.cost_usd, Some(0.05));
+    }
+
+    #[test]
+    fn parse_json_reply_handles_missing_cost_usd() {
+        let reply = parse_json_reply(r#"{"type":"result","result":"pong","session_id":"abc-123"}"#);
+        assert_eq!(reply.text, "pong");
+        assert_eq!(reply.session_id.as_deref(), Some("abc-123"));
+        assert_eq!(reply.cost_usd, None);
+    }
+
+    #[test]
+    fn parse_json_reply_falls_back_to_raw_text_on_malformed_json() {
+        let reply = parse_json_reply("not json at all");
+        assert_eq!(reply.text, "not json at all");
+        assert_eq!(reply.session_id, None);
+        assert_eq!(reply.cost_usd, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_headless_with_request_json_parses_a_json_reply_from_the_child() {
+        let reg = vec![AgentSpec {
+            id: Agent::ClaudeCode,
+            display_name: "claude-code",
+            tier: Tier::Cli,
+            binary_names: &["sh"],
+            version_args: &[],
+            package_manager: None,
+            package_name: None,
+        }];
+        match run_headless(
+            &reg,
+            "claude-code",
+            "hi",
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            &["-c".to_string(), r#"echo '{"type":"result","result":"pong","session_id":"sess-xyz"}'"#.to_string()],
+            true,
+        ) {
+            HeadlessOutcome::Ok(reply) => {
+                assert_eq!(reply.text, "pong");
+                assert_eq!(reply.session_id.as_deref(), Some("sess-xyz"));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
     }
 }
