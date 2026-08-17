@@ -16,6 +16,12 @@ pub struct State {
     /// `agentflare agents` version-resolution cache, keyed by `Agent::as_str()`.
     #[serde(default)]
     pub version_cache: HashMap<String, VersionCacheEntry>,
+    /// Round-robin position for router rules with `rotate = true`, keyed by
+    /// rule index (`"rule_<idx>"`) — see `agent_registry::router::route`.
+    /// Persisted so alternation is stable across separate `agentflare work`
+    /// invocations and daemon restarts, not just within one process.
+    #[serde(default)]
+    pub router_rotation: HashMap<String, u64>,
 }
 
 fn default_true() -> bool {
@@ -32,6 +38,7 @@ pub fn state_path() -> PathBuf {
 
 const ACTIVE_KEY: &str = "active";
 const VERSION_CACHE_KEY: &str = "version_cache";
+const ROUTER_ROTATION_KEY: &str = "router_rotation";
 
 fn default_state() -> State {
     State {
@@ -77,10 +84,17 @@ pub fn load() -> State {
         .flatten()
         .and_then(|entry| serde_json::from_slice(&entry.value).ok())
         .unwrap_or_default();
+    let router_rotation = store
+        .kv_get(ROUTER_ROTATION_KEY)
+        .ok()
+        .flatten()
+        .and_then(|entry| serde_json::from_slice(&entry.value).ok())
+        .unwrap_or_default();
 
     State {
         active,
         version_cache,
+        router_rotation,
     }
 }
 
@@ -103,6 +117,14 @@ pub fn save(state: &State) {
     match serde_json::to_vec(&state.version_cache) {
         Ok(bytes) => {
             if let Err(e) = store.kv_set(VERSION_CACHE_KEY, &bytes) {
+                eprintln!("[agentflare] warning: failed to persist state: {e}");
+            }
+        }
+        Err(e) => eprintln!("[agentflare] warning: failed to serialize state: {e}"),
+    }
+    match serde_json::to_vec(&state.router_rotation) {
+        Ok(bytes) => {
+            if let Err(e) = store.kv_set(ROUTER_ROTATION_KEY, &bytes) {
                 eprintln!("[agentflare] warning: failed to persist state: {e}");
             }
         }

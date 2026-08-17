@@ -328,7 +328,9 @@ pub fn spec(agent: Agent) -> &'static AgentSpec {
 #[must_use]
 pub fn headless_args(agent: Agent) -> Option<&'static [&'static str]> {
     match agent {
-        Agent::ClaudeCode | Agent::GeminiCli => Some(&["-p"]),
+        // `cursor-agent -p`: "Print responses to console (for scripts or
+        // non-interactive use)" — confirmed via `cursor-agent --help`.
+        Agent::ClaudeCode | Agent::GeminiCli | Agent::Cursor => Some(&["-p"]),
         Agent::Codex => Some(&["exec"]),
         Agent::Opencode => Some(&["run"]),
         _ => None,
@@ -353,6 +355,9 @@ pub fn autonomous_args(agent: Agent) -> Option<&'static [&'static str]> {
         // `opencode run --auto`: "auto-approve permissions that are not
         // explicitly denied" — confirmed via `opencode run --help`.
         Agent::Opencode => Some(&["--auto"]),
+        // `cursor-agent --force`: "Force allow commands unless explicitly
+        // denied" — confirmed via `cursor-agent --help`.
+        Agent::Cursor => Some(&["--force"]),
         _ => None,
     }
 }
@@ -419,13 +424,19 @@ mod tests {
         assert_eq!(headless_args(Agent::Codex), Some(&["exec"][..]));
         assert_eq!(headless_args(Agent::GeminiCli), Some(&["-p"][..]));
         assert_eq!(headless_args(Agent::Opencode), Some(&["run"][..]));
+        assert_eq!(headless_args(Agent::Cursor), Some(&["-p"][..]));
     }
 
     #[test]
     fn headless_args_none_for_agents_without_a_print_mode() {
         // Editor-embedded / unmapped agents have no headless invocation.
-        assert_eq!(headless_args(Agent::Cursor), None);
+        assert_eq!(headless_args(Agent::Windsurf), None);
         assert_eq!(headless_args(Agent::VscodeCopilot), None);
+    }
+
+    #[test]
+    fn autonomous_args_maps_cursor_to_force() {
+        assert_eq!(autonomous_args(Agent::Cursor), Some(&["--force"][..]));
     }
 
     #[test]

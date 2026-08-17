@@ -323,6 +323,8 @@ fn resolve_agent(
     labels: &[String],
     config: &agent_registry::RouterConfig,
     installed: &[agent_registry::Agent],
+    role: Option<&str>,
+    rotation: &mut std::collections::HashMap<String, u64>,
 ) -> Result<(agent_registry::Agent, String, Option<agent_registry::Agent>), String> {
     if let Some(name) = explicit {
         return agent_registry::agent_by_name(name)
@@ -342,8 +344,9 @@ fn resolve_agent(
         size: crate::mcp_server::item::parsed_size(&item.metadata),
         repo: None,
         assigned_agent,
+        role: role.map(str::to_string),
     };
-    let decision = agent_registry::route(&task, config, installed).ok_or_else(|| {
+    let decision = agent_registry::route(&task, config, installed, rotation).ok_or_else(|| {
         "no --agent given, and no route decision (item has no assignee and no router \
          rule matched) — pass --agent explicitly"
             .to_string()
@@ -358,14 +361,17 @@ fn resolve_agent(
     // decision was an explicit human pin (`assigned_agent`) — `route()`
     // returns that unconditionally regardless of `installed`, so the
     // second call would otherwise just return claude-code again and look
-    // like a real fallback when there isn't one.
+    // like a real fallback when there isn't one. Reuses the same `rotation`
+    // map as the primary call — this probe is a what-if, not a real pick,
+    // but a `rotate = true` rule's counter still needs to reflect it if the
+    // fallback is the one that actually runs (`pick_implementer_agent`).
     let fallback_agent = if decision.agent == agent_registry::Agent::ClaudeCode {
         let installed_minus_claude: Vec<_> = installed
             .iter()
             .copied()
             .filter(|a| *a != agent_registry::Agent::ClaudeCode)
             .collect();
-        agent_registry::route(&task, config, &installed_minus_claude)
+        agent_registry::route(&task, config, &installed_minus_claude, rotation)
             .map(|d| d.agent)
             .filter(|fb| *fb != agent_registry::Agent::ClaudeCode)
     } else {
@@ -783,8 +789,12 @@ fn execute_work_impl(
     // --- Resolve agent (explicit flag, else route from the item) ---
     // Only pay for detecting installed agents / loading the router config
     // when there's no explicit --agent to short-circuit resolve_agent with.
+    // `state` (rotation counters + version cache) is still loaded/saved
+    // either way — cheap relative to `detect_all_with`/`load_router_config`
+    // — so a `rotate = true` router rule's counter persists across every
+    // `agentflare work` invocation, not just routed ones.
+    let mut state = crate::state::load();
     let (installed, router_config) = if args.agent.is_none() {
-        let mut state = crate::state::load();
         let installed: Vec<agent_registry::Agent> = agent_registry::detect_all_with(
             agent_registry::REGISTRY,
             &mut state.version_cache,
@@ -793,7 +803,6 @@ fn execute_work_impl(
         .iter()
         .filter_map(|d| agent_registry::agent_by_name(d.id))
         .collect();
-        crate::state::save(&state);
         (installed, load_router_config())
     } else {
         (Vec::new(), agent_registry::RouterConfig::default())
@@ -804,9 +813,17 @@ fn execute_work_impl(
         &labels,
         &router_config,
         &installed,
+        // Primary/implementer role — the judge role gets its own
+        // resolution below, tagged `role = "judge"`.
+        Some("implementer"),
+        &mut state.router_rotation,
     ) {
-        Ok(pair) => pair,
+        Ok(pair) => {
+            crate::state::save(&state);
+            pair
+        }
         Err(msg) => {
+            crate::state::save(&state);
             release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
             crate::ui::error(&msg);
             return 1.into();
@@ -817,6 +834,22 @@ fn execute_work_impl(
         fallback_agent,
         crate::claude_usage::claude_over_threshold,
     );
+    // Judge/reviewer gets its own `role = "judge"` resolution, so a
+    // `[router]` rule can pin it independently of the implementer's
+    // rotation/usage-threshold fallback. No such rule (the common case)
+    // or an `Err` both fall back to `agent_enum` — the primary decision.
+    let review_agent = resolve_agent(
+        args.agent.as_deref(),
+        &item_detail,
+        &labels,
+        &router_config,
+        &installed,
+        Some("judge"),
+        &mut state.router_rotation,
+    )
+    .map(|(agent, _, _)| agent)
+    .unwrap_or(agent_enum);
+    crate::state::save(&state);
     if headless_args(agent_enum).is_none() {
         let msg = format!("agent {} has no headless print mode", agent_enum.as_str());
         release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
@@ -859,7 +892,7 @@ fn execute_work_impl(
         mcp.clone(),
         &item_detail,
         implementer_agent,
-        agent_enum,
+        review_agent,
         item_description,
         plan_doc,
         args.notify.clone(),
@@ -1073,8 +1106,16 @@ mod tests {
         let mut item = test_item();
         item.assignee_agent = Some("opencode".to_string());
         let config = agent_registry::RouterConfig::default();
-        let (agent, reason, _fallback) =
-            resolve_agent(Some("codex"), &item, &[], &config, &[]).unwrap();
+        let (agent, reason, _fallback) = resolve_agent(
+            Some("codex"),
+            &item,
+            &[],
+            &config,
+            &[],
+            None,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(agent, agent_registry::Agent::Codex);
         assert_eq!(reason, "explicit --agent flag");
     }
@@ -1085,7 +1126,16 @@ mod tests {
         // — the explicit path must accept it the same as assignee_agent does.
         let item = test_item();
         let config = agent_registry::RouterConfig::default();
-        let (agent, _, _) = resolve_agent(Some("claude"), &item, &[], &config, &[]).unwrap();
+        let (agent, _, _) = resolve_agent(
+            Some("claude"),
+            &item,
+            &[],
+            &config,
+            &[],
+            None,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
     }
 
@@ -1093,7 +1143,16 @@ mod tests {
     fn resolve_agent_explicit_flag_rejects_unknown_agent_name() {
         let item = test_item();
         let config = agent_registry::RouterConfig::default();
-        let err = resolve_agent(Some("not-a-real-agent"), &item, &[], &config, &[]).unwrap_err();
+        let err = resolve_agent(
+            Some("not-a-real-agent"),
+            &item,
+            &[],
+            &config,
+            &[],
+            None,
+            &mut Default::default(),
+        )
+        .unwrap_err();
         assert!(err.contains("unknown agent"));
     }
 
@@ -1102,7 +1161,16 @@ mod tests {
         let mut item = test_item();
         item.assignee_agent = Some("claude".to_string()); // alias, agent_by_name() maps it
         let config = agent_registry::RouterConfig::default();
-        let (agent, reason, _fallback) = resolve_agent(None, &item, &[], &config, &[]).unwrap();
+        let (agent, reason, _fallback) = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &[],
+            None,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
         assert_eq!(reason, "explicit assignment on task");
     }
@@ -1116,7 +1184,16 @@ mod tests {
         let mut item = test_item();
         item.assignee_agent = Some("claude-code:some-job-id".to_string());
         let config = agent_registry::RouterConfig::default();
-        let (agent, reason, _fallback) = resolve_agent(None, &item, &[], &config, &[]).unwrap();
+        let (agent, reason, _fallback) = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &[],
+            None,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
         assert_eq!(reason, "explicit assignment on task");
     }
@@ -1131,6 +1208,8 @@ mod tests {
             &[],
             &config,
             &[agent_registry::Agent::ClaudeCode],
+            None,
+            &mut Default::default(),
         )
         .unwrap_err();
         assert!(err.contains("--agent"));
@@ -1155,6 +1234,8 @@ use  = "opencode"
             &[],
             &config,
             &[agent_registry::Agent::Opencode],
+            None,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(agent, agent_registry::Agent::Opencode);
@@ -1179,6 +1260,8 @@ use  = "opencode"
             &[],
             &config,
             &[agent_registry::Agent::Opencode],
+            None,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(agent, agent_registry::Agent::Opencode);
@@ -1205,6 +1288,8 @@ use  = "opencode"
                 agent_registry::Agent::ClaudeCode,
                 agent_registry::Agent::Opencode,
             ],
+            None,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
@@ -1225,6 +1310,8 @@ use  = "opencode"
                 agent_registry::Agent::ClaudeCode,
                 agent_registry::Agent::Opencode,
             ],
+            None,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
@@ -1256,6 +1343,8 @@ use  = ["claude-code", "codex", "opencode"]
                 agent_registry::Agent::ClaudeCode,
                 agent_registry::Agent::Opencode,
             ],
+            None,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
@@ -1285,6 +1374,8 @@ use  = "claude-code"
             &[],
             &config,
             &[agent_registry::Agent::ClaudeCode],
+            None,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(agent, agent_registry::Agent::ClaudeCode);
@@ -1310,10 +1401,56 @@ use  = "opencode"
             &[],
             &config,
             &[agent_registry::Agent::Opencode],
+            None,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(agent, agent_registry::Agent::Opencode);
         assert_eq!(fallback, None);
+    }
+
+    #[test]
+    fn resolve_agent_rotates_across_installed_candidates_when_rule_opts_in() {
+        let item = test_item();
+        let config = agent_registry::parse_router_config(
+            r#"
+[router]
+[[router.rule]]
+when = { role = "implementer" }
+use  = ["opencode", "cursor"]
+rotate = true
+"#,
+        )
+        .unwrap();
+        let installed = [
+            agent_registry::Agent::Opencode,
+            agent_registry::Agent::Cursor,
+        ];
+        let mut rotation = std::collections::HashMap::new();
+
+        let (first, _, _) = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &installed,
+            Some("implementer"),
+            &mut rotation,
+        )
+        .unwrap();
+        let (second, _, _) = resolve_agent(
+            None,
+            &item,
+            &[],
+            &config,
+            &installed,
+            Some("implementer"),
+            &mut rotation,
+        )
+        .unwrap();
+
+        assert_eq!(first, agent_registry::Agent::Opencode);
+        assert_eq!(second, agent_registry::Agent::Cursor);
     }
 
     #[test]

@@ -603,10 +603,10 @@ mod tests {
             &conn,
             &todo.id,
             agentflare_backend::item::UpdateItem {
-                // cursor has a REGISTRY entry but no autonomous_args mapped,
-                // so it's still "unconfirmed" (unlike opencode, now that
-                // autonomous_args(Agent::Opencode) is Some(&["--auto"])).
-                assignee_agent: Some("cursor".into()),
+                // windsurf has a REGISTRY entry but no autonomous_args mapped,
+                // so it's still "unconfirmed" (unlike opencode/cursor, which
+                // both now have autonomous_args mapped).
+                assignee_agent: Some("windsurf".into()),
                 ..Default::default()
             },
         )
