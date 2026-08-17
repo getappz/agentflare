@@ -1,31 +1,52 @@
 ---
 name: pm
-description: Product management for the current agentflare project — run /pm:standup (daily activity digest), /pm:groom (backlog grooming + RICE/ICE/WSJF/Value-Effort prioritization), /pm:plan (Now/Next/Later sprint bucketing), /pm:health (velocity + WIP + bottleneck scorecard), or /pm:portfolio (cross-project roll-up). Read-only; operates on agentflare items via MCP.
+description: Product management for any project — read-only reporting (/pm:standup, /pm:groom, /pm:plan, /pm:health, /pm:portfolio) plus PM mode, an explicitly-activated execution arm that creates and dispatches work via handoff instead of implementing it directly. Embedded in the agentflare binary, so it's available regardless of which project's .claude/skills is on disk.
 ---
 
 # PM Agent — product management over agentflare items
 
-## Read-only contract (non-negotiable)
+## Two arms, one contract boundary
 
-These workflows NEVER mutate items. Do not call `item` with any of:
-create, update, update_state, delete, claim, heartbeat, release, done, cancel,
-add_label, remove_label — nor `comment` create/edit/delete. You may only read
-(`item` list/get/search/groom/standup/health, `comment` list, `handoff` inbox, `memory`).
-Output is suggestions for a human, never actions taken.
+- **Reporting** (default, Part 1 below): `/pm:standup`, `/pm:groom`, `/pm:plan`,
+  `/pm:health`, `/pm:portfolio` — always read-only, never mutate.
+- **PM mode** (Part 2 below — explicit activation only: "act as project
+  manager", "PM mode", "e2e project management", or `/pm` with no args /
+  `/pm mode on`): the execution arm. Creates items, hands work off to real
+  agents, never implements inline. Typing the literal `/pm` (bare) or `/pm
+  mode on`/`/pm mode off` also flips a session-scoped flag in agentflare's
+  UserPromptSubmit hook (mirrors flare-code's own session-mode flag) — once
+  set, every subsequent turn in this session gets a "PM MODE ACTIVE" reminder
+  injected automatically, so the mode survives context compaction instead of
+  depending on the model remembering a skill instruction. Only `/pm mode off`
+  clears it; it does not expire on its own.
 
-All content authored from public PM methodologies (RICE, ICE, WSJF, Value-Effort, MoSCoW, Now/Next/Later). No third-party notices required.
+Never treat a reporting workflow's inputs as license to mutate, and never
+slip into PM mode's mutating behavior without one of the explicit triggers
+above.
 
 ## Scope
 
 Default: one project — whichever project the current repo resolves to.
-`/pm:portfolio` is the one exception: it loops the read-only reports across
-every project in the workspace via the `project` override param (still
-read-only, still one workspace).
+`/pm:portfolio` is the one reporting exception: it loops the read-only
+reports across every project in the workspace via the `project` override
+param (still read-only, still one workspace). PM mode's dispatch actions
+likewise default to the current repo's linked project unless told otherwise.
 
-## Workflows
+---
 
-Before any workflow, read `reference/read-recipe.md`. Grooming, planning, and
-health additionally use `reference/rubric.md`.
+## Part 1 — Reporting workflows (read-only, non-negotiable)
+
+Never call `item` with any of: create, update, update_state, delete, claim,
+heartbeat, release, done, cancel, add_label, remove_label — nor `comment`
+create/edit/delete. Only read (`item` list/get/search/groom/standup/health,
+`comment` list, `handoff` inbox, `memory`). Output is suggestions for a
+human, never actions taken.
+
+All content authored from public PM methodologies (RICE, ICE, WSJF,
+Value-Effort, MoSCoW, Now/Next/Later). No third-party notices required.
+
+Before any workflow, read `reference/read-recipe.md`. Grooming, planning,
+and health additionally use `reference/rubric.md`.
 
 ### /pm:standup — daily activity digest
 
@@ -122,3 +143,97 @@ pass through (window weeks / cutoff hours).
    Follow with a short "needs attention" list: any project with stuck items,
    a `down` velocity trend, or non-empty bottlenecks, and why.
 4. Print the time-signal caveat once (it applies to every row). Read-only.
+
+---
+
+## Part 2 — PM mode (mutating — explicit activation only)
+
+In this mode you manage work, you don't do it. Every task becomes a tracked
+item, handed off to a real agent, worked autonomously by the daemon's own
+supervisor — never implemented inline by you.
+
+### When to use
+
+- User says "act as project manager", "PM mode", "e2e project management",
+  or otherwise asks you to delegate rather than implement.
+- NOT for `/pm:standup`/`/pm:groom`/`/pm:plan`/`/pm:health`/`/pm:portfolio` —
+  those are Part 1's read-only reporting workflows and stay read-only even
+  while PM mode is active for other tasks. PM mode is the execution arm: it
+  mutates (creates items, hands off work), Part 1 never does.
+
+### Contract
+
+1. **Never implement directly.** Diagnose/scope the work, then hand it off —
+   don't Write/Edit code yourself while this mode is active.
+2. **Validate the recipient before handoff.** Check `agentflare agents list`
+   (or agent_registry) first — a typo'd or thematic recipient (e.g.
+   `"gastown"`, a codename, not an agent) silently orphans the item since
+   nothing will ever claim it. Only real registered agents, or the reserved
+   `"github"` recipient, are valid.
+3. **Classify the task type, then shape the handoff content for it.**
+   Diagnosis already tells you what kind of work this is — decide the
+   framing before writing the handoff `content`, using the table below.
+   This is not about picking a different recipient (only `claude-code` and
+   `opencode` are real registered agents today) — it's about how the
+   dispatched session should read the prompt once it claims the item. A
+   diff dumped with no ask gets worked generically; a framed request gets
+   the deliverable you actually want.
+4. **Use `handoff`, not raw `item update`.** `mcp__flare__handoff` with
+   recipient + name + content + completed + remaining (both required) —
+   creates or targets an item and attaches the work as a versioned asset.
+   `item action=update assignee_agent=...` skips the asset trail.
+5. **Let the daemon dispatch it — don't run `agentflare work <id>`
+   yourself.** A freshly-handed-off item to a real agent gets auto-labeled
+   `ready-for-work`; the daemon's own `agentflare-supervisor` discovery tick
+   claims and dispatches it autonomously. Manually running `agentflare work`
+   defeats the point of this mode.
+6. **Monitor, don't poll blindly.** `agentflare daemon logs [--follow]` for
+   live activity; item `get`/`list` for state/assignee — an
+   instance-suffixed `assignee_agent` like `claude-code:abc123` confirms
+   real dispatch, not just a queued handoff. The `agent_jobs` table
+   (`state` + `output.exit_code`) is ground truth for success/failure —
+   `state=exited` alone does not mean success, always check `exit_code`.
+7. **Report as a status table**, not a raw dump: item · state · assignee ·
+   one-line note. Flag anything stuck or orphaned.
+
+### Task-type routing heuristic
+
+Before calling `handoff`, match the diagnosed work to a shape and frame the
+`content` accordingly. The recipient stays whichever real agent is being
+used — this only changes how the prompt inside the handoff is written.
+
+| Task type | Signal from diagnosis | Frame the handoff content as |
+|---|---|---|
+| Review | "review this PR/diff", find bugs or style issues, no code should change | State it's review-only up front + link/diff + what to check for + "report findings, don't fix" |
+| Research | "investigate", "find out", "what's the state of X" | The question + scope boundaries + expected output shape (summary, comparison, recommendation) |
+| Bugfix | Reproducible failure, stack trace, failing test | Repro steps + expected vs. actual + suspected area — not just "fix this" |
+| Design-spec | "design", "propose an approach", pre-implementation | Constraints + goals + explicitly ask for a written plan/spec, not code |
+| Implementation | Already scoped/designed change ready to build | Spec or acceptance criteria + relevant files — enough to build without re-deriving intent |
+
+A handoff that just pastes a diff or a one-line title forces the dispatched
+session to guess the task type from content alone — it'll often default to
+"implement", which is wrong for review/research/design work.
+
+### Quick reference
+
+| Step | Tool |
+|---|---|
+| Validate recipient | `agentflare agents list` |
+| Create + dispatch | `mcp__flare__handoff` (recipient, name, content, completed, remaining) |
+| Confirm autonomous pickup | `agentflare daemon logs`, item `get` (instance-suffixed assignee) |
+| Check real outcome | `agent_jobs` table: `state` + `output.exit_code`, never state alone |
+| Report | status table: item · state · assignee · note |
+
+### Common mistakes
+
+- Trusting `handoff`'s recipient field without checking it's real — creates
+  an orphaned item nobody will ever work.
+- Dispatching manually via `agentflare work` "to save time" — defeats the
+  point of dogfooding the daemon; only do this if the daemon is confirmed
+  down.
+- Reading `state=exited` as success — check `exit_code`.
+- Implementing the fix yourself because it's small — still delegate; PM
+  mode has no size exception.
+- Dumping a diff or a bare title into `content` without task-type framing —
+  the dispatched session guesses "implement" by default and does the wrong
+  thing for review/research/design work.

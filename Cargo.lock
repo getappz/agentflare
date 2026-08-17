@@ -244,6 +244,7 @@ version = "0.1.0"
 dependencies = [
  "agentflare-db-kit",
  "agentflare-workspace-hack",
+ "flare-sandbox",
  "parking_lot",
  "rusqlite",
  "rusqlite_migration",
@@ -1265,6 +1266,14 @@ dependencies = [
  "serde_json",
  "toml",
  "ureq 2.12.1",
+]
+
+[[package]]
+name = "flare-sandbox"
+version = "0.1.0"
+dependencies = [
+ "agentflare-workspace-hack",
+ "tempfile",
 ]
 
 [[package]]

@@ -570,6 +570,12 @@ pub fn prompt_submit(agent: &str) {
         return;
     }
 
+    if prompt == "/pm" || prompt == "/pm mode on" {
+        let _ = crate::pm_mode::set_active();
+    } else if prompt == "/pm mode off" {
+        crate::pm_mode::clear_active();
+    }
+
     // Triage the previous turn's buffered vents once per turn (best-effort;
     // never blocks the hook or surfaces errors to the agent). Always report
     // the outcome to stderr — including "0 filed" and a caught panic — so a
@@ -641,6 +647,12 @@ pub fn prompt_submit(agent: &str) {
     } else {
         vec![]
     };
+    if crate::pm_mode::is_active() {
+        bits.push(
+            "PM MODE ACTIVE — delegate & dispatch only, don't implement directly (see the `pm` skill, Part 2). /pm mode off to exit."
+                .to_string(),
+        );
+    }
     if let Some(block) = crate::mentions::expand(prompt) {
         bits.push(block);
     }
