@@ -96,12 +96,19 @@ const AGENT_DETECTOR_ENV_VARS: &[&str] = &[
 /// strips every `AGENT_DETECTOR_ENV_VARS` entry plus `AGENTFLARE_AGENT`
 /// (agentflare's own marker, which `agent-detector` doesn't know about) from
 /// the inherited environment, rather than relying on ambient absence of
-/// whichever one happens not to be set.
+/// whichever one happens not to be set. Also sets
+/// `AGENTFLARE_GIT_ASSUME_HUMAN=1` to short-circuit `agent-detector`'s
+/// `process-tree` feature, which walks ancestor processes for agent markers
+/// -- a signal that survives env-var stripping when this test suite itself
+/// runs under an agent-driven session (opencode/claude/cursor/...), and
+/// would otherwise make these "human" assertions fail for real agent
+/// sessions even though the code path being exercised is correct.
 fn human_shim(repo: &Path, home: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_git"));
     cmd.args(args)
         .current_dir(repo)
-        .env("AGENTFLARE_HOME_OVERRIDE", home);
+        .env("AGENTFLARE_HOME_OVERRIDE", home)
+        .env("AGENTFLARE_GIT_ASSUME_HUMAN", "1");
     for var in AGENT_DETECTOR_ENV_VARS {
         cmd.env_remove(var);
     }
