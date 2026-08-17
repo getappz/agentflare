@@ -75,27 +75,69 @@ fn paths_eq(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// `git_binary()`'s resolved binary path, plus the filtered/deduped PATH used
+/// to resolve it -- kept together so callers can apply the SAME filtered PATH
+/// to the spawned process's environment, not just use it for resolution.
+struct ResolvedGit {
+    binary: PathBuf,
+    /// `None` if PATH wasn't set at all in this process's environment (rare,
+    /// but then there's nothing to filter or apply).
+    filtered_path: Option<std::ffi::OsString>,
+}
+
+fn resolved_git() -> &'static ResolvedGit {
+    static RESOLVED: OnceLock<ResolvedGit> = OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        let self_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        let shims_dir = agentflare_shims_dir();
+        let filtered_path = std::env::var_os("PATH").map(|path_var| {
+            // Dedup on top of the existing self/shims/cargo-target-dir
+            // filtering: a PATH that's had the same entry prepended
+            // repeatedly (e.g. by a long-running daemon re-running setup
+            // logic across many dispatches) is exactly the shape of bloat
+            // that can eventually push a child spawn's argv+envp past
+            // ARG_MAX (see `run_in`'s doc comment) even though none of the
+            // individual entries are themselves excludable.
+            let mut seen: Vec<PathBuf> = Vec::new();
+            std::env::join_paths(std::env::split_paths(&path_var).filter(|p| {
+                let keep = !self_dir.as_deref().is_some_and(|d| paths_eq(p, d))
+                    && !shims_dir.as_deref().is_some_and(|d| paths_eq(p, d))
+                    && !is_cargo_target_profile_dir(p)
+                    && !seen.iter().any(|s| paths_eq(s, p));
+                if keep {
+                    seen.push(p.clone());
+                }
+                keep
+            }))
+            .unwrap_or(path_var)
+        });
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let binary = which::which_in("git", filtered_path.as_ref(), cwd)
+            .unwrap_or_else(|_| PathBuf::from("git"));
+        ResolvedGit {
+            binary,
+            filtered_path,
+        }
+    })
+}
+
 pub(crate) fn git_binary() -> PathBuf {
-    static RESOLVED: OnceLock<PathBuf> = OnceLock::new();
-    RESOLVED
-        .get_or_init(|| {
-            let self_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(Path::to_path_buf));
-            let shims_dir = agentflare_shims_dir();
-            let filtered_path = std::env::var_os("PATH").map(|path_var| {
-                std::env::join_paths(std::env::split_paths(&path_var).filter(|p| {
-                    !self_dir.as_deref().is_some_and(|d| paths_eq(p, d))
-                        && !shims_dir.as_deref().is_some_and(|d| paths_eq(p, d))
-                        && !is_cargo_target_profile_dir(p)
-                }))
-                .unwrap_or(path_var)
-            });
-            let cwd = std::env::current_dir().unwrap_or_default();
-            which::which_in("git", filtered_path.as_ref(), cwd)
-                .unwrap_or_else(|_| PathBuf::from("git"))
-        })
-        .clone()
+    resolved_git().binary.clone()
+}
+
+/// Applies the same filtered/deduped PATH used to resolve `git_binary()` to
+/// the spawned command's own environment. Without this, `Command::output()`
+/// inherits the FULL parent environment by default -- including whatever
+/// bloated, unfiltered PATH the daemon process itself is carrying -- so a
+/// spawn can still hit `E2BIG` even though `git_binary()` already computed a
+/// clean PATH, because that clean PATH was only ever used to *locate* the
+/// binary, never applied to the child's actual env.
+fn apply_filtered_path(cmd: &mut Command) {
+    if let Some(path) = &resolved_git().filtered_path {
+        cmd.env("PATH", path);
+    }
 }
 
 /// This crate's git spawns run inside the agentflare daemon far more than
@@ -119,6 +161,7 @@ pub fn run_in(repo_root: &Path, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new(git_binary());
     cmd.args(args).current_dir(repo_root);
     no_console_window(&mut cmd);
+    apply_filtered_path(&mut cmd);
     let out = cmd
         .output()
         .map_err(|e| format!("git not available: {e}"))?;
@@ -164,6 +207,7 @@ pub fn diff(repo_root: &Path, base: &str, head: &str) -> Result<String, String> 
     cmd.args(["diff", "--unified=3", &range])
         .current_dir(repo_root);
     no_console_window(&mut cmd);
+    apply_filtered_path(&mut cmd);
     let out = cmd.output().map_err(|e| format!("git diff failed: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -407,6 +451,71 @@ mod tests {
             Path::new("/home/user/.agentflare/shims"),
             Path::new("/home/user/.cargo/bin")
         ));
+    }
+
+    #[test]
+    fn apply_filtered_path_overrides_the_spawned_command_s_path_env() {
+        let mut cmd = Command::new(git_binary());
+        apply_filtered_path(&mut cmd);
+        let overridden = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, v)| v);
+        assert_eq!(
+            overridden,
+            resolved_git().filtered_path.as_deref(),
+            "run_in/diff must ship the SAME filtered PATH that resolved git_binary(), not the daemon's raw inherited one"
+        );
+    }
+
+    // `resolved_git()` is a process-wide `OnceLock`, so this test re-execs the
+    // compiled test binary fresh: the child inflates its OWN PATH with
+    // thousands of duplicate entries -- the shape a long-running daemon
+    // accumulates across many dispatches (see `resolved_git`'s doc comment)
+    // -- then exercises `run_in`. Without `apply_filtered_path` wired into
+    // `run_in`, the spawned git process inherits that raw bloated PATH and
+    // dies with E2BIG; that's the regression this item was filed for.
+    #[cfg(unix)]
+    #[test]
+    fn run_in_survives_a_path_bloated_by_repeated_daemon_dispatches() {
+        const MARKER: &str = "SHELL_RS_E2BIG_REGRESSION_CHILD";
+        const TEST_NAME: &str =
+            "shell::tests::run_in_survives_a_path_bloated_by_repeated_daemon_dispatches";
+
+        if std::env::var_os(MARKER).is_some() {
+            let real_path = std::env::var_os("PATH").unwrap_or_default();
+            let junk_dir = PathBuf::from(
+                "/nonexistent/padding-directory-repeated-until-argv-plus-envp-overflow-e2big",
+            );
+            let mut entries: Vec<PathBuf> = std::env::split_paths(&real_path).collect();
+            entries.extend(std::iter::repeat_n(junk_dir, 200_000));
+            // Safe: this process was just re-exec'd solely to run this one
+            // test and hasn't spawned any other threads yet.
+            unsafe {
+                std::env::set_var("PATH", std::env::join_paths(&entries).unwrap());
+            }
+
+            let repo = init_repo_with_branch("master");
+            let ok = run_in(&repo.path, &["rev-parse", "--verify", "master"]).is_ok();
+            std::process::exit(if ok { 0 } else { 1 });
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let output = Command::new(&exe)
+            .arg(TEST_NAME)
+            .arg("--exact")
+            .env(MARKER, "1")
+            .output()
+            .expect("failed to re-exec test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("running 1 test"),
+            "expected --exact to select exactly this test, got:\n{stdout}"
+        );
+        assert!(
+            output.status.success(),
+            "run_in should filter the daemon's bloated PATH before spawning git, not inherit it raw (E2BIG); child output:\n{stdout}"
+        );
     }
 
     #[cfg(windows)]
