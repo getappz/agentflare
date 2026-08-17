@@ -359,8 +359,8 @@ fn resolve_agent(
     // configured `[router]` preference order instead of hardcoding an agent.
     // The `*fb != excluded` filter catches an explicit human pin
     // (`assigned_agent`) — `route()` returns that regardless of `installed`,
-    // so the second call would otherwise return the same agent again. Probe
-    // on a rotation clone so a what-if never advances the counter.
+    // so the second call would otherwise return the same agent again. The
+    // probe routes on a clone — a what-if must not advance the counter.
     let fallback_agent = match decision.agent {
         agent_registry::Agent::ClaudeCode | agent_registry::Agent::Opencode => {
             let excluded = decision.agent;
@@ -850,8 +850,8 @@ fn execute_work_impl(
     .map(|(agent, _, _)| agent)
     .unwrap_or(agent_enum);
     crate::state::save(&state);
-    // Post-fallback: key setup off implementer_agent, not agent_enum.
     let name = implementer_agent.as_str();
+    let agent_unchanged = implementer_agent == agent_enum;
     if headless_args(implementer_agent).is_none() {
         let msg = format!("agent {name} has no headless print mode");
         release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
@@ -868,7 +868,7 @@ fn execute_work_impl(
         implementer_agent,
         args.max_turns,
         args.max_cost_usd,
-        args.model.as_deref(),
+        args.model.as_deref().filter(|_| agent_unchanged),
     );
 
     // --- Change to worktree dir and run the sdd_loop -> finalize pipeline;
