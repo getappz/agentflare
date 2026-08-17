@@ -813,12 +813,8 @@ fn execute_work_impl(
         &labels,
         &router_config,
         &installed,
-        // The SDD pipeline uses this single resolved agent for every role
-        // (implementer, reviewer, judge — see `build_sdd_loop_step`), so
-        // "implementer" is the role this whole-item routing decision most
-        // resembles. Tagging it lets a `[router]` rule scoped to `role =
-        // "implementer"` (e.g. a `rotate = true` pool) take effect today,
-        // ahead of giving the judge role its own independent resolution.
+        // Primary/implementer role — the judge role gets its own
+        // resolution below, tagged `role = "judge"`.
         Some("implementer"),
         &mut state.router_rotation,
     ) {
@@ -838,17 +834,10 @@ fn execute_work_impl(
         fallback_agent,
         crate::claude_usage::claude_over_threshold,
     );
-    // The judge/reviewer role gets its own resolution attempt, tagged
-    // `role = "judge"`, so an operator can pin it independently via a
-    // `[router]` rule (e.g. keep code review on a stronger/more consistent
-    // agent even while the implementer role rotates or usage-threshold
-    // falls back). No `role = "judge"` rule configured is the common case
-    // — `resolve_agent` then falls through to the exact same
-    // `assigned_agent`/other-rule/default decision as the primary call
-    // (same item, same router config), landing on `agent_enum` again; an
-    // `Err` here (e.g. transiently no route at all) also falls back to
-    // `agent_enum` rather than failing the whole dispatch over a role the
-    // primary call already proved has a route.
+    // Judge/reviewer gets its own `role = "judge"` resolution, so a
+    // `[router]` rule can pin it independently of the implementer's
+    // rotation/usage-threshold fallback. No such rule (the common case)
+    // or an `Err` both fall back to `agent_enum` — the primary decision.
     let review_agent = resolve_agent(
         args.agent.as_deref(),
         &item_detail,
@@ -1433,7 +1422,10 @@ rotate = true
 "#,
         )
         .unwrap();
-        let installed = [agent_registry::Agent::Opencode, agent_registry::Agent::Cursor];
+        let installed = [
+            agent_registry::Agent::Opencode,
+            agent_registry::Agent::Cursor,
+        ];
         let mut rotation = std::collections::HashMap::new();
 
         let (first, _, _) = resolve_agent(

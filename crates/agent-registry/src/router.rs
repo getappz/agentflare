@@ -525,7 +525,11 @@ mod tests {
         let mut rotation = no_rotation();
         for _ in 0..3 {
             let decision = route(&task, &config, &installed, &mut rotation).unwrap();
-            assert_eq!(decision.agent, Agent::Opencode, "always the first preference");
+            assert_eq!(
+                decision.agent,
+                Agent::Opencode,
+                "always the first preference"
+            );
         }
     }
 
