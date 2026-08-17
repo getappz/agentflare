@@ -221,15 +221,13 @@ pub fn run_captured(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    // Suppress the console window that Windows would otherwise flash for
-    // every headless dispatch — the daemon has no console of its own to
-    // attach the child to. Mirrors `Supervisor::spawn()` in
-    // agentflare-jobs/src/supervisor.rs.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    }
+    // NOTE: `CREATE_NO_WINDOW` is deliberately NOT applied here. It breaks
+    // script-shim agents (`.cmd`/`.bat`/`.ps1`, which chain through
+    // cmd.exe → powershell.exe and need a real console): cursor-agent's
+    // `.cmd` shim hangs with zero output under `CREATE_NO_WINDOW`, whereas a
+    // native `.exe` hides cleanly. The decision is per-agent, made by
+    // `run_headless` (the only production caller) from the resolved binary's
+    // extension — see its `#[cfg(windows)] creation_flags` block.
     let mut child = cmd.spawn()?;
 
     if let Some(text) = stdin {
@@ -340,6 +338,55 @@ pub fn headless_argv(agent: Agent, binary: &Path, extra_args: &[String]) -> Opti
     Some(argv)
 }
 
+/// For a script-shim binary (`.ps1`, or a `.cmd`/`.bat` that wraps a sibling
+/// `.ps1` — cursor-agent's shim shape), returns the `powershell.exe` launcher
+/// that runs it with `-WindowStyle Hidden`. Script shims chain through
+/// `powershell.exe` (and often a bundled `node.exe`) and need a real console
+/// to run — under `CREATE_NO_WINDOW` cursor-agent hangs with zero output and
+/// never produces a reply — but `-WindowStyle Hidden` provides that console
+/// with the window hidden, so no terminal flashes over the user's desktop.
+/// Returns `None` for native binaries (handled by the normal
+/// `CREATE_NO_WINDOW` path) and for `.cmd`/`.bat` with no `.ps1` sibling.
+#[cfg(windows)]
+fn script_shim_launcher(binary: &Path, args: &[String]) -> Option<(String, Vec<String>)> {
+    let script = match binary.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "ps1" => binary.to_path_buf(),
+        "cmd" | "bat" => {
+            let ps1 = binary.with_extension("ps1");
+            if ps1.is_file() {
+                ps1
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let mut argv = vec![
+        "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-WindowStyle".to_string(),
+        "Hidden".to_string(),
+        "-File".to_string(),
+        script.to_string_lossy().into_owned(),
+    ];
+    argv.extend(args.iter().cloned());
+    Some(("powershell.exe".to_string(), argv))
+}
+
+/// Resolves `(command, args, hidden_console)` for a headless spawn: the script
+/// shim launcher on Windows when one applies (`hidden_console = true`, meaning
+/// window hiding is already handled), else the binary itself. `args` is the
+/// print-mode flags + extra args (no prompt — that's piped via stdin).
+fn launch_command(binary: &Path, args: &[String]) -> (String, Vec<String>, bool) {
+    #[cfg(windows)]
+    if let Some((cmd, argv)) = script_shim_launcher(binary, args) {
+        return (cmd, argv, true);
+    }
+    (binary.to_string_lossy().into_owned(), args.to_vec(), false)
+}
+
 /// Outcome of a headless (non-interactive, output-captured) agent invocation.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -409,10 +456,26 @@ pub fn run_headless(
     // "nothing was ever committed" and reported success anyway (exit 0),
     // leaving real staged/edited work stranded in the worktree.
     let cwd = std::env::current_dir().ok();
+    // Script-shim agents (`.ps1`, or `.cmd`/`.bat` wrapping a sibling
+    // `.ps1`) are launched through `powershell.exe -WindowStyle Hidden`
+    // rather than the shim itself — see `launch_command`. The rest (native
+    // `.exe`) run directly under `CREATE_NO_WINDOW` below.
+    let (launch_cmd, launch_args, hidden_console) = launch_command(&binary, &argv[1..]);
     let (sandboxed_command, sandboxed_args) =
-        agentflare_jobs::sandbox::wrap(&argv[0], &argv[1..], cwd.as_deref(), true);
+        agentflare_jobs::sandbox::wrap(&launch_cmd, &launch_args, cwd.as_deref(), true);
     let mut cmd = Command::new(&sandboxed_command);
     cmd.args(&sandboxed_args);
+    // Suppress the console window the daemon's child would otherwise flash —
+    // but only for native binaries. Script shims need a real console to run
+    // (under `CREATE_NO_WINDOW` cursor-agent hangs with zero output); the
+    // powershell launcher's `-WindowStyle Hidden` hides *its* window instead,
+    // so `hidden_console` short-circuits this. `run_captured` no longer
+    // applies this itself; it's per-agent here.
+    #[cfg(windows)]
+    if !hidden_console {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
     // See the matching strip in `run_launch_env` above (item #139) — same
     // rationale applies to headless child processes.
     cmd.env_remove("CARGO_TARGET_DIR");
@@ -854,6 +917,25 @@ mod tests {
         ) {
             HeadlessOutcome::NotHeadless(m) => assert!(m.contains("aider")),
             other => panic!("expected NotHeadless, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn repro_cursor_cmd_hang() {
+        let t0 = std::time::Instant::now();
+        let out = super::run_headless(
+            agent_registry::REGISTRY,
+            "cursor",
+            "Reply with exactly: ok",
+            Duration::from_secs(120),
+            Duration::from_secs(60),
+            &["--force".to_string()],
+        );
+        eprintln!("elapsed={:?}", t0.elapsed());
+        match out {
+            super::HeadlessOutcome::Ok(reply) => eprintln!("OK reply={:?}", reply),
+            other => eprintln!("NOT OK: {other:?}"),
         }
     }
 
