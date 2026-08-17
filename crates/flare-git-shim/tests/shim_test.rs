@@ -152,11 +152,73 @@ fn unrecognized_subcommand_passes_through_to_real_git() {
 }
 
 #[test]
-fn escape_hatch_flags_are_denied() {
+fn escape_hatch_flags_are_denied_for_mutating_subcommands() {
     let repo = init_repo();
     let home = tempfile::TempDir::new().unwrap();
-    let out = shim(repo.path(), home.path(), &["-C", "/tmp", "status"]);
+    let out = shim(
+        repo.path(),
+        home.path(),
+        &["-C", "/tmp", "commit", "-m", "x"],
+    );
     assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("denied"), "{stderr}");
+}
+
+#[test]
+fn escape_hatch_flags_are_allowed_for_read_only_subcommands() {
+    // A read-only `git -C <path> log`/`status`/`diff`/`show` can't mutate
+    // anything this shim's policy protects, so it passes straight through
+    // instead of being denied outright for "cannot classify safely".
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let out = shim(
+        repo.path(),
+        home.path(),
+        &["-C", repo.path().to_str().unwrap(), "log", "-1"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("denied"), "{stderr}");
+}
+
+#[test]
+fn escape_hatch_read_only_with_output_is_denied() {
+    // `diff`/`log`/`show` are read-only EXCEPT with `--output=<file>`, which
+    // writes the filesystem -- a "read-only" escape can't be allowed to
+    // mutate anything (CodeRabbit finding on #527).
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let out = shim(
+        repo.path(),
+        home.path(),
+        &[
+            "-C",
+            repo.path().to_str().unwrap(),
+            "diff",
+            "--output=/tmp/escape-hatch.diff",
+        ],
+    );
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("denied"), "{stderr}");
+}
+
+#[test]
+fn escape_hatch_mutating_commit_from_non_repo_dir_is_denied() {
+    // A `git -C <repo> commit` invoked from a NON-repository directory must
+    // still be denied -- the escape-hatch parse has to run before the
+    // "not in a repo" fast path, or this would skip straight to exec_real
+    // and bypass the mutating-command deny (CodeRabbit finding on #527).
+    let repo = init_repo();
+    let outside = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let out = shim(
+        outside.path(),
+        home.path(),
+        &["-C", repo.path().to_str().unwrap(), "commit", "-m", "x"],
+    );
+    assert!(!out.status.success(), "{out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("denied"), "{stderr}");
 }

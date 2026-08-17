@@ -66,6 +66,15 @@ const ALLOW_CANONICAL_MUTATE_ENV: &str = "AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE"
 /// caller-supplied override.
 const ESCAPE_HATCH_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree"];
 
+/// Subcommands let through even with an `ESCAPE_HATCH_FLAGS` override
+/// present -- read-only, can't mutate anything this shim's policy exists to
+/// protect, so there's nothing to classify against the (unresolvable) target
+/// repo in the first place. A `git -C <path> log`/`status`/`diff`/`show` is
+/// exec'd straight to real git, same as it would be with no `-C` at all;
+/// anything else (including a subcommand this list doesn't recognize) still
+/// falls through to the deny below.
+const READ_ONLY_ESCAPE_SUBCOMMANDS: &[&str] = &["log", "status", "diff", "show"];
+
 /// Global flags that consume the following argument as their value, so
 /// subcommand detection can skip past both tokens.
 const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
@@ -380,12 +389,15 @@ fn main() {
         run_real(&tool, filtered_path.as_ref(), &args);
     }
 
-    let cwd = env::current_dir().unwrap_or_default();
-    let Some(repo_root) = branch::repo_toplevel(&cwd) else {
-        // Not inside a git repo at all -- nothing to classify (e.g. `git
-        // init`, `git clone` into a fresh directory, `git --version`).
-        exec_real(&tool, filtered_path.as_ref(), &args);
-    };
+    // Parse global flags (and the escape-hatch flag) up front, BEFORE the
+    // "not in a repo" fast path below: a `git -C <repo> commit` invoked from
+    // a non-repository directory would otherwise skip straight to `exec_real`
+    // and bypass the mutating-command deny (CodeRabbit finding on #527).
+    let str_args: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let (subcommand_idx, escape_hatch) = parse_global_flags(&str_args);
 
     if bypass_active() {
         if let Some(audit_path) = audit::default_path("git.jsonl") {
@@ -402,18 +414,32 @@ fn main() {
         exec_real(&tool, filtered_path.as_ref(), &args);
     }
 
-    let str_args: Vec<String> = args
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let (subcommand_idx, escape_hatch) = parse_global_flags(&str_args);
-
     if escape_hatch {
+        let is_read_only = subcommand_idx
+            .map(|idx| str_args[idx].as_str())
+            .is_some_and(|sc| READ_ONLY_ESCAPE_SUBCOMMANDS.contains(&sc));
+        // `diff`/`log`/`show` are nominally read-only, but each accepts
+        // `--output=<file>`, which writes the filesystem -- a "read-only"
+        // escape can't be allowed to mutate anything (CodeRabbit finding).
+        let writes_file = str_args
+            .iter()
+            .any(|a| a == "--output" || a.starts_with("--output="));
+        if is_read_only && !writes_file {
+            exec_real(&tool, filtered_path.as_ref(), &args);
+        }
         eprintln!(
-            "agentflare git shim: denied — this invocation uses -C/--git-dir/--work-tree to target a different repository, which this shim cannot classify safely."
+            "agentflare git shim: denied — this invocation uses -C/--git-dir/--work-tree to target a different repository, which this shim cannot classify safely (read-only subcommands -- {} -- are let through; anything else is not).",
+            READ_ONLY_ESCAPE_SUBCOMMANDS.join(", ")
         );
         exit(1);
     }
+
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(repo_root) = branch::repo_toplevel(&cwd) else {
+        // Not inside a git repo at all -- nothing to classify (e.g. `git
+        // init`, `git clone` into a fresh directory, `git --version`).
+        exec_real(&tool, filtered_path.as_ref(), &args);
+    };
 
     let Some(idx) = subcommand_idx else {
         exec_real(&tool, filtered_path.as_ref(), &args); // e.g. bare `git --version`

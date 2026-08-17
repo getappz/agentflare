@@ -13,6 +13,42 @@ impl AgentflareMcp {
         }
     }
 
+    /// Confirms `owner` can act on `(repo, target)` before a `release`/`done`
+    /// call, steals the lease if it's abandoned (stale or never claimed), and
+    /// errors loudly if someone else's live claim is in the way — the same
+    /// fix `item_release`/`item_done` already apply to the `item_claims`
+    /// ledger (item #83), applied here to this tool's own `claims` ledger.
+    /// Without this, a claim whose owner doesn't match the caller's current
+    /// `owner_id()` (e.g. because it was created by a different process/
+    /// session — see `claims::owner_id`'s doc comment) left `release`/`done`
+    /// silently returning `false` with no way to tell "nothing to release"
+    /// apart from "someone else is actively using this", and no path to
+    /// actually let go of a claim attributed to the caller but not created
+    /// by the caller's own session.
+    fn claim_confirm_or_steal(
+        conn: &rusqlite::Connection,
+        repo: &str,
+        target: &str,
+        owner: &str,
+        now: i64,
+        ttl: i64,
+    ) -> Result<(), ErrorData> {
+        if let crate::claims::Acquire::Held {
+            owner: holder,
+            age_secs,
+        } = crate::claims::acquire(conn, repo, target, owner, None, None, now, ttl)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "target '{target}' in repo '{repo}' is claimed by '{holder}' (active {age_secs}s ago, ttl {ttl}s) -- refusing to modify someone else's live claim"
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
     pub fn claim_impl(&self, req: ClaimRequest) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "acquire" => {
@@ -88,7 +124,22 @@ impl AgentflareMcp {
                 let target = self.resolve_claim_target(&target)?;
                 let (conn, repo) = Self::claim_ctx(&target, req.repo)?;
                 let owner = crate::claims::owner_id();
-                let ok = crate::claims::release(&conn, &repo, &target, &owner)
+                let now = crate::claims::now();
+                let ttl = crate::claims::ttl_secs();
+                // Confirm-or-steal + release in ONE write transaction (IMMEDIATE
+                // so the write lock is taken up front) so a lease that goes stale
+                // between the confirm and the release can't be stolen by a
+                // concurrent owner, leaving their claim active while we report
+                // success (CodeRabbit finding on #527).
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                Self::claim_confirm_or_steal(&tx, &repo, &target, &owner, now, ttl)?;
+                let ok = crate::claims::release(&tx, &repo, &target, &owner)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                tx.commit()
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(
                     serde_json::json!({ "released": ok, "repo": repo, "target": target })
@@ -102,7 +153,18 @@ impl AgentflareMcp {
                 let target = self.resolve_claim_target(&target)?;
                 let (conn, repo) = Self::claim_ctx(&target, req.repo)?;
                 let owner = crate::claims::owner_id();
-                let ok = crate::claims::done(&conn, &repo, &target, &owner, crate::claims::now())
+                let now = crate::claims::now();
+                let ttl = crate::claims::ttl_secs();
+                // Same single-write-transaction guarantee as `release` above.
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                Self::claim_confirm_or_steal(&tx, &repo, &target, &owner, now, ttl)?;
+                let ok = crate::claims::done(&tx, &repo, &target, &owner, now)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                tx.commit()
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(serde_json::json!({ "done": ok, "repo": repo, "target": target }).to_string())
             }
@@ -128,5 +190,73 @@ impl AgentflareMcp {
                 None,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::claims::migrate(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn claim_confirm_or_steal_acquires_when_unclaimed() {
+        let conn = mem_conn();
+        AgentflareMcp::claim_confirm_or_steal(&conn, "o/r", "issue#1", "me:1", 1000, 1800).unwrap();
+        assert!(crate::claims::release(&conn, "o/r", "issue#1", "me:1").unwrap());
+    }
+
+    #[test]
+    fn claim_confirm_or_steal_ok_on_own_live_claim() {
+        let conn = mem_conn();
+        crate::claims::acquire(&conn, "o/r", "issue#1", "me:1", None, None, 1000, 1800).unwrap();
+        AgentflareMcp::claim_confirm_or_steal(&conn, "o/r", "issue#1", "me:1", 1100, 1800).unwrap();
+        assert!(crate::claims::done(&conn, "o/r", "issue#1", "me:1", 1100).unwrap());
+    }
+
+    #[test]
+    fn claim_confirm_or_steal_steals_a_stale_foreign_claim() {
+        let conn = mem_conn();
+        crate::claims::acquire(&conn, "o/r", "issue#1", "gone:1", None, None, 1000, 1800).unwrap();
+        // Well past the TTL -- the claiming instance is gone.
+        AgentflareMcp::claim_confirm_or_steal(&conn, "o/r", "issue#1", "me:1", 10_000, 1800)
+            .unwrap();
+        assert!(
+            crate::claims::release(&conn, "o/r", "issue#1", "me:1").unwrap(),
+            "a release must succeed after stealing an abandoned claim"
+        );
+    }
+
+    #[test]
+    fn claim_confirm_or_steal_errors_naming_the_holder_of_a_live_foreign_claim() {
+        let conn = mem_conn();
+        crate::claims::acquire(
+            &conn,
+            "o/r",
+            "issue#1",
+            "someone-else:1",
+            None,
+            None,
+            1000,
+            1800,
+        )
+        .unwrap();
+        let err =
+            AgentflareMcp::claim_confirm_or_steal(&conn, "o/r", "issue#1", "me:1", 1100, 1800)
+                .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("someone-else:1"),
+            "message: {}",
+            err.message
+        );
+        assert!(
+            crate::claims::release(&conn, "o/r", "issue#1", "someone-else:1").unwrap(),
+            "a live claim held by someone else must be left untouched"
+        );
     }
 }
