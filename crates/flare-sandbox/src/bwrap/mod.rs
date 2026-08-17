@@ -12,6 +12,7 @@
 //! workspaces, so that machinery isn't needed here.
 mod bwrap_install;
 
+use crate::{AgentStateMount, MountPolicy, SandboxConfig};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -24,96 +25,6 @@ use std::sync::OnceLock;
 /// defeating the containment this sandbox exists to provide.
 const HOME_CACHE_DIRS: &[&str] = &[".cargo", ".rustup", ".cache", ".npm"];
 
-/// opencode's own data dir, relative to `$HOME` -- unlike claude-code/codex/
-/// gemini's headless modes, `opencode run` unconditionally writes into this
-/// directory on every invocation (an append-mode log file, plus a SQLite
-/// session DB it checkpoints), which crashes outright under the read-only
-/// root (item #106: `FileSystem.open` on `opencode.log`, then a WAL
-/// checkpoint failure once that's worked around). It also holds
-/// `auth.json`, so it can't just go on `HOME_CACHE_DIRS` read-only -- opencode
-/// needs to both read existing credentials/config *and* write. Mounted via
-/// `--overlay-src`+`--tmp-overlay` in `build_bwrap_args_with_home`: reads
-/// see the real directory, writes land in an invisible tmpfs that's
-/// discarded when the sandboxed process exits, so nothing persists back to
-/// the host -- same "no writable state survives past this one job" guarantee
-/// `HOME_CACHE_DIRS` argues for, just via overlay instead of read-only-try
-/// since this one dir needs both.
-const OPENCODE_DATA_DIR_RELATIVE: &str = ".local/share/opencode";
-
-/// claude-code's own data dir, relative to `$HOME`. It holds
-/// `.credentials.json`, the file claude-code's OAuth refresh machinery both
-/// reads (existing access/refresh tokens) and writes (persisting the rotated
-/// token pair after a successful server-side refresh). The write side is the
-/// part the sandbox breaks: claude-code's refresh flow first creates
-/// `.oauth_refresh.lock` (inside this dir) and later rewrites the credentials
-/// file via a temp-file+rename, and both fail with EROFS when the dir falls
-/// through to the sandbox's read-only root -- the refresh never completes and
-/// the job dies with "Failed to authenticate. API Error: 401 OAuth access
-/// token has expired" against the stale token (item #127, confirmed live:
-/// every sandboxed job hit it while the same token refreshed fine
-/// interactively). Mounted via `--overlay-src`+`--tmp-overlay` in
-/// `build_bwrap_args_with_home`, exactly like `OPENCODE_DATA_DIR_RELATIVE`:
-/// reads see the real dir, writes land in an invisible tmpfs that's discarded
-/// when the sandboxed process exits, so the in-job refresh can complete
-/// without any refreshed token persisting back to the host's real
-/// `~/.claude` -- same "no writable state survives past this one job"
-/// guarantee `HOME_CACHE_DIRS` argues for.
-const CLAUDE_DATA_DIR_RELATIVE: &str = ".claude";
-
-/// cursor-agent's own config/state dir, relative to `$HOME`. It holds
-/// `mcp.json`/`hooks.json` (read) plus a per-project tracking directory
-/// cursor-agent creates on demand under `.cursor/projects/<slug>` for
-/// whatever cwd it's launched against -- item #130, confirmed live: with
-/// `.cursor` left off the sandbox entirely (falling through to the
-/// `--ro-bind / /` read-only root, same as any other unlisted `$HOME`
-/// subdir), that `mkdir` failed and every cursor-agent job died immediately
-/// with "cursor exited non-zero -- ENOENT ... mkdir
-/// '.../.cursor/projects/<slug>'" before doing any real work. Mounted via
-/// `--overlay-src`+`--tmp-overlay` in `build_bwrap_args_with_home`, exactly
-/// like `CLAUDE_DATA_DIR_RELATIVE`/`OPENCODE_DATA_DIR_RELATIVE`: reads see
-/// the real dir (existing `mcp.json`/`hooks.json`/auth), writes -- including
-/// that per-project tracking dir -- land in an invisible tmpfs discarded
-/// when the sandboxed process exits, so nothing persists back to the host.
-const CURSOR_DATA_DIR_RELATIVE: &str = ".cursor";
-
-/// The agentflare MCP server's own state dir, relative to `$HOME` -- holds
-/// `agentflare.db`, the sqlite store every `item`/`comment`/`vent` MCP call
-/// writes through. Unlike `HOME_CACHE_DIRS`, this one must be writable: a
-/// dispatched job's whole job-completion signal (`item action=done`,
-/// `comment action=create`, even `vent` for reporting a sandbox problem like
-/// this one) is an MCP call into this same DB, so read-only here means the
-/// agent finishes real work with no way to report it (item #120 -- confirmed
-/// live via `EROFS` on `touch ~/.agentflare/probe` and two dispatched jobs
-/// stuck showing not-done despite merge-ready PRs). Bound with `--bind-try`
-/// (writable, silently skipped if missing) rather than `--bind`, matching
-/// the "missing dir is fine, wrong dir is not" fallback the other optional
-/// home binds use.
-const AGENTFLARE_DATA_DIR_RELATIVE: &str = ".agentflare";
-
-/// Whether `command` (the resolved binary about to be run, e.g.
-/// `/home/user/.opencode/bin/opencode`) is opencode -- matched on the final
-/// path component so it doesn't care whether the caller passed a bare name
-/// or a full resolved path.
-fn is_opencode(command: &str) -> bool {
-    Path::new(command).file_name() == Some(std::ffi::OsStr::new("opencode"))
-}
-
-/// Whether `command` (the resolved binary about to be run) is claude-code --
-/// matched on the final path component `claude` (the CLI's binary name, found
-/// via `find_binary(["claude"])`), so it works for both a bare name and a
-/// full resolved path, the same way `is_opencode` does.
-fn is_claude_code(command: &str) -> bool {
-    Path::new(command).file_name() == Some(std::ffi::OsStr::new("claude"))
-}
-
-/// Whether `command` (the resolved binary about to be run) is cursor-agent --
-/// matched on the final path component `cursor-agent` (the binary name from
-/// `agent-registry`'s `binary_names: &["cursor-agent"]`), the same way
-/// `is_opencode`/`is_claude_code` do.
-fn is_cursor(command: &str) -> bool {
-    Path::new(command).file_name() == Some(std::ffi::OsStr::new("cursor-agent"))
-}
-
 /// `git_writable` controls whether `cwd/.git` is re-protected read-only
 /// (the default, `false` -- appropriate for an arbitrary job command that
 /// has no business rewriting git history) or left writable under the same
@@ -125,6 +36,7 @@ pub(super) fn wrap(
     args: &[String],
     cwd: Option<&Path>,
     git_writable: bool,
+    config: &SandboxConfig,
 ) -> Option<(String, Vec<String>)> {
     let bwrap = find_or_install_bwrap()?;
     // Resolved once up front (not inside `build_bwrap_args`) so an
@@ -139,7 +51,7 @@ pub(super) fn wrap(
     };
     Some((
         path_to_string(&bwrap),
-        build_bwrap_args(cwd.as_deref(), command, args, git_writable),
+        build_bwrap_args(cwd.as_deref(), command, args, git_writable, config),
     ))
 }
 
@@ -148,6 +60,7 @@ fn build_bwrap_args(
     command: &str,
     args: &[String],
     git_writable: bool,
+    config: &SandboxConfig,
 ) -> Vec<String> {
     build_bwrap_args_with_home(
         cwd,
@@ -155,6 +68,7 @@ fn build_bwrap_args(
         args,
         std::env::var_os("HOME").as_deref(),
         git_writable,
+        config,
     )
 }
 
@@ -164,6 +78,7 @@ fn build_bwrap_args_with_home(
     args: &[String],
     home: Option<&std::ffi::OsStr>,
     git_writable: bool,
+    config: &SandboxConfig,
 ) -> Vec<String> {
     let mut bwrap_args = vec![
         "--new-session".to_string(),
@@ -237,80 +152,23 @@ fn build_bwrap_args_with_home(
             }
         }
 
-        let agentflare_dir = Path::new(home).join(AGENTFLARE_DATA_DIR_RELATIVE);
-        if agentflare_dir.exists() {
-            let agentflare_str = path_to_string(&agentflare_dir);
-            bwrap_args.push("--bind-try".to_string());
-            bwrap_args.push(agentflare_str.clone());
-            bwrap_args.push(agentflare_str);
-        }
-
-        if is_opencode(command) {
-            let opencode_dir = Path::new(home).join(OPENCODE_DATA_DIR_RELATIVE);
-            let opencode_str = path_to_string(&opencode_dir);
-            if opencode_dir.exists() {
-                // `--overlay-src` requires its source to already exist;
-                // reads pass through to it, writes go to the implicit tmpfs
-                // `--tmp-overlay` adds on top -- never touching the host.
-                bwrap_args.push("--overlay-src".to_string());
-                bwrap_args.push(opencode_str.clone());
-                bwrap_args.push("--tmp-overlay".to_string());
-                bwrap_args.push(opencode_str);
-            } else {
-                // Never run before under this `$HOME` -- nothing to read,
-                // so a plain writable tmpfs (no read-only source needed)
-                // covers the same "opencode can create+write its own data
-                // dir" case.
-                bwrap_args.push("--tmpfs".to_string());
-                bwrap_args.push(opencode_str);
+        for relative in config.writable_home_dirs {
+            let dir = Path::new(home).join(relative);
+            if dir.exists() {
+                let dir_str = path_to_string(&dir);
+                bwrap_args.push("--bind-try".to_string());
+                bwrap_args.push(dir_str.clone());
+                bwrap_args.push(dir_str);
             }
         }
 
-        if is_claude_code(command) {
-            let claude_dir = Path::new(home).join(CLAUDE_DATA_DIR_RELATIVE);
-            let claude_str = path_to_string(&claude_dir);
-            if claude_dir.exists() {
-                // Same overlay semantics as the opencode dir above: reads
-                // pass through to the host's `~/.claude` (existing
-                // `.credentials.json`), writes -- the `.oauth_refresh.lock`
-                // and rotated-token persist claude-code's refresh flow needs
-                // -- go to the implicit tmpfs `--tmp-overlay` adds on top,
-                // discarded on exit, never touching the host (item #127).
-                bwrap_args.push("--overlay-src".to_string());
-                bwrap_args.push(claude_str.clone());
-                bwrap_args.push("--tmp-overlay".to_string());
-                bwrap_args.push(claude_str);
-            } else {
-                // Never run before under this `$HOME` -- no existing
-                // credentials to read, but claude-code still needs a
-                // writable dir to create `.credentials.json` (it re-auths
-                // into the overlay, discarded after this one job).
-                bwrap_args.push("--tmpfs".to_string());
-                bwrap_args.push(claude_str);
+        let command_file_name = Path::new(command).file_name();
+        for profile in config.agent_profiles {
+            if command_file_name != Some(std::ffi::OsStr::new(profile.binary_name)) {
+                continue;
             }
-        }
-
-        if is_cursor(command) {
-            let cursor_dir = Path::new(home).join(CURSOR_DATA_DIR_RELATIVE);
-            let cursor_str = path_to_string(&cursor_dir);
-            if cursor_dir.exists() {
-                // Same overlay semantics as claude/opencode above: reads
-                // pass through to the host's `~/.cursor` (existing
-                // `mcp.json`/`hooks.json`/auth), writes -- including the
-                // per-project tracking dir cursor-agent creates on demand --
-                // go to the implicit tmpfs `--tmp-overlay` adds on top,
-                // discarded on exit, never touching the host (item #130).
-                bwrap_args.push("--overlay-src".to_string());
-                bwrap_args.push(cursor_str.clone());
-                bwrap_args.push("--tmp-overlay".to_string());
-                bwrap_args.push(cursor_str);
-            } else {
-                // Never run before under this `$HOME` -- nothing to read,
-                // but cursor-agent still needs a writable dir to create its
-                // project-tracking subdirectory (re-created into the
-                // overlay, discarded after this one job).
-                bwrap_args.push("--tmpfs".to_string());
-                bwrap_args.push(cursor_str);
+            for mount in profile.state_mounts {
+                push_agent_state_mount(&mut bwrap_args, home, mount);
             }
         }
     }
@@ -320,6 +178,34 @@ fn build_bwrap_args_with_home(
     bwrap_args.extend(args.iter().cloned());
 
     bwrap_args
+}
+
+/// Applies one agent's `$HOME` state-directory mount per its [`MountPolicy`].
+/// The only policy today, `OverlayEphemeral`, mirrors claude-code/opencode's
+/// original treatment (item #127): reads pass through to the real directory
+/// (existing config/credentials), writes -- including anything the agent
+/// creates on demand, like cursor-agent's per-project tracking dir (item
+/// #130) -- go to the implicit tmpfs `--tmp-overlay` adds on top, discarded
+/// on exit, never touching the host. A directory that's never existed under
+/// this `$HOME` gets a plain writable tmpfs instead (nothing to read, but
+/// the agent still needs somewhere to create its own state).
+fn push_agent_state_mount(
+    bwrap_args: &mut Vec<String>,
+    home: &std::ffi::OsStr,
+    mount: &AgentStateMount,
+) {
+    let MountPolicy::OverlayEphemeral = mount.policy;
+    let dir = Path::new(home).join(mount.relative_path);
+    let dir_str = path_to_string(&dir);
+    if dir.exists() {
+        bwrap_args.push("--overlay-src".to_string());
+        bwrap_args.push(dir_str.clone());
+        bwrap_args.push("--tmp-overlay".to_string());
+        bwrap_args.push(dir_str);
+    } else {
+        bwrap_args.push("--tmpfs".to_string());
+        bwrap_args.push(dir_str);
+    }
 }
 
 /// Resolves a `git worktree` checkout's `cwd/.git` gitfile
@@ -392,14 +278,14 @@ fn find_or_install_bwrap() -> Option<PathBuf> {
             match bwrap_install::install() {
                 Some(path) => {
                     eprintln!(
-                        "agentflare-jobs: installed bwrap via mise at {}",
+                        "flare-sandbox: installed bwrap via mise at {}",
                         path.display()
                     );
                     Some(path)
                 }
                 None => {
                     eprintln!(
-                        "agentflare-jobs: bwrap not found and could not be installed \
+                        "flare-sandbox: bwrap not found and could not be installed \
                          (mise missing or install failed) -- running this job unsandboxed"
                     );
                     None
@@ -444,6 +330,17 @@ pub(super) fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentProfile;
+
+    fn agent(binary_name: &'static str, mounts: &'static [AgentStateMount]) -> SandboxConfig {
+        SandboxConfig {
+            agent_profiles: Box::leak(Box::new([AgentProfile {
+                binary_name,
+                state_mounts: mounts,
+            }])),
+            writable_home_dirs: &[],
+        }
+    }
 
     #[test]
     fn missing_bwrap_falls_back_to_none() {
@@ -470,7 +367,14 @@ mod tests {
     fn resolved_cwd_is_placed_into_bind_and_chdir_args() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = std::fs::canonicalize(dir.path()).unwrap();
-        let args = build_bwrap_args_with_home(Some(cwd.as_path()), "true", &[], None, false);
+        let args = build_bwrap_args_with_home(
+            Some(cwd.as_path()),
+            "true",
+            &[],
+            None,
+            false,
+            &SandboxConfig::default(),
+        );
         let expected = path_to_string(&cwd);
         let (src, dest) = bind_arg(&args);
         assert_eq!(src, expected);
@@ -492,7 +396,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         let cwd = std::fs::canonicalize(dir.path()).unwrap();
-        let args = build_bwrap_args_with_home(Some(cwd.as_path()), "true", &[], None, false);
+        let args = build_bwrap_args_with_home(
+            Some(cwd.as_path()),
+            "true",
+            &[],
+            None,
+            false,
+            &SandboxConfig::default(),
+        );
         let git_str = path_to_string(&cwd.join(".git"));
         let idx = args
             .iter()
@@ -508,14 +419,21 @@ mod tests {
         // re-protecting `.git` read-only for that specific caller made every
         // headless work-item dispatch unable to ever commit its own staged
         // changes (bwrap denies the write with "Read-only file system",
-        // which `commit_uncommitted` in flare-git-core then swallows
-        // silently, so `item_done` reports success with nothing committed).
-        // `git_writable = true` must leave `.git` under the plain writable
-        // `--bind` for cwd instead of adding a second read-only bind on top.
+        // which `flare-git-core` then swallows silently, so `item_done`
+        // reports success with nothing committed). `git_writable = true`
+        // must leave `.git` under the plain writable `--bind` for cwd
+        // instead of adding a second read-only bind on top.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         let cwd = std::fs::canonicalize(dir.path()).unwrap();
-        let args = build_bwrap_args_with_home(Some(cwd.as_path()), "true", &[], None, true);
+        let args = build_bwrap_args_with_home(
+            Some(cwd.as_path()),
+            "true",
+            &[],
+            None,
+            true,
+            &SandboxConfig::default(),
+        );
         let git_str = path_to_string(&cwd.join(".git"));
         assert!(
             !args.iter().any(|a| a == &git_str),
@@ -554,7 +472,14 @@ mod tests {
         let cwd = std::fs::canonicalize(worktree.path()).unwrap();
         write_worktree_gitfile(&cwd, &admin_dir);
 
-        let args = build_bwrap_args_with_home(Some(cwd.as_path()), "true", &[], None, true);
+        let args = build_bwrap_args_with_home(
+            Some(cwd.as_path()),
+            "true",
+            &[],
+            None,
+            true,
+            &SandboxConfig::default(),
+        );
 
         let expected = path_to_string(&main_git_dir);
         let idx = args
@@ -574,7 +499,14 @@ mod tests {
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         let cwd = std::fs::canonicalize(dir.path()).unwrap();
 
-        let args = build_bwrap_args_with_home(Some(cwd.as_path()), "true", &[], None, false);
+        let args = build_bwrap_args_with_home(
+            Some(cwd.as_path()),
+            "true",
+            &[],
+            None,
+            false,
+            &SandboxConfig::default(),
+        );
 
         let expected = path_to_string(&cwd.join(".git"));
         let idx = args
@@ -626,7 +558,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".cargo")).unwrap();
         let home = std::ffi::OsString::from(dir.path());
-        let args = build_bwrap_args_with_home(None, "true", &[], Some(&home), false);
+        let args = build_bwrap_args_with_home(
+            None,
+            "true",
+            &[],
+            Some(&home),
+            false,
+            &SandboxConfig::default(),
+        );
         let cargo_path = path_to_string(&dir.path().join(".cargo"));
         let idx = args
             .iter()
@@ -636,156 +575,61 @@ mod tests {
     }
 
     #[test]
-    fn agentflare_data_dir_bound_read_write_when_present() {
-        // Item #120: `~/.agentflare` holds the sqlite DB every `item`/
-        // `comment`/`vent` MCP call writes through, so a dispatched job
-        // needs write access to report its own completion -- read-only (or
-        // missing entirely) means the job finishes real work with no way to
-        // signal it, exactly what happened live on items #112 and #116.
+    fn writable_home_dir_bound_read_write_when_present() {
+        // Item #120: a caller's own on-disk state (e.g. agentflare's
+        // ~/.agentflare sqlite DB) needs write access regardless of which
+        // agent CLI is running, so a dispatched job can report its own
+        // completion -- read-only (or missing entirely) means the job
+        // finishes real work with no way to signal it.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(AGENTFLARE_DATA_DIR_RELATIVE)).unwrap();
+        std::fs::create_dir(dir.path().join(".agentflare")).unwrap();
         let home = std::ffi::OsString::from(dir.path());
-        let args = build_bwrap_args_with_home(None, "true", &[], Some(&home), false);
-        let agentflare_path = path_to_string(&dir.path().join(AGENTFLARE_DATA_DIR_RELATIVE));
+        let config = SandboxConfig {
+            agent_profiles: &[],
+            writable_home_dirs: &[".agentflare"],
+        };
+        let args = build_bwrap_args_with_home(None, "true", &[], Some(&home), false, &config);
+        let path = path_to_string(&dir.path().join(".agentflare"));
         let idx = args
             .iter()
-            .position(|a| a == &agentflare_path)
+            .position(|a| a == &path)
             .expect(".agentflare dir bound");
         assert_eq!(args[idx - 1], "--bind-try");
     }
 
     #[test]
-    fn agentflare_data_dir_skipped_when_absent() {
+    fn writable_home_dir_skipped_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         let home = std::ffi::OsString::from(dir.path());
-        let args = build_bwrap_args_with_home(None, "true", &[], Some(&home), false);
-        let agentflare_path = path_to_string(&dir.path().join(AGENTFLARE_DATA_DIR_RELATIVE));
-        assert!(!args.iter().any(|a| a == &agentflare_path));
+        let config = SandboxConfig {
+            agent_profiles: &[],
+            writable_home_dirs: &[".agentflare"],
+        };
+        let args = build_bwrap_args_with_home(None, "true", &[], Some(&home), false, &config);
+        let path = path_to_string(&dir.path().join(".agentflare"));
+        assert!(!args.iter().any(|a| a == &path));
     }
 
     #[test]
-    fn opencode_data_dir_overlaid_when_present() {
+    fn matching_agent_profile_overlays_its_state_dir_when_present() {
         let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join(OPENCODE_DATA_DIR_RELATIVE);
+        let data_dir = dir.path().join(".testagent");
         std::fs::create_dir_all(&data_dir).unwrap();
         let home = std::ffi::OsString::from(dir.path());
-        let args = build_bwrap_args_with_home(None, "/usr/bin/opencode", &[], Some(&home), false);
-        let data_str = path_to_string(&data_dir);
-        let src_idx = args
-            .iter()
-            .position(|a| a == "--overlay-src")
-            .expect("--overlay-src present");
-        assert_eq!(args[src_idx + 1], data_str);
-        let overlay_idx = args
-            .iter()
-            .position(|a| a == "--tmp-overlay")
-            .expect("--tmp-overlay present");
-        assert_eq!(args[overlay_idx + 1], data_str);
-    }
-
-    #[test]
-    fn opencode_data_dir_uses_tmpfs_when_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = std::ffi::OsString::from(dir.path());
-        let args = build_bwrap_args_with_home(None, "/usr/bin/opencode", &[], Some(&home), false);
-        let data_str = path_to_string(&dir.path().join(OPENCODE_DATA_DIR_RELATIVE));
-        let idx = args
-            .iter()
-            .position(|a| a == &data_str)
-            .expect("opencode data dir tmpfs-mounted");
-        assert_eq!(args[idx - 1], "--tmpfs");
-        assert!(!args.iter().any(|a| a == "--overlay-src"));
-    }
-
-    #[test]
-    fn non_opencode_command_gets_no_opencode_specific_mount() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(OPENCODE_DATA_DIR_RELATIVE)).unwrap();
-        let home = std::ffi::OsString::from(dir.path());
-        let args = build_bwrap_args_with_home(None, "/usr/bin/claude", &[], Some(&home), false);
-        assert!(
-            !args
-                .iter()
-                .any(|a| a == "--overlay-src" || a == "--tmp-overlay")
+        let config = agent(
+            "testagent",
+            &[AgentStateMount {
+                relative_path: ".testagent",
+                policy: MountPolicy::OverlayEphemeral,
+            }],
         );
-    }
-
-    #[test]
-    fn claude_data_dir_overlaid_when_present() {
-        // Item #127: `~/.claude` holds `.credentials.json`, which claude-code's
-        // OAuth refresh must write (`.oauth_refresh.lock` + rotated-token
-        // persist) -- read-only under the sandbox's root bind means the
-        // refresh never completes and every dispatched job fails auth. A
-        // claude-code command must get `~/.claude` overlaid, not left on the
-        // read-only root.
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join(CLAUDE_DATA_DIR_RELATIVE);
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let home = std::ffi::OsString::from(dir.path());
-        let args =
-            build_bwrap_args_with_home(None, "/usr/local/bin/claude", &[], Some(&home), false);
-        let data_str = path_to_string(&data_dir);
-        let src_idx = args
-            .iter()
-            .position(|a| a == "--overlay-src")
-            .expect("--overlay-src present");
-        assert_eq!(args[src_idx + 1], data_str);
-        let overlay_idx = args
-            .iter()
-            .position(|a| a == "--tmp-overlay")
-            .expect("--tmp-overlay present");
-        assert_eq!(args[overlay_idx + 1], data_str);
-    }
-
-    #[test]
-    fn claude_data_dir_uses_tmpfs_when_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = std::ffi::OsString::from(dir.path());
-        let args =
-            build_bwrap_args_with_home(None, "/usr/local/bin/claude", &[], Some(&home), false);
-        let data_str = path_to_string(&dir.path().join(CLAUDE_DATA_DIR_RELATIVE));
-        let idx = args
-            .iter()
-            .position(|a| a == &data_str)
-            .expect("claude data dir tmpfs-mounted");
-        assert_eq!(args[idx - 1], "--tmpfs");
-        assert!(!args.iter().any(|a| a == "--overlay-src"));
-    }
-
-    #[test]
-    fn non_claude_command_gets_no_claude_specific_mount() {
-        // The `~/.claude` overlay is gated on the command actually being
-        // claude-code; an opencode job must not get one (opencode gets its own
-        // dir instead).
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(CLAUDE_DATA_DIR_RELATIVE)).unwrap();
-        let home = std::ffi::OsString::from(dir.path());
-        let args = build_bwrap_args_with_home(None, "/usr/bin/opencode", &[], Some(&home), false);
-        assert!(
-            !args
-                .iter()
-                .any(|a| a == "--overlay-src" || a == "--tmp-overlay")
-        );
-    }
-
-    #[test]
-    fn cursor_data_dir_overlaid_when_present() {
-        // Item #130: `~/.cursor` holds `mcp.json`/`hooks.json` plus a
-        // per-project tracking dir cursor-agent creates on demand -- left
-        // off the sandbox entirely (falling through to the read-only root),
-        // that `mkdir` failed and every cursor-agent job died immediately.
-        // A cursor command must get `~/.cursor` overlaid, not left on the
-        // read-only root.
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join(CURSOR_DATA_DIR_RELATIVE);
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let home = std::ffi::OsString::from(dir.path());
         let args = build_bwrap_args_with_home(
             None,
-            "/usr/local/bin/cursor-agent",
+            "/usr/local/bin/testagent",
             &[],
             Some(&home),
             false,
+            &config,
         );
         let data_str = path_to_string(&data_dir);
         let src_idx = args
@@ -801,37 +645,85 @@ mod tests {
     }
 
     #[test]
-    fn cursor_data_dir_uses_tmpfs_when_absent() {
+    fn matching_agent_profile_uses_tmpfs_when_state_dir_absent() {
         let dir = tempfile::tempdir().unwrap();
         let home = std::ffi::OsString::from(dir.path());
+        let config = agent(
+            "testagent",
+            &[AgentStateMount {
+                relative_path: ".testagent",
+                policy: MountPolicy::OverlayEphemeral,
+            }],
+        );
         let args = build_bwrap_args_with_home(
             None,
-            "/usr/local/bin/cursor-agent",
+            "/usr/local/bin/testagent",
             &[],
             Some(&home),
             false,
+            &config,
         );
-        let data_str = path_to_string(&dir.path().join(CURSOR_DATA_DIR_RELATIVE));
+        let data_str = path_to_string(&dir.path().join(".testagent"));
         let idx = args
             .iter()
             .position(|a| a == &data_str)
-            .expect("cursor data dir tmpfs-mounted");
+            .expect("agent data dir tmpfs-mounted");
         assert_eq!(args[idx - 1], "--tmpfs");
         assert!(!args.iter().any(|a| a == "--overlay-src"));
     }
 
     #[test]
-    fn non_cursor_command_gets_no_cursor_specific_mount() {
-        // The `~/.cursor` overlay is gated on the command actually being
-        // cursor-agent; a claude/opencode job must not get one.
+    fn non_matching_command_gets_no_agent_specific_mount() {
+        // The overlay is gated on the resolved command actually matching a
+        // profile's binary_name; a different command must not get one.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(CURSOR_DATA_DIR_RELATIVE)).unwrap();
+        std::fs::create_dir_all(dir.path().join(".testagent")).unwrap();
         let home = std::ffi::OsString::from(dir.path());
-        let args = build_bwrap_args_with_home(None, "/usr/bin/opencode", &[], Some(&home), false);
+        let config = agent(
+            "testagent",
+            &[AgentStateMount {
+                relative_path: ".testagent",
+                policy: MountPolicy::OverlayEphemeral,
+            }],
+        );
+        let args = build_bwrap_args_with_home(
+            None,
+            "/usr/bin/some-other-agent",
+            &[],
+            Some(&home),
+            false,
+            &config,
+        );
         assert!(
             !args
                 .iter()
                 .any(|a| a == "--overlay-src" || a == "--tmp-overlay")
         );
+    }
+
+    #[test]
+    fn profile_with_multiple_state_mounts_binds_all_of_them() {
+        // opencode needs both `.config/opencode` and `.local/share/opencode`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".config/opencode")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".local/share/opencode")).unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let config = agent(
+            "opencode",
+            &[
+                AgentStateMount {
+                    relative_path: ".config/opencode",
+                    policy: MountPolicy::OverlayEphemeral,
+                },
+                AgentStateMount {
+                    relative_path: ".local/share/opencode",
+                    policy: MountPolicy::OverlayEphemeral,
+                },
+            ],
+        );
+        let args =
+            build_bwrap_args_with_home(None, "/usr/bin/opencode", &[], Some(&home), false, &config);
+        let overlay_count = args.iter().filter(|a| *a == "--overlay-src").count();
+        assert_eq!(overlay_count, 2);
     }
 }
