@@ -303,12 +303,7 @@ async fn finalize_step_releases_claim_when_human_review_gate_is_hit() {
         review_issues: Some("- still broken".into()),
         ..Default::default()
     };
-    let step = build_finalize_step(
-        mcp.clone(),
-        item_id.clone(),
-        None,
-        owner.clone(),
-    );
+    let step = build_finalize_step(mcp.clone(), item_id.clone(), None, owner.clone());
     let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
     let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
     engine.register_workflow(wf).unwrap();
@@ -334,7 +329,10 @@ async fn finalize_step_releases_claim_when_human_review_gate_is_hit() {
             return;
         }
         if state.status == flare_workflow::WorkflowStatus::Failed {
-            panic!("finalize must succeed for human-review gate: {:?}", state.error);
+            panic!(
+                "finalize must succeed for human-review gate: {:?}",
+                state.error
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -353,12 +351,7 @@ async fn finalize_step_releases_claim_after_review_only_success() {
         last_report: Some("Found an issue.".to_string()),
         ..Default::default()
     };
-    let step = build_finalize_step(
-        mcp.clone(),
-        item_id.clone(),
-        None,
-        owner.clone(),
-    );
+    let step = build_finalize_step(mcp.clone(), item_id.clone(), None, owner.clone());
     let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
     let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
     engine.register_workflow(wf).unwrap();
