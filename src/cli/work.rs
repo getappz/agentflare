@@ -11,7 +11,10 @@ use std::time::Duration;
 /// named so the two can't silently drift apart.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 21_600;
 /// `agentflare work --idle-timeout`'s default; see [`DEFAULT_TIMEOUT_SECS`].
-pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+/// Equal to it, not shorter: headless CLI agents (print mode) emit no
+/// incremental stdout, so "no output for N secs" can't tell a hung process
+/// from one still computing — it just killed real turns (items #143/#150/#151).
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = DEFAULT_TIMEOUT_SECS;
 
 /// Claim a work item, run an agent on it in an isolated worktree, and
 /// report the result (comment + PR, or error) back onto the item.
@@ -25,16 +28,14 @@ pub struct WorkArgs {
     #[arg(long)]
     pub agent: Option<String>,
     /// Absolute hard-cap timeout in seconds, regardless of activity
-    /// (default 21600 = 6h). A backstop against a runaway process, not the
-    /// primary signal for whether to keep a job alive — see --idle-timeout.
+    /// (default 21600 = 6h). The backstop against a runaway process — see
+    /// --idle-timeout for why it defaults to the same value, not a shorter one.
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
     pub timeout: u64,
     /// Kill the agent if it produces no new stdout/stderr output for this
-    /// many seconds (default 300 = 5 min). This is the primary liveness
-    /// signal: a task that keeps producing output can run all the way to
-    /// --timeout even if that takes hours; a genuinely stuck task is caught
-    /// quickly instead of running out the full --timeout with nothing
-    /// happening.
+    /// many seconds (default: same as --timeout — headless print-mode CLIs
+    /// emit no incremental output, so a shorter default just kills real long
+    /// turns). Pass a smaller value only for an agent/mode you know streams.
     #[arg(long, default_value_t = DEFAULT_IDLE_TIMEOUT_SECS)]
     pub idle_timeout: u64,
     /// Max agent turns before forced stop (Claude Code only).
