@@ -78,11 +78,7 @@ pub(super) fn reconcile_orphaned_jobs(queue: &Queue) {
 /// finished or cancelled out-of-band while its now-dead job was still
 /// marked `running` doesn't get silently resurrected back onto the
 /// discovery queue.
-fn restore_ready_for_work(
-    mcp: &crate::mcp_server::AgentflareMcp,
-    item_id: &str,
-    agent: &str,
-) {
+fn restore_ready_for_work(mcp: &crate::mcp_server::AgentflareMcp, item_id: &str, agent: &str) {
     let _ = mcp.with_backend_db(|conn| -> Option<()> {
         let item = agentflare_backend::item::get(conn, item_id).ok()?;
         let state = agentflare_backend::state::get(conn, &item.state_id).ok()?;
