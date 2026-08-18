@@ -898,4 +898,35 @@ mod tests {
             "a stale, never-`done`/`released` claim must not permanently block re-labeling"
         );
     }
+
+    #[test]
+    fn a_json_payload_that_omits_completed_still_deserializes_and_fails_with_the_friendly_message() {
+        // Regression: `completed`/`remaining` had no `#[serde(default)]`, so
+        // a tool-call JSON that omits the key entirely (as opposed to
+        // sending an empty string) failed at the rmcp `Parameters`
+        // extractor's own deserialization step with a raw serde "missing
+        // field `completed`" error -- before `handoff_impl`'s friendlier
+        // validation (checked below) ever ran. Any caller whose JSON
+        // generation intermittently drops the key hit this raw error
+        // instead of the actionable one. `#[serde(default)]` makes a
+        // missing key deserialize to "", which then flows into the existing
+        // empty-string check uniformly.
+        let json = serde_json::json!({
+            "recipient": "claude-code",
+            "name": "do the thing",
+            "content": "content",
+            "remaining": "everything",
+        });
+        let req: HandoffRequest = serde_json::from_value(json).expect(
+            "a JSON payload missing `completed` must still deserialize into HandoffRequest",
+        );
+        assert_eq!(req.completed, "");
+
+        let (_tmp, mcp) = test_mcp();
+        let err = mcp.handoff_impl(req).unwrap_err();
+        assert!(
+            err.to_string().contains("completed and remaining are required"),
+            "{err}"
+        );
+    }
 }
