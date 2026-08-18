@@ -75,7 +75,7 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
         "Vent friction when the TOOLING blocks you (not the task) — a wrong/missing tool, a fabricated assumption, an environment gap.",
     ),
     (
-"vent_file",
+        "vent_file",
         "List or file agentflare\'s own tooling bugs (git shim, af-guard, item-tracker friction) as ONE batched GitHub issue on getappz/agentflare.",
     ),
     (
