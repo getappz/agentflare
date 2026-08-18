@@ -29,6 +29,7 @@ mod uninstall;
 mod update;
 mod vault;
 mod vent;
+mod work_missing_worktree;
 pub(crate) mod work;
 mod workflow;
 

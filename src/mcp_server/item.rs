@@ -624,7 +624,18 @@ impl AgentflareMcp {
                     Some(Err(e)) => {
                         resp["worktree_error"] = serde_json::Value::String(e);
                     }
-                    None => {}
+                    None => {
+                        let reason = match (&item, &target_branch) {
+                            (None, _) => {
+                                "item record could not be read after claim".to_string()
+                            }
+                            (Some(_), None) => {
+                                "target branch could not be resolved for worktree".to_string()
+                            }
+                            _ => "worktree creation was skipped (unknown reason)".to_string(),
+                        };
+                        resp["worktree_error"] = serde_json::Value::String(reason);
+                    }
                 }
                 resp.to_string()
             }
