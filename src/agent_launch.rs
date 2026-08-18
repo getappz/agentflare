@@ -221,15 +221,13 @@ pub fn run_captured(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    // Suppress the console window that Windows would otherwise flash for
-    // every headless dispatch — the daemon has no console of its own to
-    // attach the child to. Mirrors `Supervisor::spawn()` in
-    // agentflare-jobs/src/supervisor.rs.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    }
+    // NOTE: `CREATE_NO_WINDOW` is deliberately NOT applied here. It breaks
+    // script-shim agents (`.cmd`/`.bat`/`.ps1`, which chain through
+    // cmd.exe → powershell.exe and need a real console): cursor-agent's
+    // `.cmd` shim hangs with zero output under `CREATE_NO_WINDOW`, whereas a
+    // native `.exe` hides cleanly. The decision is per-agent, made by
+    // `run_headless` (the only production caller) from the resolved binary's
+    // extension — see its `#[cfg(windows)] creation_flags` block.
     let mut child = cmd.spawn()?;
 
     if let Some(text) = stdin {
@@ -340,6 +338,55 @@ pub fn headless_argv(agent: Agent, binary: &Path, extra_args: &[String]) -> Opti
     Some(argv)
 }
 
+/// For a script-shim binary (`.ps1`, or a `.cmd`/`.bat` that wraps a sibling
+/// `.ps1` — cursor-agent's shim shape), returns the `powershell.exe` launcher
+/// that runs it with `-WindowStyle Hidden`. Script shims chain through
+/// `powershell.exe` (and often a bundled `node.exe`) and need a real console
+/// to run — under `CREATE_NO_WINDOW` cursor-agent hangs with zero output and
+/// never produces a reply — but `-WindowStyle Hidden` provides that console
+/// with the window hidden, so no terminal flashes over the user's desktop.
+/// Returns `None` for native binaries (handled by the normal
+/// `CREATE_NO_WINDOW` path) and for `.cmd`/`.bat` with no `.ps1` sibling.
+#[cfg(windows)]
+fn script_shim_launcher(binary: &Path, args: &[String]) -> Option<(String, Vec<String>)> {
+    let script = match binary.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "ps1" => binary.to_path_buf(),
+        "cmd" | "bat" => {
+            let ps1 = binary.with_extension("ps1");
+            if ps1.is_file() {
+                ps1
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let mut argv = vec![
+        "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-WindowStyle".to_string(),
+        "Hidden".to_string(),
+        "-File".to_string(),
+        script.to_string_lossy().into_owned(),
+    ];
+    argv.extend(args.iter().cloned());
+    Some(("powershell.exe".to_string(), argv))
+}
+
+/// Resolves `(command, args, hidden_console)` for a headless spawn: the script
+/// shim launcher on Windows when one applies (`hidden_console = true`, meaning
+/// window hiding is already handled), else the binary itself. `args` is the
+/// print-mode flags + extra args (no prompt — that's piped via stdin).
+fn launch_command(binary: &Path, args: &[String]) -> (String, Vec<String>, bool) {
+    #[cfg(windows)]
+    if let Some((cmd, argv)) = script_shim_launcher(binary, args) {
+        return (cmd, argv, true);
+    }
+    (binary.to_string_lossy().into_owned(), args.to_vec(), false)
+}
+
 /// Outcome of a headless (non-interactive, output-captured) agent invocation.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -409,10 +456,29 @@ pub fn run_headless(
     // "nothing was ever committed" and reported success anyway (exit 0),
     // leaving real staged/edited work stranded in the worktree.
     let cwd = std::env::current_dir().ok();
+    // Script-shim agents (`.ps1`, or `.cmd`/`.bat` wrapping a sibling
+    // `.ps1`) are launched through `powershell.exe -WindowStyle Hidden`
+    // rather than the shim itself — see `launch_command`. The rest (native
+    // `.exe`) run directly under `CREATE_NO_WINDOW` below.
+    #[cfg(windows)]
+    let (launch_cmd, launch_args, hidden_console) = launch_command(&binary, &argv[1..]);
+    #[cfg(not(windows))]
+    let (launch_cmd, launch_args, _hidden_console) = launch_command(&binary, &argv[1..]);
     let (sandboxed_command, sandboxed_args) =
-        agentflare_jobs::sandbox::wrap(&argv[0], &argv[1..], cwd.as_deref(), true);
+        agentflare_jobs::sandbox::wrap(&launch_cmd, &launch_args, cwd.as_deref(), true);
     let mut cmd = Command::new(&sandboxed_command);
     cmd.args(&sandboxed_args);
+    // Suppress the console window the daemon's child would otherwise flash —
+    // but only for native binaries. Script shims need a real console to run
+    // (under `CREATE_NO_WINDOW` cursor-agent hangs with zero output); the
+    // powershell launcher's `-WindowStyle Hidden` hides *its* window instead,
+    // so `hidden_console` short-circuits this. `run_captured` no longer
+    // applies this itself; it's per-agent here.
+    #[cfg(windows)]
+    if !hidden_console {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
     // See the matching strip in `run_launch_env` above (item #139) — same
     // rationale applies to headless child processes.
     cmd.env_remove("CARGO_TARGET_DIR");
@@ -445,6 +511,60 @@ pub fn run_headless(
             diagnostic_suffix(&c)
         )),
         Err(e) => HeadlessOutcome::Failed(format!("failed to run {}: {e}", spec.display_name)),
+    }
+}
+
+/// Claude Code's `--output-format stream-json` reply shape: one JSON object
+/// per line (system init, tool_use/tool_result, assistant messages, ...),
+/// with only the FINAL line carrying `{"result": "...", "session_id": "...",
+/// "total_cost_usd": 0.0}` — the same shape the single-object `json` format
+/// uses for its one and only line, so parsing "the last line" handles both.
+/// Falls back to the raw text unparsed for any agent/output whose last line
+/// isn't that exact JSON shape — never errors, never blocks the caller.
+///
+/// Restores what `9dd859e`/`7698fbc` wired into the old `coder` step and
+/// `5c46bd3` deleted as apparently-dead code when that step was replaced by
+/// `sdd_loop` (see item #489) — `work_item_pipeline::real_agent_send_hook`
+/// never regained an equivalent call, so every Claude Code reply (implementer,
+/// reviewer, AND the judge) became the raw multi-line stream-json transcript.
+/// For the judge specifically, `parse_judge_decision` then parses the
+/// transcript's first line — the `{"type":"system","subtype":"init",...}`
+/// event, which has no `action` field — instead of the judge's actual
+/// decision on the transcript's last line, hard-failing every judge turn.
+pub(crate) fn parse_claude_reply(raw: &str) -> (String, Option<String>, Option<f64>) {
+    let last_line = raw.trim().lines().next_back().unwrap_or("");
+    match serde_json::from_str::<serde_json::Value>(last_line) {
+        Ok(v) => {
+            let text = v
+                .get("result")
+                .and_then(|r| r.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| raw.to_string());
+            let session_id = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .map(str::to_string);
+            let cost = v.get("total_cost_usd").and_then(serde_json::Value::as_f64);
+            (text, session_id, cost)
+        }
+        Err(_) => (raw.to_string(), None, None),
+    }
+}
+
+/// Every role dispatched through `real_agent_send_hook` (`work_item_pipeline`)
+/// — implementer, task-reviewer, re-reviewer, AND the judge — shares that
+/// hook, and `build_extra_args` (`cli::work`) forces `--output-format
+/// stream-json` for Claude Code regardless of role. `run_headless`'s captured
+/// stdout is therefore that raw multi-line transcript, not plain reply text;
+/// `parse_claude_reply` is what pulls the real reply off its final line.
+/// Other agents' headless output is already plain text, so this is a no-op
+/// for them. See `parse_claude_reply`'s doc comment for why this call exists
+/// at all (item #489).
+pub(crate) fn clean_agent_reply(agent: &str, raw: String) -> String {
+    if agent == Agent::ClaudeCode.as_str() {
+        parse_claude_reply(&raw).0
+    } else {
+        raw
     }
 }
 
@@ -858,6 +978,25 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn repro_cursor_cmd_hang() {
+        let t0 = std::time::Instant::now();
+        let out = super::run_headless(
+            agent_registry::REGISTRY,
+            "cursor",
+            "Reply with exactly: ok",
+            Duration::from_secs(120),
+            Duration::from_secs(60),
+            &["--force".to_string()],
+        );
+        eprintln!("elapsed={:?}", t0.elapsed());
+        match out {
+            super::HeadlessOutcome::Ok(reply) => eprintln!("OK reply={:?}", reply),
+            other => eprintln!("NOT OK: {other:?}"),
+        }
+    }
+
+    #[test]
     fn run_headless_binary_not_found() {
         let reg = headless_registry();
         match run_headless(
@@ -917,6 +1056,56 @@ mod tests {
             }
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_claude_reply_extracts_structured_fields() {
+        let raw = r#"{"result":"Fixed the race by adding a mutex.","session_id":"sess-123","total_cost_usd":0.0842}"#;
+        let (text, session_id, cost) = parse_claude_reply(raw);
+        assert_eq!(text, "Fixed the race by adding a mutex.");
+        assert_eq!(session_id.as_deref(), Some("sess-123"));
+        assert_eq!(cost, Some(0.0842));
+    }
+
+    #[test]
+    fn parse_claude_reply_extracts_the_result_from_the_last_line_of_a_stream_json_transcript() {
+        // --output-format stream-json emits one JSON object per line (system
+        // init, tool_use/tool_result, assistant messages, ...) and only the
+        // FINAL line carries the same {"result":...} shape the single-object
+        // `json` format uses — everything before it must be ignored, not
+        // treated as (or blended into) the reply text. This is the exact
+        // shape a judge's raw reply takes (item #489): the first line is a
+        // valid-but-`action`-less JSON object, which `parse_judge_decision`
+        // used to grab if this function wasn't called first.
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"sess-123"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working..."}]}}"#,
+            "\n",
+            r#"{"type":"result","result":"Fixed the race by adding a mutex.","session_id":"sess-123","total_cost_usd":0.0842}"#,
+        );
+        let (text, session_id, cost) = parse_claude_reply(raw);
+        assert_eq!(text, "Fixed the race by adding a mutex.");
+        assert_eq!(session_id.as_deref(), Some("sess-123"));
+        assert_eq!(cost, Some(0.0842));
+    }
+
+    #[test]
+    fn clean_agent_reply_is_a_no_op_for_non_claude_agents() {
+        let raw = "DONE: added the flag".to_string();
+        assert_eq!(
+            clean_agent_reply(Agent::Opencode.as_str(), raw.clone()),
+            raw
+        );
+    }
+
+    #[test]
+    fn parse_claude_reply_falls_back_to_raw_text_on_non_json() {
+        let raw = "plain text reply, no JSON here";
+        let (text, session_id, cost) = parse_claude_reply(raw);
+        assert_eq!(text, raw);
+        assert!(session_id.is_none());
+        assert!(cost.is_none());
     }
 
     #[test]

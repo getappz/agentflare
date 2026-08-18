@@ -83,6 +83,42 @@ pub fn opencode_plugin_dir() -> PathBuf {
     opencode_dir().join("plugin")
 }
 
+/// OpenCode's data directory (where `auth.json` lives), distinct from the
+/// config directory (`opencode_dir`) — mirrors opencode's own resolution:
+/// `OPENCODE_DATA_DIR`, else `XDG_DATA_HOME/opencode`, else the platform
+/// default (`~/.local/share/opencode` on Linux/Windows,
+/// `~/Library/Application Support/opencode` on macOS).
+pub fn opencode_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("OPENCODE_DATA_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    if let Ok(dir) = std::env::var("XDG_DATA_HOME")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir).join("opencode");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        home()
+            .join("Library")
+            .join("Application Support")
+            .join("opencode")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home().join(".local").join("share").join("opencode")
+    }
+}
+
+/// `auth.json` inside OpenCode's data directory — opencode's provider
+/// credentials, including the `opencode-go` subscription API key the Go
+/// usage tracker reads.
+pub fn opencode_auth_path() -> PathBuf {
+    opencode_data_dir().join("auth.json")
+}
+
 /// Shared by mcp_server.rs (serving skill_search/skill_load) and
 /// components.rs (syncing skillOverrides) — same on-disk cache, single path
 /// definition so the two can never drift apart.
