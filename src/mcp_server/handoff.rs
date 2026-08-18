@@ -900,7 +900,8 @@ mod tests {
     }
 
     #[test]
-    fn a_json_payload_that_omits_completed_still_deserializes_and_fails_with_the_friendly_message() {
+    fn a_json_payload_that_omits_completed_still_deserializes_and_fails_with_the_friendly_message()
+    {
         // Regression: `completed`/`remaining` had no `#[serde(default)]`, so
         // a tool-call JSON that omits the key entirely (as opposed to
         // sending an empty string) failed at the rmcp `Parameters`
@@ -925,7 +926,8 @@ mod tests {
         let (_tmp, mcp) = test_mcp();
         let err = mcp.handoff_impl(req).unwrap_err();
         assert!(
-            err.to_string().contains("completed and remaining are required"),
+            err.to_string()
+                .contains("completed and remaining are required"),
             "{err}"
         );
     }
