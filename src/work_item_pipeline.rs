@@ -468,6 +468,8 @@ pub(crate) fn build_sdd_loop_step(
 ///    human with a comment instead of opening a PR on unreviewed code, since
 ///    this step has no access to `supervisor`'s label-id lookups for a real
 ///    relabel (that stays the supervisor's job on its next discovery tick).
+///    The job is finished either way — release the claim so redispatch /
+///    supervisor discovery can pick the item back up.
 /// 4. Otherwise — the success path: `item_done`, then the same
 ///    `cap_reply_for_comment`/`format_success_comment`/comment/notify
 ///    sequence `execute_work` runs today.
@@ -477,6 +479,24 @@ pub(crate) fn build_sdd_loop_step(
 /// way `coder`/`review_or_fix`'s agent dispatch can, and unlike those two,
 /// a failure here has already done the real work and just needs to land the
 /// result.
+///
+/// Best-effort claim release on every terminal success except when
+/// `item_done` deliberately left the lease held for an open PR (`in_review`).
+fn finalize_release_claim_best_effort(
+    mcp: &crate::mcp_server::AgentflareMcp,
+    item_id: &str,
+    leave_claim_held: bool,
+) {
+    if leave_claim_held {
+        return;
+    }
+    let _ = mcp.item_release(ItemRequest {
+        action: "release".into(),
+        id: Some(item_id.to_string()),
+        ..Default::default()
+    });
+}
+
 pub(crate) fn build_finalize_step(
     mcp: std::sync::Arc<AgentflareMcp>,
     item_id: String,
@@ -492,11 +512,7 @@ pub(crate) fn build_finalize_step(
             Box::pin(async move {
                 crate::claims::with_owner_override(owner, || {
                     if let Some(reason) = ctx.data.hold_reason.clone() {
-                        let _ = mcp.item_release(ItemRequest {
-                            action: "release".into(),
-                            id: Some(item_id.clone()),
-                            ..Default::default()
-                        });
+                        finalize_release_claim_best_effort(&mcp, &item_id, false);
                         let body = format!("## agentflare work — on hold\n\n{reason}");
                         let _ = mcp.comment_impl(CommentRequest {
                             action: "create".into(),
@@ -520,11 +536,7 @@ pub(crate) fn build_finalize_step(
                         } else {
                             ctx.data.review_findings.join("\n\n---\n\n")
                         };
-                        let _ = mcp.item_release(ItemRequest {
-                            action: "release".into(),
-                            id: Some(item_id.clone()),
-                            ..Default::default()
-                        });
+                        finalize_release_claim_best_effort(&mcp, &item_id, false);
                         let body = format!("## agentflare work — review findings\n\n{findings}");
                         let _ = mcp.comment_impl(CommentRequest {
                             action: "create".into(),
@@ -540,6 +552,7 @@ pub(crate) fn build_finalize_step(
 
                     if ctx.data.review_issues.is_some() {
                         let issues = ctx.data.review_issues.clone().unwrap_or_default();
+                        finalize_release_claim_best_effort(&mcp, &item_id, false);
                         let _ = mcp.comment_impl(CommentRequest {
                             action: "create".into(),
                             item_id: Some(item_id.clone()),
@@ -567,6 +580,8 @@ pub(crate) fn build_finalize_step(
                     let done_val: serde_json::Value =
                         serde_json::from_str(&done_resp).unwrap_or(serde_json::Value::Null);
                     ctx.data.pr_url = done_val["pr_url"].as_str().map(str::to_string);
+                    let leave_claim_held = done_val["status"].as_str() == Some("in_review");
+                    finalize_release_claim_best_effort(&mcp, &item_id, leave_claim_held);
 
                     let comment_reply = crate::cli::work::cap_reply_for_comment(
                         &mcp,
