@@ -1243,7 +1243,9 @@ mod tests {
 
     #[test]
     fn parse_json_reply_extracts_result_session_and_cost() {
-        let reply = parse_json_reply(r#"{"type":"result","result":"pong","session_id":"abc-123","total_cost_usd":0.05}"#);
+        let reply = parse_json_reply(
+            r#"{"type":"result","result":"pong","session_id":"abc-123","total_cost_usd":0.05}"#,
+        );
         assert_eq!(reply.text, "pong");
         assert_eq!(reply.session_id.as_deref(), Some("abc-123"));
         assert_eq!(reply.cost_usd, Some(0.05));
@@ -1268,11 +1270,40 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_headless_with_request_json_parses_a_json_reply_from_the_child() {
+        use std::os::unix::fs::PermissionsExt;
+        // This file's usual `sh -c <script>` stub-agent idiom doesn't work
+        // with `request_json: true`: it prepends `--output-format json`
+        // ahead of `extra_args`, and a real `sh`/bash rejects that as an
+        // unrecognized long option before ever reaching `-c` -- so instead
+        // this fake binary ignores its argv entirely and always emits a
+        // fixed JSON reply. It lives under this crate's own `target/` dir,
+        // not the system temp dir -- `run_headless`'s bwrap sandbox remounts
+        // `/tmp` as a private, empty tmpfs invisible to the child (see
+        // `flare_sandbox::bwrap`'s `--tmpfs /tmp`), while `target/` sits
+        // under the sandboxed cwd bind and stays visible and writable.
+        let dir = tempfile::Builder::new()
+            .prefix("agentflare-fake-claude-")
+            .tempdir_in(std::env::current_dir().unwrap().join("target"))
+            .unwrap();
+        let fake_bin = dir.path().join("fake-claude");
+        std::fs::write(
+            &fake_bin,
+            "#!/bin/sh\necho '{\"type\":\"result\",\"result\":\"pong\",\"session_id\":\"sess-xyz\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let binary_names: &'static [&'static str] = Box::leak(
+            vec![&*Box::leak(
+                fake_bin.to_string_lossy().into_owned().into_boxed_str(),
+            )]
+            .into_boxed_slice(),
+        );
+
         let reg = vec![AgentSpec {
             id: Agent::ClaudeCode,
             display_name: "claude-code",
             tier: Tier::Cli,
-            binary_names: &["sh"],
+            binary_names,
             version_args: &[],
             package_manager: None,
             package_name: None,
@@ -1283,7 +1314,7 @@ mod tests {
             "hi",
             Duration::from_secs(10),
             Duration::from_secs(10),
-            &["-c".to_string(), r#"echo '{"type":"result","result":"pong","session_id":"sess-xyz"}'"#.to_string()],
+            &[],
             true,
         ) {
             HeadlessOutcome::Ok(reply) => {
