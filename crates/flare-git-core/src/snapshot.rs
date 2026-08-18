@@ -37,8 +37,7 @@ fn run_git_with_index(
     // while staging, regardless of the caller's ambient/global git config
     // (autocrlf=true is the common default on Windows).
     let mut cmd = Command::new(crate::shell::git_binary());
-    cmd
-        .args(["-c", "core.autocrlf=false"])
+    cmd.args(["-c", "core.autocrlf=false"])
         .args(args)
         .current_dir(repo_root)
         .env("GIT_INDEX_FILE", index_file);
