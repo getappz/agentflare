@@ -378,9 +378,20 @@ pub fn create_worktree(
         );
     }
     let worktree_add_args: Vec<String> = if branch_exists {
-        // Existing branch (local or now-fetched remote-tracking): check it out
-        // as-is, no `-b` -- git auto-creates the local tracking branch when
-        // only the remote-tracking ref exists, same as `git checkout <branch>`.
+        // Existing branch (local or now-fetched remote-tracking): it may still
+        // be tied to a broken worktree registration from an earlier attempt
+        // whose directory was removed out-of-band (crash, manual cleanup) --
+        // `worktree_already_checked_out` above only looks at the on-disk
+        // directory, so it can't see this case, and `git worktree add` below
+        // unconditionally refuses to check out a branch git still considers
+        // checked out elsewhere ("already checked out" / prunable registration
+        // -- confirmed live on item #331, regenerating on every dispatch
+        // attempt without this). Prune first so a stale registration for this
+        // branch never survives to block reuse.
+        crate::shell::prune_worktree_metadata_if(repo_root, true);
+        // Check it out as-is, no `-b` -- git auto-creates the local tracking
+        // branch when only the remote-tracking ref exists, same as `git
+        // checkout <branch>`.
         vec![
             "worktree".to_string(),
             "add".to_string(),

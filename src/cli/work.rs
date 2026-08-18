@@ -748,13 +748,13 @@ fn execute_work_impl(
         .as_str()
         .map(std::path::PathBuf::from);
     let Some(ref wpath) = worktree_path else {
-        let msg = "claim succeeded but no worktree was created (bad git state?)";
-        release_and_comment(&mcp, item_id, msg, args.notify.as_deref());
-        crate::ui::error(msg);
-        // Structural: whatever broke the git worktree state (e.g. a stale
-        // "prunable" registration, confirmed live for items #465/#466) won't
-        // heal itself between attempts, so fail straight to terminal instead
-        // of retrying against the same unfixable state (item #467).
+        let msg = match claim["worktree_error"].as_str() {
+            Some(detail) => format!("claim succeeded but no worktree was created: {detail}"),
+            None => "claim succeeded but no worktree was created (bad git state?)".to_string(),
+        };
+        release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
+        crate::ui::error(&msg);
+        // Structural failure (item #467): fail straight to terminal instead of retrying.
         return WorkOutcome {
             exit_code: 1,
             retry_after_secs: None,
