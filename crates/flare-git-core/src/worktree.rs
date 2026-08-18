@@ -530,6 +530,7 @@ pub(crate) fn run_output_timeout(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    crate::shell::apply_filtered_path(&mut cmd);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
