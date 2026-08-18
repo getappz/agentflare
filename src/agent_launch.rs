@@ -514,6 +514,60 @@ pub fn run_headless(
     }
 }
 
+/// Claude Code's `--output-format stream-json` reply shape: one JSON object
+/// per line (system init, tool_use/tool_result, assistant messages, ...),
+/// with only the FINAL line carrying `{"result": "...", "session_id": "...",
+/// "total_cost_usd": 0.0}` — the same shape the single-object `json` format
+/// uses for its one and only line, so parsing "the last line" handles both.
+/// Falls back to the raw text unparsed for any agent/output whose last line
+/// isn't that exact JSON shape — never errors, never blocks the caller.
+///
+/// Restores what `9dd859e`/`7698fbc` wired into the old `coder` step and
+/// `5c46bd3` deleted as apparently-dead code when that step was replaced by
+/// `sdd_loop` (see item #489) — `work_item_pipeline::real_agent_send_hook`
+/// never regained an equivalent call, so every Claude Code reply (implementer,
+/// reviewer, AND the judge) became the raw multi-line stream-json transcript.
+/// For the judge specifically, `parse_judge_decision` then parses the
+/// transcript's first line — the `{"type":"system","subtype":"init",...}`
+/// event, which has no `action` field — instead of the judge's actual
+/// decision on the transcript's last line, hard-failing every judge turn.
+pub(crate) fn parse_claude_reply(raw: &str) -> (String, Option<String>, Option<f64>) {
+    let last_line = raw.trim().lines().next_back().unwrap_or("");
+    match serde_json::from_str::<serde_json::Value>(last_line) {
+        Ok(v) => {
+            let text = v
+                .get("result")
+                .and_then(|r| r.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| raw.to_string());
+            let session_id = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .map(str::to_string);
+            let cost = v.get("total_cost_usd").and_then(serde_json::Value::as_f64);
+            (text, session_id, cost)
+        }
+        Err(_) => (raw.to_string(), None, None),
+    }
+}
+
+/// Every role dispatched through `real_agent_send_hook` (`work_item_pipeline`)
+/// — implementer, task-reviewer, re-reviewer, AND the judge — shares that
+/// hook, and `build_extra_args` (`cli::work`) forces `--output-format
+/// stream-json` for Claude Code regardless of role. `run_headless`'s captured
+/// stdout is therefore that raw multi-line transcript, not plain reply text;
+/// `parse_claude_reply` is what pulls the real reply off its final line.
+/// Other agents' headless output is already plain text, so this is a no-op
+/// for them. See `parse_claude_reply`'s doc comment for why this call exists
+/// at all (item #489).
+pub(crate) fn clean_agent_reply(agent: &str, raw: String) -> String {
+    if agent == Agent::ClaudeCode.as_str() {
+        parse_claude_reply(&raw).0
+    } else {
+        raw
+    }
+}
+
 /// The captured child's own output is real, useful diagnostic evidence of
 /// what it was doing right up to the kill — dropping it (the old behavior)
 /// turned every timeout into a black box with no way to tell "made real
@@ -1002,6 +1056,56 @@ mod tests {
             }
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_claude_reply_extracts_structured_fields() {
+        let raw = r#"{"result":"Fixed the race by adding a mutex.","session_id":"sess-123","total_cost_usd":0.0842}"#;
+        let (text, session_id, cost) = parse_claude_reply(raw);
+        assert_eq!(text, "Fixed the race by adding a mutex.");
+        assert_eq!(session_id.as_deref(), Some("sess-123"));
+        assert_eq!(cost, Some(0.0842));
+    }
+
+    #[test]
+    fn parse_claude_reply_extracts_the_result_from_the_last_line_of_a_stream_json_transcript() {
+        // --output-format stream-json emits one JSON object per line (system
+        // init, tool_use/tool_result, assistant messages, ...) and only the
+        // FINAL line carries the same {"result":...} shape the single-object
+        // `json` format uses — everything before it must be ignored, not
+        // treated as (or blended into) the reply text. This is the exact
+        // shape a judge's raw reply takes (item #489): the first line is a
+        // valid-but-`action`-less JSON object, which `parse_judge_decision`
+        // used to grab if this function wasn't called first.
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"sess-123"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working..."}]}}"#,
+            "\n",
+            r#"{"type":"result","result":"Fixed the race by adding a mutex.","session_id":"sess-123","total_cost_usd":0.0842}"#,
+        );
+        let (text, session_id, cost) = parse_claude_reply(raw);
+        assert_eq!(text, "Fixed the race by adding a mutex.");
+        assert_eq!(session_id.as_deref(), Some("sess-123"));
+        assert_eq!(cost, Some(0.0842));
+    }
+
+    #[test]
+    fn clean_agent_reply_is_a_no_op_for_non_claude_agents() {
+        let raw = "DONE: added the flag".to_string();
+        assert_eq!(
+            clean_agent_reply(Agent::Opencode.as_str(), raw.clone()),
+            raw
+        );
+    }
+
+    #[test]
+    fn parse_claude_reply_falls_back_to_raw_text_on_non_json() {
+        let raw = "plain text reply, no JSON here";
+        let (text, session_id, cost) = parse_claude_reply(raw);
+        assert_eq!(text, raw);
+        assert!(session_id.is_none());
+        assert!(cost.is_none());
     }
 
     #[test]
