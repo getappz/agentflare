@@ -2,6 +2,7 @@
 //! against a repo goes through here instead of hand-rolling its own
 //! `Command::new("git")` wrapper.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -60,6 +61,21 @@ fn agentflare_shims_dir() -> Option<PathBuf> {
 /// the self-deadlock this function exists to prevent. Ported from mise's
 /// `file::paths_eq` (`~/workspace/refs/mise/src/file.rs`), which solves the
 /// identical problem for its own PATH shims.
+/// Normalized key for PATH dedup; matches `paths_eq` semantics.
+fn path_dedup_key(p: &Path) -> String {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect::<Vec<_>>()
+            .join("\0")
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        p.to_string_lossy().into_owned()
+    }
+}
+
 fn paths_eq(a: &Path, b: &Path) -> bool {
     #[cfg(any(windows, target_os = "macos"))]
     {
@@ -100,16 +116,12 @@ fn resolved_git() -> &'static ResolvedGit {
             // that can eventually push a child spawn's argv+envp past
             // ARG_MAX (see `run_in`'s doc comment) even though none of the
             // individual entries are themselves excludable.
-            let mut seen: Vec<PathBuf> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
             std::env::join_paths(std::env::split_paths(&path_var).filter(|p| {
-                let keep = !self_dir.as_deref().is_some_and(|d| paths_eq(p, d))
+                !self_dir.as_deref().is_some_and(|d| paths_eq(p, d))
                     && !shims_dir.as_deref().is_some_and(|d| paths_eq(p, d))
                     && !is_cargo_target_profile_dir(p)
-                    && !seen.iter().any(|s| paths_eq(s, p));
-                if keep {
-                    seen.push(p.clone());
-                }
-                keep
+                    && seen.insert(path_dedup_key(p))
             }))
             .unwrap_or(path_var)
         });
@@ -134,7 +146,7 @@ pub(crate) fn git_binary() -> PathBuf {
 /// spawn can still hit `E2BIG` even though `git_binary()` already computed a
 /// clean PATH, because that clean PATH was only ever used to *locate* the
 /// binary, never applied to the child's actual env.
-fn apply_filtered_path(cmd: &mut Command) {
+pub(crate) fn apply_filtered_path(cmd: &mut Command) {
     if let Some(path) = &resolved_git().filtered_path {
         cmd.env("PATH", path);
     }
