@@ -583,6 +583,7 @@ fn real_agent_send_hook(
         let extra_args = extra_args.clone();
         let flare_workflow::json::StepInvocation { agent, prompt, .. } = inv;
         Box::pin(async move {
+            let agent_for_reply = agent.clone();
             let outcome = tokio::task::spawn_blocking(move || {
                 crate::agent_launch::run_headless(
                     agent_registry::REGISTRY,
@@ -596,7 +597,11 @@ fn real_agent_send_hook(
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
             match outcome {
-                crate::agent_launch::HeadlessOutcome::Ok(reply) => Ok((reply, 0, 0)),
+                crate::agent_launch::HeadlessOutcome::Ok(reply) => Ok((
+                    crate::agent_launch::clean_agent_reply(&agent_for_reply, reply),
+                    0,
+                    0,
+                )),
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
                 | crate::agent_launch::HeadlessOutcome::NotHeadless(e)
                 | crate::agent_launch::HeadlessOutcome::NotFound(e)
@@ -1007,6 +1012,34 @@ mod tests {
             back.pr_url.as_deref(),
             Some("https://github.com/x/y/pull/1")
         );
+    }
+
+    // Item #489: judge's raw Claude Code reply is a multi-line stream-json
+    // transcript; parsing its first line (action-less) instead of the last
+    // line's decision caused "missing field `action`" on #478/#502/#503.
+    const JUDGE_STREAM_JSON_TRANSCRIPT: &str = concat!(
+        r#"{"type":"system","subtype":"init","cwd":"/work/.worktrees/task/478","session_id":"sess-1"}"#,
+        "\n",
+        r#"{"type":"result","result":"{\"action\":\"advance_task\",\"rationale\":\"done\",\"ledger_line\":\"Task 0: complete\",\"task_model_tier\":null}","session_id":"sess-1"}"#,
+    );
+
+    #[test]
+    fn uncleaned_claude_stream_json_transcript_breaks_judge_parsing() {
+        let err = parse_judge_decision(JUDGE_STREAM_JSON_TRANSCRIPT).unwrap_err();
+        assert!(
+            err.to_string().contains("missing field `action`"),
+            "expected the exact upstream failure signature, got: {err}"
+        );
+    }
+
+    #[test]
+    fn clean_agent_reply_fixes_claude_stream_json_so_judge_parsing_succeeds() {
+        let cleaned = crate::agent_launch::clean_agent_reply(
+            agent_registry::Agent::ClaudeCode.as_str(),
+            JUDGE_STREAM_JSON_TRANSCRIPT.to_string(),
+        );
+        let decision = parse_judge_decision(&cleaned).expect("should parse after cleaning");
+        assert_eq!(decision.action, JudgeAction::AdvanceTask);
     }
 
     use flare_workflow::store::InMemoryStore;
