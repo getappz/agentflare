@@ -416,3 +416,31 @@ fn run_or_resume_with_sender_persists_run_id_on_success() {
     let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
     assert!(metadata["workflow_run_id"].as_str().is_some());
 }
+
+// Item #331's live failure: a double-JSON-encoded metadata field parses to
+// `Value::String(...)`, not `Value::Object(...)` -- `Value`'s `IndexMut`
+// panics assigning a key into anything that isn't already an object, so
+// `persist_run_id` used to crash the whole job instead of just recording
+// the run id against a freshly-coerced empty object.
+#[test]
+fn persist_run_id_recovers_from_non_object_existing_metadata() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, _worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("persist_run_id non-object metadata test");
+    let mcp = Arc::new(mcp);
+
+    let double_encoded = serde_json::Value::String(r#"{"size": "M"}"#.to_string());
+    let run_id = flare_workflow::WorkflowRunId::new();
+
+    let result = persist_run_id(&mcp, &item_id, &double_encoded, run_id);
+    assert!(result.is_ok(), "{result:?}");
+
+    let updated = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
+        .unwrap()
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
+    assert_eq!(
+        metadata["workflow_run_id"].as_str(),
+        Some(run_id.to_string().as_str())
+    );
+}

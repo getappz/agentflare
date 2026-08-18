@@ -930,7 +930,16 @@ fn persist_run_id(
     existing_metadata: &serde_json::Value,
     run_id: flare_workflow::WorkflowRunId,
 ) -> Result<(), String> {
-    let mut merged = existing_metadata.clone();
+    // `existing_metadata` can be a non-object (e.g. a double-JSON-encoded
+    // string, confirmed live on item #331) when the item's stored metadata
+    // is corrupted -- `Value`'s `IndexMut` panics assigning a key into
+    // anything that isn't already `Object`, so coerce defensively instead
+    // of trusting the caller-supplied value's shape.
+    let mut merged = existing_metadata
+        .as_object()
+        .cloned()
+        .map(serde_json::Value::Object)
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
     merged["workflow_run_id"] = serde_json::Value::String(run_id.to_string());
     mcp.item_update(ItemRequest {
         action: "update".into(),

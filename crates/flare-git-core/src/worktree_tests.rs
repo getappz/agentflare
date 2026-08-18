@@ -652,6 +652,45 @@ fn create_worktree_soft_fails_on_bad_git() {
 }
 
 #[test]
+fn create_worktree_recovers_when_branch_is_tied_to_a_stale_registration() {
+    // Item #511's actual failure: the worktree directory is removed
+    // out-of-band (crash, manual cleanup, disk issue) without going through
+    // `git worktree remove`, so git's `.git/worktrees/<slug>/` administrative
+    // entry survives and still associates the branch with the now-missing
+    // path. `worktree_already_checked_out` can't see this (its first check
+    // is `worktree_path.is_dir()`, which is false here), so without a prune
+    // first, the fallthrough `git worktree add <path> <branch>` refuses --
+    // git still considers the branch checked out elsewhere -- and that
+    // failed `add` itself regenerates a fresh broken registration, so every
+    // subsequent attempt reproduces the identical failure forever (confirmed
+    // live on item #331: three consecutive dispatches, three identical
+    // failures, each regenerating the same broken state).
+    let repo = init_repo();
+    let item = test_item(1);
+    let target = resolve_default_branch(&repo.path);
+    let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+    assert!(worktree_path.exists());
+
+    // Simulate the out-of-band removal: delete the directory directly,
+    // bypassing `git worktree remove`/`cleanup_item_worktree`, so git's own
+    // administrative entry is left dangling.
+    std::fs::remove_dir_all(&worktree_path).unwrap();
+    assert!(!worktree_path.exists());
+
+    let result = create_worktree(&item, &repo.path, &target, None);
+
+    assert!(
+        result.is_ok(),
+        "must recover by pruning the stale registration, not fail again: {:?}",
+        result.err()
+    );
+    assert_eq!(result.unwrap(), worktree_path);
+    assert!(worktree_path.exists());
+    let checked_out = run_git_in(&worktree_path, &["branch", "--show-current"]).unwrap();
+    assert_eq!(checked_out, task_branch_name(&item));
+}
+
+#[test]
 fn create_worktree_fetches_target_branch_and_includes_remote_only_commits() {
     // "remote" — plays the role of `origin`.
     let remote = init_repo();
