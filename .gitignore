@@ -15,6 +15,9 @@
 # Local opencode config — carries per-machine MCP server paths, not shared
 /opencode.json
 
+# Cursor local hooks/rules — per-machine editor config, not shared
+/.cursor/
+
 # opencode CLI's own local state (node_modules, package.json/lock, plans dir)
 /.opencode/
 
