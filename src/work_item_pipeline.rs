@@ -61,12 +61,27 @@ pub(crate) struct WorkItemData {
     pub ledger: Vec<String>,
     /// SDD workflow: latest generated report, if any.
     pub last_report: Option<String>,
+    /// Every analyst report produced by a review-only run (item #507).
+    /// `last_report`/`review_issues` are cleared on `advance_task`/
+    /// `skip_task` (see the judge-decision handler), so for a single-task
+    /// run that clears them on the very iteration it completes, `finalize`
+    /// would otherwise see both as `None` and post "No findings reported."
+    /// even though the analyst produced real output. `finalize` reads this
+    /// instead when non-empty.
+    #[serde(default)]
+    pub review_findings: Vec<String>,
     /// Set from `detect_review_only` at dispatch time (item #507) — routes
     /// `sdd_loop`'s role prompts to analyze-and-report phrasing instead of
     /// implement-and-commit, and routes `finalize` to post the findings as a
     /// comment instead of running `item_done`/PR flow. Without this, a
     /// handoff explicitly asking for a review only (see item #502) still
     /// gets silently converted into an implementation attempt.
+    ///
+    /// `#[serde(default)]`: persisted `state_json` from runs started before
+    /// this field existed has no `review_only` key — without a default,
+    /// `SqliteStore::load` fails to deserialize those rows and `recover()`
+    /// silently skips them as unreadable.
+    #[serde(default)]
     pub review_only: bool,
 }
 
@@ -320,6 +335,9 @@ pub(crate) fn build_sdd_loop_step(
                     ctx.data.review_issues = None;
                 } else {
                     ctx.data.last_report = Some(role_reply.clone());
+                    if ctx.data.review_only {
+                        ctx.data.review_findings.push(role_reply.clone());
+                    }
                 }
 
                 // 2. Judge dispatch.
@@ -493,12 +511,15 @@ pub(crate) fn build_finalize_step(
                     }
 
                     if ctx.data.review_only {
-                        let findings = ctx
-                            .data
-                            .last_report
-                            .clone()
-                            .or_else(|| ctx.data.review_issues.clone())
-                            .unwrap_or_else(|| "No findings reported.".to_string());
+                        let findings = if ctx.data.review_findings.is_empty() {
+                            ctx.data
+                                .last_report
+                                .clone()
+                                .or_else(|| ctx.data.review_issues.clone())
+                                .unwrap_or_else(|| "No findings reported.".to_string())
+                        } else {
+                            ctx.data.review_findings.join("\n\n---\n\n")
+                        };
                         let _ = mcp.item_release(ItemRequest {
                             action: "release".into(),
                             id: Some(item_id.clone()),

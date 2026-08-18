@@ -212,6 +212,80 @@ async fn finalize_step_posts_review_findings_comment_and_skips_item_done_when_re
                     state.error
                 );
             }
+            _ => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("finalize step did not complete");
+}
+
+/// Regression for the CodeRabbit finding on PR #547: a single-task
+/// review-only run clears `last_report`/`review_issues` in the same
+/// iteration it completes (see the `AdvanceTask`/`SkipTask` arm in
+/// `sdd_loop`'s judge-decision handler), so by the time `finalize` runs
+/// both are `None` even though the analyst produced real findings.
+/// `finalize` must read the accumulated `review_findings` instead of
+/// falling back to "No findings reported." in that case.
+#[tokio::test]
+async fn finalize_step_uses_accumulated_review_findings_when_last_report_was_cleared() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, _worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item(
+            "Review-only finalize accumulation test item",
+        );
+    let mcp = Arc::new(mcp);
+
+    let data = WorkItemData {
+        review_only: true,
+        // Simulates post-AdvanceTask state: both cleared by the judge
+        // decision handler, exactly as happens for a single-task run.
+        last_report: None,
+        review_issues: None,
+        review_findings: vec!["Found a SQL injection in the query builder.".to_string()],
+        ..Default::default()
+    };
+    let step = build_finalize_step(
+        mcp.clone(),
+        item_id.clone(),
+        None,
+        crate::claims::owner_id(),
+    );
+    let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
+    let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
+    engine.register_workflow(wf).unwrap();
+    let run_id = engine
+        .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+        .await
+        .unwrap();
+
+    for _ in 0..50 {
+        let state = engine.get_status(run_id).await.unwrap();
+        match state.status {
+            flare_workflow::WorkflowStatus::Completed => {
+                let comments: serde_json::Value = serde_json::from_str(
+                    &mcp.comment_impl(CommentRequest {
+                        action: "list".into(),
+                        item_id: Some(item_id.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+                let arr = comments.as_array().unwrap();
+                let body = arr[0]["body"].as_str().unwrap();
+                assert!(
+                    body.contains("SQL injection in the query builder"),
+                    "finalize must use review_findings, not fall back to \"No findings reported.\": {body}"
+                );
+                assert!(!body.contains("No findings reported."));
+                return;
+            }
+            flare_workflow::WorkflowStatus::Failed => {
+                panic!(
+                    "finalize must not fail for a review-only task — it must not attempt \
+                     item_done/PR flow: {:?}",
+                    state.error
+                );
+            }
             _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
         }
     }
