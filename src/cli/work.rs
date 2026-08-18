@@ -1751,9 +1751,9 @@ rotate = true
         assert!(comments[0].body.contains("claude-code not found on PATH"));
     }
 
-    /// Mock `SendMessage` for `sdd_loop`-driven tests below: answers the
-    /// judge's prompt ("You are the judge") with a `complete_pipeline`
-    /// decision, everything else with a plain role reply.
+    include!("work_worktree_error_tests.rs");
+    /// Mock `SendMessage` for `sdd_loop`-driven tests below: answers the judge's prompt ("You are
+    /// the judge") with a `complete_pipeline` decision, everything else with a plain role reply.
     const JUDGE_COMPLETE_DECISION: &str = r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#;
     fn mock_sdd_send() -> flare_workflow::json::SendMessage {
         std::sync::Arc::new(move |inv: flare_workflow::json::StepInvocation| {
