@@ -55,7 +55,7 @@ pub(super) fn reconcile_orphaned_jobs(queue: &Queue) {
                 None,
             );
         });
-        restore_ready_for_work(&mcp, item_id);
+        restore_ready_for_work(&mcp, item_id, agent);
     }
 }
 
@@ -68,12 +68,21 @@ pub(super) fn reconcile_orphaned_jobs(queue: &Queue) {
 /// sees it again; the item sits stuck until a human relabels it by hand
 /// (item #99).
 ///
+/// Also restores `assignee_agent` from the dead job's args: `release_and_comment`
+/// clears it via `item_release`, and without putting it back the next discovery
+/// tick hits `skip_item`'s "no assignee_agent set" path and lands the item on
+/// `needs-manual-dispatch` instead of auto-redispatching (item #150).
+///
 /// Skips items already in a `completed`/`cancelled` state group -- same
 /// exclusion `item::claim`'s handoff-freeze check uses -- so an item a human
 /// finished or cancelled out-of-band while its now-dead job was still
 /// marked `running` doesn't get silently resurrected back onto the
 /// discovery queue.
-fn restore_ready_for_work(mcp: &crate::mcp_server::AgentflareMcp, item_id: &str) {
+fn restore_ready_for_work(
+    mcp: &crate::mcp_server::AgentflareMcp,
+    item_id: &str,
+    agent: &str,
+) {
     let _ = mcp.with_backend_db(|conn| -> Option<()> {
         let item = agentflare_backend::item::get(conn, item_id).ok()?;
         let state = agentflare_backend::state::get(conn, &item.state_id).ok()?;
@@ -92,7 +101,17 @@ fn restore_ready_for_work(mcp: &crate::mcp_server::AgentflareMcp, item_id: &str)
         {
             let _ = agentflare_backend::item::remove_label(conn, item_id, &dispatched_id.id);
         }
-        agentflare_backend::item::add_label(conn, item_id, ready_id).ok()
+        agentflare_backend::item::add_label(conn, item_id, ready_id).ok()?;
+        agentflare_backend::item::update(
+            conn,
+            item_id,
+            agentflare_backend::item::UpdateItem {
+                assignee_agent: Some(agent.to_string()),
+                ..Default::default()
+            },
+        )
+        .ok()?;
+        Some(())
     });
 }
 
@@ -357,7 +376,7 @@ mod tests {
                             description: Some("do the thing".into()),
                             priority: None,
                             parent_id: None,
-                            assignee_agent: None,
+                            assignee_agent: Some("claude-code".into()),
                             sort_order: None,
                             external_source: None,
                             external_id: None,
@@ -429,10 +448,132 @@ mod tests {
                 labels.contains(&ready_id),
                 "orphan reconciliation must restore ready-for-work so the item auto-resumes (item #99)"
             );
+            let item = mcp
+                .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                item.assignee_agent.as_deref(),
+                Some("claude-code"),
+                "orphan reconciliation must restore assignee_agent so discovery can auto-dispatch (item #150)"
+            );
             assert!(
                 !labels.contains(&dispatched_label_id),
                 "the stale dispatched label must be removed, not left alongside ready-for-work"
             );
+        });
+    }
+
+    /// Item #150: after orphan reconciliation the item must still be
+    /// auto-dispatchable -- `skip_item`'s "no assignee_agent set" path must
+    /// not fire on the next discovery tick.
+    #[test]
+    fn reconcile_orphaned_jobs_leaves_item_dispatchable_by_discovery_tick() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let item_id = mcp
+                .with_backend_db(|conn| {
+                    let project = mcp.resolve_project(conn).unwrap();
+                    for name in [
+                        crate::supervisor::READY_LABEL,
+                        crate::supervisor::DISPATCHED_LABEL,
+                        crate::supervisor::NEEDS_MANUAL_LABEL,
+                    ] {
+                        agentflare_backend::label::create(
+                            conn,
+                            agentflare_backend::label::CreateLabel {
+                                project_id: Some(project.id.clone()),
+                                workspace_id: project.workspace_id.clone(),
+                                name: name.into(),
+                                color: None,
+                                parent_id: None,
+                                sort_order: None,
+                                external_source: None,
+                                external_id: None,
+                            },
+                        )
+                        .unwrap();
+                    }
+                    let state = agentflare_backend::state::list_by_project(conn, &project.id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|s| s.is_default)
+                        .unwrap();
+                    let item = agentflare_backend::item::create(
+                        conn,
+                        agentflare_backend::item::CreateItem {
+                            project_id: project.id.clone(),
+                            state_id: state.id,
+                            name: "orphan sweep discovery tick test item".into(),
+                            description: Some("do the thing".into()),
+                            priority: None,
+                            parent_id: None,
+                            assignee_agent: Some("claude-code".into()),
+                            sort_order: None,
+                            external_source: None,
+                            external_id: None,
+                            metadata: None,
+                            label_ids: vec![],
+                            assignee_ids: vec![],
+                            dependency_ids: vec![],
+                        },
+                    )
+                    .unwrap();
+                    let labels =
+                        agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+                    let dispatched_id = labels
+                        .iter()
+                        .find(|l| l.name == crate::supervisor::DISPATCHED_LABEL)
+                        .unwrap()
+                        .id
+                        .clone();
+                    agentflare_backend::item::add_label(conn, &item.id, &dispatched_id).unwrap();
+                    item.id
+                })
+                .unwrap();
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+            let queue = test_queue();
+            let info = queue.enqueue(&job).unwrap();
+            crate::claims::with_owner_override(format!("claude-code:{}", info.id), || {
+                let claim_json = mcp
+                    .item_claim(crate::mcp_server::types::ItemRequest {
+                        action: "claim".to_string(),
+                        id: Some(item_id.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let claim: serde_json::Value = serde_json::from_str(&claim_json).unwrap();
+                assert_eq!(claim["status"], "acquired");
+            });
+            queue.dequeue().unwrap();
+
+            reconcile_orphaned_jobs(&queue);
+
+            let auth_conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::auth_db::migrate(&auth_conn).unwrap();
+            let result = crate::supervisor::run_discovery_tick(
+                &mcp,
+                &queue,
+                &auth_conn,
+                agentflare_resource_gate::Policy::Normal,
+            );
+            assert_eq!(
+                result.dispatched, 1,
+                "freshly-reconciled item must auto-dispatch, not hit skip_item (item #150)"
+            );
+            assert_eq!(result.skipped, 0);
         });
     }
 
