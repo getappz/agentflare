@@ -1037,6 +1037,7 @@ mod tests {
             Duration::from_secs(120),
             Duration::from_secs(60),
             &["--force".to_string()],
+            false,
         );
         eprintln!("elapsed={:?}", t0.elapsed());
         match out {
