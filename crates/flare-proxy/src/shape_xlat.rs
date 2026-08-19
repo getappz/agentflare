@@ -285,7 +285,7 @@ pub(crate) fn content_text(content: &Value) -> String {
 /// payload for unwrapped responses unchanged.
 pub(crate) fn unwrap_success_envelope(val: &Value) -> &Value {
     match (val.get("success"), val.get("data")) {
-        (Some(s), Some(data)) if s.is_boolean() && data.is_object() => data,
+        (Some(s), Some(data)) if s.as_bool() == Some(true) && data.is_object() => data,
         _ => val,
     }
 }
@@ -867,6 +867,10 @@ mod tests {
         // `data` not an object (e.g. an error body) is left alone.
         let weird = json!({ "success": false, "data": "nope" });
         assert_eq!(unwrap_success_envelope(&weird).get("data").unwrap(), "nope");
+
+        // `success: false` with object data is an error envelope - keep as-is.
+        let failed = json!({ "success": false, "data": { "choices": [] } });
+        assert!(unwrap_success_envelope(&failed).get("data").is_some());
     }
 
     #[test]
