@@ -287,11 +287,11 @@ pub static REGISTRY: &[AgentSpec] = &[
     AgentSpec {
         id: Agent::Cline,
         display_name: "cline",
-        tier: Tier::Extension,
-        binary_names: &[],
-        version_args: &[],
-        package_manager: None,
-        package_name: None,
+        tier: Tier::Cli,
+        binary_names: &["cline"],
+        version_args: &["--version"],
+        package_manager: Some("npm"),
+        package_name: Some("cline"),
     },
     AgentSpec {
         id: Agent::Continue,
@@ -333,6 +333,11 @@ pub fn headless_args(agent: Agent) -> Option<&'static [&'static str]> {
         Agent::ClaudeCode | Agent::GeminiCli | Agent::Cursor => Some(&["-p"]),
         Agent::Codex => Some(&["exec"]),
         Agent::Opencode => Some(&["run"]),
+        // No subcommand needed: `cline` starts in act mode with auto-approve
+        // on by default, and headless mode triggers automatically when stdin
+        // is piped (confirmed via `cline --help` and docs.cline.bot/usage/cli-overview) —
+        // exactly how this module always delivers the prompt.
+        Agent::Cline => Some(&[]),
         _ => None,
     }
 }
@@ -358,7 +363,47 @@ pub fn autonomous_args(agent: Agent) -> Option<&'static [&'static str]> {
         // `cursor-agent --force`: "Force allow commands unless explicitly
         // denied" — confirmed via `cursor-agent --help`.
         Agent::Cursor => Some(&["--force"]),
+        // `cline --auto-approve <boolean>`: "Set tool auto-approval for all
+        // tools (default: true)" — confirmed via `cline --help`. Passed
+        // explicitly rather than relying on the default, same as every
+        // other agent above: a local config or future CLI version changing
+        // that default shouldn't silently turn a headless dispatch
+        // interactive.
+        Agent::Cline => Some(&["--auto-approve", "true"]),
         _ => None,
+    }
+}
+
+/// Nearest-capability ClinePass model for a Claude model name/alias — used
+/// when the router picks `Agent::Cline` for a task whose configured `model`
+/// is a Claude name (e.g. a `[router]` rule written before Cline was wired
+/// up, or shared across rules with other agents).
+///
+/// ClinePass ($9.99/mo, confirmed via docs.cline.bot/getting-started/clinepass)
+/// carries only open-weight models — no Anthropic models at all, so there is
+/// no literal equivalent. This maps each Claude family to the ClinePass model
+/// closest to it in capability, judged by ClinePass's own reference per-token
+/// pricing (higher price ≈ higher capability tier, same convention Anthropic
+/// uses across its own Opus/Sonnet/Haiku lineup): Fable and Opus (Anthropic's
+/// two priciest/highest tiers) map to ClinePass's two priciest models, Sonnet
+/// maps to Kimi K2.7's coding-specialized variant (Sonnet is the SDD loop's
+/// usual implementer tier, so a coding-specialized pick outweighs a strict
+/// price match), and Haiku maps to ClinePass's cheapest/fastest model. This
+/// is a heuristic, not a vendor-published equivalence — no such table exists.
+#[allow(dead_code)]
+#[must_use]
+pub fn clinepass_model_for_claude(model: &str) -> Option<&'static str> {
+    let lower = model.trim().to_ascii_lowercase();
+    if lower.contains("fable") {
+        Some("cline-pass/kimi-k3")
+    } else if lower.contains("opus") {
+        Some("cline-pass/qwen3.7-max")
+    } else if lower.contains("sonnet") {
+        Some("cline-pass/kimi-k2.7-code")
+    } else if lower.contains("haiku") {
+        Some("cline-pass/deepseek-v4-flash")
+    } else {
+        None
     }
 }
 
@@ -401,14 +446,14 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_seventeen_cli_tier_and_three_extension_tier() {
+    fn registry_has_eighteen_cli_tier_and_two_extension_tier() {
         let cli_count = REGISTRY.iter().filter(|s| s.tier == Tier::Cli).count();
         let ext_count = REGISTRY
             .iter()
             .filter(|s| s.tier == Tier::Extension)
             .count();
-        assert_eq!(cli_count, 17);
-        assert_eq!(ext_count, 3);
+        assert_eq!(cli_count, 18);
+        assert_eq!(ext_count, 2);
     }
 
     #[test]
@@ -454,6 +499,7 @@ mod tests {
         assert_eq!(headless_args(Agent::GeminiCli), Some(&["-p"][..]));
         assert_eq!(headless_args(Agent::Opencode), Some(&["run"][..]));
         assert_eq!(headless_args(Agent::Cursor), Some(&["-p"][..]));
+        assert_eq!(headless_args(Agent::Cline), Some(&[][..]));
     }
 
     #[test]
@@ -466,6 +512,40 @@ mod tests {
     #[test]
     fn autonomous_args_maps_cursor_to_force() {
         assert_eq!(autonomous_args(Agent::Cursor), Some(&["--force"][..]));
+    }
+
+    #[test]
+    fn autonomous_args_maps_cline_to_explicit_auto_approve() {
+        assert_eq!(
+            autonomous_args(Agent::Cline),
+            Some(&["--auto-approve", "true"][..])
+        );
+    }
+
+    #[test]
+    fn clinepass_model_for_claude_maps_every_known_family() {
+        assert_eq!(
+            clinepass_model_for_claude("claude-fable-5"),
+            Some("cline-pass/kimi-k3")
+        );
+        assert_eq!(
+            clinepass_model_for_claude("claude-opus-4-6"),
+            Some("cline-pass/qwen3.7-max")
+        );
+        assert_eq!(
+            clinepass_model_for_claude("sonnet"),
+            Some("cline-pass/kimi-k2.7-code")
+        );
+        assert_eq!(
+            clinepass_model_for_claude("claude-haiku-4-5-20251001"),
+            Some("cline-pass/deepseek-v4-flash")
+        );
+    }
+
+    #[test]
+    fn clinepass_model_for_claude_none_for_unrecognized_name() {
+        assert_eq!(clinepass_model_for_claude("gpt-4o"), None);
+        assert_eq!(clinepass_model_for_claude("cline-pass/kimi-k3"), None);
     }
 
     #[test]
