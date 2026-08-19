@@ -591,12 +591,13 @@ fn parse_status_str(s: &str) -> Result<WorkflowStatus, String> {
     match s {
         "pending" => Ok(WorkflowStatus::Pending),
         "running" => Ok(WorkflowStatus::Running),
+        "waiting" => Ok(WorkflowStatus::Waiting),
         "paused" => Ok(WorkflowStatus::Paused),
         "completed" => Ok(WorkflowStatus::Completed),
         "failed" => Ok(WorkflowStatus::Failed),
         "cancelled" => Ok(WorkflowStatus::Cancelled),
         other => Err(format!(
-            "unknown status '{other}' (want one of: pending, running, paused, completed, failed, cancelled)"
+            "unknown status '{other}' (want one of: pending, running, waiting, paused, completed, failed, cancelled)"
         )),
     }
 }
@@ -638,6 +639,7 @@ fn status_str(s: &WorkflowStatus) -> &'static str {
     match s {
         WorkflowStatus::Pending => "pending",
         WorkflowStatus::Running => "running",
+        WorkflowStatus::Waiting => "waiting",
         WorkflowStatus::Paused => "paused",
         WorkflowStatus::Completed => "completed",
         WorkflowStatus::Failed => "failed",

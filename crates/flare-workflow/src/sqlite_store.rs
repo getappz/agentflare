@@ -246,6 +246,7 @@ impl StatusAsStr for WorkflowStatus {
         match self {
             WorkflowStatus::Pending => "pending",
             WorkflowStatus::Running => "running",
+            WorkflowStatus::Waiting => "waiting",
             WorkflowStatus::Paused => "paused",
             WorkflowStatus::Completed => "completed",
             WorkflowStatus::Failed => "failed",
@@ -270,6 +271,7 @@ impl StatusAsStr for StepStatus {
 fn status_from_str(s: &str) -> WorkflowStatus {
     match s {
         "running" => WorkflowStatus::Running,
+        "waiting" => WorkflowStatus::Waiting,
         "paused" => WorkflowStatus::Paused,
         "completed" => WorkflowStatus::Completed,
         "failed" => WorkflowStatus::Failed,
@@ -424,7 +426,7 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
                 .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, state_json FROM workflow_runs WHERE status IN ('pending','running')",
+                    "SELECT id, state_json FROM workflow_runs WHERE status IN ('pending','running','waiting')",
                 )
                 .map_err(|e| WorkflowError::Store(format!("prepare list_active: {e}")))?;
             let rows = stmt
@@ -493,7 +495,7 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
             .to_rfc3339();
             let ids: Vec<String> = {
                 let mut stmt = conn
-                    .prepare("SELECT id FROM workflow_runs WHERE status NOT IN ('pending','running','paused') AND updated_at < ?1")
+                    .prepare("SELECT id FROM workflow_runs WHERE status NOT IN ('pending','running','waiting','paused') AND updated_at < ?1")
                     .map_err(|e| WorkflowError::Store(format!("prepare cleanup: {e}")))?;
                 let rows = stmt
                     .query_map(params![cutoff], |row| row.get::<_, String>(0))

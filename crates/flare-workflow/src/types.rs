@@ -175,6 +175,9 @@ pub enum BackoffStrategy {
 pub enum WorkflowStatus {
     Pending,
     Running,
+    /// Parked in a durable `Sleep`/`SleepUntil`/`WaitEvent` step — no step is
+    /// actively executing, distinct from `Running`.
+    Waiting,
     Paused,
     Completed,
     Failed,

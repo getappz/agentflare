@@ -78,6 +78,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 wake_at
             }
         };
+        self.state_store
+            .update(run_id, |s| s.status = WorkflowStatus::Waiting)
+            .await?;
         self.event_bus
             .publish(WorkflowEvent::StepWaiting {
                 run_id,
@@ -101,6 +104,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             .await?;
         self.state_store
             .update(run_id, |s| {
+                if s.status == WorkflowStatus::Waiting {
+                    s.status = WorkflowStatus::Running;
+                }
                 if let Some(ss) = s.step_states.get_mut(&step.id) {
                     ss.status = StepStatus::Succeeded;
                     ss.completed_at = Some(Utc::now());
@@ -155,6 +161,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 )
                 .await?;
         }
+        self.state_store
+            .update(run_id, |s| s.status = WorkflowStatus::Waiting)
+            .await?;
         self.event_bus
             .publish(WorkflowEvent::StepWaiting {
                 run_id,
@@ -226,6 +235,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     .await?;
                 self.state_store
                     .update(run_id, |s| {
+                        if s.status == WorkflowStatus::Waiting {
+                            s.status = WorkflowStatus::Running;
+                        }
                         if let Some(ss) = s.step_states.get_mut(&step.id) {
                             ss.status = StepStatus::Succeeded;
                             ss.completed_at = Some(Utc::now());
@@ -250,6 +262,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     .await?;
                 self.state_store
                     .update(run_id, |s| {
+                        if s.status == WorkflowStatus::Waiting {
+                            s.status = WorkflowStatus::Running;
+                        }
                         s.current_step = Some(step.id.clone());
                         if let Some(ss) = s.step_states.get_mut(&step.id) {
                             ss.status = StepStatus::Failed;
