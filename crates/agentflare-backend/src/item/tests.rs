@@ -1605,6 +1605,65 @@ fn redispatch_explicit_assignee_overrides_the_items_existing_one() {
 }
 
 #[test]
+fn redispatch_to_a_different_agent_clears_a_model_scoped_to_the_old_one() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    claim(&conn, &item.id, "opencode:1", 1000, TTL).unwrap();
+    update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            metadata: Some(r#"{"model":"opencode-go/deepseek-v4-pro","size":"M"}"#.to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let outcome = redispatch(&conn, &item.id, Some("claude-code:override")).unwrap();
+    assert_eq!(
+        outcome,
+        RedispatchOutcome::Ready {
+            assignee_agent: "claude-code".to_string()
+        }
+    );
+
+    let updated = get(&conn, &item.id).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
+    assert!(
+        metadata.get("model").is_none(),
+        "model scoped to opencode must not survive a redispatch to claude-code: {metadata:?}"
+    );
+    assert_eq!(metadata.get("size").and_then(|v| v.as_str()), Some("M"));
+}
+
+#[test]
+fn redispatch_to_the_same_agent_keeps_the_model_override() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
+    update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            metadata: Some(r#"{"model":"claude-opus-4"}"#.to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    redispatch(&conn, &item.id, None).unwrap();
+
+    let updated = get(&conn, &item.id).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
+    assert_eq!(
+        metadata.get("model").and_then(|v| v.as_str()),
+        Some("claude-opus-4")
+    );
+}
+
+#[test]
 fn redispatch_with_no_assignee_anywhere_returns_no_assignee_and_makes_no_changes() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
