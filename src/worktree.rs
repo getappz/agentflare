@@ -231,6 +231,83 @@ fn pr_footer(agent: &str, machine: &str, sequence_id: i64) -> String {
     format!("---\n_Opened by `{agent}` on **{machine}** for item #{sequence_id} via agentflare._")
 }
 
+/// Conventional-commit types accepted by `.github/workflows/pr-title.yml`'s
+/// `amannn/action-semantic-pull-request` check. Mirrors that file's `types`
+/// list and `cliff.toml`'s `commit_parsers` -- keep all three in sync.
+const CONVENTIONAL_TYPES: &[&str] = &[
+    "feat", "fix", "docs", "perf", "refactor", "style", "test", "chore", "ci",
+];
+
+/// Maps a common non-conventional prefix word (e.g. "Bugfix", "Feature") to
+/// the conventional type it most likely means.
+fn infer_type_from_word(word: &str) -> Option<&'static str> {
+    match word {
+        "bug" | "bugfix" | "hotfix" | "patch" => Some("fix"),
+        "feature" | "features" => Some("feat"),
+        "doc" | "documentation" => Some("docs"),
+        "performance" | "optimization" | "optimisation" => Some("perf"),
+        "refactoring" => Some("refactor"),
+        "styling" | "formatting" | "lint" | "linting" => Some("style"),
+        "testing" | "tests" => Some("test"),
+        "cleanup" | "chores" | "maintenance" | "misc" => Some("chore"),
+        "pipeline" | "workflow" | "workflows" => Some("ci"),
+        _ => None,
+    }
+}
+
+/// Falls back to scanning the full (lowercased) item name for a keyword when
+/// no prefix word gave a match. Defaults to `chore` when nothing matches.
+fn infer_type_from_text(lower_text: &str) -> &'static str {
+    if lower_text.contains("bug") || lower_text.contains("fix") {
+        "fix"
+    } else if lower_text.contains("feature") || lower_text.contains("implement") {
+        "feat"
+    } else if lower_text.contains("doc") {
+        "docs"
+    } else if lower_text.contains("perf") || lower_text.contains("optimiz") {
+        "perf"
+    } else if lower_text.contains("refactor") {
+        "refactor"
+    } else if lower_text.contains("style") || lower_text.contains("lint") {
+        "style"
+    } else if lower_text.contains("test") {
+        "test"
+    } else if lower_text.contains("pipeline") || lower_text.contains("workflow") {
+        "ci"
+    } else {
+        "chore"
+    }
+}
+
+/// Derives a PR title that satisfies `pr-title.yml`'s conventional-commit
+/// check from a raw item name, which is free-form text ("Bugfix: ...",
+/// "Feature: ...", plain English) with no guaranteed relationship to
+/// `CONVENTIONAL_TYPES`. If `name` already starts with `type: ` or
+/// `type(scope): `, that prefix is lowercased and passed through unchanged;
+/// otherwise a type is inferred from the leading word (if any) or, failing
+/// that, from keywords anywhere in `name`, and prepended -- `name` itself is
+/// never dropped, only ever prefixed.
+fn conventional_pr_title(name: &str) -> String {
+    let trimmed = name.trim();
+    if let Some((head, rest)) = trimmed.split_once(':') {
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            let head = head.trim();
+            let type_token = head.split('(').next().unwrap_or(head).trim();
+            let scope_suffix = &head[type_token.len()..];
+            let lower = type_token.to_lowercase();
+            if CONVENTIONAL_TYPES.contains(&lower.as_str()) {
+                return format!("{lower}{scope_suffix}: {rest}");
+            }
+            if let Some(mapped) = infer_type_from_word(&lower) {
+                return format!("{mapped}: {rest}");
+            }
+        }
+    }
+    let inferred = infer_type_from_text(&trimmed.to_lowercase());
+    format!("{inferred}: {trimmed}")
+}
+
 /// Pushes `item`'s isolated worktree branch and opens a PR against
 /// `target_branch` — the `done`-side counterpart to `create_worktree`.
 /// Deliberately never merges: unreviewed code should never land on the
@@ -309,7 +386,7 @@ pub fn push_and_open_pr(
     match crate::github::pulls::create(
         &client,
         &repo,
-        &item.name,
+        &conventional_pr_title(&item.name),
         &branch,
         target_branch,
         Some(&body),
@@ -383,6 +460,102 @@ mod tests {
             pr_footer("claude-code", "kumar-laptop", 42),
             "---\n_Opened by `claude-code` on **kumar-laptop** for item #42 via agentflare._"
         );
+    }
+
+    /// Mirrors what `amannn/action-semantic-pull-request` (configured in
+    /// `.github/workflows/pr-title.yml`) checks: title starts with one of
+    /// `CONVENTIONAL_TYPES`, optionally scoped, followed by `: `.
+    fn satisfies_pr_title_check(title: &str) -> bool {
+        let Some((head, rest)) = title.split_once(':') else {
+            return false;
+        };
+        if !rest.starts_with(' ') || rest.trim().is_empty() {
+            return false;
+        }
+        let type_token = head.split('(').next().unwrap_or(head);
+        CONVENTIONAL_TYPES.contains(&type_token)
+    }
+
+    #[test]
+    fn conventional_pr_title_passes_through_an_already_valid_prefix() {
+        assert_eq!(
+            conventional_pr_title("fix: correct off-by-one in pagination"),
+            "fix: correct off-by-one in pagination"
+        );
+    }
+
+    #[test]
+    fn conventional_pr_title_lowercases_an_existing_valid_prefix() {
+        assert_eq!(
+            conventional_pr_title("Feat: support nested worktrees"),
+            "feat: support nested worktrees"
+        );
+    }
+
+    #[test]
+    fn conventional_pr_title_preserves_an_existing_scope() {
+        assert_eq!(
+            conventional_pr_title("Fix(worktree): don't leak file handles"),
+            "fix(worktree): don't leak file handles"
+        );
+    }
+
+    #[test]
+    fn conventional_pr_title_maps_bugfix_prefix_to_fix() {
+        assert_eq!(
+            conventional_pr_title(
+                "Bugfix: detect_review_only doesn't classify design-spec tasks as no-code"
+            ),
+            "fix: detect_review_only doesn't classify design-spec tasks as no-code"
+        );
+    }
+
+    #[test]
+    fn conventional_pr_title_maps_feature_prefix_to_feat() {
+        assert_eq!(
+            conventional_pr_title(
+                "Feature: add WorkflowStatus::Waiting for Sleep/SleepUntil/WaitEvent suspension"
+            ),
+            "feat: add WorkflowStatus::Waiting for Sleep/SleepUntil/WaitEvent suspension"
+        );
+    }
+
+    #[test]
+    fn conventional_pr_title_falls_back_to_a_keyword_scan_for_plain_english() {
+        assert_eq!(
+            conventional_pr_title("improve documentation for the review command"),
+            "docs: improve documentation for the review command"
+        );
+    }
+
+    #[test]
+    fn conventional_pr_title_defaults_to_chore_when_nothing_matches() {
+        assert_eq!(
+            conventional_pr_title("bump vendored dependency versions"),
+            "chore: bump vendored dependency versions"
+        );
+    }
+
+    #[test]
+    fn conventional_pr_title_always_satisfies_the_ci_check() {
+        for name in [
+            "fix: correct off-by-one in pagination",
+            "Feat: support nested worktrees",
+            "Fix(worktree): don't leak file handles",
+            "Bugfix: detect_review_only doesn't classify design-spec tasks as no-code",
+            "Feature: add WorkflowStatus::Waiting for Sleep/SleepUntil/WaitEvent suspension",
+            "stop the daemon from double-dispatching the same item",
+            "bump vendored dependency versions",
+            "Add support for Cline CLI",
+            "Refactor the worktree module",
+            "Improve docs for the review command",
+        ] {
+            let title = conventional_pr_title(name);
+            assert!(
+                satisfies_pr_title_check(&title),
+                "title {title:?} (from {name:?}) does not satisfy the PR title check"
+            );
+        }
     }
 
     #[test]
