@@ -97,7 +97,6 @@ fn restore_ready_for_work(mcp: &crate::mcp_server::AgentflareMcp, item_id: &str,
         {
             let _ = agentflare_backend::item::remove_label(conn, item_id, &dispatched_id.id);
         }
-        agentflare_backend::item::add_label(conn, item_id, ready_id).ok()?;
         agentflare_backend::item::update(
             conn,
             item_id,
@@ -107,6 +106,7 @@ fn restore_ready_for_work(mcp: &crate::mcp_server::AgentflareMcp, item_id: &str,
             },
         )
         .ok()?;
+        agentflare_backend::item::add_label(conn, item_id, ready_id).ok()?;
         Some(())
     });
 }

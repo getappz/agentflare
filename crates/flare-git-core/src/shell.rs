@@ -267,6 +267,7 @@ pub fn run_in_lines_bounded(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     no_console_window(&mut cmd);
+    apply_filtered_path(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| BoundedLinesError::Git(format!("git not available: {e}")))?;
