@@ -28,7 +28,11 @@ fn cwd() -> PathBuf {
 // The Cline CLI reads MCP config from ~/.cline/data/settings/cline_mcp_settings.json,
 // not ~/.cline/mcp.json (cline/cline#7081).
 fn cline_mcp_settings_path() -> PathBuf {
-    home().join(".cline").join("data").join("settings").join("cline_mcp_settings.json")
+    home()
+        .join(".cline")
+        .join("data")
+        .join("settings")
+        .join("cline_mcp_settings.json")
 }
 
 /// `doctor` builds a fresh `Component` list per host (6+ hosts by default),
