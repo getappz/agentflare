@@ -6,17 +6,8 @@ fn sdd_pipeline_has_two_steps_with_correct_dependency() {
         std::sync::Arc::new(|_: flare_workflow::json::StepInvocation| {
             Box::pin(async { Ok((String::new(), 0, 0)) })
         });
-    let pipeline = build_work_item_pipeline_with_sender(
-        agent_registry::Agent::ClaudeCode,
-        agent_registry::Agent::ClaudeCode,
-        "Fix the null pointer in parser.rs".to_string(),
-        None,
-        std::sync::Arc::new(AgentflareMcp::default()),
-        "item-1".to_string(),
-        "opencode:test".to_string(),
-        None,
-        send,
-    );
+    let pipeline =
+        build_work_item_pipeline_with_sender(std::sync::Arc::new(AgentflareMcp::default()), send);
     assert_eq!(pipeline.steps.len(), 2);
     assert_eq!(pipeline.steps[0].id.to_string(), "sdd_loop");
     assert_eq!(pipeline.steps[1].id.to_string(), "finalize");
@@ -29,19 +20,12 @@ async fn sdd_loop_dispatches_implementer_and_review_roles_on_their_own_agents() 
         "DONE: added the flag",
         r#"{"action":"advance_task","rationale":"looks done","ledger_line":"Task 0: implementer done","task_model_tier":null}"#,
     ]);
-    let pipeline = build_work_item_pipeline_with_sender(
-        agent_registry::Agent::Opencode,
-        agent_registry::Agent::ClaudeCode,
-        "Fix the null pointer in parser.rs".to_string(),
-        None,
-        std::sync::Arc::new(AgentflareMcp::default()),
-        "item-1".to_string(),
-        "opencode:test".to_string(),
-        None,
-        send,
-    );
-    let mut ctx =
-        WorkflowContext::new(Default::default(), super::sdd_test_support::one_task_data());
+    let pipeline =
+        build_work_item_pipeline_with_sender(std::sync::Arc::new(AgentflareMcp::default()), send);
+    let mut data = super::sdd_test_support::one_task_data();
+    data.agent_name = "opencode".to_string();
+    data.judge_agent_name = "claude-code".to_string();
+    let mut ctx = WorkflowContext::new(Default::default(), data);
     pipeline.steps[0]
         .executor
         .execute(&mut ctx)
@@ -73,7 +57,7 @@ fn sdd_loop_timeout_matches_work_job_timeout_not_library_default() {
         std::sync::Arc::new(|_: flare_workflow::json::StepInvocation| {
             Box::pin(async { Ok((String::new(), 0, 0)) })
         });
-    let step = build_sdd_loop_step("agent".to_string(), "agent".to_string(), send);
+    let step = build_sdd_loop_step(send);
     let configured_timeout = step.timeout.expect("sdd_loop must set an explicit timeout");
     assert_eq!(
         configured_timeout,

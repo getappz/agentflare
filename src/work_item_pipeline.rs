@@ -41,6 +41,33 @@ pub(crate) enum TaskModelTier {
 /// phase signal, see `build_review_or_fix_step`).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct WorkItemData {
+    /// Id of the item this run is working — persisted (not closed over at
+    /// registration time) so a crash-resumed run's `finalize` targets the
+    /// real item instead of an empty placeholder.
+    ///
+    /// `#[serde(default)]`: persisted `state_json` from runs started before
+    /// this field existed has no `item_id` key — without a default,
+    /// `SqliteStore::load` fails to deserialize those rows and `recover()`
+    /// silently skips them as unreadable (same reasoning as `review_only`
+    /// below, and true of every field added in this same change).
+    #[serde(default)]
+    pub item_id: String,
+    /// Agent dispatched for the implementer/task-reviewer/re-reviewer roles
+    /// in `sdd_loop` — persisted for the same crash-resume reason as `item_id`.
+    #[serde(default)]
+    pub agent_name: String,
+    /// Agent dispatched for the judge role in `sdd_loop`.
+    #[serde(default)]
+    pub judge_agent_name: String,
+    /// Recipient `finalize` notifies on hold/completion, if any.
+    #[serde(default)]
+    pub notify_recipient: Option<String>,
+    /// `crate::claims::owner_id()` captured on the caller thread when the run
+    /// was started — `finalize` runs on `WORKFLOW_RT`'s worker threads, where
+    /// the thread-local owner override is absent, so it reads this instead of
+    /// re-resolving `owner_id()` itself.
+    #[serde(default)]
+    pub owner: String,
     pub reply_text: String,
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
@@ -245,18 +272,20 @@ const SDD_PIPELINE_COMPLETE_MARKER: &str = "PIPELINE_COMPLETE";
 ///    fix round, insert a new task, or terminate the pipeline).
 ///
 /// Mirrors `build_review_or_fix_step_with_sender`'s shape: a `FunctionStep`
-/// closure over an injected `send`, same test seam pattern.
+/// closure over an injected `send`, same test seam pattern. `agent_name`/
+/// `judge_agent_name` are read from `ctx.data` at execution time (not
+/// closed over here) so a run resumed by `engine().recover()` after a crash
+/// dispatches against the real agent identity the crashed run persisted,
+/// not whatever happened to be registered at boot.
 pub(crate) fn build_sdd_loop_step(
-    agent_name: String,
-    judge_agent_name: String,
     send: flare_workflow::json::SendMessage,
 ) -> StepDefinition<WorkItemData> {
     let executor = std::sync::Arc::new(FunctionStep::new(
         move |ctx: &mut WorkflowContext<WorkItemData>| {
             let send = send.clone();
-            let agent_name = agent_name.clone();
-            let judge_agent_name = judge_agent_name.clone();
             Box::pin(async move {
+                let agent_name = ctx.data.agent_name.clone();
+                let judge_agent_name = ctx.data.judge_agent_name.clone();
                 if ctx.data.current_task_index >= MAX_TASKS_PROCESSED {
                     return Ok(StepResult::Failure);
                 }
@@ -497,19 +526,23 @@ fn finalize_release_claim_best_effort(
     });
 }
 
+/// `item_id`/`notify_recipient`/`owner` are read from `ctx.data` at
+/// execution time (not closed over here) so a run resumed by
+/// `engine().recover()` after a crash calls `item_done`/`item_release`
+/// against the real item the crashed run persisted, not an empty
+/// placeholder. `mcp` stays a registration-time closure — it's a generic
+/// backend handle (lazily opens the real DB on first use), not per-item
+/// state, so it's safe to share across every run.
 pub(crate) fn build_finalize_step(
     mcp: std::sync::Arc<AgentflareMcp>,
-    item_id: String,
-    notify_recipient: Option<String>,
-    owner: String,
 ) -> StepDefinition<WorkItemData> {
     let executor = std::sync::Arc::new(FunctionStep::new(
         move |ctx: &mut WorkflowContext<WorkItemData>| {
             let mcp = mcp.clone();
-            let item_id = item_id.clone();
-            let notify_recipient = notify_recipient.clone();
-            let owner = owner.clone();
             Box::pin(async move {
+                let item_id = ctx.data.item_id.clone();
+                let notify_recipient = ctx.data.notify_recipient.clone();
+                let owner = ctx.data.owner.clone();
                 crate::claims::with_owner_override(owner, || {
                     if let Some(reason) = ctx.data.hold_reason.clone() {
                         finalize_release_claim_best_effort(&mcp, &item_id, false);
@@ -622,29 +655,21 @@ pub(crate) fn build_finalize_step(
 /// `WorkflowDefinition`. Real entry point: dispatches through
 /// [`real_agent_send_hook`] — see `build_work_item_pipeline_with_sender` for
 /// the test seam.
-#[allow(clippy::too_many_arguments)]
+///
+/// Takes no item/agent-specific arguments: `sdd_loop`/`finalize`'s executors
+/// read that identity from `ctx.data` (`WorkItemData::item_id`/`agent_name`/
+/// `judge_agent_name`/`notify_recipient`) at execution time instead, which is
+/// what makes the same registered definition work for both a fresh dispatch
+/// and a crash-resumed one — see `run_or_resume_with_sender` for where that
+/// data gets seeded.
 pub(crate) fn build_work_item_pipeline(
-    implementer_agent: agent_registry::Agent,
-    review_agent: agent_registry::Agent,
-    item_description: String,
-    plan_doc: Option<String>,
     mcp: std::sync::Arc<AgentflareMcp>,
-    item_id: String,
-    owner: String,
-    notify_recipient: Option<String>,
     timeout: std::time::Duration,
     idle_timeout: std::time::Duration,
     extra_args: Vec<String>,
 ) -> flare_workflow::WorkflowDefinition<WorkItemData> {
     build_work_item_pipeline_with_sender(
-        implementer_agent,
-        review_agent,
-        item_description,
-        plan_doc,
         mcp,
-        item_id,
-        owner,
-        notify_recipient,
         real_agent_send_hook(timeout, idle_timeout, extra_args),
     )
 }
@@ -697,30 +722,14 @@ fn real_agent_send_hook(
 /// Test seam: same pipeline, one injected `SendMessage` shared by the
 /// `sdd_loop` step's implementer/reviewer/judge roles instead of the real
 /// headless agent hook (mirrors `build_sdd_loop_step`'s own test seam
-/// pattern). `item_description`/`plan_doc` aren't consumed directly here —
-/// they exist so this function's signature stays parallel to
-/// `run_or_resume_with_sender`'s, which is the caller that actually needs
-/// them (to compute `WorkItemData::tasks` via `load_or_synthesize_tasks`
-/// before `start_workflow`; see that function).
-#[allow(clippy::too_many_arguments)]
+/// pattern). No per-item identity here either — see
+/// `build_work_item_pipeline`'s doc comment.
 fn build_work_item_pipeline_with_sender(
-    implementer_agent: agent_registry::Agent,
-    review_agent: agent_registry::Agent,
-    _item_description: String,
-    _plan_doc: Option<String>,
     mcp: std::sync::Arc<AgentflareMcp>,
-    item_id: String,
-    owner: String,
-    notify_recipient: Option<String>,
     send: flare_workflow::json::SendMessage,
 ) -> flare_workflow::WorkflowDefinition<WorkItemData> {
-    let sdd_loop = build_sdd_loop_step(
-        implementer_agent.as_str().to_string(),
-        review_agent.as_str().to_string(),
-        send,
-    );
-    let finalize =
-        build_finalize_step(mcp, item_id, notify_recipient, owner).depends_on(&["sdd_loop"]);
+    let sdd_loop = build_sdd_loop_step(send);
+    let finalize = build_finalize_step(mcp).depends_on(&["sdd_loop"]);
 
     flare_workflow::WorkflowDefinition::new(WORKFLOW_ID, "sdd work item")
         .add_step(sdd_loop)
@@ -757,12 +766,12 @@ pub(crate) fn engine() -> &'static WorkflowEngine<WorkItemData, SqliteStore<Work
 /// keyed by `WorkflowId` — it does NOT error on a duplicate id, it silently
 /// overwrites the previous `Arc<WorkflowDefinition>`. Runs already in flight
 /// hold their own `Arc` clone captured at `start_workflow` time, so they are
-/// unaffected by a later overwrite. The one caveat (out of scope for this
-/// task): `recover()`'s boot-time replay looks up whatever definition is
-/// CURRENTLY registered for `WORKFLOW_ID`, so if two different items'
-/// dispatches interleave around a crash, recovery could in principle replay
-/// against the wrong item's prompts — Task 8 owns `recover()` wiring and
-/// should account for this.
+/// unaffected by a later overwrite. `recover()`'s boot-time replay looks up
+/// whatever definition is CURRENTLY registered for `WORKFLOW_ID`, but that's
+/// no longer a hazard if two different items' dispatches interleave around a
+/// crash: `build_work_item_pipeline_with_sender` takes no item/agent-specific
+/// arguments, every registered definition's `sdd_loop`/`finalize` steps read
+/// that identity from the resumed run's own persisted `ctx.data` instead.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_or_resume(
     mcp: std::sync::Arc<AgentflareMcp>,
@@ -826,30 +835,39 @@ pub(crate) fn run_or_resume_with_sender(
     // once here so both `start_workflow` call sites below agree.
     let review_only = detect_review_only(&item_description, &existing_metadata);
 
-    let eng = engine();
+    let agent_name = implementer_agent.as_str().to_string();
+    let judge_agent_name = review_agent.as_str().to_string();
     // Captured on the caller thread (still inside `with_owner_override` for
     // in-process dispatch, or on the env-derived identity for the CLI
     // subprocess path) BEFORE the workflow runs on `WORKFLOW_RT`'s worker
     // threads — `finalize` executes there, where the thread-local override
-    // is absent, so it needs the owner passed down explicitly rather than
-    // re-resolving `owner_id()` itself.
+    // is absent, so it's seeded into `WorkItemData::owner` below rather than
+    // `finalize` re-resolving `owner_id()` itself.
     let owner = crate::claims::owner_id();
     let heartbeat_owner = owner.clone();
-    let definition = build_work_item_pipeline_with_sender(
-        implementer_agent,
-        review_agent,
-        item_description,
-        plan_doc,
-        mcp.clone(),
-        item.id.clone(),
-        owner,
-        notify_recipient,
-        send,
-    );
+
+    let eng = engine();
+    let definition = build_work_item_pipeline_with_sender(mcp.clone(), send);
     eng.register_workflow(definition)
         .map_err(|e| e.to_string())?;
 
     crate::workflow::blocking_runtime().block_on(async move {
+        // Seeded onto every fresh `start_workflow` call below (not carried
+        // by the definition itself, see `build_work_item_pipeline_with_sender`)
+        // so `sdd_loop`/`finalize` can rebuild their own identity from
+        // `ctx.data` at execution time — including on a crash-resumed run,
+        // whose registration (the boot-time sweep in `dashboard/server.rs`)
+        // never sees this item/agent at all.
+        let fresh_data = || WorkItemData {
+            item_id: item.id.clone(),
+            agent_name: agent_name.clone(),
+            judge_agent_name: judge_agent_name.clone(),
+            owner: owner.clone(),
+            notify_recipient: notify_recipient.clone(),
+            tasks: tasks.clone(),
+            review_only,
+            ..Default::default()
+        };
         let run_id = match existing_run_id {
             Some(run_id) => {
                 let state = eng.get_status(run_id).await.map_err(|e| e.to_string())?;
@@ -861,15 +879,7 @@ pub(crate) fn run_or_resume_with_sender(
                     // fresh self-repair pass), not a crash resume. Start
                     // over with a new run.
                     let new_run_id = eng
-                        .start_workflow(
-                            WorkflowId::new(WORKFLOW_ID),
-                            WorkItemData {
-                                tasks: tasks.clone(),
-                                review_only,
-                                ..Default::default()
-                            },
-                            String::new(),
-                        )
+                        .start_workflow(WorkflowId::new(WORKFLOW_ID), fresh_data(), String::new())
                         .await
                         .map_err(|e| e.to_string())?;
                     persist_run_id(&mcp, &item.id, &existing_metadata, new_run_id)?;
@@ -885,15 +895,7 @@ pub(crate) fn run_or_resume_with_sender(
             }
             None => {
                 let new_run_id = eng
-                    .start_workflow(
-                        WorkflowId::new(WORKFLOW_ID),
-                        WorkItemData {
-                            tasks: tasks.clone(),
-                            review_only,
-                            ..Default::default()
-                        },
-                        String::new(),
-                    )
+                    .start_workflow(WorkflowId::new(WORKFLOW_ID), fresh_data(), String::new())
                     .await
                     .map_err(|e| e.to_string())?;
                 persist_run_id(&mcp, &item.id, &existing_metadata, new_run_id)?;

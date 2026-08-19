@@ -19,7 +19,7 @@ async fn sixth_fix_round_fails_the_step() {
     d.fix_round = MAX_FIX_ROUNDS;
     d.review_issues = Some("x".to_string());
     d.last_report = Some("x".to_string());
-    let step = build_sdd_loop_step("a".to_string(), "b".to_string(), send);
+    let step = build_sdd_loop_step(send);
     let mut ctx = WorkflowContext::new(Default::default(), d);
     assert!(matches!(
         step.executor.execute(&mut ctx).await.expect("x"),
@@ -31,7 +31,7 @@ async fn max_tasks_processed_bound_fails_the_step() {
     let (send, _) = mock_send(vec![]);
     let mut d = one_task_data();
     d.current_task_index = MAX_TASKS_PROCESSED;
-    let step = build_sdd_loop_step("a".to_string(), "b".to_string(), send);
+    let step = build_sdd_loop_step(send);
     let mut ctx = WorkflowContext::new(Default::default(), d);
     assert!(matches!(
         step.executor.execute(&mut ctx).await.expect("x"),
