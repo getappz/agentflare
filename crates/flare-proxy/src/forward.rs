@@ -278,9 +278,13 @@ fn stream_translated_sse(
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            // api.cline.bot wraps OpenAI-shaped payloads in
+            // {success, data:{...}}; unwrap so the pointer lookups below hit
+            // the actual completion. No-op for every other provider.
+            let val = shape_xlat::unwrap_success_envelope(&val);
 
-            if let Some(delta) = val.pointer("/choices/0/delta/content").and_then(|v| v.as_str()) {
-                accumulated_text.push_str(delta);
+            if let Some(content) = val.pointer("/choices/0/delta/content") {
+                accumulated_text.push_str(&shape_xlat::content_text(content));
             }
             if let Some(text) = val
                 .pointer("/candidates/0/content/parts/0/text")
@@ -298,7 +302,7 @@ fn stream_translated_sse(
                     .and_then(|v| v.as_str())
                     .is_some();
 
-            let translated = translate_chunk(&val, &mut buffer);
+            let translated = translate_chunk(val, &mut buffer);
             out.extend_from_slice(&translated);
 
             if is_finish {
@@ -334,7 +338,7 @@ fn stream_translated_sse(
                 // received — that requires buffering deltas and delaying
                 // emission, a larger change tracked separately.
 
-                let finish_bytes = finish(&val, &mut buffer);
+                let finish_bytes = finish(val, &mut buffer);
                 out.extend_from_slice(&finish_bytes);
             }
         }
