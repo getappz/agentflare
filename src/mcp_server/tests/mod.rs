@@ -347,6 +347,36 @@ fn empty_item_create(name: &str) -> ItemRequest {
     }
 }
 
+/// Wires a bare local repo as `origin` and pushes `master` — remotes are
+/// repo-wide, so every worktree of this repo sees the same `origin`.
+pub(crate) fn setup_test_origin_remote(repo_root: &std::path::Path) {
+    let origin_dir = tempfile::tempdir().unwrap();
+    let run = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(origin_dir.path(), &["init", "--bare", "-b", "master"]);
+    run(
+        repo_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            origin_dir.path().to_str().unwrap(),
+        ],
+    );
+    run(repo_root, &["push", "origin", "master"]);
+    std::mem::forget(origin_dir);
+}
+
 /// A claimed item backed by a *real*, still-alive git repo — for tests that
 /// need to write actual files into the worktree and exercise git-backed
 /// `done` flows (auto-commit, push, branch-divergence checks), not just
@@ -371,6 +401,7 @@ pub(crate) fn mcp_with_claimed_item(
     std::path::PathBuf,
 ) {
     let (s, tmp, repo_dir) = item_tests::claim_harness();
+    setup_test_origin_remote(repo_dir.path());
 
     let created: serde_json::Value =
         serde_json::from_str(&s.item(Parameters(empty_item_create(name))).unwrap()).unwrap();

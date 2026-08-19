@@ -29,7 +29,7 @@ pub fn branch_diverged(
     repo_root: &Path,
     target_branch: &str,
 ) -> bool {
-    let branch = flare_git_core::worktree::task_branch_name(item);
+    let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
     flare_git_core::worktree::branch_diverged(repo_root, &branch, target_branch)
 }
 
@@ -68,7 +68,7 @@ pub fn commit_uncommitted(
 /// rather than erroring, since the caller's fallback is simply to check
 /// again later.
 pub fn is_pr_merged(item: &agentflare_backend::item::Item, repo_root: &Path) -> bool {
-    let branch = flare_git_core::worktree::task_branch_name(item);
+    let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
     let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
         return false;
     };
@@ -96,7 +96,7 @@ pub fn is_pr_merged(item: &agentflare_backend::item::Item, repo_root: &Path) -> 
 /// like the rest of this module: a label failure here must never undo (or
 /// even appear to block) a DB promotion that has already happened.
 pub fn relabel_pr_completed(item: &agentflare_backend::item::Item, repo_root: &Path) {
-    let branch = flare_git_core::worktree::task_branch_name(item);
+    let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
     let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
         return;
     };
@@ -154,7 +154,7 @@ pub enum PrCiStatus {
 /// applied once instead of in a loop -- the sweep itself provides the retry
 /// cadence across ticks.
 pub fn pr_ci_status(item: &agentflare_backend::item::Item, repo_root: &Path) -> PrCiStatus {
-    let branch = flare_git_core::worktree::task_branch_name(item);
+    let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
     let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
         return PrCiStatus::Unknown;
     };
