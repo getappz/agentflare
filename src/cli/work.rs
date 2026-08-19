@@ -263,16 +263,41 @@ fn build_extra_args(
             "--max-turns/--max-cost-usd are only supported for claude-code currently — ignored",
         );
     }
-    // `--model <name>`: confirmed via `claude --help` and `opencode run
-    // --help` that both take this same flag spelling — the only two agents
-    // that currently pass resolve_confirmed_agent. No allowlist: model
-    // catalogs change too often to hardcode, and the underlying CLI already
-    // errors on an unknown name.
+    // `--model <name>`: confirmed via `claude --help`, `opencode run --help`,
+    // and `cline --help` that all three take this same flag spelling. No
+    // allowlist: model catalogs change too often to hardcode, and the
+    // underlying CLI already errors on an unknown name.
     if let Some(model) = model {
         args.push("--model".to_string());
         args.push(model.to_string());
     }
     args
+}
+
+/// The `--model` value to actually dispatch with: an explicit CLI `--model`
+/// flag always wins (an operator's deliberate override); otherwise falls
+/// back to the router rule's configured model (`resolve_agent`'s `model`
+/// return, previously computed and silently dropped by its caller). Both
+/// only apply when the usage-threshold fallback didn't swap out the
+/// router's chosen agent (`agent_unchanged`) — same restriction `args.model`
+/// always had. When `agent` is Cline and the resolved name is a Claude
+/// model, translates it to the nearest-capability ClinePass model —
+/// ClinePass carries no Anthropic models, so the raw Claude name would just
+/// error.
+fn resolve_dispatch_model(
+    agent: agent_registry::Agent,
+    cli_model: Option<&str>,
+    route_model: Option<&str>,
+    agent_unchanged: bool,
+) -> Option<String> {
+    let raw = cli_model.or(route_model).filter(|_| agent_unchanged)?;
+    Some(if agent == agent_registry::Agent::Cline {
+        agent_registry::clinepass_model_for_claude(raw)
+            .unwrap_or(raw)
+            .to_string()
+    } else {
+        raw.to_string()
+    })
 }
 
 /// `~/.agentflare/config.toml`'s `[router]` table, or the empty config
@@ -326,10 +351,18 @@ fn resolve_agent(
     installed: &[agent_registry::Agent],
     role: Option<&str>,
     rotation: &mut std::collections::HashMap<String, u64>,
-) -> Result<(agent_registry::Agent, String, Option<agent_registry::Agent>), String> {
+) -> Result<
+    (
+        agent_registry::Agent,
+        String,
+        Option<agent_registry::Agent>,
+        Option<String>,
+    ),
+    String,
+> {
     if let Some(name) = explicit {
         return agent_registry::agent_by_name(name)
-            .map(|agent| (agent, "explicit --agent flag".to_string(), None))
+            .map(|agent| (agent, "explicit --agent flag".to_string(), None, None))
             .ok_or_else(|| format!("unknown agent: {name} — use `agentflare agents list`"));
     }
 
@@ -378,7 +411,7 @@ fn resolve_agent(
         _ => None,
     };
 
-    Ok((decision.agent, decision.reason, fallback_agent))
+    Ok((decision.agent, decision.reason, fallback_agent, decision.model))
 }
 
 /// Combines `resolve_agent`'s router-derived fallback candidate with the
@@ -807,7 +840,7 @@ fn execute_work_impl(
     } else {
         (Vec::new(), agent_registry::RouterConfig::default())
     };
-    let (agent_enum, route_reason, fallback_agent) = match resolve_agent(
+    let (agent_enum, route_reason, fallback_agent, route_model) = match resolve_agent(
         args.agent.as_deref(),
         &item_detail,
         &labels,
@@ -839,6 +872,10 @@ fn execute_work_impl(
     // `[router]` rule can pin it independently of the implementer's
     // rotation/usage-threshold fallback. No such rule (the common case)
     // or an `Err` both fall back to `agent_enum` — the primary decision.
+    // Its own routed model is dropped here: `real_agent_send_hook` shares one
+    // `extra_args` (and thus one `--model`) across every role in the
+    // `sdd_loop` run, so only the implementer's model (below) can be honored
+    // today.
     let review_agent = resolve_agent(
         args.agent.as_deref(),
         &item_detail,
@@ -848,7 +885,7 @@ fn execute_work_impl(
         Some("judge"),
         &mut state.router_rotation,
     )
-    .map(|(agent, _, _)| agent)
+    .map(|(agent, _, _, _)| agent)
     .unwrap_or(agent_enum);
     crate::state::save(&state);
     let name = implementer_agent.as_str();
@@ -865,11 +902,17 @@ fn execute_work_impl(
     let plan_doc = latest_plan_doc_content(&mcp, item_id);
 
     // --- Extra args ---
+    let resolved_model = resolve_dispatch_model(
+        implementer_agent,
+        args.model.as_deref(),
+        route_model.as_deref(),
+        agent_unchanged,
+    );
     let extra_args = build_extra_args(
         implementer_agent,
         args.max_turns,
         args.max_cost_usd,
-        args.model.as_deref().filter(|_| agent_unchanged),
+        resolved_model.as_deref(),
     );
 
     // --- Change to worktree dir and run the sdd_loop -> finalize pipeline;
@@ -1109,7 +1152,7 @@ mod tests {
         let mut item = test_item();
         item.assignee_agent = Some("opencode".to_string());
         let config = agent_registry::RouterConfig::default();
-        let (agent, reason, _fallback) = resolve_agent(
+        let (agent, reason, _fallback, _model) = resolve_agent(
             Some("codex"),
             &item,
             &[],
@@ -1129,7 +1172,7 @@ mod tests {
         // — the explicit path must accept it the same as assignee_agent does.
         let item = test_item();
         let config = agent_registry::RouterConfig::default();
-        let (agent, _, _) = resolve_agent(
+        let (agent, _, _, _) = resolve_agent(
             Some("claude"),
             &item,
             &[],
@@ -1164,7 +1207,7 @@ mod tests {
         let mut item = test_item();
         item.assignee_agent = Some("claude".to_string()); // alias, agent_by_name() maps it
         let config = agent_registry::RouterConfig::default();
-        let (agent, reason, _fallback) = resolve_agent(
+        let (agent, reason, _fallback, _model) = resolve_agent(
             None,
             &item,
             &[],
@@ -1187,7 +1230,7 @@ mod tests {
         let mut item = test_item();
         item.assignee_agent = Some("claude-code:some-job-id".to_string());
         let config = agent_registry::RouterConfig::default();
-        let (agent, reason, _fallback) = resolve_agent(
+        let (agent, reason, _fallback, _model) = resolve_agent(
             None,
             &item,
             &[],
@@ -1231,7 +1274,7 @@ use  = "opencode"
 "#,
         )
         .unwrap();
-        let (agent, _, _) = resolve_agent(
+        let (agent, _, _, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -1257,7 +1300,7 @@ use  = "opencode"
 "#,
         )
         .unwrap();
-        let (agent, _, _) = resolve_agent(
+        let (agent, _, _, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -1282,7 +1325,7 @@ use  = "opencode"
 "#,
         )
         .unwrap();
-        let (agent, _, fallback) = resolve_agent(
+        let (agent, _, fallback, _) = resolve_agent(
             Some("claude"),
             &item,
             &[],
@@ -1304,7 +1347,7 @@ use  = "opencode"
         let mut item = test_item();
         item.assignee_agent = Some("claude-code".to_string());
         let config = agent_registry::RouterConfig::default();
-        let (agent, _, fallback) = resolve_agent(
+        let (agent, _, fallback, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -1337,7 +1380,7 @@ use  = ["claude-code", "codex", "opencode"]
 "#,
         )
         .unwrap();
-        let (agent, _, fallback) = resolve_agent(
+        let (agent, _, fallback, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -1371,7 +1414,7 @@ use  = "claude-code"
 "#,
         )
         .unwrap();
-        let (agent, _, fallback) = resolve_agent(
+        let (agent, _, fallback, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -1395,7 +1438,7 @@ use  = "claude-code"
             "[router]\n[[router.rule]]\nwhen = { size = \"S\" }\nuse  = [\"opencode\", \"claude-code\"]\n",
         )
         .unwrap();
-        let (agent, _, fallback) = resolve_agent(
+        let (agent, _, fallback, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -1431,7 +1474,7 @@ rotate = true
         ];
         let mut rotation = std::collections::HashMap::new();
 
-        let (first, _, _) = resolve_agent(
+        let (first, _, _, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -1441,7 +1484,7 @@ rotate = true
             &mut rotation,
         )
         .unwrap();
-        let (second, _, _) = resolve_agent(
+        let (second, _, _, _) = resolve_agent(
             None,
             &item,
             &[],
@@ -1561,61 +1604,7 @@ rotate = true
         });
     }
 
-    #[test]
-    fn build_extra_args_includes_bypass_and_streaming_output_for_claude() {
-        // Plain `--output-format json` writes NOTHING to stdout/stderr until
-        // the entire run finishes (confirmed by hand: 0 bytes for 54s+ on a
-        // trivial 2-tool-call task) — run_captured's idle-timeout (default
-        // 300s) then kills any real task before it can finish, every time.
-        // `stream-json` (+ the `--verbose` it requires) emits one JSON
-        // object per turn/tool-call as it happens, giving a genuine
-        // liveness signal; its final line carries the same {"result":...}
-        // shape `parse_claude_reply` already expects.
-        let args = build_extra_args(agent_registry::Agent::ClaudeCode, None, None, None);
-        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
-        assert!(args.contains(&"--output-format".to_string()));
-        assert!(args.contains(&"stream-json".to_string()));
-        assert!(!args.contains(&"json".to_string()));
-        assert!(args.contains(&"--verbose".to_string()));
-        assert!(!args.iter().any(|a| a.starts_with("--max-turns")));
-    }
-
-    #[test]
-    fn build_extra_args_passes_through_max_turns_and_cost_for_claude() {
-        let args = build_extra_args(agent_registry::Agent::ClaudeCode, Some(5), Some(2.5), None);
-        assert!(args.contains(&"--max-turns=5".to_string()));
-        assert!(args.contains(&"--max-budget-usd=2.5".to_string()));
-    }
-
-    #[test]
-    fn build_extra_args_for_codex_has_bypass_but_no_json_output() {
-        let args = build_extra_args(agent_registry::Agent::Codex, None, None, None);
-        assert_eq!(args, vec!["--full-auto".to_string()]);
-    }
-
-    #[test]
-    fn build_extra_args_passes_through_model_for_any_confirmed_agent() {
-        let args = build_extra_args(
-            agent_registry::Agent::Opencode,
-            None,
-            None,
-            Some("anthropic/claude-sonnet-5"),
-        );
-        assert_eq!(
-            args,
-            vec![
-                "--auto".to_string(),
-                "--model".to_string(),
-                "anthropic/claude-sonnet-5".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn build_extra_args_omits_model_flag_when_none() {
-        let args = build_extra_args(agent_registry::Agent::Codex, None, None, None);
-        assert!(!args.iter().any(|a| a == "--model"));
-    }
+    include!("work_model_routing_tests.rs");
 
     fn seeded_item(
         mcp: &AgentflareMcp,
