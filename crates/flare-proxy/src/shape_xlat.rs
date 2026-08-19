@@ -202,7 +202,8 @@ pub fn chat_to_messages(openai: &Value) -> Option<Value> {
 
     let mut content = Vec::new();
 
-    if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+    if let Some(content_val) = delta.get("content") {
+        let text = content_text(content_val);
         if !text.is_empty() {
             content.push(json!({
                 "type": "text",
@@ -260,6 +261,33 @@ pub fn chat_to_messages(openai: &Value) -> Option<Value> {
     }
 
     Some(resp)
+}
+
+/// Extract the text of an OpenAI-format `content`/`delta.content` value,
+/// which is normally a plain string but which some providers (Cline/
+/// ClinePass via api.cline.bot) send as an array of Anthropic-style text
+/// blocks (`[{ "type": "text", "text": "..." }]`). Empty when neither shape
+/// carries text, so callers can skip emitting an empty delta.
+pub(crate) fn content_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Unwrap an upstream response wrapped in a `{ success: true, data: { ... } }`
+/// envelope — api.cline.bot wraps OpenAI-shaped payloads this way. Returns the
+/// payload for unwrapped responses unchanged.
+pub(crate) fn unwrap_success_envelope(val: &Value) -> &Value {
+    match (val.get("success"), val.get("data")) {
+        (Some(s), Some(data)) if s.as_bool() == Some(true) && data.is_object() => data,
+        _ => val,
+    }
 }
 
 pub fn error_to_anthropic(openai: &Value) -> Value {
@@ -340,21 +368,20 @@ pub fn openai_chunk_to_anthropic_sse(chunk: &Value, buffer: &mut AnthropicStream
         emit_event(&mut out, "ping", &json!({ "type": "ping" }));
     }
 
-    if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-        if !text.is_empty() {
-            emit_event(
-                &mut out,
-                "content_block_delta",
-                &json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {
-                        "type": "text_delta",
-                        "text": text
-                    }
-                }),
-            );
-        }
+    let text = content_text(delta.get("content").unwrap_or(&Value::Null));
+    if !text.is_empty() {
+        emit_event(
+            &mut out,
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "text_delta",
+                    "text": text
+                }
+            }),
+        );
     }
 
     if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
@@ -789,6 +816,61 @@ mod tests {
         assert_eq!(anthropic["stop_reason"], "tool_use");
         assert_eq!(anthropic["content"][0]["type"], "tool_use");
         assert_eq!(anthropic["content"][0]["name"], "get_weather");
+    }
+
+    #[test]
+    fn test_chat_to_messages_content_as_text_block_array() {
+        // api.cline.bot can send `content` as an array of Anthropic-style
+        // text blocks instead of a bare string.
+        let openai = json!({
+            "id": "chatcmpl-789",
+            "model": "claude-sonnet-4-5",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": [{ "type": "text", "text": "Hello there!" }] },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
+        });
+        let anthropic = chat_to_messages(&openai).unwrap();
+        assert_eq!(anthropic["content"][0]["type"], "text");
+        assert_eq!(anthropic["content"][0]["text"], "Hello there!");
+    }
+
+    #[test]
+    fn test_stream_delta_content_as_text_block_array() {
+        let mut buffer = AnthropicStreamBuffer::default();
+        let chunk = json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "content": [{ "type": "text", "text": "Hello" }] }
+            }]
+        });
+        let bytes = openai_chunk_to_anthropic_sse(&chunk, &mut buffer);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("message_start"));
+        assert!(text.contains("\"text\":\"Hello\""));
+        assert!(buffer.open_indices.contains(&0));
+    }
+
+    #[test]
+    fn test_unwrap_success_envelope_returns_data_payload() {
+        let wrapped =
+            json!({ "success": true, "data": { "choices": [{"finish_reason": "stop"}] } });
+        let unwrapped = unwrap_success_envelope(&wrapped);
+        assert!(unwrapped.get("choices").is_some());
+
+        // Non-envelope payloads pass through untouched.
+        let plain = json!({ "choices": [{"finish_reason": "stop"}] });
+        assert!(unwrap_success_envelope(&plain).get("choices").is_some());
+
+        // `data` not an object (e.g. an error body) is left alone.
+        let weird = json!({ "success": false, "data": "nope" });
+        assert_eq!(unwrap_success_envelope(&weird).get("data").unwrap(), "nope");
+
+        // `success: false` with object data is an error envelope - keep as-is.
+        let failed = json!({ "success": false, "data": { "choices": [] } });
+        assert!(unwrap_success_envelope(&failed).get("data").is_some());
     }
 
     #[test]

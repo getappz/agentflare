@@ -262,3 +262,35 @@ kind = "openai_compatible"
 base_url = "https://router.requesty.ai/v1"
 api_key_env = "REQUESTY_API_KEY"
 free_type = "recurring-uncapped"
+
+# ---------------------------------------------------------------------------
+# Cline / ClinePass (api.cline.bot). Cline's OAuth account and ClinePass's
+# BYOK subscription both speak OpenAI-compatible /chat/completions on the
+# same endpoint; the Cline client sets HTTP-Referer + X-Title, so mirror
+# that. Stream translation handles two api.cline.bot quirks in shape_xlat:
+# deltas whose `content` is an array of text blocks (not a bare string) and
+# responses wrapped in a {success, data:{...}} envelope. No free tier -- both
+# are paid-key/account providers.
+# ---------------------------------------------------------------------------
+
+[[providers]]
+prefix = "cline"
+id = "cline"
+kind = "openai_compatible"
+base_url = "https://api.cline.bot/api/v1"
+api_key_env = "CLINE_API_KEY"
+extra_headers = [
+    ["HTTP-Referer", "https://cline.bot"],
+    ["X-Title", "Cline"],
+]
+
+[[providers]]
+prefix = "clinepass"
+id = "clinepass"
+kind = "openai_compatible"
+base_url = "https://api.cline.bot/api/v1"
+api_key_env = "CLINEPASS_API_KEY"
+extra_headers = [
+    ["HTTP-Referer", "https://cline.bot"],
+    ["X-Title", "Cline"],
+]

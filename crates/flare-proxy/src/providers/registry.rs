@@ -327,6 +327,8 @@ mod tests {
             "siliconflow",
             "llm7",
             "requesty",
+            "cline",
+            "clinepass",
         ] {
             let spec =
                 find(prefix).unwrap_or_else(|| panic!("registry must define provider '{prefix}'"));
@@ -345,6 +347,29 @@ mod tests {
         let spec = find("nvidia_nim").expect("nvidia_nim must be in the registry");
         assert_eq!(spec.id, "nvidia-nim");
         assert!(matches!(spec.kind, ProviderKind::OpenAiCompatible));
+    }
+
+    #[test]
+    fn cline_providers_resolve_to_api_cline_bot_with_client_headers() {
+        for (prefix, expected_key_env) in [
+            ("cline", "CLINE_API_KEY"),
+            ("clinepass", "CLINEPASS_API_KEY"),
+        ] {
+            let spec =
+                find(prefix).unwrap_or_else(|| panic!("registry must define provider '{prefix}'"));
+            assert!(matches!(spec.kind, ProviderKind::OpenAiCompatible));
+            assert_eq!(spec.api_key_env.as_deref(), Some(expected_key_env));
+            let (base_url, headers) =
+                resolve(spec).unwrap_or_else(|| panic!("'{prefix}' must resolve to a base_url"));
+            assert_eq!(base_url, "https://api.cline.bot/api/v1");
+            assert!(
+                headers
+                    .iter()
+                    .any(|(k, v)| k == "HTTP-Referer" && v == "https://cline.bot"),
+                "'{prefix}' must send HTTP-Referer like the Cline client"
+            );
+            assert!(headers.iter().any(|(k, v)| k == "X-Title" && v == "Cline"));
+        }
     }
 
     #[test]
