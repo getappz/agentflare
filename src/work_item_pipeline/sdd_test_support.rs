@@ -8,24 +8,25 @@ use super::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-/// Records every `(agent_name, prompt)` call and returns queued replies
-/// in order.
+/// Records every `(agent_name, prompt, args)` call and returns queued
+/// replies in order.
 #[allow(clippy::type_complexity)]
 pub(crate) fn mock_send(
     replies: Vec<&'static str>,
 ) -> (
     flare_workflow::json::SendMessage,
-    Arc<Mutex<Vec<(String, String)>>>,
+    Arc<Mutex<Vec<(String, String, Vec<String>)>>>,
 ) {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let queue = Arc::new(Mutex::new(replies.into_iter().collect::<VecDeque<_>>()));
     let calls_clone = calls.clone();
     let send: flare_workflow::json::SendMessage =
         Arc::new(move |inv: flare_workflow::json::StepInvocation| {
-            calls_clone
-                .lock()
-                .unwrap()
-                .push((inv.agent.clone(), inv.prompt.clone()));
+            calls_clone.lock().unwrap().push((
+                inv.agent.clone(),
+                inv.prompt.clone(),
+                inv.args.clone(),
+            ));
             let reply = queue.lock().unwrap().pop_front().unwrap_or("").to_string();
             Box::pin(async move { Ok((reply, 10u64, 10u64)) })
         });

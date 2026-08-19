@@ -7,7 +7,7 @@ pub use detect::{
 };
 pub use registry::{
     Agent, AgentSpec, REGISTRY, Tier, agent_by_name, autonomous_args, canonicalize, headless_args,
-    spec,
+    json_output_args, resume_arg, spec,
 };
 pub use router::{
     RouteDecision, RouterConfig, RouterRule, RuleMatch, TaskContext, parse_router_config, route,

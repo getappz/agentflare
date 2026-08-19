@@ -96,6 +96,7 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                     hard_cap,
                     idle_timeout,
                     &extra_args,
+                    false,
                 )
             })
             .await
@@ -104,7 +105,7 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
                     // Agent CLIs don't report token counts; 0 keeps accounting
                     // honest (unknown rather than fabricated).
-                    Ok((reply, 0, 0))
+                    Ok((reply.text, 0, 0))
                 }
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
                 | crate::agent_launch::HeadlessOutcome::NotHeadless(e)

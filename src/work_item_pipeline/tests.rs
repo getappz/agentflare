@@ -20,6 +20,47 @@ fn work_item_data_round_trips_through_json() {
     );
 }
 
+#[test]
+fn strip_session_marker_recovers_id_and_leaves_reply_clean() {
+    let encoded = encode_session("did the thing", Some("sess-42"));
+    let (clean, id) = strip_session_marker(&encoded);
+    assert_eq!(clean, "did the thing");
+    assert_eq!(id.as_deref(), Some("sess-42"));
+}
+
+#[test]
+fn strip_session_marker_is_a_noop_without_a_marker() {
+    let (clean, id) = strip_session_marker("plain reply, no marker");
+    assert_eq!(clean, "plain reply, no marker");
+    assert_eq!(id, None);
+}
+
+#[test]
+fn resume_args_for_empty_when_no_prior_session() {
+    let sessions = std::collections::HashMap::new();
+    assert_eq!(
+        resume_args_for("claude-code", &sessions),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn resume_args_for_empty_for_an_agent_with_no_resume_flag() {
+    let mut sessions = std::collections::HashMap::new();
+    sessions.insert("opencode".to_string(), "sess-1".to_string());
+    assert_eq!(resume_args_for("opencode", &sessions), Vec::<String>::new());
+}
+
+#[test]
+fn resume_args_for_builds_the_resume_flag_when_a_session_is_known() {
+    let mut sessions = std::collections::HashMap::new();
+    sessions.insert("claude-code".to_string(), "sess-1".to_string());
+    assert_eq!(
+        resume_args_for("claude-code", &sessions),
+        vec!["--resume".to_string(), "sess-1".to_string()]
+    );
+}
+
 // Item #489: judge's raw Claude Code reply is a multi-line stream-json
 // transcript; parsing its first line (action-less) instead of the last
 // line's decision caused "missing field `action`" on #478/#502/#503.

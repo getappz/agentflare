@@ -258,6 +258,8 @@ async fn resumed_iteration_dispatches_next_task_not_a_repeat() {
     // ctx.data as it would look immediately after a crash that happened
     // right after task 0's advance_task was applied and persisted.
     let data = WorkItemData {
+        agent_name: "implementer-agent".to_string(),
+        judge_agent_name: "judge-agent".to_string(),
         tasks: vec![
             SddTask {
                 id: 0,
@@ -310,6 +312,8 @@ async fn single_task_plan_reaches_complete_pipeline_after_one_approved_review() 
     let step = sdd_step(send);
     let tasks = load_or_synthesize_tasks("Fix the off-by-one in pagination", None);
     let data = WorkItemData {
+        agent_name: "implementer-agent".to_string(),
+        judge_agent_name: "judge-agent".to_string(),
         tasks,
         ..Default::default()
     };
@@ -370,6 +374,8 @@ async fn three_task_plan_with_fix_round_escalation_and_skip() {
 
     let step = sdd_step(send);
     let data = WorkItemData {
+        agent_name: "implementer-agent".to_string(),
+        judge_agent_name: "judge-agent".to_string(),
         tasks: vec![
             SddTask {
                 id: 0,

@@ -110,6 +110,13 @@ pub(crate) struct WorkItemData {
     /// silently skips them as unreadable.
     #[serde(default)]
     pub review_only: bool,
+    /// Provider session id last observed for each agent name dispatched in
+    /// this run (implementer and judge/reviewer are usually different
+    /// agents and get independent entries). Used to pass `--resume <id>` on
+    /// that agent's next turn instead of respawning a cold, full-context
+    /// session.
+    #[serde(default)]
+    pub agent_sessions: std::collections::HashMap<String, String>,
 }
 
 impl flare_workflow::WorkflowData for WorkItemData {
@@ -244,6 +251,45 @@ const REVIEW_APPROVED_MARKER: &str = "REVIEW_APPROVED";
 /// closure below tells reviewer-turn from fixer-turn apart.
 const REVIEW_ISSUES_MARKER: &str = "REVIEW_ISSUES:";
 
+/// Smuggles a captured provider session id back through the plain-string
+/// reply channel `flare_workflow::json::SendMessage` returns, the same way
+/// REVIEW_ISSUES_MARKER/REVIEW_APPROVED_MARKER above smuggle control
+/// signals — chosen specifically so SendMessage's type never needs to
+/// widen. Always stripped before a reply is stored in ctx.data or used to
+/// build any further prompt — it never reaches a judge prompt, a PR
+/// comment, or a human.
+const SESSION_MARKER: &str = "\u{0}AGENTFLARE_SESSION:";
+
+fn encode_session(reply: &str, session_id: Option<&str>) -> String {
+    match session_id {
+        Some(id) => format!("{reply}{SESSION_MARKER}{id}"),
+        None => reply.to_string(),
+    }
+}
+
+fn strip_session_marker(reply: &str) -> (String, Option<String>) {
+    match reply.split_once(SESSION_MARKER) {
+        Some((clean, id)) => (clean.to_string(), Some(id.to_string())),
+        None => (reply.to_string(), None),
+    }
+}
+
+fn resume_args_for(
+    agent_name: &str,
+    sessions: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let Some(agent) = agent_registry::agent_by_name(agent_name) else {
+        return Vec::new();
+    };
+    let Some(flag) = agent_registry::resume_arg(agent) else {
+        return Vec::new();
+    };
+    match sessions.get(agent_name) {
+        Some(session_id) => vec![flag.to_string(), session_id.clone()],
+        None => Vec::new(),
+    }
+}
+
 /// Cap on fix rounds for a single SDD task before the loop gives up on it —
 /// mirrors `MAX_REVIEW_CYCLES`'s existing cap-constant pattern for the
 /// `coder`/`review_or_fix` pipeline.
@@ -284,8 +330,6 @@ pub(crate) fn build_sdd_loop_step(
         move |ctx: &mut WorkflowContext<WorkItemData>| {
             let send = send.clone();
             Box::pin(async move {
-                let agent_name = ctx.data.agent_name.clone();
-                let judge_agent_name = ctx.data.judge_agent_name.clone();
                 if ctx.data.current_task_index >= MAX_TASKS_PROCESSED {
                     return Ok(StepResult::Failure);
                 }
@@ -293,6 +337,18 @@ pub(crate) fn build_sdd_loop_step(
                 {
                     ctx.output = SDD_PIPELINE_COMPLETE_MARKER.to_string();
                     return Ok(StepResult::Success);
+                }
+
+                // Read at execution time, not closed over at
+                // step-registration time -- so a run resumed by
+                // `engine().recover()` against a freshly-registered,
+                // identity-less definition still dispatches the crashed
+                // run's real agents. See `WorkItemData::item_id`'s doc
+                // comment for the full rationale.
+                let agent_name = ctx.data.agent_name.clone();
+                let judge_agent_name = ctx.data.judge_agent_name.clone();
+                if agent_name.is_empty() || judge_agent_name.is_empty() {
+                    return Ok(StepResult::Failure);
                 }
 
                 let task = ctx.data.tasks[ctx.data.current_task_index].clone();
@@ -346,16 +402,29 @@ pub(crate) fn build_sdd_loop_step(
                     (agent_name.clone(), prompt)
                 };
 
-                let (role_reply, in_tok, out_tok) = send(
-                    flare_workflow::json::StepInvocation::simple(role_agent, role_prompt),
-                )
-                .await
-                .map_err(|message| WorkflowError::StepFailed {
-                    step_id: StepId::new("sdd_loop"),
-                    message,
-                })?;
+                let role_invocation = flare_workflow::json::StepInvocation {
+                    args: resume_args_for(&role_agent, &ctx.data.agent_sessions),
+                    ..flare_workflow::json::StepInvocation::simple(role_agent.clone(), role_prompt)
+                };
+                let (raw_role_reply, in_tok, out_tok) =
+                    send(role_invocation)
+                        .await
+                        .map_err(|message| WorkflowError::StepFailed {
+                            step_id: StepId::new("sdd_loop"),
+                            message,
+                        })?;
                 ctx.input_tokens += in_tok;
                 ctx.output_tokens += out_tok;
+
+                let (role_reply, role_session_id) = strip_session_marker(&raw_role_reply);
+                if let Some(id) = role_session_id {
+                    ctx.data
+                        .agent_sessions
+                        .insert(role_agent.clone(), id.clone());
+                    if role_agent == agent_name {
+                        ctx.data.session_id = Some(id);
+                    }
+                }
 
                 if let Some(issues) = role_reply.strip_prefix(REVIEW_ISSUES_MARKER) {
                     ctx.data.review_issues = Some(issues.trim().to_string());
@@ -377,16 +446,27 @@ pub(crate) fn build_sdd_loop_step(
                     &role_reply,
                     ctx.data.review_only,
                 );
-                let (judge_reply, jin_tok, jout_tok) = send(
-                    flare_workflow::json::StepInvocation::simple(judge_agent_name, judge_prompt),
-                )
-                .await
-                .map_err(|message| WorkflowError::StepFailed {
-                    step_id: StepId::new("sdd_loop"),
-                    message,
-                })?;
+                let judge_invocation = flare_workflow::json::StepInvocation {
+                    args: resume_args_for(&judge_agent_name, &ctx.data.agent_sessions),
+                    ..flare_workflow::json::StepInvocation::simple(
+                        judge_agent_name.clone(),
+                        judge_prompt,
+                    )
+                };
+                let (raw_judge_reply, jin_tok, jout_tok) =
+                    send(judge_invocation)
+                        .await
+                        .map_err(|message| WorkflowError::StepFailed {
+                            step_id: StepId::new("sdd_loop"),
+                            message,
+                        })?;
                 ctx.input_tokens += jin_tok;
                 ctx.output_tokens += jout_tok;
+
+                let (judge_reply, judge_session_id) = strip_session_marker(&raw_judge_reply);
+                if let Some(id) = judge_session_id {
+                    ctx.data.agent_sessions.insert(judge_agent_name.clone(), id);
+                }
 
                 let decision = match parse_judge_decision(&judge_reply) {
                     Ok(d) => d,
@@ -540,6 +620,17 @@ pub(crate) fn build_finalize_step(
         move |ctx: &mut WorkflowContext<WorkItemData>| {
             let mcp = mcp.clone();
             Box::pin(async move {
+                // Read at execution time, not closed over at
+                // step-registration time -- see `WorkItemData::item_id`'s
+                // doc comment. An empty id means identity genuinely
+                // couldn't be reconstructed (e.g. a run started before this
+                // field existed) -- fail closed rather than guess, same as
+                // this used to fail (by erroring inside `item_done`) when
+                // the boot-time recovery definition closed over a
+                // placeholder id.
+                if ctx.data.item_id.is_empty() {
+                    return Ok(StepResult::Failure);
+                }
                 let item_id = ctx.data.item_id.clone();
                 let notify_recipient = ctx.data.notify_recipient.clone();
                 let owner = ctx.data.owner.clone();
@@ -688,7 +779,8 @@ fn real_agent_send_hook(
     extra_args: Vec<String>,
 ) -> flare_workflow::json::SendMessage {
     std::sync::Arc::new(move |inv: flare_workflow::json::StepInvocation| {
-        let extra_args = extra_args.clone();
+        let mut all_args = extra_args.clone();
+        all_args.extend(inv.args.clone());
         let flare_workflow::json::StepInvocation { agent, prompt, .. } = inv;
         Box::pin(async move {
             let agent_for_reply = agent.clone();
@@ -699,14 +791,18 @@ fn real_agent_send_hook(
                     &prompt,
                     timeout,
                     idle_timeout,
-                    &extra_args,
+                    &all_args,
+                    true,
                 )
             })
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
             match outcome {
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => Ok((
-                    crate::agent_launch::clean_agent_reply(&agent_for_reply, reply),
+                    encode_session(
+                        &crate::agent_launch::clean_agent_reply(&agent_for_reply, reply.text),
+                        reply.session_id.as_deref(),
+                    ),
                     0,
                     0,
                 )),
@@ -826,10 +922,9 @@ pub(crate) fn run_or_resume_with_sender(
         .as_str()
         .and_then(|s| flare_workflow::WorkflowRunId::from_str(s).ok());
 
-    // Computed once, up front, from the same inputs passed to
-    // `build_work_item_pipeline_with_sender` below — seeds `WorkItemData::tasks`
-    // on both `start_workflow` call sites so `sdd_loop` (Task 5) has a task
-    // list to work through instead of completing immediately on an empty one.
+    // Computed once, up front — seeds `WorkItemData::tasks` on both
+    // `start_workflow` call sites below so `sdd_loop` has a task list to
+    // work through instead of completing immediately on an empty one.
     let tasks = load_or_synthesize_tasks(&item_description, plan_doc.as_deref());
     // Seeds `WorkItemData::review_only` (item #507) the same way — computed
     // once here so both `start_workflow` call sites below agree.

@@ -43,6 +43,47 @@ async fn sdd_loop_dispatches_implementer_and_review_roles_on_their_own_agents() 
     );
 }
 
+#[tokio::test]
+async fn sdd_loop_resumes_the_implementer_session_on_the_next_fix_round() {
+    let (send, calls) = super::sdd_test_support::mock_send(vec![
+        // Iteration 1: implementer (claude-code) reports done, carrying a
+        // session id back through the marker channel.
+        "did the thing\u{0}AGENTFLARE_SESSION:sess-1",
+        r#"{"action":"fix_round","rationale":"needs polish","ledger_line":"Task 0: fix round 1","task_model_tier":null}"#,
+        // Iteration 2: task-reviewer (cursor) finds an issue.
+        "REVIEW_ISSUES: needs a test",
+        r#"{"action":"continue_task","rationale":"reviewing","ledger_line":"Task 0: review issues found","task_model_tier":null}"#,
+        // Iteration 3: implementer (claude-code) fixes it -- this call
+        // must resume iteration 1's session.
+        "did the fix",
+        r#"{"action":"advance_task","rationale":"fixed","ledger_line":"Task 0: fixed","task_model_tier":null}"#,
+    ]);
+    let pipeline =
+        build_work_item_pipeline_with_sender(std::sync::Arc::new(AgentflareMcp::default()), send);
+    let mut data = super::sdd_test_support::one_task_data();
+    data.agent_name = agent_registry::Agent::ClaudeCode.as_str().to_string();
+    data.judge_agent_name = agent_registry::Agent::Cursor.as_str().to_string();
+    let mut ctx = WorkflowContext::new(Default::default(), data);
+    for _ in 0..3 {
+        pipeline.steps[0]
+            .executor
+            .execute(&mut ctx)
+            .await
+            .expect("executes");
+    }
+
+    assert_eq!(
+        ctx.data.agent_sessions.get("claude-code"),
+        Some(&"sess-1".to_string())
+    );
+    assert_eq!(ctx.data.session_id.as_deref(), Some("sess-1"));
+
+    let recorded = calls.lock().unwrap();
+    let (agent, _prompt, args) = recorded[4].clone();
+    assert_eq!(agent, "claude-code");
+    assert_eq!(args, vec!["--resume".to_string(), "sess-1".to_string()]);
+}
+
 /// Regression test: `sdd_loop`'s per-iteration engine timeout must not
 /// fall back to `flare_workflow::WorkflowDefinition::new`'s 300s
 /// library default -- a real implementer/reviewer/judge dispatch

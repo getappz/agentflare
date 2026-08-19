@@ -237,9 +237,10 @@ pub fn cli_run_headless(agent: &str, prompt: &str, timeout: std::time::Duration)
         timeout,
         timeout,
         &[],
+        false,
     ) {
         agent_launch::HeadlessOutcome::Ok(reply) => {
-            print!("{reply}");
+            print!("{}", reply.text);
             0
         }
         agent_launch::HeadlessOutcome::UnknownAgent(msg)
