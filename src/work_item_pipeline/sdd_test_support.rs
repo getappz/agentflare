@@ -22,10 +22,11 @@ pub(crate) fn mock_send(
     let calls_clone = calls.clone();
     let send: flare_workflow::json::SendMessage =
         Arc::new(move |inv: flare_workflow::json::StepInvocation| {
-            calls_clone
-                .lock()
-                .unwrap()
-                .push((inv.agent.clone(), inv.prompt.clone(), inv.args.clone()));
+            calls_clone.lock().unwrap().push((
+                inv.agent.clone(),
+                inv.prompt.clone(),
+                inv.args.clone(),
+            ));
             let reply = queue.lock().unwrap().pop_front().unwrap_or("").to_string();
             Box::pin(async move { Ok((reply, 10u64, 10u64)) })
         });
