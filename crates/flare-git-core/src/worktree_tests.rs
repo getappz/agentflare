@@ -769,6 +769,49 @@ fn push_branch_returns_none_when_branch_content_already_merged() {
 }
 
 #[test]
+fn resolve_item_task_branch_reads_the_worktrees_checked_out_ref() {
+    let repo = init_repo();
+    let bare_name = test_item_named(42, "!!!");
+    let target = resolve_default_branch(&repo.path);
+    create_worktree(&bare_name, &repo.path, &target, None).unwrap();
+    let renamed = test_item_named(42, "Renamed Item Title");
+    assert_eq!(
+        resolve_item_task_branch(&renamed, &repo.path),
+        "task/42",
+        "must read the checkout, not recompute slug from the current item name"
+    );
+    assert_ne!(
+        task_branch_name(&renamed),
+        "task/42",
+        "recomputed slug must differ from the bare branch the worktree is on"
+    );
+}
+
+#[test]
+fn branch_diverged_uses_resolve_item_task_branch_not_task_branch_name() {
+    let repo = init_repo();
+    let bare_name = test_item_named(42, "!!!");
+    let target = resolve_default_branch(&repo.path);
+    let worktree_path = create_worktree(&bare_name, &repo.path, &target, None).unwrap();
+    std::fs::write(worktree_path.join("work.txt"), b"x").unwrap();
+    run_git_in(&worktree_path, &["add", "work.txt"]).unwrap();
+    run_git_in(&worktree_path, &["commit", "-m", "work"]).unwrap();
+    let renamed = test_item_named(42, "Renamed Item Title");
+    assert!(
+        !branch_diverged(&repo.path, &task_branch_name(&renamed), &target),
+        "recomputed slug ref is missing — the old bug read this as not diverged"
+    );
+    assert!(
+        branch_diverged(
+            &repo.path,
+            &resolve_item_task_branch(&renamed, &repo.path),
+            &target
+        ),
+        "actual checkout branch has the commit"
+    );
+}
+
+#[test]
 fn run_output_timeout_kills_the_child_not_just_abandons_it() {
     let tmp = tempfile::tempdir().unwrap();
     let marker = tmp.path().join("marker");
