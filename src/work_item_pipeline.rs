@@ -819,6 +819,7 @@ pub(crate) fn run_or_resume_with_sender(
     // is absent, so it needs the owner passed down explicitly rather than
     // re-resolving `owner_id()` itself.
     let owner = crate::claims::owner_id();
+    let heartbeat_owner = owner.clone();
     let definition = build_work_item_pipeline_with_sender(
         implementer_agent,
         review_agent,
@@ -907,10 +908,12 @@ pub(crate) fn run_or_resume_with_sender(
                 }
                 _ => {
                     if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-                        let _ = mcp.item_heartbeat(ItemRequest {
-                            action: "heartbeat".into(),
-                            id: Some(item.id.clone()),
-                            ..Default::default()
+                        let _ = crate::claims::with_owner_override(heartbeat_owner.clone(), || {
+                            mcp.item_heartbeat(ItemRequest {
+                                action: "heartbeat".into(),
+                                id: Some(item.id.clone()),
+                                ..Default::default()
+                            })
                         });
                         last_heartbeat = std::time::Instant::now();
                     }
