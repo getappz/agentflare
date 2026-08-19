@@ -407,6 +407,35 @@ pub fn clinepass_model_for_claude(model: &str) -> Option<&'static str> {
     }
 }
 
+/// CLI flags that switch an agent's headless print mode to structured JSON
+/// output (`{"type":"result","result":"...","session_id":"...",...}`),
+/// letting `agent_launch::run_headless` capture a provider session id and
+/// (where the provider reports it) a cost instead of treating stdout as an
+/// opaque text reply. `None` for every agent whose JSON schema hasn't been
+/// verified — `run_headless` must fall back to plain-text parsing for those,
+/// never guess a schema.
+#[allow(dead_code)]
+#[must_use]
+pub fn json_output_args(agent: Agent) -> Option<&'static [&'static str]> {
+    match agent {
+        Agent::ClaudeCode | Agent::Cursor => Some(&["--output-format", "json"]),
+        _ => None,
+    }
+}
+
+/// The flag that resumes a prior session by id (e.g. `claude --resume
+/// <session_id>`, `cursor-agent --resume <chatId>`), appended after
+/// print-mode flags and before the prompt. `None` for agents with no known
+/// resume flag.
+#[allow(dead_code)]
+#[must_use]
+pub fn resume_arg(agent: Agent) -> Option<&'static str> {
+    match agent {
+        Agent::ClaudeCode | Agent::Cursor => Some("--resume"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,6 +546,28 @@ mod tests {
     fn clinepass_model_for_claude_none_for_unrecognized_name() {
         assert_eq!(clinepass_model_for_claude("gpt-4o"), None);
         assert_eq!(clinepass_model_for_claude("cline-pass/kimi-k3"), None);
+    }
+
+    #[test]
+    fn json_output_args_maps_claude_and_cursor_only() {
+        assert_eq!(
+            json_output_args(Agent::ClaudeCode),
+            Some(&["--output-format", "json"][..])
+        );
+        assert_eq!(
+            json_output_args(Agent::Cursor),
+            Some(&["--output-format", "json"][..])
+        );
+        assert_eq!(json_output_args(Agent::Opencode), None);
+        assert_eq!(json_output_args(Agent::Codex), None);
+    }
+
+    #[test]
+    fn resume_arg_maps_claude_and_cursor_only() {
+        assert_eq!(resume_arg(Agent::ClaudeCode), Some("--resume"));
+        assert_eq!(resume_arg(Agent::Cursor), Some("--resume"));
+        assert_eq!(resume_arg(Agent::Opencode), None);
+        assert_eq!(resume_arg(Agent::Codex), None);
     }
 
     #[test]
