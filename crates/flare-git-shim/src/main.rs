@@ -44,6 +44,16 @@ const BYPASS_ENV: &str = "AGENTFLARE_GIT_BYPASS"; // one-shot: set at all -> byp
 const BYPASS_AGENT_ENV: &str = "AGENTFLARE_GIT_BYPASS_AGENT"; // bypass iff it equals AGENTFLARE_AGENT
 const BYPASS_UNTIL_ENV: &str = "AGENTFLARE_GIT_BYPASS_UNTIL"; // bypass iff now < this unix epoch
 
+// Not a bypass, and not read anywhere in this crate -- noted here anyway
+// since it lives in the same "env var that changes agent/human
+// classification" family as the trio above. `AGENTFLARE_GIT_ASSUME_HUMAN`
+// is read by `flare_git_core::classify::agent_invocation_detected()`: set
+// to a non-empty value, it short-circuits detection to `false` before the
+// `agent-detector` process-tree walk (which no env-var stripping can
+// neutralize) even runs. Test-only, set by this crate's `human_shim` test
+// helper (see `tests/shim_test.rs`) so its "human" assertions hold even
+// when the test suite itself runs under an agent-driven session.
+
 /// `AGENTFLARE_GIT_SNAPSHOTS=0`/`off` disables the automatic pre-destructive
 /// snapshot; any other value (or unset) leaves it enabled. Snapshotting is
 /// a pure safety net (never blocks the underlying op even on failure), so

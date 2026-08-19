@@ -52,51 +52,14 @@ use flare_workflow::store::InMemoryStore;
 use flare_workflow::{WorkflowDefinition, WorkflowEngine, WorkflowId};
 use std::sync::Arc;
 
-/// Wires a bare local repo up as `origin` and pushes to it — same
-/// pattern `item_pr_failure_tests.rs`'s own fixture uses. Remotes are
-/// repo-wide (`.git/config`), so adding one to `repo_root` makes it
-/// visible from any of that repo's worktrees, including the item's own
-/// claimed worktree these tests dispatch into. Needed because
-/// `mcp_with_claimed_item`/`claim_harness` deliberately set up no
-/// `origin` at all, and `item_done` hard-fails (#482) when a real
-/// commit's push fails.
-fn add_origin_remote(repo_root: &std::path::Path) {
-    let origin_dir = tempfile::tempdir().unwrap();
-    let run = |dir: &std::path::Path, args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
-    run(origin_dir.path(), &["init", "--bare", "-b", "master"]);
-    run(
-        repo_root,
-        &[
-            "remote",
-            "add",
-            "origin",
-            origin_dir.path().to_str().unwrap(),
-        ],
-    );
-    run(repo_root, &["push", "origin", "master"]);
-    std::mem::forget(origin_dir);
-}
-
 #[tokio::test]
 #[ignore = "item_done hard-fails (#482) unless push succeeds AND a PR is \
             created; push_and_open_pr can't recognize a local bare repo \
             as GitHub, and this codebase has no mock GitHub client — \
             needs a real GitHub remote + credentials to reach Completed"]
 async fn finalize_step_calls_item_done_on_success() {
-    let (mcp, _backend_tmp, repo_tmp, item_id, project_id, worktree_path) =
+    let (mcp, _backend_tmp, _repo_tmp, item_id, project_id, worktree_path) =
         crate::mcp_server::tests::mcp_with_claimed_item("Finalize test item");
-    add_origin_remote(repo_tmp.path());
     // Something real to commit — otherwise `item_done` sees a
     // never-diverged branch and treats it as a no-op ("unchanged")
     // rather than a completion.
@@ -292,6 +255,98 @@ async fn finalize_step_uses_accumulated_review_findings_when_last_report_was_cle
     panic!("finalize step did not complete");
 }
 
+#[tokio::test]
+async fn finalize_step_releases_claim_when_human_review_gate_is_hit() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, _worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Human-review finalize test item");
+    let mcp = Arc::new(mcp);
+    let owner = crate::claims::owner_id();
+
+    let data = WorkItemData {
+        review_issues: Some("- still broken".into()),
+        ..Default::default()
+    };
+    let step = build_finalize_step(mcp.clone(), item_id.clone(), None, owner.clone());
+    let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
+    let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
+    engine.register_workflow(wf).unwrap();
+    let run_id = engine
+        .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+        .await
+        .unwrap();
+
+    for _ in 0..50 {
+        let state = engine.get_status(run_id).await.unwrap();
+        if state.status == flare_workflow::WorkflowStatus::Completed {
+            let still_claimed = mcp
+                .with_backend_db(|conn| {
+                    agentflare_backend::claim::is_owner(conn, &item_id, &owner)
+                        .map_err(|e| e.to_string())
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                !still_claimed,
+                "finalize must release the claim when gating for human review"
+            );
+            return;
+        }
+        if state.status == flare_workflow::WorkflowStatus::Failed {
+            panic!(
+                "finalize must succeed for human-review gate: {:?}",
+                state.error
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("finalize step did not complete");
+}
+
+#[tokio::test]
+async fn finalize_step_releases_claim_after_review_only_success() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, _worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Review-only claim release test item");
+    let mcp = Arc::new(mcp);
+    let owner = crate::claims::owner_id();
+
+    let data = WorkItemData {
+        review_only: true,
+        last_report: Some("Found an issue.".to_string()),
+        ..Default::default()
+    };
+    let step = build_finalize_step(mcp.clone(), item_id.clone(), None, owner.clone());
+    let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
+    let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
+    engine.register_workflow(wf).unwrap();
+    let run_id = engine
+        .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+        .await
+        .unwrap();
+
+    for _ in 0..50 {
+        let state = engine.get_status(run_id).await.unwrap();
+        if state.status == flare_workflow::WorkflowStatus::Completed {
+            let still_claimed = mcp
+                .with_backend_db(|conn| {
+                    agentflare_backend::claim::is_owner(conn, &item_id, &owner)
+                        .map_err(|e| e.to_string())
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                !still_claimed,
+                "finalize must release the claim after a review-only run"
+            );
+            return;
+        }
+        if state.status == flare_workflow::WorkflowStatus::Failed {
+            panic!("finalize must not fail for review-only: {:?}", state.error);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("finalize step did not complete");
+}
+
 // requires a real headless agent binary; run manually / in an
 // environment with one installed — the mock-sender variant right below
 // covers the same metadata-persistence assertion unconditionally.
@@ -351,9 +406,8 @@ fn run_or_resume_persists_run_id_and_resume_skips_completed_coder_step() {
 /// `item_done` call hard-fails on the missing PR (#482).
 #[test]
 fn run_or_resume_with_sender_persists_run_id_on_success() {
-    let (mcp, _backend_tmp, repo_tmp, item_id, _project_id, worktree_path) =
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
         crate::mcp_server::tests::mcp_with_claimed_item("Run-or-resume mock-sender test item");
-    add_origin_remote(repo_tmp.path());
     // Something real to commit — otherwise `finalize`'s `item_done` call
     // sees a never-diverged branch and treats it as a no-op rather than
     // a completion (see `finalize_step_calls_item_done_on_success`).
@@ -399,8 +453,8 @@ fn run_or_resume_with_sender_persists_run_id_on_success() {
             send,
         )
     });
-    // `add_origin_remote` gives `git push` a real target but not a real
-    // GitHub remote, so `finalize`'s `item_done` call correctly
+    // `mcp_with_claimed_item` wires a local bare `origin`, so `git push`
+    // succeeds but not a real GitHub remote — `finalize`'s `item_done` call
     // hard-fails on the missing PR (item #109 / PR #482) -- same
     // reasoning as `finalize_step_calls_item_done_on_success` right
     // above, which needs `#[ignore]` for the same root cause since it
@@ -415,6 +469,88 @@ fn run_or_resume_with_sender_persists_run_id_on_success() {
         .unwrap();
     let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
     assert!(metadata["workflow_run_id"].as_str().is_some());
+}
+
+// Item #512: bare `task/<N>` checkout + renamed slug hid divergence from
+// `item_done`; finalize must surface workflow failure (not silent success).
+#[tokio::test]
+async fn finalize_step_fails_when_branch_slug_mismatch_hides_divergence() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("!!!");
+    mcp.with_backend_db(|conn| {
+        agentflare_backend::item::update(
+            conn,
+            &item_id,
+            agentflare_backend::item::UpdateItem {
+                name: Some("Renamed Bugfix Item".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    })
+    .unwrap();
+    std::fs::write(worktree_path.join("real_work.txt"), "real work").unwrap();
+    let mcp = Arc::new(mcp);
+
+    let data = WorkItemData {
+        reply_text: "implemented the thing".into(),
+        ..Default::default()
+    };
+    let step = build_finalize_step(
+        mcp.clone(),
+        item_id.clone(),
+        None,
+        crate::claims::owner_id(),
+    );
+    let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
+    let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
+    engine.register_workflow(wf).unwrap();
+    let run_id = engine
+        .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+        .await
+        .unwrap();
+
+    // `finalize` retries StepFailed up to 3× with 1s exponential backoff.
+    for _ in 0..200 {
+        let state = engine.get_status(run_id).await.unwrap();
+        match state.status {
+            flare_workflow::WorkflowStatus::Failed => {
+                let err = state.error.unwrap_or_default();
+                assert!(
+                    err.contains("no PR resulted")
+                        || err.contains("not marking completed")
+                        || err.contains("One or more steps failed"),
+                    "finalize must fail when item_done hard-errors: {err}"
+                );
+                let comments: serde_json::Value = serde_json::from_str(
+                    &mcp.comment_impl(CommentRequest {
+                        action: "list".into(),
+                        item_id: Some(item_id.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+                let arr = comments.as_array().unwrap();
+                assert!(
+                    arr.iter().any(|c| c["body"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("PR creation failed")),
+                    "finalize failure path must post PR-failure comment: {arr:?}"
+                );
+                return;
+            }
+            flare_workflow::WorkflowStatus::Completed => {
+                panic!(
+                    "finalize must not succeed when item_done errors on slug mismatch: {:?}",
+                    state
+                );
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    panic!("finalize step did not fail");
 }
 
 // Item #331's live failure: a double-JSON-encoded metadata field parses to

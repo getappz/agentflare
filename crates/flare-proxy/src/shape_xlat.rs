@@ -153,15 +153,24 @@ fn translate_assistant_content(content: &Value) -> Value {
     }
 }
 
+/// OpenAI-compatible `tool_choice` is either the bare string `"none"` /
+/// `"auto"` / `"required"`, or `{"type": "function", "function": {"name":
+/// ...}}` for a specific function -- there is no `{"type": "auto"}` /
+/// `{"type": "required"}` object form. Live-verified against OpenRouter: a
+/// wrapped `{"type": "required"}` gets rejected with "data did not match any
+/// variant of untagged enum ChatCompletionToolChoiceOption", breaking every
+/// forced tool-use request (Anthropic's `tool_choice: {"type": "any"}`,
+/// which Claude Code itself sends for many tool calls).
 fn translate_tool_choice(tc: &Value) -> Value {
     let type_ = tc.get("type").and_then(|v| v.as_str()).unwrap_or("auto");
     match type_ {
-        "any" => json!({ "type": "required" }),
+        "any" => json!("required"),
         "tool" => {
             let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
             json!({ "type": "function", "function": { "name": name } })
         }
-        _ => json!({ "type": type_ }),
+        "none" => json!("none"),
+        _ => json!("auto"),
     }
 }
 
@@ -527,6 +536,17 @@ pub fn gemini_chunk_to_anthropic_sse(chunk: &Value, buffer: &mut AnthropicStream
 /// extraction) must do so — and register/close their own indices — before
 /// calling this, since it ends the message.
 pub fn finish_stream(chunk: &Value, buffer: &mut AnthropicStreamBuffer) -> Vec<u8> {
+    // Some OpenAI-compatible upstreams (observed live on OpenRouter) send a
+    // trailing usage-only chunk that repeats `finish_reason` after the chunk
+    // that actually closed the message. Without this guard, that second
+    // chunk re-triggers a full finish, emitting a second `message_stop` --
+    // invalid per Anthropic's Messages streaming protocol, since a stream
+    // must terminate in exactly one `message_stop`.
+    if buffer.finished {
+        return Vec::new();
+    }
+    buffer.finished = true;
+
     let mut out = Vec::new();
 
     let finish_reason = chunk
@@ -585,6 +605,13 @@ pub fn finish_stream(chunk: &Value, buffer: &mut AnthropicStreamBuffer) -> Vec<u
 /// opens a tool_use block) catches that case so the client still sees
 /// `stop_reason: "tool_use"` and knows to execute the call.
 pub fn gemini_finish_stream(chunk: &Value, buffer: &mut AnthropicStreamBuffer) -> Vec<u8> {
+    // See finish_stream's comment: guards against a repeated finish chunk
+    // re-emitting a second message_stop.
+    if buffer.finished {
+        return Vec::new();
+    }
+    buffer.finished = true;
+
     let mut out = Vec::new();
 
     let finish_reason = chunk
@@ -646,6 +673,7 @@ pub struct AnthropicStreamBuffer {
     pub open_indices: std::collections::BTreeSet<usize>,
     pub tool_index_map: std::collections::HashMap<u64, usize>,
     pub has_tool_use: bool,
+    pub finished: bool,
 }
 
 fn emit_event(out: &mut Vec<u8>, event: &str, data: &Value) {
@@ -782,7 +810,36 @@ mod tests {
         });
         let openai = messages_to_chat(&anthropic).unwrap();
         assert_eq!(openai["tools"][0]["function"]["name"], "get_weather");
-        assert_eq!(openai["tool_choice"]["type"], "auto");
+        // Bare string, not {"type": "auto"} -- see translate_tool_choice's
+        // doc comment for why the object form is rejected by real providers.
+        assert_eq!(openai["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn test_translate_tool_choice_any_becomes_bare_required_string() {
+        // Anthropic's "any" (force some tool call) must translate to the
+        // bare string "required", not {"type": "required"} -- OpenRouter
+        // live-verified rejects the object form with "data did not match
+        // any variant of untagged enum ChatCompletionToolChoiceOption".
+        let anthropic = json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "any"}
+        });
+        let openai = messages_to_chat(&anthropic).unwrap();
+        assert_eq!(openai["tool_choice"], "required");
+    }
+
+    #[test]
+    fn test_translate_tool_choice_specific_tool_keeps_object_form() {
+        let anthropic = json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "tool", "name": "get_weather"}
+        });
+        let openai = messages_to_chat(&anthropic).unwrap();
+        assert_eq!(openai["tool_choice"]["type"], "function");
+        assert_eq!(openai["tool_choice"]["function"]["name"], "get_weather");
     }
 
     #[test]
@@ -823,6 +880,39 @@ mod tests {
             last_block_stop_pos < stop_pos,
             "content_block_stop must precede message_stop"
         );
+    }
+
+    #[test]
+    fn test_finish_stream_ignores_repeated_finish_chunk() {
+        // Some OpenAI-compatible upstreams (observed live on OpenRouter)
+        // send a trailing usage-only chunk that repeats finish_reason after
+        // the chunk that actually closed the message.
+        let mut buffer = AnthropicStreamBuffer::default();
+        buffer.open_indices.insert(0);
+
+        let first =
+            json!({"choices": [{"finish_reason": "stop"}], "usage": {"completion_tokens": 0}});
+        let out1 = String::from_utf8(finish_stream(&first, &mut buffer)).unwrap();
+        assert_eq!(out1.matches("event: message_stop").count(), 1);
+
+        let second =
+            json!({"choices": [{"finish_reason": "stop"}], "usage": {"completion_tokens": 62}});
+        let out2 = finish_stream(&second, &mut buffer);
+        assert!(out2.is_empty(), "repeated finish chunk must be a no-op");
+    }
+
+    #[test]
+    fn test_gemini_finish_stream_ignores_repeated_finish_chunk() {
+        let mut buffer = AnthropicStreamBuffer::default();
+        buffer.open_indices.insert(0);
+
+        let first = json!({"candidates": [{"finishReason": "STOP"}]});
+        let out1 = String::from_utf8(gemini_finish_stream(&first, &mut buffer)).unwrap();
+        assert_eq!(out1.matches("event: message_stop").count(), 1);
+
+        let second = json!({"candidates": [{"finishReason": "STOP"}]});
+        let out2 = gemini_finish_stream(&second, &mut buffer);
+        assert!(out2.is_empty(), "repeated finish chunk must be a no-op");
     }
 
     #[test]

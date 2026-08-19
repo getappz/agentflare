@@ -138,21 +138,23 @@ fn restore_ready_for_work(mcp: &crate::mcp_server::AgentflareMcp, item_id: &str,
 /// label swap. Left alone the item stays labeled `dispatched` forever,
 /// invisible to `run_discovery_tick` (item #463).
 ///
-/// Swaps to `needs-manual-dispatch` rather than back to `ready-for-work`
-/// when that label exists on the project: a clean retry-exhaustion is more
-/// often an unretryable problem (bad credentials, no billing balance) than
-/// a transient one, and blindly re-queueing would just retry-loop against
-/// the same broken agent. Falls back to `ready-for-work` when
-/// `needs-manual-dispatch` hasn't been created for this project (unlike
-/// that label, `ready-for-work` is guaranteed to exist -- a project can
-/// only ever have reached `dispatch_item` by already having it) so the item
-/// never ends up worse off than before this hook existed: still stuck, just
-/// unlabeled.
+/// Below `dispatch_failure_ceiling::DISPATCH_FAILURE_CAP` consecutive
+/// dispatch cycles with the same terminal failure reason (one cycle per
+/// `## supervisor — dispatched` comment — intra-job retries within a cycle
+/// do not increment the count; see that module), swaps back to
+/// `ready-for-work` so a transient failure can auto-redispatch on the next
+/// discovery tick. At or above the cap, stops auto-redispatch: lands on
+/// `needs-manual-dispatch` when that label exists on the project, otherwise
+/// leaves the item off `ready-for-work` with a supervisor cap comment so a
+/// human/PM must intervene (`item action=redispatch` after fixing the root
+/// cause). Orphan-restart recovery (`restore_ready_for_work` above)
+/// deliberately does not apply this cap — a daemon death mid-job is not
+/// evidence of a deterministic failure class.
 pub(super) fn handle_terminal_job_failure(job: &agentflare_jobs::AgentJob) {
     if !job.in_process {
         return;
     }
-    let (Some(item_id), Some(_agent)) = (job.args.first(), job.args.get(1)) else {
+    let (Some(item_id), Some(agent)) = (job.args.first(), job.args.get(1)) else {
         return;
     };
     let mcp = match job.args.get(2) {
@@ -161,7 +163,7 @@ pub(super) fn handle_terminal_job_failure(job: &agentflare_jobs::AgentJob) {
         }
         None => crate::mcp_server::AgentflareMcp::default(),
     };
-    let _ = mcp.with_backend_db(|conn| -> Option<()> {
+    let cap_reached = mcp.with_backend_db(|conn| -> Option<bool> {
         let item = agentflare_backend::item::get(conn, item_id).ok()?;
         let state = agentflare_backend::state::get(conn, &item.state_id).ok()?;
         if matches!(state.group_name.as_str(), "completed" | "cancelled") {
@@ -175,16 +177,86 @@ pub(super) fn handle_terminal_job_failure(job: &agentflare_jobs::AgentJob) {
         {
             let _ = agentflare_backend::item::remove_label(conn, item_id, &dispatched_id.id);
         }
-        let target_id = &labels
+
+        let comments = agentflare_backend::comment::list_by_item(conn, item_id).ok()?;
+        let failure_count =
+            crate::dispatch_failure_ceiling::consecutive_identical_failure_count(&comments);
+        let at_cap = failure_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP;
+
+        if at_cap {
+            // Same restoration as the below-cap branch: `release_and_comment`
+            // already cleared `assignee_agent` via `item_release`. The cap
+            // comment tells a human to run `item action=redispatch`, which
+            // requires an existing `assignee_agent` unless one is passed
+            // explicitly — leaving it cleared here would make that
+            // instruction fail.
+            agentflare_backend::item::update(
+                conn,
+                item_id,
+                agentflare_backend::item::UpdateItem {
+                    assignee_agent: Some(agent.clone()),
+                    ..Default::default()
+                },
+            )
+            .ok();
+            if let Some(manual_id) = labels
+                .iter()
+                .find(|l| l.name == crate::supervisor::NEEDS_MANUAL_LABEL)
+            {
+                agentflare_backend::item::add_label(conn, item_id, &manual_id.id).ok();
+            }
+            Some(true)
+        } else if let Some(ready_id) = labels
             .iter()
-            .find(|l| l.name == crate::supervisor::NEEDS_MANUAL_LABEL)
-            .or_else(|| {
-                labels
-                    .iter()
-                    .find(|l| l.name == crate::supervisor::READY_LABEL)
-            })?
-            .id;
-        agentflare_backend::item::add_label(conn, item_id, target_id).ok()
+            .find(|l| l.name == crate::supervisor::READY_LABEL)
+        {
+            // `release_and_comment` clears assignee via `item_release`; without
+            // restoring it the next discovery tick hits `skip_item` (item
+            // #150). Restore it before adding the label so a mid-failure here
+            // never leaves the item labeled ready-for-work with no assignee.
+            agentflare_backend::item::update(
+                conn,
+                item_id,
+                agentflare_backend::item::UpdateItem {
+                    assignee_agent: Some(agent.clone()),
+                    ..Default::default()
+                },
+            )
+            .ok()?;
+            agentflare_backend::item::add_label(conn, item_id, &ready_id.id).ok();
+            Some(false)
+        } else {
+            None
+        }
+    });
+
+    let Ok(Some(true)) = cap_reached else {
+        return;
+    };
+
+    let reason_preview = mcp
+        .with_backend_db(|conn| {
+            let comments = agentflare_backend::comment::list_by_item(conn, item_id).ok()?;
+            crate::dispatch_failure_ceiling::latest_failure_reason(&comments)
+        })
+        .ok()
+        .flatten();
+
+    let cap = crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP;
+    let mut body = format!(
+        "{}\n\n{cap} consecutive identical failures detected — auto-redispatch stopped. \
+         Review the failure comments, fix the underlying issue, then \
+         `item action=redispatch` to retry.",
+        crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP_MARKER,
+    );
+    if let Some(reason) = reason_preview {
+        body.push_str(&format!("\n\nLast failure: `{reason}`"));
+    }
+    let _ = mcp.comment_impl(crate::mcp_server::types::CommentRequest {
+        action: "create".into(),
+        item_id: Some(item_id.clone()),
+        body: Some(body),
+        ..Default::default()
     });
 }
 
@@ -660,14 +732,91 @@ mod tests {
         .unwrap()
     }
 
-    /// Item #463: a job that runs to completion and cleanly fails after
+    fn seed_dispatch_cycle_failures(
+        mcp: &crate::mcp_server::AgentflareMcp,
+        item_id: &str,
+        cycles: u32,
+        reason: &str,
+    ) {
+        let failure_body = format!(
+            "{}\n\n{reason}",
+            crate::dispatch_failure_ceiling::WORK_FAILURE_MARKER
+        );
+        mcp.with_backend_db(|conn| {
+            for i in 0..cycles {
+                agentflare_backend::comment::create(
+                    conn,
+                    item_id,
+                    "test",
+                    &format!(
+                        "{}\n\njob: cycle-{i}",
+                        crate::dispatch_failure_ceiling::DISPATCH_MARKER
+                    ),
+                )
+                .unwrap();
+                // Second-resolution timestamps + random nanoid ids can reorder
+                // comments posted in the same second — stagger so dispatch
+                // always precedes its failure in `list_by_item` order.
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                agentflare_backend::comment::create(conn, item_id, "test", &failure_body).unwrap();
+                if i + 1 < cycles {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+            Some(())
+        })
+        .unwrap();
+    }
+
+    fn wait_for_terminal_job(queue: &Queue, id: &str) -> agentflare_jobs::JobInfo {
+        for _ in 0..500 {
+            if let Ok(info) = queue.get(id)
+                && info.state.is_terminal()
+            {
+                return info;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("job {id} did not reach terminal state");
+    }
+
+    /// Mirrors `WorkItemExecutor`'s per-attempt failure path: each queue
+    /// retry calls `release_and_comment` before returning a retryable error.
+    struct RetryAwareFailingExecutor {
+        mcp: std::sync::Arc<crate::mcp_server::AgentflareMcp>,
+        reason: String,
+    }
+
+    impl agentflare_jobs::InProcessExecutor for RetryAwareFailingExecutor {
+        fn execute(
+            &self,
+            job_id: &str,
+            args: &[String],
+            _log: &mut dyn std::io::Write,
+        ) -> Result<(), agentflare_jobs::JobFailure> {
+            let Some(item_id) = args.first() else {
+                return Err("malformed in-process work job: missing item_id".into());
+            };
+            let agent = args.get(1).map(String::as_str).unwrap_or("claude-code");
+            let owner = format!("{agent}:{job_id}");
+            crate::claims::with_owner_override(owner, || {
+                crate::cli::work::release_and_comment(&self.mcp, item_id, &self.reason, None);
+            });
+            Err(agentflare_jobs::JobFailure {
+                message: self.reason.clone(),
+                retry_after_secs: None,
+                fatal: false,
+            })
+        }
+    }
+
+    /// Item #463/#506: a job that runs to completion and cleanly fails after
     /// exhausting `max_retries` is *not* orphaned (the process never died),
     /// so `reconcile_orphaned_jobs` above never sees it. Without this hook
     /// the item stays labeled `dispatched` forever -- invisible to
-    /// `run_discovery_tick`, silently undispatchable. Confirms
-    /// `handle_terminal_job_failure` swaps `dispatched` for
-    /// `needs-manual-dispatch` (not straight back to `ready-for-work`) when
-    /// that label exists, so a broken agent doesn't just retry-loop.
+    /// `run_discovery_tick`, silently undispatchable. After
+    /// `DISPATCH_FAILURE_CAP` consecutive identical dispatch cycles, lands on
+    /// `needs-manual-dispatch` when that label exists.
     #[test]
     fn handle_terminal_job_failure_swaps_dispatched_for_needs_manual_dispatch() {
         crate::paths::test_support::with_temp_home(|| {
@@ -687,6 +836,12 @@ mod tests {
             );
             let dispatched_id = &label_ids[crate::supervisor::DISPATCHED_LABEL];
             let item_id = create_dispatched_item(&mcp, dispatched_id);
+            seed_dispatch_cycle_failures(
+                &mcp,
+                &item_id,
+                crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP,
+                "judge reply was not valid JSON",
+            );
 
             let job = agentflare_jobs::AgentJob::new("agentflare-work")
                 .args([
@@ -704,7 +859,7 @@ mod tests {
                 .unwrap();
             assert!(
                 labels.contains(&label_ids[crate::supervisor::NEEDS_MANUAL_LABEL]),
-                "a clean retry-exhaustion must land on needs-manual-dispatch, not silently vanish (item #463)"
+                "identical-failure cap must land on needs-manual-dispatch (item #506)"
             );
             assert!(
                 !labels.contains(dispatched_id),
@@ -712,17 +867,121 @@ mod tests {
             );
             assert!(
                 !labels.contains(&label_ids[crate::supervisor::READY_LABEL]),
-                "needs-manual-dispatch exists on this project, so ready-for-work is the wrong \
-                 target -- it would just retry-loop against the same broken agent"
+                "at the identical-failure cap, ready-for-work would just retry-loop"
             );
+            let comments = mcp
+                .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert!(
+                comments.iter().any(|c| c
+                    .body
+                    .starts_with(crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP_MARKER)),
+                "cap trip must post a supervisor comment for PM review"
+            );
+        });
+    }
+
+    /// Item #506 CodeRabbit follow-up: at cap, `assignee_agent` must be
+    /// restored too (same as the below-cap branch) so the cap comment's own
+    /// `item action=redispatch` instruction works without the caller having
+    /// to pass `assignee_agent` explicitly.
+    #[test]
+    fn handle_terminal_job_failure_restores_assignee_agent_at_cap() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let label_ids = seed_labels(
+                &mcp,
+                &[
+                    crate::supervisor::READY_LABEL,
+                    crate::supervisor::DISPATCHED_LABEL,
+                    crate::supervisor::NEEDS_MANUAL_LABEL,
+                ],
+            );
+            let dispatched_id = &label_ids[crate::supervisor::DISPATCHED_LABEL];
+            let item_id = create_dispatched_item(&mcp, dispatched_id);
+            seed_dispatch_cycle_failures(
+                &mcp,
+                &item_id,
+                crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP,
+                "judge reply was not valid JSON",
+            );
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+
+            handle_terminal_job_failure(&job);
+
+            let item = mcp
+                .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                item.assignee_agent.as_deref(),
+                Some("claude-code"),
+                "at-cap terminal hook must restore assignee_agent so \
+                 `item action=redispatch` works without an explicit override"
+            );
+        });
+    }
+
+    /// Below the cap, a project with `needs-manual-dispatch` still gets
+    /// `ready-for-work` so a transient failure can auto-redispatch.
+    #[test]
+    fn handle_terminal_job_failure_restores_ready_for_work_below_identical_failure_cap() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let label_ids = seed_labels(
+                &mcp,
+                &[
+                    crate::supervisor::READY_LABEL,
+                    crate::supervisor::DISPATCHED_LABEL,
+                    crate::supervisor::NEEDS_MANUAL_LABEL,
+                ],
+            );
+            let dispatched_id = &label_ids[crate::supervisor::DISPATCHED_LABEL];
+            let item_id = create_dispatched_item(&mcp, dispatched_id);
+            seed_dispatch_cycle_failures(&mcp, &item_id, 1, "transient network blip");
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+
+            handle_terminal_job_failure(&job);
+
+            let labels = mcp
+                .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert!(labels.contains(&label_ids[crate::supervisor::READY_LABEL]));
+            assert!(!labels.contains(&label_ids[crate::supervisor::NEEDS_MANUAL_LABEL]));
         });
     }
 
     /// Same clean-failure path as above, but the project never created a
     /// `needs-manual-dispatch` label (that label is only ever added by hand
-    /// -- unlike `ready-for-work`/`dispatched`, nothing seeds it). Falling
-    /// back to `ready-for-work` keeps the item dispatchable instead of
-    /// leaving it stuck exactly as before this hook existed.
+    /// -- unlike `ready-for-work`/`dispatched`, nothing seeds it). Below the
+    /// identical-failure cap, falling back to `ready-for-work` keeps the
+    /// item dispatchable.
     #[test]
     fn handle_terminal_job_failure_falls_back_to_ready_for_work_without_needs_manual_label() {
         crate::paths::test_support::with_temp_home(|| {
@@ -762,6 +1021,283 @@ mod tests {
                  recover to ready-for-work rather than staying stuck on dispatched"
             );
             assert!(!labels.contains(dispatched_id));
+        });
+    }
+
+    /// At the identical-failure cap without a `needs-manual-dispatch` label,
+    /// the item must not go back to `ready-for-work` (that was the unbounded
+    /// retry-loop path before item #506).
+    #[test]
+    fn handle_terminal_job_failure_stops_auto_redispatch_at_cap_without_needs_manual_label() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let label_ids = seed_labels(
+                &mcp,
+                &[
+                    crate::supervisor::READY_LABEL,
+                    crate::supervisor::DISPATCHED_LABEL,
+                ],
+            );
+            let dispatched_id = &label_ids[crate::supervisor::DISPATCHED_LABEL];
+            let item_id = create_dispatched_item(&mcp, dispatched_id);
+            seed_dispatch_cycle_failures(
+                &mcp,
+                &item_id,
+                crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP,
+                "same deterministic error",
+            );
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+
+            handle_terminal_job_failure(&job);
+
+            let labels = mcp
+                .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert!(
+                !labels.contains(&label_ids[crate::supervisor::READY_LABEL]),
+                "at cap the item must not be auto-redispatchable"
+            );
+            assert!(!labels.contains(dispatched_id));
+        });
+    }
+
+    /// Item #506: default `max_retries = 3` posts four identical failure
+    /// comments within one dispatch cycle. The cap must count that as one
+    /// cycle — first terminal hook restores `ready-for-work`, not
+    /// `needs-manual-dispatch`.
+    #[test]
+    fn handle_terminal_job_failure_after_default_intra_job_retries_still_auto_redispatches() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = std::sync::Arc::new(crate::mcp_server::AgentflareMcp::for_project_dir(
+                repo_root.clone(),
+            ));
+            let label_ids = seed_labels(
+                &mcp,
+                &[
+                    crate::supervisor::READY_LABEL,
+                    crate::supervisor::DISPATCHED_LABEL,
+                    crate::supervisor::NEEDS_MANUAL_LABEL,
+                ],
+            );
+            let dispatched_id = &label_ids[crate::supervisor::DISPATCHED_LABEL];
+            let item_id = create_dispatched_item(&mcp, dispatched_id);
+
+            let reason = "judge reply was not valid JSON";
+            mcp.with_backend_db(|conn| {
+                agentflare_backend::comment::create(
+                    conn,
+                    &item_id,
+                    "test",
+                    &format!(
+                        "{}\n\njob: integration-test",
+                        crate::dispatch_failure_ceiling::DISPATCH_MARKER
+                    ),
+                )
+                .unwrap();
+                Some(())
+            })
+            .unwrap();
+            // Second-resolution timestamps can reorder comments posted in the
+            // same second — ensure dispatch precedes failure comments in
+            // `list_by_item` order (same stagger as `seed_dispatch_cycle_failures`).
+            std::thread::sleep(std::time::Duration::from_secs(1));
+
+            let queue = test_queue();
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+            let info = queue.enqueue(&job).unwrap();
+
+            let mut pool = agentflare_jobs::WorkerPool::new(queue.clone())
+                .with_executor(std::sync::Arc::new(RetryAwareFailingExecutor {
+                    mcp: mcp.clone(),
+                    reason: reason.into(),
+                }))
+                .with_terminal_failure_hook(std::sync::Arc::new(|_job_id, job| {
+                    handle_terminal_job_failure(job);
+                }));
+            pool.start(1);
+
+            let terminal = wait_for_terminal_job(&queue, &info.id);
+            pool.shutdown();
+
+            assert_eq!(terminal.state, JobState::Failed);
+            assert_eq!(
+                terminal.retries, 3,
+                "default max_retries budget must be exhausted before the hook runs"
+            );
+
+            let comments = mcp
+                .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            let failure_comments = comments
+                .iter()
+                .filter(|c| {
+                    c.body
+                        .starts_with(crate::dispatch_failure_ceiling::WORK_FAILURE_MARKER)
+                })
+                .count();
+            assert_eq!(
+                failure_comments, 4,
+                "one dispatch cycle with max_retries=3 posts four failure comments"
+            );
+            assert_eq!(
+                crate::dispatch_failure_ceiling::consecutive_identical_failure_count(&comments),
+                1,
+                "intra-job retries must not inflate the dispatch-cycle count"
+            );
+
+            let labels = mcp
+                .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert!(
+                labels.contains(&label_ids[crate::supervisor::READY_LABEL]),
+                "first dispatch-cycle terminal failure must restore ready-for-work"
+            );
+            assert!(
+                !labels.contains(&label_ids[crate::supervisor::NEEDS_MANUAL_LABEL]),
+                "intra-job retries must not trip the cap on the first dispatch cycle"
+            );
+            assert!(!labels.contains(dispatched_id));
+        });
+    }
+
+    /// Item #506: below the cap, `release_and_comment` clears `assignee_agent`
+    /// before the terminal hook runs. Without restoring it, the next discovery
+    /// tick hits `skip_item` even though `ready-for-work` was restored.
+    #[test]
+    fn handle_terminal_job_failure_leaves_item_dispatchable_by_discovery_tick() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let label_ids = seed_labels(
+                &mcp,
+                &[
+                    crate::supervisor::READY_LABEL,
+                    crate::supervisor::DISPATCHED_LABEL,
+                    crate::supervisor::NEEDS_MANUAL_LABEL,
+                ],
+            );
+            let dispatched_id = &label_ids[crate::supervisor::DISPATCHED_LABEL];
+            let item_id = mcp
+                .with_backend_db(|conn| {
+                    let project = mcp.resolve_project(conn).unwrap();
+                    let state = agentflare_backend::state::list_by_project(conn, &project.id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|s| s.is_default)
+                        .unwrap();
+                    let item = agentflare_backend::item::create(
+                        conn,
+                        agentflare_backend::item::CreateItem {
+                            project_id: project.id,
+                            state_id: state.id,
+                            name: "terminal failure discovery tick test item".into(),
+                            description: Some("do the thing".into()),
+                            priority: None,
+                            parent_id: None,
+                            assignee_agent: Some("claude-code".into()),
+                            sort_order: None,
+                            external_source: None,
+                            external_id: None,
+                            metadata: None,
+                            label_ids: vec![],
+                            assignee_ids: vec![],
+                            dependency_ids: vec![],
+                        },
+                    )
+                    .unwrap();
+                    agentflare_backend::item::add_label(conn, &item.id, dispatched_id).unwrap();
+                    item.id
+                })
+                .unwrap();
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+            let queue = test_queue();
+            let info = queue.enqueue(&job).unwrap();
+            crate::claims::with_owner_override(format!("claude-code:{}", info.id), || {
+                let claim_json = mcp
+                    .item_claim(crate::mcp_server::types::ItemRequest {
+                        action: "claim".to_string(),
+                        id: Some(item_id.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let claim: serde_json::Value = serde_json::from_str(&claim_json).unwrap();
+                assert_eq!(claim["status"], "acquired");
+                crate::cli::work::release_and_comment(
+                    &mcp,
+                    &item_id,
+                    "transient network blip",
+                    None,
+                );
+            });
+
+            handle_terminal_job_failure(&job);
+
+            let item = mcp
+                .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                item.assignee_agent.as_deref(),
+                Some("claude-code"),
+                "below-cap terminal hook must restore assignee_agent after release_and_comment (item #150)"
+            );
+            let labels = mcp
+                .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert!(labels.contains(&label_ids[crate::supervisor::READY_LABEL]));
+            assert!(!labels.contains(dispatched_id));
+
+            let auth_conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::auth_db::migrate(&auth_conn).unwrap();
+            let result = crate::supervisor::run_discovery_tick(
+                &mcp,
+                &queue,
+                &auth_conn,
+                agentflare_resource_gate::Policy::Normal,
+            );
+            assert_eq!(
+                result.dispatched, 1,
+                "below-cap terminal failure must auto-redispatch on the next discovery tick (item #506)"
+            );
+            assert_eq!(result.skipped, 0);
         });
     }
 

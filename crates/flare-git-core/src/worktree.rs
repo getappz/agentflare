@@ -294,6 +294,24 @@ fn resolve_worktree_branch(item: &Item, worktree_path: &Path) -> String {
     task_branch_name(item)
 }
 
+/// The branch `item`'s worktree is (or should be) on — whatever is
+/// actually checked out at `.worktrees/task/<sequence_id>`, falling back
+/// to [`task_branch_name`] only when no worktree exists yet. `push_branch`
+/// and `item_done`'s divergence classification must both use this instead
+/// of recomputing `task_branch_name` alone: a rename (or a worktree
+/// created before the slugged naming scheme) leaves the checkout on the
+/// old `task/<N>` or `task/<N>-<old-slug>` ref while `task_branch_name`
+/// silently points at a different, often non-existent ref — so push runs
+/// against the real branch but `item_done` thinks nothing diverged and
+/// returns Ok without push/PR/error (item #331 / #512).
+pub fn resolve_item_task_branch(item: &Item, repo_root: &Path) -> String {
+    let worktree_path = repo_root
+        .join(".worktrees")
+        .join("task")
+        .join(item.sequence_id.to_string());
+    resolve_worktree_branch(item, &worktree_path)
+}
+
 /// Creates an isolated git worktree for `item` against `target_branch`.
 ///
 /// Deliberately takes an already-resolved `target_branch` instead of a
@@ -657,7 +675,7 @@ pub fn push_branch(
     if !worktree_path.exists() {
         return None; // nothing was ever claimed into a worktree for this item
     }
-    let branch = resolve_worktree_branch(item, &worktree_path);
+    let branch = resolve_item_task_branch(item, repo_root);
     // Nothing to push (and nothing worth a PR) if the branch never
     // diverged from its target — e.g. `done` called with no commits made.
     if !branch_diverged(repo_root, &branch, target_branch) {

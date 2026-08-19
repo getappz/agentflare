@@ -128,8 +128,19 @@ pub fn extra_trust_root_paths_from_env() -> Vec<String> {
 /// about, and `bypass_agent_env_var_bypasses_only_for_the_matching_agent`
 /// (flare-git-shim's own tests) depends on it alone being sufficient to
 /// count as agent-invoked.
+///
+/// `AGENTFLARE_GIT_ASSUME_HUMAN`, when set to a non-empty value,
+/// short-circuits this to `false` before either check runs. This crate is
+/// compiled with `agent-detector`'s `process-tree` feature, which walks
+/// ancestor processes for agent markers (opencode/claude/cursor/...) --
+/// a signal no env var can strip. Test-only escape hatch for suites that
+/// need to prove the human path while running *under* an agent-driven
+/// session themselves (see `flare-git-shim`'s `human_shim` test helper).
 #[must_use]
 pub fn agent_invocation_detected() -> bool {
+    if std::env::var_os("AGENTFLARE_GIT_ASSUME_HUMAN").is_some_and(|s| !s.is_empty()) {
+        return false;
+    }
     agent_detector::is_agent()
         || std::env::var_os("AGENTFLARE_AGENT").is_some_and(|s| !s.is_empty())
 }

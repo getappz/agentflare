@@ -1150,6 +1150,8 @@ impl AgentflareMcp {
             return Err(ErrorData::invalid_params("id is required", None));
         }
         let assignee_agent = req.assignee_agent.clone();
+        let now = crate::claims::now();
+        let ttl = crate::mcp_server::types::backend_claim_ttl_secs();
         self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
             let outcome = agentflare_backend::item::redispatch(
@@ -1159,14 +1161,34 @@ impl AgentflareMcp {
             )
             .map_err(map_backend_err)?;
             match outcome {
-                agentflare_backend::item::RedispatchOutcome::Ready { assignee_agent } => Ok(
-                    serde_json::json!({
+                agentflare_backend::item::RedispatchOutcome::Ready { assignee_agent } => {
+                    let effective_ttl =
+                        agentflare_backend::claim::effective_ttl_secs(conn, &item_id, ttl);
+                    let live = agentflare_backend::claim::live_claim_on_item(
+                        conn,
+                        &item_id,
+                        now,
+                        effective_ttl,
+                    )
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                    let blocked_by = live.filter(|c| c.owner != assignee_agent);
+                    let dispatchable = blocked_by.is_none();
+                    let mut resp = serde_json::json!({
                         "item_id": item_id,
                         "ready": true,
+                        "dispatchable": dispatchable,
                         "assignee_agent": assignee_agent,
-                    })
-                    .to_string(),
-                ),
+                    });
+                    if let Some(live) = blocked_by {
+                        resp["blocked_by_live_claim"] = serde_json::json!({
+                            "owner": live.owner,
+                            "age_secs": live.age_secs,
+                            "ttl_secs": effective_ttl,
+                            "reason": "another agent already holds a live claim on this item",
+                        });
+                    }
+                    Ok(resp.to_string())
+                },
                 agentflare_backend::item::RedispatchOutcome::NoAssignee => {
                     Err(ErrorData::invalid_params(
                         format!(
