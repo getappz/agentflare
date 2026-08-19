@@ -32,11 +32,21 @@ pub(crate) fn normalize_failure_reason(reason: &str) -> String {
 
 /// One entry per dispatch cycle: the normalized terminal failure reason for
 /// the segment after each `DISPATCH_MARKER` comment (through the next dispatch
-/// marker or end of thread). Intra-job retries only update that segment's
-/// reason — they do not add cycles.
+/// marker or end of thread), plus whether that segment is where the cap was
+/// last reported. Intra-job retries only update that segment's reason — they
+/// do not add cycles.
+struct DispatchCycle {
+    reason: String,
+    /// This cycle's segment contains `DISPATCH_FAILURE_CAP_MARKER` — the cap
+    /// was already reported for it. A later streak must not chain across it
+    /// even if the reason repeats, or a post-redispatch retry would re-trip
+    /// the cap with no retry budget.
+    cap_already_reported: bool,
+}
+
 fn dispatch_cycle_failure_reasons(
     comments: &[agentflare_backend::comment::ItemComment],
-) -> Vec<String> {
+) -> Vec<DispatchCycle> {
     let dispatch_indices: Vec<usize> = comments
         .iter()
         .enumerate()
@@ -44,7 +54,7 @@ fn dispatch_cycle_failure_reasons(
         .map(|(i, _)| i)
         .collect();
 
-    let mut reasons = Vec::new();
+    let mut cycles = Vec::new();
     for (idx, &start) in dispatch_indices.iter().enumerate() {
         let end = dispatch_indices
             .get(idx + 1)
@@ -55,7 +65,7 @@ fn dispatch_cycle_failure_reasons(
             .iter()
             .any(|c| c.body.starts_with(WORK_SUCCESS_MARKER))
         {
-            reasons.clear();
+            cycles.clear();
             continue;
         }
         let Some(reason) = segment
@@ -63,32 +73,57 @@ fn dispatch_cycle_failure_reasons(
             .rev()
             .find_map(|c| failure_reason(&c.body).map(normalize_failure_reason))
         else {
+            // No terminal failure recorded for this cycle (e.g. an
+            // orphan-restart via `restore_ready_for_work`, which
+            // deliberately posts no marker — a daemon death mid-job is not
+            // evidence of a deterministic failure class). Its outcome is
+            // unknown, so it must not silently bridge an identical reason
+            // across it as if the cycles were adjacent.
+            cycles.clear();
             continue;
         };
-        reasons.push(reason);
+        let cap_already_reported = segment
+            .iter()
+            .any(|c| c.body.starts_with(DISPATCH_FAILURE_CAP_MARKER));
+        cycles.push(DispatchCycle {
+            reason,
+            cap_already_reported,
+        });
     }
-    reasons
+    cycles
 }
 
 /// Walks dispatch-cycle terminal failure reasons (oldest-first) from newest
 /// backward, counting consecutive cycles whose normalized reason matches the
-/// latest one. Stops at the first older cycle with a different reason or at
-/// a success comment (which clears the streak when building the cycle list).
+/// latest one. Stops at the first older cycle with a different reason, at a
+/// success comment, an unrecorded-outcome cycle (both clear the streak when
+/// building the cycle list), or a cycle that already reported the cap (so a
+/// post-redispatch retry gets a fresh budget instead of re-tripping
+/// immediately).
 pub(crate) fn consecutive_identical_failure_count(
     comments: &[agentflare_backend::comment::ItemComment],
 ) -> u32 {
     let cycles = dispatch_cycle_failure_reasons(comments);
-    let mut signature: Option<&String> = None;
-    let mut count = 0u32;
-    for reason in cycles.iter().rev() {
-        match &signature {
-            None => {
-                signature = Some(reason);
-                count = 1;
-            }
-            Some(sig) if *sig == reason => count += 1,
-            Some(_) => break,
+    let mut iter = cycles.iter().rev();
+    let Some(newest) = iter.next() else {
+        return 0;
+    };
+    // Defensive: if the newest cycle's own segment already reported the cap
+    // (should not happen in practice — the cap comment is only posted after
+    // this count decides `at_cap`), stop right there rather than scanning
+    // into an already-resolved streak.
+    if newest.cap_already_reported {
+        return 1;
+    }
+    let mut count = 1u32;
+    for cycle in iter {
+        // A cycle that already reported the cap is a hard boundary — even a
+        // matching reason must not chain a post-redispatch retry onto an
+        // already-tripped streak, or it would re-trip with no retry budget.
+        if cycle.cap_already_reported || cycle.reason != newest.reason {
+            break;
         }
+        count += 1;
     }
     count
 }
@@ -167,6 +202,53 @@ mod tests {
             comment(&format!("{WORK_FAILURE_MARKER}\n\n{err}")),
         ];
         assert_eq!(consecutive_identical_failure_count(&comments), 1);
+    }
+
+    #[test]
+    fn cap_comment_gives_a_fresh_streak_budget_after_manual_redispatch() {
+        let err = "judge reply was not valid JSON";
+        let comments = vec![
+            comment(&format!("{DISPATCH_MARKER}\n\njob: a")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{err}")),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: b")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{err}")),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: c")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{err}")),
+            comment(&format!(
+                "{DISPATCH_FAILURE_CAP_MARKER}\n\n3 consecutive..."
+            )),
+            // Human fixes the root cause and runs `item action=redispatch`;
+            // the daemon dispatches a new cycle that happens to fail with
+            // the same normalized reason.
+            comment(&format!("{DISPATCH_MARKER}\n\njob: d")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{err}")),
+        ];
+        assert_eq!(
+            consecutive_identical_failure_count(&comments),
+            1,
+            "a cycle after the cap was reported must not chain onto the \
+             already-tripped streak, or the operator gets zero retry budget"
+        );
+    }
+
+    #[test]
+    fn unrecorded_outcome_cycle_breaks_adjacency() {
+        let err = "judge reply was not valid JSON";
+        let comments = vec![
+            comment(&format!("{DISPATCH_MARKER}\n\njob: a")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{err}")),
+            // Daemon restart mid-job: `restore_ready_for_work` deliberately
+            // posts no marker for this cycle.
+            comment(&format!("{DISPATCH_MARKER}\n\njob: b")),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: c")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{err}")),
+        ];
+        assert_eq!(
+            consecutive_identical_failure_count(&comments),
+            1,
+            "an unrecorded-outcome cycle must not silently bridge two \
+             identical-reason cycles into a false consecutive streak"
+        );
     }
 
     #[test]

@@ -168,6 +168,21 @@ pub(super) fn handle_terminal_job_failure(job: &agentflare_jobs::AgentJob) {
         let at_cap = failure_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP;
 
         if at_cap {
+            // Same restoration as the below-cap branch: `release_and_comment`
+            // already cleared `assignee_agent` via `item_release`. The cap
+            // comment tells a human to run `item action=redispatch`, which
+            // requires an existing `assignee_agent` unless one is passed
+            // explicitly — leaving it cleared here would make that
+            // instruction fail.
+            agentflare_backend::item::update(
+                conn,
+                item_id,
+                agentflare_backend::item::UpdateItem {
+                    assignee_agent: Some(agent.clone()),
+                    ..Default::default()
+                },
+            )
+            .ok();
             if let Some(manual_id) = labels
                 .iter()
                 .find(|l| l.name == crate::supervisor::NEEDS_MANUAL_LABEL)
@@ -847,6 +862,59 @@ mod tests {
                     .body
                     .starts_with(crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP_MARKER)),
                 "cap trip must post a supervisor comment for PM review"
+            );
+        });
+    }
+
+    /// Item #506 CodeRabbit follow-up: at cap, `assignee_agent` must be
+    /// restored too (same as the below-cap branch) so the cap comment's own
+    /// `item action=redispatch` instruction works without the caller having
+    /// to pass `assignee_agent` explicitly.
+    #[test]
+    fn handle_terminal_job_failure_restores_assignee_agent_at_cap() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let label_ids = seed_labels(
+                &mcp,
+                &[
+                    crate::supervisor::READY_LABEL,
+                    crate::supervisor::DISPATCHED_LABEL,
+                    crate::supervisor::NEEDS_MANUAL_LABEL,
+                ],
+            );
+            let dispatched_id = &label_ids[crate::supervisor::DISPATCHED_LABEL];
+            let item_id = create_dispatched_item(&mcp, dispatched_id);
+            seed_dispatch_cycle_failures(
+                &mcp,
+                &item_id,
+                crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP,
+                "judge reply was not valid JSON",
+            );
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+
+            handle_terminal_job_failure(&job);
+
+            let item = mcp
+                .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                item.assignee_agent.as_deref(),
+                Some("claude-code"),
+                "at-cap terminal hook must restore assignee_agent so \
+                 `item action=redispatch` works without an explicit override"
             );
         });
     }
