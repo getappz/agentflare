@@ -32,19 +32,24 @@ if (-not $restartOk) {
 $base = "http://127.0.0.1:$Port/proxy"
 $ready = $false
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-while ($sw.Elapsed.TotalSeconds -lt 30) {
+$readyTimeoutSeconds = 90
+while ($sw.Elapsed.TotalSeconds -lt $readyTimeoutSeconds) {
+    $tcp = [System.Net.Sockets.TcpClient]::new()
     try {
-        $tcp = [System.Net.Sockets.TcpClient]::new()
-        $tcp.Connect("127.0.0.1", $Port)
-        $tcp.Close()
-        $ready = $true
-        break
+        $connectTask = $tcp.ConnectAsync("127.0.0.1", $Port)
+        if ($connectTask.Wait(2000) -and $tcp.Connected) {
+            $ready = $true
+            break
+        }
     } catch {
-        Start-Sleep -Milliseconds 1000
+        # connection refused / not listening yet — keep polling
+    } finally {
+        $tcp.Close()
     }
+    Start-Sleep -Milliseconds 1000
 }
 if (-not $ready) {
-    Write-Error "proxy not up on port $Port after 30s; check 'agentflare daemon logs'"
+    Write-Error "proxy not up on port $Port after ${readyTimeoutSeconds}s; check 'agentflare daemon logs'"
     exit 1
 }
 
