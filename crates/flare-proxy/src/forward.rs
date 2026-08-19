@@ -43,14 +43,15 @@ pub async fn proxy_request(
             Ok(v) => v,
             Err(_) => {
                 // Fall back to the Cline CLI's own logged-in credentials
-                // (~/.cline/data/settings/providers.json) for cline/clinepass.
-                match cline_login::cli_access_token(&provider.id) {
+                // (~/.cline/data/settings/providers.json), refreshing them
+                // when expired.
+                match cline_login::cli_credential(client, &provider.id).await {
                     Some(token) => token,
                     None => {
                         return (
                             StatusCode::BAD_REQUEST,
                             format!(
-                                "{env_var} not set and no Cline CLI login found \
+                                "{env_var} not set and no usable Cline CLI login found \
                                  (run the `cline` CLI to sign in)"
                             ),
                         )
