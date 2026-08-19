@@ -738,37 +738,24 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
     // runs against, then run it, before `WorkerPool::start` below can
     // dispatch a fresh job for one of those same items.
     //
-    // Known limitation: this boot-time definition's `sdd_loop`/`finalize`
-    // steps close over placeholder identity (no real item id, agent, or
-    // prompts — those only exist inside the dead process that
-    // crashed, and `flare_workflow`'s step closures aren't reconstructible
-    // from persisted state alone). A run actually resumed through it can't
-    // reproduce the crashed run's real prompts/target item — it fails
-    // closed instead: `finalize` calls `item_done`/`item_release` against
-    // an empty item id, which errors immediately rather than touching any
-    // real item, so this is safe (no wrong-item side effects) but not yet a
-    // real crash-resume — the item stays `claimed` until the bridge's own
-    // claim-TTL reclaim picks it up, exactly like a crash would leave it
-    // pre-#110. Making this a genuine resume needs `WorkItemData` to carry
-    // enough (item id, agent, prompts) for these steps to rebuild their own
-    // `AgentflareMcp`/request at execution time instead of capturing one at
-    // registration time — tracked as follow-up, not attempted here.
+    // This definition carries no item/agent-specific identity itself —
+    // `build_work_item_pipeline`'s `sdd_loop`/`finalize` steps read the real
+    // item id, agent, and prompts from each resumed run's own persisted
+    // `WorkItemData` (`ctx.data`) at execution time instead of from whatever
+    // was passed at registration, so a genuine crash-resume reproduces the
+    // crashed run's actual target item and prompts, not a placeholder.
+    // `--timeout`/`--idle-timeout`/extra CLI args from the original dispatch
+    // aren't persisted, so a resumed run falls back to the defaults here —
+    // an accepted trade-off, not an identity gap.
     {
-        let dummy_mcp = std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default());
-        let dummy_definition = crate::work_item_pipeline::build_work_item_pipeline(
-            agent_registry::Agent::ClaudeCode,
-            agent_registry::Agent::ClaudeCode,
-            String::new(),
-            None,
-            dummy_mcp,
-            String::new(),
-            String::new(),
-            None,
+        let boot_mcp = std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default());
+        let boot_definition = crate::work_item_pipeline::build_work_item_pipeline(
+            boot_mcp,
             std::time::Duration::from_secs(crate::cli::work::DEFAULT_TIMEOUT_SECS),
             std::time::Duration::from_secs(crate::cli::work::DEFAULT_IDLE_TIMEOUT_SECS),
             Vec::new(),
         );
-        if let Err(e) = crate::work_item_pipeline::engine().register_workflow(dummy_definition) {
+        if let Err(e) = crate::work_item_pipeline::engine().register_workflow(boot_definition) {
             crate::ui::error(&format!(
                 "failed to register work-item pipeline definition at boot: {e}"
             ));

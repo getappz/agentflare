@@ -419,3 +419,164 @@ async fn three_task_plan_with_fix_round_escalation_and_skip() {
         "task 0 and task 2 both completed"
     );
 }
+
+/// End-to-end proof of the crash-resume fix: drives a real `WorkflowEngine`
+/// + `SqliteStore` across two "processes" sharing one on-disk DB file,
+/// mirroring `flare-workflow/tests/recovery_test.rs`'s own
+/// `crash_mid_run_resumes_from_last_completed_step_without_reexecution`.
+/// `sdd_loop` has no built-in park point (unlike `WaitEvent`/`Sleep`), so the
+/// crash is simulated the same way that test simulates one: the mock `send`
+/// for task 1's role dispatch never resolves, standing in for the process
+/// dying mid-await; the first engine is then dropped without ever
+/// completing task 1.
+#[tokio::test]
+async fn crash_mid_sdd_loop_resumes_against_the_persisted_item_and_agent() {
+    use flare_workflow::{SqliteStore, StateStore, WorkflowEngine, WorkflowId};
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wf.db");
+
+    let tasks = vec![
+        SddTask {
+            id: 0,
+            title: "Task 0".to_string(),
+            body: "first task body".to_string(),
+            model_tier: None,
+        },
+        SddTask {
+            id: 1,
+            title: "Task 1".to_string(),
+            body: "second task body".to_string(),
+            model_tier: None,
+        },
+    ];
+    let seed_data = WorkItemData {
+        item_id: "item-crash-test".to_string(),
+        agent_name: "impl-agent".to_string(),
+        judge_agent_name: "judge-agent".to_string(),
+        tasks: tasks.clone(),
+        ..Default::default()
+    };
+
+    let run_id;
+    {
+        // "Process 1": completes task 0, then hangs forever dispatching
+        // task 1's implementer instead of ever completing it.
+        let send: flare_workflow::json::SendMessage = Arc::new(
+            move |inv: flare_workflow::json::StepInvocation| {
+                let prompt = inv.prompt;
+                Box::pin(async move {
+                    if prompt.contains("second task body") {
+                        std::future::pending::<()>().await;
+                        unreachable!("crash point: never resolves")
+                    } else if prompt.contains("You are the judge") {
+                        Ok((
+                            r#"{"action":"advance_task","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#
+                                .to_string(),
+                            1u64,
+                            1u64,
+                        ))
+                    } else {
+                        Ok(("DONE: task 0 implemented".to_string(), 1u64, 1u64))
+                    }
+                })
+            },
+        );
+        let engine = WorkflowEngine::<WorkItemData, SqliteStore<WorkItemData>>::with_store(
+            SqliteStore::open_file(&path).unwrap(),
+        );
+        engine
+            .register_workflow(
+                flare_workflow::WorkflowDefinition::new(WORKFLOW_ID, "sdd work item")
+                    .add_step(sdd_step(send)),
+            )
+            .unwrap();
+        run_id = engine
+            .start_workflow(WorkflowId::new(WORKFLOW_ID), seed_data, String::new())
+            .await
+            .unwrap();
+
+        let store = engine.state_store().clone();
+        for _ in 0..200 {
+            let journal = store.journal(run_id).await.unwrap();
+            let task0_done = journal.iter().any(|e| {
+                matches!(
+                    e,
+                    flare_workflow::JournalEntry::LoopIteration { step_id, iteration, .. }
+                        if *step_id == StepId::new("sdd_loop") && *iteration == 1
+                )
+            });
+            if task0_done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Drop engine 1 = simulated crash; the run is still `Running` in
+        // the shared store, stuck mid task-1 dispatch.
+    }
+
+    // "Process 2": a fresh engine registered the same way the daemon's own
+    // boot-time sweep does (`dashboard::server::run`) — no item/agent-
+    // specific arguments anywhere in this registration, only a bare
+    // `sdd_step`. Whatever runs next can only get task 1's real title/body
+    // and the item's real agent name from the persisted `WorkItemData`,
+    // proving recovery no longer replays against a registration-time
+    // placeholder.
+    let recorded: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded_clone = recorded.clone();
+    let send2: flare_workflow::json::SendMessage = Arc::new(
+        move |inv: flare_workflow::json::StepInvocation| {
+            recorded_clone
+                .lock()
+                .unwrap()
+                .push((inv.agent.clone(), inv.prompt.clone()));
+            let prompt = inv.prompt;
+            Box::pin(async move {
+                if prompt.contains("You are the judge") {
+                    Ok((
+                        r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 1: complete","task_model_tier":null}"#
+                            .to_string(),
+                        1u64,
+                        1u64,
+                    ))
+                } else {
+                    Ok(("DONE: task 1 implemented".to_string(), 1u64, 1u64))
+                }
+            })
+        },
+    );
+    let engine2 = WorkflowEngine::<WorkItemData, SqliteStore<WorkItemData>>::with_store(
+        SqliteStore::open_file(&path).unwrap(),
+    );
+    engine2
+        .register_workflow(
+            flare_workflow::WorkflowDefinition::new(WORKFLOW_ID, "sdd work item")
+                .add_step(sdd_step(send2)),
+        )
+        .unwrap();
+    let resumed = engine2.recover().await.unwrap();
+    assert!(
+        resumed.contains(&run_id),
+        "recover() must resume the crashed run"
+    );
+
+    let mut state = engine2.get_status(run_id).await.unwrap();
+    for _ in 0..200 {
+        if state.status == flare_workflow::WorkflowStatus::Completed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        state = engine2.get_status(run_id).await.unwrap();
+    }
+
+    assert_eq!(state.status, flare_workflow::WorkflowStatus::Completed);
+    let recorded = recorded.lock().unwrap();
+    assert!(
+        recorded
+            .iter()
+            .any(|(agent, prompt)| agent == "impl-agent" && prompt.contains("second task body")),
+        "resumed run must dispatch task 1's real body against the persisted implementer agent, \
+         not a registration-time placeholder; recorded calls: {recorded:?}"
+    );
+}

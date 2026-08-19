@@ -67,15 +67,12 @@ async fn finalize_step_calls_item_done_on_success() {
     let mcp = Arc::new(mcp);
 
     let data = WorkItemData {
+        item_id: item_id.clone(),
+        owner: crate::claims::owner_id(),
         reply_text: "implemented the thing".into(),
         ..Default::default()
     };
-    let step = build_finalize_step(
-        mcp.clone(),
-        item_id.clone(),
-        None,
-        crate::claims::owner_id(),
-    );
+    let step = build_finalize_step(mcp.clone());
     let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
     let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
     engine.register_workflow(wf).unwrap();
@@ -126,16 +123,13 @@ async fn finalize_step_posts_review_findings_comment_and_skips_item_done_when_re
     let mcp = Arc::new(mcp);
 
     let data = WorkItemData {
+        item_id: item_id.clone(),
+        owner: crate::claims::owner_id(),
         review_only: true,
         last_report: Some("Found a SQL injection in the query builder.".to_string()),
         ..Default::default()
     };
-    let step = build_finalize_step(
-        mcp.clone(),
-        item_id.clone(),
-        None,
-        crate::claims::owner_id(),
-    );
+    let step = build_finalize_step(mcp.clone());
     let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
     let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
     engine.register_workflow(wf).unwrap();
@@ -198,6 +192,8 @@ async fn finalize_step_uses_accumulated_review_findings_when_last_report_was_cle
     let mcp = Arc::new(mcp);
 
     let data = WorkItemData {
+        item_id: item_id.clone(),
+        owner: crate::claims::owner_id(),
         review_only: true,
         // Simulates post-AdvanceTask state: both cleared by the judge
         // decision handler, exactly as happens for a single-task run.
@@ -206,12 +202,7 @@ async fn finalize_step_uses_accumulated_review_findings_when_last_report_was_cle
         review_findings: vec!["Found a SQL injection in the query builder.".to_string()],
         ..Default::default()
     };
-    let step = build_finalize_step(
-        mcp.clone(),
-        item_id.clone(),
-        None,
-        crate::claims::owner_id(),
-    );
+    let step = build_finalize_step(mcp.clone());
     let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
     let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
     engine.register_workflow(wf).unwrap();
@@ -263,10 +254,12 @@ async fn finalize_step_releases_claim_when_human_review_gate_is_hit() {
     let owner = crate::claims::owner_id();
 
     let data = WorkItemData {
+        item_id: item_id.clone(),
+        owner: owner.clone(),
         review_issues: Some("- still broken".into()),
         ..Default::default()
     };
-    let step = build_finalize_step(mcp.clone(), item_id.clone(), None, owner.clone());
+    let step = build_finalize_step(mcp.clone());
     let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
     let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
     engine.register_workflow(wf).unwrap();
@@ -310,11 +303,13 @@ async fn finalize_step_releases_claim_after_review_only_success() {
     let owner = crate::claims::owner_id();
 
     let data = WorkItemData {
+        item_id: item_id.clone(),
+        owner: owner.clone(),
         review_only: true,
         last_report: Some("Found an issue.".to_string()),
         ..Default::default()
     };
-    let step = build_finalize_step(mcp.clone(), item_id.clone(), None, owner.clone());
+    let step = build_finalize_step(mcp.clone());
     let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
     let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
     engine.register_workflow(wf).unwrap();
@@ -493,15 +488,12 @@ async fn finalize_step_fails_when_branch_slug_mismatch_hides_divergence() {
     let mcp = Arc::new(mcp);
 
     let data = WorkItemData {
+        item_id: item_id.clone(),
+        owner: crate::claims::owner_id(),
         reply_text: "implemented the thing".into(),
         ..Default::default()
     };
-    let step = build_finalize_step(
-        mcp.clone(),
-        item_id.clone(),
-        None,
-        crate::claims::owner_id(),
-    );
+    let step = build_finalize_step(mcp.clone());
     let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
     let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
     engine.register_workflow(wf).unwrap();
