@@ -1048,6 +1048,46 @@ fn item_release_errors_when_a_different_owner_holds_a_live_claim() {
 }
 
 #[test]
+fn item_redispatch_reports_dispatch_blocked_when_a_live_claim_remains() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    s.item(Parameters(ItemRequest {
+        action: "update".into(),
+        id: Some(item_id.clone()),
+        assignee_agent: Some("opencode".into()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    seed_claim(&s, &item_id, "opencode:dead-job", 60);
+
+    let resp: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "redispatch".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(resp["ready"], serde_json::Value::Bool(true));
+    assert_eq!(resp["dispatchable"], serde_json::Value::Bool(false));
+    assert_eq!(
+        resp["blocked_by_live_claim"]["owner"].as_str(),
+        Some("opencode:dead-job")
+    );
+    assert_eq!(
+        resp["blocked_by_live_claim"]["reason"].as_str(),
+        Some("another agent already holds a live claim on this item")
+    );
+    assert!(resp["blocked_by_live_claim"]["age_secs"].as_i64().unwrap() >= 60);
+}
+
+#[test]
 fn item_release_reclaims_and_releases_a_stale_claim_from_an_abandoned_owner() {
     let (_tmp, s) = harness();
     let created: serde_json::Value =
