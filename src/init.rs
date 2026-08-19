@@ -434,24 +434,6 @@ fn wire_codex_hooks() {
     }
 }
 
-/// Deliberately does NOT provision a native `lean-ctx` MCP entry or an
-/// opencode `permission: {read/grep/glob/bash: deny}` block, even though
-/// `lean-ctx onboard` sets both by hand on some machines. Every other host
-/// (claude-code, cursor, codex, cline, ...) only ever gets soft enforcement
-/// here — the `leanctx`/`agentflare-mcp` components (see components.rs)
-/// register lean-ctx behind the gateway and the "flare" MCP server, and
-/// `wire_opencode_instructions` nudges the agent toward `ctx_*` via rule
-/// text — never a hard block on native tools. A permission-deny block strands
-/// the agent with zero fallback the moment the gateway/MCP hiccups, which is
-/// a materially worse failure mode for unattended/headless dispatch than
-/// slightly worse token efficiency; it's also not something we can safely
-/// auto-clean up later, since `opencode.json` (where `onboard` writes it) is
-/// read-only from agentflare's side (see `opencode_json_path`). Keep this a
-/// manual, host-local opt-in (`lean-ctx onboard`) rather than something
-/// `init` provisions across the fleet. What agentflare DOES own here (flare
-/// MCP registration, lean-ctx-behind-gateway) is already surfaced per host by
-/// `agentflare doctor --agent opencode` via the `leanctx`/`agentflare-mcp`
-/// component checks — no separate doctor plumbing needed for that part.
 fn wire_opencode() {
     wire_opencode_instructions();
 }
