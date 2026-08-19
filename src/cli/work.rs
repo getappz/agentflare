@@ -411,7 +411,12 @@ fn resolve_agent(
         _ => None,
     };
 
-    Ok((decision.agent, decision.reason, fallback_agent, decision.model))
+    Ok((
+        decision.agent,
+        decision.reason,
+        fallback_agent,
+        decision.model,
+    ))
 }
 
 /// Combines `resolve_agent`'s router-derived fallback candidate with the
