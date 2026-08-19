@@ -1,4 +1,4 @@
-use crate::providers::{openai_compat, ProviderConfig, ProviderEntry, ProviderKind};
+use crate::providers::{cline_login, openai_compat, ProviderConfig, ProviderEntry, ProviderKind};
 use crate::shape_xlat::{self, AnthropicStreamBuffer};
 use axum::body::Body;
 use axum::http::StatusCode;
@@ -40,9 +40,23 @@ pub async fn proxy_request(
 
     let api_key = match &provider.api_key_env {
         Some(env_var) => match std::env::var(env_var) {
-            Ok(k) => k,
+            Ok(v) => v,
             Err(_) => {
-                return (StatusCode::BAD_REQUEST, format!("{} not set", env_var)).into_response()
+                // Fall back to the Cline CLI's own logged-in credentials
+                // (~/.cline/data/settings/providers.json) for cline/clinepass.
+                match cline_login::cli_access_token(&provider.id) {
+                    Some(token) => token,
+                    None => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "{env_var} not set and no Cline CLI login found \
+                                 (run the `cline` CLI to sign in)"
+                            ),
+                        )
+                            .into_response()
+                    }
+                }
             }
         },
         None => String::new(),
