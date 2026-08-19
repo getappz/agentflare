@@ -36,6 +36,15 @@ pub fn agent_part(owner: &str) -> String {
     agent_registry::canonicalize(owner.split(':').next().unwrap_or(owner))
 }
 
+/// Strips a `model` key out of an item's `metadata` JSON, returning the
+/// re-serialized object only when a `model` key was actually present (so
+/// callers can skip a pointless update when there's nothing to clear).
+fn without_model_metadata(metadata: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(metadata).ok()?;
+    let removed = value.as_object_mut()?.remove("model").is_some();
+    removed.then(|| value.to_string())
+}
+
 /// Claims an item so other agents don't duplicate the work: on a fresh
 /// acquire, sets the assignee and moves state into the project's "started"
 /// group (which sets `started_at`, via `update_state`). A live claim held by
@@ -294,6 +303,21 @@ pub fn redispatch(
         None => return Ok(RedispatchOutcome::NoAssignee),
     };
 
+    // `metadata.model` (see `item_model_override` in `supervisor.rs`) is
+    // scoped to whichever agent it was set alongside — forwarding it to a
+    // *different* agent's `--model` flag 404s (reproduced live on item
+    // #132: an opencode model string fed to `claude --model`). The previous
+    // assignee is the best proxy we have for "which agent the model was
+    // scoped to" since we don't store that separately, so clear it whenever
+    // redispatch is about to hand the item to someone else.
+    let agent_changed =
+        item.assignee_agent.as_deref().map(agent_part).as_deref() != Some(agent.as_str());
+    let metadata = if agent_changed {
+        without_model_metadata(&item.metadata)
+    } else {
+        None
+    };
+
     let backlog_state = crate::state::first_in_group(&tx, &item.project_id, "backlog")?;
     update_state(&tx, item_id, &backlog_state.id)?;
     update(
@@ -301,6 +325,7 @@ pub fn redispatch(
         item_id,
         UpdateItem {
             assignee_agent: Some(agent.clone()),
+            metadata,
             ..Default::default()
         },
     )?;
