@@ -292,6 +292,98 @@ async fn finalize_step_uses_accumulated_review_findings_when_last_report_was_cle
     panic!("finalize step did not complete");
 }
 
+#[tokio::test]
+async fn finalize_step_releases_claim_when_human_review_gate_is_hit() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, _worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Human-review finalize test item");
+    let mcp = Arc::new(mcp);
+    let owner = crate::claims::owner_id();
+
+    let data = WorkItemData {
+        review_issues: Some("- still broken".into()),
+        ..Default::default()
+    };
+    let step = build_finalize_step(mcp.clone(), item_id.clone(), None, owner.clone());
+    let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
+    let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
+    engine.register_workflow(wf).unwrap();
+    let run_id = engine
+        .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+        .await
+        .unwrap();
+
+    for _ in 0..50 {
+        let state = engine.get_status(run_id).await.unwrap();
+        if state.status == flare_workflow::WorkflowStatus::Completed {
+            let still_claimed = mcp
+                .with_backend_db(|conn| {
+                    agentflare_backend::claim::is_owner(conn, &item_id, &owner)
+                        .map_err(|e| e.to_string())
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                !still_claimed,
+                "finalize must release the claim when gating for human review"
+            );
+            return;
+        }
+        if state.status == flare_workflow::WorkflowStatus::Failed {
+            panic!(
+                "finalize must succeed for human-review gate: {:?}",
+                state.error
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("finalize step did not complete");
+}
+
+#[tokio::test]
+async fn finalize_step_releases_claim_after_review_only_success() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, _worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Review-only claim release test item");
+    let mcp = Arc::new(mcp);
+    let owner = crate::claims::owner_id();
+
+    let data = WorkItemData {
+        review_only: true,
+        last_report: Some("Found an issue.".to_string()),
+        ..Default::default()
+    };
+    let step = build_finalize_step(mcp.clone(), item_id.clone(), None, owner.clone());
+    let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
+    let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
+    engine.register_workflow(wf).unwrap();
+    let run_id = engine
+        .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+        .await
+        .unwrap();
+
+    for _ in 0..50 {
+        let state = engine.get_status(run_id).await.unwrap();
+        if state.status == flare_workflow::WorkflowStatus::Completed {
+            let still_claimed = mcp
+                .with_backend_db(|conn| {
+                    agentflare_backend::claim::is_owner(conn, &item_id, &owner)
+                        .map_err(|e| e.to_string())
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                !still_claimed,
+                "finalize must release the claim after a review-only run"
+            );
+            return;
+        }
+        if state.status == flare_workflow::WorkflowStatus::Failed {
+            panic!("finalize must not fail for review-only: {:?}", state.error);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("finalize step did not complete");
+}
+
 // requires a real headless agent binary; run manually / in an
 // environment with one installed — the mock-sender variant right below
 // covers the same metadata-persistence assertion unconditionally.

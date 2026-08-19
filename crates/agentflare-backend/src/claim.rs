@@ -86,6 +86,30 @@ pub fn current_owner(conn: &Connection, item_id: &str) -> Option<String> {
         .map(|c| c.owner)
 }
 
+/// A live (non-stale) `claimed` lease on an item, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveClaimOnItem {
+    pub owner: String,
+    pub age_secs: i64,
+}
+
+/// Returns the live claim holder on `item_id`, if one exists.
+pub fn live_claim_on_item(
+    conn: &Connection,
+    item_id: &str,
+    now: i64,
+    ttl_secs: i64,
+) -> rusqlite::Result<Option<LiveClaimOnItem>> {
+    let claims = LEDGER.list(conn, false, now, ttl_secs)?;
+    Ok(claims
+        .iter()
+        .find(|c| c.key == [item_id])
+        .map(|c| LiveClaimOnItem {
+            owner: c.owner.clone(),
+            age_secs: now - c.heartbeat_at,
+        }))
+}
+
 /// Returns true if there is an active (live, non-stale) claim on this item
 /// whose owner differs from `owner`. Used by the comment edit/delete gates
 /// to prevent modifying a comment when another agent has started work.
