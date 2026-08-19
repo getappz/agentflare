@@ -890,11 +890,13 @@ mod tests {
         let mut buffer = AnthropicStreamBuffer::default();
         buffer.open_indices.insert(0);
 
-        let first = json!({"choices": [{"finish_reason": "stop"}], "usage": {"completion_tokens": 0}});
+        let first =
+            json!({"choices": [{"finish_reason": "stop"}], "usage": {"completion_tokens": 0}});
         let out1 = String::from_utf8(finish_stream(&first, &mut buffer)).unwrap();
         assert_eq!(out1.matches("event: message_stop").count(), 1);
 
-        let second = json!({"choices": [{"finish_reason": "stop"}], "usage": {"completion_tokens": 62}});
+        let second =
+            json!({"choices": [{"finish_reason": "stop"}], "usage": {"completion_tokens": 62}});
         let out2 = finish_stream(&second, &mut buffer);
         assert!(out2.is_empty(), "repeated finish chunk must be a no-op");
     }
