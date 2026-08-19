@@ -363,6 +363,13 @@ pub fn autonomous_args(agent: Agent) -> Option<&'static [&'static str]> {
         // `cursor-agent --force`: "Force allow commands unless explicitly
         // denied" — confirmed via `cursor-agent --help`.
         Agent::Cursor => Some(&["--force"]),
+        // `cline --auto-approve <boolean>`: "Set tool auto-approval for all
+        // tools (default: true)" — confirmed via `cline --help`. Passed
+        // explicitly rather than relying on the default, same as every
+        // other agent above: a local config or future CLI version changing
+        // that default shouldn't silently turn a headless dispatch
+        // interactive.
+        Agent::Cline => Some(&["--auto-approve", "true"]),
         _ => None,
     }
 }
@@ -476,6 +483,14 @@ mod tests {
     #[test]
     fn autonomous_args_maps_cursor_to_force() {
         assert_eq!(autonomous_args(Agent::Cursor), Some(&["--force"][..]));
+    }
+
+    #[test]
+    fn autonomous_args_maps_cline_to_explicit_auto_approve() {
+        assert_eq!(
+            autonomous_args(Agent::Cline),
+            Some(&["--auto-approve", "true"][..])
+        );
     }
 
     #[test]
