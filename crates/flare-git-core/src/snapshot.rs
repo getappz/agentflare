@@ -36,11 +36,13 @@ fn run_git_with_index(
     // core.autocrlf=false` stops git silently converting line endings
     // while staging, regardless of the caller's ambient/global git config
     // (autocrlf=true is the common default on Windows).
-    let out = Command::new(crate::shell::git_binary())
-        .args(["-c", "core.autocrlf=false"])
+    let mut cmd = Command::new(crate::shell::git_binary());
+    cmd.args(["-c", "core.autocrlf=false"])
         .args(args)
         .current_dir(repo_root)
-        .env("GIT_INDEX_FILE", index_file)
+        .env("GIT_INDEX_FILE", index_file);
+    crate::shell::apply_filtered_path(&mut cmd);
+    let out = cmd
         .output()
         .map_err(|e| format!("git not available: {e}"))?;
     if !out.status.success() {

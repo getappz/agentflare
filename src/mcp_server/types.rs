@@ -181,6 +181,12 @@ pub(crate) struct HandoffRequest {
         description = "The work product being handed off (diff, review, document, ...). Prepend the brief so the recipient knows the ask. Attached to the item as an asset."
     )]
     pub(crate) content: String,
+    #[schemars(description = "What's done so far — required, part of the structured payload.")]
+    #[serde(default)]
+    pub(crate) completed: String,
+    #[schemars(description = "What's left to do — required, part of the structured payload.")]
+    #[serde(default)]
+    pub(crate) remaining: String,
     #[schemars(
         description = "html | markdown | mermaid | diagram | text (default: markdown) — picks the attached asset's extension/mime type"
     )]
@@ -235,10 +241,6 @@ pub(crate) struct HandoffRequest {
     )]
     #[serde(default)]
     pub(crate) last_commit: Option<String>,
-    #[schemars(description = "What's done so far — required, part of the structured payload.")]
-    pub(crate) completed: String,
-    #[schemars(description = "What's left to do — required, part of the structured payload.")]
-    pub(crate) remaining: String,
     #[schemars(description = "Known blockers, if any.")]
     #[serde(default)]
     pub(crate) blockers: Option<Vec<String>>,

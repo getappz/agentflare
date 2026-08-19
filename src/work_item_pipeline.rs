@@ -61,6 +61,28 @@ pub(crate) struct WorkItemData {
     pub ledger: Vec<String>,
     /// SDD workflow: latest generated report, if any.
     pub last_report: Option<String>,
+    /// Every analyst report produced by a review-only run (item #507).
+    /// `last_report`/`review_issues` are cleared on `advance_task`/
+    /// `skip_task` (see the judge-decision handler), so for a single-task
+    /// run that clears them on the very iteration it completes, `finalize`
+    /// would otherwise see both as `None` and post "No findings reported."
+    /// even though the analyst produced real output. `finalize` reads this
+    /// instead when non-empty.
+    #[serde(default)]
+    pub review_findings: Vec<String>,
+    /// Set from `detect_review_only` at dispatch time (item #507) — routes
+    /// `sdd_loop`'s role prompts to analyze-and-report phrasing instead of
+    /// implement-and-commit, and routes `finalize` to post the findings as a
+    /// comment instead of running `item_done`/PR flow. Without this, a
+    /// handoff explicitly asking for a review only (see item #502) still
+    /// gets silently converted into an implementation attempt.
+    ///
+    /// `#[serde(default)]`: persisted `state_json` from runs started before
+    /// this field existed has no `review_only` key — without a default,
+    /// `SqliteStore::load` fails to deserialize those rows and `recover()`
+    /// silently skips them as unreadable.
+    #[serde(default)]
+    pub review_only: bool,
 }
 
 impl flare_workflow::WorkflowData for WorkItemData {
@@ -266,23 +288,33 @@ pub(crate) fn build_sdd_loop_step(
                         )
                     } else {
                         // Issues open, no fix attempt yet — dispatch the
-                        // implementer to fix them.
+                        // implementer to fix them (or, for a review-only
+                        // task, the analyst to revise their findings).
                         let fix_context = ctx.data.review_issues.as_deref();
-                        (
-                            agent_name.clone(),
-                            build_implementer_prompt(&task, fix_context),
-                        )
+                        let prompt = if ctx.data.review_only {
+                            build_review_analyst_prompt(&task, fix_context)
+                        } else {
+                            build_implementer_prompt(&task, fix_context)
+                        };
+                        (agent_name.clone(), prompt)
                     }
                 } else if ctx.data.last_report.is_some() {
                     // No open issues; a report is pending review.
                     let report = ctx.data.last_report.clone().unwrap_or_default();
-                    (
-                        judge_agent_name.clone(),
-                        build_task_reviewer_prompt(&task, &report),
-                    )
+                    let prompt = if ctx.data.review_only {
+                        build_review_of_analysis_prompt(&task, &report)
+                    } else {
+                        build_task_reviewer_prompt(&task, &report)
+                    };
+                    (judge_agent_name.clone(), prompt)
                 } else {
                     // Fresh task, nothing dispatched yet.
-                    (agent_name.clone(), build_implementer_prompt(&task, None))
+                    let prompt = if ctx.data.review_only {
+                        build_review_analyst_prompt(&task, None)
+                    } else {
+                        build_implementer_prompt(&task, None)
+                    };
+                    (agent_name.clone(), prompt)
                 };
 
                 let (role_reply, in_tok, out_tok) = send(
@@ -303,6 +335,9 @@ pub(crate) fn build_sdd_loop_step(
                     ctx.data.review_issues = None;
                 } else {
                     ctx.data.last_report = Some(role_reply.clone());
+                    if ctx.data.review_only {
+                        ctx.data.review_findings.push(role_reply.clone());
+                    }
                 }
 
                 // 2. Judge dispatch.
@@ -311,6 +346,7 @@ pub(crate) fn build_sdd_loop_step(
                     ctx.data.current_task_index,
                     &ctx.data.ledger,
                     &role_reply,
+                    ctx.data.review_only,
                 );
                 let (judge_reply, jin_tok, jout_tok) = send(
                     flare_workflow::json::StepInvocation::simple(judge_agent_name, judge_prompt),
@@ -417,18 +453,24 @@ pub(crate) fn build_sdd_loop_step(
 
 /// Wraps `execute_work`'s existing hold/`item_done`/comment/notify tail
 /// (`src/cli/work.rs`'s `HeadlessOutcome::Ok` arm) as the pipeline's last
-/// step. Three outcomes, checked in order:
+/// step. Four outcomes, checked in order:
 ///
 /// 1. `ctx.data.hold_reason` set (Task 3's `coder` step detected an
 ///    `AGENTFLARE_HOLD:` signal) — release the claim and post an "on hold"
 ///    comment instead of calling `item_done`, same as `execute_work`'s hold
 ///    branch.
-/// 2. `ctx.data.review_issues` still set (Task 4's `review_or_fix` loop hit
+/// 2. `ctx.data.review_only` set (item #507 — the dispatched item asked for
+///    analysis, not implementation) — release the claim and post the
+///    accumulated findings as a comment instead of ever reaching
+///    `item_done`/PR flow, regardless of `review_issues` state.
+/// 3. `ctx.data.review_issues` still set (Task 4's `review_or_fix` loop hit
 ///    `MAX_REVIEW_CYCLES` without ever reaching approval) — gate for a
 ///    human with a comment instead of opening a PR on unreviewed code, since
 ///    this step has no access to `supervisor`'s label-id lookups for a real
 ///    relabel (that stays the supervisor's job on its next discovery tick).
-/// 3. Otherwise — the success path: `item_done`, then the same
+///    The job is finished either way — release the claim so redispatch /
+///    supervisor discovery can pick the item back up.
+/// 4. Otherwise — the success path: `item_done`, then the same
 ///    `cap_reply_for_comment`/`format_success_comment`/comment/notify
 ///    sequence `execute_work` runs today.
 ///
@@ -437,6 +479,24 @@ pub(crate) fn build_sdd_loop_step(
 /// way `coder`/`review_or_fix`'s agent dispatch can, and unlike those two,
 /// a failure here has already done the real work and just needs to land the
 /// result.
+///
+/// Best-effort claim release on every terminal success except when
+/// `item_done` deliberately left the lease held for an open PR (`in_review`).
+fn finalize_release_claim_best_effort(
+    mcp: &crate::mcp_server::AgentflareMcp,
+    item_id: &str,
+    leave_claim_held: bool,
+) {
+    if leave_claim_held {
+        return;
+    }
+    let _ = mcp.item_release(ItemRequest {
+        action: "release".into(),
+        id: Some(item_id.to_string()),
+        ..Default::default()
+    });
+}
+
 pub(crate) fn build_finalize_step(
     mcp: std::sync::Arc<AgentflareMcp>,
     item_id: String,
@@ -452,12 +512,32 @@ pub(crate) fn build_finalize_step(
             Box::pin(async move {
                 crate::claims::with_owner_override(owner, || {
                     if let Some(reason) = ctx.data.hold_reason.clone() {
-                        let _ = mcp.item_release(ItemRequest {
-                            action: "release".into(),
-                            id: Some(item_id.clone()),
+                        finalize_release_claim_best_effort(&mcp, &item_id, false);
+                        let body = format!("## agentflare work — on hold\n\n{reason}");
+                        let _ = mcp.comment_impl(CommentRequest {
+                            action: "create".into(),
+                            item_id: Some(item_id.clone()),
+                            body: Some(body.clone()),
                             ..Default::default()
                         });
-                        let body = format!("## agentflare work — on hold\n\n{reason}");
+                        if let Some(recipient) = notify_recipient.as_deref() {
+                            crate::cli::work::notify(recipient, &body, &item_id);
+                        }
+                        return Ok(StepResult::Success);
+                    }
+
+                    if ctx.data.review_only {
+                        let findings = if ctx.data.review_findings.is_empty() {
+                            ctx.data
+                                .last_report
+                                .clone()
+                                .or_else(|| ctx.data.review_issues.clone())
+                                .unwrap_or_else(|| "No findings reported.".to_string())
+                        } else {
+                            ctx.data.review_findings.join("\n\n---\n\n")
+                        };
+                        finalize_release_claim_best_effort(&mcp, &item_id, false);
+                        let body = format!("## agentflare work — review findings\n\n{findings}");
                         let _ = mcp.comment_impl(CommentRequest {
                             action: "create".into(),
                             item_id: Some(item_id.clone()),
@@ -472,6 +552,7 @@ pub(crate) fn build_finalize_step(
 
                     if ctx.data.review_issues.is_some() {
                         let issues = ctx.data.review_issues.clone().unwrap_or_default();
+                        finalize_release_claim_best_effort(&mcp, &item_id, false);
                         let _ = mcp.comment_impl(CommentRequest {
                             action: "create".into(),
                             item_id: Some(item_id.clone()),
@@ -499,6 +580,8 @@ pub(crate) fn build_finalize_step(
                     let done_val: serde_json::Value =
                         serde_json::from_str(&done_resp).unwrap_or(serde_json::Value::Null);
                     ctx.data.pr_url = done_val["pr_url"].as_str().map(str::to_string);
+                    let leave_claim_held = done_val["status"].as_str() == Some("in_review");
+                    finalize_release_claim_best_effort(&mcp, &item_id, leave_claim_held);
 
                     let comment_reply = crate::cli::work::cap_reply_for_comment(
                         &mcp,
@@ -739,6 +822,9 @@ pub(crate) fn run_or_resume_with_sender(
     // on both `start_workflow` call sites so `sdd_loop` (Task 5) has a task
     // list to work through instead of completing immediately on an empty one.
     let tasks = load_or_synthesize_tasks(&item_description, plan_doc.as_deref());
+    // Seeds `WorkItemData::review_only` (item #507) the same way — computed
+    // once here so both `start_workflow` call sites below agree.
+    let review_only = detect_review_only(&item_description, &existing_metadata);
 
     let eng = engine();
     // Captured on the caller thread (still inside `with_owner_override` for
@@ -778,6 +864,7 @@ pub(crate) fn run_or_resume_with_sender(
                             WorkflowId::new(WORKFLOW_ID),
                             WorkItemData {
                                 tasks: tasks.clone(),
+                                review_only,
                                 ..Default::default()
                             },
                             String::new(),
@@ -801,6 +888,7 @@ pub(crate) fn run_or_resume_with_sender(
                         WorkflowId::new(WORKFLOW_ID),
                         WorkItemData {
                             tasks: tasks.clone(),
+                            review_only,
                             ..Default::default()
                         },
                         String::new(),
@@ -857,7 +945,16 @@ fn persist_run_id(
     existing_metadata: &serde_json::Value,
     run_id: flare_workflow::WorkflowRunId,
 ) -> Result<(), String> {
-    let mut merged = existing_metadata.clone();
+    // `existing_metadata` can be a non-object (e.g. a double-JSON-encoded
+    // string, confirmed live on item #331) when the item's stored metadata
+    // is corrupted -- `Value`'s `IndexMut` panics assigning a key into
+    // anything that isn't already `Object`, so coerce defensively instead
+    // of trusting the caller-supplied value's shape.
+    let mut merged = existing_metadata
+        .as_object()
+        .cloned()
+        .map(serde_json::Value::Object)
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
     merged["workflow_run_id"] = serde_json::Value::String(run_id.to_string());
     mcp.item_update(ItemRequest {
         action: "update".into(),
@@ -867,6 +964,23 @@ fn persist_run_id(
     })
     .map(|_| ())
     .map_err(|e| e.message.to_string())
+}
+
+/// Decides whether a dispatched item is a review-only task (item #507):
+/// `sdd_loop` should analyze and report rather than implement, and
+/// `finalize` should post a findings comment rather than running
+/// `item_done`/PR flow. `metadata["task_type"] == "review"` is the
+/// authoritative signal — set it at handoff/dispatch time when the caller
+/// already knows the task type (e.g. PM-mode's own task-type routing).
+/// Falls back to matching the "review only" framing a human/agent handoff
+/// uses in prose when no structured field is set — item #502's own handoff
+/// read "REVIEW ONLY — do not fix, do not push, do not open a PR." with
+/// nothing else marking it as such, and the pipeline implemented it anyway.
+pub(crate) fn detect_review_only(item_description: &str, metadata: &serde_json::Value) -> bool {
+    if metadata["task_type"].as_str() == Some("review") {
+        return true;
+    }
+    item_description.to_lowercase().contains("review only")
 }
 
 /// Parses `### Task N: <title>` headings (the convention this codebase's
@@ -942,11 +1056,41 @@ pub(crate) fn build_implementer_prompt(task: &SddTask, fix_context: Option<&str>
     prompt
 }
 
+/// Review-only counterpart of `build_implementer_prompt` (item #507): same
+/// fix-round re-dispatch shape, but the role is constrained to analysis —
+/// it must never write, edit, or commit code, or open a pull request.
+pub(crate) fn build_review_analyst_prompt(task: &SddTask, fix_context: Option<&str>) -> String {
+    let mut prompt = format!(
+        "You are reviewing one task from a larger plan — analysis only. Do not write, edit, or commit any code, and do not open a pull request.\n\nTask: {}\n\n{}\n",
+        task.title, task.body
+    );
+    if let Some(ctx) = fix_context {
+        prompt.push_str(&format!(
+            "\nA second reviewer flagged gaps in your prior analysis:\n{ctx}\n\nAddress them and reply with your updated findings.\n"
+        ));
+    }
+    prompt.push_str(
+        "\nReply with your findings: what you reviewed and any issues found (or none).\n",
+    );
+    prompt
+}
+
 /// Builds the prompt for the task reviewer role: given a task and the
 /// implementer's report, review it for spec compliance and code quality.
 pub(crate) fn build_task_reviewer_prompt(task: &SddTask, implementer_report: &str) -> String {
     format!(
         "Review this task's implementation for spec compliance and code quality.\n\nTask: {}\n{}\n\nImplementer's report:\n{implementer_report}\n\nReply REVIEW_APPROVED if both spec and quality pass, or REVIEW_ISSUES: followed by a bulleted list of findings.\n",
+        task.title, task.body
+    )
+}
+
+/// Review-only counterpart of `build_task_reviewer_prompt` (item #507):
+/// checks the analyst's findings for completeness/accuracy instead of "spec
+/// compliance and code quality" — there's no code for this second pass to
+/// check, only the first pass's own analysis.
+pub(crate) fn build_review_of_analysis_prompt(task: &SddTask, analyst_report: &str) -> String {
+    format!(
+        "Review this analysis for completeness and accuracy — is anything missing or wrong?\n\nTask: {}\n{}\n\nAnalyst's report:\n{analyst_report}\n\nReply REVIEW_APPROVED if the analysis is thorough and accurate, or REVIEW_ISSUES: followed by a bulleted list of gaps.\n",
         task.title, task.body
     )
 }
@@ -967,6 +1111,7 @@ pub(crate) fn build_judge_prompt(
     current_task_index: usize,
     ledger: &[String],
     role_reply: &str,
+    review_only: bool,
 ) -> String {
     let task_list: String = tasks
         .iter()
@@ -985,1116 +1130,33 @@ pub(crate) fn build_judge_prompt(
         })
         .collect();
     let ledger_text: String = ledger.join("\n");
+    let mode_note = if review_only {
+        "This is a review-only task: no code should be written; the role's job is to analyze and report findings, not implement fixes.\n\n"
+    } else {
+        ""
+    };
     format!(
-        "You are the judge for an autonomous multi-task execution pipeline.\n\nPlan:\n{task_list}\n\nLedger so far:\n{ledger_text}\n\nLatest role reply:\n{role_reply}\n\nDecide what happens next. Reply with ONE JSON object and nothing else, matching exactly:\n{{\"action\": \"continue_task|fix_round|escalate|park_finding|rule_and_continue|insert_task|skip_task|advance_task|complete_pipeline\", \"rationale\": \"...\", \"ledger_line\": \"...\", \"task_model_tier\": \"mechanical|integration|architecture|null\"}}\n"
+        "You are the judge for an autonomous multi-task execution pipeline.\n\n{mode_note}Plan:\n{task_list}\n\nLedger so far:\n{ledger_text}\n\nLatest role reply:\n{role_reply}\n\nDecide what happens next. Reply with ONE JSON object and nothing else, matching exactly:\n{{\"action\": \"continue_task|fix_round|escalate|park_finding|rule_and_continue|insert_task|skip_task|advance_task|complete_pipeline\", \"rationale\": \"...\", \"ledger_line\": \"...\", \"task_model_tier\": \"mechanical|integration|architecture|null\"}}\n"
     )
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn work_item_data_round_trips_through_json() {
-        let data = WorkItemData {
-            reply_text: "did the thing".into(),
-            session_id: Some("sess-1".into()),
-            cost_usd: Some(0.42),
-            hold_reason: None,
-            review_issues: Some("- fix the thing".into()),
-            pr_url: Some("https://github.com/x/y/pull/1".into()),
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&data).unwrap();
-        let back: WorkItemData = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.reply_text, "did the thing");
-        assert_eq!(
-            back.pr_url.as_deref(),
-            Some("https://github.com/x/y/pull/1")
-        );
-    }
-
-    // Item #489: judge's raw Claude Code reply is a multi-line stream-json
-    // transcript; parsing its first line (action-less) instead of the last
-    // line's decision caused "missing field `action`" on #478/#502/#503.
-    const JUDGE_STREAM_JSON_TRANSCRIPT: &str = concat!(
-        r#"{"type":"system","subtype":"init","cwd":"/work/.worktrees/task/478","session_id":"sess-1"}"#,
-        "\n",
-        r#"{"type":"result","result":"{\"action\":\"advance_task\",\"rationale\":\"done\",\"ledger_line\":\"Task 0: complete\",\"task_model_tier\":null}","session_id":"sess-1"}"#,
-    );
-
-    #[test]
-    fn uncleaned_claude_stream_json_transcript_breaks_judge_parsing() {
-        let err = parse_judge_decision(JUDGE_STREAM_JSON_TRANSCRIPT).unwrap_err();
-        assert!(
-            err.to_string().contains("missing field `action`"),
-            "expected the exact upstream failure signature, got: {err}"
-        );
-    }
-
-    #[test]
-    fn clean_agent_reply_fixes_claude_stream_json_so_judge_parsing_succeeds() {
-        let cleaned = crate::agent_launch::clean_agent_reply(
-            agent_registry::Agent::ClaudeCode.as_str(),
-            JUDGE_STREAM_JSON_TRANSCRIPT.to_string(),
-        );
-        let decision = parse_judge_decision(&cleaned).expect("should parse after cleaning");
-        assert_eq!(decision.action, JudgeAction::AdvanceTask);
-    }
-
-    use flare_workflow::store::InMemoryStore;
-    use flare_workflow::{WorkflowDefinition, WorkflowEngine, WorkflowId};
-    use std::sync::Arc;
-
-    /// Wires a bare local repo up as `origin` and pushes to it — same
-    /// pattern `item_pr_failure_tests.rs`'s own fixture uses. Remotes are
-    /// repo-wide (`.git/config`), so adding one to `repo_root` makes it
-    /// visible from any of that repo's worktrees, including the item's own
-    /// claimed worktree these tests dispatch into. Needed because
-    /// `mcp_with_claimed_item`/`claim_harness` deliberately set up no
-    /// `origin` at all, and `item_done` hard-fails (#482) when a real
-    /// commit's push fails.
-    fn add_origin_remote(repo_root: &std::path::Path) {
-        let origin_dir = tempfile::tempdir().unwrap();
-        let run = |dir: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        run(origin_dir.path(), &["init", "--bare", "-b", "master"]);
-        run(
-            repo_root,
-            &[
-                "remote",
-                "add",
-                "origin",
-                origin_dir.path().to_str().unwrap(),
-            ],
-        );
-        run(repo_root, &["push", "origin", "master"]);
-        std::mem::forget(origin_dir);
-    }
-
-    #[tokio::test]
-    #[ignore = "item_done hard-fails (#482) unless push succeeds AND a PR is \
-                created; push_and_open_pr can't recognize a local bare repo \
-                as GitHub, and this codebase has no mock GitHub client — \
-                needs a real GitHub remote + credentials to reach Completed"]
-    async fn finalize_step_calls_item_done_on_success() {
-        let (mcp, _backend_tmp, repo_tmp, item_id, project_id, worktree_path) =
-            crate::mcp_server::tests::mcp_with_claimed_item("Finalize test item");
-        add_origin_remote(repo_tmp.path());
-        // Something real to commit — otherwise `item_done` sees a
-        // never-diverged branch and treats it as a no-op ("unchanged")
-        // rather than a completion.
-        std::fs::write(worktree_path.join("real_work.txt"), "real work").unwrap();
-        let mcp = Arc::new(mcp);
-
-        let data = WorkItemData {
-            reply_text: "implemented the thing".into(),
-            ..Default::default()
-        };
-        let step = build_finalize_step(
-            mcp.clone(),
-            item_id.clone(),
-            None,
-            crate::claims::owner_id(),
-        );
-        let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
-        let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
-        engine.register_workflow(wf).unwrap();
-        let run_id = engine
-            .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
-            .await
-            .unwrap();
-
-        for _ in 0..50 {
-            let state = engine.get_status(run_id).await.unwrap();
-            if state.status == flare_workflow::WorkflowStatus::Completed {
-                let completed_state_id = mcp
-                    .with_backend_db(|conn| {
-                        agentflare_backend::state::list_by_project(conn, &project_id)
-                            .unwrap()
-                            .into_iter()
-                            .find(|st| st.group_name == "completed")
-                            .unwrap()
-                            .id
-                    })
-                    .unwrap();
-                let item = mcp
-                    .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    item.state_id, completed_state_id,
-                    "finalize must move the item to the project's real 'completed' state"
-                );
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("finalize step did not complete");
-    }
-
-    // requires a real headless agent binary; run manually / in an
-    // environment with one installed — the mock-sender variant right below
-    // covers the same metadata-persistence assertion unconditionally.
-    //
-    // Deliberately a plain `#[test]` (not `#[tokio::test]`): `run_or_resume`
-    // blocks synchronously via `crate::workflow::blocking_runtime().block_on`
-    // on a *separate* runtime (`WORKFLOW_RT`); calling it from inside an
-    // already-running tokio runtime (as an async test's own executor would
-    // be) panics with "Cannot start a runtime from within a runtime" — the
-    // same reason `src/workflow.rs`'s own `run_workflow_json`-driving tests
-    // are plain `#[test]`s too.
-    #[test]
-    #[ignore]
-    fn run_or_resume_persists_run_id_and_resume_skips_completed_coder_step() {
-        let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
-            crate::mcp_server::tests::mcp_with_claimed_item("Run-or-resume real-agent test item");
-        std::fs::write(worktree_path.join("real_work.txt"), "real work").unwrap();
-        let mcp = Arc::new(mcp);
-        let item = mcp
-            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
-            .unwrap()
-            .unwrap();
-
-        // See the mock-sender variant below for why `engine()`'s db path
-        // is isolated under a temp HOME.
-        let result = crate::paths::test_support::with_temp_home(|| {
-            run_or_resume(
-                mcp.clone(),
-                &item,
-                agent_registry::Agent::ClaudeCode,
-                agent_registry::Agent::ClaudeCode,
-                "implement it".to_string(),
-                None,
-                None,
-                std::time::Duration::from_secs(600),
-                std::time::Duration::from_secs(300),
-                Vec::new(),
-            )
-        });
-        assert!(result.is_ok());
-
-        let updated = mcp
-            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
-            .unwrap()
-            .unwrap();
-        let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
-        assert!(metadata["workflow_run_id"].as_str().is_some());
-    }
-
-    /// Mock-sender counterpart of the real-agent test above: drives
-    /// `run_or_resume_with_sender` with a mock `SendMessage` that answers
-    /// `sdd_loop`'s implementer and judge roles (distinguished by prompt
-    /// content, same as `sdd_test_support::mock_send`'s callers), so it runs
-    /// unconditionally in CI. Unlike `finalize_step_calls_item_done_on_success`
-    /// this doesn't need a real GitHub PR to assert anything -- it only
-    /// checks that `workflow_run_id` was persisted before `finalize`'s
-    /// `item_done` call hard-fails on the missing PR (#482).
-    #[test]
-    fn run_or_resume_with_sender_persists_run_id_on_success() {
-        let (mcp, _backend_tmp, repo_tmp, item_id, _project_id, worktree_path) =
-            crate::mcp_server::tests::mcp_with_claimed_item("Run-or-resume mock-sender test item");
-        add_origin_remote(repo_tmp.path());
-        // Something real to commit — otherwise `finalize`'s `item_done` call
-        // sees a never-diverged branch and treats it as a no-op rather than
-        // a completion (see `finalize_step_calls_item_done_on_success`).
-        std::fs::write(worktree_path.join("real_work.txt"), "real work").unwrap();
-        let mcp = Arc::new(mcp);
-        let item = mcp
-            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
-            .unwrap()
-            .unwrap();
-
-        let send: flare_workflow::json::SendMessage = Arc::new(
-            move |inv: flare_workflow::json::StepInvocation| {
-                let prompt = inv.prompt;
-                Box::pin(async move {
-                    if prompt.contains("You are the judge") {
-                        Ok((
-                            r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#
-                                .to_string(),
-                            1u64,
-                            0u64,
-                        ))
-                    } else {
-                        Ok(("DONE: did the work".to_string(), 1u64, 0u64))
-                    }
-                })
-            },
-        );
-
-        // `engine()` is a process-lifetime singleton keyed by
-        // `crate::workflow::default_db_path()` (~/.agentflare/workflows.db)
-        // — isolate it under a temp HOME for this call so the test neither
-        // depends on nor pollutes the real user state dir (and works in
-        // sandboxes where `$HOME` is read-only).
-        let result = crate::paths::test_support::with_temp_home(|| {
-            run_or_resume_with_sender(
-                mcp.clone(),
-                &item,
-                agent_registry::Agent::ClaudeCode,
-                agent_registry::Agent::ClaudeCode,
-                "implement it".to_string(),
-                None,
-                None,
-                send,
-            )
-        });
-        // `add_origin_remote` gives `git push` a real target but not a real
-        // GitHub remote, so `finalize`'s `item_done` call correctly
-        // hard-fails on the missing PR (item #109 / PR #482) -- same
-        // reasoning as `finalize_step_calls_item_done_on_success` right
-        // above, which needs `#[ignore]` for the same root cause since it
-        // asserts completion rather than just metadata persistence. This
-        // test only cares that `workflow_run_id` was persisted before that
-        // failure, which happens well before `finalize` runs.
-        assert!(result.is_err(), "{result:?}");
-
-        let updated = mcp
-            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
-            .unwrap()
-            .unwrap();
-        let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
-        assert!(metadata["workflow_run_id"].as_str().is_some());
-    }
-}
-
+mod cap_tests;
 #[cfg(test)]
-mod pipeline_assembly_tests {
-    use super::*;
-
-    #[test]
-    fn sdd_pipeline_has_two_steps_with_correct_dependency() {
-        let send: flare_workflow::json::SendMessage =
-            std::sync::Arc::new(|_: flare_workflow::json::StepInvocation| {
-                Box::pin(async { Ok((String::new(), 0, 0)) })
-            });
-        let pipeline = build_work_item_pipeline_with_sender(
-            agent_registry::Agent::ClaudeCode,
-            agent_registry::Agent::ClaudeCode,
-            "Fix the null pointer in parser.rs".to_string(),
-            None,
-            std::sync::Arc::new(AgentflareMcp::default()),
-            "item-1".to_string(),
-            "opencode:test".to_string(),
-            None,
-            send,
-        );
-        assert_eq!(pipeline.steps.len(), 2);
-        assert_eq!(pipeline.steps[0].id.to_string(), "sdd_loop");
-        assert_eq!(pipeline.steps[1].id.to_string(), "finalize");
-        assert_eq!(pipeline.steps[1].depends_on, vec![StepId::new("sdd_loop")]);
-    }
-
-    #[tokio::test]
-    async fn sdd_loop_dispatches_implementer_and_review_roles_on_their_own_agents() {
-        let (send, calls) = super::sdd_test_support::mock_send(vec![
-            "DONE: added the flag",
-            r#"{"action":"advance_task","rationale":"looks done","ledger_line":"Task 0: implementer done","task_model_tier":null}"#,
-        ]);
-        let pipeline = build_work_item_pipeline_with_sender(
-            agent_registry::Agent::Opencode,
-            agent_registry::Agent::ClaudeCode,
-            "Fix the null pointer in parser.rs".to_string(),
-            None,
-            std::sync::Arc::new(AgentflareMcp::default()),
-            "item-1".to_string(),
-            "opencode:test".to_string(),
-            None,
-            send,
-        );
-        let mut ctx =
-            WorkflowContext::new(Default::default(), super::sdd_test_support::one_task_data());
-        pipeline.steps[0]
-            .executor
-            .execute(&mut ctx)
-            .await
-            .expect("executes");
-
-        let recorded = calls.lock().unwrap();
-        assert_eq!(
-            recorded[0].0, "opencode",
-            "implementer role must dispatch on implementer_agent"
-        );
-        assert_eq!(
-            recorded[1].0, "claude-code",
-            "judge role must dispatch on review_agent"
-        );
-    }
-
-    /// Regression test: `sdd_loop`'s per-iteration engine timeout must not
-    /// fall back to `flare_workflow::WorkflowDefinition::new`'s 300s
-    /// library default -- a real implementer/reviewer/judge dispatch
-    /// routinely exceeds that, and `execute_loop` (`loops.rs`) kills the
-    /// whole iteration the instant it's hit ("Step timed out after 300s"),
-    /// which is exactly the failure every SDD-dispatched item hit before
-    /// this fix. It must instead line up with `supervisor::WORK_JOB_TIMEOUT_SECS`,
-    /// the outer job's own hard-cap budget this step runs inside.
-    #[test]
-    fn sdd_loop_timeout_matches_work_job_timeout_not_library_default() {
-        let send: flare_workflow::json::SendMessage =
-            std::sync::Arc::new(|_: flare_workflow::json::StepInvocation| {
-                Box::pin(async { Ok((String::new(), 0, 0)) })
-            });
-        let step = build_sdd_loop_step("agent".to_string(), "agent".to_string(), send);
-        let configured_timeout = step.timeout.expect("sdd_loop must set an explicit timeout");
-        assert_eq!(
-            configured_timeout,
-            std::time::Duration::from_secs(crate::supervisor::WORK_JOB_TIMEOUT_SECS)
-        );
-        assert_ne!(
-            configured_timeout,
-            std::time::Duration::from_secs(300),
-            "sdd_loop must not fall back to the flare-workflow library's 300s default"
-        );
-    }
-}
-
+mod judge_decision_tests;
 #[cfg(test)]
-mod sdd_data_tests {
-    use super::*;
-
-    #[test]
-    fn work_item_data_roundtrips_sdd_fields() {
-        let data = WorkItemData {
-            tasks: vec![SddTask {
-                id: 0,
-                title: "Add config flag".to_string(),
-                body: "Add --verbose flag to CLI".to_string(),
-                model_tier: Some(TaskModelTier::Mechanical),
-            }],
-            current_task_index: 0,
-            fix_round: 0,
-            ledger: vec!["Task 0: dispatched".to_string()],
-            last_report: None,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&data).expect("serialize");
-        let back: WorkItemData = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.tasks.len(), 1);
-        assert_eq!(back.tasks[0].title, "Add config flag");
-        assert_eq!(back.current_task_index, 0);
-        assert_eq!(back.ledger, vec!["Task 0: dispatched".to_string()]);
-    }
-}
-
+mod pipeline_assembly_tests;
 #[cfg(test)]
-mod task_sourcing_tests {
-    use super::load_or_synthesize_tasks;
-
-    #[test]
-    fn synthesizes_single_task_when_no_plan_doc() {
-        let tasks = load_or_synthesize_tasks("Fix the null pointer in parser.rs", None);
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].id, 0);
-        assert_eq!(tasks[0].body, "Fix the null pointer in parser.rs");
-    }
-
-    #[test]
-    fn parses_task_list_from_plan_doc_headings() {
-        let plan_doc = "\
-# Some Plan
-
-### Task 1: Add validation
-
-Add input validation to the handler.
-
-### Task 2: Add tests
-
-Add unit tests for the validation.
-";
-        let tasks = load_or_synthesize_tasks("ignored when plan_doc present", Some(plan_doc));
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].title, "Add validation");
-        assert_eq!(tasks[1].title, "Add tests");
-        assert!(tasks[1].body.contains("unit tests"));
-    }
-
-    #[test]
-    fn empty_plan_doc_falls_back_to_synthesized_task() {
-        let tasks = load_or_synthesize_tasks("Bump dependency version", Some(""));
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].body, "Bump dependency version");
-    }
-}
-
+mod prompt_builder_tests;
 #[cfg(test)]
-mod prompt_builder_tests {
-    use super::*;
-
-    fn sample_task() -> SddTask {
-        SddTask {
-            id: 0,
-            title: "Add flag".to_string(),
-            body: "Add --verbose".to_string(),
-            model_tier: None,
-        }
-    }
-
-    #[test]
-    fn implementer_prompt_includes_task_body() {
-        let prompt = build_implementer_prompt(&sample_task(), None);
-        assert!(prompt.contains("Add --verbose"));
-    }
-
-    #[test]
-    fn implementer_prompt_includes_fix_context_when_present() {
-        let prompt = build_implementer_prompt(&sample_task(), Some("Reviewer found: missing test"));
-        assert!(prompt.contains("Reviewer found: missing test"));
-    }
-
-    #[test]
-    fn judge_prompt_instructs_json_only_output() {
-        let prompt = build_judge_prompt(&[sample_task()], 0, &[], "DONE: implemented flag");
-        assert!(prompt.contains("JSON"));
-        assert!(prompt.contains("DONE: implemented flag"));
-    }
-
-    #[test]
-    fn judge_prompt_includes_ledger_history() {
-        let ledger = vec!["Task 0: fix round 1/5 (1 addressed)".to_string()];
-        let prompt = build_judge_prompt(&[sample_task()], 0, &ledger, "REVIEW_APPROVED");
-        assert!(prompt.contains("fix round 1/5"));
-    }
-
-    #[test]
-    fn judge_prompt_formats_multiple_tasks_on_separate_lines() {
-        let tasks = vec![
-            SddTask {
-                id: 0,
-                title: "Add flag".to_string(),
-                body: "Add --verbose".to_string(),
-                model_tier: None,
-            },
-            SddTask {
-                id: 1,
-                title: "Fix bug".to_string(),
-                body: "Fix null pointer".to_string(),
-                model_tier: None,
-            },
-            SddTask {
-                id: 2,
-                title: "Add docs".to_string(),
-                body: "Document the flag".to_string(),
-                model_tier: None,
-            },
-        ];
-        let prompt = build_judge_prompt(&tasks, 1, &[], "Test role reply");
-
-        // Split the prompt by newlines and verify each task appears on its own line
-        let lines: Vec<&str> = prompt.lines().collect();
-
-        // Find the "Plan:" section and verify tasks are listed with proper line breaks
-        let task_lines: Vec<&str> = lines
-            .iter()
-            .filter(|line| {
-                line.contains("Add flag") || line.contains("Fix bug") || line.contains("Add docs")
-            })
-            .copied()
-            .collect();
-
-        // All three task titles should appear as separate lines (not concatenated)
-        assert_eq!(
-            task_lines.len(),
-            3,
-            "Expected 3 separate lines for 3 tasks, got: {:?}",
-            task_lines
-        );
-        assert!(task_lines[0].contains("Add flag"));
-        assert!(task_lines[1].contains("Fix bug") && task_lines[1].contains("<- current"));
-        assert!(task_lines[2].contains("Add docs"));
-    }
-}
-
+mod review_only_detection_tests;
 #[cfg(test)]
-mod judge_decision_tests {
-    use super::*;
-
-    #[test]
-    fn parses_valid_decision() {
-        let reply = r#"{"action":"advance_task","rationale":"spec met","ledger_line":"Task 0: complete","task_model_tier":null}"#;
-        let decision = parse_judge_decision(reply).expect("valid JSON parses");
-        assert_eq!(decision.action, JudgeAction::AdvanceTask);
-        assert_eq!(decision.ledger_line, "Task 0: complete");
-    }
-
-    #[test]
-    fn parses_decision_wrapped_in_prose_by_stripping_to_the_json_object() {
-        // Agents sometimes wrap JSON in a sentence despite instructions;
-        // strip to the first {...} span before parsing.
-        let reply = "Here is my decision:\n{\"action\":\"complete_pipeline\",\"rationale\":\"all tasks done\",\"ledger_line\":\"Pipeline: complete\",\"task_model_tier\":null}\nDone.";
-        let decision = parse_judge_decision(reply).expect("parses after stripping");
-        assert_eq!(decision.action, JudgeAction::CompletePipeline);
-    }
-
-    #[test]
-    fn rejects_malformed_json() {
-        let err = parse_judge_decision("not json at all").unwrap_err();
-        assert!(matches!(err, JudgeParseError::InvalidJson(_)));
-    }
-
-    #[test]
-    fn rejects_unknown_action_value() {
-        let reply = r#"{"action":"do_a_barrel_roll","rationale":"x","ledger_line":"x","task_model_tier":null}"#;
-        let err = parse_judge_decision(reply).unwrap_err();
-        assert!(matches!(err, JudgeParseError::InvalidJson(_)));
-    }
-
-    #[test]
-    fn parses_decision_from_a_json_fenced_code_block() {
-        let reply = "Here's my decision:\n```json\n{\"action\":\"advance_task\",\"rationale\":\"spec met\",\"ledger_line\":\"Task 0: complete\",\"task_model_tier\":null}\n```\nThanks.";
-        let decision = parse_judge_decision(reply).expect("parses fenced block");
-        assert_eq!(decision.action, JudgeAction::AdvanceTask);
-    }
-
-    #[test]
-    fn parses_decision_from_a_bare_fenced_code_block_with_no_language_tag() {
-        let reply = "```\n{\"action\":\"skip_task\",\"rationale\":\"x\",\"ledger_line\":\"x\",\"task_model_tier\":null}\n```";
-        let decision = parse_judge_decision(reply).expect("parses bare fenced block");
-        assert_eq!(decision.action, JudgeAction::SkipTask);
-    }
-
-    #[test]
-    fn extracts_only_the_first_object_when_trailing_prose_has_its_own_unrelated_braces() {
-        // A naive first-`{`-to-last-`}` span would run from the real
-        // object's opening brace all the way through the unrelated `{cfg}`
-        // in the trailing sentence, producing invalid combined JSON.
-        let reply = "{\"action\":\"advance_task\",\"rationale\":\"spec met\",\"ledger_line\":\"Task 0: complete\",\"task_model_tier\":null}\nNote: this respects the {cfg} override.";
-        let decision =
-            parse_judge_decision(reply).expect("parses despite trailing unrelated braces");
-        assert_eq!(decision.action, JudgeAction::AdvanceTask);
-    }
-
-    #[test]
-    fn a_brace_inside_a_json_string_value_does_not_confuse_balance_tracking() {
-        let reply = r#"{"action":"advance_task","rationale":"uses a {placeholder} pattern","ledger_line":"x","task_model_tier":null}"#;
-        let decision = parse_judge_decision(reply).expect("brace inside string value is inert");
-        assert_eq!(decision.action, JudgeAction::AdvanceTask);
-    }
-
-    #[test]
-    fn rejects_syntactically_valid_json_missing_a_required_field() {
-        // Reproduction of the live 2026-08-15 production failure (item
-        // #478): a well-formed JSON object that's simply missing `action`
-        // must still be a genuine, retried parse failure -- not silently
-        // defaulted.
-        let reply = r#"{"rationale":"x","ledger_line":"x","task_model_tier":null}"#;
-        let err = parse_judge_decision(reply).unwrap_err();
-        assert!(matches!(err, JudgeParseError::InvalidJson(msg) if msg.contains("action")));
-    }
-
-    #[test]
-    fn rejects_an_empty_reply() {
-        let err = parse_judge_decision("").unwrap_err();
-        assert!(matches!(err, JudgeParseError::InvalidJson(_)));
-    }
-}
-
-/// Shared fixtures for `sdd_loop_tests` (this task) and later plan tasks'
-/// test modules (Task 6's `cap_tests`, Tasks 11/12) that need the same
-/// mocked `send` and a minimal single-task `WorkItemData` — a sibling
-/// `#[cfg(test)] mod` can't reach into another sibling module's private
-/// items, so these live in their own module and get pulled in via
-/// `use super::sdd_test_support::*;`.
+mod sdd_data_tests;
 #[cfg(test)]
-mod sdd_test_support {
-    use super::*;
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-
-    /// Records every `(agent_name, prompt)` call and returns queued replies
-    /// in order.
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn mock_send(
-        replies: Vec<&'static str>,
-    ) -> (
-        flare_workflow::json::SendMessage,
-        Arc<Mutex<Vec<(String, String)>>>,
-    ) {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let queue = Arc::new(Mutex::new(replies.into_iter().collect::<VecDeque<_>>()));
-        let calls_clone = calls.clone();
-        let send: flare_workflow::json::SendMessage =
-            Arc::new(move |inv: flare_workflow::json::StepInvocation| {
-                calls_clone
-                    .lock()
-                    .unwrap()
-                    .push((inv.agent.clone(), inv.prompt.clone()));
-                let reply = queue.lock().unwrap().pop_front().unwrap_or("").to_string();
-                Box::pin(async move { Ok((reply, 10u64, 10u64)) })
-            });
-        (send, calls)
-    }
-
-    pub(crate) fn one_task_data() -> WorkItemData {
-        WorkItemData {
-            tasks: vec![SddTask {
-                id: 0,
-                title: "Add flag".to_string(),
-                body: "Add --verbose".to_string(),
-                model_tier: None,
-            }],
-            ..Default::default()
-        }
-    }
-
-    /// `build_sdd_loop_step` with the fixed agent names `sdd_loop_tests` uses.
-    pub(crate) fn sdd_step(
-        send: flare_workflow::json::SendMessage,
-    ) -> StepDefinition<WorkItemData> {
-        build_sdd_loop_step(
-            "implementer-agent".to_string(),
-            "judge-agent".to_string(),
-            send,
-        )
-    }
-}
-
+mod sdd_loop_tests;
 #[cfg(test)]
-mod sdd_loop_tests {
-    use super::sdd_test_support::*;
-    use super::*;
-
-    #[tokio::test]
-    async fn first_iteration_dispatches_implementer_then_judge() {
-        let (send, calls) = mock_send(vec![
-            "DONE: added the flag",
-            r#"{"action":"advance_task","rationale":"looks done","ledger_line":"Task 0: implementer done","task_model_tier":null}"#,
-        ]);
-        let step = sdd_step(send);
-        let mut ctx = WorkflowContext::new(Default::default(), one_task_data());
-        let result = step.executor.execute(&mut ctx).await.expect("executes");
-        assert!(matches!(result, StepResult::Success));
-
-        let recorded = calls.lock().unwrap();
-        assert_eq!(recorded[0].0, "implementer-agent");
-        assert_eq!(recorded[1].0, "judge-agent");
-        assert_eq!(
-            ctx.data.ledger,
-            vec!["Task 0: implementer done".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn task_reviewer_dispatches_on_the_judge_agent_not_the_implementer_agent() {
-        let (send, calls) = mock_send(vec![
-            "REVIEW_APPROVED",
-            r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#,
-        ]);
-        let mut data = one_task_data();
-        // A non-empty `last_report` with no open `review_issues` routes this
-        // iteration to the task-reviewer, not the implementer.
-        data.last_report = Some("DONE: added the flag".to_string());
-        let step = sdd_step(send);
-        let mut ctx = WorkflowContext::new(Default::default(), data);
-        step.executor.execute(&mut ctx).await.expect("executes");
-
-        let recorded = calls.lock().unwrap();
-        assert_eq!(
-            recorded[0].0, "judge-agent",
-            "task-reviewer must dispatch on the reserved judge/review agent, not the implementer agent"
-        );
-    }
-
-    #[tokio::test]
-    async fn re_reviewer_dispatches_on_the_judge_agent_not_the_implementer_agent() {
-        let (send, calls) = mock_send(vec![
-            "REVIEW_ISSUES: missing null check on line 12",
-            r#"{"action":"fix_round","rationale":"issues found","ledger_line":"Task 0: fix round 1","task_model_tier":null}"#,
-            "DONE: added the null check",
-            r#"{"action":"continue_task","rationale":"awaiting re-review","ledger_line":"Task 0: fix submitted","task_model_tier":null}"#,
-            "REVIEW_APPROVED",
-            r#"{"action":"advance_task","rationale":"fix verified","ledger_line":"Task 0: complete","task_model_tier":null}"#,
-        ]);
-        let mut data = one_task_data();
-        data.last_report = Some("DONE: initial attempt".to_string());
-        let step = sdd_step(send);
-        let mut ctx = WorkflowContext::new(Default::default(), data);
-
-        step.executor.execute(&mut ctx).await.expect("round 1"); // task-reviewer -> fix_round
-        step.executor.execute(&mut ctx).await.expect("round 2"); // implementer -> continue_task
-        step.executor.execute(&mut ctx).await.expect("round 3"); // re-reviewer
-
-        let recorded = calls.lock().unwrap();
-        assert_eq!(recorded.len(), 6);
-        assert_eq!(
-            recorded[4].0, "judge-agent",
-            "re-reviewer must dispatch on the reserved judge/review agent, not the implementer agent"
-        );
-    }
-
-    #[tokio::test]
-    async fn complete_pipeline_action_sets_terminator_output() {
-        let (send, _calls) = mock_send(vec![
-            "REVIEW_APPROVED",
-            r#"{"action":"complete_pipeline","rationale":"all done","ledger_line":"Pipeline: complete","task_model_tier":null}"#,
-        ]);
-        let mut data = one_task_data();
-        // A non-empty `last_report` with no open `review_issues`/fix round
-        // routes this iteration to the task-reviewer, not the implementer.
-        data.last_report = Some("DONE: added the flag".to_string());
-        let step = sdd_step(send);
-        let mut ctx = WorkflowContext::new(Default::default(), data);
-        step.executor.execute(&mut ctx).await.expect("executes");
-        assert_eq!(ctx.output, "PIPELINE_COMPLETE");
-    }
-
-    #[tokio::test]
-    async fn fix_round_dispatches_implementer_not_re_reviewer_next_iteration() {
-        // Round 1: the reviewer finds issues and the judge issues a
-        // `fix_round` decision, bumping `fix_round` to 1 in this SAME
-        // iteration, before the implementer ever runs. Round 2 must NOT read
-        // `fix_round > 0` as "a fix was already submitted" — it must
-        // dispatch the implementer, not re-review a stale report.
-        let (send, calls) = mock_send(vec![
-            "REVIEW_ISSUES: missing null check on line 12",
-            r#"{"action":"fix_round","rationale":"issues found","ledger_line":"Task 0: fix round 1","task_model_tier":null}"#,
-            "DONE: added the null check",
-            r#"{"action":"continue_task","rationale":"awaiting re-review","ledger_line":"Task 0: fix submitted","task_model_tier":null}"#,
-        ]);
-        let mut data = one_task_data();
-        data.last_report = Some("DONE: initial attempt".to_string());
-        let step = sdd_step(send);
-        let mut ctx = WorkflowContext::new(Default::default(), data);
-
-        // Round 1: task-reviewer finds issues, judge calls fix_round.
-        step.executor
-            .execute(&mut ctx)
-            .await
-            .expect("round 1 executes");
-        assert_eq!(ctx.data.fix_round, 1);
-        assert_eq!(
-            ctx.data.review_issues.as_deref(),
-            Some("missing null check on line 12")
-        );
-        assert_eq!(
-            ctx.data.last_report, None,
-            "clearing last_report on REVIEW_ISSUES signals no fix attempt exists yet"
-        );
-
-        // Round 2: must dispatch the implementer with the findings as fix context.
-        step.executor
-            .execute(&mut ctx)
-            .await
-            .expect("round 2 executes");
-        let recorded = calls.lock().unwrap();
-        assert_eq!(recorded.len(), 4);
-        let round2_role_prompt = &recorded[2].1;
-        assert!(
-            round2_role_prompt.contains("You are implementing one task"),
-            "round 2 must dispatch the implementer, got prompt: {round2_role_prompt}"
-        );
-        assert!(
-            round2_role_prompt.contains("missing null check on line 12"),
-            "implementer prompt must carry the reviewer's findings as fix context"
-        );
-        assert!(
-            !round2_role_prompt.contains("Re-review a fix"),
-            "round 2 must NOT dispatch the re-reviewer"
-        );
-    }
-
-    #[tokio::test]
-    async fn full_cycle_dispatches_re_reviewer_after_implementer_fix() {
-        // Extends the above: reviewer finds issues -> fix_round -> implementer
-        // fixes -> continue_task -> the FOLLOWING iteration must dispatch the
-        // re-reviewer, proving the `last_report.is_some()` branch works too.
-        let (send, calls) = mock_send(vec![
-            "REVIEW_ISSUES: missing null check on line 12",
-            r#"{"action":"fix_round","rationale":"issues found","ledger_line":"Task 0: fix round 1","task_model_tier":null}"#,
-            "DONE: added the null check",
-            r#"{"action":"continue_task","rationale":"awaiting re-review","ledger_line":"Task 0: fix submitted","task_model_tier":null}"#,
-            "REVIEW_APPROVED",
-            r#"{"action":"advance_task","rationale":"fix verified","ledger_line":"Task 0: complete","task_model_tier":null}"#,
-        ]);
-        let mut data = one_task_data();
-        data.last_report = Some("DONE: initial attempt".to_string());
-        let step = sdd_step(send);
-        let mut ctx = WorkflowContext::new(Default::default(), data);
-
-        step.executor
-            .execute(&mut ctx)
-            .await
-            .expect("round 1 executes"); // task-reviewer -> fix_round
-        step.executor
-            .execute(&mut ctx)
-            .await
-            .expect("round 2 executes"); // implementer -> continue_task
-        assert_eq!(
-            ctx.data.last_report.as_deref(),
-            Some("DONE: added the null check")
-        );
-
-        step.executor
-            .execute(&mut ctx)
-            .await
-            .expect("round 3 executes"); // must be re-reviewer
-        let recorded = calls.lock().unwrap();
-        assert_eq!(recorded.len(), 6);
-        let round3_role_prompt = &recorded[4].1;
-        assert!(
-            round3_role_prompt.contains("Re-review a fix for this task's findings only"),
-            "round 3 must dispatch the re-reviewer, got prompt: {round3_role_prompt}"
-        );
-        assert!(
-            round3_role_prompt.contains("missing null check on line 12"),
-            "re-reviewer prompt must carry the original findings"
-        );
-        assert!(
-            round3_role_prompt.contains("DONE: added the null check"),
-            "re-reviewer prompt must carry the fix report"
-        );
-    }
-
-    #[tokio::test]
-    async fn judge_parse_failure_is_retryable_step_error() {
-        // Must be a real `Err`, not `Ok(StepResult::Failure)` — the engine's
-        // `execute_step_with_retry` (`crates/flare-workflow/src/engine.rs`)
-        // only ever consults the step's `RetryPolicy` for a genuine `Err`;
-        // `Ok(StepResult::Failure)` is hardcoded non-retryable regardless of
-        // policy. A malformed judge reply is exactly the transient case
-        // `sdd_loop`'s attached `RetryPolicy` (3 attempts) exists for.
-        let (send, _calls) = mock_send(vec!["DONE: added the flag", "not json"]);
-        let step = sdd_step(send);
-        let mut ctx = WorkflowContext::new(Default::default(), one_task_data());
-        let err = step
-            .executor
-            .execute(&mut ctx)
-            .await
-            .expect_err("malformed judge reply must surface as Err to be retried");
-        assert!(matches!(err, WorkflowError::StepFailed { .. }));
-    }
-
-    #[tokio::test]
-    async fn resumed_iteration_dispatches_next_task_not_a_repeat() {
-        // Simulates the crash-resume mechanism directly at the ctx.data level
-        // (per the spec's corrected Resumability section: the engine's own
-        // loop iteration counter is NOT durable across a crash — only ctx.data
-        // is, via state_store.update() after each completed iteration). This
-        // test proves the closure's own behavior is correct given
-        // already-advanced ctx.data, which is the actual resumability
-        // guarantee — it does not exercise the engine's crash/restart
-        // machinery itself (that's flare-workflow's own test suite's job).
-        let (send, calls) = mock_send(vec![
-            "DONE: task 2 implemented",
-            r#"{"action":"advance_task","rationale":"done","ledger_line":"Task 1: complete","task_model_tier":null}"#,
-        ]);
-        let step = sdd_step(send);
-
-        // ctx.data as it would look immediately after a crash that happened
-        // right after task 0's advance_task was applied and persisted.
-        let data = WorkItemData {
-            tasks: vec![
-                SddTask {
-                    id: 0,
-                    title: "Task 1".to_string(),
-                    body: "first".to_string(),
-                    model_tier: None,
-                },
-                SddTask {
-                    id: 1,
-                    title: "Task 2".to_string(),
-                    body: "second".to_string(),
-                    model_tier: None,
-                },
-            ],
-            current_task_index: 1, // already advanced past task 0
-            ledger: vec!["Task 0: complete".to_string()],
-            ..Default::default()
-        };
-        let mut ctx = WorkflowContext::new(Default::default(), data);
-
-        step.executor.execute(&mut ctx).await.expect("executes");
-
-        let recorded = calls.lock().unwrap();
-        assert!(
-            recorded[0].1.contains("second"),
-            "must dispatch task 1's (index 1) body, not task 0's"
-        );
-        assert!(
-            !recorded[0].1.contains("first"),
-            "must not re-dispatch the already-completed task"
-        );
-    }
-
-    #[test]
-    fn single_task_synthesized_from_item_description_when_no_plan_doc() {
-        let tasks = load_or_synthesize_tasks("Fix the off-by-one in pagination", None);
-        assert_eq!(tasks.len(), 1);
-        // Degenerate case: exactly #110's original shape — one implementer
-        // dispatch, one review, no fix-loop-specific task list machinery
-        // engaged beyond what a single task naturally exercises.
-        assert_eq!(tasks[0].body, "Fix the off-by-one in pagination");
-    }
-
-    #[tokio::test]
-    async fn single_task_plan_reaches_complete_pipeline_after_one_approved_review() {
-        let (send, _calls) = mock_send(vec![
-            "DONE: fixed pagination",
-            r#"{"action":"advance_task","rationale":"impl done, needs review next","ledger_line":"Task 0: implemented","task_model_tier":null}"#,
-        ]);
-        let step = sdd_step(send);
-        let tasks = load_or_synthesize_tasks("Fix the off-by-one in pagination", None);
-        let data = WorkItemData {
-            tasks,
-            ..Default::default()
-        };
-        let mut ctx = WorkflowContext::new(Default::default(), data);
-        step.executor.execute(&mut ctx).await.expect("executes");
-        assert_eq!(
-            ctx.data.current_task_index, 1,
-            "advanced past the only task"
-        );
-        assert_eq!(
-            ctx.output, "CONTINUE",
-            "next iteration will see current_task_index >= tasks.len() and complete"
-        );
-    }
-
-    #[tokio::test]
-    async fn three_task_plan_with_fix_round_escalation_and_skip() {
-        // Task 0: implementer -> reviewer finds issues -> fix round -> re-review approves -> advance.
-        // Task 1: judge decides to skip outright.
-        // Task 2: implementer -> reviewer approves -> advance -> judge completes pipeline.
-        use std::collections::VecDeque;
-        use std::sync::{Arc, Mutex};
-
-        let responses = VecDeque::from(vec![
-            // Task 0, iteration 1: implementer
-            "DONE: task 0 attempt 1",
-            r#"{"action":"continue_task","rationale":"needs review","ledger_line":"Task 0: implementer done","task_model_tier":"mechanical"}"#,
-            // iteration 2: task-reviewer finds issues
-            "REVIEW_ISSUES: missing edge case",
-            r#"{"action":"fix_round","rationale":"real finding","ledger_line":"Task 0: fix round 1/5","task_model_tier":null}"#,
-            // iteration 3: implementer fixes
-            "DONE: fixed edge case",
-            r#"{"action":"continue_task","rationale":"needs re-review","ledger_line":"Task 0: fix applied","task_model_tier":null}"#,
-            // iteration 4: re-reviewer approves
-            "REVIEW_APPROVED",
-            r#"{"action":"advance_task","rationale":"clean","ledger_line":"Task 0: complete","task_model_tier":null}"#,
-            // Task 1, iteration 5: judge skips outright after seeing the role reply
-            "DONE: task 1 attempted",
-            r#"{"action":"skip_task","rationale":"superseded by task 0's fix","ledger_line":"Task 1: skipped","task_model_tier":null}"#,
-            // Task 2, iteration 6: implementer
-            "DONE: task 2 implemented",
-            r#"{"action":"continue_task","rationale":"needs review","ledger_line":"Task 2: implementer done","task_model_tier":null}"#,
-            // iteration 7: reviewer approves
-            "REVIEW_APPROVED",
-            r#"{"action":"advance_task","rationale":"clean","ledger_line":"Task 2: complete","task_model_tier":null}"#,
-        ]);
-        let responses = Arc::new(Mutex::new(responses));
-        let send: flare_workflow::json::SendMessage =
-            Arc::new(move |_: flare_workflow::json::StepInvocation| {
-                let reply = responses
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or_default()
-                    .to_string();
-                Box::pin(async move { Ok((reply, 5u64, 5u64)) })
-            });
-
-        let step = sdd_step(send);
-        let data = WorkItemData {
-            tasks: vec![
-                SddTask {
-                    id: 0,
-                    title: "Task 0".to_string(),
-                    body: "first".to_string(),
-                    model_tier: None,
-                },
-                SddTask {
-                    id: 1,
-                    title: "Task 1".to_string(),
-                    body: "second".to_string(),
-                    model_tier: None,
-                },
-                SddTask {
-                    id: 2,
-                    title: "Task 2".to_string(),
-                    body: "third".to_string(),
-                    model_tier: None,
-                },
-            ],
-            ..Default::default()
-        };
-        let mut ctx = WorkflowContext::new(Default::default(), data);
-
-        // Drive iterations manually until PIPELINE_COMPLETE or a safety cap —
-        // this test exercises SddLoopExecutor::execute directly in a loop,
-        // mirroring what the engine's execute_loop would do, without needing
-        // the full WorkflowEngine/state store machinery.
-        for _ in 0..20 {
-            let result = step.executor.execute(&mut ctx).await.expect("executes");
-            assert!(matches!(result, flare_workflow::StepResult::Success));
-            if ctx.output == "PIPELINE_COMPLETE" {
-                break;
-            }
-        }
-
-        assert_eq!(ctx.output, "PIPELINE_COMPLETE");
-        assert!(ctx.data.ledger.iter().any(|l| l.contains("fix round 1/5")));
-        assert!(ctx.data.ledger.iter().any(|l| l.contains("skipped")));
-        assert_eq!(
-            ctx.data
-                .ledger
-                .iter()
-                .filter(|l| l.contains("complete"))
-                .count(),
-            2,
-            "task 0 and task 2 both completed"
-        );
-    }
-}
+mod sdd_test_support;
 #[cfg(test)]
-mod cap_tests {
-    use super::{sdd_test_support::*, *};
-    #[tokio::test]
-    async fn sixth_fix_round_fails_the_step() {
-        let send: flare_workflow::json::SendMessage = std::sync::Arc::new(
-            move |inv: flare_workflow::json::StepInvocation| {
-                let p = inv.prompt;
-                Box::pin(async move {
-                    let r = if p.contains("judge") {
-                        r#"{"action":"fix_round","rationale":"x","ledger_line":"x","task_model_tier":null}"#
-                    } else {
-                        "REVIEW_ISSUES: x"
-                    };
-                    Ok((r.to_string(), 5u64, 5u64))
-                })
-            },
-        );
-        let mut d = one_task_data();
-        d.fix_round = MAX_FIX_ROUNDS;
-        d.review_issues = Some("x".to_string());
-        d.last_report = Some("x".to_string());
-        let step = build_sdd_loop_step("a".to_string(), "b".to_string(), send);
-        let mut ctx = WorkflowContext::new(Default::default(), d);
-        assert!(matches!(
-            step.executor.execute(&mut ctx).await.expect("x"),
-            StepResult::Failure
-        ));
-    }
-    #[tokio::test]
-    async fn max_tasks_processed_bound_fails_the_step() {
-        let (send, _) = mock_send(vec![]);
-        let mut d = one_task_data();
-        d.current_task_index = MAX_TASKS_PROCESSED;
-        let step = build_sdd_loop_step("a".to_string(), "b".to_string(), send);
-        let mut ctx = WorkflowContext::new(Default::default(), d);
-        assert!(matches!(
-            step.executor.execute(&mut ctx).await.expect("x"),
-            StepResult::Failure
-        ));
-    }
-}
+mod task_sourcing_tests;
+#[cfg(test)]
+mod tests;
