@@ -23,10 +23,16 @@ Write-Host "  port    : $Port"
 Write-Host ""
 
 & $Bin daemon restart | Out-Host
+$restartOk = $? -and $LASTEXITCODE -eq 0
+if (-not $restartOk) {
+    Write-Error "agentflare daemon restart failed (exit $LASTEXITCODE); check 'agentflare daemon logs'"
+    exit 1
+}
 
 $base = "http://127.0.0.1:$Port/proxy"
 $ready = $false
-for ($i = 0; $i -lt 30; $i++) {
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+while ($sw.Elapsed.TotalSeconds -lt 30) {
     try {
         $tcp = [System.Net.Sockets.TcpClient]::new()
         $tcp.Connect("127.0.0.1", $Port)
@@ -40,6 +46,10 @@ for ($i = 0; $i -lt 30; $i++) {
 if (-not $ready) {
     Write-Error "proxy not up on port $Port after 30s; check 'agentflare daemon logs'"
     exit 1
+}
+
+if ($env:AGENTFLARE_PROXY_TOKEN) {
+    $env:ANTHROPIC_CUSTOM_HEADERS = "x-agentflare-proxy-token: $env:AGENTFLARE_PROXY_TOKEN"
 }
 
 Write-Host "proxy ready at $base"
