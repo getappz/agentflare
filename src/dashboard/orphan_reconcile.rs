@@ -91,23 +91,39 @@ fn restore_ready_for_work(mcp: &crate::mcp_server::AgentflareMcp, item_id: &str,
             .iter()
             .find(|l| l.name == crate::supervisor::READY_LABEL)?
             .id;
-        if let Some(dispatched_id) = labels
+        let dispatched_id = labels
             .iter()
             .find(|l| l.name == crate::supervisor::DISPATCHED_LABEL)
-        {
-            let _ = agentflare_backend::item::remove_label(conn, item_id, &dispatched_id.id);
+            .map(|l| l.id.clone());
+
+        // Single transaction: a failure partway through must not leave the
+        // item labeled ready-for-work with no assignee (item #150) or with
+        // `dispatched` still attached (item #99) -- `with_backend_db` gives
+        // no rollback of its own, so this crate does it explicitly instead
+        // of discarding a mid-sequence error via `.ok()?` and continuing.
+        conn.execute_batch("BEGIN").ok()?;
+        let result: agentflare_backend::error::Result<()> = (|| {
+            if let Some(dispatched_id) = &dispatched_id {
+                agentflare_backend::item::remove_label(conn, item_id, dispatched_id)?;
+            }
+            agentflare_backend::item::update(
+                conn,
+                item_id,
+                agentflare_backend::item::UpdateItem {
+                    assignee_agent: Some(agent.to_string()),
+                    ..Default::default()
+                },
+            )?;
+            agentflare_backend::item::add_label(conn, item_id, ready_id)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT").ok(),
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                None
+            }
         }
-        agentflare_backend::item::update(
-            conn,
-            item_id,
-            agentflare_backend::item::UpdateItem {
-                assignee_agent: Some(agent.to_string()),
-                ..Default::default()
-            },
-        )
-        .ok()?;
-        agentflare_backend::item::add_label(conn, item_id, ready_id).ok()?;
-        Some(())
     });
 }
 
