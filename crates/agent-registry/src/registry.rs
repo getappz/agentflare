@@ -287,11 +287,11 @@ pub static REGISTRY: &[AgentSpec] = &[
     AgentSpec {
         id: Agent::Cline,
         display_name: "cline",
-        tier: Tier::Extension,
-        binary_names: &[],
-        version_args: &[],
-        package_manager: None,
-        package_name: None,
+        tier: Tier::Cli,
+        binary_names: &["cline"],
+        version_args: &["--version"],
+        package_manager: Some("npm"),
+        package_name: Some("cline"),
     },
     AgentSpec {
         id: Agent::Continue,
@@ -333,6 +333,11 @@ pub fn headless_args(agent: Agent) -> Option<&'static [&'static str]> {
         Agent::ClaudeCode | Agent::GeminiCli | Agent::Cursor => Some(&["-p"]),
         Agent::Codex => Some(&["exec"]),
         Agent::Opencode => Some(&["run"]),
+        // No subcommand needed: `cline` starts in act mode with auto-approve
+        // on by default, and headless mode triggers automatically when stdin
+        // is piped (confirmed via `cline --help` and docs.cline.bot/usage/cli-overview) —
+        // exactly how this module always delivers the prompt.
+        Agent::Cline => Some(&[]),
         _ => None,
     }
 }
@@ -372,14 +377,14 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_seventeen_cli_tier_and_three_extension_tier() {
+    fn registry_has_eighteen_cli_tier_and_two_extension_tier() {
         let cli_count = REGISTRY.iter().filter(|s| s.tier == Tier::Cli).count();
         let ext_count = REGISTRY
             .iter()
             .filter(|s| s.tier == Tier::Extension)
             .count();
-        assert_eq!(cli_count, 17);
-        assert_eq!(ext_count, 3);
+        assert_eq!(cli_count, 18);
+        assert_eq!(ext_count, 2);
     }
 
     #[test]
@@ -425,6 +430,7 @@ mod tests {
         assert_eq!(headless_args(Agent::GeminiCli), Some(&["-p"][..]));
         assert_eq!(headless_args(Agent::Opencode), Some(&["run"][..]));
         assert_eq!(headless_args(Agent::Cursor), Some(&["-p"][..]));
+        assert_eq!(headless_args(Agent::Cline), Some(&[][..]));
     }
 
     #[test]
