@@ -218,7 +218,6 @@ dependencies = [
 name = "agentflare-gateway-registry"
 version = "0.1.0"
 dependencies = [
- "agentflare-db-kit",
  "agentflare-workspace-hack",
  "axum",
  "flare-search-kit",
@@ -227,7 +226,6 @@ dependencies = [
  "regex",
  "rmcp",
  "rusqlite",
- "rusqlite_migration",
  "schemars",
  "serde",
  "serde_json",
@@ -277,6 +275,7 @@ dependencies = [
 name = "agentflare-skill-registry"
 version = "0.1.1"
 dependencies = [
+ "agentflare-db-kit",
  "agentflare-gateway-registry",
  "agentflare-workspace-hack",
  "dirs",
@@ -284,6 +283,7 @@ dependencies = [
  "flare-search-kit",
  "regex",
  "rusqlite",
+ "rusqlite_migration",
  "serde",
  "serde_json",
  "serde_yaml_ng",

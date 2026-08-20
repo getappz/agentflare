@@ -3,7 +3,8 @@
 //! inside one transaction.
 
 use crate::sources::SkillEntry;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Transaction, params};
+use rusqlite_migration::{HookResult, M, Migrations};
 use std::path::Path;
 
 /// Run PRAGMA integrity_check. Returns error message on failure, None if OK.
@@ -19,7 +20,7 @@ pub fn integrity_check(conn: &Connection) -> Option<String> {
 
 /// Open DB with repair: if integrity check fails or open fails, delete the DB
 /// file and create a fresh one.
-pub fn open_or_repair(db_path: &Path) -> rusqlite::Result<Connection> {
+pub fn open_or_repair(db_path: &Path) -> Result<Connection, db_kit::open::Error> {
     match open_db(db_path) {
         Ok(conn) => {
             if integrity_check(&conn).is_some() {
@@ -37,103 +38,111 @@ pub fn open_or_repair(db_path: &Path) -> rusqlite::Result<Connection> {
     }
 }
 
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS skills (
-  name TEXT NOT NULL,
-  source TEXT NOT NULL,
-  path TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  body TEXT NOT NULL DEFAULT '',
-  neg_text TEXT NOT NULL DEFAULT '',
-  tags TEXT NOT NULL DEFAULT '',
-  est_tokens INTEGER NOT NULL DEFAULT 0,
-  mtime INTEGER NOT NULL DEFAULT 0,
-  last_used_at INTEGER NOT NULL DEFAULT 0,
-  bandit_alpha REAL NOT NULL DEFAULT 1.0,
-  bandit_beta REAL NOT NULL DEFAULT 1.0,
-  shadow_path TEXT,
-  PRIMARY KEY (name, source)
-);
-CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(
+/// Ranking/FTS columns added to `skills` after `0001_initial` -- (name,
+/// declared type + default). Added via a hook rather than baked into
+/// `0002_ranking_and_fts.sql` because `ALTER TABLE ADD COLUMN` is not
+/// idempotent (unlike the `IF NOT EXISTS` DDL everywhere else in this
+/// crate): a `skills.db` first created any time after these columns joined
+/// the hand-rolled `apply_schema()` SCHEMA (pre-migration) already has them,
+/// and a blind `ALTER TABLE` would error `duplicate column name` on those.
+/// Checking `PRAGMA table_info` first makes the migration correct against
+/// both that shape and the pre-ranking narrow table `0001_initial` targets.
+const RANKING_COLUMNS: &[(&str, &str)] = &[
+    ("body", "TEXT NOT NULL DEFAULT ''"),
+    ("neg_text", "TEXT NOT NULL DEFAULT ''"),
+    ("last_used_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("bandit_alpha", "REAL NOT NULL DEFAULT 1.0"),
+    ("bandit_beta", "REAL NOT NULL DEFAULT 1.0"),
+];
+
+/// Always dropped and recreated from scratch rather than converted in place:
+/// this runs once per database (migration hooks run exactly once, tracked by
+/// `user_version`), so it must be correct whether `skills_fts`/its triggers
+/// never existed, are the pre-external-content standalone shape, or already
+/// match this exact shape (e.g. created by a pre-migration `apply_schema()`
+/// run against a `skills` table that was still missing these columns --
+/// `CREATE TRIGGER`/`CREATE VIRTUAL TABLE` don't validate referenced columns
+/// at creation time, only when the trigger fires). `DROP ... IF EXISTS` plus
+/// a fresh `CREATE` collapses all of those into one path instead of
+/// branching on which one it is. The final `INSERT ... SELECT` refills the
+/// index immediately so `skill_search` isn't empty until the next `rebuild`
+/// -- on a brand-new database `skills` has no rows yet, so it's a harmless
+/// no-op there.
+const FTS_AND_TRIGGERS: &str = "
+DROP TABLE IF EXISTS skills_fts;
+DROP TRIGGER IF EXISTS skills_fts_ai;
+DROP TRIGGER IF EXISTS skills_fts_ad;
+DROP TRIGGER IF EXISTS skills_fts_au;
+CREATE VIRTUAL TABLE skills_fts USING fts5(
   name, description, body, tags, neg_text, content='skills'
 );
-CREATE TRIGGER IF NOT EXISTS skills_fts_ai AFTER INSERT ON skills BEGIN
+CREATE TRIGGER skills_fts_ai AFTER INSERT ON skills BEGIN
   INSERT INTO skills_fts(rowid, name, description, body, tags, neg_text)
   VALUES (new.rowid, new.name, new.description, new.body, new.tags, new.neg_text);
 END;
-CREATE TRIGGER IF NOT EXISTS skills_fts_ad AFTER DELETE ON skills BEGIN
+CREATE TRIGGER skills_fts_ad AFTER DELETE ON skills BEGIN
   INSERT INTO skills_fts(skills_fts, rowid, name, description, body, tags, neg_text)
   VALUES ('delete', old.rowid, old.name, old.description, old.body, old.tags, old.neg_text);
 END;
 -- Scoped to the indexed columns: `last_used_at` and the bandit counters are
 -- updated on every skill load, and a bare AFTER UPDATE would re-tokenize the
 -- whole body each time for an index that cannot have changed.
-CREATE TRIGGER IF NOT EXISTS skills_fts_au
+CREATE TRIGGER skills_fts_au
 AFTER UPDATE OF name, description, body, tags, neg_text ON skills BEGIN
   INSERT INTO skills_fts(skills_fts, rowid, name, description, body, tags, neg_text)
   VALUES ('delete', old.rowid, old.name, old.description, old.body, old.tags, old.neg_text);
   INSERT INTO skills_fts(rowid, name, description, body, tags, neg_text)
   VALUES (new.rowid, new.name, new.description, new.body, new.tags, new.neg_text);
 END;
-CREATE TABLE IF NOT EXISTS skill_impressions (
-  name TEXT NOT NULL,
-  source TEXT NOT NULL,
-  surfaced_at INTEGER NOT NULL,
-  PRIMARY KEY (name, source)
-);
+INSERT INTO skills_fts(rowid, name, description, body, tags, neg_text)
+SELECT rowid, name, description, body, tags, neg_text FROM skills;
 ";
 
-/// Databases written before `skills_fts` became external-content carry the
-/// old standalone table, which `CREATE VIRTUAL TABLE IF NOT EXISTS` would
-/// leave in place. Drop it so `SCHEMA` recreates the trigger-backed shape,
-/// then refill the index from `skills` in the same call -- waiting for the
-/// next `rebuild` would leave every `skill_search` empty until then.
+fn add_ranking_columns_and_fts(tx: &Transaction) -> HookResult {
+    let existing: std::collections::HashSet<String> = tx
+        .prepare("PRAGMA table_info(skills)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    for (col, decl) in RANKING_COLUMNS {
+        if !existing.contains(*col) {
+            tx.execute(&format!("ALTER TABLE skills ADD COLUMN {col} {decl}"), [])?;
+        }
+    }
+    tx.execute_batch(FTS_AND_TRIGGERS)?;
+    Ok(())
+}
+
+/// Schema history, oldest first -- mirrors the crate's real history:
+/// `0001_initial` is the original (#92) narrow `skills` table + standalone
+/// FTS5 index; `0002_ranking_and_fts` is the bandit-ranking epic (#302) that
+/// added `skill_impressions` plus the ranking columns and external-content
+/// FTS5 index with sync triggers (#347). `IF NOT EXISTS` throughout 0001
+/// means replaying it against a pre-migration db (`user_version` still 0) is
+/// a harmless no-op; the hook in 0002 is what makes replaying safe for a db
+/// that already has some or all of the ranking columns. Future schema
+/// changes are new `000N_*.sql` files appended here, never edits to these.
 ///
-/// All of it in one transaction, because the halfway state is not
-/// self-correcting: with `skills_fts` dropped but not yet refilled, the next
-/// open finds no such table, reads `legacy` as 0, and recreates an empty
-/// index over a populated `skills` — search silently missing every skill
-/// until something forces a full `rebuild`. SQLite makes DDL transactional,
-/// so the conversion either lands whole or never happened.
-fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
-    let legacy: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master
-          WHERE type = 'table' AND name = 'skills_fts' AND sql NOT LIKE '%content=%'",
-        [],
-        |r| r.get(0),
-    )?;
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    if legacy > 0 {
-        tx.execute_batch("DROP TABLE skills_fts;")?;
-    }
-    tx.execute_batch(SCHEMA)?;
-    if legacy > 0 {
-        tx.execute_batch(
-            "INSERT INTO skills_fts(rowid, name, description, body, tags, neg_text)
-             SELECT rowid, name, description, body, tags, neg_text FROM skills;",
-        )?;
-    }
-    tx.commit()
+/// `LazyLock`, not `const`, because `M::up_with_hook` boxes its hook and so
+/// isn't a `const fn` (unlike the plain-SQL `M::up` other migrations use).
+static MIGRATIONS: std::sync::LazyLock<Migrations<'static>> = std::sync::LazyLock::new(|| {
+    Migrations::new(vec![
+        M::up(include_str!("migrations/0001_initial.sql")),
+        M::up_with_hook(
+            include_str!("migrations/0002_ranking_and_fts.sql"),
+            add_ranking_columns_and_fts,
+        ),
+    ])
+});
+
+pub fn open_db(path: &Path) -> Result<Connection, db_kit::open::Error> {
+    // `db_kit::open_file` already sets a 5s busy_timeout and WAL journal
+    // mode -- shared across all agentflare MCP processes, so readers and a
+    // writer can proceed concurrently instead of hitting SQLITE_BUSY.
+    db_kit::open_file(path, &MIGRATIONS)
 }
 
-pub fn open_db(path: &Path) -> rusqlite::Result<Connection> {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let conn = Connection::open(path)?;
-    // Shared across all agentflare MCP processes: without a busy timeout,
-    // concurrent writers hit SQLITE_BUSY immediately instead of waiting;
-    // WAL lets readers and a writer proceed concurrently.
-    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    apply_schema(&conn)?;
-    Ok(conn)
-}
-
-pub fn open_in_memory() -> rusqlite::Result<Connection> {
-    let conn = Connection::open_in_memory()?;
-    apply_schema(&conn)?;
-    Ok(conn)
+pub fn open_in_memory() -> Result<Connection, db_kit::open::Error> {
+    db_kit::open_memory(&MIGRATIONS)
 }
 
 /// Delete a skill by name and source. Returns true if a row was removed.
@@ -337,6 +346,63 @@ mod tests {
         let hits = crate::search::search(&conn, "alpha", 5, crate::search::MatchMode::All).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "a");
+    }
+
+    #[test]
+    fn a_pre_ranking_narrow_skills_table_gains_columns_without_erroring() {
+        // Reproduces the real-world bug: a `skills.db` created before the
+        // ranking epic (#302) has the original 8-column `skills` table, but
+        // a later `apply_schema()` run already created the modern FTS5
+        // triggers referencing `body`/`neg_text` on top of it (`CREATE
+        // VIRTUAL TABLE`/`CREATE TRIGGER ... IF NOT EXISTS` never validate
+        // the referenced columns at creation time). The first DELETE or
+        // qualifying UPDATE against `skills` then fails with `no such
+        // column: old.body`.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skills.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE skills (
+                   name TEXT NOT NULL, source TEXT NOT NULL, path TEXT NOT NULL,
+                   description TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '',
+                   est_tokens INTEGER NOT NULL DEFAULT 0, mtime INTEGER NOT NULL DEFAULT 0,
+                   shadow_path TEXT, PRIMARY KEY (name, source));
+                 INSERT INTO skills (name, source, path, description) VALUES ('a', 's', '/p', 'alpha');
+                 CREATE VIRTUAL TABLE skills_fts USING fts5(
+                   name, description, body, tags, neg_text, content='skills'
+                 );
+                 CREATE TRIGGER skills_fts_ad AFTER DELETE ON skills BEGIN
+                   INSERT INTO skills_fts(skills_fts, rowid, name, description, body, tags, neg_text)
+                   VALUES ('delete', old.rowid, old.name, old.description, old.body, old.tags, old.neg_text);
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let mut conn = open_db(&path).unwrap();
+
+        let cols: std::collections::HashSet<String> = conn
+            .prepare("PRAGMA table_info(skills)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for col in [
+            "body",
+            "neg_text",
+            "last_used_at",
+            "bandit_alpha",
+            "bandit_beta",
+        ] {
+            assert!(cols.contains(col), "missing column: {col}");
+        }
+
+        // The previously-broken path: rebuild()'s DELETE FROM skills used to
+        // fail firing the AFTER DELETE trigger with "no such column: old.body".
+        rebuild(&mut conn, &[entry("a", "s", "alpha desc")]).unwrap();
+        assert_eq!(fts_hits(&conn, "alpha"), 1);
     }
 
     #[test]
