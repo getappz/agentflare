@@ -18,8 +18,14 @@ pub fn integrity_check(conn: &Connection) -> Option<String> {
     }
 }
 
-/// Open DB with repair: if integrity check fails or open fails, delete the DB
-/// file and create a fresh one.
+/// Open DB with repair: if integrity check fails, or the file itself won't
+/// open (a genuine `rusqlite::Error` -- corruption, not a valid SQLite file,
+/// etc.), delete the DB file and create a fresh one. Deliberately does NOT
+/// repair-by-delete on `Migration` (a real bug in a migration -- deleting
+/// the file would silently destroy `skill_impressions`/ranking state the
+/// filesystem can't reconstruct, hiding the bug instead of surfacing it) or
+/// `SchemaAhead` (means a newer build already wrote to this file; its own
+/// error message says not to touch it by hand, let alone delete it).
 pub fn open_or_repair(db_path: &Path) -> Result<Connection, db_kit::open::Error> {
     match open_db(db_path) {
         Ok(conn) => {
@@ -31,10 +37,11 @@ pub fn open_or_repair(db_path: &Path) -> Result<Connection, db_kit::open::Error>
                 Ok(conn)
             }
         }
-        Err(_) => {
+        Err(db_kit::open::Error::Sqlite(_)) => {
             let _ = std::fs::remove_file(db_path);
             open_db(db_path)
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -68,6 +75,12 @@ const RANKING_COLUMNS: &[(&str, &str)] = &[
 /// index immediately so `skill_search` isn't empty until the next `rebuild`
 /// -- on a brand-new database `skills` has no rows yet, so it's a harmless
 /// no-op there.
+///
+/// Frozen history for `0002`, same rule as the `.sql` migration files: never
+/// edit this FTS shape after release (new databases would get the new shape
+/// at `0002` while existing databases keep the old one, with nothing to
+/// reconcile the difference) -- change it in a new `000N_*.sql` migration
+/// instead.
 const FTS_AND_TRIGGERS: &str = "
 DROP TABLE IF EXISTS skills_fts;
 DROP TRIGGER IF EXISTS skills_fts_ai;
@@ -403,6 +416,49 @@ mod tests {
         // fail firing the AFTER DELETE trigger with "no such column: old.body".
         rebuild(&mut conn, &[entry("a", "s", "alpha desc")]).unwrap();
         assert_eq!(fts_hits(&conn, "alpha"), 1);
+    }
+
+    #[test]
+    fn open_or_repair_propagates_schema_ahead_instead_of_deleting_the_db() {
+        // A newer build already migrated this file past what MIGRATIONS here
+        // knows about. Deleting it would silently destroy real data
+        // (skill_impressions/ranking state the filesystem can't
+        // reconstruct) instead of surfacing the actual problem.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skills.db");
+        {
+            let mut conn = open_db(&path).unwrap();
+            rebuild(&mut conn, &[entry("a", "s", "alpha desc")]).unwrap();
+            conn.pragma_update(None, "user_version", 999).unwrap();
+        }
+
+        let err = open_or_repair(&path).unwrap_err();
+        assert!(
+            matches!(err, db_kit::open::Error::SchemaAhead { .. }),
+            "expected SchemaAhead, got {err:?}"
+        );
+        assert!(path.exists(), "SchemaAhead must not delete the db file");
+
+        // The data survives: a plain rusqlite open (bypassing migrations)
+        // still finds the row that was there before open_or_repair ran.
+        let conn = Connection::open(&path).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM skills", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "open_or_repair must not have wiped the db");
+    }
+
+    #[test]
+    fn open_or_repair_deletes_and_recreates_on_a_corrupt_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skills.db");
+        std::fs::write(&path, b"not a sqlite file").unwrap();
+
+        let conn = open_or_repair(&path).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM skills", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "corrupt file must be replaced with a fresh db");
     }
 
     #[test]
