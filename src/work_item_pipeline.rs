@@ -416,8 +416,8 @@ pub(crate) fn build_sdd_loop_step(
                     args: resume_args_for(&role_agent, &ctx.data.agent_sessions),
                     ..flare_workflow::json::StepInvocation::simple(role_agent.clone(), role_prompt)
                 };
-                let (raw_role_reply, in_tok, out_tok) = send(role_invocation).await.map_err(
-                    |message| {
+                let (raw_role_reply, in_tok, out_tok) =
+                    send(role_invocation).await.map_err(|message| {
                         // A dead resumed session would otherwise fail the
                         // same way on every one of this step's retry
                         // attempts (same session_id -> same `--resume`
@@ -431,8 +431,7 @@ pub(crate) fn build_sdd_loop_step(
                             step_id: StepId::new("sdd_loop"),
                             message,
                         }
-                    },
-                )?;
+                    })?;
                 ctx.input_tokens += in_tok;
                 ctx.output_tokens += out_tok;
 
@@ -473,9 +472,8 @@ pub(crate) fn build_sdd_loop_step(
                         judge_prompt,
                     )
                 };
-                let (raw_judge_reply, jin_tok, jout_tok) = send(judge_invocation)
-                    .await
-                    .map_err(|message| {
+                let (raw_judge_reply, jin_tok, jout_tok) =
+                    send(judge_invocation).await.map_err(|message| {
                         if is_stale_session_error(&message) {
                             ctx.data.agent_sessions.remove(&judge_agent_name);
                         }
