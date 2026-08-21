@@ -125,7 +125,7 @@ async fn proxy_anthropic(
 
     let resp = match check_status(resp).await {
         Ok(resp) => resp,
-        Err(err) => return err,
+        Err(err) => return *err,
     };
 
     Response::builder()
@@ -170,7 +170,7 @@ async fn proxy_gemini(
             false,
             false,
         ),
-        Err(err) => err,
+        Err(err) => *err,
     }
 }
 
@@ -212,7 +212,7 @@ async fn proxy_openai_compat(
             needs_heuristic,
             needs_think,
         ),
-        Err(err) => err,
+        Err(err) => *err,
     }
 }
 
@@ -233,19 +233,25 @@ fn apply_extra_headers(
 /// Verify the upstream response succeeded, converting a non-2xx into an
 /// Anthropic-shaped error `Response`. On success, hands back the still-open
 /// `reqwest::Response` so the caller can stream its body.
-async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, Response> {
+///
+/// `Response` (`axum::http::Response<axum::body::Body>`) is >=128 bytes, so
+/// it's boxed in the `Err` variant rather than inflating every `Result`
+/// return by that much even on the success path (`clippy::result_large_err`).
+async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, Box<Response>> {
     if resp.status().is_success() {
         return Ok(resp);
     }
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     let err_val: Value = serde_json::from_str(&body).unwrap_or(json!({"error": {"message": body}}));
-    Err((
-        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        serde_json::to_string(&shape_xlat::error_to_anthropic(&err_val)).unwrap_or_default(),
-    )
-        .into_response())
+    Err(Box::new(
+        (
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&shape_xlat::error_to_anthropic(&err_val)).unwrap_or_default(),
+        )
+            .into_response(),
+    ))
 }
 
 /// Shared SSE loop for providers whose raw stream needs translating into
