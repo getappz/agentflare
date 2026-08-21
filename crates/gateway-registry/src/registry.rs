@@ -225,6 +225,7 @@ fn error_kind(e: &GatewayError) -> &'static str {
         GatewayError::InvalidArgument(_) => "InvalidArgument",
         GatewayError::CircuitOpen(_) => "CircuitOpen",
         GatewayError::Sqlite(_) => "Sqlite",
+        GatewayError::DbInit(_) => "DbInit",
     }
 }
 

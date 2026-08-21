@@ -31,6 +31,8 @@ pub enum GatewayError {
     CircuitOpen(String),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    DbInit(#[from] db_kit::open::Error),
 }
 
 /// Levenshtein edit distance between two strings (character-wise).
