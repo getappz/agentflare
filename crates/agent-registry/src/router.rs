@@ -202,6 +202,22 @@ pub fn parse_router_config(text: &str) -> Result<RouterConfig, String> {
     Ok(RouterConfig { default, rules })
 }
 
+/// The model configured by the first `[router]` rule matching `task`,
+/// independent of whether that rule's own `use_agents` is installed or even
+/// relevant — for callers where the agent is already fixed (an explicit
+/// assignment, or an operator's `--agent` flag) and only a rule's `model`
+/// still needs to apply. Mirrors `route()`'s first-match-wins precedence: a
+/// matching rule with no `model` set yields `None`, even if a later rule
+/// would have one.
+#[must_use]
+pub fn model_for_task(task: &TaskContext, config: &RouterConfig) -> Option<String> {
+    config
+        .rules
+        .iter()
+        .find(|rule| rule.when.matches(task))
+        .and_then(|rule| rule.model.clone())
+}
+
 /// Decides which agent should run `task`, or `None` if nothing local fits —
 /// the caller's cue to fall back (e.g. cede via the bridge).
 ///
@@ -234,7 +250,7 @@ pub fn route(
     if let Some(agent) = task.assigned_agent {
         return Some(RouteDecision {
             agent,
-            model: None,
+            model: model_for_task(task, config),
             reason: "explicit assignment on task".to_string(),
         });
     }
@@ -340,6 +356,34 @@ mod tests {
         let decision = route(&task, &config, &[Agent::ClaudeCode], &mut no_rotation()).unwrap();
         assert_eq!(decision.agent, Agent::Codex);
         assert_eq!(decision.reason, "explicit assignment on task");
+        assert_eq!(decision.model, None);
+    }
+
+    #[test]
+    fn explicit_assignment_still_picks_up_a_matching_rules_model() {
+        // Item #162: an assigned agent used to make `route()` bail with
+        // `model: None` before ever consulting `[router]` rules — which
+        // meant a rule's `model` could never reach a daemon-dispatched item
+        // (every daemon dispatch carries an explicit `assigned_agent`).
+        let task = TaskContext {
+            labels: vec!["docs".to_string()],
+            assigned_agent: Some(Agent::Cline),
+            ..Default::default()
+        };
+        let config = RouterConfig {
+            default: None,
+            rules: vec![RouterRule {
+                model: Some("sonnet".to_string()),
+                ..rule(&["docs"], &[Agent::Opencode])
+            }],
+        };
+        // Opencode (the rule's `use`) isn't even installed — the matched
+        // rule's model should still apply, since the agent is already fixed
+        // by the assignment and the rule isn't being consulted for agent
+        // selection here.
+        let decision = route(&task, &config, &[Agent::ClaudeCode], &mut no_rotation()).unwrap();
+        assert_eq!(decision.agent, Agent::Cline);
+        assert_eq!(decision.model.as_deref(), Some("sonnet"));
     }
 
     #[test]

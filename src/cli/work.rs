@@ -360,10 +360,23 @@ fn resolve_agent(
     ),
     String,
 > {
+    let task_context =
+        |assigned_agent: Option<agent_registry::Agent>| agent_registry::TaskContext {
+            labels: labels.to_vec(),
+            kind: crate::mcp_server::item::parsed_kind(&item.metadata),
+            size: crate::mcp_server::item::parsed_size(&item.metadata),
+            repo: None,
+            assigned_agent,
+            role: role.map(str::to_string),
+        };
+
     if let Some(name) = explicit {
-        return agent_registry::agent_by_name(name)
-            .map(|agent| (agent, "explicit --agent flag".to_string(), None, None))
-            .ok_or_else(|| format!("unknown agent: {name} — use `agentflare agents list`"));
+        let agent = agent_registry::agent_by_name(name)
+            .ok_or_else(|| format!("unknown agent: {name} — use `agentflare agents list`"))?;
+        // Agent is already fixed by the flag/dispatch — still consult
+        // `[router]` rules for a model (item #162).
+        let model = agent_registry::model_for_task(&task_context(None), config);
+        return Ok((agent, "explicit --agent flag".to_string(), None, model));
     }
 
     let assigned_agent = item
@@ -372,14 +385,7 @@ fn resolve_agent(
         .map(agentflare_backend::item::agent_part)
         .as_deref()
         .and_then(agent_registry::agent_by_name);
-    let task = agent_registry::TaskContext {
-        labels: labels.to_vec(),
-        kind: crate::mcp_server::item::parsed_kind(&item.metadata),
-        size: crate::mcp_server::item::parsed_size(&item.metadata),
-        repo: None,
-        assigned_agent,
-        role: role.map(str::to_string),
-    };
+    let task = task_context(assigned_agent);
     let decision = agent_registry::route(&task, config, installed, rotation).ok_or_else(|| {
         "no --agent given, and no route decision (item has no assignee and no router \
          rule matched) — pass --agent explicitly"
