@@ -5,7 +5,7 @@
 // consent; these just reinforce rules and report drift each session/turn.
 use crate::components::get_components;
 use crate::state;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::io::Read;
 use std::time::Duration;
 
@@ -37,7 +37,7 @@ fn read_stdin_timeout(ms: u64) -> Option<String> {
     rx.recv_timeout(Duration::from_millis(ms)).ok()
 }
 
-fn read_stdin_or_skip(label: &str) -> Option<String> {
+pub(crate) fn read_stdin_or_skip(label: &str) -> Option<String> {
     match read_stdin_timeout(STDIN_TIMEOUT_MS) {
         Some(s) if !s.is_empty() => Some(s),
         _ => {
@@ -339,192 +339,9 @@ pub fn post_tool_failure(_agent: &str) {
     println!("{}", build_failure_decision(&message, severity));
 }
 
-struct PostToolUseInput {
-    session_id: String,
-    tool_name: String,
-    command: Option<String>,
-    exit_code: Option<i32>,
-    output_text: String,
-    item_action: Option<String>,
-}
-
-/// Extracts what the completion-gate hooks need from a successful
-/// PostToolUse stdin payload: for a Bash-family call, the command text and
-/// whatever pass/fail signal `tool_response` carries; for an `item` MCP
-/// call, which `action` it invoked. The exact shape of `tool_response` for
-/// a Bash tool call isn't pinned down anywhere else in this codebase yet
-/// (unlike `parse_post_tool_failure`'s "error" field, which was live-
-/// verified) -- several plausible field names are tried defensively, same
-/// convention as that function, with a text-scan fallback in
-/// `verification_passed` below when none of them are present.
-fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
-    let v: serde_json::Value = serde_json::from_str(input).ok()?;
-    let session_id = v.get("session_id")?.as_str()?.to_string();
-    let tool_name = v.get("tool_name")?.as_str()?.to_string();
-    let tool_input = v.get("tool_input");
-    let command = tool_input
-        .and_then(|ti| {
-            ti.get("command")
-                .or_else(|| ti.get("cmd"))
-                .or_else(|| ti.get("script"))
-        })
-        .and_then(Value::as_str)
-        .map(String::from);
-    let item_action = tool_input
-        .and_then(|ti| ti.get("action"))
-        .and_then(Value::as_str)
-        .map(String::from);
-    let response = v.get("tool_response");
-    let exit_code = response
-        .and_then(|r| {
-            [
-                "exit_code",
-                "exitCode",
-                "status",
-                "returncode",
-                "return_code",
-            ]
-            .iter()
-            .find_map(|key| r.get(key))
-        })
-        .and_then(Value::as_i64)
-        .map(|n| n as i32);
-    let output_text = response
-        .map(|r| {
-            let stdout = r.get("stdout").and_then(Value::as_str).unwrap_or("");
-            let stderr = r.get("stderr").and_then(Value::as_str).unwrap_or("");
-            if stdout.is_empty() && stderr.is_empty() {
-                r.as_str().unwrap_or_default().to_string()
-            } else {
-                format!("{stdout}\n{stderr}")
-            }
-        })
-        .unwrap_or_default();
-    Some(PostToolUseInput {
-        session_id,
-        tool_name,
-        command,
-        exit_code,
-        output_text,
-        item_action,
-    })
-}
-
-const VERIFICATION_FAILURE_MARKERS: &[&str] = &[
-    "test failed",
-    "tests failed",
-    "failures:",
-    "error[e",
-    "panicked at",
-    "fatal:",
-    "build failed",
-    "compilation failed",
-    "exit code: 1",
-    "exit status 1",
-    "non-zero exit",
-];
-
-/// Whether a verification command's outcome counts as passing. Prefers an
-/// explicit exit code (0 = pass); falls back to scanning combined stdout+
-/// stderr for common failure markers when no exit code field was found,
-/// defaulting to "passed" when neither signals failure -- the completion
-/// gate's primary defense is requiring *some* fresh evidence to exist at
-/// all (`hook_redirect::completion_gate_reason`), so an ambiguous pass/fail
-/// read errs permissive here rather than blocking on a parsing gap.
-fn verification_passed(exit_code: Option<i32>, output_text: &str) -> bool {
-    if let Some(code) = exit_code {
-        return code == 0;
-    }
-    let lower = output_text.to_lowercase();
-    !VERIFICATION_FAILURE_MARKERS
-        .iter()
-        .any(|marker| lower.contains(marker))
-}
-
-/// Agentflare-flavored port of superpowers' `finishing-a-development-branch`
-/// decision menu (wording adapted, not copied verbatim -- see
-/// `.refs/superpowers/skills/finishing-a-development-branch/SKILL.md`).
-/// Surfaced once `item done`/`check_merge` succeeds, so the merge/PR/keep
-/// decision is asked explicitly instead of staying implicit in whichever of
-/// `branch_guard_reason_for`, `worktree::cleanup_worktree`, or the PM item
-/// lifecycle happens to run next.
-fn finishing_branch_menu(action: &str) -> String {
-    format!(
-        "item {action} succeeded. Decide how to integrate this branch -- 1) merge it into the target branch locally and clean up the worktree, 2) push it and open/keep a Pull Request for review (already the default unless `push=false` was passed), or 3) keep the branch and worktree as-is for now. Don't assume; ask if it's not already clear which one applies here."
-    )
-}
-
-/// Whether this successful tool call is the completion moment the
-/// finishing-a-development-branch menu should fire for -- an `item` call
-/// (by either name variant, see [`crate::hook_redirect::ITEM_TOOL_NAME`])
-/// whose action actually reached `done`/`check_merge`. Extracted from
-/// [`post_tool_use`] so the trigger condition is unit-testable without
-/// going through stdin.
-fn shows_finishing_branch_menu(tool_name: &str, action: &str) -> bool {
-    matches!(action, "done" | "check_merge")
-        && (tool_name == crate::hook_redirect::ITEM_TOOL_NAME || tool_name == "item")
-}
-
-/// PostToolUse (success) command hook. Two independent jobs, both closing
-/// gaps from item #169's completion gate: (1) records verification evidence
-/// for the session when a Bash-family call's command matches
-/// `optimize::is_verification_command` -- this is the ONLY place that
-/// evidence is ever recorded, so `hook_redirect::completion_gate_reason`
-/// has something to check; (2) surfaces the finishing-a-development-branch
-/// decision menu once `item done`/`check_merge` succeeds.
-pub fn post_tool_use(_agent: &str) {
-    let Some(input) = read_stdin_or_skip("PostToolUse") else {
-        return;
-    };
-    let Some(parsed) = parse_post_tool_use(&input) else {
-        return;
-    };
-
-    if let Some(action) = &parsed.item_action
-        && shows_finishing_branch_menu(&parsed.tool_name, action)
-    {
-        let out = json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": finishing_branch_menu(action),
-            }
-        });
-        println!("{out}");
-        return;
-    }
-
-    let Some(command) = &parsed.command else {
-        return;
-    };
-    if !crate::optimize::is_verification_command(command) {
-        return;
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let passed = verification_passed(parsed.exit_code, &parsed.output_text);
-
-    let mut runtime = crate::optimize::load_runtime();
-    crate::optimize::prune_stale_sessions(&mut runtime, now);
-    let record = runtime
-        .sessions
-        .entry(parsed.session_id.clone())
-        .or_insert_with(|| crate::optimize::SessionRecord {
-            start_ts: now,
-            turn_count: 0,
-            recent_tool_calls: vec![],
-            last_verification: None,
-        });
-    record.last_verification = Some(crate::optimize::VerificationEvidence {
-        command: command.clone(),
-        exit_code: parsed.exit_code,
-        passed,
-        ts: now,
-    });
-    crate::optimize::save_runtime(&runtime);
-}
+// PostToolUse (success) command hook lives in `hook_completion_gate` (item
+// #169) -- split out to stay under this file's LOC gate.
+pub use crate::hook_completion_gate::post_tool_use;
 
 pub fn pre_tool_use(_agent: &str) {
     let Some(input) = read_stdin_or_skip("PreToolUse") else {
@@ -1051,96 +868,6 @@ mod tests {
                 .contains("mcp__flare__vent")
         );
         assert!(d["hookSpecificOutput"]["permissionDecisionReason"].is_null());
-    }
-
-    #[test]
-    fn parse_post_tool_use_reads_bash_command_and_exit_code() {
-        let input = r#"{"session_id":"s1","tool_name":"Bash","tool_input":{"command":"cargo test"},"tool_response":{"exit_code":0,"stdout":"ok","stderr":""}}"#;
-        let parsed = parse_post_tool_use(input).unwrap();
-        assert_eq!(parsed.session_id, "s1");
-        assert_eq!(parsed.command.as_deref(), Some("cargo test"));
-        assert_eq!(parsed.exit_code, Some(0));
-        assert!(parsed.item_action.is_none());
-    }
-
-    #[test]
-    fn parse_post_tool_use_reads_item_action() {
-        let input = r#"{"session_id":"s1","tool_name":"mcp__flare__item","tool_input":{"action":"done","id":"abc"},"tool_response":{}}"#;
-        let parsed = parse_post_tool_use(input).unwrap();
-        assert_eq!(parsed.item_action.as_deref(), Some("done"));
-        assert!(parsed.command.is_none());
-    }
-
-    #[test]
-    fn parse_post_tool_use_falls_back_to_cmd_and_script_fields() {
-        let input = r#"{"session_id":"s1","tool_name":"shell","tool_input":{"cmd":"npm test"}}"#;
-        assert_eq!(
-            parse_post_tool_use(input).unwrap().command.as_deref(),
-            Some("npm test")
-        );
-        let input = r#"{"session_id":"s1","tool_name":"powershell","tool_input":{"script":"go test ./..."}}"#;
-        assert_eq!(
-            parse_post_tool_use(input).unwrap().command.as_deref(),
-            Some("go test ./...")
-        );
-    }
-
-    #[test]
-    fn parse_post_tool_use_returns_none_on_invalid_json() {
-        assert!(parse_post_tool_use("not json").is_none());
-    }
-
-    #[test]
-    fn verification_passed_trusts_zero_exit_code() {
-        assert!(verification_passed(Some(0), ""));
-        assert!(!verification_passed(Some(1), "irrelevant text"));
-    }
-
-    #[test]
-    fn verification_passed_scans_output_when_exit_code_missing() {
-        assert!(verification_passed(
-            None,
-            "running 5 tests\ntest result: ok"
-        ));
-        assert!(!verification_passed(None, "3 failures:\n  test_foo"));
-        assert!(!verification_passed(
-            None,
-            "thread 'main' panicked at 'boom'"
-        ));
-    }
-
-    #[test]
-    fn finishing_branch_menu_names_the_three_options() {
-        let menu = finishing_branch_menu("done");
-        assert!(menu.contains("merge"));
-        assert!(menu.contains("Pull Request"));
-        assert!(menu.contains("keep"));
-    }
-
-    #[test]
-    fn shows_finishing_branch_menu_triggers_on_done_and_check_merge() {
-        assert!(shows_finishing_branch_menu(
-            crate::hook_redirect::ITEM_TOOL_NAME,
-            "done"
-        ));
-        assert!(shows_finishing_branch_menu(
-            crate::hook_redirect::ITEM_TOOL_NAME,
-            "check_merge"
-        ));
-        assert!(shows_finishing_branch_menu("item", "done"));
-    }
-
-    #[test]
-    fn shows_finishing_branch_menu_ignores_other_actions_and_tools() {
-        assert!(!shows_finishing_branch_menu(
-            crate::hook_redirect::ITEM_TOOL_NAME,
-            "claim"
-        ));
-        assert!(!shows_finishing_branch_menu(
-            crate::hook_redirect::ITEM_TOOL_NAME,
-            "update"
-        ));
-        assert!(!shows_finishing_branch_menu("Bash", "done"));
     }
 
     #[test]

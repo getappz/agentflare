@@ -16,7 +16,7 @@ use std::time::Duration;
 const GATING_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// Native/MCP tools that mutate files on disk — every one of these is gated
-/// by `branch_guard_reason` so a direct edit can never land on the repo's
+/// by `branch_guard_reason_for` so a direct edit can never land on the repo's
 /// default branch, regardless of which of these the agent reaches for.
 /// Includes opencode's native tool names (`write`/`edit` lowercase already
 /// covered Claude Code's own lowercase variants; `patch`/`apply_patch`/
