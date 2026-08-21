@@ -9,7 +9,9 @@ repository = "https://github.com/getappz/agentflare"
 publish = false
 
 [dependencies]
+db_kit = { package = "agentflare-db-kit", path = "../agentflare-db-kit" }
 rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite_migration = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

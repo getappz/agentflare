@@ -224,9 +224,14 @@ impl<D: WorkflowData> SqliteStore<D> {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| WorkflowError::Store(format!("begin delete tx: {e}")))?;
-        for table in ["workflow_runs", "journal", "step_state", "run_vars"] {
+        for (table, id_col) in [
+            ("workflow_runs", "id"),
+            ("journal", "run_id"),
+            ("step_state", "run_id"),
+            ("run_vars", "run_id"),
+        ] {
             tx.execute(
-                &format!("DELETE FROM {table} WHERE run_id = ?1"),
+                &format!("DELETE FROM {table} WHERE {id_col} = ?1"),
                 params![run_id],
             )
             .map_err(|e| WorkflowError::Store(format!("delete from {table}: {e}")))?;
@@ -246,6 +251,7 @@ impl StatusAsStr for WorkflowStatus {
         match self {
             WorkflowStatus::Pending => "pending",
             WorkflowStatus::Running => "running",
+            WorkflowStatus::Waiting => "waiting",
             WorkflowStatus::Paused => "paused",
             WorkflowStatus::Completed => "completed",
             WorkflowStatus::Failed => "failed",
@@ -270,6 +276,7 @@ impl StatusAsStr for StepStatus {
 fn status_from_str(s: &str) -> WorkflowStatus {
     match s {
         "running" => WorkflowStatus::Running,
+        "waiting" => WorkflowStatus::Waiting,
         "paused" => WorkflowStatus::Paused,
         "completed" => WorkflowStatus::Completed,
         "failed" => WorkflowStatus::Failed,
@@ -424,7 +431,7 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
                 .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, state_json FROM workflow_runs WHERE status IN ('pending','running')",
+                    "SELECT id, state_json FROM workflow_runs WHERE status IN ('pending','running','waiting')",
                 )
                 .map_err(|e| WorkflowError::Store(format!("prepare list_active: {e}")))?;
             let rows = stmt
@@ -493,7 +500,7 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
             .to_rfc3339();
             let ids: Vec<String> = {
                 let mut stmt = conn
-                    .prepare("SELECT id FROM workflow_runs WHERE status NOT IN ('pending','running','paused') AND updated_at < ?1")
+                    .prepare("SELECT id FROM workflow_runs WHERE status NOT IN ('pending','running','waiting','paused') AND updated_at < ?1")
                     .map_err(|e| WorkflowError::Store(format!("prepare cleanup: {e}")))?;
                 let rows = stmt
                     .query_map(params![cutoff], |row| row.get::<_, String>(0))
@@ -846,5 +853,16 @@ mod tests {
         let reopened = SqliteStore::<TestData>::open_file(&path).unwrap();
         let loaded = reopened.load(s.run_id).await.unwrap();
         assert_eq!(loaded.input, "hello");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_state_from_all_tables() {
+        let store = SqliteStore::<TestData>::open_memory().unwrap();
+        let original = state(&store).await;
+
+        store.delete(original.run_id).await.unwrap();
+
+        let err = store.load(original.run_id).await.unwrap_err();
+        assert!(matches!(err, WorkflowError::NotFound(_)));
     }
 }
