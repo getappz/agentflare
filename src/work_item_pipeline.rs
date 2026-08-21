@@ -1066,21 +1066,42 @@ fn persist_run_id(
     .map_err(|e| e.message.to_string())
 }
 
-/// Decides whether a dispatched item is a review-only task (item #507):
-/// `sdd_loop` should analyze and report rather than implement, and
+/// Decides whether a dispatched item is a no-code task (item #507, widened
+/// by #156): `sdd_loop` should analyze/propose rather than implement, and
 /// `finalize` should post a findings comment rather than running
-/// `item_done`/PR flow. `metadata["task_type"] == "review"` is the
-/// authoritative signal — set it at handoff/dispatch time when the caller
-/// already knows the task type (e.g. PM-mode's own task-type routing).
-/// Falls back to matching the "review only" framing a human/agent handoff
-/// uses in prose when no structured field is set — item #502's own handoff
-/// read "REVIEW ONLY — do not fix, do not push, do not open a PR." with
-/// nothing else marking it as such, and the pipeline implemented it anyway.
+/// `item_done`/PR flow. `metadata["task_type"]` of `"review"` or
+/// `"design-spec"`/`"design_spec"` is the authoritative signal — set it at
+/// handoff/dispatch time when the caller already knows the task type (e.g.
+/// PM-mode's own task-type routing); nothing sets it in production yet, so
+/// in practice the description-phrase fallback below is load-bearing.
+///
+/// The fallback matches the "review only" / "design-spec" framing a
+/// human/agent handoff uses in prose when no structured field is set —
+/// item #502's own handoff read "REVIEW ONLY — do not fix, do not push, do
+/// not open a PR." with nothing else marking it as such, and the pipeline
+/// implemented it anyway. Hyphens are normalized to spaces before matching
+/// because the PM skill's own routing table (`.claude/skills/pm/SKILL.md`)
+/// tells callers to write the hyphenated "review-only", which the original
+/// space-separated-only check missed (item #156).
 pub(crate) fn detect_review_only(item_description: &str, metadata: &serde_json::Value) -> bool {
-    if metadata["task_type"].as_str() == Some("review") {
+    if matches!(
+        metadata["task_type"].as_str(),
+        Some("review") | Some("design-spec") | Some("design_spec")
+    ) {
         return true;
     }
-    item_description.to_lowercase().contains("review only")
+    let normalized = item_description.to_lowercase().replace('-', " ");
+    if normalized.contains("review only") {
+        return true;
+    }
+    // Word-boundary match on "design spec" so "design specification"/"design
+    // specs" (ordinary implementation-task phrasing) doesn't false-positive
+    // on the "spec" prefix.
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    words.windows(2).any(|pair| {
+        pair[0].trim_matches(|c: char| !c.is_alphanumeric()) == "design"
+            && pair[1].trim_matches(|c: char| !c.is_alphanumeric()) == "spec"
+    })
 }
 
 /// Parses `### Task N: <title>` headings (the convention this codebase's
