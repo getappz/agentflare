@@ -7,36 +7,36 @@ use rusqlite::{Connection, Transaction, params};
 use rusqlite_migration::{HookResult, M, Migrations};
 use std::path::Path;
 
-/// Run PRAGMA integrity_check. Returns error message on failure, None if OK.
-pub fn integrity_check(conn: &Connection) -> Option<String> {
-    let result: Result<String, _> =
-        conn.pragma_query_value(None, "integrity_check", |r| r.get::<_, String>(0));
-    match result {
-        Ok(s) if s == "ok" => None,
-        Ok(s) => Some(s),
-        Err(e) => Some(format!("integrity_check query failed: {e}")),
-    }
+/// Run PRAGMA integrity_check. `Ok(None)` means clean, `Ok(Some(msg))` means
+/// SQLite itself reported corruption. `Err` means the check couldn't run at
+/// all (locked, permission denied, I/O error, ...) -- distinct from
+/// corruption, since the file may be perfectly fine.
+pub fn integrity_check(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    let result: String = conn.pragma_query_value(None, "integrity_check", |r| r.get(0))?;
+    Ok(if result == "ok" { None } else { Some(result) })
 }
 
-/// Open DB with repair: if integrity check fails, or the file itself won't
-/// open (a genuine `rusqlite::Error` -- corruption, not a valid SQLite file,
-/// etc.), delete the DB file and create a fresh one. Deliberately does NOT
-/// repair-by-delete on `Migration` (a real bug in a migration -- deleting
-/// the file would silently destroy `skill_impressions`/ranking state the
-/// filesystem can't reconstruct, hiding the bug instead of surfacing it) or
-/// `SchemaAhead` (means a newer build already wrote to this file; its own
-/// error message says not to touch it by hand, let alone delete it).
+/// Open DB with repair: if integrity check reports actual corruption, or the
+/// file itself won't open (a genuine `rusqlite::Error` -- corruption, not a
+/// valid SQLite file, etc.), delete the DB file and create a fresh one.
+/// Deliberately does NOT repair-by-delete when the integrity check itself
+/// fails to run (locked/permission/I-O error -- not evidence of corruption),
+/// on `Migration` (a real bug in a migration -- deleting the file would
+/// silently destroy `skill_impressions`/ranking state the filesystem can't
+/// reconstruct, hiding the bug instead of surfacing it), or on `SchemaAhead`
+/// (means a newer build already wrote to this file; its own error message
+/// says not to touch it by hand, let alone delete it).
 pub fn open_or_repair(db_path: &Path) -> Result<Connection, db_kit::open::Error> {
     match open_db(db_path) {
-        Ok(conn) => {
-            if integrity_check(&conn).is_some() {
+        Ok(conn) => match integrity_check(&conn) {
+            Ok(None) => Ok(conn),
+            Ok(Some(_)) => {
                 drop(conn);
                 let _ = std::fs::remove_file(db_path);
                 open_db(db_path)
-            } else {
-                Ok(conn)
             }
-        }
+            Err(e) => Err(db_kit::open::Error::Sqlite(e)),
+        },
         Err(db_kit::open::Error::Sqlite(_)) => {
             let _ = std::fs::remove_file(db_path);
             open_db(db_path)
