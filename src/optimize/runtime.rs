@@ -579,7 +579,9 @@ mod tests {
         assert!(is_verification_command(
             "grep -rn \"cargo test\" src/ ; cargo test --lib"
         ));
-        assert!(is_verification_command("cd foo && npm test 2>&1 | tee out.log"));
+        assert!(is_verification_command(
+            "cd foo && npm test 2>&1 | tee out.log"
+        ));
     }
 
     #[test]
