@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod anthropic;
+pub mod cline_login;
 pub mod gemini;
 pub mod openai_compat;
 pub mod quota;
