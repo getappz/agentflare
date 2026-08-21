@@ -218,6 +218,7 @@ dependencies = [
 name = "agentflare-gateway-registry"
 version = "0.1.0"
 dependencies = [
+ "agentflare-db-kit",
  "agentflare-workspace-hack",
  "axum",
  "flare-search-kit",
@@ -226,6 +227,7 @@ dependencies = [
  "regex",
  "rmcp",
  "rusqlite",
+ "rusqlite_migration",
  "schemars",
  "serde",
  "serde_json",
