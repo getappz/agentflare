@@ -550,8 +550,10 @@ impl Store {
             |row| {
                 let blob: Vec<u8> = row.get(0)?;
                 let vec: Vec<f32> = blob
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 Ok(vec)
             },
@@ -588,8 +590,10 @@ impl Store {
                     return None;
                 }
                 let doc_vec: Vec<f32> = blob
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 let sim = crate::embed::cosine_similarity(query_vec, &doc_vec)? as f64;
                 Some((
