@@ -586,3 +586,82 @@ async fn crash_mid_sdd_loop_resumes_against_the_persisted_item_and_agent() {
          not a registration-time placeholder; recorded calls: {recorded:?}"
     );
 }
+
+/// item #159: a session resumed from before a daemon crash/restart is often
+/// gone for good (`claude --resume <dead-id>` -> "No conversation found").
+/// Retrying that failure verbatim just repeats it `RetryPolicy::max_attempts`
+/// times against the same dead id and fails the whole run. The fix clears
+/// the stale entry from `ctx.data.agent_sessions` on that specific error, so
+/// the very next attempt (same in-memory `ctx`, mirroring `execute_loop`'s
+/// retry) falls back to a fresh, non-resumed prompt instead.
+#[tokio::test]
+async fn stale_resumed_session_is_cleared_so_the_retry_sends_a_fresh_prompt() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let call_count_clone = call_count.clone();
+    let send: flare_workflow::json::SendMessage = Arc::new(
+        move |inv: flare_workflow::json::StepInvocation| {
+            let n = call_count_clone.fetch_add(1, Ordering::SeqCst);
+            let args = inv.args.clone();
+            Box::pin(async move {
+                match n {
+                    0 => {
+                        assert_eq!(
+                            args,
+                            vec!["--resume".to_string(), "dead-session".to_string()],
+                            "first attempt must resume the persisted (now-dead) session"
+                        );
+                        Err("claude-code exited non-zero — last stderr before kill:\n\
+                             No conversation found with session ID: dead-session"
+                            .to_string())
+                    }
+                    1 => {
+                        assert!(
+                            args.is_empty(),
+                            "retry must fall back to a fresh prompt, not repeat --resume \
+                             dead-session; got args: {args:?}"
+                        );
+                        Ok(("DONE: implemented fresh".to_string(), 1u64, 1u64))
+                    }
+                    _ => Ok((
+                        r#"{"action":"advance_task","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#
+                            .to_string(),
+                        1u64,
+                        1u64,
+                    )),
+                }
+            })
+        },
+    );
+
+    // Must be a real `agent_registry` id ("implementer-agent" isn't
+    // registered, so `resume_args_for` would return no args regardless of
+    // `agent_sessions` — "claude-code" is the one whose actual stderr this
+    // whole scenario is modeled on).
+    let mut data = one_task_data();
+    data.agent_name = "claude-code".to_string();
+    data.agent_sessions
+        .insert("claude-code".to_string(), "dead-session".to_string());
+    let step = build_sdd_loop_step(send);
+    let mut ctx = WorkflowContext::new(Default::default(), data);
+
+    let err = step
+        .executor
+        .execute(&mut ctx)
+        .await
+        .expect_err("dispatch against a dead session must surface as a retryable Err");
+    assert!(matches!(err, WorkflowError::StepFailed { .. }));
+    assert!(
+        !ctx.data.agent_sessions.contains_key("claude-code"),
+        "stale session must be cleared on the not-found signature"
+    );
+
+    let result = step
+        .executor
+        .execute(&mut ctx)
+        .await
+        .expect("retry with a fresh prompt must succeed");
+    assert!(matches!(result, StepResult::Success));
+}

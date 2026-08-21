@@ -290,6 +290,16 @@ fn resume_args_for(
     }
 }
 
+/// True when a `send` failure means the resumed provider session no longer
+/// exists — e.g. it was born under a daemon process that crashed/restarted
+/// mid-run (item #159) — rather than a transient failure worth retrying
+/// as-is. Matches Claude Code's `claude --resume <dead-id>` stderr; other
+/// `resume_arg` agents (Cursor) are expected to fail the same recognizable
+/// way, but none has been observed yet to confirm the exact text.
+fn is_stale_session_error(message: &str) -> bool {
+    message.to_lowercase().contains("no conversation found")
+}
+
 /// Cap on fix rounds for a single SDD task before the loop gives up on it —
 /// mirrors `MAX_REVIEW_CYCLES`'s existing cap-constant pattern for the
 /// `coder`/`review_or_fix` pipeline.
@@ -406,13 +416,23 @@ pub(crate) fn build_sdd_loop_step(
                     args: resume_args_for(&role_agent, &ctx.data.agent_sessions),
                     ..flare_workflow::json::StepInvocation::simple(role_agent.clone(), role_prompt)
                 };
-                let (raw_role_reply, in_tok, out_tok) =
-                    send(role_invocation)
-                        .await
-                        .map_err(|message| WorkflowError::StepFailed {
+                let (raw_role_reply, in_tok, out_tok) = send(role_invocation).await.map_err(
+                    |message| {
+                        // A dead resumed session would otherwise fail the
+                        // same way on every one of this step's retry
+                        // attempts (same session_id -> same `--resume`
+                        // failure) until `RetryPolicy` gives up — clearing
+                        // it here makes the very next attempt fall back to
+                        // a fresh prompt instead.
+                        if is_stale_session_error(&message) {
+                            ctx.data.agent_sessions.remove(&role_agent);
+                        }
+                        WorkflowError::StepFailed {
                             step_id: StepId::new("sdd_loop"),
                             message,
-                        })?;
+                        }
+                    },
+                )?;
                 ctx.input_tokens += in_tok;
                 ctx.output_tokens += out_tok;
 
@@ -453,13 +473,17 @@ pub(crate) fn build_sdd_loop_step(
                         judge_prompt,
                     )
                 };
-                let (raw_judge_reply, jin_tok, jout_tok) =
-                    send(judge_invocation)
-                        .await
-                        .map_err(|message| WorkflowError::StepFailed {
+                let (raw_judge_reply, jin_tok, jout_tok) = send(judge_invocation)
+                    .await
+                    .map_err(|message| {
+                        if is_stale_session_error(&message) {
+                            ctx.data.agent_sessions.remove(&judge_agent_name);
+                        }
+                        WorkflowError::StepFailed {
                             step_id: StepId::new("sdd_loop"),
                             message,
-                        })?;
+                        }
+                    })?;
                 ctx.input_tokens += jin_tok;
                 ctx.output_tokens += jout_tok;
 
