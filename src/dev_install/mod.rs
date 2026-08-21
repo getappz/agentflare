@@ -8,6 +8,7 @@
 
 mod cargo;
 
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -108,7 +109,16 @@ fn install_shims(release: bool, target: &Path) {
         (crate::shim_install::generic_shim_binary_name(), shim),
         (crate::cli::git::shim_dest_name().to_string(), git_shim),
     ] {
-        if let Err(e) = crate::update::swap::replace_binary(&src, &bin_dir.join(&name)) {
+        // A plain overwrite copy, not `swap::replace_binary`: these are inert
+        // staging files, not the currently-running agentflare image, so they
+        // don't need its lock-safe rename-aside dance. That dance actively
+        // breaks the git shim here -- its staging file is deleted at the end
+        // of every run (see below), so on the *next* run the target is always
+        // absent, `replace_binary`'s Windows path always takes that as "the
+        // file is locked" and defers the copy to a post-exit `.bat`, and
+        // `shim_install::install()` (called synchronously right after this
+        // loop) never sees it in time.
+        if let Err(e) = fs::copy(&src, bin_dir.join(&name)) {
             crate::ui::info(&format!("could not place {name} next to agentflare: {e}"));
             return;
         }
