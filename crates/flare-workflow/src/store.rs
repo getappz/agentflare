@@ -140,7 +140,12 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
         let states = self.states.read();
         Ok(states
             .values()
-            .filter(|s| matches!(s.status, WorkflowStatus::Running | WorkflowStatus::Pending))
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    WorkflowStatus::Running | WorkflowStatus::Pending | WorkflowStatus::Waiting
+                )
+            })
             .cloned()
             .collect())
     }
@@ -166,7 +171,10 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
         states.retain(|_, state| {
             if matches!(
                 state.status,
-                WorkflowStatus::Running | WorkflowStatus::Pending | WorkflowStatus::Paused
+                WorkflowStatus::Running
+                    | WorkflowStatus::Pending
+                    | WorkflowStatus::Waiting
+                    | WorkflowStatus::Paused
             ) {
                 return true;
             }
