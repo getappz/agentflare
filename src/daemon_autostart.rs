@@ -87,14 +87,47 @@ fn daemon_home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
+// Appends `dir` to `path` unless it's already present. Split out from
+// `daemon_path_env` so the append logic is testable without touching the
+// real filesystem/env.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn append_path_dir(path: String, dir: &PathBuf) -> String {
+    if std::env::split_paths(&path).any(|p| &p == dir) {
+        return path;
+    }
+    if path.is_empty() {
+        dir.to_string_lossy().into_owned()
+    } else {
+        format!("{path}:{}", dir.to_string_lossy())
+    }
+}
+
 // A systemd/launchd-restarted daemon only inherits the service manager's
 // bare default PATH, not the invoking shell's -- capture the real PATH at
 // enable-time (which includes ~/.local/bin, ~/.cargo/bin, etc.) so a
 // crash-restart doesn't strand the daemon without the agent CLIs it needs
 // to dispatch jobs.
+//
+// mise-managed agents (e.g. `cline`, installed via `agentflare agents
+// install`) only resolve through mise's shims directory or `mise
+// activate`'s per-shell PATH injection -- neither is guaranteed to be on
+// the installing shell's ambient PATH captured above (item #167: the
+// captured PATH had neither, so the daemon's in-process dispatch failed
+// `find_binary` for `cline` even though `agents list` -- run from a
+// mise-activated interactive shell -- reported it ready). The shims
+// directory is mise's own recommended integration for non-interactive
+// processes (`mise doctor` suggests it verbatim) and is static once
+// created, so appending it here keeps every future `mise install` visible
+// to the daemon without ever needing to reinstall the service.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn daemon_path_env() -> String {
-    std::env::var("PATH").unwrap_or_default()
+    let path = std::env::var("PATH").unwrap_or_default();
+    let shims = daemon_home_dir().join(".local/share/mise/shims");
+    if shims.is_dir() {
+        append_path_dir(path, &shims)
+    } else {
+        path
+    }
 }
 
 // Command::args does not go through a shell, so a literal "gui/$(id -u)"
@@ -380,5 +413,36 @@ fn start_linux() -> Result<(), String> {
         Ok(())
     } else {
         Err("systemctl start failed".to_string())
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod path_env_tests {
+    use super::*;
+
+    #[test]
+    fn appends_dir_not_already_on_path() {
+        let path = "/usr/bin:/bin".to_string();
+        let shims = PathBuf::from("/home/x/.local/share/mise/shims");
+        assert_eq!(
+            append_path_dir(path, &shims),
+            "/usr/bin:/bin:/home/x/.local/share/mise/shims"
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_a_dir_already_on_path() {
+        let path = "/usr/bin:/home/x/.local/share/mise/shims:/bin".to_string();
+        let shims = PathBuf::from("/home/x/.local/share/mise/shims");
+        assert_eq!(append_path_dir(path.clone(), &shims), path);
+    }
+
+    #[test]
+    fn appends_to_an_empty_path_without_a_leading_separator() {
+        let shims = PathBuf::from("/home/x/.local/share/mise/shims");
+        assert_eq!(
+            append_path_dir(String::new(), &shims),
+            "/home/x/.local/share/mise/shims"
+        );
     }
 }
