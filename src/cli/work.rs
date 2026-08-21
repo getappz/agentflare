@@ -806,6 +806,12 @@ fn execute_work_impl(
         };
     };
     let _ = writeln!(log, "worktree: {}", wpath.display());
+    if let Some(detail) = claim["rebase_conflict"].as_str() {
+        let _ = writeln!(
+            log,
+            "worktree: rebase conflicted, proceeding on prior base: {detail}"
+        );
+    }
 
     // --- Fetch item + labels (no longer comments -- `sdd_loop` builds its
     // own per-task prompts from `item_detail.description`/a plan doc) ---

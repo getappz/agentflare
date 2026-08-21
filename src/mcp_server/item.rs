@@ -604,6 +604,28 @@ impl AgentflareMcp {
             ),
             _ => None,
         };
+        // A re-claimed/redispatched worktree is never refreshed by
+        // `create_worktree` itself (its own fetch only ever runs on first
+        // creation), so it can sit stale while other agents merge unrelated
+        // PRs into `target`. Rebase it onto `target`'s latest tip right here,
+        // before any work starts (item #161) -- runs for a freshly-created
+        // worktree too, but is then a cheap no-op (`UpToDate`) since it was
+        // just branched off the same fetch.
+        let rebase_conflict = match (&item, &target_branch, &worktree_result) {
+            (Some(item), Some(target), Some(Ok(_))) => {
+                match crate::worktree::rebase_item_worktree(item, &repo_root, target) {
+                    crate::worktree::RebaseOutcome::Conflict(detail) => {
+                        eprintln!(
+                            "worktree: rebase onto latest {target} conflicted for item {item_id} \
+                             -- leaving the worktree on its prior base: {detail}"
+                        );
+                        Some(detail)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         Ok(match outcome {
             agentflare_backend::item::ClaimOutcome::Acquired => {
                 let mut resp = serde_json::json!({
@@ -625,6 +647,13 @@ impl AgentflareMcp {
                         resp["worktree_error"] = serde_json::Value::String(e);
                     }
                     None => {}
+                }
+                // Non-fatal like `worktree_error` above -- work can still
+                // proceed against the worktree's prior (unrebased) base
+                // exactly as it would have before this rebase step existed;
+                // this just tells the caller its base may be stale.
+                if let Some(detail) = rebase_conflict {
+                    resp["rebase_conflict"] = serde_json::Value::String(detail);
                 }
                 resp.to_string()
             }

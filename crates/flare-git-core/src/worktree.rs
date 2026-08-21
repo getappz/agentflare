@@ -659,6 +659,21 @@ pub fn branch_diverged(repo_root: &Path, branch: &str, target_branch: &str) -> b
 /// `None`) on any failure — nothing here should block `done` since the
 /// item's completion is already committed to the DB by the time this runs.
 ///
+/// Rebases onto `target_branch`'s latest tip (via [`rebase_item_worktree`])
+/// before pushing — the work session between claim and `done` can easily
+/// outlive other agents' merges to `target_branch`, so without this the PR
+/// opened next can already be behind the base it's meant to land on (item
+/// #161). A conflict there just aborts the rebase and pushes the branch
+/// unchanged, same as if this call weren't here at all.
+///
+/// Pushes with `--force-with-lease` rather than a plain push: a successful
+/// rebase rewrites this branch's commits, so a plain push to a branch this
+/// process already pushed in an earlier `done` call would be rejected as
+/// non-fast-forward. `--force-with-lease` only overwrites the remote branch
+/// if it still matches what this process last saw (its own remote-tracking
+/// ref, refreshed by the rebase's own fetch above), so it's safe even when
+/// nothing was actually rebased this call.
+///
 /// Deliberately does NOT open a PR — that's a GitHub-API concern kept out
 /// of this crate; see the thin wrapper in the main binary's
 /// `src/worktree.rs::push_and_open_pr`.
@@ -675,6 +690,22 @@ pub fn push_branch(
     if !worktree_path.exists() {
         return None; // nothing was ever claimed into a worktree for this item
     }
+    match rebase_item_worktree(item, repo_root, target_branch) {
+        RebaseOutcome::Rebased => {
+            eprintln!(
+                "worktree: rebased item {}'s branch onto latest {target_branch} before push",
+                item.id
+            );
+        }
+        RebaseOutcome::Conflict(detail) => {
+            eprintln!(
+                "worktree: rebase onto latest {target_branch} conflicted for item {} \
+                 (pushing the branch unchanged instead): {detail}",
+                item.id
+            );
+        }
+        RebaseOutcome::Skipped | RebaseOutcome::UpToDate | RebaseOutcome::Dirty => {}
+    }
     let branch = resolve_item_task_branch(item, repo_root);
     // Nothing to push (and nothing worth a PR) if the branch never
     // diverged from its target — e.g. `done` called with no commits made.
@@ -687,7 +718,7 @@ pub fn push_branch(
     let push_timeout = 120;
     match run_output_timeout(
         crate::shell::git_binary(),
-        &["push", "-u", "origin", &branch],
+        &["push", "--force-with-lease", "-u", "origin", &branch],
         repo_root,
         push_timeout,
     ) {
@@ -706,6 +737,98 @@ pub fn push_branch(
         _ => {}
     }
     Some(branch)
+}
+
+/// Outcome of [`rebase_item_worktree`].
+pub enum RebaseOutcome {
+    /// No worktree exists yet, or the fetch itself didn't land (no remote,
+    /// offline, or the fetched ref didn't resolve) -- soft-failed like
+    /// every other network step in this file rather than blocking the
+    /// caller.
+    Skipped,
+    /// The worktree's branch already contains the fetched target tip --
+    /// nothing to rebase.
+    UpToDate,
+    /// Rebased cleanly onto the fetched target tip.
+    Rebased,
+    /// The worktree had uncommitted changes -- rebasing over them risks
+    /// losing or corrupting in-progress work, so nothing ran.
+    Dirty,
+    /// The rebase hit a conflict and was aborted; the branch is exactly as
+    /// it was before this call. Carries `git rebase`'s stderr for whoever
+    /// surfaces this to a human.
+    Conflict(String),
+}
+
+/// Fetches the current tip of `target_branch` and rebases `item`'s worktree
+/// branch onto it, if the worktree exists and is clean.
+///
+/// `create_worktree`'s own fetch only ever runs once, at initial creation --
+/// a worktree that's re-claimed/redispatched, or that simply sits idle while
+/// other agents merge unrelated PRs into `target_branch`, never gets
+/// refreshed, so work (and the PR eventually opened from it) can proceed
+/// against an already-stale base. Callers are expected to invoke this both
+/// right after a claim resolves a worktree (covering the re-claim/redispatch
+/// case) and again right before opening a PR (covering drift that happened
+/// during the work session itself) (item #161).
+///
+/// Never forces or discards anything: a dirty tree is left untouched
+/// (`Dirty`), and a real conflict aborts the rebase immediately (`Conflict`)
+/// rather than leaving the worktree mid-rebase or resolving anything
+/// automatically. Soft-fails (`Skipped`) on no worktree / no reachable
+/// remote, matching every other network step in this file.
+pub fn rebase_item_worktree(item: &Item, repo_root: &Path, target_branch: &str) -> RebaseOutcome {
+    let worktree_path = repo_root
+        .join(".worktrees")
+        .join("task")
+        .join(item.sequence_id.to_string());
+    if !worktree_path.is_dir() {
+        return RebaseOutcome::Skipped;
+    }
+    let fetch_timeout_secs = 30;
+    let fetch_result = fetch_with_retry(
+        crate::shell::git_binary(),
+        &["fetch", "origin", target_branch],
+        &worktree_path,
+        fetch_timeout_secs,
+    );
+    let remote_ref = format!("origin/{target_branch}");
+    let fetched = matches!(&fetch_result, Ok(out) if out.status.success())
+        && run_git_in_ok(
+            &worktree_path,
+            &["rev-parse", "--verify", "--quiet", &remote_ref],
+        );
+    if !fetched {
+        return RebaseOutcome::Skipped;
+    }
+    match run_git_in(&worktree_path, &["status", "--porcelain"]) {
+        Ok(out) if out.trim().is_empty() => {}
+        _ => return RebaseOutcome::Dirty,
+    }
+    if run_git_in_ok(
+        &worktree_path,
+        &["merge-base", "--is-ancestor", &remote_ref, "HEAD"],
+    ) {
+        return RebaseOutcome::UpToDate;
+    }
+    let rebase_timeout_secs = 60;
+    match run_output_timeout(
+        crate::shell::git_binary(),
+        &["rebase", &remote_ref],
+        &worktree_path,
+        rebase_timeout_secs,
+    ) {
+        Ok(out) if out.status.success() => RebaseOutcome::Rebased,
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let _ = run_git_in(&worktree_path, &["rebase", "--abort"]);
+            RebaseOutcome::Conflict(stderr)
+        }
+        Err(e) => {
+            let _ = run_git_in(&worktree_path, &["rebase", "--abort"]);
+            RebaseOutcome::Conflict(e)
+        }
+    }
 }
 
 /// Information about an orphaned worktree detected during audit.
