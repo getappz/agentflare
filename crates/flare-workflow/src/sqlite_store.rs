@@ -224,9 +224,14 @@ impl<D: WorkflowData> SqliteStore<D> {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| WorkflowError::Store(format!("begin delete tx: {e}")))?;
-        for table in ["workflow_runs", "journal", "step_state", "run_vars"] {
+        for (table, id_col) in [
+            ("workflow_runs", "id"),
+            ("journal", "run_id"),
+            ("step_state", "run_id"),
+            ("run_vars", "run_id"),
+        ] {
             tx.execute(
-                &format!("DELETE FROM {table} WHERE run_id = ?1"),
+                &format!("DELETE FROM {table} WHERE {id_col} = ?1"),
                 params![run_id],
             )
             .map_err(|e| WorkflowError::Store(format!("delete from {table}: {e}")))?;
@@ -848,5 +853,16 @@ mod tests {
         let reopened = SqliteStore::<TestData>::open_file(&path).unwrap();
         let loaded = reopened.load(s.run_id).await.unwrap();
         assert_eq!(loaded.input, "hello");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_state_from_all_tables() {
+        let store = SqliteStore::<TestData>::open_memory().unwrap();
+        let original = state(&store).await;
+
+        store.delete(original.run_id).await.unwrap();
+
+        let err = store.load(original.run_id).await.unwrap_err();
+        assert!(matches!(err, WorkflowError::NotFound(_)));
     }
 }
