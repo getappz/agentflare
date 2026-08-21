@@ -109,7 +109,7 @@ fn install_shims(release: bool, target: &Path) {
         (crate::shim_install::generic_shim_binary_name(), shim),
         (crate::cli::git::shim_dest_name().to_string(), git_shim),
     ] {
-        // A plain overwrite copy, not `swap::replace_binary`: these are inert
+        // Stage-then-rename, not `swap::replace_binary`: these are inert
         // staging files, not the currently-running agentflare image, so they
         // don't need its lock-safe rename-aside dance. That dance actively
         // breaks the git shim here -- its staging file is deleted at the end
@@ -118,7 +118,19 @@ fn install_shims(release: bool, target: &Path) {
         // file is locked" and defers the copy to a post-exit `.bat`, and
         // `shim_install::install()` (called synchronously right after this
         // loop) never sees it in time.
-        if let Err(e) = fs::copy(&src, bin_dir.join(&name)) {
+        //
+        // A direct `fs::copy` over the destination would overwrite
+        // `agentflare-shim`/`git` in place -- if it failed partway (disk
+        // full, the destination momentarily locked), every one of the
+        // GENERIC_SHIM_TOOLS hardlinks pointing at that same file would break.
+        // Copy to a pid-scoped sibling first and only rename over the real
+        // destination once the copy has fully succeeded, so a failure never
+        // touches the pre-existing shared binary.
+        let dest = bin_dir.join(&name);
+        let staged = bin_dir.join(format!("{name}.{}.new", std::process::id()));
+        let result = fs::copy(&src, &staged).and_then(|_| fs::rename(&staged, &dest));
+        if let Err(e) = result {
+            let _ = fs::remove_file(&staged);
             crate::ui::info(&format!("could not place {name} next to agentflare: {e}"));
             return;
         }
