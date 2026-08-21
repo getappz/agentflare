@@ -185,6 +185,73 @@ fn merge_opencode_mcp(path: &Path, key: &str, entry: Value) -> bool {
     write_json_pretty(path, &existing).is_ok()
 }
 
+/// `opencode.jsonc` permission keys that route native reads/search/shell
+/// through the flare gateway's lean-ctx tools instead — the enforcement half
+/// of opencode's token-compression setup (the flare MCP entry alone only
+/// makes the compact tools *available*, not preferred).
+const OPENCODE_DENY_KEYS: &[&str] = &["read", "grep", "glob", "bash"];
+
+/// True once every `OPENCODE_DENY_KEYS` entry is present (any value — an
+/// existing user choice like `"ask"` counts as already decided) in the
+/// merged `opencode.json` + `opencode.jsonc` view.
+fn opencode_permission_configured() -> bool {
+    opencode_config_merged()
+        .get("permission")
+        .and_then(|p| p.as_object())
+        .is_some_and(|perm| OPENCODE_DENY_KEYS.iter().all(|k| perm.contains_key(*k)))
+}
+
+/// True once the `flare` MCP server is registered somewhere opencode reads
+/// from — the escape hatch `opencode-token-guard` requires before it will
+/// deny native read/grep/glob/bash, so denying those never strands opencode
+/// without a working replacement.
+fn opencode_flare_mcp_registered() -> bool {
+    opencode_config_merged()
+        .get("mcp")
+        .and_then(|m| m.get("flare"))
+        .is_some()
+}
+
+/// True once opencode has a working lean-ctx route: the `flare` MCP entry is
+/// registered *and* `leanctx` is registered behind the gateway
+/// (`~/.agentflare/gateway.toml`). Both are required — a `flare` entry alone
+/// still gets `ServerNotFound` from `tool(action="execute", server="leanctx")`
+/// if the user declined the separate `leanctx` component's consent prompt, so
+/// checking `flare` in isolation would let `opencode-token-guard` deny native
+/// read/grep/glob/bash with no working replacement behind them.
+fn opencode_lean_ctx_route_ready() -> bool {
+    opencode_flare_mcp_registered() && crate::gateway_integrations::already_registered("leanctx")
+}
+
+/// Adds any `keys` entry missing from `path`'s own `permission` object
+/// (denying it), preserving whatever the user already set. Only ever
+/// inserts into `opencode_config_path` (jsonc), matching `merge_opencode_mcp`.
+/// Returns the number of keys actually added.
+fn merge_opencode_permission(path: &Path, keys: &[&str]) -> usize {
+    let mut existing = read_json_object(path, || serde_json::json!({}));
+    let obj = existing.as_object_mut().unwrap();
+    let permission = obj
+        .entry("permission")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(p) = permission.as_object_mut() else {
+        return 0;
+    };
+    let mut added = 0;
+    for key in keys {
+        if !p.contains_key(*key) {
+            p.insert(key.to_string(), serde_json::json!("deny"));
+            added += 1;
+        }
+    }
+    if added > 0 {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = write_json_pretty(path, &existing);
+    }
+    added
+}
+
 fn write_if_absent(path: &PathBuf, content: &str) -> bool {
     if path.exists() {
         return false;
@@ -961,6 +1028,42 @@ pub fn get_components(host: &str) -> Vec<Component> {
                 })
             },
         },
+        // Registering the flare MCP entry (above) only makes opencode's
+        // gateway-fronted lean-ctx tools available; without this, opencode
+        // still defaults to its native read/grep/glob/bash, so a
+        // dispatch-driven agent (e.g. the SDD-loop implementer) gets no
+        // token compression unless someone happened to run `lean-ctx
+        // onboard` by hand on that host. Denying the native equivalents
+        // makes the compact path the only path — but only once `flare` is
+        // actually registered, so this never strands opencode without a
+        // working read/shell route.
+        Component {
+            id: "opencode-token-guard",
+            needs_consent: true,
+            describe: "opencode.jsonc permission block (read/grep/glob/bash: deny) — routes file reads and shell commands through the flare gateway's lean-ctx tools instead of native calls".to_string(),
+            check: {
+                let host = host_owned.clone();
+                Box::new(move || host != "opencode" || opencode_permission_configured())
+            },
+            apply: {
+                let host = host_owned.clone();
+                Box::new(move || {
+                    if host != "opencode" {
+                        return "not applicable for this host".to_string();
+                    }
+                    if !opencode_lean_ctx_route_ready() {
+                        return "skipped — flare MCP entry and/or the leanctx gateway registration aren't wired yet in opencode's config; re-run `agentflare init` once both are set up (denying native tools without a working MCP alternative would strand opencode with no read/shell path)".to_string();
+                    }
+                    let path = opencode_config_path();
+                    let added = merge_opencode_permission(&path, OPENCODE_DENY_KEYS);
+                    if added > 0 {
+                        format!("{} ({added} permission key(s) set to deny: read/grep/glob/bash)", path.display())
+                    } else {
+                        format!("{} already has all permission keys configured", path.display())
+                    }
+                })
+            },
+        },
         Component {
             id: "optimize-code-mode",
             needs_consent: false,
@@ -1073,6 +1176,7 @@ mod tests {
             "opencode-branch-guard",
             "leanctx",
             "agentflare-mcp",
+            "opencode-token-guard",
             "optimize-code-mode",
             "gateway-permissions",
         ];
@@ -1673,6 +1777,125 @@ mod tests {
                 .find(|c| c.id == "gateway-permissions")
                 .unwrap();
             assert!((gw.check)());
+        });
+    }
+
+    #[test]
+    fn opencode_token_guard_is_satisfied_for_non_opencode_hosts() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("claude-code");
+            let guard = components
+                .iter()
+                .find(|c| c.id == "opencode-token-guard")
+                .unwrap();
+            assert!((guard.check)());
+        });
+    }
+
+    #[test]
+    fn opencode_token_guard_refuses_to_deny_native_tools_without_flare_registered() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("opencode");
+            let guard = components
+                .iter()
+                .find(|c| c.id == "opencode-token-guard")
+                .unwrap();
+            assert!(!(guard.check)(), "fresh temp home has no config yet");
+
+            let msg = (guard.apply)();
+            assert!(
+                msg.contains("skipped"),
+                "must not deny native tools before flare MCP is registered: {msg}"
+            );
+            assert!(
+                !(guard.check)(),
+                "check should still fail — nothing was written"
+            );
+            assert!(
+                !opencode_config_path().exists(),
+                "apply must not create opencode.jsonc when it skips"
+            );
+        });
+    }
+
+    #[test]
+    fn opencode_token_guard_refuses_to_deny_native_tools_without_leanctx_registered() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("opencode");
+            let mcp = components
+                .iter()
+                .find(|c| c.id == "agentflare-mcp")
+                .unwrap();
+            (mcp.apply)();
+
+            let guard = components
+                .iter()
+                .find(|c| c.id == "opencode-token-guard")
+                .unwrap();
+            let msg = (guard.apply)();
+            assert!(
+                msg.contains("skipped"),
+                "flare alone isn't enough — leanctx isn't registered behind the gateway yet: {msg}"
+            );
+            assert!(!(guard.check)());
+        });
+    }
+
+    #[test]
+    fn opencode_token_guard_check_then_apply_then_check_once_flare_is_registered() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("opencode");
+            let mcp = components
+                .iter()
+                .find(|c| c.id == "agentflare-mcp")
+                .unwrap();
+            (mcp.apply)();
+            crate::gateway_integrations::register(&crate::gateway_integrations::LEANCTX);
+
+            let guard = components
+                .iter()
+                .find(|c| c.id == "opencode-token-guard")
+                .unwrap();
+            assert!(!(guard.check)());
+            let msg = (guard.apply)();
+            assert!(!msg.contains("skipped"), "unexpected skip: {msg}");
+            assert!(
+                (guard.check)(),
+                "should be satisfied immediately after apply"
+            );
+
+            let parsed =
+                crate::jsonc::read_jsonc(&opencode_config_path(), || serde_json::Value::Null);
+            for key in OPENCODE_DENY_KEYS {
+                assert_eq!(parsed["permission"][key], "deny");
+            }
+        });
+    }
+
+    #[test]
+    fn opencode_token_guard_preserves_an_existing_permission_choice() {
+        crate::paths::test_support::with_temp_home(|| {
+            fs::create_dir_all(opencode_config_path().parent().unwrap()).unwrap();
+            fs::write(
+                opencode_config_path(),
+                r#"{"permission": {"read": "ask"}, "mcp": {"flare": {"command": "agentflare"}}}"#,
+            )
+            .unwrap();
+            crate::gateway_integrations::register(&crate::gateway_integrations::LEANCTX);
+
+            let components = get_components("opencode");
+            let guard = components
+                .iter()
+                .find(|c| c.id == "opencode-token-guard")
+                .unwrap();
+            (guard.apply)();
+
+            let written = fs::read_to_string(opencode_config_path()).unwrap();
+            assert!(
+                written.contains("\"read\": \"ask\""),
+                "must not override a value the user already set: {written}"
+            );
+            assert!(written.contains("\"grep\": \"deny\""));
         });
     }
 
