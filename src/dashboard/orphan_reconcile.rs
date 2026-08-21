@@ -46,19 +46,10 @@ pub(super) fn reconcile_orphaned_jobs(queue: &Queue) {
             ),
             None => crate::mcp_server::AgentflareMcp::default(),
         };
-        // Kill any process still touching the item's worktree BEFORE
-        // releasing the claim/relabeling ready-for-work below. A subprocess
-        // `run_headless` spawns is placed in its own process group
-        // (`agent_launch::run_captured`'s `cmd.process_group(0)`, needed so
-        // `kill_tree`'s targeted kill works during a normal timeout) --
-        // which also means it does NOT die when the daemon itself
-        // crashes/restarts. It survives as a genuine orphan, re-parented to
-        // init, invisible to the DB-only reconciliation above. Without this
-        // kill, restoring `ready-for-work` hands the item straight back to
-        // `run_discovery_tick`, which dispatches a *second* agent into the
-        // same worktree while the orphaned first one is still mutating it --
-        // two agents editing the same files concurrently, corrupting both
-        // (hit in production, 2026-08-21, item #164).
+        // Kill any process still touching the worktree BEFORE releasing
+        // below: `run_headless`'s subprocess (own process group, needed for
+        // `kill_tree`) survives a daemon restart as an orphan, invisible to
+        // the DB-only reconciliation above (item #164).
         if let Some(folder_path) = job.args.get(2) {
             let repo_root = std::path::PathBuf::from(folder_path);
             let worktree_path = mcp
@@ -93,20 +84,39 @@ pub(super) fn reconcile_orphaned_jobs(queue: &Queue) {
 }
 
 /// Force-kills every process whose command line references `worktree_path`
-/// -- see the call site's doc comment for why this is necessary (a daemon
-/// restart does not kill an orphaned subprocess tree on its own). Matches
-/// by substring against each process's full command line (`pgrep -f`)
-/// rather than tracking a raw PID across the restart, which would only
-/// cover the direct spawned child: `pgrep -f` catches every process with
-/// this worktree bind-mounted into it regardless of process-tree shape
-/// (bwrap sandbox layers, grandchildren), the same way a human operator
-/// would find and kill them by hand (`ps aux | grep <worktree-path>`).
-/// Best-effort: `pgrep`/`kill` failures are swallowed, matching this
-/// module's existing best-effort tone (`cleanup_worktree`, `push_and_open_pr`).
+/// (see the call site for why) -- matched by substring on the full command
+/// line, not a tracked PID, so it catches the whole process tree
+/// (bwrap layers, grandchildren). Best-effort: a failing lookup is swallowed.
+#[cfg(unix)]
 fn kill_processes_touching_worktree(worktree_path: &std::path::Path) {
     let pattern = worktree_path.to_string_lossy().into_owned();
     let Ok(output) = std::process::Command::new("pgrep")
         .args(["-f", &pattern])
+        .output()
+    else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Ok(pid) = line.trim().parse::<u32>() {
+            let _ = crate::ipc::process::force_kill(pid);
+        }
+    }
+}
+
+/// Windows has no `pgrep`; `Get-CimInstance Win32_Process` exposes each
+/// process's `CommandLine` for the same match. `''`-escapes a stray quote.
+#[cfg(windows)]
+fn kill_processes_touching_worktree(worktree_path: &std::path::Path) {
+    let pattern = worktree_path
+        .to_string_lossy()
+        .into_owned()
+        .replace('\'', "''");
+    let script = format!(
+        "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{pattern}*' }} \
+         | ForEach-Object {{ $_.ProcessId }}"
+    );
+    let Ok(output) = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
     else {
         return;
@@ -466,17 +476,16 @@ mod tests {
         });
     }
 
-    /// Item #164: the DB-only reconciliation covered by the test above isn't
-    /// enough on its own -- an orphaned subprocess tree survives a daemon
-    /// restart (see `kill_processes_touching_worktree`'s doc comment) and
-    /// must actually be killed before the item is handed back out, or a
-    /// fresh dispatch races the still-alive orphan into editing the same
-    /// worktree concurrently. Spawns a real long-lived process whose
-    /// command line embeds the item's worktree path (mirroring how a real
-    /// sandboxed agent CLI's bwrap invocation embeds it), confirms
-    /// `reconcile_orphaned_jobs` actually terminates it -- not just that the
-    /// job row/claim/label state changed.
+    /// Item #164: an orphaned subprocess must actually be killed, not just
+    /// have its DB row updated. Spawns a real long-lived process whose argv
+    /// embeds the worktree path (mirroring a real sandboxed agent's bwrap
+    /// invocation) and confirms reconciliation terminates it. Unix-only:
+    /// `yes` is spawned directly (no shell) so its argv genuinely,
+    /// permanently contains the path -- a shell one-liner risks tail-call
+    /// execing away the embedded path. Windows' branch is exercised
+    /// manually, not by a test here.
     #[test]
+    #[cfg(unix)]
     fn reconcile_orphaned_jobs_kills_a_still_alive_orphaned_process() {
         crate::paths::test_support::with_temp_home(|| {
             let tmp = tempfile::tempdir().unwrap();
