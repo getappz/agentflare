@@ -292,6 +292,19 @@ fn wire_claude_code() {
         format!("\"{bin}\" hook post-tool-failure"),
         5,
     );
+    // Completion gate (item #169): records verification evidence off
+    // successful Bash-family calls and surfaces the finishing-a-
+    // development-branch menu off a successful `item done`/`check_merge` --
+    // no single matcher covers both, so (like PreToolUse) this fires
+    // unmatched and hook.rs::post_tool_use filters internally.
+    added |= add_hook_entry(
+        hooks_obj,
+        "PostToolUse",
+        "hook post-tool-use",
+        None,
+        format!("\"{bin}\" hook post-tool-use"),
+        5,
+    );
 
     if !added {
         ui::skip("~/.claude/settings.json hooks (already wired)");
@@ -943,6 +956,29 @@ mod tests {
                 "an upgraded install must end up with exactly one PostToolUseFailure hook"
             );
             assert!(content.contains("hook post-tool-failure"));
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_wires_post_tool_use_command_hook() {
+        with_temp_home(|| {
+            wire_claude_code();
+            let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+            assert!(
+                content.contains("hook post-tool-use"),
+                "expected the command-hook marker in PostToolUse hooks"
+            );
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_post_tool_use_is_idempotent() {
+        with_temp_home(|| {
+            wire_claude_code();
+            let first = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+            wire_claude_code();
+            let second = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+            assert_eq!(first, second, "second run must not duplicate PostToolUse");
         });
     }
 

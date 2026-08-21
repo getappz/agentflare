@@ -23,6 +23,12 @@ pub enum HookEvent {
         #[arg(long, value_enum)]
         agent: Option<agent_registry::Agent>,
     },
+    /// Fires after a tool call succeeds; records verification evidence and
+    /// surfaces the finishing-a-development-branch decision menu.
+    PostToolUse {
+        #[arg(long, value_enum)]
+        agent: Option<agent_registry::Agent>,
+    },
     /// No-op — kept only so an old settings.json entry from a prior
     /// agentflare version doesn't start erroring after an upgrade. New
     /// installs never wire this (see init.rs).
@@ -66,6 +72,7 @@ impl HookArgs {
             HookEvent::PostToolFailure { agent } => {
                 crate::hook::post_tool_failure(&resolve_agent(agent))
             }
+            HookEvent::PostToolUse { agent } => crate::hook::post_tool_use(&resolve_agent(agent)),
             HookEvent::SessionEnd { agent } => crate::hook::session_end(&resolve_agent(agent)),
             HookEvent::PreCompact { agent } => crate::hook::pre_compact(&resolve_agent(agent)),
         }
