@@ -132,9 +132,15 @@ async fn pipeline_completion_after_last_task_advances_synthesizes_reply_text_fro
     let step = sdd_step(send);
     let mut ctx = WorkflowContext::new(Default::default(), one_task_data());
 
-    step.executor.execute(&mut ctx).await.expect("task 0 executes");
+    step.executor
+        .execute(&mut ctx)
+        .await
+        .expect("task 0 executes");
     assert_eq!(ctx.data.current_task_index, 1);
-    assert_eq!(ctx.data.last_report, None, "advance_task clears last_report");
+    assert_eq!(
+        ctx.data.last_report, None,
+        "advance_task clears last_report"
+    );
     assert_eq!(ctx.data.reply_text, "", "not completed yet");
 
     step.executor
@@ -143,8 +149,7 @@ async fn pipeline_completion_after_last_task_advances_synthesizes_reply_text_fro
         .expect("tasks-exhausted iteration executes");
     assert_eq!(ctx.output, "PIPELINE_COMPLETE");
     assert_eq!(
-        ctx.data.reply_text,
-        "Task 0: implementer done",
+        ctx.data.reply_text, "Task 0: implementer done",
         "falls back to the ledger when last_report is empty"
     );
 }
