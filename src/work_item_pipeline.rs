@@ -314,6 +314,22 @@ pub(crate) const MAX_TASKS_PROCESSED: usize = 50;
 /// registered with (see the bottom of this function).
 const SDD_PIPELINE_COMPLETE_MARKER: &str = "PIPELINE_COMPLETE";
 
+/// Builds `WorkItemData::reply_text` at pipeline completion, for
+/// `build_finalize_step` to hand to `item_done` as the PR/completion-comment
+/// summary. Prefers `last_report` -- the implementer's own final status
+/// message, the most detailed account of the actual change -- but that field
+/// is `None` on the pipeline's most common exit path: the last task's
+/// `AdvanceTask` clears it before the loop's own exhaustion check (top of
+/// `build_sdd_loop_step`'s executor) ends the run with no role dispatched
+/// that turn. Falls back to the ledger's task-lifecycle history so
+/// `reply_text` is never empty for a real run.
+fn synthesize_reply_text(last_report: &Option<String>, ledger: &[String]) -> String {
+    match last_report {
+        Some(report) if !report.trim().is_empty() => report.clone(),
+        _ => ledger.join("\n"),
+    }
+}
+
 /// The single `StepMode::Loop` step for the SDD (subagent-driven-development)
 /// task pipeline. Each iteration:
 ///
