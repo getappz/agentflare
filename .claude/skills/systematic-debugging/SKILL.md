@@ -76,15 +76,14 @@ guarantees you miss the difference that matters:
 ## Phase 4: Implementation
 
 1. Write a failing test that reproduces the bug, if the codebase has a test
-   framework in reach — see `superpowers:test-driven-development`. If a
-   proper test isn't practical, a minimal repro script still counts; either
-   way, confirm it fails before touching the fix.
+   framework in reach. If a proper test isn't practical, a minimal repro
+   script still counts; either way, confirm it fails before touching the fix.
 2. Apply one fix addressing the confirmed root cause. No bundled cleanup,
    no "while I'm here" changes — those hide whether the fix actually
    worked.
 3. Verify: the new test passes, no other tests regressed, the original
-   symptom is gone. Use `superpowers:verification-before-completion` before
-   claiming the bug is fixed.
+   symptom is gone — verify with fresh evidence, not a stale earlier test
+   run, before claiming the bug is fixed.
 4. **If the fix doesn't work, stop and count attempts.** Fewer than three →
    return to Phase 1 with what you just learned. Three or more failed fixes
    on the same bug is not bad luck — it's a signal to stop fixing and
