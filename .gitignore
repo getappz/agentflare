@@ -22,8 +22,12 @@
 /.opencode/
 
 # Per-repo agentflare-backend project link (Vercel-style .vercel/project.json
-# equivalent) — machine-local, not something to share via git.
-/.agentflare/
+# equivalent) — machine-local, not something to share via git. Workflow
+# definitions/scripts under workflows/ and scripts/ ARE meant to be versioned
+# (per the workflow engine's own convention), so they're carved out below.
+/.agentflare/*
+!/.agentflare/workflows/
+!/.agentflare/scripts/
 
 # Local onpush doc-generation tooling (machine-specific, not part of the project)
 /.onpush/
