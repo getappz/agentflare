@@ -341,7 +341,10 @@ pub(crate) fn build_sdd_loop_step(
             let send = send.clone();
             Box::pin(async move {
                 if ctx.data.current_task_index >= MAX_TASKS_PROCESSED {
-                    return Ok(StepResult::Failure);
+                    return Ok(StepResult::Failed(format!(
+                        "current_task_index {} reached MAX_TASKS_PROCESSED ({})",
+                        ctx.data.current_task_index, MAX_TASKS_PROCESSED
+                    )));
                 }
                 if ctx.data.tasks.is_empty() || ctx.data.current_task_index >= ctx.data.tasks.len()
                 {
@@ -358,7 +361,9 @@ pub(crate) fn build_sdd_loop_step(
                 let agent_name = ctx.data.agent_name.clone();
                 let judge_agent_name = ctx.data.judge_agent_name.clone();
                 if agent_name.is_empty() || judge_agent_name.is_empty() {
-                    return Ok(StepResult::Failure);
+                    return Ok(StepResult::Failed(format!(
+                        "sdd_loop missing agent identity: agent_name={agent_name:?} judge_agent_name={judge_agent_name:?}"
+                    )));
                 }
 
                 let task = ctx.data.tasks[ctx.data.current_task_index].clone();
@@ -514,7 +519,10 @@ pub(crate) fn build_sdd_loop_step(
                     JudgeAction::FixRound => {
                         ctx.data.fix_round += 1;
                         if ctx.data.fix_round > MAX_FIX_ROUNDS {
-                            return Ok(StepResult::Failure);
+                            return Ok(StepResult::Failed(format!(
+                                "task {} exceeded MAX_FIX_ROUNDS ({}) without converging",
+                                task.id, MAX_FIX_ROUNDS
+                            )));
                         }
                     }
                     JudgeAction::Escalate => {
@@ -528,7 +536,11 @@ pub(crate) fn build_sdd_loop_step(
                     }
                     JudgeAction::InsertTask => {
                         if ctx.data.tasks.len() >= MAX_TASKS_PROCESSED {
-                            return Ok(StepResult::Failure);
+                            return Ok(StepResult::Failed(format!(
+                                "cannot insert task: tasks.len() {} reached MAX_TASKS_PROCESSED ({})",
+                                ctx.data.tasks.len(),
+                                MAX_TASKS_PROCESSED
+                            )));
                         }
                         let new_id = ctx.data.tasks.len();
                         ctx.data.tasks.push(SddTask {
@@ -651,7 +663,9 @@ pub(crate) fn build_finalize_step(
                 // the boot-time recovery definition closed over a
                 // placeholder id.
                 if ctx.data.item_id.is_empty() {
-                    return Ok(StepResult::Failure);
+                    return Ok(StepResult::Failed(
+                        "finalize: item_id is empty, cannot reconstruct run identity".to_string(),
+                    ));
                 }
                 let item_id = ctx.data.item_id.clone();
                 let notify_recipient = ctx.data.notify_recipient.clone();

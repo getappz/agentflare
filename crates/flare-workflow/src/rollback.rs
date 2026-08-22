@@ -163,8 +163,12 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                         .await;
                 match result {
                     Ok(Ok(StepResult::Success)) | Ok(Ok(StepResult::Skip)) => break Ok(()),
-                    Ok(Ok(StepResult::Failure)) | Ok(Err(_)) | Err(_) => {
+                    Ok(Ok(StepResult::Failure))
+                    | Ok(Ok(StepResult::Failed(_)))
+                    | Ok(Err(_))
+                    | Err(_) => {
                         let (error_msg, should_retry) = match &result {
+                            Ok(Ok(StepResult::Failed(msg))) => (msg.clone(), false),
                             Ok(Err(e)) => (format!("{e}"), rollback_executor.is_retryable(e)),
                             Err(_) => (format!("rollback timeout after {step_timeout:?}"), true),
                             _ => ("rollback failed".to_string(), false),
