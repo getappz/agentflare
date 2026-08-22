@@ -25,9 +25,9 @@ fn work_item_data_roundtrips_sdd_fields() {
 
 #[test]
 fn deserializes_persisted_state_json_from_before_review_only_existed() {
-    // Runs started before item #507 persisted state_json with no
-    // `review_only`/`review_findings` keys at all. Without `#[serde(default)]`
-    // on those fields, SqliteStore::load fails to deserialize these rows and
+    // Runs started before item #507 (or #179's `tdd` field) persisted
+    // state_json with none of these keys at all. Without `#[serde(default)]`
+    // on them, SqliteStore::load fails to deserialize these rows and
     // recover() silently skips them as unreadable.
     let pre_507_json = r#"{
         "reply_text": "",
@@ -46,4 +46,5 @@ fn deserializes_persisted_state_json_from_before_review_only_existed() {
         .expect("old state_json without review_only must still deserialize");
     assert!(!data.review_only);
     assert!(data.review_findings.is_empty());
+    assert!(!data.tdd);
 }
