@@ -11,14 +11,48 @@ fn sample_task() -> SddTask {
 
 #[test]
 fn implementer_prompt_includes_task_body() {
-    let prompt = build_implementer_prompt(&sample_task(), None);
+    let prompt = build_implementer_prompt(&sample_task(), None, false);
     assert!(prompt.contains("Add --verbose"));
 }
 
 #[test]
 fn implementer_prompt_includes_fix_context_when_present() {
-    let prompt = build_implementer_prompt(&sample_task(), Some("Reviewer found: missing test"));
+    let prompt =
+        build_implementer_prompt(&sample_task(), Some("Reviewer found: missing test"), false);
     assert!(prompt.contains("Reviewer found: missing test"));
+}
+
+#[test]
+fn implementer_prompt_includes_tdd_instructions_when_set() {
+    let prompt = build_implementer_prompt(&sample_task(), None, true);
+    assert!(prompt.contains("test-driven development"));
+    assert!(prompt.contains("failing test"));
+}
+
+#[test]
+fn implementer_prompt_omits_tdd_instructions_by_default() {
+    let prompt = build_implementer_prompt(&sample_task(), None, false);
+    assert!(!prompt.contains("test-driven development"));
+}
+
+#[test]
+fn task_reviewer_prompt_includes_task_and_report() {
+    let prompt = build_task_reviewer_prompt(&sample_task(), "DONE: added the flag", false);
+    assert!(prompt.contains("Add --verbose"));
+    assert!(prompt.contains("DONE: added the flag"));
+    assert!(prompt.contains("REVIEW_APPROVED"));
+}
+
+#[test]
+fn task_reviewer_prompt_checks_test_first_evidence_when_tdd_set() {
+    let prompt = build_task_reviewer_prompt(&sample_task(), "DONE: added the flag", true);
+    assert!(prompt.contains("test-first evidence"));
+}
+
+#[test]
+fn task_reviewer_prompt_omits_test_first_check_by_default() {
+    let prompt = build_task_reviewer_prompt(&sample_task(), "DONE: added the flag", false);
+    assert!(!prompt.contains("test-first evidence"));
 }
 
 #[test]

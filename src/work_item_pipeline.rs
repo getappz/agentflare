@@ -110,6 +110,22 @@ pub(crate) struct WorkItemData {
     /// silently skips them as unreadable.
     #[serde(default)]
     pub review_only: bool,
+    /// Set from `detect_tdd_mode` at dispatch time (item #179) — an
+    /// opt-in, item-level flag (no free-text fallback like `review_only`
+    /// needs, since this has no legacy callers to support) that appends
+    /// red-green-refactor instructions to the implementer prompt and a
+    /// test-first-evidence check to the task-reviewer prompt.
+    ///
+    /// If `review_only` is also set, `review_only` takes precedence and
+    /// `tdd` has no effect — every dispatch site branches on `review_only`
+    /// first, routing to the analysis-only prompts regardless of `tdd`.
+    /// This is intentional, not a bug: TDD is a discipline for writing
+    /// code, and a review-only task never writes any.
+    ///
+    /// `#[serde(default)]` for the same reason as `review_only`: runs
+    /// started before this field existed must still deserialize.
+    #[serde(default)]
+    pub tdd: bool,
     /// Provider session id last observed for each agent name dispatched in
     /// this run (implementer and judge/reviewer are usually different
     /// agents and get independent entries). Used to pass `--resume <id>` on
@@ -412,7 +428,7 @@ pub(crate) fn build_sdd_loop_step(
                         let prompt = if ctx.data.review_only {
                             build_review_analyst_prompt(&task, fix_context)
                         } else {
-                            build_implementer_prompt(&task, fix_context)
+                            build_implementer_prompt(&task, fix_context, ctx.data.tdd)
                         };
                         (agent_name.clone(), prompt)
                     }
@@ -422,7 +438,7 @@ pub(crate) fn build_sdd_loop_step(
                     let prompt = if ctx.data.review_only {
                         build_review_of_analysis_prompt(&task, &report)
                     } else {
-                        build_task_reviewer_prompt(&task, &report)
+                        build_task_reviewer_prompt(&task, &report, ctx.data.tdd)
                     };
                     (judge_agent_name.clone(), prompt)
                 } else {
@@ -430,7 +446,7 @@ pub(crate) fn build_sdd_loop_step(
                     let prompt = if ctx.data.review_only {
                         build_review_analyst_prompt(&task, None)
                     } else {
-                        build_implementer_prompt(&task, None)
+                        build_implementer_prompt(&task, None, ctx.data.tdd)
                     };
                     (agent_name.clone(), prompt)
                 };
@@ -987,6 +1003,8 @@ pub(crate) fn run_or_resume_with_sender(
     // Seeds `WorkItemData::review_only` (item #507) the same way — computed
     // once here so both `start_workflow` call sites below agree.
     let review_only = detect_review_only(&item_description, &existing_metadata);
+    // Seeds `WorkItemData::tdd` (item #179) the same way.
+    let tdd = detect_tdd_mode(&existing_metadata);
 
     let agent_name = implementer_agent.as_str().to_string();
     let judge_agent_name = review_agent.as_str().to_string();
@@ -1019,6 +1037,7 @@ pub(crate) fn run_or_resume_with_sender(
             notify_recipient: notify_recipient.clone(),
             tasks: tasks.clone(),
             review_only,
+            tdd,
             ..Default::default()
         };
         let run_id = match existing_run_id {
@@ -1162,6 +1181,14 @@ pub(crate) fn detect_review_only(item_description: &str, metadata: &serde_json::
     })
 }
 
+/// Whether TDD mode (item #179) is on for this dispatch: a deliberate,
+/// item-level opt-in read straight from metadata — no free-text fallback
+/// like `detect_review_only` needs, since there are no legacy callers to
+/// support for a brand-new flag.
+pub(crate) fn detect_tdd_mode(metadata: &serde_json::Value) -> bool {
+    metadata["tdd"].as_bool().unwrap_or(false)
+}
+
 /// Parses `### Task N: <title>` headings (the convention this codebase's
 /// own plans already use — see docs on item #110) into a task list; falls
 /// back to a single synthesized task from the item's own description when
@@ -1220,8 +1247,13 @@ fn parse_task_headings(doc: &str) -> Vec<SddTask> {
 
 /// Builds the prompt for the implementer role: given a task, it must implement
 /// it. If `fix_context` is provided (a prior reviewer's findings), the prompt
-/// instructs them to address those issues.
-pub(crate) fn build_implementer_prompt(task: &SddTask, fix_context: Option<&str>) -> String {
+/// instructs them to address those issues. When `tdd` is set (item #179),
+/// appends explicit red-green-refactor instructions.
+pub(crate) fn build_implementer_prompt(
+    task: &SddTask,
+    fix_context: Option<&str>,
+    tdd: bool,
+) -> String {
     let mut prompt = format!(
         "You are implementing one task from a larger plan.\n\nTask: {}\n\n{}\n",
         task.title, task.body
@@ -1230,6 +1262,11 @@ pub(crate) fn build_implementer_prompt(task: &SddTask, fix_context: Option<&str>
         prompt.push_str(&format!(
             "\nA reviewer found issues with your prior attempt:\n{ctx}\n\nAddress them, re-run any tests you touched, and reply with your status.\n"
         ));
+    }
+    if tdd {
+        prompt.push_str(
+            "\nFollow test-driven development for this task: write a failing test first, confirm it fails, then write the minimal code to pass it, then refactor. Do not write implementation code before its test.\n"
+        );
     }
     prompt.push_str("\nReply with a short status: what you did, tests run, and any concerns.\n");
     prompt
@@ -1256,9 +1293,20 @@ pub(crate) fn build_review_analyst_prompt(task: &SddTask, fix_context: Option<&s
 
 /// Builds the prompt for the task reviewer role: given a task and the
 /// implementer's report, review it for spec compliance and code quality.
-pub(crate) fn build_task_reviewer_prompt(task: &SddTask, implementer_report: &str) -> String {
+/// When `tdd` is set (item #179), also requires test-first evidence in the
+/// implementer's report as a review criterion.
+pub(crate) fn build_task_reviewer_prompt(
+    task: &SddTask,
+    implementer_report: &str,
+    tdd: bool,
+) -> String {
+    let tdd_note = if tdd {
+        " Also check for test-first evidence: the report must show a failing test was written and confirmed before the implementation change, not just tests added at the end. Missing that sequence is a REVIEW_ISSUES finding even if the code otherwise works."
+    } else {
+        ""
+    };
     format!(
-        "Review this task's implementation for spec compliance and code quality.\n\nTask: {}\n{}\n\nImplementer's report:\n{implementer_report}\n\nReply REVIEW_APPROVED if both spec and quality pass, or REVIEW_ISSUES: followed by a bulleted list of findings.\n",
+        "Review this task's implementation for spec compliance and code quality.{tdd_note}\n\nTask: {}\n{}\n\nImplementer's report:\n{implementer_report}\n\nReply REVIEW_APPROVED if both spec and quality pass, or REVIEW_ISSUES: followed by a bulleted list of findings.\n",
         task.title, task.body
     )
 }
@@ -1337,5 +1385,7 @@ mod sdd_loop_tests;
 mod sdd_test_support;
 #[cfg(test)]
 mod task_sourcing_tests;
+#[cfg(test)]
+mod tdd_mode_tests;
 #[cfg(test)]
 mod tests;
