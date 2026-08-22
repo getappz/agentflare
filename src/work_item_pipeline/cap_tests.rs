@@ -21,10 +21,15 @@ async fn sixth_fix_round_fails_the_step() {
     d.last_report = Some("x".to_string());
     let step = build_sdd_loop_step(send);
     let mut ctx = WorkflowContext::new(Default::default(), d);
-    assert!(matches!(
-        step.executor.execute(&mut ctx).await.expect("x"),
-        StepResult::Failure
-    ));
+    match step.executor.execute(&mut ctx).await.expect("x") {
+        StepResult::Failed(message) => {
+            assert!(
+                message.contains("MAX_FIX_ROUNDS"),
+                "expected the real cap-exceeded reason, got: {message}"
+            );
+        }
+        other => panic!("expected StepResult::Failed with a reason, got: {other:?}"),
+    }
 }
 #[tokio::test]
 async fn max_tasks_processed_bound_fails_the_step() {
@@ -33,8 +38,13 @@ async fn max_tasks_processed_bound_fails_the_step() {
     d.current_task_index = MAX_TASKS_PROCESSED;
     let step = build_sdd_loop_step(send);
     let mut ctx = WorkflowContext::new(Default::default(), d);
-    assert!(matches!(
-        step.executor.execute(&mut ctx).await.expect("x"),
-        StepResult::Failure
-    ));
+    match step.executor.execute(&mut ctx).await.expect("x") {
+        StepResult::Failed(message) => {
+            assert!(
+                message.contains("MAX_TASKS_PROCESSED"),
+                "expected the real cap-exceeded reason, got: {message}"
+            );
+        }
+        other => panic!("expected StepResult::Failed with a reason, got: {other:?}"),
+    }
 }
