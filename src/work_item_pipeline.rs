@@ -1106,11 +1106,15 @@ fn persist_run_id(
 /// tells callers to write the hyphenated "review-only", which the original
 /// space-separated-only check missed (item #156).
 pub(crate) fn detect_review_only(item_description: &str, metadata: &serde_json::Value) -> bool {
-    if matches!(
-        metadata["task_type"].as_str(),
-        Some("review") | Some("design-spec") | Some("design_spec")
-    ) {
-        return true;
+    match metadata["task_type"].as_str() {
+        Some("review") | Some("design-spec") | Some("design_spec") => return true,
+        // An explicit, non-forcing task_type (e.g. "implementation") is a
+        // caller's deliberate signal that this isn't a review-only task —
+        // skip the free-text scan entirely rather than let ordinary prose
+        // override it. Only fall through to the scan when task_type is
+        // absent/non-string, i.e. no signal was given either way.
+        Some(_) => return false,
+        None => {}
     }
     let normalized = item_description.to_lowercase().replace('-', " ");
     if normalized.contains("review only") {
