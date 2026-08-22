@@ -106,7 +106,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     timeout(step_timeout, step.executor.execute(&mut context)).await;
                 let is_failure = matches!(
                     attempt_result,
-                    Ok(Ok(StepResult::Failure)) | Ok(Ok(StepResult::Failed(_))) | Ok(Err(_)) | Err(_)
+                    Ok(Ok(StepResult::Failure))
+                        | Ok(Ok(StepResult::Failed(_)))
+                        | Ok(Err(_))
+                        | Err(_)
                 );
                 if !is_failure {
                     break attempt_result;
