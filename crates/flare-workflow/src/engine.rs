@@ -1348,7 +1348,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     Err(format!("Workflow failed at step {step_name}: {error_msg}"))
                 }
                 WorkflowStatus::Cancelled => Err(format!("Workflow cancelled for {label}")),
-                WorkflowStatus::Pending | WorkflowStatus::Paused | WorkflowStatus::Running => {
+                WorkflowStatus::Pending
+                | WorkflowStatus::Paused
+                | WorkflowStatus::Running
+                | WorkflowStatus::Waiting => {
                     tokio::time::sleep(poll_interval).await;
                     poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
                     continue;

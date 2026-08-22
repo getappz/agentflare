@@ -918,3 +918,202 @@ fn fetch_with_retry_returns_the_final_failure_when_every_attempt_fails() {
         "a persistently-failing fetch must still surface as a failure after the retry"
     );
 }
+
+/// Sets up a "remote" repo (`init_repo()`) plus a "local" clone of it,
+/// mirroring `create_worktree_fetches_target_branch_and_includes_remote_only_commits`
+/// above -- the shape every `rebase_item_worktree`/`push_branch` test below
+/// needs to make the remote's default branch diverge independently of the
+/// local clone (item #161's "other agents merge PRs while we're mid-session"
+/// scenario).
+fn init_remote_and_local_clone() -> (Repo, TempDir, PathBuf) {
+    let remote = init_repo();
+    let local_container = TempDir::new().unwrap();
+    let local_path = local_container.path().join("local");
+    run_git_in(
+        local_container.path(),
+        &[
+            "clone",
+            remote.path.to_str().unwrap(),
+            local_path.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    run_git_in(&local_path, &["config", "user.email", "test@test.com"]).unwrap();
+    run_git_in(&local_path, &["config", "user.name", "Test"]).unwrap();
+    (remote, local_container, local_path)
+}
+
+#[test]
+fn rebase_item_worktree_skips_when_no_worktree_exists() {
+    let repo = init_repo();
+    let item = test_item(1);
+    assert!(matches!(
+        rebase_item_worktree(&item, &repo.path, "master"),
+        RebaseOutcome::Skipped
+    ));
+}
+
+#[test]
+fn rebase_item_worktree_skips_when_there_is_no_remote_to_fetch_from() {
+    // A plain (non-cloned) repo has no `origin` at all -- the fetch itself
+    // can't land, so this must soft-fail rather than error, same as every
+    // other network step in this file.
+    let repo = init_repo();
+    let item = test_item(1);
+    let target = resolve_default_branch(&repo.path);
+    create_worktree(&item, &repo.path, &target, None).unwrap();
+    assert!(matches!(
+        rebase_item_worktree(&item, &repo.path, &target),
+        RebaseOutcome::Skipped
+    ));
+}
+
+#[test]
+fn rebase_item_worktree_is_up_to_date_when_nothing_new_landed() {
+    let (_remote, _local_container, local_path) = init_remote_and_local_clone();
+    let item = test_item(1);
+    create_worktree(&item, &local_path, "master", None).unwrap();
+    assert!(matches!(
+        rebase_item_worktree(&item, &local_path, "master"),
+        RebaseOutcome::UpToDate
+    ));
+}
+
+#[test]
+fn rebase_item_worktree_rebases_a_stale_worktree_onto_the_latest_target() {
+    let (remote, _local_container, local_path) = init_remote_and_local_clone();
+    let item = test_item(1);
+    let worktree_path = create_worktree(&item, &local_path, "master", None).unwrap();
+
+    // The worktree gets its own commit first, then the remote's default
+    // branch moves independently -- the re-claim/redispatch case this
+    // function exists to cover (item #161).
+    std::fs::write(worktree_path.join("work.txt"), b"in progress").unwrap();
+    run_git_in(&worktree_path, &["add", "work.txt"]).unwrap();
+    run_git_in(&worktree_path, &["commit", "-m", "in-progress work"]).unwrap();
+
+    run_git_in(
+        &remote.path,
+        &["commit", "--allow-empty", "-m", "merged elsewhere"],
+    )
+    .unwrap();
+    let remote_head = run_git_in(&remote.path, &["rev-parse", "HEAD"]).unwrap();
+
+    let outcome = rebase_item_worktree(&item, &local_path, "master");
+    assert!(
+        matches!(outcome, RebaseOutcome::Rebased),
+        "expected Rebased"
+    );
+    assert!(
+        run_git_in_ok(
+            &worktree_path,
+            &["merge-base", "--is-ancestor", &remote_head, "HEAD"],
+        ),
+        "worktree HEAD must now have the remote's latest commit as an ancestor"
+    );
+    let log = run_git_in(&worktree_path, &["log", "--oneline"]).unwrap();
+    assert!(
+        log.contains("in-progress work"),
+        "must keep the worktree's own commit, not discard it: {log}"
+    );
+}
+
+#[test]
+fn rebase_item_worktree_skips_a_dirty_worktree() {
+    let (remote, _local_container, local_path) = init_remote_and_local_clone();
+    let item = test_item(1);
+    let worktree_path = create_worktree(&item, &local_path, "master", None).unwrap();
+    std::fs::write(worktree_path.join("uncommitted.txt"), b"wip").unwrap();
+
+    run_git_in(
+        &remote.path,
+        &["commit", "--allow-empty", "-m", "merged elsewhere"],
+    )
+    .unwrap();
+
+    let outcome = rebase_item_worktree(&item, &local_path, "master");
+    assert!(matches!(outcome, RebaseOutcome::Dirty));
+    assert!(
+        worktree_path.join("uncommitted.txt").exists(),
+        "must not touch uncommitted work"
+    );
+}
+
+#[test]
+fn rebase_item_worktree_aborts_and_reports_a_real_conflict() {
+    let (remote, _local_container, local_path) = init_remote_and_local_clone();
+    // A file both sides will edit differently at the same lines.
+    std::fs::write(remote.path.join("shared.txt"), "base\n").unwrap();
+    run_git_in(&remote.path, &["add", "shared.txt"]).unwrap();
+    run_git_in(&remote.path, &["commit", "-m", "add shared.txt"]).unwrap();
+    run_git_in(&local_path, &["pull"]).unwrap();
+
+    let item = test_item(1);
+    let worktree_path = create_worktree(&item, &local_path, "master", None).unwrap();
+
+    std::fs::write(worktree_path.join("shared.txt"), "worktree change\n").unwrap();
+    run_git_in(&worktree_path, &["add", "shared.txt"]).unwrap();
+    run_git_in(&worktree_path, &["commit", "-m", "worktree edit"]).unwrap();
+    let own_commit_head = run_git_in(&worktree_path, &["rev-parse", "HEAD"]).unwrap();
+
+    std::fs::write(remote.path.join("shared.txt"), "remote change\n").unwrap();
+    run_git_in(&remote.path, &["add", "shared.txt"]).unwrap();
+    run_git_in(&remote.path, &["commit", "-m", "conflicting remote edit"]).unwrap();
+
+    let outcome = rebase_item_worktree(&item, &local_path, "master");
+    match outcome {
+        RebaseOutcome::Conflict(detail) => {
+            assert!(!detail.is_empty(), "conflict detail must not be empty");
+        }
+        _ => panic!("expected a conflict outcome"),
+    }
+    assert!(
+        !worktree_path.join(".git").join("rebase-merge").exists()
+            && !worktree_path.join(".git").join("rebase-apply").exists(),
+        "rebase must be aborted, not left mid-rebase"
+    );
+    let status = run_git_in(&worktree_path, &["status", "--porcelain"]).unwrap();
+    assert!(status.is_empty(), "worktree must be left clean: {status}");
+    let after_head = run_git_in(&worktree_path, &["rev-parse", "HEAD"]).unwrap();
+    assert_eq!(
+        after_head, own_commit_head,
+        "branch must be exactly as it was before the aborted rebase -- nothing forced or discarded"
+    );
+}
+
+#[test]
+fn push_branch_rebases_onto_the_latest_target_before_pushing() {
+    let (remote, _local_container, local_path) = init_remote_and_local_clone();
+    let item = test_item(1);
+    let worktree_path = create_worktree(&item, &local_path, "master", None).unwrap();
+    std::fs::write(worktree_path.join("work.txt"), b"work").unwrap();
+    run_git_in(&worktree_path, &["add", "work.txt"]).unwrap();
+    run_git_in(&worktree_path, &["commit", "-m", "worktree work"]).unwrap();
+
+    // Landed on the remote's default branch during the (simulated) work
+    // session -- other agents merging concurrently is the normal case in
+    // this multi-agent setup (item #161).
+    run_git_in(
+        &remote.path,
+        &["commit", "--allow-empty", "-m", "merged elsewhere"],
+    )
+    .unwrap();
+    let remote_master_head = run_git_in(&remote.path, &["rev-parse", "HEAD"]).unwrap();
+
+    let branch = push_branch(&item, &local_path, "master", None);
+    assert_eq!(branch.as_deref(), Some(task_branch_name(&item).as_str()));
+
+    let pushed_head = run_git_in(&remote.path, &["rev-parse", &task_branch_name(&item)]).unwrap();
+    assert!(
+        run_git_in_ok(
+            &remote.path,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &remote_master_head,
+                &pushed_head
+            ],
+        ),
+        "the pushed branch must be based on the target's latest commit, not the stale one it started from"
+    );
+}

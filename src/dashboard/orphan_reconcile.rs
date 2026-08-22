@@ -46,6 +46,30 @@ pub(super) fn reconcile_orphaned_jobs(queue: &Queue) {
             ),
             None => crate::mcp_server::AgentflareMcp::default(),
         };
+        // Kill any process still touching the worktree BEFORE releasing
+        // below: `run_headless`'s subprocess (own process group, needed for
+        // `kill_tree`) survives a daemon restart as an orphan, invisible to
+        // the DB-only reconciliation above (item #164).
+        if let Some(folder_path) = job.args.get(2) {
+            let repo_root = std::path::PathBuf::from(folder_path);
+            let worktree_path = mcp
+                .with_backend_db(|conn| {
+                    agentflare_backend::item::get(conn, item_id)
+                        .ok()
+                        .map(|item| item.sequence_id)
+                })
+                .ok()
+                .flatten()
+                .map(|seq| {
+                    repo_root
+                        .join(".worktrees")
+                        .join("task")
+                        .join(seq.to_string())
+                });
+            if let Some(path) = worktree_path {
+                kill_processes_touching_worktree(&path);
+            }
+        }
         let owner = format!("{agent}:{job_id}");
         crate::claims::with_owner_override(owner, || {
             crate::cli::work::release_and_comment(
@@ -56,6 +80,51 @@ pub(super) fn reconcile_orphaned_jobs(queue: &Queue) {
             );
         });
         restore_ready_for_work(&mcp, item_id, agent);
+    }
+}
+
+/// Force-kills every process whose command line references `worktree_path`
+/// (see the call site for why) -- matched by substring on the full command
+/// line, not a tracked PID, so it catches the whole process tree
+/// (bwrap layers, grandchildren). Best-effort: a failing lookup is swallowed.
+#[cfg(unix)]
+fn kill_processes_touching_worktree(worktree_path: &std::path::Path) {
+    let pattern = worktree_path.to_string_lossy().into_owned();
+    let Ok(output) = std::process::Command::new("pgrep")
+        .args(["-f", &pattern])
+        .output()
+    else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Ok(pid) = line.trim().parse::<u32>() {
+            let _ = crate::ipc::process::force_kill(pid);
+        }
+    }
+}
+
+/// Windows has no `pgrep`; `Get-CimInstance Win32_Process` exposes each
+/// process's `CommandLine` for the same match. `''`-escapes a stray quote.
+#[cfg(windows)]
+fn kill_processes_touching_worktree(worktree_path: &std::path::Path) {
+    let pattern = worktree_path
+        .to_string_lossy()
+        .into_owned()
+        .replace('\'', "''");
+    let script = format!(
+        "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{pattern}*' }} \
+         | ForEach-Object {{ $_.ProcessId }}"
+    );
+    let Ok(output) = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+    else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Ok(pid) = line.trim().parse::<u32>() {
+            let _ = crate::ipc::process::force_kill(pid);
+        }
     }
 }
 
@@ -404,6 +473,117 @@ mod tests {
                 .unwrap();
             assert_eq!(comments.len(), 1);
             assert!(comments[0].body.contains("orphaned by daemon restart"));
+        });
+    }
+
+    /// Item #164: an orphaned subprocess must actually be killed, not just
+    /// have its DB row updated. Spawns a real long-lived process whose argv
+    /// embeds the worktree path (mirroring a real sandboxed agent's bwrap
+    /// invocation) and confirms reconciliation terminates it. Unix-only:
+    /// `yes` is spawned directly (no shell) so its argv genuinely,
+    /// permanently contains the path -- a shell one-liner risks tail-call
+    /// execing away the embedded path. Windows' branch is exercised
+    /// manually, not by a test here.
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_orphaned_jobs_kills_a_still_alive_orphaned_process() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let item = mcp
+                .with_backend_db(|conn| {
+                    let project = mcp.resolve_project(conn).unwrap();
+                    let state = agentflare_backend::state::list_by_project(conn, &project.id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|s| s.is_default)
+                        .unwrap();
+                    agentflare_backend::item::create(
+                        conn,
+                        agentflare_backend::item::CreateItem {
+                            project_id: project.id,
+                            state_id: state.id,
+                            name: "orphan process kill test item".into(),
+                            description: Some("do the thing".into()),
+                            priority: None,
+                            parent_id: None,
+                            assignee_agent: None,
+                            sort_order: None,
+                            external_source: None,
+                            external_id: None,
+                            metadata: None,
+                            label_ids: vec![],
+                            assignee_ids: vec![],
+                            dependency_ids: vec![],
+                        },
+                    )
+                    .unwrap()
+                })
+                .unwrap();
+
+            let worktree_path = repo_root
+                .join(".worktrees")
+                .join("task")
+                .join(item.sequence_id.to_string());
+            std::fs::create_dir_all(&worktree_path).unwrap();
+
+            // A real, long-lived orphan whose argv embeds the worktree path,
+            // exactly what `pgrep -f <path>` needs to find it -- mirrors how
+            // a real bwrap-sandboxed agent CLI's command line embeds its
+            // `--bind <worktree_path> <worktree_path>` argument. Spawned
+            // directly (no shell) so there's no risk of the shell's
+            // single-command exec-optimization silently replacing this
+            // process's argv with something that no longer contains the
+            // path (as `sh -c "sleep 30 # <path>"` does in practice --
+            // `sh` tail-calls straight into `sleep 30`, dropping the
+            // comment from `/proc/<pid>/cmdline` entirely). `yes` accepts
+            // any argument uncritically and loops forever printing it.
+            let mut orphan = std::process::Command::new("yes")
+                .arg(worktree_path.display().to_string())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let orphan_pid = orphan.id();
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item.id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+            let queue = test_queue();
+            let info = queue.enqueue(&job).unwrap();
+            crate::claims::with_owner_override(format!("claude-code:{}", info.id), || {
+                mcp.item_claim(crate::mcp_server::types::ItemRequest {
+                    action: "claim".to_string(),
+                    id: Some(item.id.clone()),
+                    ..Default::default()
+                })
+                .unwrap();
+            });
+            queue.dequeue().unwrap();
+
+            reconcile_orphaned_jobs(&queue);
+
+            // Give the kill a moment to land, then confirm the orphan is
+            // actually gone -- `try_wait` returns `Ok(Some(_))` once the
+            // process has exited.
+            for _ in 0..50 {
+                if matches!(orphan.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                matches!(orphan.try_wait(), Ok(Some(_))),
+                "orphaned process (pid {orphan_pid}) touching the item's worktree must be \
+                 killed during reconciliation, not left running to race a fresh dispatch"
+            );
         });
     }
 

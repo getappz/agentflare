@@ -290,6 +290,16 @@ fn resume_args_for(
     }
 }
 
+/// True when a `send` failure means the resumed provider session no longer
+/// exists — e.g. it was born under a daemon process that crashed/restarted
+/// mid-run (item #159) — rather than a transient failure worth retrying
+/// as-is. Matches Claude Code's `claude --resume <dead-id>` stderr; other
+/// `resume_arg` agents (Cursor) are expected to fail the same recognizable
+/// way, but none has been observed yet to confirm the exact text.
+fn is_stale_session_error(message: &str) -> bool {
+    message.to_lowercase().contains("no conversation found")
+}
+
 /// Cap on fix rounds for a single SDD task before the loop gives up on it —
 /// mirrors `MAX_REVIEW_CYCLES`'s existing cap-constant pattern for the
 /// `coder`/`review_or_fix` pipeline.
@@ -407,12 +417,21 @@ pub(crate) fn build_sdd_loop_step(
                     ..flare_workflow::json::StepInvocation::simple(role_agent.clone(), role_prompt)
                 };
                 let (raw_role_reply, in_tok, out_tok) =
-                    send(role_invocation)
-                        .await
-                        .map_err(|message| WorkflowError::StepFailed {
+                    send(role_invocation).await.map_err(|message| {
+                        // A dead resumed session would otherwise fail the
+                        // same way on every one of this step's retry
+                        // attempts (same session_id -> same `--resume`
+                        // failure) until `RetryPolicy` gives up — clearing
+                        // it here makes the very next attempt fall back to
+                        // a fresh prompt instead.
+                        if is_stale_session_error(&message) {
+                            ctx.data.agent_sessions.remove(&role_agent);
+                        }
+                        WorkflowError::StepFailed {
                             step_id: StepId::new("sdd_loop"),
                             message,
-                        })?;
+                        }
+                    })?;
                 ctx.input_tokens += in_tok;
                 ctx.output_tokens += out_tok;
 
@@ -454,12 +473,15 @@ pub(crate) fn build_sdd_loop_step(
                     )
                 };
                 let (raw_judge_reply, jin_tok, jout_tok) =
-                    send(judge_invocation)
-                        .await
-                        .map_err(|message| WorkflowError::StepFailed {
+                    send(judge_invocation).await.map_err(|message| {
+                        if is_stale_session_error(&message) {
+                            ctx.data.agent_sessions.remove(&judge_agent_name);
+                        }
+                        WorkflowError::StepFailed {
                             step_id: StepId::new("sdd_loop"),
                             message,
-                        })?;
+                        }
+                    })?;
                 ctx.input_tokens += jin_tok;
                 ctx.output_tokens += jout_tok;
 
@@ -1066,21 +1088,42 @@ fn persist_run_id(
     .map_err(|e| e.message.to_string())
 }
 
-/// Decides whether a dispatched item is a review-only task (item #507):
-/// `sdd_loop` should analyze and report rather than implement, and
+/// Decides whether a dispatched item is a no-code task (item #507, widened
+/// by #156): `sdd_loop` should analyze/propose rather than implement, and
 /// `finalize` should post a findings comment rather than running
-/// `item_done`/PR flow. `metadata["task_type"] == "review"` is the
-/// authoritative signal — set it at handoff/dispatch time when the caller
-/// already knows the task type (e.g. PM-mode's own task-type routing).
-/// Falls back to matching the "review only" framing a human/agent handoff
-/// uses in prose when no structured field is set — item #502's own handoff
-/// read "REVIEW ONLY — do not fix, do not push, do not open a PR." with
-/// nothing else marking it as such, and the pipeline implemented it anyway.
+/// `item_done`/PR flow. `metadata["task_type"]` of `"review"` or
+/// `"design-spec"`/`"design_spec"` is the authoritative signal — set it at
+/// handoff/dispatch time when the caller already knows the task type (e.g.
+/// PM-mode's own task-type routing); nothing sets it in production yet, so
+/// in practice the description-phrase fallback below is load-bearing.
+///
+/// The fallback matches the "review only" / "design-spec" framing a
+/// human/agent handoff uses in prose when no structured field is set —
+/// item #502's own handoff read "REVIEW ONLY — do not fix, do not push, do
+/// not open a PR." with nothing else marking it as such, and the pipeline
+/// implemented it anyway. Hyphens are normalized to spaces before matching
+/// because the PM skill's own routing table (`.claude/skills/pm/SKILL.md`)
+/// tells callers to write the hyphenated "review-only", which the original
+/// space-separated-only check missed (item #156).
 pub(crate) fn detect_review_only(item_description: &str, metadata: &serde_json::Value) -> bool {
-    if metadata["task_type"].as_str() == Some("review") {
+    if matches!(
+        metadata["task_type"].as_str(),
+        Some("review") | Some("design-spec") | Some("design_spec")
+    ) {
         return true;
     }
-    item_description.to_lowercase().contains("review only")
+    let normalized = item_description.to_lowercase().replace('-', " ");
+    if normalized.contains("review only") {
+        return true;
+    }
+    // Word-boundary match on "design spec" so "design specification"/"design
+    // specs" (ordinary implementation-task phrasing) doesn't false-positive
+    // on the "spec" prefix.
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    words.windows(2).any(|pair| {
+        pair[0].trim_matches(|c: char| !c.is_alphanumeric()) == "design"
+            && pair[1].trim_matches(|c: char| !c.is_alphanumeric()) == "spec"
+    })
 }
 
 /// Parses `### Task N: <title>` headings (the convention this codebase's

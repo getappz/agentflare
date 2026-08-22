@@ -72,6 +72,32 @@ async fn sleep_step_waits_and_completes() {
 }
 
 #[tokio::test]
+async fn sleep_step_reports_waiting_status_while_parked() {
+    let engine = engine();
+    let wf = WorkflowDefinition::new("wf", "wf").add_step(
+        StepDefinition::new("nap", "nap", noop_executor::<Ctx>())
+            .with_mode(StepMode::Sleep { duration_secs: 2 }),
+    );
+    let run = start(&engine, wf).await;
+
+    // Give the step time to arm the sleep and journal it as pending.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(
+        state.status,
+        WorkflowStatus::Waiting,
+        "a run parked in Sleep must not be indistinguishable from Running"
+    );
+
+    engine
+        .wait_for_completion(run, "wf", Duration::from_secs(10))
+        .await
+        .unwrap();
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+}
+
+#[tokio::test]
 async fn sleep_until_step_waits_and_completes() {
     let engine = engine();
     let wake_at = chrono::Utc::now() + chrono::Duration::milliseconds(1000);
@@ -145,6 +171,40 @@ async fn wait_event_resolves_via_complete_event() {
         state.step_states[&StepId::new("approve")].status,
         StepStatus::Succeeded
     );
+}
+
+#[tokio::test]
+async fn wait_event_reports_waiting_status_while_parked() {
+    let engine = engine();
+    let wf = WorkflowDefinition::new("wf", "wf").add_step(
+        StepDefinition::new("approve", "approve", noop_executor::<Ctx>()).with_mode(
+            StepMode::WaitEvent {
+                name: "approve".into(),
+                timeout_secs: 10,
+            },
+        ),
+    );
+    let run = start(&engine, wf).await;
+
+    // Let the step arm the wait before checking status.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(
+        state.status,
+        WorkflowStatus::Waiting,
+        "a run parked in WaitEvent must not be indistinguishable from Running"
+    );
+
+    engine
+        .complete_event(run, "approve", EntryResult::Success(b"approved".to_vec()))
+        .await
+        .unwrap();
+    engine
+        .wait_for_completion(run, "wf", Duration::from_secs(10))
+        .await
+        .unwrap();
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
 }
 
 #[tokio::test]

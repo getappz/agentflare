@@ -10,5 +10,6 @@ pub use registry::{
     clinepass_model_for_claude, headless_args, json_output_args, resume_arg, spec,
 };
 pub use router::{
-    RouteDecision, RouterConfig, RouterRule, RuleMatch, TaskContext, parse_router_config, route,
+    RouteDecision, RouterConfig, RouterRule, RuleMatch, TaskContext, model_for_task,
+    parse_router_config, route,
 };

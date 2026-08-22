@@ -25,6 +25,16 @@ fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_default()
 }
 
+// The Cline CLI reads MCP config from ~/.cline/data/settings/cline_mcp_settings.json,
+// not ~/.cline/mcp.json (cline/cline#7081).
+fn cline_mcp_settings_path() -> PathBuf {
+    home()
+        .join(".cline")
+        .join("data")
+        .join("settings")
+        .join("cline_mcp_settings.json")
+}
+
 /// `doctor` builds a fresh `Component` list per host (6+ hosts by default),
 /// but these three checks each spawn a subprocess (`git`, `where`/`which`)
 /// and their result never depends on which host is being checked — spawning
@@ -929,7 +939,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
                         .get("servers")
                         .and_then(|m| m.get("flare"))
                         .is_some(),
-                    "cline" => json_at(&home().join(".cline").join("mcp.json"))
+                    "cline" => json_at(&cline_mcp_settings_path())
                         .get("mcpServers")
                         .and_then(|m| m.get("flare"))
                         .is_some(),
@@ -1000,7 +1010,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
                             }
                         }
                         "cline" => {
-                            let path = home().join(".cline").join("mcp.json");
+                            let path = cline_mcp_settings_path();
                             if merge_json(&path, "mcpServers", "flare", entry) {
                                 format!("{} (flare registered)", path.display())
                             } else {
@@ -1495,6 +1505,36 @@ mod tests {
             assert!(!(agentflare_mcp.check)());
             (agentflare_mcp.apply)();
             assert!((agentflare_mcp.check)());
+        });
+    }
+
+    #[test]
+    fn agentflare_mcp_cline_check_then_apply_then_check() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("cline");
+            let agentflare_mcp = components
+                .iter()
+                .find(|c| c.id == "agentflare-mcp")
+                .unwrap();
+            assert!(!(agentflare_mcp.check)());
+            (agentflare_mcp.apply)();
+            assert!((agentflare_mcp.check)());
+        });
+    }
+
+    #[test]
+    fn agentflare_mcp_cline_writes_the_cli_settings_path_not_the_extension_one() {
+        // The Cline CLI reads ~/.cline/data/settings/cline_mcp_settings.json
+        // (cline/cline#7081), not ~/.cline/mcp.json.
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("cline");
+            let agentflare_mcp = components
+                .iter()
+                .find(|c| c.id == "agentflare-mcp")
+                .unwrap();
+            (agentflare_mcp.apply)();
+            assert!(cline_mcp_settings_path().exists());
+            assert!(!home().join(".cline").join("mcp.json").exists());
         });
     }
 

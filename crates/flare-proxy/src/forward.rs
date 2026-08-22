@@ -1,4 +1,4 @@
-use crate::providers::{openai_compat, ProviderConfig, ProviderEntry, ProviderKind};
+use crate::providers::{cline_login, openai_compat, ProviderConfig, ProviderEntry, ProviderKind};
 use crate::shape_xlat::{self, AnthropicStreamBuffer};
 use axum::body::Body;
 use axum::http::StatusCode;
@@ -40,9 +40,24 @@ pub async fn proxy_request(
 
     let api_key = match &provider.api_key_env {
         Some(env_var) => match std::env::var(env_var) {
-            Ok(k) => k,
+            Ok(v) => v,
             Err(_) => {
-                return (StatusCode::BAD_REQUEST, format!("{} not set", env_var)).into_response()
+                // Fall back to the Cline CLI's own logged-in credentials
+                // (~/.cline/data/settings/providers.json), refreshing them
+                // when expired.
+                match cline_login::cli_credential(client, &provider.id).await {
+                    Some(token) => token,
+                    None => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "{env_var} not set and no usable Cline CLI login found \
+                                 (run the `cline` CLI to sign in)"
+                            ),
+                        )
+                            .into_response()
+                    }
+                }
             }
         },
         None => String::new(),
@@ -110,7 +125,7 @@ async fn proxy_anthropic(
 
     let resp = match check_status(resp).await {
         Ok(resp) => resp,
-        Err(err) => return err,
+        Err(err) => return *err,
     };
 
     Response::builder()
@@ -155,7 +170,7 @@ async fn proxy_gemini(
             false,
             false,
         ),
-        Err(err) => err,
+        Err(err) => *err,
     }
 }
 
@@ -197,7 +212,7 @@ async fn proxy_openai_compat(
             needs_heuristic,
             needs_think,
         ),
-        Err(err) => err,
+        Err(err) => *err,
     }
 }
 
@@ -218,19 +233,25 @@ fn apply_extra_headers(
 /// Verify the upstream response succeeded, converting a non-2xx into an
 /// Anthropic-shaped error `Response`. On success, hands back the still-open
 /// `reqwest::Response` so the caller can stream its body.
-async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, Response> {
+///
+/// `Response` (`axum::http::Response<axum::body::Body>`) is >=128 bytes, so
+/// it's boxed in the `Err` variant rather than inflating every `Result`
+/// return by that much even on the success path (`clippy::result_large_err`).
+async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, Box<Response>> {
     if resp.status().is_success() {
         return Ok(resp);
     }
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     let err_val: Value = serde_json::from_str(&body).unwrap_or(json!({"error": {"message": body}}));
-    Err((
-        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        serde_json::to_string(&shape_xlat::error_to_anthropic(&err_val)).unwrap_or_default(),
-    )
-        .into_response())
+    Err(Box::new(
+        (
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&shape_xlat::error_to_anthropic(&err_val)).unwrap_or_default(),
+        )
+            .into_response(),
+    ))
 }
 
 /// Shared SSE loop for providers whose raw stream needs translating into
@@ -278,9 +299,13 @@ fn stream_translated_sse(
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            // api.cline.bot wraps OpenAI-shaped payloads in
+            // {success, data:{...}}; unwrap so the pointer lookups below hit
+            // the actual completion. No-op for every other provider.
+            let val = shape_xlat::unwrap_success_envelope(&val);
 
-            if let Some(delta) = val.pointer("/choices/0/delta/content").and_then(|v| v.as_str()) {
-                accumulated_text.push_str(delta);
+            if let Some(content) = val.pointer("/choices/0/delta/content") {
+                accumulated_text.push_str(&shape_xlat::content_text(content));
             }
             if let Some(text) = val
                 .pointer("/candidates/0/content/parts/0/text")
@@ -298,7 +323,7 @@ fn stream_translated_sse(
                     .and_then(|v| v.as_str())
                     .is_some();
 
-            let translated = translate_chunk(&val, &mut buffer);
+            let translated = translate_chunk(val, &mut buffer);
             out.extend_from_slice(&translated);
 
             if is_finish {
@@ -334,7 +359,7 @@ fn stream_translated_sse(
                 // received — that requires buffering deltas and delaying
                 // emission, a larger change tracked separately.
 
-                let finish_bytes = finish(&val, &mut buffer);
+                let finish_bytes = finish(val, &mut buffer);
                 out.extend_from_slice(&finish_bytes);
             }
         }
