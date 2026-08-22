@@ -220,23 +220,18 @@ fn stage_and_attach_asset(
 }
 
 /// Per-agent extra argv inserted before the prompt: the confirmed
-/// permission-bypass flag, plus — Claude Code only, since it's the only
-/// agent with a confirmed structured-output flag and native turn/cost caps
-/// — `--output-format stream-json` (plus the `--verbose` Claude Code
-/// requires alongside it — confirmed by hand: omitting it errors with
-/// "--print with stream-json output requires --verbose") and any
-/// `--max-turns`/`--max-cost-usd` the caller asked for. Other agents get
-/// only their bypass flag; a caller-supplied cap for them is dropped with a
-/// warning rather than guessed at.
-///
-/// NOT plain `--output-format json`: that format writes nothing to
-/// stdout/stderr until the entire run finishes (confirmed by hand: 0 bytes
-/// for 54s+ on a trivial 2-tool-call task), so `run_captured`'s idle-timeout
-/// (default 300s) kills any real, longer task as a false-positive hang
-/// before it can ever finish — the actual cause behind item #43's repeated
-/// "went idle for 300s (no output captured)" failures. `stream-json` emits
-/// one JSON object per turn/tool-call as it happens, giving genuine
-/// liveness; `parse_claude_reply` reads the result back off its final line.
+/// permission-bypass flag, plus — for Claude Code and cursor-agent, the
+/// only agents with a confirmed `--output-format stream-json` headless mode
+/// — that flag (Claude Code also needs `--verbose`, confirmed by hand:
+/// omitting it errors with "--print with stream-json output requires
+/// --verbose", plus any `--max-turns`/`--max-cost-usd` asked for). Others
+/// get only their bypass flag; a caller-supplied cap is dropped with a
+/// warning rather than guessed at. NOT plain `--output-format json`: it
+/// writes nothing until the run finishes (confirmed by hand: 0 bytes for
+/// 54s+ on a trivial task), so `run_captured`'s idle-timeout (300s default)
+/// kills a real, longer task as a false positive — item #43's cause (and
+/// cursor-agent's default `text` format, item #183's). `parse_claude_reply`
+/// reads the reply off stream-json's final line.
 fn build_extra_args(
     agent: agent_registry::Agent,
     max_turns: Option<u64>,
@@ -248,9 +243,12 @@ fn build_extra_args(
         .flatten()
         .map(|s| s.to_string())
         .collect();
-    if agent == agent_registry::Agent::ClaudeCode {
+    use agent_registry::Agent::{ClaudeCode, Cursor};
+    if matches!(agent, ClaudeCode | Cursor) {
         args.push("--output-format".to_string());
         args.push("stream-json".to_string());
+    }
+    if agent == ClaudeCode {
         args.push("--verbose".to_string());
         if let Some(turns) = max_turns {
             args.push(format!("--max-turns={turns}"));
@@ -1044,6 +1042,8 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
     }
 }
 
+#[cfg(test)]
+mod cursor_dispatch_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
