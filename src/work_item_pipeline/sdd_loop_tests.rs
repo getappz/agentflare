@@ -111,6 +111,42 @@ async fn complete_pipeline_action_sets_terminator_output() {
     let mut ctx = WorkflowContext::new(Default::default(), data);
     step.executor.execute(&mut ctx).await.expect("executes");
     assert_eq!(ctx.output, "PIPELINE_COMPLETE");
+    assert_eq!(
+        ctx.data.reply_text, "DONE: added the flag",
+        "reply_text must be populated from last_report by the real \
+         CompletePipeline code path, not left empty for build_finalize_step"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_completion_after_last_task_advances_synthesizes_reply_text_from_ledger() {
+    // `AdvanceTask` clears `last_report` on every task boundary, so by the
+    // time the loop's next iteration detects `current_task_index >=
+    // tasks.len()` and completes, there's no single "final reply" left to
+    // point to -- reply_text must fall back to the accumulated ledger
+    // instead of staying empty.
+    let (send, _calls) = mock_send(vec![
+        "DONE: added the flag",
+        r#"{"action":"advance_task","rationale":"looks done","ledger_line":"Task 0: implementer done","task_model_tier":null}"#,
+    ]);
+    let step = sdd_step(send);
+    let mut ctx = WorkflowContext::new(Default::default(), one_task_data());
+
+    step.executor.execute(&mut ctx).await.expect("task 0 executes");
+    assert_eq!(ctx.data.current_task_index, 1);
+    assert_eq!(ctx.data.last_report, None, "advance_task clears last_report");
+    assert_eq!(ctx.data.reply_text, "", "not completed yet");
+
+    step.executor
+        .execute(&mut ctx)
+        .await
+        .expect("tasks-exhausted iteration executes");
+    assert_eq!(ctx.output, "PIPELINE_COMPLETE");
+    assert_eq!(
+        ctx.data.reply_text,
+        "Task 0: implementer done",
+        "falls back to the ledger when last_report is empty"
+    );
 }
 
 #[tokio::test]
