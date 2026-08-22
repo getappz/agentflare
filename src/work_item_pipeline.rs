@@ -116,6 +116,12 @@ pub(crate) struct WorkItemData {
     /// red-green-refactor instructions to the implementer prompt and a
     /// test-first-evidence check to the task-reviewer prompt.
     ///
+    /// If `review_only` is also set, `review_only` takes precedence and
+    /// `tdd` has no effect — every dispatch site branches on `review_only`
+    /// first, routing to the analysis-only prompts regardless of `tdd`.
+    /// This is intentional, not a bug: TDD is a discipline for writing
+    /// code, and a review-only task never writes any.
+    ///
     /// `#[serde(default)]` for the same reason as `review_only`: runs
     /// started before this field existed must still deserialize.
     #[serde(default)]
