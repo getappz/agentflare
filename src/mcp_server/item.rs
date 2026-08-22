@@ -646,7 +646,15 @@ impl AgentflareMcp {
                     Some(Err(e)) => {
                         resp["worktree_error"] = serde_json::Value::String(e);
                     }
-                    None => {}
+                    // Only reachable when `item::get` fails to read the item
+                    // back right after this same claim acquired it —
+                    // `resolve_target_branch` is infallible, so this arm
+                    // isn't reached for any other reason.
+                    None => {
+                        resp["worktree_error"] = serde_json::Value::String(
+                            "item record could not be read back after claim".to_string(),
+                        );
+                    }
                 }
                 // Non-fatal like `worktree_error` above -- work can still
                 // proceed against the worktree's prior (unrebased) base
