@@ -1,0 +1,53 @@
+{
+  "name": "repo-compare",
+  "description": "Compare a target repo (e.g. a .refs/<name> clone) against agentflare's own codebase across a fixed set of dimensions, gated by human review before anything is recorded. Invoke with params: {\"repo_path\": \".refs/<name>\", \"repo_name\": \"<name>\"}.",
+  "steps": [
+    {
+      "name": "check-cache",
+      "agent": "claude-code",
+      "prompt": "Run: bash .agentflare/scripts/repo-compare-cache.sh check {{params.repo_path}} {{params.repo_name}} (from the agentflare repo root). If it prints a URL and exits 0, that's a cache hit for the current SHAs of both {{params.repo_name}} and agentflare — reply with nothing but that URL, verbatim, on its own line. If it exits non-zero, reply with exactly the single word: MISS. Do no other analysis in this step.",
+      "timeout_secs": 120,
+      "output_var": "cache_check"
+    },
+    {
+      "name": "orient",
+      "agent": "claude-code",
+      "run_if": "{{cache_check}} == 'MISS'",
+      "prompt": "Orient in the repository at {{params.repo_path}} (use ctx_compose via mcp__flare__tool execute server=leanctx tool=ctx_compose first). Produce a concise structural summary covering: purpose (from README), language(s) and major dependencies, directory/module layout, and any distinctive architecture patterns. Plain prose + bullets, under 600 words, no marketing language.",
+      "timeout_secs": 1800,
+      "output_var": "orient"
+    },
+    {
+      "name": "extract-features",
+      "agent": "claude-code",
+      "run_if": "{{cache_check}} == 'MISS'",
+      "prompt": "From this orientation summary of {{params.repo_path}}, extract a bullet list of concrete, comparably-scoped features/capabilities the repo implements — one line each, name + one-sentence description. Only list things you can point at in the actual code or docs; skip marketing language.\n\nOrientation:\n{{orient}}",
+      "timeout_secs": 1800,
+      "output_var": "features"
+    },
+    {
+      "name": "compare",
+      "agent": "claude-code",
+      "run_if": "{{cache_check}} == 'MISS'",
+      "prompt": "Compare this feature list for {{params.repo_name}} against agentflare's own codebase (this repo's project root — use ctx_search/ctx_compose to check whether/how agentflare already covers each item). For every feature output one row of a markdown table: | Feature | In {{params.repo_name}} | In agentflare | Verdict (adopt / already-covered / not-applicable / needs-more-research) | Better implementation ({{params.repo_name}} / agentflare / tie / n-a) | Why |. Default to 'not-applicable' or 'needs-more-research' when unsure on Verdict — only mark 'adopt' for a concrete, low-risk win. For 'Better implementation', judge only features both sides actually implement (even via a different mechanism) on correctness, robustness, and fit for their respective use case — not just presence; use 'n-a' when only one side has it. The 'Why' column must justify both the Verdict and the Better-implementation call.\n\nFeatures:\n{{features}}",
+      "timeout_secs": 1800,
+      "output_var": "verdict"
+    },
+    {
+      "name": "review-gate",
+      "agent": "claude-code",
+      "run_if": "{{cache_check}} == 'MISS'",
+      "prompt": "Comparison verdict for {{params.repo_name}} is ready for review — waiting for approval before recording:\n\n{{verdict}}",
+      "mode": { "wait_event": { "name": "approve", "timeout_secs": 86400 } },
+      "timeout_secs": 1800,
+      "output_var": "reviewed"
+    },
+    {
+      "name": "record",
+      "agent": "claude-code",
+      "prompt": "If {{cache_check}} is exactly 'MISS': publish {{verdict}} for {{params.repo_name}} as an artifact in agentflare's OWN artifact store — call the mcp__flare__artifact tool (action=publish), NOT the Claude Code Artifact tool and NOT an item comment. Write a self-contained HTML page (type='html') presenting the comparison table and bottom-line summary; name it '{{params.repo_name}} vs agentflare'; set description to a one-sentence summary and favicon to a fitting emoji. The publish call returns an artifact id/URL — then persist it for future cache hits: run `bash .agentflare/scripts/repo-compare-cache.sh write {{params.repo_path}} {{params.repo_name}} <the-returned-artifact-url-or-id>`. If {{cache_check}} is NOT 'MISS', it already IS the cached artifact URL/id from a prior run whose inputs haven't changed — skip publishing and skip the cache write entirely. In both cases, reply with nothing else — just the final artifact URL or id, alone on the last line.",
+      "timeout_secs": 1800,
+      "output_var": "artifact_url"
+    }
+  ]
+}

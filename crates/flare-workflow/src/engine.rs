@@ -879,19 +879,16 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                                 t.skipped.insert(step_id.clone());
                                 (StepResult::Skip, false)
                             }
-                            Ok(StepResult::Failure) | Ok(StepResult::Failed(_)) | Err(_) => {
-                                match step.on_failure {
-                                    FailureAction::FailWorkflow
-                                    | FailureAction::RetryIndefinitely => {
-                                        t.failed.insert(step_id.clone());
-                                        (StepResult::Failure, false)
-                                    }
-                                    FailureAction::ContinueNextStep => {
-                                        t.skipped.insert(step_id.clone());
-                                        (StepResult::Skip, true)
-                                    }
+                            Ok(StepResult::Failure) | Ok(StepResult::Failed(_)) | Err(_) => match step.on_failure {
+                                FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => {
+                                    t.failed.insert(step_id.clone());
+                                    (StepResult::Failure, false)
                                 }
-                            }
+                                FailureAction::ContinueNextStep => {
+                                    t.skipped.insert(step_id.clone());
+                                    (StepResult::Skip, true)
+                                }
+                            },
                         };
 
                         if let Err(e) = tx.try_send((step_id.clone(), sig)) {
@@ -1127,6 +1124,12 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                             s.output = Some(out.clone());
                             if let Some(var) = step.output_var.as_deref() {
                                 capture_output(&mut s.variables, Some(var), &out);
+                                // Keep the persisted context's variables (what
+                                // `run_if` reads via `get_context`) in sync
+                                // with this step's own just-captured output —
+                                // otherwise a downstream step's run_if sees a
+                                // one-step-stale snapshot.
+                                s.context.variables = s.variables.clone();
                             }
                             if let Some(ss) = s.step_states.get_mut(&step.id) {
                                 ss.status = StepStatus::Succeeded;
@@ -1167,12 +1170,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 | Ok(Err(_))
                 | Err(_) => {
                     let (error_msg, should_retry) = match result {
-                        Ok(Ok(StepResult::Failed(msg))) => (msg, false),
                         Ok(Err(e)) => {
                             let retryable = step.executor.is_retryable(&e);
                             (format!("{e}"), retryable)
                         }
                         Err(_) => (format!("Step timeout after {step_timeout:?}"), true),
+                        // Carries its own reason — never retried, same as `Failure`.
+                        Ok(Ok(StepResult::Failed(ref msg))) => (msg.clone(), false),
                         _ => ("Step failed".to_string(), false),
                     };
 
