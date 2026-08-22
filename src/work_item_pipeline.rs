@@ -333,6 +333,22 @@ const SDD_PIPELINE_COMPLETE_MARKER: &str = "PIPELINE_COMPLETE";
 /// closed over here) so a run resumed by `engine().recover()` after a crash
 /// dispatches against the real agent identity the crashed run persisted,
 /// not whatever happened to be registered at boot.
+/// Fills `WorkItemData::reply_text` when the pipeline completes, so
+/// `build_finalize_step` has an actual summary instead of an empty string
+/// (see that function's `item_done` call and success-comment body).
+/// `last_report` is the natural choice — the latest substantive role
+/// report — but `AdvanceTask`/`SkipTask` clear it on every task boundary
+/// (see the judge-decision handler below), so it's `None` by the time the
+/// final task's completion is detected via the tasks-exhausted check.
+/// Falling back to the ledger, which accumulates one line per task/round
+/// across the whole run, still yields a real summary instead of nothing.
+fn synthesize_reply_text(last_report: Option<&str>, ledger: &[String]) -> String {
+    match last_report {
+        Some(report) if !report.trim().is_empty() => report.to_string(),
+        _ => ledger.join("\n"),
+    }
+}
+
 pub(crate) fn build_sdd_loop_step(
     send: flare_workflow::json::SendMessage,
 ) -> StepDefinition<WorkItemData> {
@@ -348,6 +364,8 @@ pub(crate) fn build_sdd_loop_step(
                 }
                 if ctx.data.tasks.is_empty() || ctx.data.current_task_index >= ctx.data.tasks.len()
                 {
+                    ctx.data.reply_text =
+                        synthesize_reply_text(ctx.data.last_report.as_deref(), &ctx.data.ledger);
                     ctx.output = SDD_PIPELINE_COMPLETE_MARKER.to_string();
                     return Ok(StepResult::Success);
                 }
@@ -551,6 +569,10 @@ pub(crate) fn build_sdd_loop_step(
                         });
                     }
                     JudgeAction::CompletePipeline => {
+                        ctx.data.reply_text = synthesize_reply_text(
+                            ctx.data.last_report.as_deref(),
+                            &ctx.data.ledger,
+                        );
                         ctx.output = SDD_PIPELINE_COMPLETE_MARKER.to_string();
                         return Ok(StepResult::Success);
                     }
