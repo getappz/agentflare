@@ -1144,13 +1144,22 @@ fn persist_run_id(
 }
 
 /// Decides whether a dispatched item is a no-code task (item #507, widened
-/// by #156): `sdd_loop` should analyze/propose rather than implement, and
-/// `finalize` should post a findings comment rather than running
-/// `item_done`/PR flow. `metadata["task_type"]` of `"review"` or
-/// `"design-spec"`/`"design_spec"` is the authoritative signal — set it at
-/// handoff/dispatch time when the caller already knows the task type (e.g.
-/// PM-mode's own task-type routing); nothing sets it in production yet, so
-/// in practice the description-phrase fallback below is load-bearing.
+/// by #156, given a `task_type` override in #170): `sdd_loop` should
+/// analyze/propose rather than implement, and `finalize` should post a
+/// findings comment rather than running `item_done`/PR flow.
+///
+/// `metadata["task_type"]` is the authoritative signal whenever a caller
+/// sets it: `"review"`/`"design-spec"`/`"design_spec"` force `true`, and
+/// ANY OTHER explicit string forces `false` — skipping the free-text scan
+/// below entirely, even if the description contains review-only-sounding
+/// prose. This means `task_type` is trusted absolutely once set: it must
+/// only ever be set to a value that actually reflects whether the task is
+/// no-code, never for an unrelated purpose (e.g. a general category label)
+/// on the same field, or a real review-only item could be silently
+/// dispatched as an implementation task. Only when `task_type` is
+/// absent/non-string does the free-text fallback below run — today that's
+/// every caller, since nothing sets `task_type` in production yet, making
+/// the fallback load-bearing in practice.
 ///
 /// The fallback matches the "review only" / "design-spec" framing a
 /// human/agent handoff uses in prose when no structured field is set —
@@ -1161,11 +1170,15 @@ fn persist_run_id(
 /// tells callers to write the hyphenated "review-only", which the original
 /// space-separated-only check missed (item #156).
 pub(crate) fn detect_review_only(item_description: &str, metadata: &serde_json::Value) -> bool {
-    if matches!(
-        metadata["task_type"].as_str(),
-        Some("review") | Some("design-spec") | Some("design_spec")
-    ) {
-        return true;
+    match metadata["task_type"].as_str() {
+        Some("review") | Some("design-spec") | Some("design_spec") => return true,
+        // An explicit, non-forcing task_type (e.g. "implementation") is a
+        // caller's deliberate signal that this isn't a review-only task —
+        // skip the free-text scan entirely rather than let ordinary prose
+        // override it. Only fall through to the scan when task_type is
+        // absent/non-string, i.e. no signal was given either way.
+        Some(_) => return false,
+        None => {}
     }
     let normalized = item_description.to_lowercase().replace('-', " ");
     if normalized.contains("review only") {

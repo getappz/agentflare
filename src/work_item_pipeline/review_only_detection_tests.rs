@@ -77,3 +77,20 @@ fn design_specification_phrase_is_not_review_only() {
         &json!({}),
     ));
 }
+
+#[test]
+fn explicit_non_forcing_task_type_overrides_the_free_text_scan() {
+    // Built via concatenation rather than a literal adjacent token, same
+    // convention item #170's own description had to adopt once it kept
+    // re-triggering the bug it was describing.
+    let trigger = format!("{}-{}", "design", "spec");
+    let description = format!("Full {trigger}: see the doc, this builds it");
+    assert!(
+        detect_review_only(&description, &json!({})),
+        "sanity check: without task_type, the phrase must still trigger review-only"
+    );
+    assert!(
+        !detect_review_only(&description, &json!({"task_type": "implementation"})),
+        "an explicit non-forcing task_type must skip the free-text scan entirely"
+    );
+}
