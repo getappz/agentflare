@@ -879,16 +879,19 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                                 t.skipped.insert(step_id.clone());
                                 (StepResult::Skip, false)
                             }
-                            Ok(StepResult::Failure) | Ok(StepResult::Failed(_)) | Err(_) => match step.on_failure {
-                                FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => {
-                                    t.failed.insert(step_id.clone());
-                                    (StepResult::Failure, false)
+                            Ok(StepResult::Failure) | Ok(StepResult::Failed(_)) | Err(_) => {
+                                match step.on_failure {
+                                    FailureAction::FailWorkflow
+                                    | FailureAction::RetryIndefinitely => {
+                                        t.failed.insert(step_id.clone());
+                                        (StepResult::Failure, false)
+                                    }
+                                    FailureAction::ContinueNextStep => {
+                                        t.skipped.insert(step_id.clone());
+                                        (StepResult::Skip, true)
+                                    }
                                 }
-                                FailureAction::ContinueNextStep => {
-                                    t.skipped.insert(step_id.clone());
-                                    (StepResult::Skip, true)
-                                }
-                            },
+                            }
                         };
 
                         if let Err(e) = tx.try_send((step_id.clone(), sig)) {
