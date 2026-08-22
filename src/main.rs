@@ -37,6 +37,7 @@ mod gateway_integrations;
 mod gateway_secrets;
 mod github;
 mod hook;
+mod hook_completion_gate;
 mod hook_redirect;
 mod init;
 mod ipc;

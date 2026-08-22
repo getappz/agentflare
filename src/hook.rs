@@ -37,7 +37,7 @@ fn read_stdin_timeout(ms: u64) -> Option<String> {
     rx.recv_timeout(Duration::from_millis(ms)).ok()
 }
 
-fn read_stdin_or_skip(label: &str) -> Option<String> {
+pub(crate) fn read_stdin_or_skip(label: &str) -> Option<String> {
     match read_stdin_timeout(STDIN_TIMEOUT_MS) {
         Some(s) if !s.is_empty() => Some(s),
         _ => {
@@ -339,6 +339,10 @@ pub fn post_tool_failure(_agent: &str) {
     println!("{}", build_failure_decision(&message, severity));
 }
 
+// PostToolUse (success) command hook lives in `hook_completion_gate` (item
+// #169) -- split out to stay under this file's LOC gate.
+pub use crate::hook_completion_gate::post_tool_use;
+
 pub fn pre_tool_use(_agent: &str) {
     let Some(input) = read_stdin_or_skip("PreToolUse") else {
         return;
@@ -383,7 +387,27 @@ pub fn pre_tool_use(_agent: &str) {
             start_ts: now,
             turn_count: 0,
             recent_tool_calls: vec![],
+            last_verification: None,
         });
+
+    // Completion gate (item #169): `item done`/`check_merge` requires fresh,
+    // passing verification evidence for this session -- see
+    // hook_redirect::completion_gate_reason's doc comment.
+    if let Some(reason) = crate::hook_redirect::completion_gate_reason(
+        &parsed.tool_name,
+        parsed.tool_input.as_ref(),
+        crate::optimize::has_fresh_passing_verification(record, now),
+    ) {
+        let decision = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        });
+        println!("{decision}");
+        return;
+    }
 
     let mut nudges: Vec<String> = vec![];
 
@@ -609,6 +633,7 @@ pub fn prompt_submit(agent: &str) {
                     start_ts: now,
                     turn_count: 0,
                     recent_tool_calls: vec![],
+                    last_verification: None,
                 });
         first_turn = record.turn_count == 0;
         record.turn_count += 1;

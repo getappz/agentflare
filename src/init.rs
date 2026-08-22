@@ -292,6 +292,27 @@ fn wire_claude_code() {
         format!("\"{bin}\" hook post-tool-failure"),
         5,
     );
+    // Completion gate (item #169): records verification evidence off
+    // successful Bash-family calls, invalidates it off a successful mutating
+    // edit, and surfaces the finishing-a-development-branch menu off a
+    // successful `item done`/`check_merge` -- no single tool name covers all
+    // three, so the matcher is scoped to their union (unlike PreToolUse,
+    // which genuinely needs every tool call for the branch guard) rather
+    // than left unmatched, so this doesn't spawn a subprocess on every Read/
+    // Grep/etc call too.
+    let post_tool_use_matcher = format!(
+        "Bash|bash|PowerShell|powershell|shell|{}|item|{}",
+        crate::hook_redirect::ITEM_TOOL_NAME,
+        crate::hook_redirect::MUTATING_TOOLS.join("|")
+    );
+    added |= add_hook_entry(
+        hooks_obj,
+        "PostToolUse",
+        "hook post-tool-use",
+        Some(&post_tool_use_matcher),
+        format!("\"{bin}\" hook post-tool-use"),
+        5,
+    );
 
     if !added {
         ui::skip("~/.claude/settings.json hooks (already wired)");
@@ -943,6 +964,29 @@ mod tests {
                 "an upgraded install must end up with exactly one PostToolUseFailure hook"
             );
             assert!(content.contains("hook post-tool-failure"));
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_wires_post_tool_use_command_hook() {
+        with_temp_home(|| {
+            wire_claude_code();
+            let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+            assert!(
+                content.contains("hook post-tool-use"),
+                "expected the command-hook marker in PostToolUse hooks"
+            );
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_post_tool_use_is_idempotent() {
+        with_temp_home(|| {
+            wire_claude_code();
+            let first = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+            wire_claude_code();
+            let second = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+            assert_eq!(first, second, "second run must not duplicate PostToolUse");
         });
     }
 

@@ -21,6 +21,13 @@ pub struct SessionRecord {
     pub turn_count: u32,
     #[serde(default)]
     pub recent_tool_calls: Vec<ToolCallRecord>,
+    /// Most recent test/build/lint command this session actually ran, used
+    /// by the completion gate (item #169) to require fresh evidence before
+    /// `item done`/`check_merge` is allowed -- "tests passed earlier this
+    /// session" doesn't count once it falls outside
+    /// [`VERIFICATION_FRESHNESS_SECS`] or a newer command superseded it.
+    #[serde(default)]
+    pub last_verification: Option<VerificationEvidence>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -29,7 +36,153 @@ pub struct ToolCallRecord {
     pub ts: u64,
 }
 
+/// Evidence that a test/build/lint command was actually run in this
+/// session, captured by the `PostToolUse` success hook (`hook.rs::post_tool_use`)
+/// when a Bash-family call's command matches [`is_verification_command`].
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct VerificationEvidence {
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub passed: bool,
+    pub ts: u64,
+}
+
 const STALE_SESSION_SECS: u64 = 24 * 60 * 60;
+
+/// How long a passing verification run stays "fresh" enough to satisfy the
+/// completion gate (`hook_redirect::completion_gate_reason`) before `item
+/// done`/`check_merge` requires a new one. Long enough to cover the
+/// push/PR round trip right after a test run finishes, short enough that
+/// "tests passed earlier this session" (superpowers' own named
+/// rationalization) can't be stretched across an entire long session.
+pub const VERIFICATION_FRESHNESS_SECS: u64 = 30 * 60;
+
+/// Substrings (lowercased) that mark a shell command as a verification run
+/// worth recording as completion-gate evidence. Deliberately broad rather
+/// than an exhaustive per-ecosystem parser -- a false-positive match (e.g. a
+/// command that merely mentions "cargo test" in a comment) only makes the
+/// gate slightly more permissive, never less safe, and false negatives are
+/// the failure mode that actually blocks legitimate completions.
+const VERIFICATION_COMMAND_MARKERS: &[&str] = &[
+    "cargo test",
+    "cargo build",
+    "cargo check",
+    "cargo clippy",
+    "npm test",
+    "npm run test",
+    "npm run build",
+    "npm run lint",
+    "yarn test",
+    "yarn build",
+    "yarn lint",
+    "pnpm test",
+    "pnpm run test",
+    "pnpm build",
+    "pytest",
+    "python -m pytest",
+    "python3 -m pytest",
+    "go test",
+    "go build",
+    "go vet",
+    "make test",
+    "make build",
+    "make check",
+    "mvn test",
+    "gradle test",
+    "./gradlew test",
+    "jest",
+    "vitest",
+    "eslint",
+    "tsc --noemit",
+    "tsc -p",
+    "ruff check",
+    "mypy",
+];
+
+/// First word of a shell statement that means "this statement isn't
+/// actually invoking a program" for verification-marker purposes -- a
+/// search/print command whose argument merely *mentions* a marker (e.g.
+/// `grep -rn "cargo test" src/`, `echo "remember to run npm test"`) must
+/// not be recorded as real passing verification evidence.
+const NON_EXECUTING_FIRST_WORDS: &[&str] =
+    &["echo", "printf", "grep", "rg", "ag", "cat", "less", "more"];
+
+/// Removes single- and double-quoted substrings (delimiters included) from
+/// `s` -- used so a marker mentioned only inside a quoted string (a grep
+/// pattern, an echoed message) doesn't count as that command actually
+/// running. Doesn't attempt to handle shell escaping inside the quotes;
+/// good enough for the "is this text merely quoted" question this exists
+/// to answer, not a full shell parser.
+fn strip_quoted_substrings(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '"' || c == '\'' {
+            for c2 in chars.by_ref() {
+                if c2 == c {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// True when `command` looks like a test/build/lint invocation -- see
+/// [`VERIFICATION_COMMAND_MARKERS`]. Splits on shell statement separators
+/// and checks each statement independently (same convention as
+/// `hook_redirect::destructive_data_file_reason`) so a marker string only
+/// counts when some statement actually looks like it invokes that program,
+/// not merely mentions it as a quoted argument to `grep`/`echo`/etc.
+pub fn is_verification_command(command: &str) -> bool {
+    for statement in command
+        .split(['\n', ';'])
+        .flat_map(|s| s.split("&&"))
+        .flat_map(|s| s.split("||"))
+        .flat_map(|s| s.split('|'))
+    {
+        let stripped = strip_quoted_substrings(statement);
+        let trimmed = stripped.trim().to_lowercase();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let first_word = trimmed.split_whitespace().next().unwrap_or("");
+        if NON_EXECUTING_FIRST_WORDS.contains(&first_word) {
+            continue;
+        }
+        if VERIFICATION_COMMAND_MARKERS
+            .iter()
+            .any(|marker| trimmed.contains(marker))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `record` carries verification evidence recent and passing enough
+/// to satisfy the completion gate right now.
+pub fn has_fresh_passing_verification(record: &SessionRecord, now: u64) -> bool {
+    record
+        .last_verification
+        .as_ref()
+        .is_some_and(|v| v.passed && now.saturating_sub(v.ts) < VERIFICATION_FRESHNESS_SECS)
+}
+
+/// Clears a session's recorded verification evidence -- called by the
+/// `PostToolUse` success hook (`hook::post_tool_use`) whenever a mutating
+/// tool (Write/Edit/MultiEdit/patch/ctx_patch/...) runs, because a test run
+/// that passed *before* this edit no longer proves the CURRENT tree still
+/// works. Without this, `record cargo test` -> `edit src/foo.rs` (breaking
+/// it) -> `item done` would sail through the completion gate on stale
+/// evidence for the rest of [`VERIFICATION_FRESHNESS_SECS`].
+pub fn invalidate_verification(state: &mut RuntimeState, session_id: &str) {
+    if let Some(record) = state.sessions.get_mut(session_id) {
+        record.last_verification = None;
+    }
+}
 
 pub fn runtime_state_path() -> PathBuf {
     crate::state::state_dir().join("runtime-state.json")
@@ -272,6 +425,7 @@ mod tests {
                     start_ts: 1000,
                     turn_count: 3,
                     recent_tool_calls: vec![],
+                    last_verification: None,
                 },
             );
             save_runtime(&state);
@@ -299,6 +453,7 @@ mod tests {
                 start_ts: 0,
                 turn_count: 1,
                 recent_tool_calls: vec![],
+                last_verification: None,
             },
         );
         state.sessions.insert(
@@ -307,6 +462,7 @@ mod tests {
                 start_ts: 100_000,
                 turn_count: 1,
                 recent_tool_calls: vec![],
+                last_verification: None,
             },
         );
         let now = 100_100; // 100s after "recent", ~27.7h after "old"
@@ -321,6 +477,7 @@ mod tests {
             start_ts: 0,
             turn_count: 5,
             recent_tool_calls: vec![],
+            last_verification: None,
         };
         assert!(session_hygiene_nudge(&record, 100).is_none());
     }
@@ -331,6 +488,7 @@ mod tests {
             start_ts: 0,
             turn_count: 81,
             recent_tool_calls: vec![],
+            last_verification: None,
         };
         assert!(session_hygiene_nudge(&record, 100).is_some());
     }
@@ -341,6 +499,7 @@ mod tests {
             start_ts: 0,
             turn_count: 1,
             recent_tool_calls: vec![],
+            last_verification: None,
         };
         assert!(session_hygiene_nudge(&record, 2 * 60 * 60 + 1).is_some());
     }
@@ -377,6 +536,142 @@ mod tests {
     fn model_routing_still_flags_real_locate_and_where_is_prompts() {
         assert!(model_routing_nudge("please locate the missing file").is_some());
         assert!(model_routing_nudge("where is the auth check?").is_some());
+    }
+
+    #[test]
+    fn is_verification_command_matches_common_test_build_lint_invocations() {
+        assert!(is_verification_command("cargo test --lib"));
+        assert!(is_verification_command("npm test"));
+        assert!(is_verification_command("cd foo && pytest -x"));
+        assert!(is_verification_command("go test ./..."));
+        assert!(is_verification_command("CARGO CLIPPY --all-targets"));
+    }
+
+    #[test]
+    fn is_verification_command_ignores_unrelated_commands() {
+        assert!(!is_verification_command("ls -la"));
+        assert!(!is_verification_command("git status"));
+        assert!(!is_verification_command("echo hello"));
+    }
+
+    #[test]
+    fn is_verification_command_ignores_marker_mentioned_in_quoted_grep_pattern() {
+        // Regression: PR #581 review finding #1 -- a search whose pattern
+        // happens to be a marker string is not that command actually running.
+        assert!(!is_verification_command("grep -rn \"cargo test\" src/"));
+        assert!(!is_verification_command("rg 'npm test' ."));
+    }
+
+    #[test]
+    fn is_verification_command_ignores_marker_echoed_in_quotes() {
+        assert!(!is_verification_command(
+            "echo \"remember to run npm test\""
+        ));
+    }
+
+    #[test]
+    fn is_verification_command_ignores_marker_echoed_unquoted() {
+        assert!(!is_verification_command("echo remember to run npm test"));
+    }
+
+    #[test]
+    fn is_verification_command_still_matches_real_invocation_after_pipe_or_chain() {
+        assert!(is_verification_command(
+            "grep -rn \"cargo test\" src/ ; cargo test --lib"
+        ));
+        assert!(is_verification_command(
+            "cd foo && npm test 2>&1 | tee out.log"
+        ));
+    }
+
+    #[test]
+    fn invalidate_verification_clears_existing_evidence() {
+        let mut state = RuntimeState::default();
+        state.sessions.insert(
+            "s1".to_string(),
+            SessionRecord {
+                start_ts: 0,
+                turn_count: 0,
+                recent_tool_calls: vec![],
+                last_verification: Some(VerificationEvidence {
+                    command: "cargo test".into(),
+                    exit_code: Some(0),
+                    passed: true,
+                    ts: 1000,
+                }),
+            },
+        );
+        invalidate_verification(&mut state, "s1");
+        assert!(state.sessions["s1"].last_verification.is_none());
+    }
+
+    #[test]
+    fn invalidate_verification_is_a_noop_for_unknown_session() {
+        let mut state = RuntimeState::default();
+        invalidate_verification(&mut state, "does-not-exist");
+        assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn has_fresh_passing_verification_true_for_recent_pass() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: Some(VerificationEvidence {
+                command: "cargo test".into(),
+                exit_code: Some(0),
+                passed: true,
+                ts: 1000,
+            }),
+        };
+        assert!(has_fresh_passing_verification(&record, 1000 + 60));
+    }
+
+    #[test]
+    fn has_fresh_passing_verification_false_when_stale() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: Some(VerificationEvidence {
+                command: "cargo test".into(),
+                exit_code: Some(0),
+                passed: true,
+                ts: 1000,
+            }),
+        };
+        assert!(!has_fresh_passing_verification(
+            &record,
+            1000 + VERIFICATION_FRESHNESS_SECS + 1
+        ));
+    }
+
+    #[test]
+    fn has_fresh_passing_verification_false_when_failed() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: Some(VerificationEvidence {
+                command: "cargo test".into(),
+                exit_code: Some(1),
+                passed: false,
+                ts: 1000,
+            }),
+        };
+        assert!(!has_fresh_passing_verification(&record, 1000));
+    }
+
+    #[test]
+    fn has_fresh_passing_verification_false_when_absent() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: None,
+        };
+        assert!(!has_fresh_passing_verification(&record, 1000));
     }
 
     #[test]
