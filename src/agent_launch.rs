@@ -601,14 +601,14 @@ pub(crate) fn parse_claude_reply(raw: &str) -> (String, Option<String>, Option<f
 /// Every role dispatched through `real_agent_send_hook` (`work_item_pipeline`)
 /// — implementer, task-reviewer, re-reviewer, AND the judge — shares that
 /// hook, and `build_extra_args` (`cli::work`) forces `--output-format
-/// stream-json` for Claude Code regardless of role. `run_headless`'s captured
-/// stdout is therefore that raw multi-line transcript, not plain reply text;
-/// `parse_claude_reply` is what pulls the real reply off its final line.
-/// Other agents' headless output is already plain text, so this is a no-op
-/// for them. See `parse_claude_reply`'s doc comment for why this call exists
-/// at all (item #489).
+/// stream-json` for Claude Code and cursor-agent regardless of role.
+/// `run_headless`'s captured stdout is therefore that raw multi-line
+/// transcript, not plain reply text; `parse_claude_reply` is what pulls the
+/// real reply off its final line. Other agents' headless output is already
+/// plain text, so this is a no-op for them. See `parse_claude_reply`'s doc
+/// comment for why this call exists at all (item #489).
 pub(crate) fn clean_agent_reply(agent: &str, raw: String) -> String {
-    if agent == Agent::ClaudeCode.as_str() {
+    if agent == Agent::ClaudeCode.as_str() || agent == Agent::Cursor.as_str() {
         parse_claude_reply(&raw).0
     } else {
         raw
@@ -1148,6 +1148,22 @@ mod tests {
         assert_eq!(
             clean_agent_reply(Agent::Opencode.as_str(), raw.clone()),
             raw
+        );
+    }
+
+    #[test]
+    fn clean_agent_reply_parses_cursor_stream_json() {
+        let raw = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working..."}]}}"#,
+            "\n",
+            r#"{"type":"result","result":"single line content again","session_id":"sess-456"}"#,
+        );
+        let (text, session_id, _) = parse_claude_reply(raw);
+        assert_eq!(text, "single line content again");
+        assert_eq!(session_id.as_deref(), Some("sess-456"));
+        assert_eq!(
+            clean_agent_reply(Agent::Cursor.as_str(), raw.to_string()),
+            "single line content again"
         );
     }
 
