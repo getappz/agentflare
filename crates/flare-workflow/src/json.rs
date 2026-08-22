@@ -272,9 +272,9 @@ fn compile_run_if(
                 .to_string()
         };
         if let Some((lhs, rhs)) = expr.split_once("!=") {
-            expand(lhs) != expand(rhs).trim_matches(['\'', '"']).to_string()
+            expand(lhs) != expand(rhs).trim_matches(['\'', '"'])
         } else if let Some((lhs, rhs)) = expr.split_once("==") {
-            expand(lhs) == expand(rhs).trim_matches(['\'', '"']).to_string()
+            expand(lhs) == expand(rhs).trim_matches(['\'', '"'])
         } else {
             let v = expand(&expr);
             !v.is_empty() && v != "false" && v != "0"
