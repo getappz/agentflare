@@ -37,6 +37,11 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 /// The same suppression applied to an existing builder -- for call sites that
 /// construct the `Command` incrementally (env/cwd wiring spread across
 /// branches) or wrap `std::process::Command`.
+///
+/// Windows contract: this OVERWRITES the creation-flags mask (`std` exposes
+/// no getter, so caller-set flags cannot be merged). Call it before any other
+/// `creation_flags` call on the builder, or fold your own flags in after --
+/// never before.
 pub fn no_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
