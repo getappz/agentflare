@@ -25,12 +25,16 @@ fn find_duplicate_pr(
 
 /// Picks which match to act on when `find_by_item_marker` returns more than
 /// one PR for the same item — a merged one wins so `handle_duplicate_pr`
-/// self-heals instead of merely flagging for review. Split out from
-/// `find_duplicate_pr` so this selection logic is unit-testable without a
-/// mock GitHub server.
+/// self-heals instead of merely flagging for review. A closed-but-unmerged
+/// PR (a previously abandoned attempt, e.g. an item found superseded and
+/// closed) is dropped entirely rather than treated as an open duplicate —
+/// otherwise it would permanently block a legitimate redispatch. Split out
+/// from `find_duplicate_pr` so this selection logic is unit-testable
+/// without a mock GitHub server.
 fn pick_duplicate_pr(
     mut prs: Vec<crate::github::models::PullRequest>,
 ) -> Option<crate::github::models::PullRequest> {
+    prs.retain(|pr| pr.merged_at.is_some() || pr.state == "open");
     prs.sort_by_key(|pr| pr.merged_at.is_none());
     prs.into_iter().next()
 }
@@ -43,9 +47,17 @@ fn pick_duplicate_pr(
 ///
 /// - Merged: self-heal — mark the item completed, clean up its worktree,
 ///   relabel the PR `agentflare:completed`, and release the claim, the same
-///   shape `item_check_merge`'s promoted path already uses.
+///   shape `item_check_merge`'s promoted path already uses. If marking
+///   completed doesn't confirm success, this returns a retryable failure
+///   instead of reporting success, leaving `claim_guard` armed so its
+///   `Drop` releases the claim for a future attempt.
 /// - Still open: skip dispatch and flag for a human instead of racing a
 ///   second PR for the same item.
+///
+/// Either way, `claim_guard` is only disarmed once `item_release` actually
+/// confirms success — a failed release leaves it armed so `Drop`'s
+/// best-effort retry is still the backstop, matching `release_and_comment`'s
+/// own contract.
 #[allow(clippy::too_many_arguments)]
 fn handle_duplicate_pr(
     mcp: &AgentflareMcp,
@@ -64,10 +76,18 @@ fn handle_duplicate_pr(
             .ok()
             .and_then(Result::ok)
             .unwrap_or(false);
-        if marked {
-            crate::worktree::cleanup_worktree(item, worktree_path);
-            crate::worktree::relabel_pr_completed(item, worktree_path);
+        if !marked {
+            let msg = format!(
+                "duplicate work: PR #{} already merged for {item_id}, but mark_completed \
+                 didn't confirm success -- leaving claim armed for retry",
+                pr.number
+            );
+            let _ = writeln!(log, "{msg}");
+            crate::ui::error(&msg);
+            return 1.into();
         }
+        crate::worktree::cleanup_worktree(item, worktree_path);
+        crate::worktree::relabel_pr_completed(item, worktree_path);
         let _ = writeln!(
             log,
             "duplicate work: PR #{} already merged for {item_id} -- auto-completed",
@@ -96,15 +116,23 @@ fn handle_duplicate_pr(
         body: Some(body.clone()),
         ..Default::default()
     });
-    let _ = mcp.item_release(ItemRequest {
+    match mcp.item_release(ItemRequest {
         action: "release".into(),
         id: Some(item_id.into()),
         ..Default::default()
-    });
+    }) {
+        Ok(_) => claim_guard.disarm(),
+        Err(e) => {
+            let _ = writeln!(
+                log,
+                "duplicate work: item_release failed for {item_id}: {e} -- \
+                 leaving claim armed so ClaimGuard's Drop retries it"
+            );
+        }
+    }
     if let Some(recipient) = notify_recipient {
         notify(recipient, &body, item_id);
     }
-    claim_guard.disarm();
     0.into()
 }
 

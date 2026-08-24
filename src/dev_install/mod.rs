@@ -193,18 +193,33 @@ fn verify_runs(binary: &Path) -> Result<(), String> {
 
 /// Run `<binary> daemon workflow-store-smoke-test` (the hidden verb behind
 /// [`crate::cli::daemon::DaemonSubcommand::WorkflowStoreSmokeTest`]) and
-/// confirm it exits successfully.
+/// confirm it exits successfully within [`VERIFY_TIMEOUT`] — same
+/// spawn/try_wait/kill pattern as [`verify_runs`], so a hung smoke test
+/// can't block `dev-install` indefinitely.
 fn verify_workflow_store(binary: &Path) -> Result<(), String> {
-    let status = Command::new(binary)
+    let mut child = Command::new(binary)
         .args(["daemon", "workflow-store-smoke-test"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
+        .spawn()
         .map_err(|e| format!("failed to spawn workflow-store-smoke-test: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("workflow-store-smoke-test exited with {status}"))
+
+    let deadline = Instant::now() + VERIFY_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(format!("workflow-store-smoke-test exited with {status}"));
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return Err("workflow-store-smoke-test timed out".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("waiting on workflow-store-smoke-test: {e}")),
+        }
     }
 }
 

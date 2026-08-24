@@ -10,16 +10,41 @@
         .unwrap()
     }
 
+    /// A genuinely open (unmerged, unclosed) PR, unlike [`duplicate_pr`]'s
+    /// unmerged case, which is closed.
+    fn open_duplicate_pr(number: u64) -> crate::github::models::PullRequest {
+        serde_json::from_str(&format!(
+            r#"{{"number":{number},"html_url":"https://github.com/o/r/pull/{number}","state":"open","title":"t"}}"#
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn pick_duplicate_pr_prefers_a_merged_match_over_an_open_one() {
         let picked =
-            pick_duplicate_pr(vec![duplicate_pr(1, false), duplicate_pr(2, true)]).unwrap();
+            pick_duplicate_pr(vec![open_duplicate_pr(1), duplicate_pr(2, true)]).unwrap();
         assert_eq!(picked.number, 2);
     }
 
     #[test]
     fn pick_duplicate_pr_returns_none_for_an_empty_list() {
         assert!(pick_duplicate_pr(vec![]).is_none());
+    }
+
+    /// A closed-but-unmerged PR (a previously abandoned attempt, e.g. one
+    /// found superseded and closed rather than merged) must not be treated
+    /// as an open duplicate — that would permanently block a legitimate
+    /// redispatch. `duplicate_pr(_, false)` builds exactly this shape:
+    /// `state: "closed"`, `merged_at: None`.
+    #[test]
+    fn pick_duplicate_pr_ignores_a_closed_unmerged_pr() {
+        assert!(pick_duplicate_pr(vec![duplicate_pr(3, false)]).is_none());
+    }
+
+    #[test]
+    fn pick_duplicate_pr_selects_a_genuinely_open_pr_when_no_merged_match_exists() {
+        let picked = pick_duplicate_pr(vec![duplicate_pr(4, false), open_duplicate_pr(5)]).unwrap();
+        assert_eq!(picked.number, 5);
     }
 
     /// Item #164's acceptance criterion: a merged duplicate PR self-heals
@@ -136,7 +161,7 @@
                 &item.id,
                 &item,
                 &repo_root,
-                &duplicate_pr(7, false),
+                &open_duplicate_pr(7),
                 None,
                 &mut guard,
                 &mut log,

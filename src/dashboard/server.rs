@@ -730,56 +730,61 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
     .expect("failed to open job queue");
     // Before anything below can dequeue a single job (see its own doc comment).
     super::orphan_reconcile::reconcile_orphaned_jobs(&queue);
-    // Same reasoning as `reconcile_orphaned_jobs` above, for the work-item
-    // `flare-workflow` pipeline's own crash story: register a definition
-    // under `work_item_pipeline::WORKFLOW_ID` so `engine().recover()` (a
-    // whole-store sweep — see its doc comment on why it's only ever called
-    // here, once, never per-dispatch) has something to resume non-terminal
-    // runs against, then run it, before `WorkerPool::start` below can
-    // dispatch a fresh job for one of those same items.
-    //
-    // This definition carries no item/agent-specific identity itself —
-    // `build_work_item_pipeline`'s `sdd_loop`/`finalize` steps read the real
-    // item id, agent, and prompts from each resumed run's own persisted
-    // `WorkItemData` (`ctx.data`) at execution time instead of from whatever
-    // was passed at registration, so a genuine crash-resume reproduces the
-    // crashed run's actual target item and prompts, not a placeholder.
-    // `--timeout`/`--idle-timeout`/extra CLI args from the original dispatch
-    // aren't persisted, so a resumed run falls back to the defaults here —
-    // an accepted trade-off, not an identity gap.
-    {
-        let boot_mcp = std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default());
-        let boot_definition = crate::work_item_pipeline::build_work_item_pipeline(
-            boot_mcp,
-            std::time::Duration::from_secs(crate::cli::work::DEFAULT_TIMEOUT_SECS),
-            std::time::Duration::from_secs(crate::cli::work::DEFAULT_IDLE_TIMEOUT_SECS),
-            Vec::new(),
-        );
-        if let Err(e) = crate::work_item_pipeline::engine().register_workflow(boot_definition) {
-            crate::ui::error(&format!(
-                "failed to register work-item pipeline definition at boot: {e}"
-            ));
-        } else if let Err(e) = crate::work_item_pipeline::engine().recover().await {
-            crate::ui::error(&format!(
-                "failed to recover in-flight work-item pipeline runs at boot: {e}"
-            ));
-        }
-    }
     // Kept alive for `run()` (no graceful shutdown path, see `daemon::stop_daemon`).
     // init_global() starts the sampler `supervisor` dispatch consults (item #435).
+    // Independent of the workflow store, so it runs regardless of the smoke
+    // test below.
     agentflare_resource_gate::init_global();
     // Boot-time gate (item #164): a cheap save/delete/load round-trip
     // against the real on-disk workflow store, proving its schema actually
-    // works before anything gets claimed against it. Without this, a
-    // broken store (e.g. `delete()` silently no-op'ing on a column-name
-    // mismatch, item #576) doesn't fail loudly -- every claimed item just
-    // retries and fails individually into a stuck state, which is exactly
-    // what ran undetected for ~33h. On failure, skip starting the worker
-    // pool and the supervisor's discovery/review ticks entirely (no claims,
-    // no dispatch) while leaving the dashboard itself up so the alert below
+    // works before anything -- including workflow recovery just below --
+    // touches it. Without this, a broken store (e.g. `delete()` silently
+    // no-op'ing on a column-name mismatch, item #576) doesn't fail loudly
+    // -- every claimed item just retries and fails individually into a
+    // stuck state, which is exactly what ran undetected for ~33h. On
+    // failure, skip registration/recovery, the worker pool, and the
+    // supervisor's discovery/review ticks entirely (no claims, no
+    // dispatch) while leaving the dashboard itself up so the alert below
     // is actually visible.
     match flare_workflow::smoke_test(crate::work_item_pipeline::engine().state_store()).await {
         Ok(()) => {
+            // Same reasoning as `reconcile_orphaned_jobs` above, for the
+            // work-item `flare-workflow` pipeline's own crash story:
+            // register a definition under `work_item_pipeline::WORKFLOW_ID`
+            // so `engine().recover()` (a whole-store sweep — see its doc
+            // comment on why it's only ever called here, once, never
+            // per-dispatch) has something to resume non-terminal runs
+            // against, then run it, before `WorkerPool::start` below can
+            // dispatch a fresh job for one of those same items.
+            //
+            // This definition carries no item/agent-specific identity
+            // itself — `build_work_item_pipeline`'s `sdd_loop`/`finalize`
+            // steps read the real item id, agent, and prompts from each
+            // resumed run's own persisted `WorkItemData` (`ctx.data`) at
+            // execution time instead of from whatever was passed at
+            // registration, so a genuine crash-resume reproduces the
+            // crashed run's actual target item and prompts, not a
+            // placeholder. `--timeout`/`--idle-timeout`/extra CLI args
+            // from the original dispatch aren't persisted, so a resumed
+            // run falls back to the defaults here — an accepted
+            // trade-off, not an identity gap.
+            let boot_mcp = std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default());
+            let boot_definition = crate::work_item_pipeline::build_work_item_pipeline(
+                boot_mcp,
+                std::time::Duration::from_secs(crate::cli::work::DEFAULT_TIMEOUT_SECS),
+                std::time::Duration::from_secs(crate::cli::work::DEFAULT_IDLE_TIMEOUT_SECS),
+                Vec::new(),
+            );
+            if let Err(e) = crate::work_item_pipeline::engine().register_workflow(boot_definition) {
+                crate::ui::error(&format!(
+                    "failed to register work-item pipeline definition at boot: {e}"
+                ));
+            } else if let Err(e) = crate::work_item_pipeline::engine().recover().await {
+                crate::ui::error(&format!(
+                    "failed to recover in-flight work-item pipeline runs at boot: {e}"
+                ));
+            }
+
             let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
                 .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor))
                 .with_terminal_failure_hook(std::sync::Arc::new(|_job_id, job| {
@@ -800,8 +805,9 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
         Err(e) => {
             crate::ui::error(&format!(
                 "workflow store failed its boot-time smoke test: {e} -- refusing to \
-                 start work dispatch (worker pool + supervisor ticks) until this is fixed. \
-                 The dashboard will still run so you can see this alert."
+                 start work dispatch (registration, recovery, worker pool, supervisor \
+                 ticks) until this is fixed. The dashboard will still run so you can \
+                 see this alert."
             ));
         }
     }

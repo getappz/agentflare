@@ -877,18 +877,19 @@ mod tests {
     }
 
     /// Item #164's other acceptance criterion, driven through the real
-    /// rusqlite code path rather than a trait double: a schema that's
-    /// missing the `id`/`run_id` distinction (`workflow_runs` keyed on
-    /// `run_id` like every other table, instead of its actual `id` column --
-    /// the exact shape of #576's regression, reproduced as a schema defect)
-    /// must fail `smoke_test` loudly through `SqliteStore`'s real
-    /// `write_state`/`delete_state` SQL, not silently report success.
+    /// rusqlite code path rather than a trait double: `write_state` only
+    /// ever inserts into `workflow_runs` (keyed on `id`) for a smoke test's
+    /// empty-steps/empty-vars `WorkflowState`, so `save` succeeds here and
+    /// the schema defect — `journal` missing the `run_id` column
+    /// `delete_state` unconditionally deletes by, the exact shape of #576's
+    /// regression — is only reached by `delete_state`'s real SQL, not
+    /// silently swallowed as a save failure.
     #[tokio::test]
     async fn smoke_test_fails_against_a_schema_missing_the_id_run_id_distinction() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE workflow_runs (
-                run_id TEXT PRIMARY KEY,
+                id TEXT PRIMARY KEY,
                 workflow_id TEXT NOT NULL,
                 status TEXT NOT NULL,
                 current_step TEXT,
@@ -900,11 +901,11 @@ mod tests {
                 updated_at TEXT NOT NULL
              );
              CREATE TABLE journal (
-                run_id TEXT NOT NULL,
+                bad_run_id TEXT NOT NULL,
                 seq INTEGER NOT NULL,
                 entry_type TEXT NOT NULL,
                 payload TEXT NOT NULL,
-                PRIMARY KEY (run_id, seq)
+                PRIMARY KEY (bad_run_id, seq)
              );
              CREATE TABLE step_state (
                 run_id TEXT NOT NULL,
@@ -936,5 +937,9 @@ mod tests {
 
         let err = crate::store::smoke_test(&store).await.unwrap_err();
         assert!(matches!(err, WorkflowError::Store(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("journal"),
+            "expected the failure to come from delete_state's journal delete, got: {err}"
+        );
     }
 }

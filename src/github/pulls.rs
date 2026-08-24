@@ -1,6 +1,15 @@
 use crate::github::models::{PullRequest, Review, ReviewComment};
 use crate::github::{Client, GitHubError, RepoId};
 
+/// Extractor for the Search API's `{"items": [...], "total_count": N}`
+/// envelope, mirroring `actions::workflow_runs`/`check_runs`.
+fn search_items(page: &serde_json::Value) -> Vec<serde_json::Value> {
+    page.get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn create_body(title: &str, head: &str, base: &str, body: Option<&str>) -> serde_json::Value {
     let mut v = serde_json::json!({ "title": title, "head": head, "base": base });
     if let Some(b) = body {
@@ -71,8 +80,8 @@ pub fn find_by_item_marker(
         repo.owner, repo.repo
     );
     let path = format!("/search/issues?q={}", crate::github::encode_query(&query));
-    let json = client.request("GET", &path, None)?;
-    let numbers: Vec<u64> = json["items"]
+    let items = client.get_paginated(&path, search_items)?;
+    let numbers: Vec<u64> = items
         .as_array()
         .into_iter()
         .flatten()
