@@ -143,6 +143,89 @@
         });
     }
 
+    /// Items #185/#187: `reconcile_orphaned_jobs`'s earlier release (via
+    /// `release_and_comment` under `with_owner_override`) is best-effort
+    /// (`let _ = ...`) -- if it silently doesn't take, `restore_ready_for_work`
+    /// must not leave the claim behind just because it already re-added
+    /// `ready-for-work`. Calls `restore_ready_for_work` directly, skipping
+    /// the earlier release step entirely, to prove its own defensive release
+    /// closes the gap standalone rather than relying on the first release
+    /// having worked.
+    #[test]
+    fn restore_ready_for_work_releases_the_claim_even_when_the_earlier_release_was_skipped() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let item = mcp
+                .with_backend_db(|conn| {
+                    let project = mcp.resolve_project(conn).unwrap();
+                    let state = agentflare_backend::state::list_by_project(conn, &project.id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|s| s.is_default)
+                        .unwrap();
+                    agentflare_backend::item::create(
+                        conn,
+                        agentflare_backend::item::CreateItem {
+                            project_id: project.id,
+                            state_id: state.id,
+                            name: "restore-without-prior-release test item".into(),
+                            description: Some("do the thing".into()),
+                            priority: None,
+                            parent_id: None,
+                            assignee_agent: None,
+                            sort_order: None,
+                            external_source: None,
+                            external_id: None,
+                            metadata: None,
+                            label_ids: vec![],
+                            assignee_ids: vec![],
+                            dependency_ids: vec![],
+                        },
+                    )
+                    .unwrap()
+                })
+                .unwrap();
+
+            let job_id = "a-dead-job-id";
+            crate::claims::with_owner_override(format!("opencode:{job_id}"), || {
+                let claim_json = mcp
+                    .item_claim(crate::mcp_server::types::ItemRequest {
+                        action: "claim".to_string(),
+                        id: Some(item.id.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let claim: serde_json::Value = serde_json::from_str(&claim_json).unwrap();
+                assert_eq!(claim["status"], "acquired");
+            });
+
+            // Straight to `restore_ready_for_work` -- no `release_and_comment`
+            // call first, simulating that step having silently no-op'd.
+            restore_ready_for_work(&mcp, &item.id, "opencode", job_id);
+
+            let reclaim_json =
+                crate::claims::with_owner_override("opencode:a-fresh-instance", || {
+                    mcp.item_claim(crate::mcp_server::types::ItemRequest {
+                        action: "claim".to_string(),
+                        id: Some(item.id.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                });
+            let reclaim: serde_json::Value = serde_json::from_str(&reclaim_json).unwrap();
+            assert_eq!(
+                reclaim["status"], "acquired",
+                "restore_ready_for_work must release the dead job's own claim itself, \
+                 not depend on an earlier release having already succeeded: {reclaim}"
+            );
+        });
+    }
+
     /// Item #164: an orphaned subprocess must actually be killed, not just
     /// have its DB row updated. Spawns a real long-lived process whose argv
     /// embeds the worktree path (mirroring a real sandboxed agent's bwrap

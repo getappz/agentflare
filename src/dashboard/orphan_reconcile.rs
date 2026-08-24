@@ -79,7 +79,7 @@ pub(super) fn reconcile_orphaned_jobs(queue: &Queue) {
                 None,
             );
         });
-        if restore_ready_for_work(&mcp, item_id, agent) {
+        if restore_ready_for_work(&mcp, item_id, agent, &job_id) {
             post_any_reason_cap_comment(&mcp, item_id);
         }
     }
@@ -169,6 +169,7 @@ fn restore_ready_for_work(
     mcp: &crate::mcp_server::AgentflareMcp,
     item_id: &str,
     agent: &str,
+    job_id: &str,
 ) -> bool {
     let at_cap = mcp
         .with_backend_db(|conn| -> Option<bool> {
@@ -202,6 +203,22 @@ fn restore_ready_for_work(
         // of discarding a mid-sequence error via `.ok()?` and continuing.
         conn.execute_batch("BEGIN").ok()?;
         let result: agentflare_backend::error::Result<()> = (|| {
+            // Defense in depth: `reconcile_orphaned_jobs` already tries to
+            // release this claim via `release_and_comment` under a
+            // `with_owner_override` scope before calling here, but that
+            // release is best-effort (`let _ = ...`) and its failure is
+            // silent. Without this, a release that silently didn't take
+            // leaves the claim "live" for its full TTL even after this
+            // function puts `ready-for-work` back on -- `run_discovery_tick`
+            // sees the item as dispatchable, but the actual dispatch (and
+            // `redispatch`) both refuse with "blocked_by_live_claim" until
+            // the TTL naturally expires (items #185/#187 reproduced this:
+            // stuck for the better part of an hour with no visible error,
+            // owner strings confirmed to be this exact job's own dead
+            // claim). Same owner string `reconcile_orphaned_jobs` already
+            // constructs (`{agent}:{job_id}`) so this only ever releases the
+            // dead job's own lease, never a live one held by something else.
+            agentflare_backend::claim::release(conn, item_id, &format!("{agent}:{job_id}"))?;
             if let Some(dispatched_id) = &dispatched_id {
                 agentflare_backend::item::remove_label(conn, item_id, dispatched_id)?;
             }
