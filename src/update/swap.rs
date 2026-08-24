@@ -119,10 +119,10 @@ fn schedule_deferred_swap_windows(new_binary: &Path, target: &Path) -> Result<()
         target = target.display(),
     );
     std::fs::write(&bat, script).map_err(|e| format!("write deferred updater: {e}"))?;
-    // Hidden outer cmd; the `start /min` inside still keeps the deferred
-    // swap detached from this (possibly exiting) process.
+    // Hidden outer cmd; `start /B` detaches the swap script with no window
+    // at all (`/min` would still pop a minimized one).
     flare_process::command("cmd")
-        .args(["/C", "start", "/min", "", &bat.to_string_lossy()])
+        .args(["/C", "start", "/B", "", &bat.to_string_lossy()])
         .spawn()
         .map_err(|e| format!("spawn deferred updater: {e}"))?;
     Ok(())

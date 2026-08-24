@@ -47,6 +47,8 @@ pub fn no_window(cmd: &mut Command) {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    #[cfg(not(windows))]
+    let _ = cmd;
 }
 
 #[cfg(test)]
@@ -61,6 +63,7 @@ mod tests {
         let output = command("sh").args(["-c", "echo ok"]).output().unwrap();
 
         assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
     }
 
     #[test]
