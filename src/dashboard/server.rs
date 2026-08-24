@@ -775,32 +775,47 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
                 std::time::Duration::from_secs(crate::cli::work::DEFAULT_IDLE_TIMEOUT_SECS),
                 Vec::new(),
             );
-            if let Err(e) = crate::work_item_pipeline::engine().register_workflow(boot_definition) {
-                crate::ui::error(&format!(
-                    "failed to register work-item pipeline definition at boot: {e}"
-                ));
-            } else if let Err(e) = crate::work_item_pipeline::engine().recover().await {
-                crate::ui::error(&format!(
-                    "failed to recover in-flight work-item pipeline runs at boot: {e}"
-                ));
-            }
+            // A registration/recovery failure means the pipeline's own
+            // resume state is untrustworthy, so dispatch stays disabled
+            // here too -- same "fail closed, dashboard stays up" contract
+            // as the smoke-test gate this block is already nested inside.
+            let pipeline_ready =
+                match crate::work_item_pipeline::engine().register_workflow(boot_definition) {
+                    Ok(()) => match crate::work_item_pipeline::engine().recover().await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            crate::ui::error(&format!(
+                                "failed to recover in-flight work-item pipeline runs at boot: {e}"
+                            ));
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        crate::ui::error(&format!(
+                            "failed to register work-item pipeline definition at boot: {e}"
+                        ));
+                        false
+                    }
+                };
 
-            let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
-                .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor))
-                .with_terminal_failure_hook(std::sync::Arc::new(|_job_id, job| {
-                    super::orphan_reconcile::handle_terminal_job_failure(job);
-                }));
-            worker_pool.start(work_max_concurrency());
-            spawn_supervisor_discovery(
-                queue.clone(),
-                std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
-                SUPERVISOR_DISCOVERY_INTERVAL,
-            );
-            spawn_supervisor_review_sweep(
-                queue.clone(),
-                std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
-                SUPERVISOR_REVIEW_SWEEP_INTERVAL,
-            );
+            if pipeline_ready {
+                let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
+                    .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor))
+                    .with_terminal_failure_hook(std::sync::Arc::new(|_job_id, job| {
+                        super::orphan_reconcile::handle_terminal_job_failure(job);
+                    }));
+                worker_pool.start(work_max_concurrency());
+                spawn_supervisor_discovery(
+                    queue.clone(),
+                    std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
+                    SUPERVISOR_DISCOVERY_INTERVAL,
+                );
+                spawn_supervisor_review_sweep(
+                    queue.clone(),
+                    std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
+                    SUPERVISOR_REVIEW_SWEEP_INTERVAL,
+                );
+            }
         }
         Err(e) => {
             crate::ui::error(&format!(
