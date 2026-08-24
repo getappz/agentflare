@@ -66,6 +66,36 @@ pub trait StateStore<D: WorkflowData>: Send + Sync + Clone {
     async fn workflow_metrics(&self, filter: MetricsFilter) -> WorkflowResult<WorkflowMetrics>;
 }
 
+/// Cheap end-to-end proof that `store`'s actual schema works: write a
+/// throwaway state, delete it, and confirm a subsequent load reports it
+/// gone. Exists because `SqliteStore::delete_state` silently used the wrong
+/// column name on three of its four tables for ~33h before anyone noticed
+/// (agentflare item #164/#576) — every claimed item just retried and failed
+/// individually instead of surfacing anything actionable. Callers (daemon
+/// boot) should refuse to dispatch entirely on failure rather than let that
+/// repeat.
+pub async fn smoke_test<D, S>(store: &S) -> WorkflowResult<()>
+where
+    D: WorkflowData + Default,
+    S: StateStore<D>,
+{
+    let run_id = WorkflowRunId::new();
+    let state = crate::types::WorkflowState::new(
+        run_id,
+        crate::types::WorkflowId::new("agentflare-store-smoke-test"),
+        D::default(),
+    );
+    store.save(state).await?;
+    store.delete(run_id).await?;
+    match store.load(run_id).await {
+        Err(WorkflowError::NotFound(_)) => Ok(()),
+        Ok(_) => Err(WorkflowError::Store(
+            "smoke test: state still loadable after delete()".into(),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
 /// In-memory state storage for workflow instances.
 #[derive(Clone)]
 pub struct InMemoryStore<D: WorkflowData> {
@@ -303,5 +333,91 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
             total_output_tokens,
             step_breakdown,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    struct TestData;
+
+    impl WorkflowData for TestData {
+        fn workflow_type() -> &'static str {
+            "smoke-test-data"
+        }
+    }
+
+    #[tokio::test]
+    async fn smoke_test_passes_against_a_working_store() {
+        let store = InMemoryStore::<TestData>::new();
+        smoke_test(&store).await.unwrap();
+    }
+
+    /// A store double whose `delete` is a no-op -- the exact shape of the
+    /// bug `SqliteStore::delete_state` had (item #576): `save`/`load` work
+    /// fine, but `delete` silently fails to remove the row, so a
+    /// caller-observable `load()` after `delete()` still succeeds.
+    #[derive(Clone, Default)]
+    struct BrokenDeleteStore<D: WorkflowData> {
+        inner: InMemoryStore<D>,
+    }
+
+    #[async_trait]
+    impl<D: WorkflowData> StateStore<D> for BrokenDeleteStore<D> {
+        async fn save(&self, state: WorkflowState<D>) -> WorkflowResult<()> {
+            self.inner.save(state).await
+        }
+        async fn load(&self, run_id: WorkflowRunId) -> WorkflowResult<WorkflowState<D>> {
+            self.inner.load(run_id).await
+        }
+        async fn update<F>(&self, run_id: WorkflowRunId, f: F) -> WorkflowResult<()>
+        where
+            F: FnOnce(&mut WorkflowState<D>) + Send,
+        {
+            self.inner.update(run_id, f).await
+        }
+        async fn delete(&self, _run_id: WorkflowRunId) -> WorkflowResult<()> {
+            Ok(())
+        }
+        async fn list_active(&self) -> WorkflowResult<Vec<WorkflowState<D>>> {
+            self.inner.list_active().await
+        }
+        async fn list_all(&self) -> WorkflowResult<Vec<WorkflowState<D>>> {
+            self.inner.list_all().await
+        }
+        async fn is_cancelled(&self, run_id: WorkflowRunId) -> WorkflowResult<bool> {
+            self.inner.is_cancelled(run_id).await
+        }
+        async fn cleanup_old_workflows(&self, ttl: Duration) -> usize {
+            self.inner.cleanup_old_workflows(ttl).await
+        }
+        async fn get_context(&self, run_id: WorkflowRunId) -> WorkflowResult<WorkflowContext<D>> {
+            self.inner.get_context(run_id).await
+        }
+        async fn cleanup_if_terminal(&self, run_id: WorkflowRunId) -> bool {
+            self.inner.cleanup_if_terminal(run_id).await
+        }
+        async fn append_journal(
+            &self,
+            run_id: WorkflowRunId,
+            entry: JournalEntry,
+        ) -> WorkflowResult<u64> {
+            self.inner.append_journal(run_id, entry).await
+        }
+        async fn journal(&self, run_id: WorkflowRunId) -> WorkflowResult<Vec<JournalEntry>> {
+            self.inner.journal(run_id).await
+        }
+        async fn workflow_metrics(&self, filter: MetricsFilter) -> WorkflowResult<WorkflowMetrics> {
+            self.inner.workflow_metrics(filter).await
+        }
+    }
+
+    #[tokio::test]
+    async fn smoke_test_fails_when_delete_does_not_remove_state() {
+        let store = BrokenDeleteStore::<TestData>::default();
+        let err = smoke_test(&store).await.unwrap_err();
+        assert!(matches!(err, WorkflowError::Store(_)));
     }
 }

@@ -48,6 +48,20 @@ pub fn run(release: bool, dry_run: bool) {
         std::process::exit(1);
     }
 
+    // Same reasoning, one layer deeper (item #164): `--version` proves the
+    // binary starts, not that its storage layer actually works. A binary
+    // swap is the exact trigger that let a broken `SqliteStore::delete_state`
+    // (item #576) go undetected for ~33h -- this process is still running
+    // the *old* code, so only a subprocess of `built` itself can prove the
+    // *new* code's save/delete/load round-trip works before anything
+    // overwrites the installed binary.
+    if let Err(e) = verify_workflow_store(&built) {
+        crate::ui::error(&format!(
+            "built binary failed its workflow-store smoke test: {e}"
+        ));
+        std::process::exit(1);
+    }
+
     let target = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -177,6 +191,38 @@ fn verify_runs(binary: &Path) -> Result<(), String> {
     }
 }
 
+/// Run `<binary> daemon workflow-store-smoke-test` (the hidden verb behind
+/// [`crate::cli::daemon::DaemonSubcommand::WorkflowStoreSmokeTest`]) and
+/// confirm it exits successfully within [`VERIFY_TIMEOUT`] — same
+/// spawn/try_wait/kill pattern as [`verify_runs`], so a hung smoke test
+/// can't block `dev-install` indefinitely.
+fn verify_workflow_store(binary: &Path) -> Result<(), String> {
+    let mut child = Command::new(binary)
+        .args(["daemon", "workflow-store-smoke-test"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn workflow-store-smoke-test: {e}"))?;
+
+    let deadline = Instant::now() + VERIFY_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(format!("workflow-store-smoke-test exited with {status}"));
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return Err("workflow-store-smoke-test timed out".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("waiting on workflow-store-smoke-test: {e}")),
+        }
+    }
+}
+
 /// `dev-install` replaces the *one* shared `agentflare` binary and, via its
 /// migrations, mutates the *one* shared `~/.agentflare/*.db` files. If the
 /// current branch adds a schema migration, installing it here bakes that
@@ -257,5 +303,15 @@ mod tests {
         // path is reported as an error rather than panicking.
         let missing = std::env::temp_dir().join("agentflare-nonexistent-binary-xyz");
         assert!(verify_runs(&missing).is_err());
+    }
+
+    #[test]
+    fn verify_workflow_store_errors_for_a_missing_binary() {
+        // Same guard as `verify_runs_errors_for_a_missing_binary`, for the
+        // workflow-store smoke-test subprocess -- the happy path (a real
+        // built binary passing its store round-trip) is exercised by the
+        // real `dev-install` flow, not unit tests.
+        let missing = std::env::temp_dir().join("agentflare-nonexistent-binary-xyz");
+        assert!(verify_workflow_store(&missing).is_err());
     }
 }

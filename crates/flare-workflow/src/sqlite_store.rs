@@ -697,7 +697,7 @@ mod tests {
     use super::*;
     use crate::types::{JournalEntry, StepId, StepState, WorkflowId, WorkflowRunId};
 
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
     struct TestData {
         value: i32,
     }
@@ -864,5 +864,82 @@ mod tests {
 
         let err = store.load(original.run_id).await.unwrap_err();
         assert!(matches!(err, WorkflowError::NotFound(_)));
+    }
+
+    /// Boot-time gate (item #164): `crate::store::smoke_test` must pass
+    /// against the real on-disk `SqliteStore` schema, not just an in-memory
+    /// double, since it's what actually caught nothing for the ~33h
+    /// `delete_state`'s wrong column name (item #576) went unnoticed.
+    #[tokio::test]
+    async fn store_smoke_test_passes_against_the_real_sqlite_schema() {
+        let store = SqliteStore::<TestData>::open_memory().unwrap();
+        crate::store::smoke_test(&store).await.unwrap();
+    }
+
+    /// Item #164's other acceptance criterion, driven through the real
+    /// rusqlite code path rather than a trait double: `write_state` only
+    /// ever inserts into `workflow_runs` (keyed on `id`) for a smoke test's
+    /// empty-steps/empty-vars `WorkflowState`, so `save` succeeds here and
+    /// the schema defect — `journal` missing the `run_id` column
+    /// `delete_state` unconditionally deletes by, the exact shape of #576's
+    /// regression — is only reached by `delete_state`'s real SQL, not
+    /// silently swallowed as a save failure.
+    #[tokio::test]
+    async fn smoke_test_fails_against_a_schema_missing_the_id_run_id_distinction() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workflow_runs (
+                id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                current_step TEXT,
+                input TEXT,
+                output TEXT,
+                error TEXT,
+                state_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE journal (
+                bad_run_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                entry_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (bad_run_id, seq)
+             );
+             CREATE TABLE step_state (
+                run_id TEXT NOT NULL,
+                step_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempt INTEGER,
+                last_error TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                duration_ms INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                PRIMARY KEY (run_id, step_id)
+             );
+             CREATE TABLE run_vars (
+                run_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT,
+                PRIMARY KEY (run_id, key)
+             );",
+        )
+        .unwrap();
+
+        let store = SqliteStore::<TestData> {
+            conn: Arc::new(Mutex::new(conn)),
+            update_lock: Arc::new(tokio::sync::Mutex::new(())),
+            _marker: PhantomData,
+        };
+
+        let err = crate::store::smoke_test(&store).await.unwrap_err();
+        assert!(matches!(err, WorkflowError::Store(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("journal"),
+            "expected the failure to come from delete_state's journal delete, got: {err}"
+        );
     }
 }

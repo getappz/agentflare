@@ -542,6 +542,7 @@ pub(crate) fn notify(recipient: &str, body: &str, item_id: &str) {
     }
 }
 
+include!("work_duplicate_pr.rs");
 impl WorkArgs {
     pub fn run(self) {
         if let Some(agent) = agent_detector::agent_name() {
@@ -567,20 +568,15 @@ impl WorkArgs {
     }
 }
 
-/// `execute_work`'s result: the process exit code (0 = success), plus — set
-/// only when the failure was classified as rate-limit shaped — a hint for
-/// how long the job queue should wait before retrying this item, and
-/// `fatal` for a structural setup failure (see its doc comment below).
-/// `WorkItemExecutor` converts this into `agentflare_jobs::JobFailure`.
+/// `execute_work`'s result: exit code, an optional rate-limit retry-after
+/// hint, and `fatal` for a structural setup failure (see below). Converted
+/// into `agentflare_jobs::JobFailure` by `WorkItemExecutor`.
 pub(crate) struct WorkOutcome {
     pub exit_code: i32,
     pub retry_after_secs: Option<u64>,
-    /// Set for a failure that happened while establishing the working
-    /// environment (e.g. "claim succeeded but no worktree was created") as
-    /// opposed to a failure during the agent run itself. The underlying
-    /// cause of a structural setup failure doesn't change between attempts
-    /// — see `agentflare_jobs::JobFailure::fatal`, which this maps onto so
-    /// the job queue fails it straight to terminal instead of retrying.
+    /// Set for a failure establishing the working environment (vs. during
+    /// the agent run) — maps onto `JobFailure::fatal` to fail straight to
+    /// terminal instead of retrying, since the cause won't change on retry.
     pub fatal: bool,
 }
 
@@ -618,13 +614,10 @@ const DEFAULT_COOLDOWN_PROFILE: &str = "__default__";
 /// interactive path's rate-limit rotation.
 const RATE_LIMIT_COOLDOWN_MINUTES: u32 = 30;
 
-/// Classifies a headless run's failure message the same way the interactive
-/// `agentflare run` path does (`auth_runner::is_rate_limited`) and, if it
-/// looks rate-limit shaped, records a cooldown so `auth_db::is_cooling_down`
-/// (checked by the discovery tick before dispatching the next item for this
-/// agent, and by `auth rotate`) sees it too. Returns the seconds until that
-/// cooldown clears, for the caller to pass through as the job queue's
-/// retry-after delay.
+/// Classifies a headless failure the same way `auth_runner::is_rate_limited`
+/// does for the interactive path and, if rate-limit shaped, records a
+/// cooldown so `auth_db::is_cooling_down` (discovery tick, `auth rotate`)
+/// sees it too. Returns seconds until clear, as the job queue's retry delay.
 fn classify_and_cooldown(agent: &str, failure_message: &str) -> Option<u64> {
     if !crate::auth_runner::is_rate_limited(failure_message) {
         return None;
@@ -645,27 +638,22 @@ fn classify_and_cooldown(agent: &str, failure_message: &str) -> Option<u64> {
 
 /// Claims `args.target`, runs the resolved agent on it, and reports the
 /// outcome back onto the item — the whole body of `agentflare work`.
-/// Progress lines that used to go straight to stdout now go through `log`
-/// instead, so this same logic can run in-process inside the daemon
-/// (`WorkItemExecutor`, called from `agentflare_jobs::WorkerPool`) with its
-/// progress captured into that job's own log file — the exact same file the
-/// dashboard already tails for subprocess-dispatched jobs — rather than only
-/// working when there's a real subprocess's stdout to capture.
+/// Progress goes through `log` instead of straight to stdout, so this same
+/// logic can run in-process inside the daemon (`WorkItemExecutor`, called
+/// from `agentflare_jobs::WorkerPool`), captured into that job's own log
+/// file — the same file the dashboard already tails for subprocess jobs.
 ///
-/// `args.repo_root`, when set (daemon dispatch — see `WorkItemExecutor`),
-/// scopes project/worktree resolution to the claimed item's own project
-/// directory instead of this process's cwd (item #63) — a human running
-/// `agentflare work` directly leaves it unset and keeps the prior
-/// cwd-resolved behavior.
+/// `args.repo_root`, when set (daemon dispatch), scopes project/worktree
+/// resolution to the claimed item's own project directory instead of this
+/// process's cwd (item #63); a human running `agentflare work` directly
+/// leaves it unset and keeps the prior cwd-resolved behavior.
 pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> WorkOutcome {
     execute_work_impl(args, log, crate::work_item_pipeline::run_or_resume)
 }
 
 /// Test seam: same as [`execute_work`], with the `sdd_loop`→`finalize`
 /// pipeline runner injected — mirrors `work_item_pipeline`'s own
-/// `_with_sender` pattern, one level up (this file doesn't touch
-/// `flare_workflow::json::SendMessage` directly, only whatever runs the
-/// whole pipeline for a given item).
+/// `_with_sender` pattern, one level up.
 #[allow(clippy::too_many_arguments)]
 fn execute_work_impl(
     args: WorkArgs,
@@ -753,10 +741,9 @@ fn execute_work_impl(
     let status = claim["status"].as_str().unwrap_or("unknown");
     if status != "acquired" {
         // "held" (a live claim by another owner) and "blocked" (an unaccepted
-        // handoff — see `ClaimOutcome::BlockedByAssignee`) are different
-        // shapes: "blocked" has no `owner`/`age_secs` at all, so formatting
-        // it as if it were "held" printed the nonsensical "held by ? (0s)"
-        // instead of the actionable reason the claim response already carries.
+        // handoff, `ClaimOutcome::BlockedByAssignee`) differ: "blocked" has
+        // no `owner`/`age_secs`, so formatting it as "held" printed the
+        // nonsensical "held by ? (0s)" instead of the real reason.
         let msg = match status {
             "blocked" => claim["reason"]
                 .as_str()
@@ -827,6 +814,17 @@ fn execute_work_impl(
             return 1.into();
         }
     };
+
+    if let Some(outcome) = duplicate_pr_short_circuit(
+        &mcp,
+        &item_detail,
+        wpath,
+        args.notify.as_deref(),
+        &mut claim_guard,
+        log,
+    ) {
+        return outcome;
+    }
 
     // --- Resolve agent (explicit flag, else route from the item) ---
     // Only pay for detecting installed agents / loading the router config
@@ -2097,4 +2095,6 @@ rotate = true
         // exercised cross-module from `cli::work`.
         let _ = AgentflareMcp::item_update;
     }
+
+    include!("work_duplicate_pr_tests.rs");
 }
