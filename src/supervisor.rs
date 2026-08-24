@@ -15,10 +15,10 @@ pub(crate) const READY_LABEL: &str = "ready-for-work";
 /// the two can't drift, same rationale as `READY_LABEL` above.
 pub(crate) const DISPATCHED_LABEL: &str = "dispatched";
 /// Also read by `dashboard::orphan_reconcile::handle_terminal_job_failure`
-/// -- once `dispatch_failure_ceiling::DISPATCH_FAILURE_CAP` consecutive
-/// dispatch cycles end with the same terminal failure reason, it lands here
-/// rather than back on `READY_LABEL`, so it doesn't retry-loop against the
-/// same broken agent (items #463/#506).
+/// and `restore_ready_for_work` -- once `dispatch_failure_ceiling`'s
+/// identical-reason or any-reason cap trips, it lands here rather than back
+/// on `READY_LABEL`, so it doesn't retry-loop against the same broken agent
+/// or a persistently orphaning job (items #463/#506/#164).
 pub(crate) const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
 const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 
