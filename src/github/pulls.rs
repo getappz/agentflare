@@ -51,6 +51,36 @@ pub fn find_existing(
         .find(|pr| pr.head.as_ref().is_some_and(|h| h.git_ref == branch)))
 }
 
+/// Finds every PR (open, merged, or closed) whose body carries the
+/// `for item #<sequence_id>` marker `pr_footer` stamps onto every PR
+/// agentflare opens (see `push_and_open_pr`) -- the pre-dispatch
+/// duplicate-work check (item #164). Unlike `find_existing`, this doesn't
+/// depend on the item's own tracked branch name, so it still finds a PR
+/// that merged while the item's tracked state fell out of sync (items
+/// #122/#156: the state-side promotion never ran, so a routine redispatch
+/// nearly re-did already-merged work). Uses GitHub's search API rather than
+/// `list` + filter, mirroring the exact `gh pr list --search "\"for item
+/// #N \" in:body"` query a human ran to catch that incident.
+pub fn find_by_item_marker(
+    client: &Client,
+    repo: &RepoId,
+    sequence_id: i64,
+) -> Result<Vec<PullRequest>, GitHubError> {
+    let query = format!(
+        "repo:{}/{} type:pr \"for item #{sequence_id} \" in:body",
+        repo.owner, repo.repo
+    );
+    let path = format!("/search/issues?q={}", crate::github::encode_query(&query));
+    let json = client.request("GET", &path, None)?;
+    let numbers: Vec<u64> = json["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["number"].as_u64())
+        .collect();
+    numbers.into_iter().map(|n| get(client, repo, n)).collect()
+}
+
 pub fn get(client: &Client, repo: &RepoId, number: u64) -> Result<PullRequest, GitHubError> {
     let path = format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.repo);
     let json = client.request("GET", &path, None)?;
@@ -251,6 +281,40 @@ mod tests {
             find_existing(&client, &repo(), "task/348")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn find_by_item_marker_searches_and_fetches_each_matching_pr() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, r#"{"items":[{"number":42}]}"#),
+            MockResponse::json(
+                200,
+                r#"{"number":42,"html_url":"u","state":"closed","title":"t","merged_at":"2026-08-01T00:00:00Z"}"#,
+            ),
+        ]);
+        let client = server.client(None);
+        let found = find_by_item_marker(&client, &repo(), 164).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].number, 42);
+        assert!(found[0].merged_at.is_some());
+
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "GET");
+        assert!(reqs[0].path.starts_with("/search/issues?q="));
+        assert!(reqs[0].path.contains("repo%3Ao/r"));
+        assert!(reqs[0].path.contains("%22for%20item%20%23164%20%22"));
+        assert_eq!(reqs[1].path, "/repos/o/r/pulls/42");
+    }
+
+    #[test]
+    fn find_by_item_marker_returns_empty_when_search_finds_nothing() {
+        let server = MockServer::start(vec![MockResponse::json(200, r#"{"items":[]}"#)]);
+        let client = server.client(None);
+        assert!(
+            find_by_item_marker(&client, &repo(), 999)
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -768,24 +768,45 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
     // Kept alive for `run()` (no graceful shutdown path, see `daemon::stop_daemon`).
     // init_global() starts the sampler `supervisor` dispatch consults (item #435).
     agentflare_resource_gate::init_global();
-    let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
-        .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor))
-        .with_terminal_failure_hook(std::sync::Arc::new(|_job_id, job| {
-            super::orphan_reconcile::handle_terminal_job_failure(job);
-        }));
-    worker_pool.start(work_max_concurrency());
+    // Boot-time gate (item #164): a cheap save/delete/load round-trip
+    // against the real on-disk workflow store, proving its schema actually
+    // works before anything gets claimed against it. Without this, a
+    // broken store (e.g. `delete()` silently no-op'ing on a column-name
+    // mismatch, item #576) doesn't fail loudly -- every claimed item just
+    // retries and fails individually into a stuck state, which is exactly
+    // what ran undetected for ~33h. On failure, skip starting the worker
+    // pool and the supervisor's discovery/review ticks entirely (no claims,
+    // no dispatch) while leaving the dashboard itself up so the alert below
+    // is actually visible.
+    match flare_workflow::smoke_test(crate::work_item_pipeline::engine().state_store()).await {
+        Ok(()) => {
+            let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
+                .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor))
+                .with_terminal_failure_hook(std::sync::Arc::new(|_job_id, job| {
+                    super::orphan_reconcile::handle_terminal_job_failure(job);
+                }));
+            worker_pool.start(work_max_concurrency());
+            spawn_supervisor_discovery(
+                queue.clone(),
+                std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
+                SUPERVISOR_DISCOVERY_INTERVAL,
+            );
+            spawn_supervisor_review_sweep(
+                queue.clone(),
+                std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
+                SUPERVISOR_REVIEW_SWEEP_INTERVAL,
+            );
+        }
+        Err(e) => {
+            crate::ui::error(&format!(
+                "workflow store failed its boot-time smoke test: {e} -- refusing to \
+                 start work dispatch (worker pool + supervisor ticks) until this is fixed. \
+                 The dashboard will still run so you can see this alert."
+            ));
+        }
+    }
     spawn_binary_staleness_watchdog(crate::daemon::BinarySnapshot::capture());
     spawn_job_cleanup(queue.clone());
-    spawn_supervisor_discovery(
-        queue.clone(),
-        std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
-        SUPERVISOR_DISCOVERY_INTERVAL,
-    );
-    spawn_supervisor_review_sweep(
-        queue.clone(),
-        std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
-        SUPERVISOR_REVIEW_SWEEP_INTERVAL,
-    );
 
     let listener = tokio::net::TcpListener::bind((host, port))
         .await

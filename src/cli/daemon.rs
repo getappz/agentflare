@@ -27,6 +27,15 @@ pub enum DaemonSubcommand {
         #[arg(short, long)]
         follow: bool,
     },
+    /// Internal: run the workflow-store boot smoke test standalone (save,
+    /// delete, confirm gone) and exit 0/1. `dashboard::server::run` runs the
+    /// same check in-process on every daemon start; this hidden verb lets
+    /// `dev_install::run` (item #164) run it against a freshly built binary
+    /// right after a binary swap -- the exact trigger (item #576) that let a
+    /// broken `delete_state` go unnoticed for ~33h. Not meant to be run by
+    /// hand.
+    #[command(hide = true, name = "workflow-store-smoke-test")]
+    WorkflowStoreSmokeTest,
 }
 
 impl DaemonArgs {
@@ -39,6 +48,7 @@ impl DaemonArgs {
             DaemonSubcommand::Enable => cmd_enable(),
             DaemonSubcommand::Disable => cmd_disable(),
             DaemonSubcommand::Logs { follow } => cmd_logs(follow),
+            DaemonSubcommand::WorkflowStoreSmokeTest => cmd_workflow_store_smoke_test(),
         }
     }
 }
@@ -131,6 +141,20 @@ fn cmd_disable() {
         Ok(()) => crate::ui::success("autostart disabled"),
         Err(e) => {
             crate::ui::error(&e.to_string());
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_workflow_store_smoke_test() {
+    let store = crate::work_item_pipeline::engine().state_store();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(flare_workflow::smoke_test(store));
+    match result {
+        Ok(()) => crate::ui::success("workflow store smoke test passed"),
+        Err(e) => {
+            crate::ui::error(&format!("workflow store smoke test failed: {e}"));
             std::process::exit(1);
         }
     }
