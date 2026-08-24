@@ -20,6 +20,7 @@ which = "6"
 fs2 = "0.4"
 toml = "0.8"
 thiserror = "2"
+flare-process = { path = "../flare-process" }
 agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
 
 [dev-dependencies]

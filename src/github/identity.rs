@@ -128,7 +128,7 @@ fn repo_host(remote_url: &str) -> Option<String> {
 /// ssh config resolution; works offline, handles HostName/Match/Include).
 /// Returns None if ssh is unavailable or emits no `hostname` line.
 fn resolve_ssh_alias(host: &str) -> Option<String> {
-    let out = std::process::Command::new("ssh")
+    let out = flare_process::command("ssh")
         .arg("-G")
         .arg(host)
         .output()

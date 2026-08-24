@@ -333,7 +333,7 @@ fn uninstall_shim() {
 #[cfg(windows)]
 pub(crate) fn ensure_on_path(dir: &Path) -> Result<bool, String> {
     let dir_str = dir.to_string_lossy().to_string();
-    let get = std::process::Command::new("powershell.exe")
+    let get = flare_process::command("powershell.exe")
         .args([
             "-NoProfile",
             "-Command",
@@ -358,7 +358,7 @@ pub(crate) fn ensure_on_path(dir: &Path) -> Result<bool, String> {
         "[Environment]::SetEnvironmentVariable('PATH', '{}', 'User')",
         new_path.replace('\'', "''")
     );
-    let set = std::process::Command::new("powershell.exe")
+    let set = flare_process::command("powershell.exe")
         .args(["-NoProfile", "-Command", &set_script])
         .status()
         .map_err(|e| e.to_string())?;

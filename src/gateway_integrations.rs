@@ -160,7 +160,7 @@ fn rivalsearch_dir() -> PathBuf {
 
 fn rivalsearch_available() -> bool {
     rivalsearch_dir().join("server.py").exists()
-        && std::process::Command::new("uv")
+        && flare_process::command("uv")
             .arg("--version")
             .output()
             .is_ok_and(|o| o.status.success())

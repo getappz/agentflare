@@ -115,7 +115,8 @@ fn kill_processes_touching_worktree(worktree_path: &std::path::Path) {
         "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{pattern}*' }} \
          | ForEach-Object {{ $_.ProcessId }}"
     );
-    let Ok(output) = std::process::Command::new("powershell")
+    // Background reconcile tick runs console-less; hidden spawn or Windows flashes.
+    let Ok(output) = flare_process::command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
     else {

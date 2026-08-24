@@ -91,6 +91,7 @@ dependencies = [
  "eyre",
  "flare-docs",
  "flare-git-core",
+ "flare-process",
  "flare-proxy",
  "flare-search-kit",
  "flare-vault",
@@ -206,6 +207,7 @@ version = "0.1.0"
 dependencies = [
  "agentflare-workspace-hack",
  "dirs",
+ "flare-process",
  "regex",
  "serde_json",
  "tempfile",
@@ -246,6 +248,7 @@ version = "0.1.0"
 dependencies = [
  "agentflare-db-kit",
  "agentflare-workspace-hack",
+ "flare-process",
  "flare-sandbox",
  "parking_lot",
  "rusqlite",
@@ -270,6 +273,7 @@ version = "0.1.0"
 dependencies = [
  "agentflare-workspace-hack",
  "dirs",
+ "flare-process",
  "which",
 ]
 
@@ -1230,6 +1234,7 @@ dependencies = [
  "agentflare-shim",
  "agentflare-workspace-hack",
  "dirs",
+ "flare-process",
  "fs2",
  "rusqlite",
  "serde",
@@ -1249,9 +1254,17 @@ dependencies = [
  "agentflare-workspace-hack",
  "dirs",
  "flare-git-core",
+ "flare-process",
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "flare-process"
+version = "0.1.0"
+dependencies = [
+ "agentflare-workspace-hack",
 ]
 
 [[package]]

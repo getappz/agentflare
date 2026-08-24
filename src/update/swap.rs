@@ -119,8 +119,10 @@ fn schedule_deferred_swap_windows(new_binary: &Path, target: &Path) -> Result<()
         target = target.display(),
     );
     std::fs::write(&bat, script).map_err(|e| format!("write deferred updater: {e}"))?;
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "/min", "", &bat.to_string_lossy()])
+    // Hidden outer cmd; `start /B` detaches the swap script with no window
+    // at all (`/min` would still pop a minimized one).
+    flare_process::command("cmd")
+        .args(["/C", "start", "/B", "", &bat.to_string_lossy()])
         .spawn()
         .map_err(|e| format!("spawn deferred updater: {e}"))?;
     Ok(())
@@ -142,7 +144,7 @@ pub(crate) fn find_killable_pids() -> Vec<u32> {
 /// separate from [`parse_other_pids`] so the parsing is unit-testable.
 fn list_agentflare_pids_raw() -> String {
     #[cfg(windows)]
-    let output = std::process::Command::new("tasklist")
+    let output = flare_process::command("tasklist")
         .args(["/FI", "IMAGENAME eq agentflare.exe", "/FO", "CSV", "/NH"])
         .output();
     #[cfg(not(windows))]

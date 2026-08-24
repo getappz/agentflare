@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[derive(Debug)]
 pub enum WorkspaceGraphError {
@@ -74,7 +73,7 @@ impl WorkspaceGraph {
         if !repo_root.join("Cargo.toml").exists() {
             return Err(WorkspaceGraphError::NoCargoToml);
         }
-        let output = Command::new("cargo")
+        let output = flare_process::command("cargo")
             .args(["metadata", "--format-version", "1"])
             .current_dir(repo_root)
             .output()

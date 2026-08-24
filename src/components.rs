@@ -11,7 +11,7 @@ use crate::rule_text;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 pub struct Component {
     pub id: &'static str,
@@ -62,7 +62,7 @@ fn githooks_installed_cached() -> bool {
 }
 
 fn run_ok(cmd: &str, args: &[&str]) -> bool {
-    Command::new(cmd)
+    flare_process::command(cmd)
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

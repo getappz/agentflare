@@ -115,7 +115,7 @@ pub fn create_github_issue(title: &str, body: &str) -> std::io::Result<String> {
     let body = body.to_string();
     let output = crate::ipc::process::run_with_timeout(
         move || {
-            std::process::Command::new("gh")
+            flare_process::command("gh")
                 .args([
                     "issue",
                     "create",

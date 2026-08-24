@@ -214,7 +214,7 @@ fn isolate_worktree_target_dir(worktree_path: &Path) {
 
 /// True when the `sccache` binary is reachable on `PATH`.
 fn sccache_available() -> bool {
-    Command::new("sccache")
+    flare_process::command("sccache")
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -560,7 +560,7 @@ pub(crate) fn run_output_timeout(
     timeout_secs: u64,
 ) -> Result<std::process::Output, String> {
     let program = program.as_ref().to_owned();
-    let mut cmd = Command::new(&program);
+    let mut cmd = flare_process::command(&program);
     cmd.args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -1107,7 +1107,7 @@ fn remove_worktree_dir(path: &Path, name: &str) -> bool {
 
     #[cfg(windows)]
     {
-        if std::process::Command::new("cmd")
+        if flare_process::command("cmd")
             .args(["/c", "rmdir", "/s", "/q", &path.to_string_lossy()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1136,7 +1136,7 @@ fn remove_worktree_dir(path: &Path, name: &str) -> bool {
                 "/C".to_string(),
                 "/Q".to_string(),
             ];
-            let _ = std::process::Command::new("icacls")
+            let _ = flare_process::command("icacls")
                 .args(&icacls_args)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -1147,7 +1147,7 @@ fn remove_worktree_dir(path: &Path, name: &str) -> bool {
         }
 
         for handle_exe in &["handle64.exe", "handle.exe"] {
-            if let Ok(output) = std::process::Command::new(handle_exe)
+            if let Ok(output) = flare_process::command(handle_exe)
                 .args(["-accepteula", "-nobanner", &path.to_string_lossy()])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())

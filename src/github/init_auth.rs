@@ -27,7 +27,7 @@ fn env_present() -> bool {
 }
 
 fn gh_present() -> bool {
-    std::process::Command::new("gh")
+    flare_process::command("gh")
         .args(["auth", "token"])
         .output()
         .map(|o| o.status.success() && !o.stdout.is_empty())

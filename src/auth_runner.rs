@@ -132,10 +132,10 @@ pub fn daemon_running(agent: &str) -> bool {
         "claude-code" => &["claude"][..],
         _ => return false,
     };
-    if let Ok(output) = std::process::Command::new("pgrep").args(names).output() {
+    if let Ok(output) = flare_process::command("pgrep").args(names).output() {
         return !output.stdout.is_empty();
     }
-    if let Ok(output) = std::process::Command::new("tasklist")
+    if let Ok(output) = flare_process::command("tasklist")
         .arg("/FI")
         .arg(format!("IMAGENAME eq {}.exe", names[0]))
         .output()
@@ -158,14 +158,14 @@ pub fn reload_daemon(agent: &str) -> Result<(), DaemonError> {
     #[cfg(windows)]
     {
         for name in names {
-            std::process::Command::new("taskkill")
+            flare_process::command("taskkill")
                 .args(["/IM", &format!("{name}.exe")])
                 .output()?;
         }
     }
     #[cfg(not(windows))]
     {
-        std::process::Command::new("pkill").args(names).output()?;
+        flare_process::command("pkill").args(names).output()?;
     }
     Ok(())
 }
