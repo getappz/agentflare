@@ -31,6 +31,7 @@
       "run_if": "{{cache_check}} == 'MISS'",
       "prompt": "Compare this feature list for {{params.repo_name}} against agentflare's own codebase (this repo's project root — use ctx_search/ctx_compose to check whether/how agentflare already covers each item). For every feature output one row of a markdown table: | Feature | In {{params.repo_name}} | In agentflare | Verdict (adopt / already-covered / not-applicable / needs-more-research) | Better implementation ({{params.repo_name}} / agentflare / tie / n-a) | Why |. Default to 'not-applicable' or 'needs-more-research' when unsure on Verdict — only mark 'adopt' for a concrete, low-risk win. For 'Better implementation', judge only features both sides actually implement (even via a different mechanism) on correctness, robustness, and fit for their respective use case — not just presence; use 'n-a' when only one side has it. The 'Why' column must justify both the Verdict and the Better-implementation call.\n\nFeatures:\n{{features}}",
       "timeout_secs": 1800,
+      "idle_timeout_secs": 900,
       "output_var": "verdict"
     },
     {
