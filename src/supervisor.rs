@@ -21,6 +21,20 @@ pub(crate) const DISPATCHED_LABEL: &str = "dispatched";
 /// or a persistently orphaning job (items #463/#506/#164).
 pub(crate) const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
 const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
+/// Blocks auto-dispatch even while `READY_LABEL` is also present -- for a
+/// go/no-go candidate item whose description says "not dispatched, awaiting
+/// decision" but which was created (or handed off) with `ready-for-work`
+/// attached anyway. That prose was previously the *only* gate, which nothing
+/// actually enforced: `run_discovery_tick` dispatches on `READY_LABEL` alone,
+/// so items #184/#185/#186/#187 (all four go/no-go candidates from #166's
+/// spec) got auto-dispatched and re-dispatched across multiple agents dozens
+/// of times before anyone made the call. Removing `READY_LABEL` isn't
+/// enough on its own either -- `redispatch` re-attaches it unconditionally
+/// (see `item::claim::REDISPATCH_CLEARED_LABELS`) -- so this label is a
+/// belt-and-suspenders check that survives that path too, cleared only once
+/// a human actually decides (remove the label, or `redispatch`
+/// after removing it).
+const NEEDS_DECISION_LABEL: &str = "needs-decision";
 
 /// Since item #19, work items run in-process via `WorkItemExecutor` rather
 /// than as a spawned `agentflare work` subprocess, so this is no longer an
@@ -133,6 +147,21 @@ pub(crate) fn run_discovery_tick(
             ready_id,
         } = batch;
         for item in items {
+            if let Some(gate_id) = label_id_by_name.get(NEEDS_DECISION_LABEL) {
+                let gated = mcp
+                    .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
+                    .ok()
+                    .and_then(Result::ok)
+                    .is_some_and(|ids| ids.contains(gate_id));
+                if gated {
+                    eprintln!(
+                        "agentflare-supervisor: item #{} ({}) is ready-for-work but gated pending a go/no-go decision ({NEEDS_DECISION_LABEL})",
+                        item.sequence_id, item.id
+                    );
+                    result.waiting += 1;
+                    continue;
+                }
+            }
             match crate::quota::decide::decide_for_supervisor(mcp, &item) {
                 crate::quota::decide::EffectiveAction::Run
                 | crate::quota::decide::EffectiveAction::SelfRepair => {
