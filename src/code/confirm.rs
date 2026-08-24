@@ -1,6 +1,5 @@
 use regex::Regex;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 pub struct ConfirmHit {
     pub file: PathBuf,
@@ -17,7 +16,7 @@ pub fn search_crate_dir(crate_dir: &Path, crate_ident: &str) -> Vec<ConfirmHit> 
 }
 
 fn try_lean_ctx_grep(dir: &Path, pattern: &str) -> Option<Vec<ConfirmHit>> {
-    let output = Command::new("lean-ctx")
+    let output = flare_process::command("lean-ctx")
         .arg("grep")
         .arg(pattern)
         .arg(dir)

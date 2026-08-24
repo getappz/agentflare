@@ -320,16 +320,11 @@ fn scope_check_outcome(subcommand: &str) -> ScopeCheckOutcome {
     let bin = "agentflare".to_string();
     let mut cmd = std::process::Command::new(&bin);
     cmd.args(["git", "scope-check", "--subcommand", subcommand]);
-    // Runs on every git invocation through this shim; without this flag,
-    // whenever the invoking parent has no inherited console (e.g. spawned by
-    // an IDE/editor extension), Windows auto-allocates one for this child —
-    // visible as a brief flashing terminal window.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    // Runs on every git invocation through this shim; without the no-window
+    // flag, whenever the invoking parent has no inherited console (e.g.
+    // spawned by an IDE/editor extension), Windows auto-allocates one for
+    // this child — visible as a brief flashing terminal window.
+    flare_process::no_window(&mut cmd);
     let output = match cmd.output() {
         Ok(o) => o,
         Err(e) => {

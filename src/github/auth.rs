@@ -32,7 +32,7 @@ fn secret_token() -> Option<String> {
 }
 
 fn gh_auth_token() -> Option<String> {
-    let out = std::process::Command::new("gh")
+    let out = flare_process::command("gh")
         .args(["auth", "token"])
         .output()
         .ok()?;

@@ -122,14 +122,9 @@ pub fn tool_name_from_exe(exe: &Path) -> Option<String> {
 /// a spawned child when the parent (e.g. a shim invoked from a console-less
 /// launcher) has none -- doesn't affect stdio inheritance, so interactive
 /// passthrough via `.status()` is unchanged.
-#[cfg(windows)]
 fn no_console_window(cmd: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    flare_process::no_window(cmd);
 }
-#[cfg(not(windows))]
-fn no_console_window(_cmd: &mut Command) {}
 
 /// Resolve `tool` on `filtered_path` (or the current PATH if `None`), exec
 /// it with argv/stdio forwarded, and exit with its exit code. Exits 127 if

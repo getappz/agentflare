@@ -81,15 +81,11 @@ impl Supervisor {
         // This supervisor is driven by the daemon's own background discovery
         // tick (`spawn_supervisor_discovery`, every `SUPERVISOR_DISCOVERY_INTERVAL`)
         // as well as interactive job requests — no console-attached parent is
-        // guaranteed. Without this flag every dispatched job auto-allocates a
-        // console window on Windows, flashing briefly even with no active
-        // Claude Code session, since the daemon runs unattended in the background.
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+        // guaranteed. Without the no-window flag every dispatched job
+        // auto-allocates a console window on Windows, flashing briefly even
+        // with no active Claude Code session, since the daemon runs
+        // unattended in the background.
+        flare_process::no_window(&mut cmd);
 
         let mut child = cmd.spawn()?;
 
@@ -240,17 +236,13 @@ fn kill_graceful(child: &mut std::process::Child, kill_after: Duration) {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let pid = child.id().to_string();
-        let _ = Command::new("taskkill")
+        let _ = flare_process::command("taskkill")
             .args(["/T", "/PID", &pid])
-            .creation_flags(CREATE_NO_WINDOW)
             .status();
         std::thread::sleep(kill_after);
-        let _ = Command::new("taskkill")
+        let _ = flare_process::command("taskkill")
             .args(["/T", "/F", "/PID", &pid])
-            .creation_flags(CREATE_NO_WINDOW)
             .status();
         // `taskkill /T` builds its kill list from a single point-in-time
         // process-tree snapshot. A grandchild spawned in the narrow window
@@ -263,9 +255,8 @@ fn kill_graceful(child: &mut std::process::Child, kill_after: Duration) {
         // moment later still finds and kills any such straggler; it's a
         // harmless no-op once the tree is already gone.
         std::thread::sleep(Duration::from_millis(250));
-        let _ = Command::new("taskkill")
+        let _ = flare_process::command("taskkill")
             .args(["/T", "/F", "/PID", &pid])
-            .creation_flags(CREATE_NO_WINDOW)
             .status();
     }
     #[cfg(not(any(unix, windows)))]

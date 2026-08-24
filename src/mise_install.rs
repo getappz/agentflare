@@ -3,7 +3,7 @@
 // tools on PATH for the session, on machines that don't already have mise.
 use crate::paths::home;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 pub enum MiseOutcome {
     /// Already on the system (path to the binary).
@@ -118,7 +118,7 @@ fn install_windows() -> Result<(), String> {
 
 fn which(cmd: &str) -> Option<String> {
     let checker = if cfg!(windows) { "where" } else { "which" };
-    let out = Command::new(checker)
+    let out = flare_process::command(checker)
         .arg(cmd)
         .stderr(Stdio::null())
         .output()
@@ -139,9 +139,9 @@ fn has(cmd: &str) -> bool {
 
 fn run_shell(cmd: &str) -> Result<(), String> {
     let result = if cfg!(windows) {
-        Command::new("cmd").args(["/c", cmd]).status()
+        flare_process::command("cmd").args(["/c", cmd]).status()
     } else {
-        Command::new("sh").args(["-c", cmd]).status()
+        flare_process::command("sh").args(["-c", cmd]).status()
     };
     match result {
         Ok(s) if s.success() => Ok(()),
@@ -151,7 +151,7 @@ fn run_shell(cmd: &str) -> Result<(), String> {
 }
 
 fn run_status(cmd: &str, args: &[&str]) -> bool {
-    Command::new(cmd)
+    flare_process::command(cmd)
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

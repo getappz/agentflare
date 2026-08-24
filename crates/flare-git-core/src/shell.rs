@@ -155,16 +155,11 @@ pub(crate) fn apply_filtered_path(cmd: &mut Command) {
 /// This crate's git spawns run inside the agentflare daemon far more than
 /// any other one -- `resolve_project()` calls `run_in`-backed `repo_toplevel`
 /// on essentially every project/item MCP call. The daemon itself is
-/// console-less, so without this flag every one of those spawns
+/// console-less, so without the no-window flag every one of those spawns
 /// auto-allocates a console window on Windows, flashing briefly.
-#[cfg(windows)]
 fn no_console_window(cmd: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    flare_process::no_window(cmd);
 }
-#[cfg(not(windows))]
-fn no_console_window(_cmd: &mut Command) {}
 
 /// Runs `git` in `repo_root`; `Ok(stdout)` trimmed on success, `Err(stderr)`
 /// trimmed on a non-zero exit, or a process-spawn error message (git

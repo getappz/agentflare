@@ -149,7 +149,7 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
         // another option rather than as the target once a signal option has
         // already been consumed. `-s SIGNAME` plus a `--` end-of-options
         // marker before the pid is the portable, unambiguous idiom.
-        let _ = Command::new("kill")
+        let _ = flare_process::command("kill")
             .arg("-s")
             .arg("KILL")
             .arg("--")
@@ -158,7 +158,7 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        let _ = flare_process::command("taskkill")
             .args(["/T", "/F", "/PID", &child.id().to_string()])
             .status();
         // `taskkill /T` builds its kill list from a single point-in-time
@@ -171,7 +171,7 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
         // such straggler; it's a harmless no-op once the tree is already
         // gone.
         std::thread::sleep(Duration::from_millis(250));
-        let _ = Command::new("taskkill")
+        let _ = flare_process::command("taskkill")
             .args(["/T", "/F", "/PID", &child.id().to_string()])
             .status();
     }

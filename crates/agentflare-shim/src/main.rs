@@ -28,7 +28,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, exit};
+use std::process::exit;
 
 use agentflare_shim::{
     in_scoped_project, is_set, path_without_shim_dir, run_real, tool_name_from_exe, trace,
@@ -75,7 +75,10 @@ fn main() {
     }
 
     trace(&format!("dispatch: lean-ctx -c {tool}"));
-    let mut cmd = Command::new("lean-ctx");
+    // CREATE_NO_WINDOW on Windows: a headless agent run (daemon dispatch)
+    // has no console to inherit, so an unflagged spawn would allocate a
+    // flashing one just to run lean-ctx.
+    let mut cmd = flare_process::command("lean-ctx");
     cmd.arg("-c").arg(&tool).args(&args);
     if let Some(p) = &filtered_path {
         cmd.env("PATH", p);

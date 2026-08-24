@@ -127,7 +127,7 @@ fn run_direct(argv: &[&str]) -> bool {
     let mut dirs = vec![crate::paths::home().join(".local").join("bin")];
     dirs.extend(std::env::split_paths(&existing));
     let path = std::env::join_paths(dirs).unwrap_or(existing);
-    Command::new(prog)
+    flare_process::command(prog)
         .args(args)
         .env("PATH", path)
         .stdout(Stdio::null())
@@ -139,9 +139,9 @@ fn run_direct(argv: &[&str]) -> bool {
 
 fn run_shell(cmd: &str) -> Result<(), String> {
     let result = if cfg!(windows) {
-        Command::new("cmd").args(["/c", cmd]).status()
+        flare_process::command("cmd").args(["/c", cmd]).status()
     } else {
-        Command::new("sh").args(["-c", cmd]).status()
+        flare_process::command("sh").args(["-c", cmd]).status()
     };
     match result {
         Ok(s) if s.success() => Ok(()),

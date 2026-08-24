@@ -6,9 +6,8 @@ use std::os::windows::process::CommandExt;
 pub fn is_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
-        let status = std::process::Command::new("tasklist")
+        let status = flare_process::command("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .output();
         match status {
             Ok(o) => {
@@ -79,9 +78,8 @@ pub fn spawn_detached(
 pub fn terminate_gracefully(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let status = std::process::Command::new("taskkill")
+        let status = flare_process::command("taskkill")
             .args(["/PID", &pid.to_string()])
-            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .status()
             .map_err(|e| format!("taskkill: {e}"))?;
         if status.success() {
@@ -107,9 +105,8 @@ pub fn terminate_gracefully(pid: u32) -> Result<(), String> {
 pub fn force_kill(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let status = std::process::Command::new("taskkill")
+        let status = flare_process::command("taskkill")
             .args(["/F", "/PID", &pid.to_string()])
-            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .status()
             .map_err(|e| format!("taskkill /F: {e}"))?;
         if status.success() {
@@ -142,7 +139,7 @@ pub fn find_killable_pids(binary_name: &str) -> Vec<u32> {
 #[allow(dead_code)]
 fn list_pids_raw(binary_name: &str) -> String {
     #[cfg(windows)]
-    let output = std::process::Command::new("tasklist")
+    let output = flare_process::command("tasklist")
         .args([
             "/FI",
             &format!("IMAGENAME eq {binary_name}"),
@@ -150,10 +147,9 @@ fn list_pids_raw(binary_name: &str) -> String {
             "CSV",
             "/NH",
         ])
-        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
         .output();
     #[cfg(not(windows))]
-    let output = std::process::Command::new("pgrep")
+    let output = flare_process::command("pgrep")
         .args(["-x", binary_name])
         .output();
 
