@@ -31,12 +31,21 @@ pub(crate) struct SkillDetectRequest {
     #[serde(default)]
     pub(crate) limit: Option<usize>,
     #[schemars(
-        description = "If true, return skill body content instead of just metadata (default false)"
-    )]
     #[serde(default)]
     pub(crate) include_body: bool,
 }
-
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SkillRecommendRequest {
+    #[schemars(description = "Project directory to analyze (default: current working directory)")]
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
+    #[schemars(description = "Max skills to return (default 10)")]
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+    #[schemars(description = "Include full skill body in response")]
+    #[serde(default)]
+    pub(crate) include_body: bool,
+}
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SkillRequest {
     #[schemars(description = "Action: search|load")]

@@ -21,7 +21,10 @@ pub(crate) mod types;
 mod workflow;
 
 use crate::optimize;
+use crate::project_toolchain::{detect_project_type, rank_skills_for_project};
 use crate::progress::{PROGRESS_SENDER, ProgressSender};
+use crate::skill_registry::search::MatchMode;
+use std::path::PathBuf;
 use base64::Engine as _;
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -301,6 +304,51 @@ impl AgentflareMcp {
             "skills": body_skills,
         });
         Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+    }
+    #[tool(
+        description = "Recommend skills based on project toolchain detection (Cargo.toml, package.json, pyproject.toml, etc.). Distinct from skill_detect which classifies user intent from prompts — this analyzes the actual project files to recommend relevant skills."
+    )]
+    async fn skill_recommend(
+        &self,
+        Parameters(req): Parameters<SkillRecommendRequest>,
+    ) -> Result<String, ErrorData> {
+        let cwd = req.cwd.as_deref().map(PathBuf::from).unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        });
+        let profile = detect_project_type(&cwd);
+        let limit = req.limit.unwrap_or(10);
+
+        let skills = self.with_fresh_registry(|reg| reg.search("", limit * 3, MatchMode::Any))?;
+
+        let ranked = rank_skills_for_project(&profile, skills);
+        let top_skills: Vec<_> = ranked.into_iter().take(limit).collect();
+
+        let mut result = serde_json::json!({
+            "project_profile": {
+                "languages": profile.languages,
+                "frameworks": profile.frameworks,
+                "package_managers": profile.package_managers,
+                "build_tools": profile.build_tools,
+                "is_monorepo": profile.is_monorepo,
+            },
+            "skills": top_skills.iter().map(|s| {
+                let mut obj = serde_json::json!({
+                    "name": s.name,
+                    "source": s.source,
+                    "description": s.description,
+                    "score": s.score,
+                    "match_reasons": s.match_reasons,
+                    "est_tokens": s.est_tokens,
+                });
+                if req.include_body {
+                    if let Ok(loaded) = self.with_fresh_registry(|reg| reg.load(&s.name, false)) {
+                        obj["body"] = serde_json::json!(loaded.body);
+                    }
+                }
+                obj
+            }).collect::<Vec<_>>(),
+        });
+        Ok(result.to_string())
     }
     #[tool(
         description = "Skill operations — search installed skills or load one by name. Single consolidated tool with `action` field (search|load)."

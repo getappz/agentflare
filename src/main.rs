@@ -51,6 +51,7 @@ mod nudge_pace;
 mod opencode_go_usage;
 mod optimize;
 mod paths;
+mod project_toolchain;
 mod pm_mode;
 mod pricing;
 mod progress;
