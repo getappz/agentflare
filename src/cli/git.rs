@@ -60,6 +60,51 @@ pub enum GitCommand {
     /// -- the "ship it" macro. Requires a clean working tree (commit first);
     /// this never stages or commits for you.
     Ship(ShipArgs),
+    /// Explain a commit's provenance: the agent, branch, item, and session
+    /// that produced it, plus (best-effort) the originating prompt read
+    /// back from that session's local transcript.
+    Explain(ExplainArgs),
+    /// Browse commits annotated with their agent/session provenance, and
+    /// restore the working tree to how one of them looked.
+    Rewind(RewindArgs),
+}
+
+#[derive(Args)]
+pub struct ExplainArgs {
+    /// Commit to explain. Defaults to HEAD.
+    pub commit: Option<String>,
+}
+
+#[derive(Args)]
+pub struct RewindArgs {
+    #[command(subcommand)]
+    pub command: RewindCommand,
+}
+
+#[derive(Subcommand)]
+pub enum RewindCommand {
+    /// List recent commits with their agent/session provenance, newest first.
+    List(RewindListArgs),
+    /// Restore tracked files to how they looked at a commit. Non-destructive:
+    /// files added since are left alone and HEAD is not moved -- this only
+    /// changes what's in the working tree, like `snapshot restore`.
+    Restore(RewindRestoreArgs),
+}
+
+#[derive(Args)]
+pub struct RewindListArgs {
+    /// Max commits to show.
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct RewindRestoreArgs {
+    /// Commit-ish to restore file contents from.
+    pub commit: String,
+    /// Skip the confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Args)]
@@ -248,6 +293,8 @@ pub fn run(args: GitArgs) {
         GitCommand::Audit(opts) => worktree_audit_cmd(opts),
         GitCommand::Doctor(opts) => doctor_cmd(opts),
         GitCommand::Ship(opts) => ship_cmd(opts),
+        GitCommand::Explain(opts) => explain_cmd(opts),
+        GitCommand::Rewind(opts) => rewind_cmd(opts),
     }
 }
 
@@ -662,6 +709,20 @@ fn resolve_repo_root(command_name: &str) -> Option<PathBuf> {
     root
 }
 
+/// Truncates `s` to at most `max_bytes` bytes, snapped back to the nearest
+/// preceding UTF-8 character boundary. Git SHAs are ASCII hex, so this is a
+/// no-op for them; the boundary-snap matters for `session_id`, which is
+/// parsed from arbitrary, self-reported commit-trailer text (see
+/// `provenance.rs`'s "not cryptographically attested" doc comment) and can
+/// contain a multi-byte character right at the truncation point.
+fn short_id(s: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn snapshot_cmd(args: SnapshotArgs) {
     let Some(repo_root) = resolve_repo_root("snapshot") else {
         return;
@@ -680,7 +741,7 @@ fn snapshot_list(repo_root: &Path) {
         return;
     }
     for s in snaps {
-        let short_id = &s.id.0[..s.id.0.len().min(12)];
+        let short_id = short_id(&s.id.0, 12);
         println!("{short_id}  {}  {}", s.committer_date, s.reason);
     }
 }
@@ -708,7 +769,7 @@ fn snapshot_restore(repo_root: &Path, opts: &SnapshotRestoreArgs) {
     match snapshot::restore(repo_root, &meta.id) {
         Ok(()) => crate::ui::success(&format!(
             "restored snapshot {} ({})",
-            &meta.id.0[..meta.id.0.len().min(12)],
+            short_id(&meta.id.0, 12),
             meta.reason
         )),
         Err(e) => crate::ui::error(&format!("agentflare git snapshot restore: {e}")),
@@ -737,6 +798,264 @@ fn trailer_inject(msg_file: &Path) {
     let updated = provenance::append_trailers(&original, &trailers);
     if updated != original {
         let _ = fs::write(msg_file, updated);
+    }
+}
+
+/// `agentflare git explain [<commit>]` -- prints a commit's provenance
+/// (agent/branch/item/session, parsed back off its `Agentflare-*` trailers
+/// via `provenance::parse_trailers`) and, if a session id resolved, the
+/// prompt that opened that session -- read from the local Claude Code
+/// transcript at `~/.claude/projects/<slug>/<session_id>.jsonl` (best
+/// effort: absent for non-Claude-Code sessions, or when the transcript was
+/// made on a different machine).
+fn explain_cmd(opts: ExplainArgs) {
+    let Some(repo_root) = resolve_repo_root("explain") else {
+        return;
+    };
+    let commit_ref = opts.commit.as_deref().unwrap_or("HEAD");
+    let Ok(sha) = shell::run_in(&repo_root, &["rev-parse", "--verify", commit_ref]) else {
+        crate::ui::error(&format!(
+            "agentflare git explain: unknown commit '{commit_ref}'"
+        ));
+        return;
+    };
+    // Subject, date, and full body in one `git log` call, `\x1f`-delimited
+    // (fields never contain that control byte) with the multi-line body
+    // last so it can't be truncated by the split -- one spawn instead of
+    // three separate `git log -1 --format=...` calls.
+    let Ok(combined) = shell::run_in(&repo_root, &["log", "-1", "--format=%s\x1f%ci\x1f%B", &sha])
+    else {
+        crate::ui::error(&format!(
+            "agentflare git explain: could not read commit {sha}"
+        ));
+        return;
+    };
+    let mut fields = combined.splitn(3, '\x1f');
+    let subject = fields.next().unwrap_or_default();
+    let date = fields.next().unwrap_or_default();
+    let msg = fields.next().unwrap_or_default();
+    let trailers = provenance::parse_trailers(msg);
+
+    println!("commit  {} ({date})", short_id(&sha, 12));
+    println!("subject {subject}");
+    println!(
+        "agent   {}",
+        trailers.agent.as_deref().unwrap_or("(unknown)")
+    );
+    println!(
+        "branch  {}",
+        trailers.branch.as_deref().unwrap_or("(unknown)")
+    );
+    match &trailers.item_id {
+        Some(id) => println!("item    #{id}{}", item_summary_suffix(id)),
+        None => println!("item    (none)"),
+    }
+    match &trailers.session_id {
+        Some(sid) => {
+            println!("session {sid}");
+            match find_session_prompt(sid) {
+                Some(prompt) => println!("prompt  {}", truncate_for_display(&prompt, 400)),
+                None => println!("prompt  (transcript not found locally)"),
+            }
+        }
+        None => {
+            println!("session (none -- commit predates session trailers, or wasn't agent-made)")
+        }
+    }
+}
+
+/// Best-effort item name lookup for `explain`'s `item    #<id> (<name>)`
+/// line -- an empty suffix (not an error) on any DB miss, matching this
+/// file's existing soft-fail convention for item lookups (see
+/// `claimed_sequence_ids`/`item_state_groups`).
+fn item_summary_suffix(sequence_id: &str) -> String {
+    let Ok(seq) = sequence_id.parse::<i64>() else {
+        return String::new();
+    };
+    let Ok(conn) = crate::db::open() else {
+        return String::new();
+    };
+    conn.query_row(
+        "SELECT name FROM items WHERE sequence_id = ?1 AND deleted_at IS NULL",
+        [seq],
+        |r| r.get::<_, String>(0),
+    )
+    .map(|name| format!(" ({name})"))
+    .unwrap_or_default()
+}
+
+/// `true` for a `session_id` that's safe to interpolate into a filename --
+/// alphanumeric plus `-`/`_` only, matching the UUID-ish shape Claude Code
+/// actually issues. `session_id` is parsed from arbitrary, self-reported
+/// commit-trailer text (`provenance::parse_trailers` -- explicitly "not
+/// cryptographically attested"), so a forged trailer must never be able to
+/// steer `find_session_transcript`'s path join outside the projects
+/// directory (e.g. via `..` or `/`) or onto an unintended file.
+fn is_safe_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Locates `<session_id>.jsonl` under any project directory in
+/// `~/.claude/projects/` -- the session id alone is enough to find it
+/// without reconstructing the cwd-derived project slug.
+fn find_session_transcript(session_id: &str) -> Option<PathBuf> {
+    if !is_safe_session_id(session_id) {
+        return None;
+    }
+    let projects_dir = crate::paths::claude_projects_dir();
+    for entry in fs::read_dir(&projects_dir).ok()?.flatten() {
+        let candidate = entry.path().join(format!("{session_id}.jsonl"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Reads the first plain-text user turn out of a session transcript -- the
+/// prompt/task that opened the session.
+fn find_session_prompt(session_id: &str) -> Option<String> {
+    let path = find_session_transcript(session_id)?;
+    let content = fs::read_to_string(path).ok()?;
+    extract_first_user_prompt(&content)
+}
+
+/// Pure JSONL-parsing half of `find_session_prompt`, split out so it's
+/// testable without touching the filesystem. Tool-result turns carry
+/// `content` as a JSON array rather than a string, so the `.as_str()`
+/// filter here naturally skips past those to the first real prompt.
+fn extract_first_user_prompt(transcript: &str) -> Option<String> {
+    for line in transcript.lines() {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if parsed.get("type").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+        if let Some(text) = parsed
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+        {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
+fn truncate_for_display(s: &str, max_chars: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let truncated: String = trimmed.chars().take(max_chars).collect();
+    format!("{truncated}…")
+}
+
+fn rewind_cmd(args: RewindArgs) {
+    match args.command {
+        RewindCommand::List(opts) => rewind_list(&opts),
+        RewindCommand::Restore(opts) => rewind_restore(&opts),
+    }
+}
+
+/// `agentflare git rewind list` -- one line per commit: short sha, date,
+/// agent, session (short), subject. A single `git log` call carries every
+/// commit's sha/date/subject/body, `\x1e`-delimited between commits and
+/// `\x1f`-delimited between fields within one (neither byte occurs in
+/// ordinary commit text) -- one spawn total instead of `1 + 3*limit`.
+fn rewind_list(opts: &RewindListArgs) {
+    let Some(repo_root) = resolve_repo_root("rewind") else {
+        return;
+    };
+    let limit_arg = opts.limit.to_string();
+    let out = match shell::run_in(
+        &repo_root,
+        &[
+            "log",
+            "-n",
+            &limit_arg,
+            "--format=%H\x1f%cs\x1f%s\x1f%B\x1e",
+        ],
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::ui::error(&format!("agentflare git rewind list: {e}"));
+            return;
+        }
+    };
+    if out.trim().is_empty() {
+        println!("No commits found.");
+        return;
+    }
+    println!(
+        "{:<9}  {:<10}  {:<14}  {:<10}  subject",
+        "commit", "date", "agent", "session"
+    );
+    for record in out.split('\x1e') {
+        let record = record.trim_matches('\n');
+        if record.is_empty() {
+            continue;
+        }
+        let mut fields = record.splitn(4, '\x1f');
+        let (Some(sha), Some(date), Some(subject), Some(body)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let trailers = provenance::parse_trailers(body);
+        let agent = trailers.agent.as_deref().unwrap_or("-");
+        let session = trailers
+            .session_id
+            .as_deref()
+            .map(|s| short_id(s, 8))
+            .unwrap_or("-");
+        let short = short_id(sha, 9);
+        println!("{short:<9}  {date:<10}  {agent:<14}  {session:<10}  {subject}");
+    }
+}
+
+/// `agentflare git rewind restore <commit>` -- checks out `<commit>`'s
+/// tracked files into the working tree without moving HEAD (same
+/// non-destructive shape as `snapshot::restore`: paths absent from the
+/// target commit but present now are left alone). Takes its own pre-restore
+/// snapshot first via the existing `snapshot` module, so a restore is
+/// itself undoable with `agentflare git snapshot restore`.
+fn rewind_restore(opts: &RewindRestoreArgs) {
+    let Some(repo_root) = resolve_repo_root("rewind") else {
+        return;
+    };
+    let Ok(sha) = shell::run_in(&repo_root, &["rev-parse", "--verify", &opts.commit]) else {
+        crate::ui::error(&format!(
+            "agentflare git rewind restore: unknown commit '{}'",
+            opts.commit
+        ));
+        return;
+    };
+    if !opts.yes {
+        crate::ui::error(&format!(
+            "agentflare git rewind restore: pass --yes to confirm -- restores tracked files to how they looked at {} (files added since are left alone, HEAD is not moved)",
+            short_id(&sha, 12)
+        ));
+        return;
+    }
+    if let Err(e) = snapshot::snapshot_before(&repo_root, &format!("pre rewind restore to {sha}")) {
+        crate::ui::warning(&format!(
+            "could not snapshot current state before restoring (continuing anyway): {e}"
+        ));
+    }
+    match shell::run_in(
+        &repo_root,
+        &["-c", "core.autocrlf=false", "checkout", &sha, "--", "."],
+    ) {
+        Ok(_) => crate::ui::success(&format!(
+            "restored working tree to {} -- HEAD is unchanged; undo with `agentflare git snapshot restore` if needed",
+            short_id(&sha, 12)
+        )),
+        Err(e) => crate::ui::error(&format!("agentflare git rewind restore: {e}")),
     }
 }
 
@@ -1533,5 +1852,91 @@ mod tests {
         let result = scope_deny("overlapping claim".to_string());
         assert!(result.deny);
         assert_eq!(result.error, None);
+    }
+
+    #[test]
+    fn truncate_for_display_passes_short_text_through_unchanged() {
+        assert_eq!(truncate_for_display("  hi there  \n", 400), "hi there");
+    }
+
+    #[test]
+    fn truncate_for_display_truncates_and_marks_long_text() {
+        let long = "x".repeat(10);
+        let out = truncate_for_display(&long, 4);
+        assert_eq!(out, "xxxx…");
+    }
+
+    #[test]
+    fn extract_first_user_prompt_skips_non_user_lines_and_array_content() {
+        let transcript = concat!(
+            r#"{"type":"queue-operation","sessionId":"s1"}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":"reply"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"do the thing"}}"#,
+        );
+        assert_eq!(
+            extract_first_user_prompt(transcript).as_deref(),
+            Some("do the thing")
+        );
+    }
+
+    #[test]
+    fn extract_first_user_prompt_none_when_no_plain_text_user_turn() {
+        let transcript = r#"{"type":"assistant","message":{"content":"hi"}}"#;
+        assert_eq!(extract_first_user_prompt(transcript), None);
+    }
+
+    #[test]
+    fn item_summary_suffix_is_empty_for_a_non_numeric_id() {
+        assert_eq!(item_summary_suffix("not-a-number"), "");
+    }
+
+    #[test]
+    fn short_id_does_not_panic_when_the_cut_point_lands_mid_character() {
+        // session_id comes from arbitrary, self-reported commit-trailer
+        // text (provenance::parse_trailers); a multi-byte character can
+        // sit right at the truncation point rewind_list uses.
+        let s = "1234567😀rest"; // 7 ASCII bytes + one 4-byte emoji
+        let out = short_id(s, 8);
+        assert!(s.is_char_boundary(out.len()));
+        assert_eq!(out, "1234567");
+    }
+
+    #[test]
+    fn short_id_handles_a_string_entirely_below_the_multibyte_boundary() {
+        let s = "héllo"; // e-acute is 2 bytes, landing byte 2 mid-character
+        let out = short_id(s, 2);
+        assert!(s.is_char_boundary(out.len()));
+        assert_eq!(out, "h");
+    }
+
+    #[test]
+    fn is_safe_session_id_accepts_a_claude_code_style_uuid() {
+        assert!(is_safe_session_id("a1b2c3d4-e5f6-7890-abcd-ef1234567890"));
+    }
+
+    #[test]
+    fn is_safe_session_id_rejects_path_traversal_and_separators() {
+        assert!(!is_safe_session_id("../../etc/passwd"));
+        assert!(!is_safe_session_id("foo/bar"));
+        assert!(!is_safe_session_id("foo\\bar"));
+        assert!(!is_safe_session_id(""));
+    }
+
+    #[test]
+    fn is_safe_session_id_rejects_non_ascii() {
+        // The same forged-trailer content that can break short_id's
+        // truncation must also be rejected here before it ever reaches
+        // a filesystem path join in find_session_transcript.
+        assert!(!is_safe_session_id("sessi😀n"));
+    }
+
+    #[test]
+    fn find_session_transcript_returns_none_for_an_unsafe_session_id_without_touching_disk() {
+        assert_eq!(find_session_transcript("../../../etc/passwd"), None);
+        assert_eq!(find_session_transcript("a/b"), None);
     }
 }

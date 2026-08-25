@@ -42,6 +42,12 @@ pub fn claude_rules_dir() -> PathBuf {
     claude_dir().join("rules")
 }
 
+/// `~/.claude/projects` — Claude Code's per-project session transcript
+/// directories, each containing `<session_id>.jsonl` files.
+pub fn claude_projects_dir() -> PathBuf {
+    claude_dir().join("projects")
+}
+
 /// `~/.claude.json` — user-scope `claude mcp add` registrations live here, a
 /// separate file from `~/.claude/settings.json`.
 pub fn claude_json_path() -> PathBuf {
