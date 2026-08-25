@@ -25,12 +25,31 @@ pub fn load_app_manifest(app_dir: &Path) -> Result<AppManifest, String> {
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
     let raw: RawAppManifest =
         toml::from_str(&text).map_err(|e| format!("{}: invalid app.toml: {e}", path.display()))?;
+    let workflow = workflow_path_within_app_dir(app_dir, &raw.workflow)?;
     Ok(AppManifest {
         name: raw.name,
         version: raw.version,
-        workflow: app_dir.join(raw.workflow),
+        workflow,
         sandbox_profile: raw.sandbox_profile,
     })
+}
+
+/// Rejects an absolute path or a `..` component so `app.toml`'s `workflow`
+/// field can't point outside `app_dir` — apps are untrusted content (Task 7
+/// treats them as importable/shareable units), so a malicious `app.toml`
+/// must not be able to name an arbitrary file on disk.
+fn workflow_path_within_app_dir(app_dir: &Path, workflow: &str) -> Result<PathBuf, String> {
+    let rel = Path::new(workflow);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(format!(
+            "app.toml: workflow path '{workflow}' must be relative and stay within the app directory"
+        ));
+    }
+    Ok(app_dir.join(rel))
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,11 +60,11 @@ pub struct ToolsManifest {
 
 pub fn load_tools_manifest(app_dir: &Path) -> Result<Option<ToolsManifest>, String> {
     let path = app_dir.join("tools.toml");
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
     let parsed: ToolsManifest = toml::from_str(&text)
         .map_err(|e| format!("{}: invalid tools.toml: {e}", path.display()))?;
     Ok(Some(parsed))
@@ -84,6 +103,46 @@ mod tests {
         assert!(
             err.contains("app.toml"),
             "error should name the missing file: {err}"
+        );
+    }
+
+    fn write_app_toml_with_workflow(dir: &std::path::Path, workflow: &str) {
+        let mut f = std::fs::File::create(dir.join("app.toml")).unwrap();
+        writeln!(
+            f,
+            r#"
+            name = "auto-company"
+            version = "0.1.0"
+            workflow = "{workflow}"
+            "#
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_an_absolute_workflow_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let absolute = if cfg!(windows) {
+            "C:\\\\Windows\\\\System32\\\\config"
+        } else {
+            "/etc/passwd"
+        };
+        write_app_toml_with_workflow(dir.path(), absolute);
+        let err = load_app_manifest(dir.path()).unwrap_err();
+        assert!(
+            err.contains("must be relative"),
+            "absolute workflow path should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_parent_traversal_workflow_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_app_toml_with_workflow(dir.path(), "../../etc/passwd");
+        let err = load_app_manifest(dir.path()).unwrap_err();
+        assert!(
+            err.contains("must be relative"),
+            "parent-traversal workflow path should be rejected: {err}"
         );
     }
 }
