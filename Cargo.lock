@@ -140,6 +140,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentflare-apps"
+version = "0.1.0"
+dependencies = [
+ "agentflare-gateway-registry",
+ "agentflare-workspace-hack",
+ "serde",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "agentflare-artifacts"
 version = "0.1.0"
 dependencies = [
