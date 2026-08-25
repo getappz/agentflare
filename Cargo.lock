@@ -68,6 +68,7 @@ dependencies = [
  "aes-gcm",
  "agent-detector",
  "agentflare-agent-registry",
+ "agentflare-apps",
  "agentflare-artifacts",
  "agentflare-backend",
  "agentflare-db-kit",

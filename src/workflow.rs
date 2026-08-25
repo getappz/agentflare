@@ -116,6 +116,82 @@ pub(crate) fn agent_send_hook() -> SendMessage {
     })
 }
 
+/// Same role as [`agent_send_hook`], but for a workflow that belongs to an
+/// AgentFlare App: before dispatching each step, projects the App's
+/// agent-neutral personas/skills/tools into a fresh, per-invocation scratch
+/// directory (never the App's own directory), then launches the step's
+/// agent with that directory as its cwd via `run_headless_in` so the
+/// agent's own native project-local discovery (`.claude/agents`,
+/// `.claude/skills`, `.mcp.json`) picks it up. The scratch directory is
+/// torn down after the step completes, win or lose.
+#[allow(dead_code)]
+pub(crate) fn app_send_hook(
+    app_dir: PathBuf,
+    tools: Option<agentflare_apps::ToolsManifest>,
+) -> SendMessage {
+    std::sync::Arc::new(move |inv: flare_workflow::json::StepInvocation| {
+        let app_dir = app_dir.clone();
+        let tools = tools.clone();
+        Box::pin(async move {
+            let scratch =
+                tempfile::tempdir().map_err(|e| format!("could not create scratch dir: {e}"))?;
+            agentflare_apps::project::project_for_claude_code(
+                &app_dir,
+                scratch.path(),
+                tools.as_ref(),
+            )?;
+
+            let flare_workflow::json::StepInvocation {
+                agent,
+                prompt,
+                model,
+                args,
+                hard_cap_secs,
+                idle_timeout_secs,
+            } = inv;
+            let mut extra_args = Vec::with_capacity(args.len() + 2);
+            if let Some(m) = model {
+                extra_args.push("--model".to_string());
+                extra_args.push(m);
+            }
+            extra_args.extend(args);
+            let hard_cap = Duration::from_secs(hard_cap_secs.unwrap_or(DEFAULT_HARD_CAP_SECS));
+            let idle_timeout =
+                Duration::from_secs(idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS));
+            let scratch_path = scratch.path().to_path_buf();
+
+            // Same spawn_blocking rationale as `agent_send_hook`: the
+            // subprocess launch blocks synchronously and must run inside
+            // this async block so it's polled on a blocking-pool thread,
+            // not eagerly on whatever thread first called this closure.
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::agent_launch::run_headless_in(
+                    &scratch_path,
+                    agent_registry::REGISTRY,
+                    &agent,
+                    &prompt,
+                    hard_cap,
+                    idle_timeout,
+                    &extra_args,
+                    false,
+                )
+            })
+            .await
+            .map_err(|e| format!("agent task panicked: {e}"))?;
+
+            // `scratch` (the TempDir) drops here regardless of outcome,
+            // deleting the projected directory now that the step is done.
+            match outcome {
+                crate::agent_launch::HeadlessOutcome::Ok(reply) => Ok((reply.text, 0, 0)),
+                crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
+                | crate::agent_launch::HeadlessOutcome::NotHeadless(e)
+                | crate::agent_launch::HeadlessOutcome::NotFound(e)
+                | crate::agent_launch::HeadlessOutcome::Failed(e) => Err(e),
+            }
+        })
+    })
+}
+
 /// Directory a project keeps its custom `flare-workflow` JSON definitions
 /// in, sibling to `.agentflare/config.toml` (see `github::bridge::config`).
 pub(crate) fn project_workflows_dir(repo_root: &Path) -> PathBuf {
@@ -247,9 +323,10 @@ pub(crate) async fn run_workflow_json_with_params_async(
     Ok((run_id, workflow_id))
 }
 
-/// Same as [`run_workflow_json`] with an injectable `SendMessage` hook — used
-/// by tests to drive steps without an installed agent binary.
-#[cfg(test)]
+/// Same as [`run_workflow_json`] with an injectable `SendMessage` hook — the
+/// actual hook-in point for [`app_send_hook`] (via `agentflare apps run`) as
+/// well as tests that drive steps without an installed agent binary.
+#[allow(dead_code)]
 pub(crate) fn run_workflow_json_with_sender(
     definition_json: &str,
     input: &str,
@@ -1156,5 +1233,70 @@ mod tests {
     fn list_workflow_definitions_empty_when_no_directory() {
         let repo = tempfile::tempdir().unwrap();
         assert!(list_workflow_definitions(repo.path()).is_empty());
+    }
+
+    /// `app_send_hook`'s dispatch is not injectable (unlike `mock_send`, it
+    /// always ends at the real `run_headless_in`), so an unknown agent id is
+    /// the deterministic way to exercise the full chain — scratch dir
+    /// creation, persona/skill projection, `run_headless_in` dispatch, and
+    /// `HeadlessOutcome` -> `Result` mapping — without depending on any CLI
+    /// agent binary being installed on the test machine's PATH.
+    #[test]
+    fn app_send_hook_projects_then_reports_the_dispatch_error() {
+        let app_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_dir.path().join("personas")).unwrap();
+        std::fs::write(app_dir.path().join("personas/ceo.md"), "# CEO").unwrap();
+
+        let send = app_send_hook(app_dir.path().to_path_buf(), None);
+        let inv = flare_workflow::json::StepInvocation::simple("no-such-agent", "hi");
+        let result = blocking_runtime().block_on((send)(inv));
+
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unknown agent: no-such-agent"),
+            "expected an unknown-agent error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn app_send_hook_wired_through_run_workflow_json_with_sender_reaches_failed() {
+        let app_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_dir.path().join("personas")).unwrap();
+        std::fs::write(app_dir.path().join("personas/ceo.md"), "# CEO").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wf.db");
+
+        let send = app_send_hook(app_dir.path().to_path_buf(), None);
+        let (run_id, _workflow_id) = run_workflow_json_with_sender(
+            r#"{
+                "name": "app-pipeline",
+                "steps": [
+                    {"name": "a", "agent": "no-such-agent", "prompt": "Do: {{input}}"}
+                ]
+            }"#,
+            "seed",
+            &db,
+            send,
+        )
+        .unwrap();
+
+        let rt = blocking_runtime();
+        rt.block_on(async {
+            for _ in 0..200 {
+                let store = SqliteStore::<PipelineData>::open_file(&db).unwrap();
+                let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
+                if let Ok(s) = engine.get_status(run_id).await
+                    && s.status == WorkflowStatus::Failed
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("workflow did not reach Failed status");
+        });
+
+        let status = workflow_status(&run_id.to_string(), &db).unwrap();
+        assert_eq!(status["status"], "failed");
     }
 }
