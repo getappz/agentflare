@@ -333,6 +333,9 @@ agentflare git snapshot prune --keep 5
 agentflare git audit preview
 agentflare git audit prune --all
 agentflare git doctor --format json --reclaim
+agentflare git explain HEAD
+agentflare git rewind list --limit 10
+agentflare git rewind restore <commit> --yes
 ```
 
 - `install-hooks [--yes]` — installs pre-commit/pre-push/prepare-commit-msg/
@@ -347,6 +350,14 @@ agentflare git doctor --format json --reclaim
   (snapshots taken first).
 - `doctor [--format text|json|markdown] [--reclaim] [--force] [--staleness-days N]` —
   health sweep over all claim worktrees; exits `1` if violations are found.
+- `explain [<commit>]` — prints a commit's provenance (agent/branch/item/session,
+  read back off its `Agentflare-*` trailers) and, best-effort, the prompt that
+  opened that session from its local Claude Code transcript. Defaults to `HEAD`.
+- `rewind list [--limit N]` — lists recent commits (default 20) with their
+  agent/session provenance, newest first.
+- `rewind restore <commit> [--yes]` — restores tracked files to how they looked
+  at `<commit>` without moving `HEAD`; non-destructive (files added since are
+  left alone), and takes its own pre-restore snapshot first.
 
 ## Auth & secrets
 
