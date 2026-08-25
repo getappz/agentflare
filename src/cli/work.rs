@@ -651,6 +651,8 @@ pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> Work
     execute_work_impl(args, log, crate::work_item_pipeline::run_or_resume)
 }
 
+include!("work_cwd_lock.rs");
+
 /// Test seam: same as [`execute_work`], with the `sdd_loop`→`finalize`
 /// pipeline runner injected — mirrors `work_item_pipeline`'s own
 /// `_with_sender` pattern, one level up.
@@ -922,42 +924,38 @@ fn execute_work_impl(
         resolved_model.as_deref(),
     );
 
-    // --- Change to worktree dir and run the sdd_loop -> finalize pipeline;
-    // the chdir must stay in effect for the whole `run_or_resume` call, not
-    // just one turn -- `sdd_loop` reads/commits real files across every
-    // iteration of a resumed run. ---
-    let original_dir = std::env::current_dir().ok();
-    if std::env::set_current_dir(wpath).is_err() {
-        let msg = format!("failed to chdir into {}", wpath.display());
-        release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
-        crate::ui::error(&msg);
-        // Same structural category as the missing-worktree case above: the
-        // claimed worktree path came back from `item::claim` but doesn't
-        // actually exist/isn't enterable, which won't change on retry.
-        return WorkOutcome {
-            exit_code: 1,
-            retry_after_secs: None,
-            fatal: true,
-        };
-    }
-
-    let result = run_pipeline(
-        mcp.clone(),
-        &item_detail,
-        implementer_agent,
-        review_agent,
-        item_description,
-        plan_doc,
-        args.notify.clone(),
-        timeout,
-        idle_timeout,
-        extra_args,
-    );
-
-    // Restore cwd regardless of outcome.
-    if let Some(d) = original_dir {
-        let _ = std::env::set_current_dir(d);
-    }
+    // --- Run the sdd_loop -> finalize pipeline inside the worktree; the
+    // chdir must stay in effect for the whole call, not just one turn --
+    // `sdd_loop` reads/commits real files every iteration of a resumed run.
+    // `run_in_worktree` serializes this against a concurrent item's chdir. ---
+    let result = match run_in_worktree(wpath, || {
+        run_pipeline(
+            mcp.clone(),
+            &item_detail,
+            implementer_agent,
+            review_agent,
+            item_description,
+            plan_doc,
+            args.notify.clone(),
+            timeout,
+            idle_timeout,
+            extra_args,
+        )
+    }) {
+        Ok(result) => result,
+        Err(msg) => {
+            release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
+            crate::ui::error(&msg);
+            // Same structural category as the missing-worktree case above: the
+            // claimed worktree path came back from `item::claim` but doesn't
+            // actually exist/isn't enterable, which won't change on retry.
+            return WorkOutcome {
+                exit_code: 1,
+                retry_after_secs: None,
+                fatal: true,
+            };
+        }
+    };
 
     // `run_or_resume`'s `finalize` step already performed every bit of
     // report-back the old inline `HeadlessOutcome::Ok` arm did (hold-signal
@@ -1865,6 +1863,8 @@ rotate = true
             );
         });
     }
+
+    include!("work_cwd_race_tests.rs");
 
     /// Task 8: `execute_work_impl` dispatches through `run_or_resume`, which
     /// persists `workflow_run_id` onto the item's metadata before polling
