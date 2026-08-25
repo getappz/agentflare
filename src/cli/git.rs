@@ -1042,15 +1042,16 @@ fn rewind_restore(opts: &RewindRestoreArgs) {
         ));
         return;
     }
+    // Abort the destructive checkout if the snapshot itself fails, since that
+    // snapshot is the only recovery point a restore has; proceeding anyway
+    // would defeat the whole point of snapshotting first.
     if let Err(e) = snapshot::snapshot_before(&repo_root, &format!("pre rewind restore to {sha}")) {
-        crate::ui::warning(&format!(
-            "could not snapshot current state before restoring (continuing anyway): {e}"
+        crate::ui::error(&format!(
+            "agentflare git rewind restore: could not snapshot current state, aborting: {e}"
         ));
+        return;
     }
-    match shell::run_in(
-        &repo_root,
-        &["-c", "core.autocrlf=false", "checkout", &sha, "--", "."],
-    ) {
+    match snapshot::checkout_into_worktree(&repo_root, &sha) {
         Ok(_) => crate::ui::success(&format!(
             "restored working tree to {} -- HEAD is unchanged; undo with `agentflare git snapshot restore` if needed",
             short_id(&sha, 12)
