@@ -67,9 +67,19 @@ pub fn find_existing(
 /// depend on the item's own tracked branch name, so it still finds a PR
 /// that merged while the item's tracked state fell out of sync (items
 /// #122/#156: the state-side promotion never ran, so a routine redispatch
-/// nearly re-did already-merged work). Uses GitHub's search API rather than
-/// `list` + filter, mirroring the exact `gh pr list --search "\"for item
-/// #N \" in:body"` query a human ran to catch that incident.
+/// nearly re-did already-merged work).
+///
+/// GitHub's search API (used here as a candidate filter, mirroring the exact
+/// `gh pr list --search "\"for item #N \" in:body"` query a human ran to
+/// catch that incident) doesn't guarantee an exact phrase match -- it
+/// tokenizes on punctuation like `#`, so a PR whose body merely mentions the
+/// item nearby unrelated prose can surface as a false hit. PR #599's body
+/// ("Motivated by two items (#184, #185 ...)") matched this way and got
+/// item #184 auto-completed even though the PR never touched its code
+/// (caught live, item #190). So each candidate's *actual* body is checked
+/// locally afterward for the literal fixed suffix `pr_footer` always
+/// stamps -- `for item #N via agentflare.` -- before it counts as a real
+/// duplicate.
 pub fn find_by_item_marker(
     client: &Client,
     repo: &RepoId,
@@ -87,7 +97,15 @@ pub fn find_by_item_marker(
         .flatten()
         .filter_map(|item| item["number"].as_u64())
         .collect();
-    numbers.into_iter().map(|n| get(client, repo, n)).collect()
+    let marker = format!("for item #{sequence_id} via agentflare.");
+    let prs: Vec<PullRequest> = numbers
+        .into_iter()
+        .map(|n| get(client, repo, n))
+        .collect::<Result<_, _>>()?;
+    Ok(prs
+        .into_iter()
+        .filter(|pr| pr.body.as_deref().is_some_and(|b| b.contains(&marker)))
+        .collect())
 }
 
 pub fn get(client: &Client, repo: &RepoId, number: u64) -> Result<PullRequest, GitHubError> {
@@ -299,7 +317,7 @@ mod tests {
             MockResponse::json(200, r#"{"items":[{"number":42}]}"#),
             MockResponse::json(
                 200,
-                r#"{"number":42,"html_url":"u","state":"closed","title":"t","merged_at":"2026-08-01T00:00:00Z"}"#,
+                r#"{"number":42,"html_url":"u","state":"closed","title":"t","merged_at":"2026-08-01T00:00:00Z","body":"---\n_Opened by `claude-code` on **box** for item #164 via agentflare._"}"#,
             ),
         ]);
         let client = server.client(None);
@@ -322,6 +340,28 @@ mod tests {
         let client = server.client(None);
         assert!(
             find_by_item_marker(&client, &repo(), 999)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // Regression for item #190: GitHub's search API matched PR #599's body
+    // ("Motivated by two items (#184, #185 ...)") against the `"for item
+    // #184 " in:body` query even though the PR never carries the actual
+    // `pr_footer` stamp for #184, which nearly got #184 auto-completed as
+    // a false-positive duplicate.
+    #[test]
+    fn find_by_item_marker_drops_a_search_hit_that_lacks_the_literal_footer() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, r#"{"items":[{"number":599}]}"#),
+            MockResponse::json(
+                200,
+                r#"{"number":599,"html_url":"u","state":"closed","title":"t","body":"Motivated by two items (#184, #185 in the linked project) for item #184 discovery."}"#,
+            ),
+        ]);
+        let client = server.client(None);
+        assert!(
+            find_by_item_marker(&client, &repo(), 184)
                 .unwrap()
                 .is_empty()
         );

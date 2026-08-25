@@ -18,6 +18,11 @@ pub struct PullRequest {
     pub number: u64,
     pub html_url: String,
     pub state: String,
+    // Present on the single-PR endpoint (`pulls::get`) but not on `list`'s
+    // items -- used by `find_by_item_marker` to confirm a search hit is the
+    // literal footer stamp, not just incidental proximity of those words.
+    #[serde(default)]
+    pub body: Option<String>,
     pub title: String,
     #[serde(default)]
     pub draft: bool,
