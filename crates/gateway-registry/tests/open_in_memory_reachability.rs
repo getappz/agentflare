@@ -26,8 +26,6 @@
 //! child process has to a backend tool — spawning the underlying command
 //! itself, never going through `Registry`.
 
-mod support;
-
 use agentflare_gateway_registry::{GatewayConfig, MatchMode, Registry, ServerConfig};
 use std::collections::HashMap;
 
@@ -79,7 +77,10 @@ async fn open_in_memory_instances_share_no_state_even_within_one_process() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, agentflare_gateway_registry::GatewayError::ServerNotFound(_)),
+        matches!(
+            err,
+            agentflare_gateway_registry::GatewayError::ServerNotFound(_)
+        ),
         "reg2 has no 'fixture' backend of its own — got {err:?}"
     );
 }
@@ -104,7 +105,11 @@ async fn a_separately_spawned_child_reaches_only_the_raw_command_never_the_paren
         .await
         .unwrap();
     let via_registry = reg
-        .execute("fixture", "echo", serde_json::json!({"text": "via-registry"}))
+        .execute(
+            "fixture",
+            "echo",
+            serde_json::json!({"text": "via-registry"}),
+        )
         .await
         .unwrap();
     let via_registry_text = via_registry
@@ -136,7 +141,11 @@ async fn a_separately_spawned_child_reaches_only_the_raw_command_never_the_paren
     let _ = child.wait();
 
     let via_registry_again = reg
-        .execute("fixture", "echo", serde_json::json!({"text": "still-works"}))
+        .execute(
+            "fixture",
+            "echo",
+            serde_json::json!({"text": "still-works"}),
+        )
         .await
         .unwrap();
     let text_again = via_registry_again
