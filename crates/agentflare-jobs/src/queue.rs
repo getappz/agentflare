@@ -201,6 +201,40 @@ impl Queue {
         Ok(())
     }
 
+    /// Persists a job's log paths/byte counts independently of `state` —
+    /// for `run_in_process`'s failure/timeout paths, which already wrote a
+    /// real stdout log before the executor errored out or the timeout fired
+    /// and go on to call `fail` (not `complete`, since `fail` alone carries
+    /// the retry-vs-terminal logic), so without this the log a job actually
+    /// produced was silently discarded and `stdout_log_path` stayed NULL
+    /// forever even though the file exists on disk.
+    pub fn record_output(
+        &self,
+        id: &str,
+        stdout_path: &Path,
+        stderr_path: &Path,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
+    ) -> Result<(), Error> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE agent_jobs
+             SET stdout_log_path = ?1,
+                 stderr_log_path = ?2,
+                 stdout_bytes = ?3,
+                 stderr_bytes = ?4
+             WHERE id = ?5",
+            params![
+                stdout_path.to_string_lossy().as_ref(),
+                stderr_path.to_string_lossy().as_ref(),
+                stdout_bytes as i64,
+                stderr_bytes as i64,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Returns `true` when this failure was terminal (retries exhausted, or
     /// `fatal` short-circuited them, row left `state = 'failed'`), `false`
     /// when it went back to `queued` for another attempt — callers that need
@@ -289,9 +323,32 @@ impl Queue {
                 .collect::<Result<Vec<_>, _>>()?
         };
         for (id, _) in &rows {
+            // Both the subprocess (`Supervisor`) and in-process
+            // (`run_in_process`) paths name their log files `{id}.stdout`/
+            // `{id}.stderr` under `log_dir()` and may have already written
+            // real output before the daemon died mid-job — without this,
+            // that log survives on disk but the row's `stdout_log_path`
+            // stays NULL forever, so it's unreachable via `JobInfo`/the
+            // dashboard even though the file is right there.
+            let stdout_path = self.log_dir.join(format!("{id}.stdout"));
+            let stderr_path = self.log_dir.join(format!("{id}.stderr"));
+            let stdout_bytes = std::fs::metadata(&stdout_path).map(|m| m.len()).unwrap_or(0);
+            let stderr_bytes = std::fs::metadata(&stderr_path).map(|m| m.len()).unwrap_or(0);
             conn.execute(
-                "UPDATE agent_jobs SET state = 'failed', error = ?1, finished_at = ?2 WHERE id = ?3",
-                params![ORPHAN_ERROR, now, id],
+                "UPDATE agent_jobs
+                 SET state = 'failed', error = ?1, finished_at = ?2,
+                     stdout_log_path = ?3, stderr_log_path = ?4,
+                     stdout_bytes = ?5, stderr_bytes = ?6
+                 WHERE id = ?7",
+                params![
+                    ORPHAN_ERROR,
+                    now,
+                    stdout_path.to_string_lossy().as_ref(),
+                    stderr_path.to_string_lossy().as_ref(),
+                    stdout_bytes as i64,
+                    stderr_bytes as i64,
+                    id
+                ],
             )?;
         }
         Ok(rows
@@ -484,6 +541,44 @@ mod tests {
         (queue, dir)
     }
 
+    // A `run_in_process` failure/timeout still writes a real stdout log
+    // before calling `fail` (which alone doesn't touch the log columns) --
+    // `record_output` is how that log's path/size gets persisted so it
+    // isn't orphaned on disk with a `NULL` `stdout_log_path`, regardless of
+    // whether the row ends up 'queued' (retried) or 'failed' (terminal).
+    #[test]
+    fn record_output_persists_log_paths_independently_of_fail() {
+        let (queue, _dir) = test_queue();
+        let job = AgentJob::new("true").max_retries(0);
+        let info = queue.enqueue(&job).unwrap();
+        queue.dequeue().unwrap();
+
+        queue
+            .record_output(
+                &info.id,
+                Path::new("/tmp/job.stdout"),
+                Path::new("/tmp/job.stderr"),
+                42,
+                7,
+            )
+            .unwrap();
+        queue.fail(&info.id, "boom", None, true).unwrap();
+
+        let conn = queue.conn.lock();
+        let (stdout_path, stderr_path, stdout_bytes, stderr_bytes): (String, String, i64, i64) =
+            conn.query_row(
+                "SELECT stdout_log_path, stderr_log_path, stdout_bytes, stderr_bytes
+                 FROM agent_jobs WHERE id = ?1",
+                params![info.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(stdout_path, "/tmp/job.stdout");
+        assert_eq!(stderr_path, "/tmp/job.stderr");
+        assert_eq!(stdout_bytes, 42);
+        assert_eq!(stderr_bytes, 7);
+    }
+
     #[test]
     fn fail_without_retry_delay_requeues_immediately() {
         let (queue, _dir) = test_queue();
@@ -547,6 +642,40 @@ mod tests {
         assert_eq!(stored.state, JobState::Failed);
         assert!(stored.finished_at.is_some());
         assert_eq!(stored.error.as_deref(), Some("orphaned by daemon restart"));
+    }
+
+    // A job killed mid-run by a daemon restart may already have written real
+    // progress to its `{id}.stdout` file before the process died -- without
+    // persisting that path/size here, the log survives on disk but is
+    // unreachable (no DB row points at it) and `cleanup` can never find it
+    // to delete it either, so it leaks forever. Reproduced live: 599 failed
+    // rows with an empty `stdout_log_path` alongside real `.stdout` files on
+    // disk, all originating from this exact path.
+    #[test]
+    fn reconcile_orphaned_running_persists_the_stdout_log_already_written_to_disk() {
+        let (queue, _dir) = test_queue();
+        let job = AgentJob::new("agentflare-work")
+            .args(["item-1", "claude-code"])
+            .in_process();
+        let info = queue.enqueue(&job).unwrap();
+        queue.dequeue().unwrap();
+
+        std::fs::create_dir_all(queue.log_dir()).unwrap();
+        let stdout_path = queue.log_dir().join(format!("{}.stdout", info.id));
+        std::fs::write(&stdout_path, "claimed: item-1\nworktree: ...\n").unwrap();
+
+        queue.reconcile_orphaned_running().unwrap();
+
+        let conn = queue.conn.lock();
+        let (path, bytes): (String, i64) = conn
+            .query_row(
+                "SELECT stdout_log_path, stdout_bytes FROM agent_jobs WHERE id = ?1",
+                params![info.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(path, stdout_path.to_string_lossy());
+        assert_eq!(bytes, 30);
     }
 
     #[test]
