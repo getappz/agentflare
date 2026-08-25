@@ -96,6 +96,8 @@ agentflare-resource-gate = { path = "crates/agentflare-resource-gate" }
 machine-uid = "0.6.0"
 agentflare-workspace-hack = { version = "0.1", path = "agentflare-workspace-hack" }
 dunce = "1"
+agentflare-apps = { path = "crates/agentflare-apps" }
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -120,7 +122,6 @@ built = { version = "0.8", features = ["chrono"] }
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
-tempfile = "3"
 pretty_assertions = "1"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
 tokio = { version = "1", features = ["test-util"] }
