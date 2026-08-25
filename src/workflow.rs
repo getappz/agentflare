@@ -164,7 +164,17 @@ pub(crate) fn app_send_hook(
             // subprocess launch blocks synchronously and must run inside
             // this async block so it's polled on a blocking-pool thread,
             // not eagerly on whatever thread first called this closure.
+            //
+            // `scratch` itself (not just its path) moves into the closure so
+            // it stays alive until `run_headless_in` returns. The engine
+            // wraps each step's `execute` in `tokio::time::timeout`
+            // (`execute_step_with_retry`), which drops this whole future on
+            // expiry — a `spawn_blocking` task can't be cancelled once
+            // started (it keeps running on its own thread regardless), so a
+            // `scratch` owned by the *outer* future would be deleted out
+            // from under a still-running `run_headless_in` call.
             let outcome = tokio::task::spawn_blocking(move || {
+                let _scratch = scratch;
                 crate::agent_launch::run_headless_in(
                     &scratch_path,
                     agent_registry::REGISTRY,
@@ -179,8 +189,6 @@ pub(crate) fn app_send_hook(
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
 
-            // `scratch` (the TempDir) drops here regardless of outcome,
-            // deleting the projected directory now that the step is done.
             match outcome {
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => Ok((reply.text, 0, 0)),
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
@@ -1255,6 +1263,68 @@ mod tests {
         assert!(
             err.contains("unknown agent: no-such-agent"),
             "expected an unknown-agent error, got: {err}"
+        );
+    }
+
+    /// Regression guard for the `app_send_hook` TempDir race CodeRabbit
+    /// flagged on PR #611: `run_headless_in`'s dispatch isn't injectable
+    /// (see the doc comment on
+    /// `app_send_hook_projects_then_reports_the_dispatch_error` above), so
+    /// this exercises the same ownership pattern directly instead of
+    /// through the full hook — a `Drop`-on-drop guard moved *into* a
+    /// `spawn_blocking` closure (exactly how `app_send_hook` now moves
+    /// `scratch` in) must outlive the outer task being aborted mid-flight,
+    /// the same thing the engine's per-step `tokio::time::timeout` does to
+    /// a step's `execute` future on expiry (see `execute_step_with_retry`
+    /// in `flare-workflow`).
+    #[test]
+    fn spawn_blocking_owned_guard_outlives_outer_future_drop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (finish_tx, finish_rx) = mpsc::channel::<()>();
+
+        let rt = blocking_runtime();
+        let outer = rt.spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _guard = guard; // moved in, like `scratch` now is
+                started_tx.send(()).unwrap();
+                finish_rx.recv().unwrap(); // block until the test says go
+            })
+            .await
+            .unwrap();
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("blocking task never started");
+
+        // Simulate the engine's per-step timeout dropping the outer future
+        // while the blocking work is still running.
+        outer.abort();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "guard must still be alive: it was moved into spawn_blocking, \
+             which keeps running on its own thread and can't be cancelled \
+             once started, regardless of the outer task being aborted"
+        );
+
+        finish_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "guard should finally drop once the blocking closure returns"
         );
     }
 
