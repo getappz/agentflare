@@ -146,6 +146,7 @@ dependencies = [
  "agentflare-gateway-registry",
  "agentflare-workspace-hack",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
 ]
