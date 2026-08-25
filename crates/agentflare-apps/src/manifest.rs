@@ -52,7 +52,7 @@ fn workflow_path_within_app_dir(app_dir: &Path, workflow: &str) -> Result<PathBu
     Ok(app_dir.join(rel))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ToolsManifest {
     #[serde(default)]
     pub servers: HashMap<String, gateway_registry::ServerConfig>,
