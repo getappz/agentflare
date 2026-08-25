@@ -20,7 +20,7 @@ fn find_duplicate_pr(
     let repo = crate::github::RepoId::resolve_from_remote(repo_root)?;
     let client = crate::github::Client::new().ok()?;
     let prs = crate::github::pulls::find_by_item_marker(&client, &repo, item.sequence_id).ok()?;
-    pick_duplicate_pr(prs)
+    pick_duplicate_pr(prs, flare_git_core::branch::current_branch(repo_root).as_deref())
 }
 
 /// Picks which match to act on when `find_by_item_marker` returns more than
@@ -31,10 +31,31 @@ fn find_duplicate_pr(
 /// otherwise it would permanently block a legitimate redispatch. Split out
 /// from `find_duplicate_pr` so this selection logic is unit-testable
 /// without a mock GitHub server.
+///
+/// `current_branch` excludes a still-open PR that's already checked out in
+/// *this* worktree from counting as a duplicate at all — otherwise a
+/// self-repair job reclaiming its own item's existing PR (`self_repair_or_gate`
+/// in `supervisor.rs`, whose whole point is to push a fix onto that exact
+/// branch) finds its own PR via `find_by_item_marker`, treats it as
+/// somebody else's competing duplicate, and bails without ever attempting
+/// the repair — then, because `item::release` only clears the claim and
+/// never restores the state group, the item is left orphaned in `started`
+/// with no label either `run_discovery_tick` or `run_review_sweep` will
+/// ever pick back up (reproduced live on item #186/PR #597). A *merged*
+/// match still always short-circuits regardless of branch, since that's
+/// this function's other job: self-heal an item whose PR landed while its
+/// tracked state fell out of sync (items #122/#156).
 fn pick_duplicate_pr(
     mut prs: Vec<crate::github::models::PullRequest>,
+    current_branch: Option<&str>,
 ) -> Option<crate::github::models::PullRequest> {
     prs.retain(|pr| pr.merged_at.is_some() || pr.state == "open");
+    prs.retain(|pr| {
+        pr.merged_at.is_some()
+            || current_branch
+                .zip(pr.head.as_ref())
+                .is_none_or(|(current, head)| head.git_ref != current)
+    });
     prs.sort_by_key(|pr| pr.merged_at.is_none());
     prs.into_iter().next()
 }

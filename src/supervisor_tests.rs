@@ -224,6 +224,68 @@ fn agent_in_cooldown_is_skipped_not_dispatched() {
     );
 }
 
+#[test]
+fn needs_decision_label_blocks_dispatch_even_though_ready_for_work_is_present() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let auth_conn = test_auth_conn();
+    let item_id = seed_ready_item(&mcp, Some("claude-code"));
+    mcp.with_backend_db(|conn| {
+        let project = mcp.resolve_project(conn).unwrap();
+        agentflare_backend::label::create(
+            conn,
+            agentflare_backend::label::CreateLabel {
+                project_id: Some(project.id.clone()),
+                workspace_id: project.workspace_id.clone(),
+                name: NEEDS_DECISION_LABEL.into(),
+                color: None,
+                parent_id: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+        let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+        let gate_id = &labels
+            .iter()
+            .find(|l| l.name == NEEDS_DECISION_LABEL)
+            .unwrap()
+            .id;
+        agentflare_backend::item::add_label(conn, &item_id, gate_id).unwrap();
+        Some(())
+    })
+    .unwrap();
+
+    let result = run_discovery_tick(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+
+    assert_eq!(result.dispatched, 0);
+    assert_eq!(result.skipped, 0);
+    assert_eq!(
+        result.waiting, 1,
+        "a go/no-go item gated on a pending decision must count as waiting, not dispatch"
+    );
+    assert!(
+        queue.list(None).unwrap().is_empty(),
+        "a needs-decision item must never reach the job queue, regardless of ready-for-work"
+    );
+
+    let labels = mcp
+        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+        .unwrap();
+    assert!(
+        labels_contain_name(&mcp, &labels, "ready-for-work"),
+        "the gate must not touch ready-for-work -- redispatch re-attaches it unconditionally, \
+         so needs-decision has to keep blocking on its own"
+    );
+    assert!(labels_contain_name(&mcp, &labels, NEEDS_DECISION_LABEL));
+}
+
 #[path = "supervisor/tests/host_gate_tests.rs"]
 mod host_gate_tests;
 
