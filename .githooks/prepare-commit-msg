@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # agentflare provenance trailers (prepare-commit-msg).
 #
-# Appends Agentflare-Agent/Agentflare-Branch/Agentflare-Item trailers to
-# every commit message, so it's clear afterward which agent (if any) made
-# it and what work item it belongs to. Self-reported, not cryptographically
+# Appends Agentflare-Agent/Agentflare-Branch/Agentflare-Item/
+# Agentflare-Session trailers to every commit message, so it's clear
+# afterward which agent (if any) made it, what work item it belongs to, and
+# which agent session/prompt produced it (`agentflare git explain`/
+# `rewind` read these back). Self-reported, not cryptographically
 # attested -- matches every other AGENTFLARE_AGENT-based identity check in
 # this codebase (see claims::owner_id). Idempotent: re-running on an
 # already-stamped message (e.g. `commit --amend`) is a no-op.

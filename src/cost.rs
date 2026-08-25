@@ -13,10 +13,6 @@ use std::path::{Path, PathBuf};
 
 use std::collections::HashMap;
 
-fn claude_projects_dir() -> PathBuf {
-    crate::paths::home().join(".claude").join("projects")
-}
-
 pub(crate) struct LineUsage {
     pub(crate) model: Option<String>,
     pub(crate) tokens: TokenUsage,
@@ -248,7 +244,7 @@ pub(crate) fn summarize(
     group_by: GroupBy,
 ) -> HashMap<String, GroupTotals> {
     let mut conn = crate::rollup::open_or_rebuild();
-    crate::rollup::sync(&mut conn, &claude_projects_dir());
+    crate::rollup::sync(&mut conn, &crate::paths::claude_projects_dir());
     crate::rollup::query(&conn, date_range, group_by)
 }
 
