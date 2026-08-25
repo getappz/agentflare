@@ -46,8 +46,8 @@ pub fn load_tools_manifest(app_dir: &Path) -> Result<Option<ToolsManifest>, Stri
     }
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-    let parsed: ToolsManifest =
-        toml::from_str(&text).map_err(|e| format!("{}: invalid tools.toml: {e}", path.display()))?;
+    let parsed: ToolsManifest = toml::from_str(&text)
+        .map_err(|e| format!("{}: invalid tools.toml: {e}", path.display()))?;
     Ok(Some(parsed))
 }
 
@@ -81,6 +81,9 @@ mod tests {
     fn missing_app_toml_is_a_clear_error() {
         let dir = tempfile::tempdir().unwrap();
         let err = load_app_manifest(dir.path()).unwrap_err();
-        assert!(err.contains("app.toml"), "error should name the missing file: {err}");
+        assert!(
+            err.contains("app.toml"),
+            "error should name the missing file: {err}"
+        );
     }
 }
