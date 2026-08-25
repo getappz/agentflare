@@ -823,10 +823,8 @@ fn explain_cmd(opts: ExplainArgs) {
     // (fields never contain that control byte) with the multi-line body
     // last so it can't be truncated by the split -- one spawn instead of
     // three separate `git log -1 --format=...` calls.
-    let Ok(combined) = shell::run_in(
-        &repo_root,
-        &["log", "-1", "--format=%s\x1f%ci\x1f%B", &sha],
-    ) else {
+    let Ok(combined) = shell::run_in(&repo_root, &["log", "-1", "--format=%s\x1f%ci\x1f%B", &sha])
+    else {
         crate::ui::error(&format!(
             "agentflare git explain: could not read commit {sha}"
         ));
