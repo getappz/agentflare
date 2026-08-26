@@ -116,6 +116,23 @@ impl InsightsStore {
                 VALUES (new.rowid, new.session_id, new.user_text, new.assistant_text);
             END;
 
+            CREATE TABLE IF NOT EXISTS file_events (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS subagents (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                parent_tool_call_id TEXT,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                task TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
             CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
             CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -339,11 +356,53 @@ impl InsightsStore {
         Ok(out)
     }
 
-    /// DRY transactional session+turns+tools
-    pub fn upsert_session_bundle(&self, s: &Session, turns: &[Turn], tools: &[ToolCall]) -> Result<(), StoreError> {
+    pub fn upsert_file_events_batch(&self, events: &[crate::model::FileEvent]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for e in events {
+            tx.execute(
+                "INSERT INTO file_events(id, session_id, path, kind, at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET path=excluded.path, kind=excluded.kind, at=excluded.at",
+                params![e.id, e.session_id, e.path, e.kind, e.at.to_rfc3339()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_file_events(&self, session_id: &str) -> Result<Vec<crate::model::FileEvent>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT * FROM file_events WHERE session_id=?1 ORDER BY at ASC")?;
+        let rows = stmt.query_map(params![session_id], row_to_file_event)?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    pub fn upsert_subagents_batch(&self, subs: &[crate::model::Subagent]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for s in subs {
+            tx.execute(
+                "INSERT INTO subagents(id, session_id, parent_tool_call_id, kind, status, task) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, status=excluded.status, task=excluded.task",
+                params![s.id, s.session_id, s.parent_tool_call_id, s.kind, s.status, s.task],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_subagents(&self, session_id: &str) -> Result<Vec<crate::model::Subagent>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT * FROM subagents WHERE session_id=?1")?;
+        let rows = stmt.query_map(params![session_id], row_to_subagent)?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    /// DRY transactional session+turns+tools+files+subagents
+    pub fn upsert_session_bundle(&self, s: &Session, turns: &[Turn], tools: &[ToolCall], files: &[crate::model::FileEvent], subs: &[crate::model::Subagent]) -> Result<(), StoreError> {
         self.upsert_session(s)?;
         if !turns.is_empty() { self.upsert_turns_batch(turns)?; }
         if !tools.is_empty() { self.upsert_tool_calls_batch(tools)?; }
+        if !files.is_empty() { self.upsert_file_events_batch(files)?; }
+        if !subs.is_empty() { self.upsert_subagents_batch(subs)?; }
         Ok(())
     }
 }
@@ -415,6 +474,29 @@ fn row_to_turn(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
         ended_at: ended.and_then(parse_dt),
         tokens,
         cost_usd: row.get("cost_usd")?,
+    })
+}
+
+fn row_to_file_event(row: &rusqlite::Row) -> rusqlite::Result<crate::model::FileEvent> {
+    let at_str: String = row.get("at")?;
+    let at = at_str.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now());
+    Ok(crate::model::FileEvent {
+        id: row.get("id")?,
+        session_id: row.get("session_id")?,
+        path: row.get("path")?,
+        kind: row.get("kind")?,
+        at,
+    })
+}
+
+fn row_to_subagent(row: &rusqlite::Row) -> rusqlite::Result<crate::model::Subagent> {
+    Ok(crate::model::Subagent {
+        id: row.get("id")?,
+        session_id: row.get("session_id")?,
+        parent_tool_call_id: row.get("parent_tool_call_id")?,
+        kind: row.get("kind")?,
+        status: row.get("status")?,
+        task: row.get("task")?,
     })
 }
 

@@ -136,6 +136,8 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
     let mut total_sessions = 0;
     let mut total_turns = 0;
     let mut total_tools = 0;
+    let mut total_files = 0;
+    let mut total_subs = 0;
     for (source, res) in mgr.scan_all(&config) {
         match res {
             Ok(bundle) => {
@@ -155,15 +157,23 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
                 if !bundle.tool_calls.is_empty() {
                     let _ = store.upsert_tool_calls_batch(&bundle.tool_calls);
                 }
+                if !bundle.file_events.is_empty() {
+                    let _ = store.upsert_file_events_batch(&bundle.file_events);
+                }
+                if !bundle.subagents.is_empty() {
+                    let _ = store.upsert_subagents_batch(&bundle.subagents);
+                }
                 total_sessions += bundle.sessions.len();
                 total_turns += bundle.turns.len();
                 total_tools += bundle.tool_calls.len();
+                total_files += bundle.file_events.len();
+                total_subs += bundle.subagents.len();
             }
             Err(e) => eprintln!("{source}: error {e}"),
         }
     }
     println!(
-        "synced {total_sessions} sessions {total_turns} turns {total_tools} tools -> {}",
+        "synced {total_sessions} sessions {total_turns} turns {total_tools} tools {total_files} files {total_subs} subs -> {}",
         db.display()
     );
     if args.prune_days > 0 {

@@ -117,3 +117,40 @@ pub fn get_nested_str<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
     }
     cur.as_str()
 }
+
+/// DRY: extract file path from tool input for file_events
+pub fn extract_file_path(tool: &str, input: &serde_json::Value) -> Option<String> {
+    // Claude/Codex and OpenCode share similar arg names
+    for key in ["file_path", "path", "file", "filepath", "filename"] {
+        if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
+            return Some(s.to_string());
+        }
+    }
+    // nested file_path inside input
+    if let Some(obj) = input.as_object() {
+        for (_, v) in obj {
+            if let Some(s) = v.as_str() {
+                if s.contains('/') && (s.ends_with(".rs") || s.ends_with(".ts") || s.ends_with(".py") || s.contains('.')) {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    // fallback: for read/write/edit tools, try to find any string containing '/'
+    if matches!(tool, "read" | "write" | "edit" | "glob" | "grep" | "bash") {
+        if let Some(s) = input.as_str() {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+pub fn file_kind_for_tool(tool: &str) -> &'static str {
+    match tool {
+        "read" | "glob" | "grep" => "read",
+        "write" => "write",
+        "edit" => "edit",
+        "bash" => "bash",
+        _ => "tool",
+    }
+}
