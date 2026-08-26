@@ -69,6 +69,12 @@ pub fn commit_uncommitted(
 /// resolvable remote, or a lookup failure all just report "not merged yet"
 /// rather than erroring, since the caller's fallback is simply to check
 /// again later.
+///
+/// `find_existing` matches on branch name alone, and branch names get
+/// reused across items over time, so a match is only trusted as this
+/// item's own PR when `marks_item` confirms it -- otherwise an unrelated,
+/// already-merged PR from a past item would fool `check_merge` into
+/// promoting this item off someone else's merge (item #63).
 pub fn is_pr_merged(item: &agentflare_backend::item::Item, repo_root: &Path) -> bool {
     let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
     let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
@@ -79,7 +85,10 @@ pub fn is_pr_merged(item: &agentflare_backend::item::Item, repo_root: &Path) -> 
         Err(_) => return false,
     };
     match crate::github::pulls::find_existing(&client, &repo, &branch) {
-        Ok(Some(pr)) => pr.merged_at.is_some(),
+        Ok(Some(pr)) => {
+            pr.merged_at.is_some()
+                && crate::github::pulls::marks_item(pr.body.as_deref(), item.sequence_id)
+        }
         Ok(None) => false,
         Err(e) => {
             eprintln!(
@@ -97,6 +106,11 @@ pub fn is_pr_merged(item: &agentflare_backend::item::Item, repo_root: &Path) -> 
 /// -- it identifies who did the work, not what stage it's in. Best-effort
 /// like the rest of this module: a label failure here must never undo (or
 /// even appear to block) a DB promotion that has already happened.
+///
+/// Same branch-reuse hazard as `is_pr_merged`: a `find_existing` match is
+/// only relabeled once `marks_item` confirms it's this item's own PR, so an
+/// unrelated PR that happens to share the branch name never gets its
+/// labels touched on this item's behalf (item #63).
 pub fn relabel_pr_completed(item: &agentflare_backend::item::Item, repo_root: &Path) {
     let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
     let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
@@ -107,8 +121,10 @@ pub fn relabel_pr_completed(item: &agentflare_backend::item::Item, repo_root: &P
         Err(_) => return,
     };
     let pr = match crate::github::pulls::find_existing(&client, &repo, &branch) {
-        Ok(Some(pr)) => pr,
-        Ok(None) => return,
+        Ok(Some(pr)) if crate::github::pulls::marks_item(pr.body.as_deref(), item.sequence_id) => {
+            pr
+        }
+        Ok(Some(_)) | Ok(None) => return,
         Err(e) => {
             eprintln!(
                 "worktree: could not look up PR to relabel for item {}: {e}",
@@ -155,6 +171,11 @@ pub enum PrCiStatus {
 /// Same "total>0 && not pending" gate `cli::git::wait_for_checks` polls on,
 /// applied once instead of in a loop -- the sweep itself provides the retry
 /// cadence across ticks.
+///
+/// Same branch-reuse hazard as `is_pr_merged`: a `find_existing` match is
+/// only trusted once `marks_item` confirms it's this item's own PR, so an
+/// unrelated PR sharing the branch name can't report its CI status as this
+/// item's (item #63).
 pub fn pr_ci_status(item: &agentflare_backend::item::Item, repo_root: &Path) -> PrCiStatus {
     let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
     let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
@@ -165,8 +186,10 @@ pub fn pr_ci_status(item: &agentflare_backend::item::Item, repo_root: &Path) -> 
         Err(_) => return PrCiStatus::Unknown,
     };
     let pr = match crate::github::pulls::find_existing(&client, &repo, &branch) {
-        Ok(Some(pr)) => pr,
-        Ok(None) => return PrCiStatus::Unknown,
+        Ok(Some(pr)) if crate::github::pulls::marks_item(pr.body.as_deref(), item.sequence_id) => {
+            pr
+        }
+        Ok(Some(_)) | Ok(None) => return PrCiStatus::Unknown,
         Err(e) => {
             eprintln!(
                 "worktree: could not check PR status for item {}: {e}",
@@ -370,12 +393,31 @@ pub fn push_and_open_pr(
     // soft-failed the same way the rest of this function is: log and fall
     // through to `create`, since a rare duplicate is a far smaller harm
     // than silently never opening a PR on a lookup hiccup.
+    //
+    // A closed/merged match is only trusted as *this item's own* prior PR
+    // when its body carries this item's marker -- branch names get reused
+    // across items over time, and `find_existing` matches on branch name
+    // alone, so an unrelated, already-merged PR from a past item can share
+    // this branch's name (item #63: that stale match got returned as
+    // `pr_url`, which made `in_review` true and skipped the
+    // `nothing_was_ever_committed` safety net for real, uncommitted work).
+    // An open match is always trusted regardless of its body, since GitHub
+    // itself would reject creating a genuine duplicate against it anyway.
     match crate::github::pulls::find_existing(&client, &repo, &branch) {
-        Ok(Some(existing)) => {
+        Ok(Some(existing))
+            if existing.state == "open"
+                || crate::github::pulls::marks_item(existing.body.as_deref(), item.sequence_id) =>
+        {
             if let Some(p) = progress {
                 p.send(1.0, Some(1.0), Some("PR already exists".into()));
             }
             return Some(existing.html_url);
+        }
+        Ok(Some(existing)) => {
+            eprintln!(
+                "worktree: found a {} PR #{} on branch {branch} but it isn't item {}'s own PR -- opening a new one",
+                existing.state, existing.number, item.id
+            );
         }
         Ok(None) => {}
         Err(e) => {
