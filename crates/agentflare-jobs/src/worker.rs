@@ -2,6 +2,7 @@ use crate::executor::{InProcessExecutor, JobFailure};
 use crate::queue::Queue;
 use crate::supervisor::Supervisor;
 use crate::types::JobOutput;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -242,6 +243,7 @@ fn run_in_process(
             }
         }
         Ok(Err(failure)) => {
+            record_output_best_effort(queue, id, &stdout_path, &stderr_path);
             record_fail(&failure.message, failure.retry_after_secs, failure.fatal);
         }
         Err(_) => {
@@ -252,7 +254,22 @@ fn run_in_process(
                  what this timeout measures)",
                 job.timeout_secs
             );
+            record_output_best_effort(queue, id, &stdout_path, &stderr_path);
             record_fail(&msg, None, false);
         }
+    }
+}
+
+/// The log file at `stdout_path` was already written by the executor
+/// before it failed or timed out (see `run_in_process`'s call sites) — this
+/// persists that path/size the same way the success branch does, so a
+/// failed job's log stays reachable via `stdout_log_path` instead of
+/// existing on disk with no DB row pointing at it. Best-effort: a failure
+/// here just means the job's own failure/timeout error still gets recorded
+/// via `record_fail` right after, unaffected by this.
+fn record_output_best_effort(queue: &Queue, id: &str, stdout_path: &Path, stderr_path: &Path) {
+    let stdout_total_bytes = std::fs::metadata(stdout_path).map(|m| m.len()).unwrap_or(0);
+    if let Err(e) = queue.record_output(id, stdout_path, stderr_path, stdout_total_bytes, 0) {
+        eprintln!("agentflare-jobs: failed to record output for {id}: {e}");
     }
 }

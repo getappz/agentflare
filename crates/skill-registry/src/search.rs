@@ -3,7 +3,7 @@
 
 pub use flare_search_kit::MatchMode;
 use flare_search_kit::{clamped_limit, fts_query};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SkillHit {
@@ -192,6 +192,123 @@ pub fn list_all_name_source_pairs(conn: &Connection) -> rusqlite::Result<Vec<(St
     rows.collect()
 }
 
+/// Every distinct category with its skill count, ordered by count (most
+/// populated first) then name. Skills with no explicit `category:` and no
+/// tag to derive one from (an empty string) group under `""` -- the
+/// `skill_categories` MCP tool surfaces that as "uncategorized".
+pub fn list_categories(conn: &Connection) -> rusqlite::Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT category, count(*) FROM skills
+         GROUP BY category
+         ORDER BY count(*) DESC, category",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+/// (name, source) pairs for every skill in one category, name-ordered.
+pub fn skills_in_category(
+    conn: &Connection,
+    category: &str,
+) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT name, source FROM skills WHERE category = ?1 ORDER BY name")?;
+    let rows = stmt.query_map(rusqlite::params![category], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+/// Load one skill's full `SkillHit` row (score overridden by the caller).
+/// Used by `search_semantic` to backfill a vector-only match that didn't
+/// place in the BM25 candidate pool.
+fn hit_by_key(conn: &Connection, name: &str, source: &str) -> rusqlite::Result<Option<SkillHit>> {
+    conn.query_row(
+        "SELECT s.name, s.source, s.description, s.est_tokens,
+                s.shadow_path IS NOT NULL, s.last_used_at,
+                s.bandit_alpha, s.bandit_beta
+         FROM skills s WHERE s.name = ?1 AND s.source = ?2",
+        rusqlite::params![name, source],
+        |r| {
+            Ok(SkillHit {
+                name: r.get(0)?,
+                source: r.get(1)?,
+                description: r.get(2)?,
+                est_tokens: r.get(3)?,
+                compressed: r.get(4)?,
+                last_used_at: r.get(5)?,
+                bandit_alpha: r.get(6)?,
+                bandit_beta: r.get(7)?,
+                score: 0.0,
+                install_hint: None,
+                remote_url: None,
+            })
+        },
+    )
+    .optional()
+}
+
+/// `search()` blended with semantic (embedding) similarity, degrading
+/// exactly to `search()`'s own ranking when `embed_query` returns `None`
+/// (no `semantic` feature, no model, or a failed call) -- byte-identical to
+/// pre-semantic behavior in that case, per `src/memory`'s established
+/// pattern. `embed_query` is caller-supplied (mirrors `skill_detect::find_skills`)
+/// since this crate has no access to the binary's embedding engine.
+pub fn search_semantic(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    mode: MatchMode,
+    embed_query: impl Fn(&str) -> Option<Vec<f32>>,
+) -> rusqlite::Result<Vec<SkillHit>> {
+    let pool = limit.max(20);
+    let bm25_hits = search(conn, query, pool, mode)?;
+
+    let Some(qvec) = embed_query(query) else {
+        let mut hits = bm25_hits;
+        hits.truncate(limit);
+        return Ok(hits);
+    };
+    let vec_hits = crate::embed_store::candidates(conn, &qvec, pool)?;
+    if vec_hits.is_empty() {
+        let mut hits = bm25_hits;
+        hits.truncate(limit);
+        return Ok(hits);
+    }
+
+    // merge_ranked wants higher-is-better bm25 scores; ours are lower-is-better.
+    let bm25_scored: Vec<((String, String), f64)> = bm25_hits
+        .iter()
+        .map(|h| ((h.name.clone(), h.source.clone()), -h.score))
+        .collect();
+    let mut merged = agentflare_store::retrieval::merge_ranked(&bm25_scored, &vec_hits, 0.6, 0.4);
+    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut by_key: std::collections::HashMap<(String, String), SkillHit> = bm25_hits
+        .into_iter()
+        .map(|h| ((h.name.clone(), h.source.clone()), h))
+        .collect();
+
+    let mut out = Vec::with_capacity(limit);
+    for ((name, source), blended) in merged {
+        if out.len() >= limit {
+            break;
+        }
+        let hit = match by_key.remove(&(name.clone(), source.clone())) {
+            Some(mut hit) => {
+                hit.score = blended;
+                Some(hit)
+            }
+            None => hit_by_key(conn, &name, &source)?.map(|mut hit| {
+                hit.score = blended;
+                hit
+            }),
+        };
+        if let Some(hit) = hit {
+            out.push(hit);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +326,7 @@ mod tests {
             body: body.into(),
             neg_text: String::new(),
             tags: String::new(),
+            category: String::new(),
             est_tokens: 100,
             mtime: 1,
             bandit_alpha: 1.0,
@@ -252,6 +370,7 @@ mod tests {
             body: body_text.into(),
             neg_text: String::new(),
             tags: String::new(),
+            category: String::new(),
             est_tokens: 100,
             mtime: 1,
             bandit_alpha: 1.0,
@@ -329,6 +448,7 @@ mod tests {
             body: String::new(),
             neg_text: neg.into(),
             tags: String::new(),
+            category: String::new(),
             est_tokens: 100,
             mtime: 1,
             bandit_alpha: 1.0,
@@ -397,6 +517,62 @@ mod tests {
                 "win-cleanup".to_string()
             ]
         );
+    }
+
+    fn seed_categories() -> Connection {
+        let mut conn = crate::db::open_in_memory().unwrap();
+        let mk = |name: &str, category: &str| crate::sources::SkillEntry {
+            name: name.into(),
+            source: "claude-user".into(),
+            path: std::path::PathBuf::from(format!("/x/{name}/SKILL.md")),
+            description: "d".into(),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: String::new(),
+            category: category.into(),
+            est_tokens: 10,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        };
+        crate::db::rebuild(
+            &mut conn,
+            &[
+                mk("a", "testing"),
+                mk("b", "testing"),
+                mk("c", "web"),
+                mk("d", ""),
+            ],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn list_categories_groups_and_counts_most_populated_first() {
+        let conn = seed_categories();
+        assert_eq!(
+            list_categories(&conn).unwrap(),
+            vec![
+                ("testing".to_string(), 2),
+                ("".to_string(), 1),
+                ("web".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn skills_in_category_lists_only_that_categorys_skills() {
+        let conn = seed_categories();
+        assert_eq!(
+            skills_in_category(&conn, "testing").unwrap(),
+            vec![
+                ("a".to_string(), "claude-user".to_string()),
+                ("b".to_string(), "claude-user".to_string()),
+            ]
+        );
+        assert!(skills_in_category(&conn, "nonexistent").unwrap().is_empty());
     }
 
     #[test]
@@ -494,6 +670,7 @@ mod tests {
             body: String::new(),
             neg_text: neg.into(),
             tags: String::new(),
+            category: String::new(),
             est_tokens: 100,
             mtime: 1,
             bandit_alpha: 1.0,
@@ -514,6 +691,55 @@ mod tests {
             "long-desc",
             "a genuine (if diluted) positive match must outrank a short neg_text-only match; got order: {:?}",
             hits.iter().map(|h| h.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn search_semantic_degrades_to_plain_search_without_an_embedder() {
+        let conn = seed();
+        let plain = search(&conn, "usage analytics", 5, MatchMode::Any).unwrap();
+        let semantic =
+            search_semantic(&conn, "usage analytics", 5, MatchMode::Any, |_| None).unwrap();
+        let names = |hits: &[SkillHit]| hits.iter().map(|h| h.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&plain), names(&semantic));
+    }
+
+    #[test]
+    fn search_semantic_surfaces_a_vector_only_match_the_keyword_search_misses() {
+        let conn = seed();
+        // "win-cleanup" shares no keywords with the query, but we give it the
+        // closest embedding -- it should surface via the vector side even
+        // though plain keyword search wouldn't rank it at all.
+        crate::embed_store::upsert(&conn, "live", "claude-user", &[0.0, 1.0], "test").unwrap();
+        crate::embed_store::upsert(&conn, "cv-usage", "claude-user", &[0.0, 1.0], "test").unwrap();
+        crate::embed_store::upsert(&conn, "win-cleanup", "claude-user", &[1.0, 0.0], "test")
+            .unwrap();
+
+        let plain = search(&conn, "reclaim storage", 5, MatchMode::Any).unwrap();
+        assert!(
+            plain.is_empty(),
+            "keyword search should find nothing for this phrasing"
+        );
+
+        let semantic = search_semantic(&conn, "reclaim storage", 5, MatchMode::Any, |_| {
+            Some(vec![1.0, 0.0])
+        })
+        .unwrap();
+        assert_eq!(semantic[0].name, "win-cleanup");
+    }
+
+    #[test]
+    fn search_semantic_blends_a_shared_hit_rather_than_duplicating_it() {
+        let conn = seed();
+        crate::embed_store::upsert(&conn, "cv-usage", "claude-user", &[1.0, 0.0], "test").unwrap();
+        let semantic = search_semantic(&conn, "usage analytics", 5, MatchMode::Any, |_| {
+            Some(vec![1.0, 0.0])
+        })
+        .unwrap();
+        assert_eq!(
+            semantic.iter().filter(|h| h.name == "cv-usage").count(),
+            1,
+            "a skill matched by both bm25 and the vector side must appear once, blended"
         );
     }
 }

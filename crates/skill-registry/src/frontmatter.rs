@@ -10,6 +10,8 @@ pub struct Frontmatter {
     pub description: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 /// Parse `---\n<yaml>\n---\n<body>`. Returns None when the file has no
@@ -69,5 +71,17 @@ mod tests {
     #[test]
     fn returns_none_on_unterminated_block() {
         assert!(parse_frontmatter("---\nname: x\nno closing fence").is_none());
+    }
+
+    #[test]
+    fn parses_explicit_category() {
+        let (fm, _) = parse_frontmatter("---\nname: x\ncategory: testing\n---\nb").unwrap();
+        assert_eq!(fm.category.as_deref(), Some("testing"));
+    }
+
+    #[test]
+    fn category_defaults_to_none_when_absent() {
+        let (fm, _) = parse_frontmatter("---\nname: x\n---\nb").unwrap();
+        assert_eq!(fm.category, None);
     }
 }
