@@ -438,8 +438,65 @@ fn parse_json_reply(stdout: &str) -> HeadlessReply {
 /// (see `run_captured`'s doc comment for the distinction). Reuses the shared
 /// registry (binary discovery + per-agent print-mode mapping) so callers
 /// don't reimplement any of it.
+///
+/// Runs in the caller's ambient cwd — the child inherits whatever directory
+/// the caller already chdir'd into. Use `run_headless_in` when the cwd must
+/// be set explicitly regardless of ambient state.
 #[allow(dead_code)]
 pub fn run_headless(
+    registry: &[AgentSpec],
+    agent: &str,
+    prompt: &str,
+    hard_cap: Duration,
+    idle_timeout: Duration,
+    extra_args: &[String],
+    request_json: bool,
+) -> HeadlessOutcome {
+    run_headless_impl(
+        None,
+        registry,
+        agent,
+        prompt,
+        hard_cap,
+        idle_timeout,
+        extra_args,
+        request_json,
+    )
+}
+
+/// Like `run_headless`, but explicitly sets the child's working directory to
+/// `cwd` via `Command::current_dir` instead of relying on the caller's
+/// ambient cwd. Needed because `agentflare_jobs::sandbox::wrap`'s own `cwd`
+/// parameter only affects the Linux bwrap sandbox path (see its doc comment)
+/// — on Windows/macOS the argv comes back unchanged and nothing else in this
+/// module ever calls `Command::current_dir`.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn run_headless_in(
+    cwd: &Path,
+    registry: &[AgentSpec],
+    agent: &str,
+    prompt: &str,
+    hard_cap: Duration,
+    idle_timeout: Duration,
+    extra_args: &[String],
+    request_json: bool,
+) -> HeadlessOutcome {
+    run_headless_impl(
+        Some(cwd),
+        registry,
+        agent,
+        prompt,
+        hard_cap,
+        idle_timeout,
+        extra_args,
+        request_json,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_headless_impl(
+    explicit_cwd: Option<&Path>,
     registry: &[AgentSpec],
     agent: &str,
     prompt: &str,
@@ -478,10 +535,12 @@ pub fn run_headless(
     };
     // Native Linux and WSL2 run the agent CLI inside a bwrap sandbox, same as
     // `Supervisor::spawn`; Windows and macOS get argv back unchanged (see
-    // `agentflare_jobs::sandbox`). Uses the ambient cwd since neither this
-    // function nor `run_captured` below ever calls `Command::current_dir` —
-    // the child inherits whatever directory the caller already chdir'd into
-    // (e.g. `execute_work`'s worktree chdir for autonomous dispatch).
+    // `agentflare_jobs::sandbox`). `run_headless` (explicit_cwd = None) uses
+    // the ambient cwd since neither this function nor `run_captured` below
+    // otherwise calls `Command::current_dir` — the child inherits whatever
+    // directory the caller already chdir'd into (e.g. `execute_work`'s
+    // worktree chdir for autonomous dispatch). `run_headless_in` passes an
+    // explicit cwd instead, set on `cmd` below.
     //
     // `git_writable = true`: unlike `Supervisor::spawn`'s arbitrary job
     // commands, this specific child IS the headless coding-agent CLI, whose
@@ -492,7 +551,9 @@ pub fn run_headless(
     // swallowed silently, so `agentflare_mcp::item_done` fell through to
     // "nothing was ever committed" and reported success anyway (exit 0),
     // leaving real staged/edited work stranded in the worktree.
-    let cwd = std::env::current_dir().ok();
+    let cwd = explicit_cwd
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
     // Script-shim agents (`.ps1`, or `.cmd`/`.bat` wrapping a sibling
     // `.ps1`) are launched through `powershell.exe -WindowStyle Hidden`
     // rather than the shim itself — see `launch_command`. The rest (native
@@ -505,6 +566,9 @@ pub fn run_headless(
         agentflare_jobs::sandbox::wrap(&launch_cmd, &launch_args, cwd.as_deref(), true);
     let mut cmd = Command::new(&sandboxed_command);
     cmd.args(&sandboxed_args);
+    if let Some(dir) = explicit_cwd {
+        cmd.current_dir(dir);
+    }
     // Suppress the console window the daemon's child would otherwise flash —
     // but only for native binaries. Script shims need a real console to run
     // (under `CREATE_NO_WINDOW` cursor-agent hangs with zero output); the
@@ -1104,6 +1168,48 @@ mod tests {
                     reply.text.trim(),
                     huge_prompt.len().to_string(),
                     "the full oversized prompt should have arrived via stdin"
+                );
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    // `run_headless_in` differs from `run_headless` in exactly one way: it
+    // sets the child's cwd explicitly via `Command::current_dir` instead of
+    // relying on the caller's ambient cwd (see the doc comment on
+    // `run_headless_impl`). `sh -c pwd` reports back whatever cwd the child
+    // actually launched in, proving the explicit `cwd` argument reached the
+    // spawned process rather than being ignored.
+    #[cfg(unix)]
+    #[test]
+    fn run_headless_in_launches_with_an_explicit_cwd() {
+        let reg = vec![AgentSpec {
+            id: Agent::ClaudeCode,
+            display_name: "claude-code",
+            tier: Tier::Cli,
+            binary_names: &["sh"],
+            version_args: &[],
+            package_manager: None,
+            package_name: None,
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        let expected = std::fs::canonicalize(dir.path()).unwrap();
+
+        match run_headless_in(
+            dir.path(),
+            &reg,
+            "claude-code",
+            "ignored prompt",
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            &["-c".to_string(), "pwd".to_string()],
+            false,
+        ) {
+            HeadlessOutcome::Ok(reply) => {
+                assert_eq!(
+                    std::path::Path::new(reply.text.trim()),
+                    expected.as_path(),
+                    "child should have launched with the explicit cwd"
                 );
             }
             other => panic!("expected Ok, got {other:?}"),

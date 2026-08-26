@@ -68,6 +68,7 @@ dependencies = [
  "aes-gcm",
  "agent-detector",
  "agentflare-agent-registry",
+ "agentflare-apps",
  "agentflare-artifacts",
  "agentflare-backend",
  "agentflare-db-kit",
@@ -136,6 +137,18 @@ dependencies = [
  "agentflare-workspace-hack",
  "clap",
  "serde",
+ "toml",
+]
+
+[[package]]
+name = "agentflare-apps"
+version = "0.1.0"
+dependencies = [
+ "agentflare-gateway-registry",
+ "agentflare-workspace-hack",
+ "serde",
+ "serde_json",
+ "tempfile",
  "toml",
 ]
 
