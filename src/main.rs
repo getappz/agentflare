@@ -54,6 +54,7 @@ mod paths;
 mod pm_mode;
 mod pricing;
 mod progress;
+mod project_toolchain;
 mod quota;
 mod review;
 mod rollup;
