@@ -38,6 +38,15 @@ pub(crate) struct SkillDetectRequest {
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SkillCategoriesRequest {
+    #[schemars(
+        description = "Omit to list every category with its skill count. Pass a category name to list the skills in it instead."
+    )]
+    #[serde(default)]
+    pub(crate) category: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SkillRequest {
     #[schemars(description = "Action: search|load")]
     pub(crate) action: String,

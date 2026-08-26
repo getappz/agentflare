@@ -245,6 +245,18 @@ impl Registry {
         crate::search::list_all_names(&self.conn).map_err(|e| LoadError::Db(e.to_string()))
     }
 
+    /// Every distinct category with its skill count. See `search::list_categories`.
+    pub fn list_categories(&self) -> Result<Vec<(String, i64)>, LoadError> {
+        crate::search::list_categories(&self.conn).map_err(|e| LoadError::Db(e.to_string()))
+    }
+
+    /// (name, source) pairs for every skill in one category. See
+    /// `search::skills_in_category`.
+    pub fn skills_in_category(&self, category: &str) -> Result<Vec<(String, String)>, LoadError> {
+        crate::search::skills_in_category(&self.conn, category)
+            .map_err(|e| LoadError::Db(e.to_string()))
+    }
+
     pub fn load(&self, name: &str, original: bool) -> Result<LoadedSkill, LoadError> {
         load(&self.conn, name, original)
     }
@@ -277,6 +289,7 @@ mod tests {
                 body: String::new(),
                 neg_text: String::new(),
                 tags: String::new(),
+                category: String::new(),
                 est_tokens: 10,
                 mtime: 1,
                 bandit_alpha: 1.0,
@@ -291,6 +304,7 @@ mod tests {
                 body: String::new(),
                 neg_text: String::new(),
                 tags: String::new(),
+                category: String::new(),
                 est_tokens: 10,
                 mtime: 1,
                 bandit_alpha: 1.0,

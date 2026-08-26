@@ -145,6 +145,7 @@ static MIGRATIONS: std::sync::LazyLock<Migrations<'static>> = std::sync::LazyLoc
             add_ranking_columns_and_fts,
         ),
         M::up(include_str!("migrations/0003_vec.sql")),
+        M::up(include_str!("migrations/0004_category.sql")),
     ])
 });
 
@@ -179,8 +180,8 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
         // OR IGNORE: a single bad skill (duplicate (name, source)) must not
         // roll back the whole rebuild and disable every skill_search/skill_load.
         let mut ins = tx.prepare(
-            "INSERT OR IGNORE INTO skills (name, source, path, description, body, neg_text, tags, est_tokens, mtime, last_used_at, bandit_alpha, bandit_beta, shadow_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?11, ?12, ?10)",
+            "INSERT OR IGNORE INTO skills (name, source, path, description, body, neg_text, tags, category, est_tokens, mtime, last_used_at, bandit_alpha, bandit_beta, shadow_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?12, ?13, ?11)",
         )?;
         for e in entries {
             ins.execute(params![
@@ -191,6 +192,7 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
                 e.body,
                 e.neg_text,
                 e.tags,
+                e.category,
                 e.est_tokens,
                 e.mtime,
                 e.shadow_path
@@ -232,6 +234,7 @@ mod tests {
             body: String::new(),
             neg_text: String::new(),
             tags: String::new(),
+            category: String::new(),
             est_tokens: 100,
             mtime: 1,
             bandit_alpha: 1.0,
