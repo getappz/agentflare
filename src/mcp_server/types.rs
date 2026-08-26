@@ -68,7 +68,9 @@ pub(crate) struct SkillRequest {
 pub(crate) struct SkillCreateRequest {
     #[schemars(description = "Name of the new skill (becomes directory name)")]
     pub(crate) name: String,
-    #[schemars(description = "Template to use: web-development, api-development, testing, base, or path to custom template")]
+    #[schemars(
+        description = "Template to use: web-development, api-development, testing, base, or path to custom template"
+    )]
     pub(crate) template: Option<String>,
     #[schemars(description = "Description for the skill frontmatter")]
     pub(crate) description: Option<String>,

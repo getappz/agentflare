@@ -312,7 +312,10 @@ impl AgentflareMcp {
     #[tool(
         description = "Create a new skill from a template. Scaffolds a skill directory with SKILL.md frontmatter and body. Templates: web-development, api-development, testing, base (default). Writes to .claude/skills/<name>/ by default."
     )]
-    async fn skill_create(&self, Parameters(req): Parameters<SkillCreateRequest>) -> Result<String, ErrorData> {
+    async fn skill_create(
+        &self,
+        Parameters(req): Parameters<SkillCreateRequest>,
+    ) -> Result<String, ErrorData> {
         self.skill_create_impl(req).await
     }
 
