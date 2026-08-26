@@ -144,6 +144,7 @@ static MIGRATIONS: std::sync::LazyLock<Migrations<'static>> = std::sync::LazyLoc
             include_str!("migrations/0002_ranking_and_fts.sql"),
             add_ranking_columns_and_fts,
         ),
+        M::up(include_str!("migrations/0003_vec.sql")),
     ])
 });
 

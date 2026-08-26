@@ -214,6 +214,32 @@ impl Registry {
             .map_err(|e| LoadError::Db(e.to_string()))
     }
 
+    /// `search`, blended with semantic similarity when `embed_query` returns
+    /// a vector -- degrades to plain `search` otherwise. See
+    /// `crate::search::search_semantic`.
+    pub fn search_semantic(
+        &self,
+        query: &str,
+        limit: usize,
+        mode: MatchMode,
+        embed_query: impl Fn(&str) -> Option<Vec<f32>>,
+    ) -> Result<Vec<SkillHit>, LoadError> {
+        crate::search::search_semantic(&self.conn, query, limit, mode, embed_query)
+            .map_err(|e| LoadError::Db(e.to_string()))
+    }
+
+    /// Compute and store embeddings for up to `limit` indexed skills that
+    /// don't have one yet. See `crate::embed_store::backfill`.
+    pub fn backfill_embeddings(
+        &self,
+        embed_doc: impl Fn(&str) -> Option<Vec<f32>>,
+        model: &str,
+        limit: usize,
+    ) -> Result<usize, LoadError> {
+        crate::embed_store::backfill(&self.conn, embed_doc, model, limit)
+            .map_err(|e| LoadError::Db(e.to_string()))
+    }
+
     /// Every distinct skill name currently indexed, regardless of source.
     pub fn list_all_names(&self) -> Result<Vec<String>, LoadError> {
         crate::search::list_all_names(&self.conn).map_err(|e| LoadError::Db(e.to_string()))
