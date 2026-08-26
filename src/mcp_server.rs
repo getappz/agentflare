@@ -21,10 +21,8 @@ pub(crate) mod types;
 mod workflow;
 
 use crate::optimize;
-use crate::project_toolchain::{detect_project_type, rank_skills_for_project};
 use crate::progress::{PROGRESS_SENDER, ProgressSender};
-use crate::skill_registry::search::MatchMode;
-use std::path::PathBuf;
+use crate::project_toolchain::{detect_project_type, rank_skills_for_project};
 use base64::Engine as _;
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -42,6 +40,8 @@ use rmcp::{
 };
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
+use skill_registry::search::MatchMode;
+use std::path::PathBuf;
 
 use types::*;
 
@@ -312,18 +312,26 @@ impl AgentflareMcp {
         &self,
         Parameters(req): Parameters<SkillRecommendRequest>,
     ) -> Result<String, ErrorData> {
-        let cwd = req.cwd.as_deref().map(PathBuf::from).unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        });
+        let cwd = req
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let profile = detect_project_type(&cwd);
         let limit = req.limit.unwrap_or(10);
 
-        let skills = self.with_fresh_registry(|reg| reg.search("", limit * 3, MatchMode::Any))?;
+        let skills = self
+            .with_fresh_registry(|reg| reg.search("", limit * 3, MatchMode::Any))
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let skills = match skills {
+            Ok(s) => s,
+            Err(e) => return Err(ErrorData::internal_error(e.to_string(), None)),
+        };
 
         let ranked = rank_skills_for_project(&profile, skills);
         let top_skills: Vec<_> = ranked.into_iter().take(limit).collect();
 
-        let mut result = serde_json::json!({
+        let result = serde_json::json!({
             "project_profile": {
                 "languages": profile.languages,
                 "frameworks": profile.frameworks,
@@ -340,11 +348,12 @@ impl AgentflareMcp {
                     "match_reasons": s.match_reasons,
                     "est_tokens": s.est_tokens,
                 });
-                if req.include_body {
-                    if let Ok(loaded) = self.with_fresh_registry(|reg| reg.load(&s.name, false)) {
+                if req.include_body
+                    && let Ok(Ok(loaded)) =
+                        self.with_fresh_registry(|reg| reg.load(&s.name, false))
+                    {
                         obj["body"] = serde_json::json!(loaded.body);
                     }
-                }
                 obj
             }).collect::<Vec<_>>(),
         });

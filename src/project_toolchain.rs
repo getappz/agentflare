@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectProfile {
@@ -30,8 +30,6 @@ fn detect_package_manager(cwd: &Path) -> String {
         "yarn".to_string()
     } else if cwd.join("bun.lockb").exists() {
         "bun".to_string()
-    } else if cwd.join("package-lock.json").exists() {
-        "npm".to_string()
     } else {
         "npm".to_string()
     }
@@ -39,143 +37,141 @@ fn detect_package_manager(cwd: &Path) -> String {
 
 fn parse_cargo_toml(cwd: &Path, profile: &mut ProjectProfile) {
     let cargo_toml = cwd.join("Cargo.toml");
-    if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
-        if let Ok(value) = content.parse::<toml::Value>() {
-            if let Some(deps) = value.get("dependencies").and_then(|d| d.as_table()) {
-                for (name, _) in deps {
-                    match name.as_str() {
-                        "actix-web" | "actix" => profile.frameworks.push("actix".to_string()),
-                        "axum" => profile.frameworks.push("axum".to_string()),
-                        "rocket" => profile.frameworks.push("rocket".to_string()),
-                        "warp" => profile.frameworks.push("warp".to_string()),
-                        "tokio" => profile.frameworks.push("tokio".to_string()),
-                        "async-std" => profile.frameworks.push("async-std".to_string()),
-                        "serde" => profile.frameworks.push("serde".to_string()),
-                        "diesel" => profile.frameworks.push("diesel".to_string()),
-                        "sqlx" => profile.frameworks.push("sqlx".to_string()),
-                        "tauri" => profile.frameworks.push("tauri".to_string()),
-                        "leptos" => profile.frameworks.push("leptos".to_string()),
-                        "dioxus" => profile.frameworks.push("dioxus".to_string()),
-                        "yew" => profile.frameworks.push("yew".to_string()),
-                        _ => {}
-                    }
+    if let Ok(content) = std::fs::read_to_string(&cargo_toml)
+        && let Ok(value) = content.parse::<toml::Value>()
+    {
+        if let Some(deps) = value.get("dependencies").and_then(|d| d.as_table()) {
+            for (name, _) in deps {
+                match name.as_str() {
+                    "actix-web" | "actix" => profile.frameworks.push("actix".to_string()),
+                    "axum" => profile.frameworks.push("axum".to_string()),
+                    "rocket" => profile.frameworks.push("rocket".to_string()),
+                    "warp" => profile.frameworks.push("warp".to_string()),
+                    "tokio" => profile.frameworks.push("tokio".to_string()),
+                    "async-std" => profile.frameworks.push("async-std".to_string()),
+                    "serde" => profile.frameworks.push("serde".to_string()),
+                    "diesel" => profile.frameworks.push("diesel".to_string()),
+                    "sqlx" => profile.frameworks.push("sqlx".to_string()),
+                    "tauri" => profile.frameworks.push("tauri".to_string()),
+                    "leptos" => profile.frameworks.push("leptos".to_string()),
+                    "dioxus" => profile.frameworks.push("dioxus".to_string()),
+                    "yew" => profile.frameworks.push("yew".to_string()),
+                    _ => {}
                 }
             }
-            if value.get("workspace").is_some() {
-                profile.is_monorepo = true;
-            }
+        }
+        if value.get("workspace").is_some() {
+            profile.is_monorepo = true;
         }
     }
 }
 
 fn parse_package_json(cwd: &Path, profile: &mut ProjectProfile) {
     let package_json = cwd.join("package.json");
-    if let Ok(content) = std::fs::read_to_string(&package_json) {
-        if let Ok(value) = content.parse::<serde_json::Value>() {
-            let deps = value
-                .get("dependencies")
-                .and_then(|d| d.as_object())
-                .into_iter()
-                .flat_map(|o| o.keys())
-                .chain(
-                    value
-                        .get("devDependencies")
-                        .and_then(|d| d.as_object())
-                        .into_iter()
-                        .flat_map(|o| o.keys()),
-                )
-                .collect::<HashSet<_>>();
+    if let Ok(content) = std::fs::read_to_string(&package_json)
+        && let Ok(value) = content.parse::<serde_json::Value>()
+    {
+        let deps = value
+            .get("dependencies")
+            .and_then(|d| d.as_object())
+            .into_iter()
+            .flat_map(|o| o.keys())
+            .chain(
+                value
+                    .get("devDependencies")
+                    .and_then(|d| d.as_object())
+                    .into_iter()
+                    .flat_map(|o| o.keys()),
+            )
+            .collect::<HashSet<_>>();
 
-            for dep in deps {
-                match dep.as_str() {
-                    "react" | "react-dom" => profile.frameworks.push("react".to_string()),
-                    "next" => profile.frameworks.push("nextjs".to_string()),
-                    "vue" => profile.frameworks.push("vue".to_string()),
-                    "nuxt" => profile.frameworks.push("nuxt".to_string()),
-                    "svelte" => profile.frameworks.push("svelte".to_string()),
-                    "express" => profile.frameworks.push("express".to_string()),
-                    "fastify" => profile.frameworks.push("fastify".to_string()),
-                    "nestjs" | "@nestjs/core" => profile.frameworks.push("nestjs".to_string()),
-                    "vite" => profile.build_tools.push("vite".to_string()),
-                    "webpack" => profile.build_tools.push("webpack".to_string()),
-                    "turbo" | "turbo-repo" => profile.build_tools.push("turborepo".to_string()),
-                    "nx" => profile.build_tools.push("nx".to_string()),
-                    "jest" | "vitest" => profile.frameworks.push("testing".to_string()),
-                    "typescript" => {
-                        if !profile.languages.contains(&"typescript".to_string()) {
-                            profile.languages.push("typescript".to_string());
-                        }
-                    }
-                    _ => {}
+        for dep in deps {
+            match dep.as_str() {
+                "react" | "react-dom" => profile.frameworks.push("react".to_string()),
+                "next" => profile.frameworks.push("nextjs".to_string()),
+                "vue" => profile.frameworks.push("vue".to_string()),
+                "nuxt" => profile.frameworks.push("nuxt".to_string()),
+                "svelte" => profile.frameworks.push("svelte".to_string()),
+                "express" => profile.frameworks.push("express".to_string()),
+                "fastify" => profile.frameworks.push("fastify".to_string()),
+                "nestjs" | "@nestjs/core" => profile.frameworks.push("nestjs".to_string()),
+                "vite" => profile.build_tools.push("vite".to_string()),
+                "webpack" => profile.build_tools.push("webpack".to_string()),
+                "turbo" | "turbo-repo" => profile.build_tools.push("turborepo".to_string()),
+                "nx" => profile.build_tools.push("nx".to_string()),
+                "jest" | "vitest" => profile.frameworks.push("testing".to_string()),
+                "typescript" if !profile.languages.contains(&"typescript".to_string()) => {
+                    profile.languages.push("typescript".to_string());
                 }
+                _ => {}
             }
-
-            if let Some(workspaces) = value.get("workspaces").and_then(|w| w.as_array()) {
-                if !workspaces.is_empty() {
-                    profile.is_monorepo = true;
-                }
-            }
-
-            profile.package_managers.push(detect_package_manager(cwd));
         }
+
+        if let Some(workspaces) = value.get("workspaces").and_then(|w| w.as_array())
+            && !workspaces.is_empty()
+        {
+            profile.is_monorepo = true;
+        }
+
+        profile.package_managers.push(detect_package_manager(cwd));
     }
 }
 
 fn parse_pyproject_toml(cwd: &Path, profile: &mut ProjectProfile) {
     let pyproject = cwd.join("pyproject.toml");
-    if let Ok(content) = std::fs::read_to_string(&pyproject) {
-        if let Ok(value) = content.parse::<toml::Value>() {
-            let deps = value
-                .get("project")
-                .and_then(|p| p.get("dependencies"))
-                .and_then(|d| d.as_array())
-                .into_iter()
-                .flat_map(|a| a.iter().filter_map(|v| v.as_str()))
-                .chain(
-                    value
-                        .get("tool")
-                        .and_then(|t| t.get("poetry"))
-                        .and_then(|p| p.get("dependencies"))
-                        .and_then(|d| d.as_table())
-                        .into_iter()
-                        .flat_map(|t| t.keys()),
-                )
-                .chain(
-                    value
-                        .get("tool")
-                        .and_then(|t| t.get("pdm"))
-                        .and_then(|p| p.get("dependencies"))
-                        .and_then(|d| d.as_table())
-                        .into_iter()
-                        .flat_map(|t| t.keys()),
-                )
-                .collect::<HashSet<_>>();
+    if let Ok(content) = std::fs::read_to_string(&pyproject)
+        && let Ok(value) = content.parse::<toml::Value>()
+    {
+        let deps = value
+            .get("project")
+            .and_then(|p| p.get("dependencies"))
+            .and_then(|d| d.as_array())
+            .into_iter()
+            .flat_map(|a| a.iter().filter_map(|v| v.as_str()))
+            .chain(
+                value
+                    .get("tool")
+                    .and_then(|t| t.get("poetry"))
+                    .and_then(|p| p.get("dependencies"))
+                    .and_then(|d| d.as_table())
+                    .into_iter()
+                    .flat_map(|t| t.keys().map(String::as_str)),
+            )
+            .chain(
+                value
+                    .get("tool")
+                    .and_then(|t| t.get("pdm"))
+                    .and_then(|p| p.get("dependencies"))
+                    .and_then(|d| d.as_table())
+                    .into_iter()
+                    .flat_map(|t| t.keys().map(String::as_str)),
+            )
+            .collect::<HashSet<_>>();
 
-            for dep in deps {
-                match dep.to_lowercase().as_str() {
-                    "django" => profile.frameworks.push("django".to_string()),
-                    "fastapi" => profile.frameworks.push("fastapi".to_string()),
-                    "flask" => profile.frameworks.push("flask".to_string()),
-                    "pydantic" => profile.frameworks.push("pydantic".to_string()),
-                    "sqlalchemy" => profile.frameworks.push("sqlalchemy".to_string()),
-                    "httpx" => profile.frameworks.push("httpx".to_string()),
-                    "typer" => profile.frameworks.push("typer".to_string()),
-                    "pytest" => profile.frameworks.push("testing".to_string()),
-                    "ruff" => profile.build_tools.push("ruff".to_string()),
-                    "maturin" => profile.build_tools.push("maturin".to_string()),
-                    _ => {}
-                }
+        for dep in deps {
+            match dep.to_lowercase().as_str() {
+                "django" => profile.frameworks.push("django".to_string()),
+                "fastapi" => profile.frameworks.push("fastapi".to_string()),
+                "flask" => profile.frameworks.push("flask".to_string()),
+                "pydantic" => profile.frameworks.push("pydantic".to_string()),
+                "sqlalchemy" => profile.frameworks.push("sqlalchemy".to_string()),
+                "httpx" => profile.frameworks.push("httpx".to_string()),
+                "typer" => profile.frameworks.push("typer".to_string()),
+                "pytest" => profile.frameworks.push("testing".to_string()),
+                "ruff" => profile.build_tools.push("ruff".to_string()),
+                "maturin" => profile.build_tools.push("maturin".to_string()),
+                _ => {}
             }
+        }
 
-            if value.get("tool").and_then(|t| t.get("poetry")).is_some() {
-                profile.package_managers.push("poetry".to_string());
-            } else if value.get("tool").and_then(|t| t.get("pdm")).is_some() {
-                profile.package_managers.push("pdm".to_string());
-            } else if value.get("tool").and_then(|t| t.get("hatch")).is_some() {
-                profile.package_managers.push("hatch".to_string());
-            } else if value.get("build-system").is_some() {
-                profile.package_managers.push("pip".to_string());
-            }
+        if value.get("tool").and_then(|t| t.get("poetry")).is_some() {
+            profile.package_managers.push("poetry".to_string());
+        } else if value.get("tool").and_then(|t| t.get("pdm")).is_some() {
+            profile.package_managers.push("pdm".to_string());
+        } else if value.get("tool").and_then(|t| t.get("hatch")).is_some() {
+            profile.package_managers.push("hatch".to_string());
+        } else if value.get("build-system").is_some() {
+            profile.package_managers.push("pip".to_string());
         }
     }
 }
@@ -188,7 +184,10 @@ fn parse_requirements_txt(cwd: &Path, profile: &mut ProjectProfile) {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let dep = line.split(&['=', '>', '<', '!', '~'][..]).next().unwrap_or(line);
+            let dep = line
+                .split(&['=', '>', '<', '!', '~'][..])
+                .next()
+                .unwrap_or(line);
             match dep.to_lowercase().as_str() {
                 "django" => profile.frameworks.push("django".to_string()),
                 "fastapi" => profile.frameworks.push("fastapi".to_string()),
@@ -240,10 +239,10 @@ pub fn detect_project_type(cwd: &Path) -> ProjectProfile {
         if !profile.languages.contains(&"javascript".to_string()) {
             profile.languages.push("javascript".to_string());
         }
-        if cwd.join("tsconfig.json").exists() {
-            if !profile.languages.contains(&"typescript".to_string()) {
-                profile.languages.push("typescript".to_string());
-            }
+        if cwd.join("tsconfig.json").exists()
+            && !profile.languages.contains(&"typescript".to_string())
+        {
+            profile.languages.push("typescript".to_string());
         }
         parse_package_json(cwd, &mut profile);
         profile.confidence.insert("javascript".to_string(), 1.0);
@@ -317,7 +316,7 @@ pub fn detect_project_type(cwd: &Path) -> ProjectProfile {
 
 pub fn rank_skills_for_project(
     profile: &ProjectProfile,
-    skills: Vec<crate::skill_registry::search::SkillHit>,
+    skills: Vec<skill_registry::search::SkillHit>,
 ) -> Vec<RankedSkill> {
     let mut ranked: Vec<RankedSkill> = skills
         .into_iter()
@@ -360,22 +359,18 @@ pub fn rank_skills_for_project(
                 }
             }
 
-            if profile.languages.contains(&"rust".to_string())
-                && skill_tags.contains(&"systems".to_string())
-            {
+            if profile.languages.contains(&"rust".to_string()) && skill_tags.contains("systems") {
                 score += 3.0;
                 reasons.push("category:systems".to_string());
             }
             if (profile.languages.contains(&"javascript".to_string())
                 || profile.languages.contains(&"typescript".to_string()))
-                && skill_tags.contains(&"web".to_string())
+                && skill_tags.contains("web")
             {
                 score += 3.0;
                 reasons.push("category:web".to_string());
             }
-            if profile.languages.contains(&"python".to_string())
-                && skill_tags.contains(&"data".to_string())
-            {
+            if profile.languages.contains(&"python".to_string()) && skill_tags.contains("data") {
                 score += 3.0;
                 reasons.push("category:data".to_string());
             }
@@ -392,7 +387,11 @@ pub fn rank_skills_for_project(
         })
         .collect();
 
-    ranked.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     ranked
 }
 
@@ -405,7 +404,11 @@ mod tests {
     #[test]
     fn detect_rust_project() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"\n[dependencies]\naxum = \"0.7\"\n").unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\n[dependencies]\naxum = \"0.7\"\n",
+        )
+        .unwrap();
 
         let profile = detect_project_type(dir.path());
         assert!(profile.languages.contains(&"rust".to_string()));
@@ -419,7 +422,8 @@ mod tests {
         fs::write(
             dir.path().join("package.json"),
             r#"{"name": "test", "dependencies": {"react": "^18", "next": "^14"}}"#,
-        ).unwrap();
+        )
+        .unwrap();
         fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
 
         let profile = detect_project_type(dir.path());
@@ -437,7 +441,8 @@ mod tests {
             r#"[project]
 name = "test"
 dependencies = ["fastapi", "pydantic"]"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let profile = detect_project_type(dir.path());
         assert!(profile.languages.contains(&"python".to_string()));
@@ -451,7 +456,8 @@ dependencies = ["fastapi", "pydantic"]"#,
         fs::write(
             dir.path().join("go.mod"),
             "module test\n\nrequire github.com/gin-gonic/gin v1.9.0\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let profile = detect_project_type(dir.path());
         assert!(profile.languages.contains(&"go".to_string()));
@@ -464,7 +470,8 @@ dependencies = ["fastapi", "pydantic"]"#,
         fs::write(
             dir.path().join("package.json"),
             r#"{"name": "root", "workspaces": ["packages/*"]}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let profile = detect_project_type(dir.path());
         assert!(profile.is_monorepo);

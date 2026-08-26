@@ -31,9 +31,12 @@ pub(crate) struct SkillDetectRequest {
     #[serde(default)]
     pub(crate) limit: Option<usize>,
     #[schemars(
+        description = "If true, return skill body content instead of just metadata (default false)"
+    )]
     #[serde(default)]
     pub(crate) include_body: bool,
 }
+
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SkillRecommendRequest {
     #[schemars(description = "Project directory to analyze (default: current working directory)")]
