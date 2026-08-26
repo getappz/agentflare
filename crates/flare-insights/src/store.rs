@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-use crate::model::{Session, SessionSource, SessionStatus, TokenUsage};
+use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, Turn, ToolCall};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -80,7 +80,8 @@ impl InsightsStore {
                 ended_at TEXT,
                 input_tokens INTEGER,
                 output_tokens INTEGER,
-                cost_usd REAL
+                cost_usd REAL,
+                UNIQUE(session_id, seq)
             );
 
             CREATE TABLE IF NOT EXISTS tool_calls (
@@ -95,24 +96,6 @@ impl InsightsStore {
                 created_at TEXT
             );
 
-            CREATE TABLE IF NOT EXISTS subagents (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                parent_tool_call_id TEXT,
-                kind TEXT NOT NULL,
-                status TEXT NOT NULL,
-                task TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS file_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                path TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                at TEXT NOT NULL
-            );
-
-            -- FTS5 for full-text search across turns
             CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
                 session_id, user_text, assistant_text,
                 content='turns', content_rowid='rowid',
@@ -142,6 +125,8 @@ impl InsightsStore {
         )?;
         Ok(())
     }
+
+    // ---- sessions ----
 
     pub fn upsert_session(&self, s: &Session) -> Result<(), StoreError> {
         let tags = serde_json::to_string(&s.tags)?;
@@ -216,7 +201,6 @@ impl InsightsStore {
     }
 
     pub fn search_sessions(&self, query: &str, limit: usize) -> Result<Vec<Session>, StoreError> {
-        // FTS5 search via turns_fts, rank by match
         let mut stmt = self.conn.prepare(
             r#"SELECT s.* FROM sessions s
                JOIN (SELECT session_id, rank FROM turns_fts WHERE turns_fts MATCH ?1 ORDER BY rank LIMIT ?2) f
@@ -243,6 +227,124 @@ impl InsightsStore {
         let mut stmt = self.conn.prepare("SELECT COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0), COALESCE(SUM(cost_usd),0) FROM sessions")?;
         let (tokens, cost): (i64, f64) = stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok((tokens as u64, cost))
+    }
+
+    // ---- turns (DRY batch) ----
+
+    pub fn upsert_turn(&self, t: &Turn) -> Result<(), StoreError> {
+        self.conn.execute(
+            r#"INSERT INTO turns(id, session_id, seq, user_text, assistant_text, started_at, ended_at, input_tokens, output_tokens, cost_usd)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+               ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, seq=excluded.seq, user_text=excluded.user_text, assistant_text=excluded.assistant_text, started_at=excluded.started_at, ended_at=excluded.ended_at, input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cost_usd=excluded.cost_usd"#,
+            params![
+                t.id,
+                t.session_id,
+                t.seq as i64,
+                t.user_text,
+                t.assistant_text,
+                t.started_at.map(|v| v.to_rfc3339()),
+                t.ended_at.map(|v| v.to_rfc3339()),
+                t.tokens.as_ref().map(|tok| tok.input as i64),
+                t.tokens.as_ref().map(|tok| tok.output as i64),
+                t.cost_usd,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_turns_batch(&self, turns: &[Turn]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for t in turns {
+            tx.execute(
+                r#"INSERT INTO turns(id, session_id, seq, user_text, assistant_text, started_at, ended_at, input_tokens, output_tokens, cost_usd)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                   ON CONFLICT(id) DO UPDATE SET user_text=excluded.user_text, assistant_text=excluded.assistant_text, input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cost_usd=excluded.cost_usd"#,
+                params![
+                    t.id,
+                    t.session_id,
+                    t.seq as i64,
+                    t.user_text,
+                    t.assistant_text,
+                    t.started_at.map(|v| v.to_rfc3339()),
+                    t.ended_at.map(|v| v.to_rfc3339()),
+                    t.tokens.as_ref().map(|tok| tok.input as i64),
+                    t.tokens.as_ref().map(|tok| tok.output as i64),
+                    t.cost_usd,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_turns(&self, session_id: &str) -> Result<Vec<Turn>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT * FROM turns WHERE session_id=?1 ORDER BY seq ASC")?;
+        let rows = stmt.query_map(params![session_id], row_to_turn)?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    // ---- tool_calls ----
+
+    pub fn upsert_tool_call(&self, tc: &ToolCall) -> Result<(), StoreError> {
+        self.conn.execute(
+            r#"INSERT INTO tool_calls(id, session_id, turn_seq, name, input, output, status, duration_ms, created_at)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+               ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, turn_seq=excluded.turn_seq, name=excluded.name, input=excluded.input, output=excluded.output, status=excluded.status, duration_ms=excluded.duration_ms, created_at=excluded.created_at"#,
+            params![
+                tc.id,
+                tc.session_id,
+                tc.turn_seq as i64,
+                tc.name,
+                serde_json::to_string(&tc.input).unwrap(),
+                tc.output,
+                tc.status,
+                tc.duration_ms.map(|v| v as i64),
+                tc.created_at.map(|v| v.to_rfc3339()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_tool_calls_batch(&self, tcs: &[ToolCall]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for tc in tcs {
+            tx.execute(
+                r#"INSERT INTO tool_calls(id, session_id, turn_seq, name, input, output, status, duration_ms, created_at)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                   ON CONFLICT(id) DO UPDATE SET output=excluded.output, status=excluded.status, duration_ms=excluded.duration_ms"#,
+                params![
+                    tc.id,
+                    tc.session_id,
+                    tc.turn_seq as i64,
+                    tc.name,
+                    serde_json::to_string(&tc.input).unwrap(),
+                    tc.output,
+                    tc.status,
+                    tc.duration_ms.map(|v| v as i64),
+                    tc.created_at.map(|v| v.to_rfc3339()),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_tool_calls(&self, session_id: &str) -> Result<Vec<ToolCall>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT * FROM tool_calls WHERE session_id=?1 ORDER BY turn_seq ASC")?;
+        let rows = stmt.query_map(params![session_id], row_to_tool_call)?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    /// DRY transactional session+turns+tools
+    pub fn upsert_session_bundle(&self, s: &Session, turns: &[Turn], tools: &[ToolCall]) -> Result<(), StoreError> {
+        self.upsert_session(s)?;
+        if !turns.is_empty() { self.upsert_turns_batch(turns)?; }
+        if !tools.is_empty() { self.upsert_tool_calls_batch(tools)?; }
+        Ok(())
     }
 }
 
@@ -289,5 +391,46 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         starred: row.get::<_, i64>("starred")? != 0,
         pid: row.get::<_, Option<i64>>("pid")?.map(|v| v as u32),
         cwd: row.get("cwd")?,
+    })
+}
+
+fn row_to_turn(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
+    let started: Option<String> = row.get("started_at")?;
+    let ended: Option<String> = row.get("ended_at")?;
+    let parse_dt = |s: String| s.parse::<DateTime<Utc>>().ok();
+    let input: Option<i64> = row.get("input_tokens")?;
+    let output: Option<i64> = row.get("output_tokens")?;
+    let tokens = match (input, output) {
+        (Some(i), Some(o)) => Some(TokenUsage { input: i as u64, output: o as u64, cache_read: 0, cache_write: 0, reasoning: 0 }),
+        (Some(i), None) => Some(TokenUsage { input: i as u64, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 }),
+        _ => None,
+    };
+    Ok(Turn {
+        id: row.get("id")?,
+        session_id: row.get("session_id")?,
+        seq: row.get::<_, i64>("seq")? as u32,
+        user_text: row.get("user_text")?,
+        assistant_text: row.get("assistant_text")?,
+        started_at: started.and_then(parse_dt),
+        ended_at: ended.and_then(parse_dt),
+        tokens,
+        cost_usd: row.get("cost_usd")?,
+    })
+}
+
+fn row_to_tool_call(row: &rusqlite::Row) -> rusqlite::Result<ToolCall> {
+    let input_str: String = row.get("input")?;
+    let input = serde_json::from_str(&input_str).unwrap_or(serde_json::Value::Null);
+    let created: Option<String> = row.get("created_at")?;
+    Ok(ToolCall {
+        id: row.get("id")?,
+        session_id: row.get("session_id")?,
+        turn_seq: row.get::<_, i64>("turn_seq")? as u32,
+        name: row.get("name")?,
+        input,
+        output: row.get("output")?,
+        status: row.get("status")?,
+        duration_ms: row.get::<_, Option<i64>>("duration_ms")?.map(|v| v as u64),
+        created_at: created.and_then(|s| s.parse::<DateTime<Utc>>().ok()),
     })
 }

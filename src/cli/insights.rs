@@ -133,20 +133,39 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
     let store = open_store(db.clone());
     let config = flare_insights::config::InsightsConfig::default();
     let mgr = flare_insights::ingest::IngestManager::new();
-    let mut total = 0;
+    let mut total_sessions = 0;
+    let mut total_turns = 0;
+    let mut total_tools = 0;
     for (source, res) in mgr.scan_all(&config) {
         match res {
-            Ok(sessions) => {
-                println!("{source}: {} sessions", sessions.len());
-                for s in sessions {
-                    let _ = store.upsert_session(&s);
-                    total += 1;
+            Ok(bundle) => {
+                println!(
+                    "{source}: {} sessions {} turns {} tools",
+                    bundle.sessions.len(),
+                    bundle.turns.len(),
+                    bundle.tool_calls.len()
+                );
+                // DRY: transactional bundle via store helpers
+                for s in &bundle.sessions {
+                    let _ = store.upsert_session(s);
                 }
+                if !bundle.turns.is_empty() {
+                    let _ = store.upsert_turns_batch(&bundle.turns);
+                }
+                if !bundle.tool_calls.is_empty() {
+                    let _ = store.upsert_tool_calls_batch(&bundle.tool_calls);
+                }
+                total_sessions += bundle.sessions.len();
+                total_turns += bundle.turns.len();
+                total_tools += bundle.tool_calls.len();
             }
             Err(e) => eprintln!("{source}: error {e}"),
         }
     }
-    println!("synced {total} sessions -> {}", db.display());
+    println!(
+        "synced {total_sessions} sessions {total_turns} turns {total_tools} tools -> {}",
+        db.display()
+    );
     if args.prune_days > 0 {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(args.prune_days as i64);
         match store.prune_older_than(cutoff) {
@@ -192,7 +211,10 @@ fn run_show(db: PathBuf, args: ShowArgs) {
     match store.get_session(&args.session_id) {
         Ok(Some(s)) => {
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&s).unwrap());
+                let turns = store.get_turns(&s.id).unwrap_or_default();
+                let tools = store.get_tool_calls(&s.id).unwrap_or_default();
+                let bundle = serde_json::json!({"session": s, "turns": turns, "tool_calls": tools});
+                println!("{}", serde_json::to_string_pretty(&bundle).unwrap());
             } else {
                 println!("{} [{}] {}", s.id, s.source.as_str(), s.project);
                 println!(
@@ -216,6 +238,28 @@ fn run_show(db: PathBuf, args: ShowArgs) {
                     "turns: {} tools: {} subagents: {}",
                     s.turn_count, s.tool_call_count, s.subagent_count
                 );
+                if let Some(t) = s.title {
+                    println!("title: {t}");
+                }
+                // DRY: show recent turns
+                let turns = store.get_turns(&s.id).unwrap_or_default();
+                for t in turns.iter().take(3) {
+                    println!(
+                        "  turn {}: {}",
+                        t.seq,
+                        t.user_text
+                            .as_deref()
+                            .or(t.assistant_text.as_deref())
+                            .unwrap_or("-")
+                            .chars()
+                            .take(120)
+                            .collect::<String>()
+                    );
+                }
+                let tools = store.get_tool_calls(&s.id).unwrap_or_default();
+                for tc in tools.iter().take(5) {
+                    println!("  tool {}: {}", tc.name, tc.id);
+                }
             }
         }
         Ok(None) => {
@@ -301,13 +345,14 @@ fn run_handoff(db: PathBuf, args: HandoffArgs) {
         eprintln!("session not found");
         std::process::exit(1);
     };
+    let turns = store.get_turns(&session.id).unwrap_or_default();
     let verbosity = match args.verbosity.as_str() {
         "minimal" => flare_insights::handoff::Verbosity::Minimal,
         "verbose" => flare_insights::handoff::Verbosity::Verbose,
         "full" => flare_insights::handoff::Verbosity::Full,
         _ => flare_insights::handoff::Verbosity::Standard,
     };
-    let doc = flare_insights::handoff::handoff_doc(&session, &[], &args.target, verbosity);
+    let doc = flare_insights::handoff::handoff_doc(&session, &turns, &args.target, verbosity);
     println!("{doc}");
 }
 
