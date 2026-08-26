@@ -124,7 +124,6 @@ pub(crate) fn agent_send_hook() -> SendMessage {
 /// agent's own native project-local discovery (`.claude/agents`,
 /// `.claude/skills`, `.mcp.json`) picks it up. The scratch directory is
 /// torn down after the step completes, win or lose.
-#[allow(dead_code)]
 pub(crate) fn app_send_hook(
     app_dir: PathBuf,
     tools: Option<agentflare_apps::ToolsManifest>,
@@ -334,7 +333,6 @@ pub(crate) async fn run_workflow_json_with_params_async(
 /// Same as [`run_workflow_json`] with an injectable `SendMessage` hook — the
 /// actual hook-in point for [`app_send_hook`] (via `agentflare apps run`) as
 /// well as tests that drive steps without an installed agent binary.
-#[allow(dead_code)]
 pub(crate) fn run_workflow_json_with_sender(
     definition_json: &str,
     input: &str,
