@@ -332,8 +332,12 @@ impl Queue {
             // dashboard even though the file is right there.
             let stdout_path = self.log_dir.join(format!("{id}.stdout"));
             let stderr_path = self.log_dir.join(format!("{id}.stderr"));
-            let stdout_bytes = std::fs::metadata(&stdout_path).map(|m| m.len()).unwrap_or(0);
-            let stderr_bytes = std::fs::metadata(&stderr_path).map(|m| m.len()).unwrap_or(0);
+            let stdout_bytes = std::fs::metadata(&stdout_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let stderr_bytes = std::fs::metadata(&stderr_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
             conn.execute(
                 "UPDATE agent_jobs
                  SET state = 'failed', error = ?1, finished_at = ?2,
