@@ -38,6 +38,19 @@ pub(crate) struct SkillDetectRequest {
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SkillRecommendRequest {
+    #[schemars(description = "Project directory to analyze (default: current working directory)")]
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
+    #[schemars(description = "Max skills to return (default 10)")]
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+    #[schemars(description = "Include full skill body in response")]
+    #[serde(default)]
+    pub(crate) include_body: bool,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SkillCategoriesRequest {
     #[schemars(
         description = "Omit to list every category with its skill count. Pass a category name to list the skills in it instead."
