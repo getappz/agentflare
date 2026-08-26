@@ -1,5 +1,5 @@
 [workspace]
-members = ["agentflare-workspace-hack","crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-process", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault", "crates/agentflare-resource-gate", "crates/flare-workflow", "crates/flare-sandbox"]
+members = ["agentflare-workspace-hack","crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-process", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault", "crates/agentflare-resource-gate", "crates/flare-workflow", "crates/flare-sandbox", "crates/agentflare-apps"]
 resolver = "2"
 
 [package]
@@ -43,6 +43,7 @@ path = "src/lib.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+toml = { version = "0.8" }
 serde_json = "1"
 dirs = "6"
 chrono = "0.4"
@@ -58,7 +59,6 @@ same-file = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2"
-toml = "0.8"
 rand = "0.8"
 aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", features = ["simple"] }
@@ -96,6 +96,8 @@ agentflare-resource-gate = { path = "crates/agentflare-resource-gate" }
 machine-uid = "0.6.0"
 agentflare-workspace-hack = { version = "0.1", path = "agentflare-workspace-hack" }
 dunce = "1"
+agentflare-apps = { path = "crates/agentflare-apps" }
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -120,7 +122,6 @@ built = { version = "0.8", features = ["chrono"] }
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
-tempfile = "3"
 pretty_assertions = "1"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
 tokio = { version = "1", features = ["test-util"] }

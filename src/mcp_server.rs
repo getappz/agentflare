@@ -22,6 +22,7 @@ mod workflow;
 
 use crate::optimize;
 use crate::progress::{PROGRESS_SENDER, ProgressSender};
+use crate::project_toolchain::{detect_project_type, rank_skills_for_project};
 use base64::Engine as _;
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -39,6 +40,8 @@ use rmcp::{
 };
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
+use skill_registry::search::MatchMode;
+use std::path::PathBuf;
 
 use types::*;
 
@@ -303,10 +306,110 @@ impl AgentflareMcp {
         Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
     }
     #[tool(
+        description = "Recommend skills based on project toolchain detection (Cargo.toml, package.json, pyproject.toml, etc.). Distinct from skill_detect which classifies user intent from prompts — this analyzes the actual project files to recommend relevant skills."
+    )]
+    async fn skill_recommend(
+        &self,
+        Parameters(req): Parameters<SkillRecommendRequest>,
+    ) -> Result<String, ErrorData> {
+        let cwd = req
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let profile = detect_project_type(&cwd);
+        let limit = req.limit.unwrap_or(10);
+
+        let skills = self
+            .with_fresh_registry(|reg| reg.search("", limit * 3, MatchMode::Any))
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let skills = match skills {
+            Ok(s) => s,
+            Err(e) => return Err(ErrorData::internal_error(e.to_string(), None)),
+        };
+
+        let ranked = rank_skills_for_project(&profile, skills);
+        let top_skills: Vec<_> = ranked.into_iter().take(limit).collect();
+
+        let result = serde_json::json!({
+            "project_profile": {
+                "languages": profile.languages,
+                "frameworks": profile.frameworks,
+                "package_managers": profile.package_managers,
+                "build_tools": profile.build_tools,
+                "is_monorepo": profile.is_monorepo,
+            },
+            "skills": top_skills.iter().map(|s| {
+                let mut obj = serde_json::json!({
+                    "name": s.name,
+                    "source": s.source,
+                    "description": s.description,
+                    "score": s.score,
+                    "match_reasons": s.match_reasons,
+                    "est_tokens": s.est_tokens,
+                });
+                if req.include_body
+                    && let Ok(Ok(loaded)) =
+                        self.with_fresh_registry(|reg| reg.load(&s.name, false))
+                    {
+                        obj["body"] = serde_json::json!(loaded.body);
+                    }
+                obj
+            }).collect::<Vec<_>>(),
+        });
+        Ok(result.to_string())
+    }
+    #[tool(
         description = "Skill operations — search installed skills or load one by name. Single consolidated tool with `action` field (search|load)."
     )]
     async fn skill(&self, Parameters(req): Parameters<SkillRequest>) -> Result<String, ErrorData> {
         self.skill_impl(req).await
+    }
+
+    #[tool(
+        description = "Create a new skill from a template. Scaffolds a skill directory with SKILL.md frontmatter and body. Templates: web-development, api-development, testing, base (default). Writes to .claude/skills/<name>/ by default."
+    )]
+    async fn skill_create(
+        &self,
+        Parameters(req): Parameters<SkillCreateRequest>,
+    ) -> Result<String, ErrorData> {
+        self.skill_create_impl(req).await
+    }
+
+    #[tool(
+        description = "List skill categories (derived from each skill's `category:` frontmatter, or its first tag when unset). Omit `category` for every category with its skill count; pass one to list the skills in it. Read-only."
+    )]
+    async fn skill_categories(
+        &self,
+        Parameters(req): Parameters<SkillCategoriesRequest>,
+    ) -> Result<String, ErrorData> {
+        let result = match req.category {
+            None => {
+                let categories = self
+                    .with_fresh_registry(|reg| reg.list_categories())?
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                serde_json::json!({
+                    "categories": categories.into_iter().map(|(category, count)| {
+                        serde_json::json!({
+                            "category": if category.is_empty() { "uncategorized".to_string() } else { category },
+                            "count": count,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            }
+            Some(category) => {
+                let skills = self
+                    .with_fresh_registry(|reg| reg.skills_in_category(&category))?
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                serde_json::json!({
+                    "category": category,
+                    "skills": skills.into_iter().map(|(name, source)| {
+                        serde_json::json!({"name": name, "source": source})
+                    }).collect::<Vec<_>>(),
+                })
+            }
+        };
+        Ok(result.to_string())
     }
     /// Filesystem/URL-safe stem derived from a display name — lowercased,
     /// non-alphanumerics collapsed to `-`, falling back to "handoff" if that

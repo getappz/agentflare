@@ -60,6 +60,25 @@ pub fn find_existing(
         .find(|pr| pr.head.as_ref().is_some_and(|h| h.git_ref == branch)))
 }
 
+/// The `for item #<sequence_id> ` marker `pr_footer` stamps onto every PR
+/// agentflare opens, shared by `find_by_item_marker`'s search query and
+/// `marks_item`'s body check below.
+fn item_marker(sequence_id: i64) -> String {
+    format!("for item #{sequence_id} ")
+}
+
+/// True if `body` carries `item_marker(sequence_id)` -- i.e. this PR really
+/// is `sequence_id`'s own, as opposed to an unrelated PR that only happens
+/// to share the same branch name. Branch names get reused across items over
+/// time, so a closed/merged `find_existing` match needs this confirmation
+/// before a caller treats it as "this item's PR already exists" (item #63:
+/// a stale, unrelated, already-merged PR from a prior item was returned as
+/// the current item's `pr_url`, which made `in_review` true and skipped the
+/// `nothing_was_ever_committed` safety net for real, uncommitted work).
+pub fn marks_item(body: Option<&str>, sequence_id: i64) -> bool {
+    body.is_some_and(|b| b.contains(&item_marker(sequence_id)))
+}
+
 /// Finds every PR (open, merged, or closed) whose body carries the
 /// `for item #<sequence_id>` marker `pr_footer` stamps onto every PR
 /// agentflare opens (see `push_and_open_pr`) -- the pre-dispatch
@@ -86,8 +105,10 @@ pub fn find_by_item_marker(
     sequence_id: i64,
 ) -> Result<Vec<PullRequest>, GitHubError> {
     let query = format!(
-        "repo:{}/{} type:pr \"for item #{sequence_id} \" in:body",
-        repo.owner, repo.repo
+        "repo:{}/{} type:pr \"{}\" in:body",
+        repo.owner,
+        repo.repo,
+        item_marker(sequence_id)
     );
     let path = format!("/search/issues?q={}", crate::github::encode_query(&query));
     let items = client.get_paginated(&path, search_items)?;
@@ -309,6 +330,44 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn marks_item_true_when_body_carries_the_marker() {
+        assert!(marks_item(
+            Some("---\n_Opened by `claude-code` on **box** for item #63 via agentflare._"),
+            63
+        ));
+    }
+
+    #[test]
+    fn marks_item_false_when_body_is_none() {
+        assert!(!marks_item(None, 63));
+    }
+
+    #[test]
+    fn marks_item_false_when_body_has_no_marker_at_all() {
+        assert!(!marks_item(Some("just a regular PR description"), 63));
+    }
+
+    #[test]
+    fn marks_item_does_not_let_a_shorter_id_match_a_longer_ones_marker() {
+        // A PR marked "for item #63 " must not also count as evidence for
+        // item #6 -- naive substring matching without the marker's own
+        // digit-boundary delimiter would let "for item #6" match inside
+        // "for item #63 ".
+        assert!(!marks_item(
+            Some("---\n_Opened by `claude-code` on **box** for item #63 via agentflare._"),
+            6
+        ));
+    }
+
+    #[test]
+    fn marks_item_does_not_let_a_longer_id_match_a_shorter_ones_marker() {
+        assert!(!marks_item(
+            Some("---\n_Opened by `claude-code` on **box** for item #6 via agentflare._"),
+            63
+        ));
     }
 
     #[test]

@@ -25,6 +25,8 @@ pub struct PullRequest {
     pub body: Option<String>,
     pub title: String,
     #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
     pub draft: bool,
     // Present (non-null) on both the list and single-PR endpoints, unlike
     // `merged: bool` which the GitHub API only returns from the single-PR
