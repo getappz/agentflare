@@ -1,0 +1,11 @@
+RANKING_COLUMNS: &[(&str, &str)] = &[
+    ("body", "TEXT NOT NULL DEFAULT ''"),
+    ("neg_text", "TEXT NOT NULL DEFAULT ''"),
+    ("last_used_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("bandit_alpha", "REAL NOT NULL DEFAULT 1.0"),
+    ("bandit_beta", "REAL NOT NULL DEFAULT 1.0"),
+];
+
+/// Always dropped and recreated from scratch rather than converted in place:
+/// this runs once per database (migration hooks run exactly once, tracked by
+/// `user_version`), so it must be correct whether `skills_ft

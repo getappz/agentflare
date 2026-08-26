@@ -192,6 +192,16 @@ pub fn list_all_name_source_pairs(conn: &Connection) -> rusqlite::Result<Vec<(St
     rows.collect()
 }
 
+pub fn list_categories(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT category FROM skills WHERE category IS NOT NULL AND category != '' ORDER BY category")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    let mut categories = Vec::new();
+    for row in rows {
+        categories.push(row?);
+    }
+    Ok(categories)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

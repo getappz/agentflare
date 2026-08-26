@@ -1,0 +1,1 @@
+cat /home/avihs/projects/agentflare/.worktrees/task/185/build_stderr.txt

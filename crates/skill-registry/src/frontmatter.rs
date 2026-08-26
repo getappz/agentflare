@@ -10,6 +10,8 @@ pub struct Frontmatter {
     pub description: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 /// Parse `---\n<yaml>\n---\n<body>`. Returns None when the file has no

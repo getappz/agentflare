@@ -1,0 +1,2 @@
+#!/bin/bash
+grep -A 20 "pub fn list_categories" /home/avihs/projects/agentflare/.worktrees/task/185/crates/skill-registry/src/search.rs > /home/avihs/projects/agentflare/.worktrees/task/185/cat_func.txt

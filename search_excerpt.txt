@@ -1,0 +1,33 @@
+pub fn list_all_names(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT name FROM skills ORDER BY name")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    rows.collect()
+}
+
+/// Every (name, source) pair currently indexed. Unlike `list_all_names`,
+/// this preserves source attribution -- required for callers (export/hub
+/// push) that need to reconstruct a qualified `source:name` lookup key,
+/// since bare names collide across sources and `list_all_names` cannot
+/// be split on to recover the source (skill names contain no separator).
+pub fn list_all_name_source_pairs(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT name, source FROM skills ORDER BY name")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{open_in_memory, rebuild};
+    use crate::sources::SkillEntry;
+    use std::path::PathBuf;
+
+    fn seed() -> Connection {
+        let mut conn = open_in_memory().unwrap();
+        let mk = |name: &str, desc: &str, body: &str, shadow: bool| SkillEntry {
+            name: name.into(),
+            source: "claude-user".into(),
+            path: PathBuf::from(format!("/x/{name}/SKILL.md")),
+            description: desc.into(),
+            body: body.into(),
+            neg_text: String::new(),

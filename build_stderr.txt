@@ -1,0 +1,101 @@
+    Checking agentflare-skill-registry v0.1.1 (/home/avihs/projects/agentflare/.worktrees/task/185/crates/skill-registry)
+error[E0432]: unresolved import `crate::sources::SkillEntry`
+ --> crates/skill-registry/src/db.rs:5:5
+  |
+5 | use crate::sources::SkillEntry;
+  |     ^^^^^^^^^^^^^^^^----------
+  |                     |
+  |                     no `SkillEntry` in `sources`
+
+error[E0432]: unresolved import `crate::sources::SkillEntry`
+ --> crates/skill-registry/src/pack.rs:1:5
+  |
+1 | use crate::sources::SkillEntry;
+  |     ^^^^^^^^^^^^^^^^----------
+  |                     |
+  |                     no `SkillEntry` in `sources`
+
+error[E0432]: unresolved import `crate::SkillSpec`
+ --> crates/skill-registry/src/sources.rs:1:5
+  |
+1 | use crate::SkillSpec;
+  |     ^^^^^^^---------
+  |            |
+  |            no `SkillSpec` in the root
+
+error[E0432]: unresolved import `crate::SkillSource`
+ --> crates/skill-registry/src/sources.rs:2:5
+  |
+2 | use crate::SkillSource;
+  |     ^^^^^^^-----------
+  |            |
+  |            no `SkillSource` in the root
+
+error[E0432]: unresolved import `crate::SourceReadError`
+ --> crates/skill-registry/src/sources.rs:3:5
+  |
+3 | use crate::SourceReadError;
+  |     ^^^^^^^---------------
+  |            |
+  |            no `SourceReadError` in the root
+
+error[E0432]: unresolved import `crate::SourceWriteError`
+ --> crates/skill-registry/src/sources.rs:4:5
+  |
+4 | use crate::SourceWriteError;
+  |     ^^^^^^^----------------
+  |            |
+  |            no `SourceWriteError` in the root
+
+error[E0432]: unresolved import `search::list_categories`
+  --> crates/skill-registry/src/lib.rs:12:68
+   |
+12 | pub use search::{MatchMode, SkillHit, merge_registry_hits, search, list_categories};
+   |                                                                    ^^^^^^^^^^^^^^^ no `list_categories` in `search`
+
+error[E0425]: cannot find function `default_sources` in module `crate::sources`
+   --> crates/skill-registry/src/load.rs:191:39
+    |
+191 |         let sources = crate::sources::default_sources(&home, &cwd, &self.detected_agents);
+    |                                       ^^^^^^^^^^^^^^^ not found in `crate::sources`
+
+error[E0425]: cannot find function `scan_sources` in module `crate::sources`
+   --> crates/skill-registry/src/load.rs:192:35
+    |
+192 |         let out = crate::sources::scan_sources(&sources);
+    |                                   ^^^^^^^^^^^^ not found in `crate::sources`
+
+error[E0425]: cannot find function `validate_entry` in module `crate::sources`
+   --> crates/skill-registry/src/load.rs:195:41
+    |
+195 |             let warns = crate::sources::validate_entry(entry);
+    |                                         ^^^^^^^^^^^^^^ not found in `crate::sources`
+
+warning: unused import: `std::path::PathBuf`
+ --> crates/skill-registry/src/sources.rs:6:5
+  |
+6 | use std::path::PathBuf;
+  |     ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0433]: cannot find module or crate `toml` in this scope
+  --> crates/skill-registry/src/sources.rs:12:27
+   |
+12 |     let spec: SkillSpec = toml::from_str(&content)
+   |                           ^^^^ use of unresolved module or unlinked crate `toml`
+   |
+   = help: if you wanted to use a crate named `toml`, use `cargo add toml` to add it to your `Cargo.toml`
+
+error[E0433]: cannot find module or crate `toml` in this scope
+  --> crates/skill-registry/src/sources.rs:19:19
+   |
+19 |     let content = toml::to_string_pretty(spec)
+   |                   ^^^^ use of unresolved module or unlinked crate `toml`
+   |
+   = help: if you wanted to use a crate named `toml`, use `cargo add toml` to add it to your `Cargo.toml`
+
+Some errors have detailed explanations: E0425, E0432, E0433.
+For more information about an error, try `rustc --explain E0425`.
+warning: `agentflare-skill-registry` (lib) generated 1 warning
+error: could not compile `agentflare-skill-registry` (lib) due to 12 previous errors; 1 warning emitted

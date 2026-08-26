@@ -39,7 +39,7 @@ pub(crate) struct SkillDetectRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SkillRequest {
-    #[schemars(description = "Action: search|load")]
+    #[schemars(description = "Action: search|load|create|categories")]
     pub(crate) action: String,
     #[schemars(description = "What you need to do; keyword-style works best (search)")]
     #[serde(default)]
@@ -53,16 +53,23 @@ pub(crate) struct SkillRequest {
     #[schemars(
         description = "'all' = every word must match (default); 'any' = broader recall for retries (search)"
     )]
-    #[serde(default)]
+#[serde(default)]
     pub(crate) mode: Option<String>,
     #[schemars(description = "true = load the original even when a compressed copy exists (load)")]
     #[serde(default)]
     pub(crate) original: bool,
     #[schemars(
-        description = "Wrap skill body + siblings in a <SKILL_ACTIVATION> enforcement block (load only, default false)"
-    )]
     #[serde(default)]
     pub(crate) activation_wrapper: bool,
+    #[schemars(description = "Template to use: base, web-development, api-development, testing (create)")]
+    #[serde(default)]
+    pub(crate) template: Option<String>,
+    #[schemars(description = "Skill description (create)")]
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    #[schemars(description = "Tags for the skill (create)")]
+    #[serde(default)]
+    pub(crate) tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
