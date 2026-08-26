@@ -7,7 +7,7 @@ pub mod watcher;
 use std::path::Path;
 
 use crate::config::InsightsConfig;
-use crate::model::{Session, ToolCall, Turn};
+use crate::model::{FileEvent, Session, Subagent, ToolCall, Turn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
@@ -26,6 +26,8 @@ pub struct IngestBundle {
     pub sessions: Vec<Session>,
     pub turns: Vec<Turn>,
     pub tool_calls: Vec<ToolCall>,
+    pub file_events: Vec<FileEvent>,
+    pub subagents: Vec<Subagent>,
 }
 
 pub trait Adapter: Send + Sync {
@@ -72,6 +74,8 @@ impl IngestManager {
                 bundle.sessions.extend(b.sessions);
                 bundle.turns.extend(b.turns);
                 bundle.tool_calls.extend(b.tool_calls);
+                bundle.file_events.extend(b.file_events);
+                bundle.subagents.extend(b.subagents);
             }
         }
         bundle

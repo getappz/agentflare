@@ -4,7 +4,7 @@
 
 use crate::config::InsightsConfig;
 use crate::ingest::{
-    common::{extract_tokens, parse_timestamp},
+    common::{extract_file_path, extract_tokens, file_kind_for_tool, parse_timestamp},
     IngestBundle, IngestError, Adapter,
 };
 use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, Turn, ToolCall};
@@ -35,7 +35,7 @@ impl Adapter for OpenCodeAdapter {
         }
 
         for session in sessions {
-            let (turns, tools) = ingest_messages_for_session(&conn, &session.id);
+            let (turns, tools, file_events) = ingest_messages_for_session(&conn, &session.id);
             let mut s = session;
             s.turn_count = turns.len() as u32;
             s.tool_call_count = tools.len() as u32;
@@ -63,7 +63,29 @@ impl Adapter for OpenCodeAdapter {
             }
             bundle.turns.extend(turns);
             bundle.tool_calls.extend(tools);
+            bundle.file_events.extend(file_events);
             bundle.sessions.push(s);
+        }
+
+        // DRY: subagents are child sessions (parent_id != null) - fetch via SQL
+        if let Ok(mut stmt) = conn.prepare("SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL LIMIT 1000") {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+                for row in rows.filter_map(|r| r.ok()) {
+                    let (child_id, parent_id) = row;
+                    bundle.subagents.push(crate::model::Subagent {
+                        id: child_id.clone(),
+                        session_id: parent_id.clone(),
+                        parent_tool_call_id: None,
+                        kind: "opencode_subagent".into(),
+                        status: "completed".into(),
+                        task: None,
+                    });
+                    // also increment subagent_count for parent
+                    if let Some(parent) = bundle.sessions.iter_mut().find(|s| s.id == parent_id) {
+                        parent.subagent_count += 1;
+                    }
+                }
+            }
         }
 
         Ok(bundle)
@@ -280,15 +302,16 @@ fn try_sessions_table(conn: &rusqlite::Connection) -> Vec<Session> {
 fn ingest_messages_for_session(
     conn: &rusqlite::Connection,
     session_id: &str,
-) -> (Vec<Turn>, Vec<ToolCall>) {
+) -> (Vec<Turn>, Vec<ToolCall>, Vec<crate::model::FileEvent>) {
     let mut turns = Vec::new();
     let mut tools = Vec::new();
+    let mut file_events: Vec<crate::model::FileEvent> = Vec::new();
 
     let mut stmt = match conn.prepare(
         "SELECT id, data, time_created FROM message WHERE session_id = ?1 ORDER BY time_created, id",
     ) {
         Ok(s) => s,
-        Err(_) => return (turns, tools),
+        Err(_) => return (turns, tools, file_events),
     };
     let rows: Vec<(String, String, Option<i64>)> = match stmt.query_map([session_id], |r| {
         Ok((
@@ -298,7 +321,7 @@ fn ingest_messages_for_session(
         ))
     }) {
         Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-        Err(_) => return (turns, tools),
+        Err(_) => return (turns, tools, file_events),
     };
 
     let mut seq: u32 = 0;
@@ -401,6 +424,16 @@ fn ingest_messages_for_session(
                         } else {
                             call_id.clone()
                         };
+                        // DRY file_event
+                        if let Some(path) = extract_file_path(tool, &input) {
+                            file_events.push(crate::model::FileEvent {
+                                id: format!("{}-fe-{}", session_id, file_events.len()),
+                                session_id: session_id.to_string(),
+                                path,
+                                kind: file_kind_for_tool(tool).into(),
+                                at: created_at.unwrap_or_else(chrono::Utc::now),
+                            });
+                        }
                         tools.push(ToolCall {
                             id: tool_id,
                             session_id: session_id.to_string(),
@@ -445,7 +478,7 @@ fn ingest_messages_for_session(
         }
     }
 
-    (turns, tools)
+    (turns, tools, file_events)
 }
 
 fn get_parts_for_message(

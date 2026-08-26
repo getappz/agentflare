@@ -150,6 +150,7 @@ pub struct Subagent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEvent {
+    pub id: String,
     pub session_id: String,
     pub path: String,
     pub kind: String, // read/write/edit

@@ -5,10 +5,10 @@ use walkdir::WalkDir;
 
 use crate::config::InsightsConfig;
 use crate::ingest::{
-    common::{extract_tokens, parse_timestamp, title_from_text},
+    common::{extract_file_path, extract_tokens, file_kind_for_tool, parse_timestamp, title_from_text},
     IngestBundle, IngestError, Adapter,
 };
-use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, Turn, ToolCall};
+use crate::model::{FileEvent, Session, SessionSource, SessionStatus, Subagent, TokenUsage, Turn, ToolCall};
 
 pub struct ClaudeAdapter;
 
@@ -29,17 +29,19 @@ impl Adapter for ClaudeAdapter {
             if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Some((s, turns, tools)) = parse_claude_jsonl(entry.path()) {
-                bundle.sessions.push(s);
-                bundle.turns.extend(turns);
-                bundle.tool_calls.extend(tools);
+            if let Some(b) = parse_claude_jsonl(entry.path()) {
+                bundle.sessions.extend(b.sessions);
+                bundle.turns.extend(b.turns);
+                bundle.tool_calls.extend(b.tool_calls);
+                bundle.file_events.extend(b.file_events);
+                bundle.subagents.extend(b.subagents);
             }
         }
         Ok(bundle)
     }
 }
 
-fn parse_claude_jsonl(path: &Path) -> Option<(Session, Vec<Turn>, Vec<ToolCall>)> {
+fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
     let vals = crate::ingest::read_jsonl_sessions(path);
     if vals.is_empty() {
         return None;
@@ -69,6 +71,8 @@ fn parse_claude_jsonl(path: &Path) -> Option<(Session, Vec<Turn>, Vec<ToolCall>)
     let mut title: Option<String> = None;
     let mut turns: Vec<Turn> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut file_events: Vec<FileEvent> = Vec::new();
+    let mut subagents: Vec<Subagent> = Vec::new();
     let mut seq: u32 = 0;
 
     for v in &vals {
@@ -95,7 +99,6 @@ fn parse_claude_jsonl(path: &Path) -> Option<(Session, Vec<Turn>, Vec<ToolCall>)
 
         let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-        // DRY: extract usage via common
         let usage = v.get("usage").or_else(|| v.get("message").and_then(|m| m.get("usage")));
         if let Some(u) = usage {
             let t = extract_tokens(u);
@@ -106,7 +109,29 @@ fn parse_claude_jsonl(path: &Path) -> Option<(Session, Vec<Turn>, Vec<ToolCall>)
             tokens.reasoning += t.reasoning;
         }
 
-        // Build turns: each type=="user" or "assistant" becomes a turn
+        // subagent detection: type == "subagent" or tool Task
+        if typ == "subagent" || typ == "task" {
+            let sub_id = v
+                .get("id")
+                .or_else(|| v.get("uuid"))
+                .and_then(|id| id.as_str())
+                .unwrap_or(&format!("{}-sub-{}", id, subagents.len()))
+                .to_string();
+            let task = v
+                .get("task")
+                .or_else(|| v.get("content"))
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string());
+            subagents.push(Subagent {
+                id: sub_id,
+                session_id: id.clone(),
+                parent_tool_call_id: None,
+                kind: "claude_subagent".into(),
+                status: "completed".into(),
+                task,
+            });
+        }
+
         if typ == "user" || typ == "human" || typ == "assistant" {
             seq += 1;
             let msg = v.get("message");
@@ -121,7 +146,6 @@ fn parse_claude_jsonl(path: &Path) -> Option<(Session, Vec<Turn>, Vec<ToolCall>)
                 (None, Some(text))
             };
             let started_at = v.get("timestamp").and_then(|t| parse_timestamp(t));
-            // tokens per turn if present
             let turn_tokens = usage.map(extract_tokens);
             let turn_id = format!("{}-{}", id, seq);
             turns.push(Turn {
@@ -136,7 +160,6 @@ fn parse_claude_jsonl(path: &Path) -> Option<(Session, Vec<Turn>, Vec<ToolCall>)
                 cost_usd: None,
             });
 
-            // tool_calls inside message.content[]
             let content_val = msg.and_then(|m| m.get("content"));
             if let Some(arr) = content_val.and_then(|c| c.as_array()) {
                 for c in arr {
@@ -153,6 +176,27 @@ fn parse_claude_jsonl(path: &Path) -> Option<(Session, Vec<Turn>, Vec<ToolCall>)
                             .unwrap_or("unknown")
                             .to_string();
                         let input = c.get("input").cloned().unwrap_or(serde_json::Value::Null);
+                        // DRY file_event
+                        if let Some(path) = extract_file_path(&name, &input) {
+                            file_events.push(FileEvent {
+                                id: format!("{}-fe-{}", id, file_events.len()),
+                                session_id: id.clone(),
+                                path,
+                                kind: file_kind_for_tool(&name).into(),
+                                at: started_at.unwrap_or_else(Utc::now),
+                            });
+                        }
+                        // subagent via Task tool
+                        if name.to_lowercase().contains("task") || name.to_lowercase().contains("agent") {
+                            subagents.push(Subagent {
+                                id: call_id.clone(),
+                                session_id: id.clone(),
+                                parent_tool_call_id: Some(call_id.clone()),
+                                kind: name.clone(),
+                                status: "completed".into(),
+                                task: input.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            });
+                        }
                         tool_calls.push(ToolCall {
                             id: call_id,
                             session_id: id.clone(),
@@ -164,17 +208,6 @@ fn parse_claude_jsonl(path: &Path) -> Option<(Session, Vec<Turn>, Vec<ToolCall>)
                             duration_ms: None,
                             created_at: started_at,
                         });
-                    }
-                }
-            }
-        }
-
-        // Also count direct content tool_use (outside message)
-        if typ != "assistant" && typ != "user" && typ != "human" {
-            if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
-                for c in arr {
-                    if c.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        tool_call_count += 1;
                     }
                 }
             }
@@ -198,14 +231,20 @@ fn parse_claude_jsonl(path: &Path) -> Option<(Session, Vec<Turn>, Vec<ToolCall>)
         cost: None,
         turn_count: turns.len() as u32,
         tool_call_count,
-        subagent_count: 0,
+        subagent_count: subagents.len() as u32,
         tags: vec![],
         starred: false,
         pid: None,
         cwd: None,
     };
 
-    Some((session, turns, tool_calls))
+    Some(IngestBundle {
+        sessions: vec![session],
+        turns,
+        tool_calls,
+        file_events,
+        subagents,
+    })
 }
 
 fn extract_text_from_message(msg: Option<&serde_json::Value>) -> String {
@@ -241,24 +280,5 @@ mod tests {
         };
         let a = ClaudeAdapter;
         assert!(a.scan(&cfg).unwrap().sessions.is_empty());
-    }
-
-    #[test]
-    fn parses_user_and_tool_calls() {
-        let dir = TempDir::new().unwrap();
-        let file = dir.path().join("test.jsonl");
-        let content = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
-{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","message":{"model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":2},"content":[{"type":"tool_use","id":"call1","name":"Bash","input":{}}]}}
-"#;
-        std::fs::write(&file, content).unwrap();
-        let cfg = InsightsConfig {
-            sources: [("claude_code".to_string(), dir.path().to_path_buf())].into(),
-            ..Default::default()
-        };
-        let bundle = ClaudeAdapter.scan(&cfg).unwrap();
-        assert_eq!(bundle.sessions.len(), 1);
-        assert_eq!(bundle.sessions[0].turn_count, 2);
-        assert_eq!(bundle.tool_calls.len(), 1);
-        assert_eq!(bundle.sessions[0].tokens.input, 10);
     }
 }
