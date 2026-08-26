@@ -36,6 +36,13 @@ const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 /// after removing it).
 const NEEDS_DECISION_LABEL: &str = "needs-decision";
 
+/// `vault` secret holding the Telegram chat id human-gate pings go to.
+/// Reuses the same `channels`/`vault` path as `agentflare channel send`
+/// rather than inventing a separate config store for one setting -- set it
+/// with `agentflare vault set telegram_notify_chat_id <chat_id>` alongside
+/// `telegram_bot_token` (see `channels::Platform::secret_name`).
+const TELEGRAM_NOTIFY_CHAT_ID_SECRET: &str = "telegram_notify_chat_id";
+
 /// Since item #19, work items run in-process via `WorkItemExecutor` rather
 /// than as a spawned `agentflare work` subprocess, so this is no longer an
 /// outer subprocess wall-clock kill -- it's the watchdog `run_in_process`
@@ -158,6 +165,9 @@ pub(crate) fn run_discovery_tick(
                         "agentflare-supervisor: item #{} ({}) is ready-for-work but gated pending a go/no-go decision ({NEEDS_DECISION_LABEL})",
                         item.sequence_id, item.id
                     );
+                    if first_time_gated(&item.id) {
+                        notify_human_gate(&item, "gated pending a go/no-go decision");
+                    }
                     result.waiting += 1;
                     continue;
                 }
@@ -303,6 +313,7 @@ fn ask_item(
             ..Default::default()
         });
     }
+    notify_human_gate(item, question);
 }
 
 /// Runs in-process via `WorkItemExecutor` (registered on the daemon's
@@ -578,6 +589,47 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
     .any(|job| job.args.contains(&item_id.to_string()))
 }
 
+/// Best-effort Telegram ping for an item that just landed on a human gate
+/// (a go/no-go decision, an unanswerable question, or a CI self-repair cap).
+/// Silently does nothing when `TELEGRAM_NOTIFY_CHAT_ID_SECRET` isn't
+/// configured, since notifications are opt-in and a bare install shouldn't
+/// spam stderr every tick; a configured-but-failing send only logs -- a
+/// notification failure must never block the gate itself.
+fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &str) {
+    let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
+        return;
+    };
+    let text = format!(
+        "agentflare: item #{} ({}) needs a human -- {reason}",
+        item.sequence_id, item.id
+    );
+    if let Err(e) =
+        crate::channels::send_message(crate::channels::Platform::Telegram, &chat_id, &text)
+    {
+        eprintln!(
+            "agentflare-supervisor: telegram notify failed for item #{}: {e}",
+            item.sequence_id
+        );
+    }
+}
+
+/// True the first time a given item id is seen gated since this process
+/// started, false on every later call for the same id -- `run_discovery_tick`
+/// re-visits an already-gated item on every tick (it stays in the
+/// `ready-for-work` query until a human clears `NEEDS_DECISION_LABEL`), so
+/// this keeps `notify_human_gate` firing once per gate instead of once per
+/// tick. In-memory and per-process by design: a daemon restart re-notifies
+/// once, which is preferable to a persistent marker for a one-line ping.
+fn first_time_gated(item_id: &str) -> bool {
+    static NOTIFIED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    NOTIFIED
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(item_id.to_string())
+}
+
 /// Dispatches a self-repair job for an item whose PR has failing CI checks,
 /// or -- once `quota::decide::SELF_REPAIR_CAP` prior attempts have been made
 /// with no green build -- gates it for a human instead of retrying forever.
@@ -636,6 +688,14 @@ fn self_repair_or_gate(
                 ..Default::default()
             });
         }
+        notify_human_gate(
+            item,
+            &format!(
+                "CI self-repair cap reached ({} attempt(s), still failing: {})",
+                crate::quota::decide::SELF_REPAIR_CAP,
+                failed_checks.join(", ")
+            ),
+        );
         return SelfRepairOutcome::Skipped;
     }
 

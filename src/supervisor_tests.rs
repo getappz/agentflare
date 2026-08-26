@@ -226,64 +226,69 @@ fn agent_in_cooldown_is_skipped_not_dispatched() {
 
 #[test]
 fn needs_decision_label_blocks_dispatch_even_though_ready_for_work_is_present() {
-    let mcp = test_mcp();
-    let queue = test_queue();
-    let auth_conn = test_auth_conn();
-    let item_id = seed_ready_item(&mcp, Some("claude-code"));
-    mcp.with_backend_db(|conn| {
-        let project = mcp.resolve_project(conn).unwrap();
-        agentflare_backend::label::create(
-            conn,
-            agentflare_backend::label::CreateLabel {
-                project_id: Some(project.id.clone()),
-                workspace_id: project.workspace_id.clone(),
-                name: NEEDS_DECISION_LABEL.into(),
-                color: None,
-                parent_id: None,
-                sort_order: None,
-                external_source: None,
-                external_id: None,
-            },
-        )
+    // The gated branch now fires a best-effort Telegram notify -- run under
+    // an isolated home so this can't read (or send through) the developer's
+    // real vault, same reasoning as channels.rs's own vault-touching tests.
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let auth_conn = test_auth_conn();
+        let item_id = seed_ready_item(&mcp, Some("claude-code"));
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            agentflare_backend::label::create(
+                conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(project.id.clone()),
+                    workspace_id: project.workspace_id.clone(),
+                    name: NEEDS_DECISION_LABEL.into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap();
+            let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+            let gate_id = &labels
+                .iter()
+                .find(|l| l.name == NEEDS_DECISION_LABEL)
+                .unwrap()
+                .id;
+            agentflare_backend::item::add_label(conn, &item_id, gate_id).unwrap();
+            Some(())
+        })
         .unwrap();
-        let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
-        let gate_id = &labels
-            .iter()
-            .find(|l| l.name == NEEDS_DECISION_LABEL)
-            .unwrap()
-            .id;
-        agentflare_backend::item::add_label(conn, &item_id, gate_id).unwrap();
-        Some(())
-    })
-    .unwrap();
 
-    let result = run_discovery_tick(
-        &mcp,
-        &queue,
-        &auth_conn,
-        agentflare_resource_gate::Policy::Normal,
-    );
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
 
-    assert_eq!(result.dispatched, 0);
-    assert_eq!(result.skipped, 0);
-    assert_eq!(
-        result.waiting, 1,
-        "a go/no-go item gated on a pending decision must count as waiting, not dispatch"
-    );
-    assert!(
-        queue.list(None).unwrap().is_empty(),
-        "a needs-decision item must never reach the job queue, regardless of ready-for-work"
-    );
+        assert_eq!(result.dispatched, 0);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(
+            result.waiting, 1,
+            "a go/no-go item gated on a pending decision must count as waiting, not dispatch"
+        );
+        assert!(
+            queue.list(None).unwrap().is_empty(),
+            "a needs-decision item must never reach the job queue, regardless of ready-for-work"
+        );
 
-    let labels = mcp
-        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
-        .unwrap();
-    assert!(
-        labels_contain_name(&mcp, &labels, "ready-for-work"),
-        "the gate must not touch ready-for-work -- redispatch re-attaches it unconditionally, \
-         so needs-decision has to keep blocking on its own"
-    );
-    assert!(labels_contain_name(&mcp, &labels, NEEDS_DECISION_LABEL));
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(
+            labels_contain_name(&mcp, &labels, "ready-for-work"),
+            "the gate must not touch ready-for-work -- redispatch re-attaches it unconditionally, \
+             so needs-decision has to keep blocking on its own"
+        );
+        assert!(labels_contain_name(&mcp, &labels, NEEDS_DECISION_LABEL));
+    });
 }
 
 #[path = "supervisor/tests/host_gate_tests.rs"]
@@ -528,28 +533,35 @@ fn under_cap_self_repairs_and_dispatches() {
 
 #[test]
 fn at_cap_forces_ask_instead_of_dispatching() {
-    let mcp = test_mcp();
-    let queue = test_queue();
-    let (item_id, _goal_id) =
-        seed_ready_item_under_active_goal_with_repairs(&mcp, crate::quota::decide::SELF_REPAIR_CAP);
+    // ask_item now fires a best-effort Telegram notify -- run under an
+    // isolated home so this can't read (or send through) the developer's
+    // real vault, same reasoning as channels.rs's own vault-touching tests.
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let (item_id, _goal_id) = seed_ready_item_under_active_goal_with_repairs(
+            &mcp,
+            crate::quota::decide::SELF_REPAIR_CAP,
+        );
 
-    let auth_conn = test_auth_conn();
-    let result = run_discovery_tick(
-        &mcp,
-        &queue,
-        &auth_conn,
-        agentflare_resource_gate::Policy::Normal,
-    );
+        let auth_conn = test_auth_conn();
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
 
-    assert_eq!(
-        result.dispatched, 0,
-        "the cap must force ask, not another self-repair dispatch"
-    );
-    assert!(queue.list(None).unwrap().is_empty());
-    let labels = mcp
-        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
-        .unwrap();
-    assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
+        assert_eq!(
+            result.dispatched, 0,
+            "the cap must force ask, not another self-repair dispatch"
+        );
+        assert!(queue.list(None).unwrap().is_empty());
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
+    });
 }
 
 #[test]
@@ -1041,44 +1053,50 @@ fn self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment() {
 
 #[test]
 fn self_repair_or_gate_gates_instead_of_dispatching_once_the_cap_is_reached() {
-    let mcp = test_mcp();
-    let queue = test_queue();
-    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
-    let label_id_by_name = seed_gate_label(&mcp);
-    let auth_conn = test_auth_conn();
+    // The cap-reached branch now fires a best-effort Telegram notify -- run
+    // under an isolated home so this can't read (or send through) the
+    // developer's real vault, same reasoning as channels.rs's own
+    // vault-touching tests.
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+        let label_id_by_name = seed_gate_label(&mcp);
+        let auth_conn = test_auth_conn();
 
-    // Pre-seed SELF_REPAIR_CAP prior marker comments -- as if this many
-    // repair rounds already ran with CI still red.
-    for _ in 0..crate::quota::decide::SELF_REPAIR_CAP {
-        mcp.comment_impl(CommentRequest {
-            action: "create".into(),
-            item_id: Some(item_id.clone()),
-            body: Some(format!("{CI_SELF_REPAIR_MARKER}\n\njob: prior")),
-            ..Default::default()
-        })
-        .unwrap();
-    }
-    let item = mcp
-        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
-        .unwrap();
+        // Pre-seed SELF_REPAIR_CAP prior marker comments -- as if this many
+        // repair rounds already ran with CI still red.
+        for _ in 0..crate::quota::decide::SELF_REPAIR_CAP {
+            mcp.comment_impl(CommentRequest {
+                action: "create".into(),
+                item_id: Some(item_id.clone()),
+                body: Some(format!("{CI_SELF_REPAIR_MARKER}\n\njob: prior")),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap();
 
-    let outcome = self_repair_or_gate(
-        &mcp,
-        &queue,
-        &auth_conn,
-        agentflare_resource_gate::Policy::Normal,
-        &item,
-        &["clippy".to_string()],
-        &label_id_by_name,
-        "/repo",
-    );
+        let outcome = self_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            &["clippy".to_string()],
+            &label_id_by_name,
+            "/repo",
+        );
 
-    assert!(matches!(outcome, SelfRepairOutcome::Skipped));
-    assert!(queue.list(None).unwrap().is_empty());
-    let labels = mcp
-        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
-        .unwrap();
-    assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
+        assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+        assert!(queue.list(None).unwrap().is_empty());
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
+    });
 }
 
 #[test]
@@ -1189,5 +1207,32 @@ fn self_repair_or_gate_defers_instead_of_dispatching_into_a_still_live_claim() {
             .any(|c| c.body.starts_with(CI_SELF_REPAIR_MARKER)),
         "a deferred attempt must not post a self-repair-dispatched marker, \
          or it would count against the cap on a later real attempt"
+    );
+}
+
+#[test]
+fn first_time_gated_is_true_once_then_false_for_the_same_id() {
+    // Unique per-test id -- the backing set is a single process-wide static
+    // shared by every test in this binary, so a literal like "item-1" would
+    // collide with another test using the same id.
+    let id = "first-time-gated-test-item-9f3a";
+    assert!(
+        first_time_gated(id),
+        "the first sighting of a newly-gated item must notify"
+    );
+    assert!(
+        !first_time_gated(id),
+        "a later tick re-seeing the same still-gated item must not notify again"
+    );
+}
+
+#[test]
+fn first_time_gated_treats_different_ids_independently() {
+    let a = "first-time-gated-test-item-a1";
+    let b = "first-time-gated-test-item-b2";
+    assert!(first_time_gated(a));
+    assert!(
+        first_time_gated(b),
+        "a different item id must still get its own first-sighting notify"
     );
 }

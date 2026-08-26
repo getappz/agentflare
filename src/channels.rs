@@ -9,6 +9,13 @@
 //! - Telegram: `POST {base}/bot{token}/sendMessage`  body `{chat_id, text}`     (token in URL)
 //! - Slack:    `POST slack.com/api/chat.postMessage`  body `{channel, text}`    (Authorization: Bearer)
 //! - Discord:  `POST discord.com/api/v10/channels/{id}/messages`  body `{content}` (Authorization: Bot)
+//!
+//! Each platform needs a bot token stored under [`Platform::secret_name`] via
+//! `agentflare vault set <secret_name>` (value piped over stdin) before
+//! [`send_message`] will work — it errors out by name when the secret is
+//! missing rather than failing silently. For getting a bot token/chat id per
+//! platform and wiring up the supervisor's human-in-loop pings, see the
+//! "Channel notifications" guide in `docs-site/src/content/docs/guides.md`.
 
 use serde_json::{Value, json};
 
