@@ -64,6 +64,21 @@ pub(crate) struct SkillRequest {
     #[serde(default)]
     pub(crate) activation_wrapper: bool,
 }
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SkillCreateRequest {
+    #[schemars(description = "Name of the new skill (becomes directory name)")]
+    pub(crate) name: String,
+    #[schemars(description = "Template to use: web-development, api-development, testing, base, or path to custom template")]
+    pub(crate) template: Option<String>,
+    #[schemars(description = "Description for the skill frontmatter")]
+    pub(crate) description: Option<String>,
+    #[schemars(description = "Tags for the skill frontmatter")]
+    #[serde(default)]
+    pub(crate) tags: Vec<String>,
+    #[schemars(description = "Target directory (default: .claude/skills in repo root)")]
+    #[serde(default)]
+    pub(crate) target_dir: Option<String>,
+}
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ToolRequest {
