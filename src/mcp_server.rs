@@ -365,6 +365,17 @@ impl AgentflareMcp {
     async fn skill(&self, Parameters(req): Parameters<SkillRequest>) -> Result<String, ErrorData> {
         self.skill_impl(req).await
     }
+
+    #[tool(
+        description = "Create a new skill from a template. Scaffolds a skill directory with SKILL.md frontmatter and body. Templates: web-development, api-development, testing, base (default). Writes to .claude/skills/<name>/ by default."
+    )]
+    async fn skill_create(
+        &self,
+        Parameters(req): Parameters<SkillCreateRequest>,
+    ) -> Result<String, ErrorData> {
+        self.skill_create_impl(req).await
+    }
+
     #[tool(
         description = "List skill categories (derived from each skill's `category:` frontmatter, or its first tag when unset). Omit `category` for every category with its skill count; pass one to list the skills in it. Read-only."
     )]

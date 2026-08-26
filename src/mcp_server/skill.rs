@@ -97,3 +97,189 @@ impl AgentflareMcp {
         }
     }
 }
+
+impl AgentflareMcp {
+    pub(super) async fn skill_create_impl(
+        &self,
+        req: SkillCreateRequest,
+    ) -> Result<String, ErrorData> {
+        use std::fs;
+        use std::path::PathBuf;
+
+        // Validate name
+        if req.name.trim().is_empty() {
+            return Err(ErrorData::invalid_params(
+                "skill name cannot be empty",
+                None,
+            ));
+        }
+
+        // Determine template
+        let template = req.template.unwrap_or_else(|| "base".to_string());
+
+        // Get template content
+        let (_frontmatter, body) = match Self::get_template(&template) {
+            Some((fm, b)) => (fm, b),
+            None => {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "unknown template: {}. Available: web-development, api-development, testing, base",
+                        template
+                    ),
+                    None,
+                ));
+            }
+        };
+
+        // Determine target directory
+        let target_dir = req.target_dir.unwrap_or_else(|| {
+            Self::repo_root()
+                .join(".claude/skills")
+                .to_string_lossy()
+                .to_string()
+        });
+        let target_path = PathBuf::from(&target_dir).join(&req.name);
+
+        // Check if already exists
+        if target_path.exists() {
+            return Err(ErrorData::invalid_params(
+                format!("skill directory already exists: {}", target_path.display()),
+                None,
+            ));
+        }
+
+        // Create directory
+        fs::create_dir_all(&target_path).map_err(|e| {
+            ErrorData::internal_error(format!("failed to create skill directory: {e}"), None)
+        })?;
+
+        // Build frontmatter
+        let description = req
+            .description
+            .unwrap_or_else(|| format!("{} skill", req.name));
+        let tags = if req.tags.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\ntags: [{}]",
+                req.tags
+                    .iter()
+                    .map(|t| format!("\"{}\"", t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+
+        let fm_content = format!(
+            "---\nname: {}\ndescription: {}{}\n---\n",
+            req.name, description, tags
+        );
+
+        // Write SKILL.md
+        let skill_file = target_path.join("SKILL.md");
+        let full_content = format!("{}{}", fm_content, body);
+        fs::write(&skill_file, full_content).map_err(|e| {
+            ErrorData::internal_error(format!("failed to write SKILL.md: {e}"), None)
+        })?;
+
+        Ok(serde_json::json!({
+            "created": true,
+            "path": skill_file.to_string_lossy(),
+            "name": req.name,
+            "template": template
+        })
+        .to_string())
+    }
+
+    fn get_template(name: &str) -> Option<(String, String)> {
+        match name {
+            "web-development" => Some((
+                String::new(),
+                r#"## When to use
+Use for web development tasks including frontend, backend, and full-stack work.
+
+## Frontend
+- React, Vue, Svelte component patterns
+- State management (Redux, Zustand, Pinia, etc.)
+- CSS/SCSS/Tailwind styling approaches
+- TypeScript type safety
+
+## Backend
+- API design (REST, GraphQL, tRPC)
+- Database schema and migrations
+- Authentication and authorization
+- Caching strategies
+
+## Testing
+- Unit, integration, E2E testing patterns
+- Test-driven development workflows
+"#
+                .to_string(),
+            )),
+            "api-development" => Some((
+                String::new(),
+                r#"## When to use
+Use for API development tasks including design, implementation, and documentation.
+
+## Design
+- RESTful resource modeling
+- GraphQL schema design
+- tRPC/grpc contract-first development
+- Versioning strategies
+
+## Implementation
+- Request/response validation
+- Error handling patterns
+- Rate limiting and throttling
+- Observability (logging, metrics, tracing)
+
+## Documentation
+- OpenAPI/Swagger generation
+- API versioning and deprecation
+- Client SDK considerations
+"#
+                .to_string(),
+            )),
+            "testing" => Some((
+                String::new(),
+                r#"## When to use
+Use for testing strategies, patterns, and best practices.
+
+## Unit Testing
+- Test organization and naming
+- Mocking and stubbing strategies
+- Property-based testing
+- Snapshot testing
+
+## Integration Testing
+- Database integration tests
+- API contract testing
+- Service-to-service testing
+- Testcontainers patterns
+
+## E2E Testing
+- Browser automation (Playwright, Cypress)
+- User journey testing
+- Visual regression testing
+- CI/CD integration
+"#
+                .to_string(),
+            )),
+            "base" => Some((
+                String::new(),
+                r#"## When to use
+Use for general-purpose skill scaffolding. Replace this content with your skill-specific guidance.
+
+## Structure
+- When to use this skill
+- Key concepts and patterns
+- Best practices
+- Common pitfalls
+- Handoff instructions
+"#
+                .to_string(),
+            )),
+            _ => None,
+        }
+    }
+}
