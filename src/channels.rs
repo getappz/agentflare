@@ -9,6 +9,48 @@
 //! - Telegram: `POST {base}/bot{token}/sendMessage`  body `{chat_id, text}`     (token in URL)
 //! - Slack:    `POST slack.com/api/chat.postMessage`  body `{channel, text}`    (Authorization: Bearer)
 //! - Discord:  `POST discord.com/api/v10/channels/{id}/messages`  body `{content}` (Authorization: Bot)
+//!
+//! # Setup
+//!
+//! Each platform needs a bot token stored under [`Platform::secret_name`] via
+//! `agentflare vault set <secret_name> <token>` before [`send_message`] will
+//! work — it errors out by name when the secret is missing rather than
+//! failing silently.
+//!
+//! **Telegram**
+//! 1. Message [@BotFather](https://t.me/BotFather) on Telegram, run `/newbot`,
+//!    and follow the prompts to get a bot token (`123456:ABC-...`).
+//! 2. `agentflare vault set telegram_bot_token <token>`
+//! 3. Get the target chat id: add the bot to the chat (or DM it directly),
+//!    send it any message, then call
+//!    `https://api.telegram.org/bot<token>/getUpdates` and read
+//!    `result[].message.chat.id` from the response.
+//! 4. `agentflare channel send --to telegram --target <chat_id> --message "test"`
+//!    to confirm delivery.
+//!
+//! The supervisor's human-in-loop notifier (`supervisor::notify_human_gate`)
+//! reuses this same bot token but sends to a separate secret,
+//! `telegram_notify_chat_id` — set it once (`agentflare vault set
+//! telegram_notify_chat_id <chat_id>`, same chat id as step 3) to start
+//! getting a Telegram ping whenever an item needs a go/no-go decision or
+//! hits a self-repair cap; leave it unset to keep that path silent.
+//!
+//! **Slack**
+//! 1. Create a Slack app at <https://api.slack.com/apps>, add the
+//!    `chat:write` bot token scope under OAuth & Permissions, install it to
+//!    the workspace, and copy the `xoxb-...` Bot User OAuth Token.
+//! 2. Invite the bot to the target channel (`/invite @your-bot`).
+//! 3. `agentflare vault set slack_bot_token <token>`, then `--target` is the
+//!    channel id (e.g. `C0123456789`, found in the channel's details panel).
+//!
+//! **Discord**
+//! 1. Create an application at <https://discord.com/developers/applications>,
+//!    add a Bot, and copy its token.
+//! 2. Invite the bot to the server with the `Send Messages` permission via
+//!    OAuth2 URL Generator (`bot` scope).
+//! 3. `agentflare vault set discord_bot_token <token>`, then `--target` is
+//!    the numeric channel id (enable Developer Mode in Discord, right-click
+//!    the channel → Copy Channel ID).
 
 use serde_json::{Value, json};
 
