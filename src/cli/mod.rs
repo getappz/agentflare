@@ -32,6 +32,7 @@ mod vault;
 mod vent;
 pub(crate) mod work;
 mod workflow;
+mod insights;
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
@@ -143,6 +144,8 @@ pub enum Commands {
     Docs(docs::DocsArgs),
     /// Run and inspect durable agent pipelines through the workflow engine.
     Workflow(workflow::WorkflowArgs),
+    /// Unified observability for AI coding sessions (Claude/Codex/OpenCode/Cursor/Gemini) — local-first.
+    Insights(insights::InsightsArgs),
     /// Run and manage AgentFlare Apps — self-contained agentic domain modules.
     Apps(apps::AppsArgs),
 }
@@ -184,6 +187,7 @@ impl Commands {
             Self::Work(cmd) => cmd.run(),
             Self::Docs(cmd) => docs::run(cmd),
             Self::Workflow(cmd) => cmd.run(),
+            Self::Insights(cmd) => cmd.run(),
             Self::Apps(cmd) => cmd.run(),
         }
     }
