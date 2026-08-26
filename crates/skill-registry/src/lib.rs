@@ -1,5 +1,6 @@
 pub mod builtin;
 pub mod db;
+pub mod embed_store;
 pub mod frontmatter;
 pub mod hub;
 pub mod load;
