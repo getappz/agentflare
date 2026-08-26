@@ -12,6 +12,9 @@ pub struct SkillEntry {
     pub body: String,
     pub neg_text: String,
     pub tags: String, // space-joined, FTS column
+    /// Explicit `category:` frontmatter, or the first tag when absent. Empty
+    /// when neither is set.
+    pub category: String,
     pub est_tokens: i64,
     pub mtime: i64,
     pub bandit_alpha: f64,
@@ -112,6 +115,9 @@ fn read_entry(id: &str, path: &Path) -> Option<SkillEntry> {
         (true, false) => body_neg,
         (false, false) => format!("{desc_neg} {body_neg}"),
     };
+    let category = fm
+        .category
+        .unwrap_or_else(|| fm.tags.first().cloned().unwrap_or_default());
     Some(SkillEntry {
         name: fm.name.unwrap_or(dir_name),
         source: id.to_string(),
@@ -120,6 +126,7 @@ fn read_entry(id: &str, path: &Path) -> Option<SkillEntry> {
         body,
         neg_text,
         tags: fm.tags.join(" "),
+        category,
         est_tokens: est_tokens(meta.len()),
         mtime,
         bandit_alpha: 1.0,
@@ -353,6 +360,51 @@ mod tests {
         let alpha = out.entries.iter().find(|e| e.name == "alpha").unwrap();
         assert_eq!(alpha.source, "claude-user");
         assert!(alpha.est_tokens > 0);
+    }
+
+    #[test]
+    fn category_uses_explicit_frontmatter_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("alpha");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(
+            d.join("SKILL.md"),
+            "---\nname: alpha\ndescription: d\ntags: [web, testing]\ncategory: infra\n---\nbody",
+        )
+        .unwrap();
+        let out = scan_sources(&[Source {
+            id: "claude-user".into(),
+            kind: SourceKind::FlatDir(tmp.path().to_path_buf()),
+        }]);
+        assert_eq!(out.entries[0].category, "infra");
+    }
+
+    #[test]
+    fn category_falls_back_to_first_tag_when_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("alpha");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(
+            d.join("SKILL.md"),
+            "---\nname: alpha\ndescription: d\ntags: [web, testing]\n---\nbody",
+        )
+        .unwrap();
+        let out = scan_sources(&[Source {
+            id: "claude-user".into(),
+            kind: SourceKind::FlatDir(tmp.path().to_path_buf()),
+        }]);
+        assert_eq!(out.entries[0].category, "web");
+    }
+
+    #[test]
+    fn category_is_empty_when_no_category_and_no_tags() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "alpha", "d", "body");
+        let out = scan_sources(&[Source {
+            id: "claude-user".into(),
+            kind: SourceKind::FlatDir(tmp.path().to_path_buf()),
+        }]);
+        assert_eq!(out.entries[0].category, "");
     }
 
     #[test]

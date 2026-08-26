@@ -192,6 +192,31 @@ pub fn list_all_name_source_pairs(conn: &Connection) -> rusqlite::Result<Vec<(St
     rows.collect()
 }
 
+/// Every distinct category with its skill count, ordered by count (most
+/// populated first) then name. Skills with no explicit `category:` and no
+/// tag to derive one from (an empty string) group under `""` -- the
+/// `skill_categories` MCP tool surfaces that as "uncategorized".
+pub fn list_categories(conn: &Connection) -> rusqlite::Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT category, count(*) FROM skills
+         GROUP BY category
+         ORDER BY count(*) DESC, category",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+/// (name, source) pairs for every skill in one category, name-ordered.
+pub fn skills_in_category(
+    conn: &Connection,
+    category: &str,
+) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT name, source FROM skills WHERE category = ?1 ORDER BY name")?;
+    let rows = stmt.query_map(rusqlite::params![category], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
 /// Load one skill's full `SkillHit` row (score overridden by the caller).
 /// Used by `search_semantic` to backfill a vector-only match that didn't
 /// place in the BM25 candidate pool.
@@ -301,6 +326,7 @@ mod tests {
             body: body.into(),
             neg_text: String::new(),
             tags: String::new(),
+            category: String::new(),
             est_tokens: 100,
             mtime: 1,
             bandit_alpha: 1.0,
@@ -344,6 +370,7 @@ mod tests {
             body: body_text.into(),
             neg_text: String::new(),
             tags: String::new(),
+            category: String::new(),
             est_tokens: 100,
             mtime: 1,
             bandit_alpha: 1.0,
@@ -421,6 +448,7 @@ mod tests {
             body: String::new(),
             neg_text: neg.into(),
             tags: String::new(),
+            category: String::new(),
             est_tokens: 100,
             mtime: 1,
             bandit_alpha: 1.0,
@@ -489,6 +517,62 @@ mod tests {
                 "win-cleanup".to_string()
             ]
         );
+    }
+
+    fn seed_categories() -> Connection {
+        let mut conn = crate::db::open_in_memory().unwrap();
+        let mk = |name: &str, category: &str| crate::sources::SkillEntry {
+            name: name.into(),
+            source: "claude-user".into(),
+            path: std::path::PathBuf::from(format!("/x/{name}/SKILL.md")),
+            description: "d".into(),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: String::new(),
+            category: category.into(),
+            est_tokens: 10,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        };
+        crate::db::rebuild(
+            &mut conn,
+            &[
+                mk("a", "testing"),
+                mk("b", "testing"),
+                mk("c", "web"),
+                mk("d", ""),
+            ],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn list_categories_groups_and_counts_most_populated_first() {
+        let conn = seed_categories();
+        assert_eq!(
+            list_categories(&conn).unwrap(),
+            vec![
+                ("testing".to_string(), 2),
+                ("".to_string(), 1),
+                ("web".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn skills_in_category_lists_only_that_categorys_skills() {
+        let conn = seed_categories();
+        assert_eq!(
+            skills_in_category(&conn, "testing").unwrap(),
+            vec![
+                ("a".to_string(), "claude-user".to_string()),
+                ("b".to_string(), "claude-user".to_string()),
+            ]
+        );
+        assert!(skills_in_category(&conn, "nonexistent").unwrap().is_empty());
     }
 
     #[test]
@@ -586,6 +670,7 @@ mod tests {
             body: String::new(),
             neg_text: neg.into(),
             tags: String::new(),
+            category: String::new(),
             est_tokens: 100,
             mtime: 1,
             bandit_alpha: 1.0,
