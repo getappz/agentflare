@@ -296,6 +296,7 @@ version = "0.1.1"
 dependencies = [
  "agentflare-db-kit",
  "agentflare-gateway-registry",
+ "agentflare-store",
  "agentflare-workspace-hack",
  "dirs",
  "fastrand",

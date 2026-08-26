@@ -24,8 +24,21 @@ impl AgentflareMcp {
                     }
                 };
                 let limit = req.limit.unwrap_or(5);
+                // Lazily backfill a small batch of missing embeddings before
+                // searching, so the semantic index gradually catches up on
+                // first use rather than needing a separate background job.
+                // A no-op (and free) when the `semantic` feature is off.
+                let _ = self.with_fresh_registry(|reg| {
+                    reg.backfill_embeddings(
+                        crate::memory::engine::embed_doc,
+                        crate::memory::engine::model_name().as_deref().unwrap_or(""),
+                        25,
+                    )
+                });
                 let local = self
-                    .with_fresh_registry(|reg| reg.search(&query, limit, mode))?
+                    .with_fresh_registry(|reg| {
+                        reg.search_semantic(&query, limit, mode, crate::memory::engine::embed_query)
+                    })?
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 let hits = if local.len() < limit {
                     let remaining = limit - local.len();

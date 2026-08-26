@@ -319,6 +319,41 @@ impl AgentflareMcp {
         self.skill_create_impl(req).await
     }
 
+    #[tool(
+        description = "List skill categories (derived from each skill's `category:` frontmatter, or its first tag when unset). Omit `category` for every category with its skill count; pass one to list the skills in it. Read-only."
+    )]
+    async fn skill_categories(
+        &self,
+        Parameters(req): Parameters<SkillCategoriesRequest>,
+    ) -> Result<String, ErrorData> {
+        let result = match req.category {
+            None => {
+                let categories = self
+                    .with_fresh_registry(|reg| reg.list_categories())?
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                serde_json::json!({
+                    "categories": categories.into_iter().map(|(category, count)| {
+                        serde_json::json!({
+                            "category": if category.is_empty() { "uncategorized".to_string() } else { category },
+                            "count": count,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            }
+            Some(category) => {
+                let skills = self
+                    .with_fresh_registry(|reg| reg.skills_in_category(&category))?
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                serde_json::json!({
+                    "category": category,
+                    "skills": skills.into_iter().map(|(name, source)| {
+                        serde_json::json!({"name": name, "source": source})
+                    }).collect::<Vec<_>>(),
+                })
+            }
+        };
+        Ok(result.to_string())
+    }
     /// Filesystem/URL-safe stem derived from a display name — lowercased,
     /// non-alphanumerics collapsed to `-`, falling back to "handoff" if that
     /// leaves nothing.
