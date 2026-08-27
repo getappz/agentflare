@@ -1345,3 +1345,207 @@ fn first_time_gated_treats_different_ids_independently() {
         "a different item id must still get its own first-sighting notify"
     );
 }
+
+/// Sets up a project with the `ready-for-work` label and an item, optionally
+/// with dependencies and an assignee -- shared by the `cascade_unblock_dependents`
+/// tests below.
+fn seed_item_with_deps(
+    mcp: &AgentflareMcp,
+    name: &str,
+    assignee: Option<&str>,
+    dependency_ids: Vec<String>,
+) -> String {
+    mcp.with_backend_db(|conn| {
+        let project = mcp.resolve_project(conn).unwrap();
+        if agentflare_backend::label::list_by_project(conn, &project.id)
+            .unwrap()
+            .iter()
+            .all(|l| l.name != READY_LABEL)
+        {
+            agentflare_backend::label::create(
+                conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(project.id.clone()),
+                    workspace_id: project.workspace_id.clone(),
+                    name: READY_LABEL.into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap();
+        }
+        let states = agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+        let state_id = states.iter().find(|s| s.is_default).unwrap().id.clone();
+        agentflare_backend::item::create(
+            conn,
+            agentflare_backend::item::CreateItem {
+                project_id: project.id,
+                state_id,
+                name: name.into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: assignee.map(str::to_string),
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids,
+            },
+        )
+        .unwrap()
+        .id
+    })
+    .unwrap()
+}
+
+fn complete_item(mcp: &AgentflareMcp, item_id: &str) {
+    mcp.with_backend_db(|conn| {
+        let item = agentflare_backend::item::get(conn, item_id).unwrap();
+        let completed =
+            agentflare_backend::state::first_in_group(conn, &item.project_id, "completed").unwrap();
+        agentflare_backend::item::update_state(conn, item_id, &completed.id).unwrap();
+    })
+    .unwrap();
+}
+
+fn item_has_ready_label(mcp: &AgentflareMcp, item_id: &str) -> bool {
+    // Two sequential with_backend_db calls, not nested -- the backing
+    // connection lock is a plain (non-reentrant) Mutex.
+    let labels = mcp
+        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, item_id).unwrap())
+        .unwrap();
+    labels_contain_name(mcp, &labels, READY_LABEL)
+}
+
+#[test]
+fn cascade_unblock_dependents_labels_dependent_once_its_only_dependency_completes() {
+    let mcp = test_mcp();
+    let blocker = seed_item_with_deps(&mcp, "Blocker", None, vec![]);
+    let dependent = seed_item_with_deps(
+        &mcp,
+        "Dependent",
+        Some("claude-code"),
+        vec![blocker.clone()],
+    );
+    complete_item(&mcp, &blocker);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
+        .unwrap();
+
+    assert!(
+        item_has_ready_label(&mcp, &dependent),
+        "dependent's only dependency is completed -- it must be auto-labeled ready-for-work"
+    );
+}
+
+#[test]
+fn cascade_unblock_dependents_leaves_dependent_with_a_still_open_sibling_dependency() {
+    let mcp = test_mcp();
+    let blocker_a = seed_item_with_deps(&mcp, "BlockerA", None, vec![]);
+    let blocker_b = seed_item_with_deps(&mcp, "BlockerB", None, vec![]);
+    let dependent = seed_item_with_deps(
+        &mcp,
+        "Dependent",
+        Some("claude-code"),
+        vec![blocker_a.clone(), blocker_b.clone()],
+    );
+    complete_item(&mcp, &blocker_a);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker_a))
+        .unwrap();
+
+    assert!(
+        !item_has_ready_label(&mcp, &dependent),
+        "blocker_b is still open -- the dependent must not be auto-labeled yet"
+    );
+}
+
+#[test]
+fn cascade_unblock_dependents_skips_a_dependent_when_completed_item_has_no_assignee_either() {
+    let mcp = test_mcp();
+    let blocker = seed_item_with_deps(&mcp, "Blocker", None, vec![]);
+    let dependent = seed_item_with_deps(&mcp, "Dependent", None, vec![blocker.clone()]);
+    complete_item(&mcp, &blocker);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
+        .unwrap();
+
+    assert!(
+        !item_has_ready_label(&mcp, &dependent),
+        "an unassigned dependent has nothing to inherit from an equally-unassigned \
+         completed blocker -- it must not be silently auto-labeled"
+    );
+}
+
+#[test]
+fn cascade_unblock_dependents_unassigned_dependent_inherits_completed_items_assignee() {
+    let mcp = test_mcp();
+    let blocker = seed_item_with_deps(&mcp, "Blocker", Some("claude-code:instance-1"), vec![]);
+    let dependent = seed_item_with_deps(&mcp, "Dependent", None, vec![blocker.clone()]);
+    complete_item(&mcp, &blocker);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
+        .unwrap();
+
+    assert!(
+        item_has_ready_label(&mcp, &dependent),
+        "dependent had no assignee -- it should inherit the completed item's and get labeled"
+    );
+    let dependent_assignee = mcp
+        .with_backend_db(|conn| {
+            agentflare_backend::item::get(conn, &dependent)
+                .unwrap()
+                .assignee_agent
+        })
+        .unwrap();
+    assert_eq!(
+        dependent_assignee.as_deref(),
+        Some("claude-code"),
+        "inherited assignee must be stripped down to the bare agent id, not the \
+         agent:instance form"
+    );
+}
+
+#[test]
+fn cascade_unblock_dependents_is_idempotent_across_repeated_calls() {
+    let mcp = test_mcp();
+    let blocker = seed_item_with_deps(&mcp, "Blocker", None, vec![]);
+    let dependent = seed_item_with_deps(
+        &mcp,
+        "Dependent",
+        Some("claude-code"),
+        vec![blocker.clone()],
+    );
+    complete_item(&mcp, &blocker);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
+        .unwrap();
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
+        .unwrap();
+
+    let labels = mcp
+        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &dependent).unwrap())
+        .unwrap();
+    let ready_count = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let ready_id = agentflare_backend::label::list_by_project(conn, &project.id)
+                .unwrap()
+                .into_iter()
+                .find(|l| l.name == READY_LABEL)
+                .unwrap()
+                .id;
+            labels.iter().filter(|id| **id == ready_id).count()
+        })
+        .unwrap();
+    assert_eq!(
+        ready_count, 1,
+        "add_label's INSERT OR IGNORE must keep repeated cascade calls idempotent"
+    );
+}

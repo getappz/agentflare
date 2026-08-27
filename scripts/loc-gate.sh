@@ -39,6 +39,11 @@ ALLOWLIST=(
   # doing but is a separate, larger refactor than this nitpick-followup fix
   # should carry. Frozen at <= FROZEN_LIMIT; a real split is separate work.
   src/cli/git.rs
+  # Already 1542 lines on master before item #195's cascade_unblock_dependents
+  # tests were added, same situation as item/tests.rs above -- a small,
+  # scoped feature's own tests shouldn't have to carry a pre-existing test-
+  # module split. Frozen at <= FROZEN_LIMIT; a real split is separate work.
+  src/supervisor_tests.rs
 )
 
 cd "$(dirname "$0")/.."

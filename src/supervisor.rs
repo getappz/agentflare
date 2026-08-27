@@ -633,6 +633,99 @@ fn merge_approved_pr(
     }
 }
 
+/// Called from `item_check_merge` right after `item_id` is promoted to
+/// `completed` (both the automatic path via `promote_merged_item` above and
+/// manual/reconciliation calls funnel through that one function) -- for
+/// every item that declared a dependency on `item_id`, once *all* of its
+/// dependencies are completed, apply `READY_LABEL` so `run_discovery_tick`
+/// picks it up without a human/PM having to notice and `handoff` it by hand
+/// (item #195).
+///
+/// `run_discovery_tick` only dispatches items with a resolvable
+/// `assignee_agent`, so a dependent with none would just sit inert once
+/// labeled -- a dependent with no assignee inherits the just-completed
+/// item's own assignee (the agent that finished the blocking work is a
+/// reasonable default owner for what it unblocked) before being labeled.
+/// Only skipped, loudly, when the completed item itself has no assignee to
+/// inherit from.
+///
+/// Idempotent and safe under concurrent sibling completions:
+/// `item::add_label`'s `INSERT OR IGNORE` makes re-labeling a no-op, and an
+/// already-`dispatched` item won't be relabeled `ready-for-work` by this
+/// (it only ever adds the ready label, never touches `dispatched`).
+pub(crate) fn cascade_unblock_dependents(conn: &rusqlite::Connection, item_id: &str) {
+    let Ok(dependents) = agentflare_backend::item::dependents_of(conn, item_id) else {
+        return;
+    };
+    if dependents.is_empty() {
+        return;
+    }
+    let Ok(completed) = agentflare_backend::item::get(conn, item_id) else {
+        return;
+    };
+    let inherited_assignee = completed
+        .assignee_agent
+        .as_deref()
+        .map(agentflare_backend::item::agent_part);
+    for dependent_id in dependents {
+        if !agentflare_backend::item::all_dependencies_completed(conn, &dependent_id)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Ok(dependent) = agentflare_backend::item::get(conn, &dependent_id) else {
+            continue;
+        };
+        if dependent.assignee_agent.is_none() {
+            let Some(agent) = &inherited_assignee else {
+                // The just-completed item has no assignee of its own to hand
+                // off, so there's nothing sensible to inherit -- leave this
+                // loudly unassigned rather than silently no-op'ing.
+                eprintln!(
+                    "agentflare-supervisor: item #{} ({}) has all dependencies completed but no assignee_agent to inherit (completed item {item_id} has none either) -- not auto-labeled {READY_LABEL}, needs manual dispatch",
+                    dependent.sequence_id, dependent.id
+                );
+                continue;
+            };
+            if let Err(e) = agentflare_backend::item::update(
+                conn,
+                &dependent.id,
+                agentflare_backend::item::UpdateItem {
+                    assignee_agent: Some(agent.clone()),
+                    ..Default::default()
+                },
+            ) {
+                eprintln!(
+                    "agentflare-supervisor: failed to inherit assignee {agent} onto item #{} ({}) after dependency {item_id} completed: {e}",
+                    dependent.sequence_id, dependent.id
+                );
+                continue;
+            }
+        }
+        let Ok(labels) = agentflare_backend::label::list_by_project(conn, &dependent.project_id)
+        else {
+            continue;
+        };
+        let Some(ready_id) = labels
+            .into_iter()
+            .find(|l| l.name == READY_LABEL)
+            .map(|l| l.id)
+        else {
+            continue;
+        };
+        match agentflare_backend::item::add_label(conn, &dependent.id, &ready_id) {
+            Ok(()) => eprintln!(
+                "agentflare-supervisor: item #{} ({}) all dependencies completed -- auto-labeled {READY_LABEL}",
+                dependent.sequence_id, dependent.id
+            ),
+            Err(e) => eprintln!(
+                "agentflare-supervisor: failed to auto-label item #{} ({}) {READY_LABEL} after dependency {item_id} completed: {e}",
+                dependent.sequence_id, dependent.id
+            ),
+        }
+    }
+}
+
 /// Whether an `agentflare-work` job is already queued or running for
 /// `item_id` -- guards the (small) window between `enqueue_work_job`
 /// returning and the job actually reaching `item_claim`, during which the
