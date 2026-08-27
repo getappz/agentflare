@@ -1088,7 +1088,11 @@ pub fn commit_uncommitted(item: &Item, repo_root: &Path, message: &str) -> Commi
 /// intentionally bypasses it, since an in-progress turn's diff can
 /// legitimately, if only temporarily, exceed the gate; `finalize`'s
 /// squashed commit (see `squash_since`) is what the gate actually evaluates.
-pub fn commit_uncommitted_at(worktree_path: &Path, message: &str, no_verify: bool) -> CommitOutcome {
+pub fn commit_uncommitted_at(
+    worktree_path: &Path,
+    message: &str,
+    no_verify: bool,
+) -> CommitOutcome {
     match run_git_in(worktree_path, &["status", "--porcelain"]) {
         Ok(out) if !out.trim().is_empty() => {}
         _ => return CommitOutcome::NothingToCommit,
