@@ -8,6 +8,7 @@ use crate::ingest::{
     common::{extract_file_path, extract_tokens, file_kind_for_tool, parse_timestamp, title_from_text},
     IngestBundle, IngestError, Adapter,
 };
+use crate::config::PricingTable;
 use crate::model::{FileEvent, Session, SessionSource, SessionStatus, Subagent, TokenUsage, Turn, ToolCall};
 
 pub struct ClaudeAdapter;
@@ -214,13 +215,18 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
         }
     }
 
+    let cost_for_session = {
+        let pricing = PricingTable::default();
+        let c = pricing.cost_for(model.as_deref(), &tokens);
+        if c.total_usd > 0.0 { Some(c) } else { None }
+    };
     let session = Session {
         id: id.clone(),
         source: SessionSource::ClaudeCode,
         project,
         project_path: path.parent().map(|p| p.to_string_lossy().to_string()),
         title,
-        model,
+        model: model.clone(),
         status: SessionStatus::Completed,
         awaiting_reason: None,
         started_at: updated_at,
@@ -228,7 +234,7 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
         ended_at: updated_at,
         duration_secs: None,
         tokens: tokens.clone(),
-        cost: None,
+        cost: cost_for_session,
         turn_count: turns.len() as u32,
         tool_call_count,
         subagent_count: subagents.len() as u32,

@@ -7,6 +7,7 @@ use crate::ingest::{
     common::{extract_file_path, extract_tokens, file_kind_for_tool, parse_timestamp},
     IngestBundle, IngestError, Adapter,
 };
+use crate::config::PricingTable;
 use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, Turn, ToolCall};
 
 pub struct OpenCodeAdapter;
@@ -130,9 +131,11 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
     let mut out = Vec::new();
     while let Ok(Some(row)) = rows.next() {
         let id: String = row.get(id_idx).unwrap_or_else(|_| "unknown".to_string());
-        let project: String = project_idx
+        let project_id_raw: String = project_idx
             .and_then(|idx| row.get::<_, Option<String>>(idx).ok().flatten())
             .unwrap_or_else(|| "opencode".to_string());
+    let directory: Option<String> = find(&["directory", "path"])
+            .and_then(|idx| row.get::<_, Option<String>>(idx).ok().flatten());
         let title: Option<String> = title_idx
             .and_then(|idx| row.get::<_, Option<String>>(idx).ok().flatten());
         let model: Option<String> = model_idx
@@ -188,23 +191,29 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
 
         // Try to resolve project name via project table
         let project_name = {
-            let mut stmt = conn
-                .prepare("SELECT name FROM project WHERE id = ?1")
-                .ok();
-            if let Some(stmt) = stmt.as_mut() {
-                stmt.query_row([&project], |r| r.get::<_, String>(0))
-                    .ok()
-                    .unwrap_or(project.clone())
+            // DRY: prefer project.name, fallback to directory basename (agent-eval style), then project_id hash
+            if let Ok(mut stmt) = conn.prepare("SELECT name FROM project WHERE id = ?1") {
+                if let Ok(name) = stmt.query_row([&project_id_raw], |r| r.get::<_, String>(0)) {
+                    name
+                } else if let Some(dir) = &directory {
+                    dir.rsplit('/').next().unwrap_or(dir).to_string()
+                } else {
+                    project_id_raw.clone()
+                }
+            } else if let Some(dir) = &directory {
+                dir.rsplit('/').next().unwrap_or(dir).to_string()
             } else {
-                project.clone()
+                project_id_raw.clone()
             }
         };
 
+        let model_for_cost = model.clone();
+        let cost_for_session = cost.map(|total_usd| crate::model::Cost { total_usd, input_usd: 0.0, output_usd: 0.0, cache_read_usd: 0.0, cache_write_usd: 0.0, }).or_else(|| { let pricing = PricingTable::default(); let c = pricing.cost_for(model_for_cost.as_deref(), &tokens); if c.total_usd > 0.0 { Some(c) } else { None } });
         out.push(Session {
             id,
             source: SessionSource::OpenCode,
-            project: project_name,
-            project_path: Some(project),
+            project: project_name.clone(),
+            project_path: directory.clone().or(Some(project_id_raw.clone())),
             title,
             model,
             status: SessionStatus::Completed,
@@ -214,13 +223,7 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
             ended_at: None,
             duration_secs: None,
             tokens,
-            cost: cost.map(|total_usd| crate::model::Cost {
-                total_usd,
-                input_usd: 0.0,
-                output_usd: 0.0,
-                cache_read_usd: 0.0,
-                cache_write_usd: 0.0,
-            }),
+            cost: cost_for_session,
             turn_count: 0,
             tool_call_count: 0,
             subagent_count: 0,

@@ -28,6 +28,8 @@ pub enum InsightsCommands {
     Handoff(HandoffArgs),
     /// Run local dashboard (127.0.0.1 only)
     Serve(ServeArgs),
+    /// Watch sources and re-sync on change (live)
+    Watch(WatchArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -95,6 +97,12 @@ pub struct ServeArgs {
     pub port: u16,
 }
 
+#[derive(Parser, Debug)]
+pub struct WatchArgs {
+    #[arg(long, default_value = "5")]
+    pub interval_secs: u64,
+}
+
 impl InsightsArgs {
     pub fn run(self) {
         let db_path = self.db.unwrap_or_else(|| {
@@ -118,6 +126,7 @@ impl InsightsArgs {
             InsightsCommands::Export(args) => run_export(db_path, args),
             InsightsCommands::Handoff(args) => run_handoff(db_path, args),
             InsightsCommands::Serve(args) => run_serve(db_path, args),
+            InsightsCommands::Watch(args) => run_watch(db_path, args),
         }
     }
 }
@@ -385,6 +394,36 @@ fn run_handoff(db: PathBuf, args: HandoffArgs) {
     };
     let doc = flare_insights::handoff::handoff_doc(&session, &turns, &args.target, verbosity);
     println!("{doc}");
+}
+
+fn run_watch(db: PathBuf, args: WatchArgs) {
+    use flare_insights::ingest::watcher::InsightsWatcher;
+    use flare_insights::config::InsightsConfig;
+    println!("watching sources every {}s (ctrl-c to stop)", args.interval_secs);
+    let config = InsightsConfig::default();
+    let store = open_store(db.clone());
+    // initial sync
+    let (s, t, tools) = InsightsWatcher::rescan_and_store(&config, &store);
+    println!("initial: {s} sessions {t} turns {tools} tools");
+    // spawn watcher - clone config for closure
+    let db_clone = db.clone();
+    let config_clone = config.clone();
+    let _ = InsightsWatcher::from_config(&config).spawn(move |ev| {
+        println!("change: {:?} -> resync", ev);
+        if let Ok(store) = flare_insights::store::InsightsStore::open(&db_clone) {
+            let (s, t, tools) = InsightsWatcher::rescan_and_store(&config_clone, &store);
+            println!("resynced: {s} sessions {t} turns {tools} tools");
+        }
+    });
+    // keep alive + poll fallback
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(args.interval_secs));
+        let store = open_store(db.clone());
+        let (s, t, tools) = InsightsWatcher::rescan_and_store(&config, &store);
+        if s > 0 {
+            println!("tick: {s} sessions {t} turns");
+        }
+    }
 }
 
 fn run_serve(db: PathBuf, args: ServeArgs) {

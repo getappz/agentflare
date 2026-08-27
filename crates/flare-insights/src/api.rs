@@ -73,6 +73,12 @@ async fn handle_conn(
 
     let (route, query) = split_query(path);
 
+    // DRY dashboard for claude/opencode (simple HTML, no build)
+    if route == "/" || route == "/dashboard" {
+        let html = dashboard_html();
+        return write_html_response(socket, &html).await;
+    }
+
     let (status, body) = match route {
         "/api/health" => (200, serde_json::json!({"status":"ok","version": crate::VERSION})),
         "/api/sessions" => {
@@ -187,6 +193,46 @@ async fn write_response(
     socket.write_all(resp.as_bytes()).await?;
     socket.flush().await?;
     Ok(())
+}
+
+async fn write_html_response(socket: &mut tokio::net::TcpStream, html: &str) -> anyhow::Result<()> {
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        html.len(),
+        html
+    );
+    socket.write_all(resp.as_bytes()).await?;
+    socket.flush().await?;
+    Ok(())
+}
+
+fn dashboard_html() -> String {
+    r#"<!doctype html><html><head><meta charset="utf-8"><title>flare-insights — claude / opencode</title>
+<style>body{font-family:system-ui, sans-serif; max-width:900px; margin:2rem auto; padding:0 1rem} pre{background:#f6f6f6; padding:1rem; overflow:auto} a{color:#0366d6}</style>
+</head><body>
+<h1>flare-insights — Claude Code + OpenCode</h1>
+<p>Local-first, 127.0.0.1 only. Sources: <code>~/.agentflare/projects</code> (claude) + <code>~/.local/share/opencode/opencode.db</code></p>
+<ul>
+<li><a href="/api/health">/api/health</a></li>
+<li><a href="/api/sessions?limit=5">/api/sessions?limit=5</a> — recent sessions</li>
+<li><a href="/api/stats">/api/stats</a> — tokens, cost, by_source</li>
+<li><a href="/api/search?q=agentflare">/api/search?q=agentflare</a> — FTS + file/tool</li>
+</ul>
+<div id="sessions">Loading...</div>
+<script>
+async function load(){
+  const [s, stats] = await Promise.all([
+    fetch('/api/sessions?limit=10').then(r=>r.json()),
+    fetch('/api/stats').then(r=>r.json())
+  ]);
+  document.getElementById('sessions').innerHTML =
+    '<h2>Stats</h2><pre>'+JSON.stringify(stats,null,2)+'</pre>'+
+    '<h2>Recent sessions</h2><pre>'+JSON.stringify(s,null,2)+'</pre>';
+}
+load();
+setInterval(load, 5000);
+</script>
+</body></html>"#.to_string()
 }
 
 // Minimal urlencoding fallback if crate not present
