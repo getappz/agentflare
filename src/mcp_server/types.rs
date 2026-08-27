@@ -851,15 +851,20 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) reclaim: Option<bool>,
     #[schemars(
-        description = "doctor only: with reclaim=true, also delete lanes flagged dirty (uncommitted changes). Default false. DANGEROUS when `worktree` is omitted: it force-deletes EVERY dirty lane in the repo, not just the one you're trying to fix — always pass `worktree` alongside `force=true` unless you genuinely intend a repo-wide sweep."
+        description = "doctor only: with reclaim=true, also delete lanes flagged dirty (uncommitted changes). Default false. Refused when `worktree` is omitted (an unscoped force-reclaim force-deletes EVERY dirty lane in the repo, including other agents' uncommitted work) unless `repo_wide=true` explicitly confirms repo-wide intent."
     )]
     #[serde(default)]
     pub(crate) force: Option<bool>,
     #[schemars(
-        description = "doctor only: with reclaim=true, scope reclaim to a single lane by name (e.g. \"task/110\") or its worktree path. Omit to reclaim across every eligible lane repo-wide (the default). Strongly recommended whenever `force=true` is set, to avoid deleting unrelated dirty worktrees."
+        description = "doctor only: with reclaim=true, scope reclaim to a single lane by name (e.g. \"task/110\") or its worktree path. Always pass this alongside `force=true` to fix ONE broken worktree; omit only for a genuine repo-wide sweep."
     )]
     #[serde(default)]
     pub(crate) worktree: Option<String>,
+    #[schemars(
+        description = "doctor only: explicit confirmation that an unscoped `force=true` reclaim may delete EVERY dirty lane repo-wide. Required (true) whenever `reclaim=true` + `force=true` and `worktree` is omitted — the call is refused otherwise, since that combination would otherwise silently delete other agents' uncommitted work (2026-08-16 incident). Ignored when `worktree` is set or `force` is false."
+    )]
+    #[serde(default)]
+    pub(crate) repo_wide: Option<bool>,
 }
 
 /// Lean per-item projection for `item(list)` — the raw 19-field `Item` (full
