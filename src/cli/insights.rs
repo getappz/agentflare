@@ -387,8 +387,17 @@ fn run_handoff(db: PathBuf, args: HandoffArgs) {
     println!("{doc}");
 }
 
-fn run_serve(_db: PathBuf, args: ServeArgs) {
+fn run_serve(db: PathBuf, args: ServeArgs) {
     println!("flare-insights serve on 127.0.0.1:{} (API + WS)", args.port);
-    println!("endpoints: GET /api/sessions  GET /api/search?q=  GET /api/stats  WS /ws");
-    println!("(full axum server behind `api` feature — scaffold ready, bind 127.0.0.1 only)");
+    println!("endpoints: GET /api/health  GET /api/sessions  GET /api/sessions/:id  GET /api/search?q=  GET /api/stats");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        if let Err(e) = flare_insights::api::serve(db, args.port).await {
+            eprintln!("serve error: {e}");
+            std::process::exit(1);
+        }
+    });
 }

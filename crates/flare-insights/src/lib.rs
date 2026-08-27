@@ -24,7 +24,6 @@ pub mod replay;
 pub mod search;
 pub mod store;
 
-#[cfg(feature = "api")]
 pub mod api;
 
 pub use config::{InsightsConfig, PricingTable};
