@@ -509,6 +509,76 @@ fn commit_uncommitted_is_a_noop_when_no_worktree_exists() {
     ));
 }
 
+// Item #193: the SDD loop's per-implementer-turn checkpoint commits use
+// `commit_uncommitted_at`/`head_sha`/`squash_since` directly against an
+// already-resolved worktree path (not an `Item`), and `finalize` squashes
+// them back into one diff before its own `commit_uncommitted` call.
+#[test]
+fn commit_uncommitted_at_commits_with_no_verify_when_requested() {
+    let repo = init_repo();
+    let item = test_item(1);
+    let target = resolve_default_branch(&repo.path);
+    let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+    std::fs::write(worktree_path.join("checkpoint.txt"), "x").unwrap();
+
+    assert!(matches!(
+        commit_uncommitted_at(&worktree_path, "checkpoint", true),
+        CommitOutcome::Committed
+    ));
+    let status = run_git_in(&worktree_path, &["status", "--porcelain"]).unwrap();
+    assert!(status.is_empty(), "worktree must be clean after commit");
+}
+
+#[test]
+fn head_sha_resolves_the_current_commit() {
+    let repo = init_repo();
+    let item = test_item(1);
+    let target = resolve_default_branch(&repo.path);
+    let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+    let expected = run_git_in(&worktree_path, &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_sha(&worktree_path), Some(expected));
+}
+
+#[test]
+fn head_sha_is_none_when_no_worktree_exists() {
+    let repo = init_repo();
+    assert_eq!(head_sha(&repo.path.join("nope")), None);
+}
+
+#[test]
+fn squash_since_folds_checkpoint_commits_into_one_uncommitted_diff() {
+    let repo = init_repo();
+    let item = test_item(1);
+    let target = resolve_default_branch(&repo.path);
+    let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+    let base_sha = head_sha(&worktree_path).unwrap();
+
+    std::fs::write(worktree_path.join("checkpoint.txt"), "turn 1").unwrap();
+    assert!(matches!(
+        commit_uncommitted_at(&worktree_path, "wip: turn 1", true),
+        CommitOutcome::Committed
+    ));
+    std::fs::write(worktree_path.join("checkpoint.txt"), "turn 2").unwrap();
+    assert!(matches!(
+        commit_uncommitted_at(&worktree_path, "wip: turn 2", true),
+        CommitOutcome::Committed
+    ));
+
+    squash_since(&worktree_path, &base_sha).unwrap();
+
+    assert_eq!(head_sha(&worktree_path), Some(base_sha));
+    let status = run_git_in(&worktree_path, &["status", "--porcelain"]).unwrap();
+    assert!(
+        !status.trim().is_empty(),
+        "squash must leave the diff staged, not discard it"
+    );
+    let content = std::fs::read_to_string(worktree_path.join("checkpoint.txt")).unwrap();
+    assert_eq!(content, "turn 2");
+}
+
 // Windows' FILE_ATTRIBUTE_READONLY on a *directory* doesn't prevent writes
 // to files inside it (unlike Unix permission bits) -- the readonly-git-dir
 // simulation below relies on that Unix-specific behavior to make `git add`

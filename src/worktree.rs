@@ -63,6 +63,25 @@ pub fn commit_uncommitted(
     flare_git_core::worktree::commit_uncommitted(item, repo_root, message)
 }
 
+/// See `flare_git_core::worktree::commit_uncommitted_at`.
+pub fn commit_uncommitted_at(
+    worktree_path: &Path,
+    message: &str,
+    no_verify: bool,
+) -> CommitOutcome {
+    flare_git_core::worktree::commit_uncommitted_at(worktree_path, message, no_verify)
+}
+
+/// See `flare_git_core::worktree::head_sha`.
+pub fn head_sha(worktree_path: &Path) -> Option<String> {
+    flare_git_core::worktree::head_sha(worktree_path)
+}
+
+/// See `flare_git_core::worktree::squash_since`.
+pub fn squash_since(worktree_path: &Path, base_sha: &str) -> Result<(), String> {
+    flare_git_core::worktree::squash_since(worktree_path, base_sha)
+}
+
 /// Checks whether `item`'s branch already has a merged PR — the promotion
 /// signal `check_merge` uses to move an item out of "in_review" (item
 /// #420). Soft-fails like `push_and_open_pr`: no GitHub credentials, no
