@@ -13,6 +13,21 @@ fn ready_label_id(conn: &rusqlite::Connection, project_id: &str) -> Option<Strin
         .map(|l| l.id)
 }
 
+/// Merges `"task_type"` into an existing metadata JSON string, same
+/// defensive-coercion pattern as `work_item_pipeline::persist_run_id` (a
+/// non-object existing value, e.g. a double-encoded string, must not panic
+/// `IndexMut` — it's just dropped in favor of a fresh object). Returns the
+/// merged string ready for `UpdateItem`/`CreateItem`'s `metadata` field.
+fn merge_task_type(existing: &str, task_type: &str) -> String {
+    let mut merged = serde_json::from_str::<serde_json::Value>(existing)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .map(serde_json::Value::Object)
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    merged["task_type"] = serde_json::Value::String(task_type.to_string());
+    merged.to_string()
+}
+
 impl AgentflareMcp {
     pub fn handoff_impl(
         &self,
@@ -25,6 +40,7 @@ impl AgentflareMcp {
             thread_id,
             reply_to,
             description,
+            task_type,
             facts,
             summary,
             findings,
@@ -132,8 +148,18 @@ impl AgentflareMcp {
 
             let item = match &item_id {
                 Some(id) => {
+                    let metadata = match &task_type {
+                        Some(t) => Some(merge_task_type(
+                            &agentflare_backend::item::get(conn, id)
+                                .map_err(map_backend_err)?
+                                .metadata,
+                            t,
+                        )),
+                        None => None,
+                    };
                     let input = agentflare_backend::item::UpdateItem {
                         assignee_agent: Some(recipient.clone()),
+                        metadata,
                         ..Default::default()
                     };
                     let item = agentflare_backend::item::update(conn, id, input)
@@ -226,9 +252,13 @@ impl AgentflareMcp {
                                     ErrorData::internal_error("project has no default state", None)
                                 })?
                                 .id;
-                        let metadata = thread_id
+                        let mut metadata = thread_id
                             .as_ref()
                             .map(|t| serde_json::json!({ "thread": t }).to_string());
+                        if let Some(t) = &task_type {
+                            metadata =
+                                Some(merge_task_type(metadata.as_deref().unwrap_or("{}"), t));
+                        }
                         // A brand-new handed-off item is real, undone work —
                         // labeling it `ready-for-work` (when the project has
                         // that label at all; skipped otherwise rather than
@@ -844,6 +874,79 @@ mod tests {
         assert!(
             item_label_names(&mcp, &item_id).contains(&crate::supervisor::READY_LABEL.to_string())
         );
+    }
+
+    #[test]
+    fn task_type_on_a_new_item_handoff_lands_in_metadata() {
+        let req = HandoffRequest {
+            task_type: Some("implementation".to_string()),
+            ..base_request()
+        };
+        let (_tmp, mcp) = test_mcp();
+        let reply = mcp.handoff_impl(req).unwrap();
+        let item_id = serde_json::from_str::<serde_json::Value>(&reply).unwrap()["item_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let metadata = mcp
+            .with_backend_db(|conn| {
+                agentflare_backend::item::get(conn, &item_id)
+                    .unwrap()
+                    .metadata
+            })
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(parsed["task_type"], "implementation");
+    }
+
+    #[test]
+    fn task_type_on_an_existing_item_handoff_merges_without_clobbering_other_metadata_keys() {
+        // item #170's false-positive class, reproduced live twice more in a
+        // single PM-mode session (items #192/#173): a description that
+        // merely *mentions* "design-spec" (e.g. referencing another item's
+        // spec) forces work_item_pipeline::detect_review_only's free-text
+        // scan to treat a genuine implementation task as review-only. This
+        // is the fix -- a caller sets task_type explicitly on the handoff
+        // instead of relying on prose. Also asserts the merge is real (an
+        // unrelated pre-existing key, e.g. `size`, survives).
+        let (_tmp, mcp) = test_mcp();
+        let first = mcp.handoff_impl(base_request()).unwrap();
+        let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        mcp.with_backend_db(|conn| {
+            agentflare_backend::item::update(
+                conn,
+                &item_id,
+                agentflare_backend::item::UpdateItem {
+                    metadata: Some(serde_json::json!({"size": "M"}).to_string()),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+
+        let reply = HandoffRequest {
+            item_id: Some(item_id.clone()),
+            task_type: Some("implementation".to_string()),
+            completed: "more".to_string(),
+            remaining: "less".to_string(),
+            ..base_request()
+        };
+        mcp.handoff_impl(reply).unwrap();
+
+        let metadata = mcp
+            .with_backend_db(|conn| {
+                agentflare_backend::item::get(conn, &item_id)
+                    .unwrap()
+                    .metadata
+            })
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(parsed["task_type"], "implementation");
+        assert_eq!(parsed["size"], "M");
     }
 
     #[test]
