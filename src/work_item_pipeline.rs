@@ -143,6 +143,12 @@ pub(crate) struct WorkItemData {
     /// back to ambient cwd in that case.
     #[serde(default)]
     pub worktree_path: String,
+    /// SHA captured before the SDD loop's first checkpoint commit (item
+    /// #193). `finalize` squashes back to this point before its own
+    /// auto-commit, so the LOC-freeze gate sees one commit, not per-turn
+    /// fragments. `None` until then, and for review-only runs.
+    #[serde(default)]
+    pub checkpoint_base_sha: Option<String>,
 }
 
 impl flare_workflow::WorkflowData for WorkItemData {
@@ -375,6 +381,36 @@ fn synthesize_reply_text(last_report: Option<&str>, ledger: &[String]) -> String
     }
 }
 
+/// Commits whatever an implementer turn just changed, so a crash/timeout
+/// later in the run (item #191's #186/#187) has something to resume from
+/// besides a raw, possibly-corrupted diff (item #193). `--no-verify` skips
+/// the LOC-freeze gate — an in-progress turn can legitimately exceed it
+/// temporarily; `finalize`'s squash+`commit_uncommitted` is what runs it.
+/// Captures `checkpoint_base_sha` lazily for `finalize` to reset back to.
+///
+/// No-ops when `worktree_path` is empty (a run persisted before item #191
+/// threaded it through): unlike agent dispatch, which has an ambient-cwd
+/// fallback for that legacy case, a `git commit` has no safe ambient
+/// fallback — the process cwd is never guaranteed to BE that item's
+/// worktree, and committing into whatever it actually is would be a
+/// correctness hazard, not just a missed checkpoint. Best-effort otherwise:
+/// a commit failure is logged, not fatal.
+fn checkpoint_implementer_turn(data: &mut WorkItemData, task_id: usize) {
+    if data.worktree_path.is_empty() {
+        return;
+    }
+    let worktree_path = std::path::PathBuf::from(&data.worktree_path);
+    if data.checkpoint_base_sha.is_none() {
+        data.checkpoint_base_sha = crate::worktree::head_sha(&worktree_path);
+    }
+    let message = format!("wip(sdd-loop): task {task_id} checkpoint");
+    if let crate::worktree::CommitOutcome::Failed(e) =
+        crate::worktree::commit_uncommitted_at(&worktree_path, &message, true)
+    {
+        eprintln!("sdd_loop: checkpoint commit for task {task_id} failed: {e}");
+    }
+}
+
 pub(crate) fn build_sdd_loop_step(
     send: flare_workflow::json::SendMessage,
 ) -> StepDefinition<WorkItemData> {
@@ -420,46 +456,48 @@ pub(crate) fn build_sdd_loop_step(
                 // dispatch further down), so a usage-threshold fallback that
                 // swaps `agent_name` to another CLI still leaves real code
                 // review running on the reserved agent.
-                let (role_agent, role_prompt) = if ctx.data.review_issues.is_some() {
-                    if ctx.data.last_report.is_some() {
-                        // A fix has already been submitted for the current
-                        // issues — re-review it.
-                        let findings = ctx.data.review_issues.clone().unwrap_or_default();
-                        let fix_report = ctx.data.last_report.clone().unwrap_or_default();
-                        (
-                            judge_agent_name.clone(),
-                            build_re_reviewer_prompt(&task, &findings, &fix_report),
-                        )
-                    } else {
-                        // Issues open, no fix attempt yet — dispatch the
-                        // implementer to fix them (or, for a review-only
-                        // task, the analyst to revise their findings).
-                        let fix_context = ctx.data.review_issues.as_deref();
-                        let prompt = if ctx.data.review_only {
-                            build_review_analyst_prompt(&task, fix_context)
+                let (role_agent, role_prompt, is_implementer_turn) =
+                    if ctx.data.review_issues.is_some() {
+                        if ctx.data.last_report.is_some() {
+                            // A fix has already been submitted for the current
+                            // issues — re-review it.
+                            let findings = ctx.data.review_issues.clone().unwrap_or_default();
+                            let fix_report = ctx.data.last_report.clone().unwrap_or_default();
+                            (
+                                judge_agent_name.clone(),
+                                build_re_reviewer_prompt(&task, &findings, &fix_report),
+                                false,
+                            )
                         } else {
-                            build_implementer_prompt(&task, fix_context, ctx.data.tdd)
+                            // Issues open, no fix attempt yet — dispatch the
+                            // implementer to fix them (or, for a review-only
+                            // task, the analyst to revise their findings).
+                            let fix_context = ctx.data.review_issues.as_deref();
+                            let prompt = if ctx.data.review_only {
+                                build_review_analyst_prompt(&task, fix_context)
+                            } else {
+                                build_implementer_prompt(&task, fix_context, ctx.data.tdd)
+                            };
+                            (agent_name.clone(), prompt, !ctx.data.review_only)
+                        }
+                    } else if ctx.data.last_report.is_some() {
+                        // No open issues; a report is pending review.
+                        let report = ctx.data.last_report.clone().unwrap_or_default();
+                        let prompt = if ctx.data.review_only {
+                            build_review_of_analysis_prompt(&task, &report)
+                        } else {
+                            build_task_reviewer_prompt(&task, &report, ctx.data.tdd)
                         };
-                        (agent_name.clone(), prompt)
-                    }
-                } else if ctx.data.last_report.is_some() {
-                    // No open issues; a report is pending review.
-                    let report = ctx.data.last_report.clone().unwrap_or_default();
-                    let prompt = if ctx.data.review_only {
-                        build_review_of_analysis_prompt(&task, &report)
+                        (judge_agent_name.clone(), prompt, false)
                     } else {
-                        build_task_reviewer_prompt(&task, &report, ctx.data.tdd)
+                        // Fresh task, nothing dispatched yet.
+                        let prompt = if ctx.data.review_only {
+                            build_review_analyst_prompt(&task, None)
+                        } else {
+                            build_implementer_prompt(&task, None, ctx.data.tdd)
+                        };
+                        (agent_name.clone(), prompt, !ctx.data.review_only)
                     };
-                    (judge_agent_name.clone(), prompt)
-                } else {
-                    // Fresh task, nothing dispatched yet.
-                    let prompt = if ctx.data.review_only {
-                        build_review_analyst_prompt(&task, None)
-                    } else {
-                        build_implementer_prompt(&task, None, ctx.data.tdd)
-                    };
-                    (agent_name.clone(), prompt)
-                };
 
                 let cwd = (!ctx.data.worktree_path.is_empty())
                     .then(|| std::path::PathBuf::from(&ctx.data.worktree_path));
@@ -486,6 +524,10 @@ pub(crate) fn build_sdd_loop_step(
                     })?;
                 ctx.input_tokens += in_tok;
                 ctx.output_tokens += out_tok;
+
+                if is_implementer_turn {
+                    checkpoint_implementer_turn(&mut ctx.data, task.id);
+                }
 
                 let (role_reply, role_session_id) = strip_session_marker(&raw_role_reply);
                 if let Some(id) = role_session_id {
@@ -776,6 +818,22 @@ pub(crate) fn build_finalize_step(
                             ..Default::default()
                         });
                         return Ok(StepResult::Success);
+                    }
+
+                    // Squash checkpoint commits (item #193) into one diff
+                    // before `item_done`'s own commit, so the LOC-freeze
+                    // gate sees the whole run at once. `.take()`: a retry
+                    // of this step must not re-squash an already-squashed
+                    // commit.
+                    if let Some(base_sha) = ctx.data.checkpoint_base_sha.take()
+                        && !ctx.data.worktree_path.is_empty()
+                    {
+                        let worktree_path = std::path::PathBuf::from(&ctx.data.worktree_path);
+                        if let Err(e) = crate::worktree::squash_since(&worktree_path, &base_sha) {
+                            eprintln!(
+                                "finalize: squashing sdd_loop checkpoint commits for item {item_id} failed: {e}"
+                            );
+                        }
                     }
 
                     let done_resp = mcp

@@ -89,6 +89,56 @@ fn clean_agent_reply_fixes_claude_stream_json_so_judge_parsing_succeeds() {
     assert_eq!(decision.action, JudgeAction::AdvanceTask);
 }
 
+// Item #193 regression: falling back to the ambient process cwd for a
+// checkpoint `git commit` (the way `real_agent_send_hook` safely does for
+// agent dispatch on a run persisted before item #191 threaded a real
+// worktree path through) is not safe here -- ambient cwd during `cargo
+// test` is this very repo, and an earlier version of this fallback
+// committed the test process's own uncommitted work into it.
+#[test]
+fn checkpoint_implementer_turn_is_a_noop_without_a_worktree_path() {
+    let mut data = WorkItemData::default();
+    checkpoint_implementer_turn(&mut data, 0);
+    assert!(data.checkpoint_base_sha.is_none());
+}
+
+#[test]
+fn checkpoint_implementer_turn_commits_and_squash_since_folds_turns_back_together() {
+    let (_mcp, _backend_tmp, _repo_tmp, _item_id, _project_id, worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Checkpoint commit test item");
+    let head_before = crate::worktree::head_sha(&worktree_path).unwrap();
+
+    let mut data = WorkItemData {
+        worktree_path: worktree_path.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+
+    std::fs::write(worktree_path.join("real_work.txt"), "turn 1").unwrap();
+    checkpoint_implementer_turn(&mut data, 0);
+    assert_eq!(
+        data.checkpoint_base_sha.as_deref(),
+        Some(head_before.as_str())
+    );
+    let head_after_first = crate::worktree::head_sha(&worktree_path).unwrap();
+    assert_ne!(
+        head_after_first, head_before,
+        "first turn should have committed"
+    );
+
+    std::fs::write(worktree_path.join("real_work.txt"), "turn 2").unwrap();
+    checkpoint_implementer_turn(&mut data, 0);
+    // Base is captured once, not re-captured on the second checkpoint.
+    assert_eq!(
+        data.checkpoint_base_sha.as_deref(),
+        Some(head_before.as_str())
+    );
+
+    crate::worktree::squash_since(&worktree_path, &head_before).unwrap();
+    assert_eq!(crate::worktree::head_sha(&worktree_path), Some(head_before));
+    let content = std::fs::read_to_string(worktree_path.join("real_work.txt")).unwrap();
+    assert_eq!(content, "turn 2");
+}
+
 use flare_workflow::store::InMemoryStore;
 use flare_workflow::{WorkflowDefinition, WorkflowEngine, WorkflowId};
 use std::sync::Arc;
