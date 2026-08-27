@@ -706,7 +706,10 @@ pub(crate) fn cascade_unblock_dependents(conn: &rusqlite::Connection, item_id: &
         else {
             continue;
         };
-        let Some(ready_id) = labels.into_iter().find(|l| l.name == READY_LABEL).map(|l| l.id)
+        let Some(ready_id) = labels
+            .into_iter()
+            .find(|l| l.name == READY_LABEL)
+            .map(|l| l.id)
         else {
             continue;
         };

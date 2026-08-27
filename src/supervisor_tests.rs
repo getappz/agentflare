@@ -1408,8 +1408,7 @@ fn complete_item(mcp: &AgentflareMcp, item_id: &str) {
     mcp.with_backend_db(|conn| {
         let item = agentflare_backend::item::get(conn, item_id).unwrap();
         let completed =
-            agentflare_backend::state::first_in_group(conn, &item.project_id, "completed")
-                .unwrap();
+            agentflare_backend::state::first_in_group(conn, &item.project_id, "completed").unwrap();
         agentflare_backend::item::update_state(conn, item_id, &completed.id).unwrap();
     })
     .unwrap();
@@ -1428,7 +1427,12 @@ fn item_has_ready_label(mcp: &AgentflareMcp, item_id: &str) -> bool {
 fn cascade_unblock_dependents_labels_dependent_once_its_only_dependency_completes() {
     let mcp = test_mcp();
     let blocker = seed_item_with_deps(&mcp, "Blocker", None, vec![]);
-    let dependent = seed_item_with_deps(&mcp, "Dependent", Some("claude-code"), vec![blocker.clone()]);
+    let dependent = seed_item_with_deps(
+        &mcp,
+        "Dependent",
+        Some("claude-code"),
+        vec![blocker.clone()],
+    );
     complete_item(&mcp, &blocker);
 
     mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
@@ -1512,7 +1516,12 @@ fn cascade_unblock_dependents_unassigned_dependent_inherits_completed_items_assi
 fn cascade_unblock_dependents_is_idempotent_across_repeated_calls() {
     let mcp = test_mcp();
     let blocker = seed_item_with_deps(&mcp, "Blocker", None, vec![]);
-    let dependent = seed_item_with_deps(&mcp, "Dependent", Some("claude-code"), vec![blocker.clone()]);
+    let dependent = seed_item_with_deps(
+        &mcp,
+        "Dependent",
+        Some("claude-code"),
+        vec![blocker.clone()],
+    );
     complete_item(&mcp, &blocker);
 
     mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
