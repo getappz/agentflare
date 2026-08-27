@@ -48,6 +48,11 @@ pub struct PullRequest {
     pub head: Option<RefInfo>,
     #[serde(default)]
     pub base: Option<RefInfo>,
+    // Present on both the list and single-PR endpoints -- `worktree::pr_ci_status`
+    // reads these to spot the auto-merge approval marker (see
+    // `supervisor::PR_APPROVAL_LABEL`) without a second round-trip.
+    #[serde(default)]
+    pub labels: Vec<Label>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -279,6 +284,26 @@ mod pr_status_model_tests {
         assert_eq!(pr.additions, Some(10));
         assert_eq!(pr.head.unwrap().sha, "abc123");
         assert_eq!(pr.base.unwrap().git_ref, "main");
+    }
+
+    #[test]
+    fn pull_request_deserializes_labels() {
+        let json = serde_json::json!({
+            "number": 5, "html_url": "u", "state": "open", "title": "t",
+            "labels": [{"name": "status:pr:approved"}, {"name": "size/s"}]
+        });
+        let pr: PullRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(pr.labels.len(), 2);
+        assert_eq!(pr.labels[0].name, "status:pr:approved");
+    }
+
+    #[test]
+    fn pull_request_tolerates_absent_labels() {
+        let json = serde_json::json!({
+            "number": 5, "html_url": "u", "state": "open", "title": "t"
+        });
+        let pr: PullRequest = serde_json::from_value(json).unwrap();
+        assert!(pr.labels.is_empty());
     }
 
     #[test]

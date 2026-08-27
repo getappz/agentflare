@@ -36,6 +36,15 @@ const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 /// after removing it).
 const NEEDS_DECISION_LABEL: &str = "needs-decision";
 
+/// GitHub label a human applies to a CI-green PR to explicitly sign off on
+/// `run_review_sweep`'s `Passing` branch auto-merging it (item #194). CI
+/// green is what routes an item into that branch in the first place, so
+/// this label only ever adds a gate on top of CI, never bypasses it --
+/// mirrors item #192's "never bypass CI" principle for the duplicate-PR
+/// guard. Single named constant so the label convention has one place to
+/// rename.
+const PR_APPROVAL_LABEL: &str = "status:pr:approved";
+
 /// `vault` secret holding the Telegram chat id human-gate pings go to.
 /// Reuses the same `channels`/`vault` path as `agentflare channel send`
 /// rather than inventing a separate config store for one setting -- set it
@@ -548,9 +557,14 @@ pub(crate) fn run_review_sweep(
                         SelfRepairOutcome::Skipped => result.skipped += 1,
                     }
                 }
-                crate::worktree::PrCiStatus::Pending
-                | crate::worktree::PrCiStatus::Passing
-                | crate::worktree::PrCiStatus::Unknown => {
+                crate::worktree::PrCiStatus::Passing { number, labels } => {
+                    if merge_if_approved(mcp, item, &repo_root, number, &labels) {
+                        result.promoted += 1;
+                    } else {
+                        result.skipped += 1;
+                    }
+                }
+                crate::worktree::PrCiStatus::Pending | crate::worktree::PrCiStatus::Unknown => {
                     result.skipped += 1;
                 }
             }
@@ -571,6 +585,52 @@ fn promote_merged_item(mcp: &AgentflareMcp, item: &agentflare_backend::item::Ite
         .ok()
         .and_then(|v| v["promoted"].as_bool())
         .unwrap_or(false)
+}
+
+/// Auto-merges a CI-green PR and promotes its item, but only once a human
+/// has attached `PR_APPROVAL_LABEL` to the PR itself -- checked first and
+/// short-circuits before any GitHub call so an unapproved item never touches
+/// the network here. Only ever called from `run_review_sweep`'s `Passing`
+/// arm, so CI green is structurally required: the label can add a gate on
+/// top of it, never bypass it.
+fn merge_if_approved(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    repo_root: &std::path::Path,
+    number: u64,
+    labels: &[String],
+) -> bool {
+    if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) {
+        return false;
+    }
+    let Some(repo) = crate::github::RepoId::resolve_from_remote(repo_root) else {
+        return false;
+    };
+    let Ok(client) = crate::github::Client::new() else {
+        return false;
+    };
+    merge_approved_pr(&client, &repo, number) && promote_merged_item(mcp, item)
+}
+
+/// The actual GitHub merge call for an approved, CI-green PR. Split out from
+/// `merge_if_approved` so tests can drive it against a mock server instead
+/// of `Client::new()`'s real credentials/host, mirroring `github::pulls`'
+/// own test style. Squash matches this repo's existing single-commit-per-item
+/// convention. Logs and falls through (never retries in-line) on failure --
+/// branch protection or a merge conflict just means the item sits until the
+/// next sweep tick, same as any other `skipped` outcome.
+fn merge_approved_pr(
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    number: u64,
+) -> bool {
+    match crate::github::pulls::merge(client, repo, number, "squash") {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("agentflare-supervisor: auto-merge failed for PR #{number} in {repo}: {e}");
+            false
+        }
+    }
 }
 
 /// Whether an `agentflare-work` job is already queued or running for
