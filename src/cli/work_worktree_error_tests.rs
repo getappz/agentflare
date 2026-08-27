@@ -33,7 +33,7 @@ fn execute_work_impl_posts_server_worktree_error_when_provisioning_fails() {
             repo_root: Some(repo_root.clone()),
         };
         let mut log = Vec::new();
-        let outcome = execute_work_impl(work_args, &mut log, |_, _, _, _, _, _, _, _, _, _| {
+        let outcome = execute_work_impl(work_args, &mut log, |_, _, _, _, _, _, _, _, _, _, _| {
             panic!("pipeline must not run when worktree provisioning failed");
         });
 

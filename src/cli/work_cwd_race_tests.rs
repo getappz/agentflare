@@ -41,6 +41,7 @@ fn execute_work_impl_serializes_the_cwd_dependent_section_across_concurrent_disp
         ) -> impl FnOnce(
             std::sync::Arc<AgentflareMcp>,
             &agentflare_backend::item::Item,
+            &std::path::Path,
             agent_registry::Agent,
             agent_registry::Agent,
             String,
@@ -52,6 +53,7 @@ fn execute_work_impl_serializes_the_cwd_dependent_section_across_concurrent_disp
         ) -> Result<(), String> {
             move |mcp,
                   item,
+                  worktree_path,
                   implementer_agent,
                   review_agent,
                   item_description,
@@ -79,6 +81,7 @@ fn execute_work_impl_serializes_the_cwd_dependent_section_across_concurrent_disp
                 crate::work_item_pipeline::run_or_resume_with_sender(
                     mcp,
                     item,
+                    worktree_path,
                     implementer_agent,
                     review_agent,
                     item_description,

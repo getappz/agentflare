@@ -70,6 +70,7 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                 args,
                 hard_cap_secs,
                 idle_timeout_secs,
+                cwd: _,
             } = inv;
             // `--model` ahead of any caller-supplied flags, mirroring
             // `run_launch_env`'s existing `--model` placement for the
@@ -147,6 +148,7 @@ pub(crate) fn app_send_hook(
                 args,
                 hard_cap_secs,
                 idle_timeout_secs,
+                cwd: _,
             } = inv;
             let mut extra_args = Vec::with_capacity(args.len() + 2);
             if let Some(m) = model {

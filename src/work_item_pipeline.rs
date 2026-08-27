@@ -133,6 +133,16 @@ pub(crate) struct WorkItemData {
     /// session.
     #[serde(default)]
     pub agent_sessions: std::collections::HashMap<String, String>,
+    /// The item's claimed worktree, captured once at dispatch time and
+    /// threaded through every `sdd_loop` agent call as `StepInvocation::cwd`
+    /// (item #191) — a run resumed by `engine().recover()` after a daemon
+    /// restart executes on the engine's own scheduler, never re-entering
+    /// `execute_work`'s `run_in_worktree` chdir, so it can't rely on the
+    /// process's ambient cwd matching this item's worktree. Empty for runs
+    /// persisted before this field existed; `real_agent_send_hook` falls
+    /// back to ambient cwd in that case.
+    #[serde(default)]
+    pub worktree_path: String,
 }
 
 impl flare_workflow::WorkflowData for WorkItemData {
@@ -451,8 +461,11 @@ pub(crate) fn build_sdd_loop_step(
                     (agent_name.clone(), prompt)
                 };
 
+                let cwd = (!ctx.data.worktree_path.is_empty())
+                    .then(|| std::path::PathBuf::from(&ctx.data.worktree_path));
                 let role_invocation = flare_workflow::json::StepInvocation {
                     args: resume_args_for(&role_agent, &ctx.data.agent_sessions),
+                    cwd: cwd.clone(),
                     ..flare_workflow::json::StepInvocation::simple(role_agent.clone(), role_prompt)
                 };
                 let (raw_role_reply, in_tok, out_tok) =
@@ -506,6 +519,7 @@ pub(crate) fn build_sdd_loop_step(
                 );
                 let judge_invocation = flare_workflow::json::StepInvocation {
                     args: resume_args_for(&judge_agent_name, &ctx.data.agent_sessions),
+                    cwd,
                     ..flare_workflow::json::StepInvocation::simple(
                         judge_agent_name.clone(),
                         judge_prompt,
@@ -855,11 +869,19 @@ fn real_agent_send_hook(
     std::sync::Arc::new(move |inv: flare_workflow::json::StepInvocation| {
         let mut all_args = extra_args.clone();
         all_args.extend(inv.args.clone());
-        let flare_workflow::json::StepInvocation { agent, prompt, .. } = inv;
+        let flare_workflow::json::StepInvocation {
+            agent, prompt, cwd, ..
+        } = inv;
         Box::pin(async move {
             let agent_for_reply = agent.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                crate::agent_launch::run_headless(
+            let outcome = tokio::task::spawn_blocking(move || match &cwd {
+                // Explicit cwd (the item's own worktree, threaded through
+                // `WorkItemData::worktree_path`) instead of the ambient
+                // process cwd — required for a run resumed by
+                // `engine().recover()`, which never re-enters
+                // `execute_work`'s `run_in_worktree` chdir (item #191).
+                Some(cwd) => crate::agent_launch::run_headless_in(
+                    cwd,
                     agent_registry::REGISTRY,
                     &agent,
                     &prompt,
@@ -867,7 +889,16 @@ fn real_agent_send_hook(
                     idle_timeout,
                     &all_args,
                     true,
-                )
+                ),
+                None => crate::agent_launch::run_headless(
+                    agent_registry::REGISTRY,
+                    &agent,
+                    &prompt,
+                    timeout,
+                    idle_timeout,
+                    &all_args,
+                    true,
+                ),
             })
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
@@ -946,6 +977,7 @@ pub(crate) fn engine() -> &'static WorkflowEngine<WorkItemData, SqliteStore<Work
 pub(crate) fn run_or_resume(
     mcp: std::sync::Arc<AgentflareMcp>,
     item: &agentflare_backend::item::Item,
+    worktree_path: &std::path::Path,
     implementer_agent: agent_registry::Agent,
     review_agent: agent_registry::Agent,
     item_description: String,
@@ -958,6 +990,7 @@ pub(crate) fn run_or_resume(
     run_or_resume_with_sender(
         mcp,
         item,
+        worktree_path,
         implementer_agent,
         review_agent,
         item_description,
@@ -976,6 +1009,7 @@ pub(crate) fn run_or_resume(
 pub(crate) fn run_or_resume_with_sender(
     mcp: std::sync::Arc<AgentflareMcp>,
     item: &agentflare_backend::item::Item,
+    worktree_path: &std::path::Path,
     implementer_agent: agent_registry::Agent,
     review_agent: agent_registry::Agent,
     item_description: String,
@@ -1022,6 +1056,7 @@ pub(crate) fn run_or_resume_with_sender(
     eng.register_workflow(definition)
         .map_err(|e| e.to_string())?;
 
+    let worktree_path = worktree_path.display().to_string();
     crate::workflow::blocking_runtime().block_on(async move {
         // Seeded onto every fresh `start_workflow` call below (not carried
         // by the definition itself, see `build_work_item_pipeline_with_sender`)
@@ -1038,6 +1073,7 @@ pub(crate) fn run_or_resume_with_sender(
             tasks: tasks.clone(),
             review_only,
             tdd,
+            worktree_path: worktree_path.clone(),
             ..Default::default()
         };
         let run_id = match existing_run_id {
