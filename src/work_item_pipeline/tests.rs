@@ -412,6 +412,7 @@ fn run_or_resume_persists_run_id_and_resume_skips_completed_coder_step() {
         run_or_resume(
             mcp.clone(),
             &item,
+            &worktree_path,
             agent_registry::Agent::ClaudeCode,
             agent_registry::Agent::ClaudeCode,
             "implement it".to_string(),
@@ -481,6 +482,7 @@ fn run_or_resume_with_sender_persists_run_id_on_success() {
         run_or_resume_with_sender(
             mcp.clone(),
             &item,
+            &worktree_path,
             agent_registry::Agent::ClaudeCode,
             agent_registry::Agent::ClaudeCode,
             "implement it".to_string(),
@@ -505,6 +507,73 @@ fn run_or_resume_with_sender_persists_run_id_on_success() {
         .unwrap();
     let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
     assert!(metadata["workflow_run_id"].as_str().is_some());
+}
+
+// Item #191: a run resumed by `engine().recover()` after a daemon restart
+// executes `sdd_loop`'s steps on the engine's own scheduler, never
+// re-entering `execute_work`'s `run_in_worktree` chdir -- so the agent
+// dispatch can no longer rely on the process's ambient cwd matching this
+// item's worktree (two concurrently-active items would race on that global
+// state, see `work_cwd_race_tests.rs`'s regression coverage for the
+// sibling bug this same class of race caused in `execute_work_impl`
+// itself). `build_sdd_loop_step` must instead thread `ctx.data.worktree_path`
+// through every `StepInvocation` it sends, explicitly, so the actual
+// dispatch (`real_agent_send_hook`) never depends on ambient cwd at all.
+#[test]
+fn sdd_loop_step_invocations_carry_the_item_s_own_worktree_path_as_cwd() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Worktree-cwd-threading test item");
+    std::fs::write(worktree_path.join("real_work.txt"), "real work").unwrap();
+    let mcp = Arc::new(mcp);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
+        .unwrap()
+        .unwrap();
+
+    let seen_cwds: Arc<std::sync::Mutex<Vec<Option<std::path::PathBuf>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_cwds_for_send = seen_cwds.clone();
+    let send: flare_workflow::json::SendMessage = Arc::new(move |inv| {
+        seen_cwds_for_send.lock().unwrap().push(inv.cwd.clone());
+        let prompt = inv.prompt;
+        Box::pin(async move {
+            if prompt.contains("You are the judge") {
+                Ok((
+                    r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#
+                        .to_string(),
+                    1u64,
+                    0u64,
+                ))
+            } else {
+                Ok(("DONE: did the work".to_string(), 1u64, 0u64))
+            }
+        })
+    });
+
+    let _ = crate::paths::test_support::with_temp_home(|| {
+        run_or_resume_with_sender(
+            mcp.clone(),
+            &item,
+            &worktree_path,
+            agent_registry::Agent::ClaudeCode,
+            agent_registry::Agent::ClaudeCode,
+            "implement it".to_string(),
+            None,
+            None,
+            send,
+        )
+    });
+
+    let seen_cwds = seen_cwds.lock().unwrap();
+    assert!(!seen_cwds.is_empty(), "sdd_loop never dispatched an agent");
+    let expected = Some(worktree_path.clone());
+    for cwd in seen_cwds.iter() {
+        assert_eq!(
+            cwd, &expected,
+            "StepInvocation.cwd must be the item's own claimed worktree, \
+             not left for the SendMessage hook to guess from ambient cwd"
+        );
+    }
 }
 
 // Item #512: bare `task/<N>` checkout + renamed slug hid divergence from

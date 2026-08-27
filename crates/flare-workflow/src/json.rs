@@ -41,6 +41,14 @@ pub struct StepInvocation {
     pub args: Vec<String>,
     pub hard_cap_secs: Option<u64>,
     pub idle_timeout_secs: Option<u64>,
+    /// Explicit working directory the agent subprocess must run in, when the
+    /// caller has one (e.g. a work item's claimed worktree). `None` leaves
+    /// the `SendMessage` hook free to fall back to the ambient process cwd
+    /// — never safe across a step that can outlive the caller who set that
+    /// cwd (a crash-resumed run's steps execute on the engine's own
+    /// scheduler, not inside whatever chdir span originally dispatched the
+    /// run — see `agentflare::work_item_pipeline`'s `WorkItemData::worktree_path`).
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl StepInvocation {
@@ -304,6 +312,7 @@ impl StepExecutor<PipelineData> for PromptExecutor {
             args: self.args.clone(),
             hard_cap_secs: self.hard_cap_secs,
             idle_timeout_secs: self.idle_timeout_secs,
+            cwd: None,
         };
         let (output, input_tokens, output_tokens) =
             (self.send)(invocation)
