@@ -173,3 +173,80 @@ fn item_doctor_force_reclaim_scoped_by_worktree_spares_other_dirty_lanes() {
         }
     }
 }
+
+#[test]
+fn item_doctor_refuses_unscoped_force_reclaim_without_repo_wide() {
+    // 2026-08-16 incident follow-up: `reclaim=true` + `force=true` with no
+    // `worktree` is repo-wide by construction and would silently delete every
+    // dirty lane, including other agents' uncommitted work. It must be refused
+    // unless `repo_wide=true` explicitly confirms repo-wide intent.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    };
+    run_git(&repo_root, &["init", "-b", "master"]);
+    run_git(&repo_root, &["config", "user.email", "test@test.com"]);
+    run_git(&repo_root, &["config", "user.name", "Test"]);
+    run_git(&repo_root, &["commit", "--allow-empty", "-m", "initial"]);
+
+    let mut dirty_paths = Vec::new();
+    for name in ["lane-a", "lane-b"] {
+        let path = repo_dir.path().join(name);
+        run_git(
+            &repo_root,
+            &["worktree", "add", "-b", name, path.to_str().unwrap()],
+        );
+        std::fs::write(path.join("scratch.txt"), "uncommitted\n").unwrap();
+        dirty_paths.push((name.to_string(), path));
+    }
+
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+
+    let refused = s.item(Parameters(ItemRequest {
+        action: "doctor".into(),
+        reclaim: Some(true),
+        force: Some(true),
+        ..Default::default()
+    }));
+    assert!(
+        refused.is_err(),
+        "unscoped force-reclaim must be refused without repo_wide=true"
+    );
+    for (_, path) in &dirty_paths {
+        assert!(
+            path.exists(),
+            "a refused reclaim must not delete any dirty lane: {path:?}"
+        );
+    }
+
+    let report: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "doctor".into(),
+            reclaim: Some(true),
+            force: Some(true),
+            repo_wide: Some(true),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let reclaimed = report["reclaimed"].as_array().unwrap();
+    assert_eq!(reclaimed.len(), 2, "{report:?}");
+    for (_, path) in &dirty_paths {
+        assert!(
+            !path.exists(),
+            "repo-wide force must delete every dirty lane"
+        );
+    }
+}
