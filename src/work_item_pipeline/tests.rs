@@ -71,6 +71,27 @@ const JUDGE_STREAM_JSON_TRANSCRIPT: &str = concat!(
 );
 
 #[test]
+fn detect_review_only_false_positives_on_a_description_that_merely_mentions_design_spec() {
+    // item #170's known false-positive class, reproduced live twice more in
+    // one PM-mode session (items #192/#173): the free-text fallback matches
+    // "design"+"spec" anywhere in the description, including a reference to
+    // a *different* item's design-spec, not just this item's own framing.
+    // Documents the current (undesired but expected-without-task_type)
+    // behavior; the paired test below shows the actual fix.
+    let description =
+        "Instead of X, do the Y ask per item #166's design-spec, which already covers Z.";
+    assert!(detect_review_only(description, &serde_json::json!({})));
+}
+
+#[test]
+fn detect_review_only_explicit_task_type_overrides_design_spec_mention_in_free_text() {
+    let description =
+        "Instead of X, do the Y ask per item #166's design-spec, which already covers Z.";
+    let metadata = serde_json::json!({"task_type": "implementation"});
+    assert!(!detect_review_only(description, &metadata));
+}
+
+#[test]
 fn uncleaned_claude_stream_json_transcript_breaks_judge_parsing() {
     let err = parse_judge_decision(JUDGE_STREAM_JSON_TRANSCRIPT).unwrap_err();
     assert!(

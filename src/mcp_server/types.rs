@@ -252,6 +252,11 @@ pub(crate) struct HandoffRequest {
     #[serde(default)]
     pub(crate) description: Option<String>,
     #[schemars(
+        description = "review | design-spec | implementation | bugfix | research | ... — merged into the item's metadata.task_type so work_item_pipeline::detect_review_only reads this structured signal instead of scanning free text for review/design-spec-sounding prose (item #170's false-positive class: a description that merely *mentions* \"design-spec\", e.g. referencing another item's spec, otherwise forces review-only mode even for a genuine implementation task). Any non-review/design-spec value short-circuits the free-text scan entirely. Set on every handoff whose task isn't ambiguous."
+    )]
+    #[serde(default)]
+    pub(crate) task_type: Option<String>,
+    #[schemars(
         description = "Knowledge facts to import into the recipient's memory on receive. Each item: {title, content, type, topic_key?}."
     )]
     #[serde(default)]
