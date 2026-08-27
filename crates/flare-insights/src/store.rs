@@ -138,6 +138,9 @@ impl InsightsStore {
             CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
             CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
             CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id);
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_name ON tool_calls(name);
+            CREATE INDEX IF NOT EXISTS idx_file_events_session ON file_events(session_id);
+            CREATE INDEX IF NOT EXISTS idx_file_events_path ON file_events(path);
             "#,
         )?;
         Ok(())
@@ -229,6 +232,26 @@ impl InsightsStore {
         for r in rows {
             out.push(r?);
         }
+        Ok(out)
+    }
+
+    pub fn search_sessions_by_file_path(&self, pattern: &str, limit: usize) -> Result<Vec<Session>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT s.* FROM sessions s JOIN file_events f ON f.session_id = s.id WHERE f.path LIKE ?1 ORDER BY s.updated_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pattern, limit as i64], row_to_session)?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    pub fn search_sessions_by_tool(&self, pattern: &str, limit: usize) -> Result<Vec<Session>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT s.* FROM sessions s JOIN tool_calls t ON t.session_id = s.id WHERE t.name LIKE ?1 ORDER BY s.updated_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pattern, limit as i64], row_to_session)?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
         Ok(out)
     }
 
@@ -391,6 +414,22 @@ impl InsightsStore {
     pub fn get_subagents(&self, session_id: &str) -> Result<Vec<crate::model::Subagent>, StoreError> {
         let mut stmt = self.conn.prepare("SELECT * FROM subagents WHERE session_id=?1")?;
         let rows = stmt.query_map(params![session_id], row_to_subagent)?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    pub fn list_tool_calls(&self, limit: usize) -> Result<Vec<ToolCall>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT * FROM tool_calls LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit as i64], row_to_tool_call)?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    pub fn list_file_events(&self, limit: usize) -> Result<Vec<crate::model::FileEvent>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT * FROM file_events LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit as i64], row_to_file_event)?;
         let mut out = Vec::new();
         for r in rows { out.push(r?); }
         Ok(out)

@@ -223,7 +223,9 @@ fn run_show(db: PathBuf, args: ShowArgs) {
             if args.json {
                 let turns = store.get_turns(&s.id).unwrap_or_default();
                 let tools = store.get_tool_calls(&s.id).unwrap_or_default();
-                let bundle = serde_json::json!({"session": s, "turns": turns, "tool_calls": tools});
+                let files = store.get_file_events(&s.id).unwrap_or_default();
+                let subs = store.get_subagents(&s.id).unwrap_or_default();
+                let bundle = serde_json::json!({"session": s, "turns": turns, "tool_calls": tools, "file_events": files, "subagents": subs});
                 println!("{}", serde_json::to_string_pretty(&bundle).unwrap());
             } else {
                 println!("{} [{}] {}", s.id, s.source.as_str(), s.project);
@@ -248,11 +250,18 @@ fn run_show(db: PathBuf, args: ShowArgs) {
                     "turns: {} tools: {} subagents: {}",
                     s.turn_count, s.tool_call_count, s.subagent_count
                 );
-                if let Some(t) = s.title {
+                if let Some(t) = s.title.clone() {
                     println!("title: {t}");
                 }
-                // DRY: show recent turns
+                // DRY: replay timeline for opencode/claude
                 let turns = store.get_turns(&s.id).unwrap_or_default();
+                let tools = store.get_tool_calls(&s.id).unwrap_or_default();
+                let files = store.get_file_events(&s.id).unwrap_or_default();
+                let replay = flare_insights::replay::SessionReplay::from_parts(s.id.clone(), turns.clone(), tools.clone(), files.clone());
+                println!("--- replay timeline (first 10) ---");
+                for ev in replay.timeline().iter().take(10) {
+                    println!("  [{}] {}: {}", ev.seq, ev.kind, ev.detail.chars().take(100).collect::<String>());
+                }
                 for t in turns.iter().take(3) {
                     println!(
                         "  turn {}: {}",
@@ -266,9 +275,11 @@ fn run_show(db: PathBuf, args: ShowArgs) {
                             .collect::<String>()
                     );
                 }
-                let tools = store.get_tool_calls(&s.id).unwrap_or_default();
                 for tc in tools.iter().take(5) {
                     println!("  tool {}: {}", tc.name, tc.id);
+                }
+                for fe in files.iter().take(5) {
+                    println!("  file {}: {}", fe.kind, fe.path);
                 }
             }
         }
@@ -291,6 +302,8 @@ fn run_search(db: PathBuf, args: SearchArgs) {
         project: None,
         limit: args.limit,
         offset: 0,
+        include_files: true,
+        include_tools: true,
     };
     let res = flare_insights::search::search(&store, &opts).unwrap_or_default();
     if args.json {
@@ -311,19 +324,27 @@ fn run_search(db: PathBuf, args: SearchArgs) {
 fn run_stats(db: PathBuf, args: StatsArgs) {
     let store = open_store(db);
     let sessions = store.list_sessions(10000, 0).unwrap_or_default();
-    let analytics = flare_insights::analytics::compute_analytics(&sessions);
+    let tools = store.list_tool_calls(100000).unwrap_or_default();
+    let files = store.list_file_events(100000).unwrap_or_default();
+    let analytics = flare_insights::analytics::compute_analytics_with_tools(&sessions, &tools, &files);
     if args.json {
         println!("{}", serde_json::to_string_pretty(&analytics).unwrap());
     } else {
         println!(
-            "sessions: {} tokens: {} cost: ${:.2} cache_hit: {:.1}%",
+            "sessions: {} tokens: {} cost: ${:.2} cache_hit: {:.1}% tools:{} files:{}",
             analytics.total_sessions,
             analytics.total_tokens,
             analytics.total_cost_usd,
-            analytics.cache_hit_rate * 100.0
+            analytics.cache_hit_rate * 100.0,
+            tools.len(),
+            files.len()
         );
         println!("by_source: {:?}", analytics.by_source);
         println!("by_project: {:?}", analytics.by_project);
+        let top_tools = flare_insights::analytics::top_tools(&tools, 5);
+        let top_files = flare_insights::analytics::top_files(&files, 5);
+        println!("top_tools: {:?}", top_tools);
+        println!("top_files: {:?}", top_files);
         for b in &analytics.by_day {
             println!("{}: {} sessions ${:.2}", b.date, b.sessions, b.cost_usd);
         }
