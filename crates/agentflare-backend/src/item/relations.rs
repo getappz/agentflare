@@ -86,6 +86,35 @@ pub fn list_dependencies(conn: &Connection, item_id: &str) -> Result<Vec<String>
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// Items (non-deleted) with a live dependency on `item_id` — the reverse
+/// direction of `list_dependencies`. Used to find who might unblock once
+/// `item_id` completes (item #195's auto-dispatch-dependents cascade).
+pub fn dependents_of(conn: &Connection, item_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.item_id FROM item_dependencies d
+         JOIN items i ON i.id = d.item_id AND i.deleted_at IS NULL
+         WHERE d.depends_on_item_id = ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![item_id], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// True when `item_id` has at least one dependency and every one of them
+/// (via `dependency_edges_for_items`, so a deleted dependency target counts
+/// as unsatisfied rather than silently dropping out of the count) is in the
+/// `completed` state group. An item with no dependencies at all is not a
+/// dependent in the first place, so this returns `false` for it rather than
+/// vacuously true -- callers only reach this after `dependents_of` already
+/// confirmed at least one dependency edge exists.
+pub fn all_dependencies_completed(conn: &Connection, item_id: &str) -> Result<bool> {
+    let deps = list_dependencies(conn, item_id)?;
+    if deps.is_empty() {
+        return Ok(false);
+    }
+    let edges = dependency_edges_for_items(conn, &[item_id.to_string()])?;
+    Ok(edges.len() == deps.len() && edges.iter().all(|(_, _, group)| group == "completed"))
+}
+
 /// Dependency edges for a set of items, with each edge's target state_group
 /// already joined in — so a caller's blocking status is correct even when
 /// the dependency target isn't itself in the same shortlist/limit window

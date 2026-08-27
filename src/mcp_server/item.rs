@@ -1074,6 +1074,9 @@ impl AgentflareMcp {
                 .map_err(map_backend_err)
         })??;
         if promoted {
+            self.with_backend_db(|conn| {
+                crate::supervisor::cascade_unblock_dependents(conn, &item_id);
+            })?;
             crate::worktree::cleanup_worktree(&item, &repo_root);
             crate::worktree::relabel_pr_completed(&item, &repo_root);
         }
