@@ -155,7 +155,8 @@ pub fn relabel_pr_completed(item: &agentflare_backend::item::Item, repo_root: &P
 }
 
 /// CI signal the in-review sweep (`supervisor::run_review_sweep`, item #65)
-/// polls per item: merged (promote), failing (self-repair), or nothing
+/// polls per item: merged (promote), failing (self-repair), CI-green with a
+/// human approval label attached (auto-merge, item #194), or nothing
 /// actionable yet. `Unknown` covers every soft-fail case `is_pr_merged`
 /// above also treats as "not merged yet" -- no credentials, no resolvable
 /// remote, no PR found, or a lookup error -- since the caller's fallback is
@@ -164,7 +165,13 @@ pub enum PrCiStatus {
     Merged,
     Failing(Vec<String>),
     Pending,
-    Passing,
+    /// CI is green. Carries the PR number and its GitHub label names so
+    /// `run_review_sweep` can decide whether to auto-merge without a second
+    /// API round-trip just to re-fetch labels.
+    Passing {
+        number: u64,
+        labels: Vec<String>,
+    },
     Unknown,
 }
 
@@ -228,7 +235,10 @@ pub fn pr_ci_status(item: &agentflare_backend::item::Item, repo_root: &Path) -> 
         })
         .unwrap_or_default();
     if failed.is_empty() {
-        PrCiStatus::Passing
+        PrCiStatus::Passing {
+            number: pr.number,
+            labels: pr.labels.into_iter().map(|l| l.name).collect(),
+        }
     } else {
         PrCiStatus::Failing(failed)
     }

@@ -1001,6 +1001,115 @@ fn run_review_sweep_scans_in_review_items_from_every_registered_project_not_just
     );
 }
 
+// --- auto-merge on CI-green + approval label (item #194) ---
+
+#[test]
+fn merge_approved_pr_merges_via_squash_on_success() {
+    let server = crate::github::test_support::MockServer::start(vec![
+        crate::github::test_support::MockResponse::json(200, r#"{"merged":true}"#),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = crate::github::RepoId {
+        owner: "o".into(),
+        repo: "r".into(),
+    };
+
+    assert!(merge_approved_pr(&client, &repo, 42));
+
+    let reqs = server.requests();
+    assert_eq!(reqs[0].method, "PUT");
+    assert_eq!(reqs[0].path, "/repos/o/r/pulls/42/merge");
+    let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+    assert_eq!(sent["merge_method"], "squash");
+}
+
+#[test]
+fn merge_approved_pr_returns_false_and_does_not_panic_on_github_error() {
+    // Branch protection / an unresolved conflict -- GitHub answers 405 on
+    // the merge endpoint. The safety property is that this falls through to
+    // `skipped` (no panic, no retry loop here); the sweep just polls again
+    // next tick.
+    let server = crate::github::test_support::MockServer::start(vec![
+        crate::github::test_support::MockResponse::json(405, r#"{"message":"not mergeable"}"#),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = crate::github::RepoId {
+        owner: "o".into(),
+        repo: "r".into(),
+    };
+
+    assert!(!merge_approved_pr(&client, &repo, 42));
+}
+
+#[test]
+fn merge_if_approved_skips_without_touching_network_when_label_is_absent() {
+    // No approval label on the PR -- CI green alone must never be enough to
+    // merge. The label check must happen before any GitHub call, so this
+    // must return false even with an unresolvable repo/no credentials.
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+
+    let merged = merge_if_approved(&mcp, &item, repo.path(), 42, &["size/s".to_string()]);
+
+    assert!(!merged);
+    let still_in_review = mcp
+        .with_backend_db(|conn| {
+            let refetched = agentflare_backend::item::get(conn, &item_id).unwrap();
+            let state = agentflare_backend::state::get(conn, &refetched.state_id).unwrap();
+            state.group_name == "in_review"
+        })
+        .unwrap();
+    assert!(still_in_review, "an unapproved item must not be promoted");
+}
+
+#[test]
+fn run_review_sweep_never_merges_when_the_approval_label_only_exists_on_the_project_not_the_pr() {
+    // Regression for the safety property in item #194's spec: the approval
+    // label must gate on the PR's OWN GitHub labels (carried by
+    // `PrCiStatus::Passing`), never merely on the label existing somewhere
+    // in the project's label table. A throwaway repo with no remote always
+    // resolves to `PrCiStatus::Unknown`, so this also covers Pending/Failing
+    // by construction -- none of those variants carry PR labels for
+    // `merge_if_approved` to check in the first place.
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let _item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    mcp.with_backend_db(|conn| {
+        let project = mcp.resolve_project(conn).unwrap();
+        agentflare_backend::label::create(
+            conn,
+            agentflare_backend::label::CreateLabel {
+                project_id: Some(project.id.clone()),
+                workspace_id: project.workspace_id.clone(),
+                name: PR_APPROVAL_LABEL.into(),
+                color: None,
+                parent_id: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+    })
+    .unwrap();
+    let queue = test_queue();
+    let auth_conn = test_auth_conn();
+
+    let result = run_review_sweep(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+
+    assert_eq!(result.promoted, 0);
+    assert_eq!(result.skipped, 1);
+}
+
 #[test]
 fn self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment() {
     let mcp = test_mcp();
