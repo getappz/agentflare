@@ -1074,17 +1074,57 @@ pub fn commit_uncommitted(item: &Item, repo_root: &Path, message: &str) -> Commi
         .join(".worktrees")
         .join("task")
         .join(item.sequence_id.to_string());
-    match run_git_in(&worktree_path, &["status", "--porcelain"]) {
+    commit_uncommitted_at(&worktree_path, message, false)
+}
+
+/// Same mechanics as `commit_uncommitted`, but against an already-resolved
+/// worktree path instead of one derived from `Item::sequence_id` -- used by
+/// the SDD loop's per-implementer-turn checkpoint commits (item #193),
+/// where the caller already holds the path via `WorkItemData::worktree_path`
+/// rather than an `Item`.
+///
+/// `no_verify` skips local git hooks, including the repo's LOC-freeze
+/// pre-commit gate (`scripts/loc-gate.sh`, item #141) -- a checkpoint commit
+/// intentionally bypasses it, since an in-progress turn's diff can
+/// legitimately, if only temporarily, exceed the gate; `finalize`'s
+/// squashed commit (see `squash_since`) is what the gate actually evaluates.
+pub fn commit_uncommitted_at(worktree_path: &Path, message: &str, no_verify: bool) -> CommitOutcome {
+    match run_git_in(worktree_path, &["status", "--porcelain"]) {
         Ok(out) if !out.trim().is_empty() => {}
         _ => return CommitOutcome::NothingToCommit,
     }
-    if let Err(e) = run_git_in(&worktree_path, &["add", "-A"]) {
+    if let Err(e) = run_git_in(worktree_path, &["add", "-A"]) {
         return CommitOutcome::Failed(format!("git add failed: {e}"));
     }
-    match run_git_in(&worktree_path, &["commit", "-m", message]) {
+    let mut args = vec!["commit", "-m", message];
+    if no_verify {
+        args.push("--no-verify");
+    }
+    match run_git_in(worktree_path, &args) {
         Ok(_) => CommitOutcome::Committed,
         Err(e) => CommitOutcome::Failed(format!("git commit failed: {e}")),
     }
+}
+
+/// The worktree's current `HEAD` commit SHA, if resolvable -- used to
+/// capture the SDD loop's pre-checkpoint base (item #193) before its first
+/// per-turn commit, so `finalize` can later fold every checkpoint commit
+/// back into an uncommitted diff via `squash_since`.
+pub fn head_sha(worktree_path: &Path) -> Option<String> {
+    run_git_in(worktree_path, &["rev-parse", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Folds every commit made since `base_sha` back into the index and working
+/// tree as one uncommitted diff, without touching any file content --
+/// `git reset --soft` under the hood. Used by `finalize` (item #193) to
+/// squash the SDD loop's per-turn checkpoint commits into a single diff
+/// right before its own `commit_uncommitted` call, so the repo's LOC-freeze
+/// gate evaluates the whole run's changes as one commit instead of turn by
+/// turn. A no-op if `base_sha` is already `HEAD`.
+pub fn squash_since(worktree_path: &Path, base_sha: &str) -> Result<(), String> {
+    run_git_in(worktree_path, &["reset", "--soft", base_sha]).map(|_| ())
 }
 
 /// Remove a worktree directory, with retry + Windows fallback.
