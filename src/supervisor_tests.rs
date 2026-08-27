@@ -1463,7 +1463,7 @@ fn cascade_unblock_dependents_leaves_dependent_with_a_still_open_sibling_depende
 }
 
 #[test]
-fn cascade_unblock_dependents_skips_a_dependent_with_no_assignee() {
+fn cascade_unblock_dependents_skips_a_dependent_when_completed_item_has_no_assignee_either() {
     let mcp = test_mcp();
     let blocker = seed_item_with_deps(&mcp, "Blocker", None, vec![]);
     let dependent = seed_item_with_deps(&mcp, "Dependent", None, vec![blocker.clone()]);
@@ -1474,8 +1474,37 @@ fn cascade_unblock_dependents_skips_a_dependent_with_no_assignee() {
 
     assert!(
         !item_has_ready_label(&mcp, &dependent),
-        "an unassigned dependent would just sit inert in run_discovery_tick -- it must not \
-         be silently auto-labeled"
+        "an unassigned dependent has nothing to inherit from an equally-unassigned \
+         completed blocker -- it must not be silently auto-labeled"
+    );
+}
+
+#[test]
+fn cascade_unblock_dependents_unassigned_dependent_inherits_completed_items_assignee() {
+    let mcp = test_mcp();
+    let blocker = seed_item_with_deps(&mcp, "Blocker", Some("claude-code:instance-1"), vec![]);
+    let dependent = seed_item_with_deps(&mcp, "Dependent", None, vec![blocker.clone()]);
+    complete_item(&mcp, &blocker);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
+        .unwrap();
+
+    assert!(
+        item_has_ready_label(&mcp, &dependent),
+        "dependent had no assignee -- it should inherit the completed item's and get labeled"
+    );
+    let dependent_assignee = mcp
+        .with_backend_db(|conn| {
+            agentflare_backend::item::get(conn, &dependent)
+                .unwrap()
+                .assignee_agent
+        })
+        .unwrap();
+    assert_eq!(
+        dependent_assignee.as_deref(),
+        Some("claude-code"),
+        "inherited assignee must be stripped down to the bare agent id, not the \
+         agent:instance form"
     );
 }
 

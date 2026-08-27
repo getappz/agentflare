@@ -641,6 +641,14 @@ fn merge_approved_pr(
 /// picks it up without a human/PM having to notice and `handoff` it by hand
 /// (item #195).
 ///
+/// `run_discovery_tick` only dispatches items with a resolvable
+/// `assignee_agent`, so a dependent with none would just sit inert once
+/// labeled -- a dependent with no assignee inherits the just-completed
+/// item's own assignee (the agent that finished the blocking work is a
+/// reasonable default owner for what it unblocked) before being labeled.
+/// Only skipped, loudly, when the completed item itself has no assignee to
+/// inherit from.
+///
 /// Idempotent and safe under concurrent sibling completions:
 /// `item::add_label`'s `INSERT OR IGNORE` makes re-labeling a no-op, and an
 /// already-`dispatched` item won't be relabeled `ready-for-work` by this
@@ -649,6 +657,16 @@ pub(crate) fn cascade_unblock_dependents(conn: &rusqlite::Connection, item_id: &
     let Ok(dependents) = agentflare_backend::item::dependents_of(conn, item_id) else {
         return;
     };
+    if dependents.is_empty() {
+        return;
+    }
+    let Ok(completed) = agentflare_backend::item::get(conn, item_id) else {
+        return;
+    };
+    let inherited_assignee = completed
+        .assignee_agent
+        .as_deref()
+        .map(agentflare_backend::item::agent_part);
     for dependent_id in dependents {
         if !agentflare_backend::item::all_dependencies_completed(conn, &dependent_id)
             .unwrap_or(false)
@@ -659,15 +677,30 @@ pub(crate) fn cascade_unblock_dependents(conn: &rusqlite::Connection, item_id: &
             continue;
         };
         if dependent.assignee_agent.is_none() {
-            // A ready-for-work item with no assignee just sits inert in
-            // run_discovery_tick (it only dispatches a resolvable
-            // assignee_agent) -- labeling it here would be a silent no-op,
-            // so skip it loudly instead so a PM/human notices and assigns it.
-            eprintln!(
-                "agentflare-supervisor: item #{} ({}) has all dependencies completed but no assignee_agent -- not auto-labeled {READY_LABEL}, needs manual dispatch",
-                dependent.sequence_id, dependent.id
-            );
-            continue;
+            let Some(agent) = &inherited_assignee else {
+                // The just-completed item has no assignee of its own to hand
+                // off, so there's nothing sensible to inherit -- leave this
+                // loudly unassigned rather than silently no-op'ing.
+                eprintln!(
+                    "agentflare-supervisor: item #{} ({}) has all dependencies completed but no assignee_agent to inherit (completed item {item_id} has none either) -- not auto-labeled {READY_LABEL}, needs manual dispatch",
+                    dependent.sequence_id, dependent.id
+                );
+                continue;
+            };
+            if let Err(e) = agentflare_backend::item::update(
+                conn,
+                &dependent.id,
+                agentflare_backend::item::UpdateItem {
+                    assignee_agent: Some(agent.clone()),
+                    ..Default::default()
+                },
+            ) {
+                eprintln!(
+                    "agentflare-supervisor: failed to inherit assignee {agent} onto item #{} ({}) after dependency {item_id} completed: {e}",
+                    dependent.sequence_id, dependent.id
+                );
+                continue;
+            }
         }
         let Ok(labels) = agentflare_backend::label::list_by_project(conn, &dependent.project_id)
         else {
