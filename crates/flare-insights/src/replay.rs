@@ -30,29 +30,35 @@ impl SessionReplay {
         for tc in tool_calls {
             by_turn_tools.entry(tc.turn_seq).or_default().push(tc);
         }
+        // file_events don't carry turn_seq, so attribute each to the last turn that
+        // had already started by the event's time (falling back to the first turn
+        // for events that precede every turn's recorded start).
+        let first_seq = turns.first().map(|t| t.seq).unwrap_or(1);
+        let total_files = file_events.len();
         let mut by_turn_files: std::collections::HashMap<u32, Vec<FileEvent>> =
             std::collections::HashMap::new();
-        // file_events don't have turn_seq, so assign by time proximity: for now, attach to all turns
-        // Simple DRY: distribute by turn seq if file event's at is between turn start/end
-        // For now, attach all to first turn if no better mapping
+        for fe in file_events {
+            let seq = turns
+                .iter()
+                .filter(|t| t.started_at.is_some_and(|s| s <= fe.at))
+                .map(|t| t.seq)
+                .max()
+                .unwrap_or(first_seq);
+            by_turn_files.entry(seq).or_default().push(fe);
+        }
+
         let session_id_str = session_id.into();
         let total_tokens = turns
             .iter()
             .filter_map(|r| r.tokens.as_ref().map(|t| t.total()))
             .sum();
-        let total_files = file_events.len();
 
         let replay_turns = turns
             .into_iter()
             .map(|t| {
                 let seq = t.seq;
                 let tcs = by_turn_tools.remove(&seq).unwrap_or_default();
-                // naive: files whose at is within turn window, else attach to nearest
-                let fes = if seq == 1 {
-                    file_events.clone()
-                } else {
-                    vec![]
-                };
+                let fes = by_turn_files.remove(&seq).unwrap_or_default();
                 ReplayTurn {
                     turn: t,
                     tool_calls: tcs,

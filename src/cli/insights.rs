@@ -365,6 +365,10 @@ fn run_stats(db: PathBuf, args: StatsArgs) {
 fn run_export(db: PathBuf, args: ExportArgs) {
     let store = open_store(db);
     let sessions = store.list_sessions(10000, 0).unwrap_or_default();
+    let turns: Vec<flare_insights::model::Turn> = sessions
+        .iter()
+        .flat_map(|s| store.get_turns(&s.id).unwrap_or_default())
+        .collect();
     let fmt = match args.format.as_str() {
         "jsonl" => flare_insights::export::ExportFormat::Jsonl,
         "html" => flare_insights::export::ExportFormat::Html,
@@ -372,7 +376,7 @@ fn run_export(db: PathBuf, args: ExportArgs) {
         "openai" | "openai-evals" => flare_insights::export::ExportFormat::OpenAiEvals,
         _ => flare_insights::export::ExportFormat::Json,
     };
-    let out = flare_insights::export::export_sessions(&sessions, &[], fmt);
+    let out = flare_insights::export::export_sessions(&sessions, &turns, fmt);
     if let Some(path) = args.output {
         std::fs::write(&path, out).unwrap();
         println!("exported to {}", path.display());

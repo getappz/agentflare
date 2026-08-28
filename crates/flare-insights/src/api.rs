@@ -184,7 +184,7 @@ async fn write_response(
 ) -> anyhow::Result<()> {
     let body_str = serde_json::to_string(body)?;
     let resp = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         status,
         status_text,
         body_str.len(),
@@ -238,26 +238,35 @@ setInterval(load, 5000);
 // Minimal urlencoding fallback if crate not present
 mod urlencoding {
     pub fn decode(s: &str) -> Result<std::borrow::Cow<'_, str>, ()> {
-        // very small: only decode %20 etc.
-        if !s.contains('%') {
+        if !s.contains('%') && !s.contains('+') {
             return Ok(std::borrow::Cow::Borrowed(s));
         }
-        let mut out = String::new();
-        let mut chars = s.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '%' {
-                let hi = chars.next().unwrap_or('0');
-                let lo = chars.next().unwrap_or('0');
-                let hex = format!("{}{}", hi, lo);
-                if let Ok(b) = u8::from_str_radix(&hex, 16) {
-                    out.push(b as char);
+        // Decode into raw bytes first so percent-escaped multi-byte UTF-8
+        // sequences (e.g. CJK) get reassembled correctly, then convert once.
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'%' if i + 2 < bytes.len() => {
+                    if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                        out.push(b);
+                        i += 3;
+                        continue;
+                    }
+                    out.push(bytes[i]);
+                    i += 1;
                 }
-            } else if c == '+' {
-                out.push(' ');
-            } else {
-                out.push(c);
+                b'+' => {
+                    out.push(b' ');
+                    i += 1;
+                }
+                b => {
+                    out.push(b);
+                    i += 1;
+                }
             }
         }
-        Ok(std::borrow::Cow::Owned(out))
+        Ok(std::borrow::Cow::Owned(String::from_utf8_lossy(&out).into_owned()))
     }
 }

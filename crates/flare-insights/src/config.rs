@@ -119,9 +119,20 @@ impl Default for PricingTable {
 }
 
 impl PricingTable {
+    /// Real session `model` fields are dated identifiers (e.g. "claude-opus-4-20250514"),
+    /// so fall back to a prefix match against the family key when there's no exact hit.
+    fn lookup(&self, model: &str) -> Option<&ModelPricing> {
+        self.models.get(model).or_else(|| {
+            self.models
+                .iter()
+                .find(|(key, _)| model.starts_with(key.as_str()))
+                .map(|(_, p)| p)
+        })
+    }
+
     pub fn cost_for(&self, model: Option<&str>, tokens: &crate::model::TokenUsage) -> crate::model::Cost {
         let p = model
-            .and_then(|m| self.models.get(m))
+            .and_then(|m| self.lookup(m))
             .unwrap_or(&self.default);
         let input_usd = tokens.input as f64 / 1_000_000.0 * p.input_per_mtok;
         let output_usd = tokens.output as f64 / 1_000_000.0 * p.output_per_mtok;

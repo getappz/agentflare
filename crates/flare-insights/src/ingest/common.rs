@@ -100,10 +100,10 @@ pub fn extract_cost(v: &Value) -> Option<Cost> {
 }
 
 pub fn title_from_text(s: &str, n: usize) -> String {
-    let mut t = s.chars().take(n).collect::<String>();
-    t = t.replace('\n', " ").trim().to_string();
-    if t.len() > n {
-        t.truncate(n);
+    let cleaned = s.replace('\n', " ");
+    let trimmed = cleaned.trim();
+    let mut t: String = trimmed.chars().take(n).collect();
+    if trimmed.chars().count() > n {
         t.push('…');
     }
     t
@@ -137,7 +137,8 @@ pub fn extract_file_path(tool: &str, input: &serde_json::Value) -> Option<String
         }
     }
     // fallback: for read/write/edit tools, try to find any string containing '/'
-    if matches!(tool, "read" | "write" | "edit" | "glob" | "grep" | "bash") {
+    // tool names vary by case across sources (Claude Code uses "Read"/"Write"/...)
+    if matches!(tool.to_lowercase().as_str(), "read" | "write" | "edit" | "glob" | "grep" | "bash") {
         if let Some(s) = input.as_str() {
             return Some(s.to_string());
         }
@@ -146,7 +147,7 @@ pub fn extract_file_path(tool: &str, input: &serde_json::Value) -> Option<String
 }
 
 pub fn file_kind_for_tool(tool: &str) -> &'static str {
-    match tool {
+    match tool.to_lowercase().as_str() {
         "read" | "glob" | "grep" => "read",
         "write" => "write",
         "edit" => "edit",

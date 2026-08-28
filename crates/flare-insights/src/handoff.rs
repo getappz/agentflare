@@ -32,7 +32,12 @@ pub fn handoff_doc(session: &Session, turns: &[crate::model::Turn], target: &str
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n { s.to_string() } else { format!("{}…", &s[..n]) }
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(n).collect();
+        format!("{}…", t)
+    }
 }
 
 pub fn convert_session_json(session: &Session, turns: &[crate::model::Turn], from: &str, to: &str) -> serde_json::Value {

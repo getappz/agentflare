@@ -81,12 +81,10 @@ fn search_by_files_and_tools(
 }
 
 fn sanitize_fts_query(q: &str) -> String {
+    // Always quote as an FTS5 phrase: an unquoted single token can still contain
+    // reserved characters (e.g. a hyphen, parsed as NOT) that break the query.
     let escaped = q.replace('"', "\"\"");
-    if escaped.contains(' ') {
-        format!("\"{}\"", escaped)
-    } else {
-        escaped
-    }
+    format!("\"{}\"", escaped)
 }
 
 #[cfg(test)]
@@ -97,7 +95,8 @@ mod tests {
     #[test]
     fn sanitize() {
         assert_eq!(sanitize_fts_query("hello world"), "\"hello world\"");
-        assert_eq!(sanitize_fts_query("hello"), "hello");
+        assert_eq!(sanitize_fts_query("hello"), "\"hello\"");
+        assert_eq!(sanitize_fts_query("gpt-4"), "\"gpt-4\"");
     }
     #[test]
     fn search_empty_returns_list() {

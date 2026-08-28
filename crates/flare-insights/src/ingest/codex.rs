@@ -92,6 +92,8 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
             tokens.input += t.input;
             tokens.output += t.output;
             tokens.cache_read += t.cache_read;
+            tokens.cache_write += t.cache_write;
+            tokens.reasoning += t.reasoning;
         }
 
         if is_user || is_assistant {
