@@ -513,6 +513,11 @@ pub(crate) fn run_review_sweep(
         updated: 0,
         discovered: 0,
     };
+    // Computed once, not per-project/per-PR: identifies this workstation to
+    // `claim_pr_for_discovery`'s marker comment so two workstations racing to
+    // discover the same PR can tell each other apart. Same persisted id
+    // `github::bridge` itself uses.
+    let discovery_owner = crate::github::bridge::config::stable_instance_id();
 
     let fetched = mcp.with_backend_db(|conn| {
         let dirs = agentflare_backend::project_dir::list(conn).ok()?;
@@ -587,6 +592,7 @@ pub(crate) fn run_review_sweep(
                         &project_id,
                         &in_review_state_id,
                         &known_pr_numbers,
+                        &discovery_owner,
                     )
                 })
                 .unwrap_or(0);
