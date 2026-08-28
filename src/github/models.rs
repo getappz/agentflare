@@ -33,6 +33,11 @@ pub struct PullRequest {
     // merge status straight off `find_existing`'s list call.
     #[serde(default)]
     pub merged_at: Option<String>,
+    // Present on both the list and single-PR endpoints -- `work_duplicate_pr`
+    // reads this to decide whether a still-open, CI-red duplicate is stale
+    // enough to stop blocking redispatch.
+    #[serde(default)]
+    pub created_at: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
     pub mergeable: Option<bool>,
