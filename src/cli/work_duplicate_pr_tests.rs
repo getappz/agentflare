@@ -31,14 +31,14 @@
 
     #[test]
     fn pick_duplicate_pr_prefers_a_merged_match_over_an_open_one() {
-        let picked =
-            pick_duplicate_pr(vec![open_duplicate_pr(1), duplicate_pr(2, true)], None).unwrap();
+        let picked = pick_duplicate_pr(vec![open_duplicate_pr(1), duplicate_pr(2, true)], None, None)
+            .unwrap();
         assert_eq!(picked.number, 2);
     }
 
     #[test]
     fn pick_duplicate_pr_returns_none_for_an_empty_list() {
-        assert!(pick_duplicate_pr(vec![], None).is_none());
+        assert!(pick_duplicate_pr(vec![], None, None).is_none());
     }
 
     /// A closed-but-unmerged PR (a previously abandoned attempt, e.g. one
@@ -48,13 +48,14 @@
     /// `state: "closed"`, `merged_at: None`.
     #[test]
     fn pick_duplicate_pr_ignores_a_closed_unmerged_pr() {
-        assert!(pick_duplicate_pr(vec![duplicate_pr(3, false)], None).is_none());
+        assert!(pick_duplicate_pr(vec![duplicate_pr(3, false)], None, None).is_none());
     }
 
     #[test]
     fn pick_duplicate_pr_selects_a_genuinely_open_pr_when_no_merged_match_exists() {
         let picked =
-            pick_duplicate_pr(vec![duplicate_pr(4, false), open_duplicate_pr(5)], None).unwrap();
+            pick_duplicate_pr(vec![duplicate_pr(4, false), open_duplicate_pr(5)], None, None)
+                .unwrap();
         assert_eq!(picked.number, 5);
     }
 
@@ -68,6 +69,7 @@
             pick_duplicate_pr(
                 vec![open_duplicate_pr_on_branch(6, "task/186-toolchain-sniffer")],
                 Some("task/186-toolchain-sniffer"),
+                None,
             )
             .is_none()
         );
@@ -82,9 +84,73 @@
         let picked = pick_duplicate_pr(
             vec![open_duplicate_pr_on_branch(7, "task/186-someone-elses-attempt")],
             Some("task/186-toolchain-sniffer"),
+            None,
         )
         .unwrap();
         assert_eq!(picked.number, 7);
+    }
+
+    /// Item #192: `metadata.pr.number` is a more durable "this is my own PR"
+    /// signal than the current branch -- it doesn't depend on the worktree
+    /// actually being checked out onto that exact branch right now, which is
+    /// what kept blocking item #186/#597's self-repair attempts even after
+    /// the branch-based exclusion landed.
+    #[test]
+    fn pick_duplicate_pr_excludes_an_open_pr_matching_the_items_own_tracked_pr_number() {
+        assert!(
+            pick_duplicate_pr(vec![open_duplicate_pr(8)], None, Some(8)).is_none()
+        );
+    }
+
+    /// The own-PR-number exclusion is specific to that exact PR -- a
+    /// different open PR for the same item (someone else's competing
+    /// attempt) must still be flagged even when the item has its own
+    /// tracked PR recorded.
+    #[test]
+    fn pick_duplicate_pr_still_flags_a_different_open_pr_when_own_pr_number_does_not_match() {
+        let picked = pick_duplicate_pr(vec![open_duplicate_pr(9)], None, Some(8)).unwrap();
+        assert_eq!(picked.number, 9);
+    }
+
+    fn open_duplicate_pr_created_at(number: u64, created_at: &str) -> crate::github::models::PullRequest {
+        serde_json::from_str(&format!(
+            r#"{{"number":{number},"html_url":"https://github.com/o/r/pull/{number}","state":"open","title":"t","created_at":"{created_at}"}}"#
+        ))
+        .unwrap()
+    }
+
+    fn days_ago(days: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::Duration::days(days)
+    }
+
+    /// Item #192's core fix: a duplicate that's been CI-red long enough must
+    /// stop blocking redispatch/re-review instead of shielding a bad PR
+    /// forever (item #186/#597).
+    #[test]
+    fn is_stale_ci_red_is_true_once_a_ci_failing_pr_has_sat_open_past_the_threshold() {
+        let pr = open_duplicate_pr_created_at(1, &days_ago(4).to_rfc3339());
+        assert!(is_stale_ci_red(&pr, true, chrono::Utc::now()));
+    }
+
+    #[test]
+    fn is_stale_ci_red_is_false_for_a_ci_failing_pr_still_within_the_threshold() {
+        let pr = open_duplicate_pr_created_at(2, &days_ago(1).to_rfc3339());
+        assert!(!is_stale_ci_red(&pr, true, chrono::Utc::now()));
+    }
+
+    /// An old PR whose CI isn't actually failing (passing, pending, or
+    /// unknown) is still plausibly in-progress work, not a dead end -- age
+    /// alone must not be enough to unblock it.
+    #[test]
+    fn is_stale_ci_red_is_false_for_an_old_pr_that_is_not_ci_failing() {
+        let pr = open_duplicate_pr_created_at(3, &days_ago(30).to_rfc3339());
+        assert!(!is_stale_ci_red(&pr, false, chrono::Utc::now()));
+    }
+
+    #[test]
+    fn is_stale_ci_red_is_false_when_created_at_is_missing() {
+        let pr = open_duplicate_pr(4);
+        assert!(!is_stale_ci_red(&pr, true, chrono::Utc::now()));
     }
 
     /// Item #164's acceptance criterion: a merged duplicate PR self-heals

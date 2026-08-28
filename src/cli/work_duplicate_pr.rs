@@ -1,3 +1,12 @@
+/// A still-open, CI-red duplicate stops blocking redispatch once it's sat
+/// unmerged this long (item #192: item #186/PR #597 sat CI-red across at
+/// least 4 blocked attempts over 2 days, including the daemon's own CI
+/// self-repair trigger, with no route back to re-examination). Chosen to
+/// comfortably outlast a transient CI blip or an in-flight self-repair
+/// attempt while still surfacing a genuinely stuck PR within a few days
+/// instead of indefinitely.
+const STALE_DUPLICATE_DAYS: i64 = 3;
+
 /// Duplicate-work pre-check (item #164): searches GitHub for a PR that
 /// already carries `item`'s `for item #<sequence_id>` marker (the footer
 /// `worktree::pr_footer` stamps onto every PR agentflare opens). Unlike
@@ -20,7 +29,45 @@ fn find_duplicate_pr(
     let repo = crate::github::RepoId::resolve_from_remote(repo_root)?;
     let client = crate::github::Client::new().ok()?;
     let prs = crate::github::pulls::find_by_item_marker(&client, &repo, item.sequence_id).ok()?;
-    pick_duplicate_pr(prs, flare_git_core::branch::current_branch(repo_root).as_deref())
+    let pr = pick_duplicate_pr(
+        prs,
+        flare_git_core::branch::current_branch(repo_root).as_deref(),
+        crate::worktree::pr_number_from_metadata(item),
+    )?;
+    if pr.merged_at.is_none() {
+        let ci_failing = matches!(
+            crate::worktree::pr_ci_status(item, repo_root),
+            crate::worktree::PrCiStatus::Failing(_)
+        );
+        if is_stale_ci_red(&pr, ci_failing, chrono::Utc::now()) {
+            return None;
+        }
+    }
+    Some(pr)
+}
+
+/// Whether `pr` -- an open duplicate that survived `pick_duplicate_pr`'s
+/// exclusions -- is both CI-red and older than `STALE_DUPLICATE_DAYS`: the
+/// minimum content signal available without an LLM judge that a PR "already
+/// covering this item" no longer actually does (item #192). A fresh PR, one
+/// still running checks, or one with passing/unknown CI keeps blocking, since
+/// only a PR that's been failing for a while is a plausible dead end rather
+/// than routine in-progress work. `ci_failing` is passed in (rather than
+/// computed here from `item`/`repo_root`) so this decision is unit-testable
+/// without a mock GitHub server, matching `pick_duplicate_pr`'s split.
+fn is_stale_ci_red(
+    pr: &crate::github::models::PullRequest,
+    ci_failing: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    ci_failing
+        && pr
+            .created_at
+            .as_deref()
+            .and_then(|c| chrono::DateTime::parse_from_rfc3339(c).ok())
+            .is_some_and(|created| {
+                now.signed_duration_since(created) > chrono::Duration::days(STALE_DUPLICATE_DAYS)
+            })
 }
 
 /// Picks which match to act on when `find_by_item_marker` returns more than
@@ -41,20 +88,34 @@ fn find_duplicate_pr(
 /// the repair — then, because `item::release` only clears the claim and
 /// never restores the state group, the item is left orphaned in `started`
 /// with no label either `run_discovery_tick` or `run_review_sweep` will
-/// ever pick back up (reproduced live on item #186/PR #597). A *merged*
-/// match still always short-circuits regardless of branch, since that's
-/// this function's other job: self-heal an item whose PR landed while its
-/// tracked state fell out of sync (items #122/#156).
+/// ever pick back up (reproduced live on item #186/PR #597).
+///
+/// `own_pr_number` (`metadata.pr.number`, item #192) is the same exclusion
+/// by a more durable signal than the current branch: the branch check only
+/// fires once the worktree is actually checked out onto that exact branch,
+/// which self-repair's own dispatch didn't reliably guarantee -- item
+/// #186/#597 kept getting blocked by this same guard across at least 4
+/// attempts *after* the branch fix landed, including the daemon's own CI
+/// self-repair trigger. A PR `push_and_open_pr` already recorded as this
+/// item's own is never a competing duplicate, regardless of what's checked
+/// out right now.
+///
+/// A *merged* match still always short-circuits regardless of branch or
+/// ownership, since that's this function's other job: self-heal an item
+/// whose PR landed while its tracked state fell out of sync (items
+/// #122/#156).
 fn pick_duplicate_pr(
     mut prs: Vec<crate::github::models::PullRequest>,
     current_branch: Option<&str>,
+    own_pr_number: Option<u64>,
 ) -> Option<crate::github::models::PullRequest> {
     prs.retain(|pr| pr.merged_at.is_some() || pr.state == "open");
     prs.retain(|pr| {
         pr.merged_at.is_some()
-            || current_branch
-                .zip(pr.head.as_ref())
-                .is_none_or(|(current, head)| head.git_ref != current)
+            || (own_pr_number != Some(pr.number)
+                && current_branch
+                    .zip(pr.head.as_ref())
+                    .is_none_or(|(current, head)| head.git_ref != current))
     });
     prs.sort_by_key(|pr| pr.merged_at.is_none());
     prs.into_iter().next()
