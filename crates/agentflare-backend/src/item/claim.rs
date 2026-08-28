@@ -247,8 +247,13 @@ pub fn promote_in_review_to_completed(conn: &Connection, item_id: &str) -> Resul
 /// Labels the daemon's own `run_discovery_tick` (`src/supervisor.rs`)
 /// treats as part of a dispatch's lifecycle rather than a plain worklist
 /// marker — cleared on redispatch so a stale one left over from a failed
-/// attempt doesn't shadow the fresh `READY_LABEL` re-attached below.
-const REDISPATCH_CLEARED_LABELS: &[&str] = &["dispatched", "needs-manual-dispatch"];
+/// attempt doesn't shadow the fresh `READY_LABEL` re-attached below. Also
+/// reused by `mcp_server::handoff` (item #197's follow-up): a `handoff`
+/// onto an existing `item_id` that still carries one of these from a prior
+/// dispatch cycle must clear it too, or the fresh `READY_LABEL` handoff
+/// adds never gets seen as "this item needs a new attempt" — it just sits
+/// alongside the stale label with no discovery-tick effect either way.
+pub const REDISPATCH_CLEARED_LABELS: &[&str] = &["dispatched", "needs-manual-dispatch"];
 const READY_LABEL: &str = "ready-for-work";
 
 /// Outcome of `redispatch` — mirrors `ClaimOutcome`'s style of an
