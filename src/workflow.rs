@@ -720,6 +720,26 @@ pub(crate) async fn complete_workflow_event_async(
     Ok(())
 }
 
+/// Cancel a running workflow. Already-succeeded steps are left
+/// uncompensated (no saga rollback) — mirrors the engine's own
+/// `cancel_workflow` doc comment. Sync wrapper — see
+/// [`cancel_workflow_async`].
+pub fn cancel_workflow(run_id: &str, db_path: &Path) -> Result<(), String> {
+    WORKFLOW_RT
+        .block_on(cancel_workflow_async(run_id, db_path))
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn cancel_workflow_async(run_id: &str, db_path: &Path) -> Result<(), String> {
+    let store = open_store(db_path)?;
+    let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
+    let run_id = parse_run_id(run_id)?;
+    engine
+        .cancel_workflow(run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 fn status_str(s: &WorkflowStatus) -> &'static str {
     match s {
         WorkflowStatus::Pending => "pending",
@@ -1018,6 +1038,55 @@ mod tests {
 
         let status = workflow_status(&run_id.to_string(), &db).unwrap();
         assert_eq!(status["status"], "completed");
+    }
+
+    #[test]
+    fn cancel_workflow_stops_a_waiting_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wf.db");
+
+        let (run_id, _) = run_workflow_json_with_sender(
+            r#"{
+                "name": "cancellable",
+                "steps": [
+                    {"name": "ask", "agent": "opencode", "prompt": "Ask: {{input}}", "mode": {"wait_event": {"name": "approve", "timeout_secs": 10}}},
+                    {"name": "after", "agent": "opencode", "prompt": "After: {{input}}"}
+                ]
+            }"#,
+            "needs approval",
+            &db,
+            mock_send(),
+        )
+        .unwrap();
+
+        // Wait for the run to arm on the wait event before cancelling it.
+        let mut armed = false;
+        for _ in 0..100 {
+            let status = workflow_status(&run_id.to_string(), &db).unwrap();
+            armed = status["journal_tail"]
+                .as_array()
+                .map(|t| t.iter().any(|e| e["entry_type"] == "wait_event"))
+                .unwrap_or(false);
+            if armed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(armed, "run never armed on the wait event");
+
+        cancel_workflow(&run_id.to_string(), &db).unwrap();
+
+        let status = workflow_status(&run_id.to_string(), &db).unwrap();
+        assert_eq!(status["status"], "cancelled");
+    }
+
+    #[test]
+    fn cancel_workflow_rejects_unknown_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wf.db");
+        // Any DB error, including a nonexistent store file with no matching
+        // row, is surfaced as an `Err` rather than silently succeeding.
+        assert!(cancel_workflow("not-a-uuid", &db).is_err());
     }
 
     #[test]

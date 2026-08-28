@@ -22,6 +22,9 @@ pub enum WorkflowCommand {
     Status(StatusArgs),
     /// Resolve a human-in-the-loop WaitEvent.
     CompleteEvent(CompleteEventArgs),
+    /// Cancel a running/waiting workflow. Already-succeeded steps are left
+    /// uncompensated.
+    Cancel(CancelArgs),
     /// List run summaries.
     List(ListArgs),
     /// List this project's `.agentflare/workflows/*.json` definitions.
@@ -63,6 +66,15 @@ pub struct CompleteEventArgs {
     /// Completion payload text.
     #[arg(long, default_value = "approved")]
     pub result: String,
+    /// SQLite store path (defaults to ~/.agentflare/workflows.db).
+    #[arg(long)]
+    pub db_path: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct CancelArgs {
+    /// Run UUID.
+    pub run_id: String,
     /// SQLite store path (defaults to ~/.agentflare/workflows.db).
     #[arg(long)]
     pub db_path: Option<PathBuf>,
@@ -164,6 +176,15 @@ impl WorkflowArgs {
                     &db_path(&args.db_path),
                 ) {
                     Ok(()) => println!("event '{}' completed", args.name),
+                    Err(e) => {
+                        ui::error(&e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            WorkflowCommand::Cancel(args) => {
+                match crate::workflow::cancel_workflow(&args.run_id, &db_path(&args.db_path)) {
+                    Ok(()) => println!("run '{}' cancelled", args.run_id),
                     Err(e) => {
                         ui::error(&e);
                         std::process::exit(1);
