@@ -221,6 +221,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "dirs",
+ "flare-search-kit",
  "hex",
  "notify",
  "regex",

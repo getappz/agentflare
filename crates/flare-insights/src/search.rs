@@ -31,7 +31,7 @@ pub fn search(store: &InsightsStore, opts: &SearchOptions) -> anyhow::Result<Vec
     if opts.query.trim().is_empty() {
         return Ok(store.list_sessions(opts.limit, opts.offset)?);
     }
-    let q = sanitize_fts_query(&opts.query);
+    let q = flare_search_kit::fts_phrase_query(&opts.query);
     let mut results = store.search_sessions(&q, opts.limit + opts.offset)?;
 
     // DRY: optionally extend with file_events/tool_calls matches (for opencode/claude)
@@ -80,13 +80,6 @@ fn search_by_files_and_tools(
     Ok(out)
 }
 
-fn sanitize_fts_query(q: &str) -> String {
-    // Always quote as an FTS5 phrase: an unquoted single token can still contain
-    // reserved characters (e.g. a hyphen, parsed as NOT) that break the query.
-    let escaped = q.replace('"', "\"\"");
-    format!("\"{}\"", escaped)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,9 +87,9 @@ mod tests {
     use chrono::Utc;
     #[test]
     fn sanitize() {
-        assert_eq!(sanitize_fts_query("hello world"), "\"hello world\"");
-        assert_eq!(sanitize_fts_query("hello"), "\"hello\"");
-        assert_eq!(sanitize_fts_query("gpt-4"), "\"gpt-4\"");
+        assert_eq!(flare_search_kit::fts_phrase_query("hello world"), "\"hello\" \"world\"");
+        assert_eq!(flare_search_kit::fts_phrase_query("hello"), "\"hello\"");
+        assert_eq!(flare_search_kit::fts_phrase_query("gpt-4"), "\"gpt-4\"");
     }
     #[test]
     fn search_empty_returns_list() {

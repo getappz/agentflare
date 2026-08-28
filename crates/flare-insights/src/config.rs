@@ -31,17 +31,6 @@ fn dirs_data_dir() -> PathBuf {
     }
 }
 
-// Minimal dirs fallback without adding dep: use HOME
-mod dirs {
-    use std::path::PathBuf;
-    pub fn data_dir() -> Option<PathBuf> {
-        if let Ok(home) = std::env::var("HOME") {
-            return Some(PathBuf::from(home).join(".local").join("share"));
-        }
-        None
-    }
-}
-
 fn default_sources() -> HashMap<String, PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let h = PathBuf::from(home);
