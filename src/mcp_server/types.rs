@@ -1115,7 +1115,9 @@ pub(crate) struct SearchRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WorkflowRequest {
-    #[schemars(description = "Action: run|status|complete_event|list|list_definitions|metrics")]
+    #[schemars(
+        description = "Action: run|status|complete_event|cancel|list|list_definitions|metrics"
+    )]
     pub(crate) action: String,
     #[schemars(
         description = "JSON workflow definition (run) — OpenFang-style {name, steps}. Alternative to workflow_name."
@@ -1135,7 +1137,7 @@ pub(crate) struct WorkflowRequest {
     )]
     #[serde(default)]
     pub(crate) params: Option<String>,
-    #[schemars(description = "Run UUID (status, complete_event)")]
+    #[schemars(description = "Run UUID (status, complete_event, cancel)")]
     #[serde(default)]
     pub(crate) run_id: Option<String>,
     #[schemars(description = "WaitEvent name to resolve (complete_event)")]

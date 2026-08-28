@@ -80,6 +80,15 @@ impl AgentflareMcp {
                     .map_err(|e| ErrorData::invalid_params(e, None))?;
                 Ok(r#"{"status":"completed"}"#.to_string())
             }
+            "cancel" => {
+                let run_id = req
+                    .run_id
+                    .ok_or_else(|| ErrorData::invalid_params("run_id is required", None))?;
+                crate::workflow::cancel_workflow_async(&run_id, &db_path)
+                    .await
+                    .map_err(|e| ErrorData::invalid_params(e, None))?;
+                Ok(r#"{"status":"cancelled"}"#.to_string())
+            }
             "list" => {
                 let runs = crate::workflow::list_workflows_async(&db_path)
                     .await
@@ -204,6 +213,66 @@ mod tests {
         }
         assert_eq!(v["status"], "completed");
         assert!(v["input"].as_str().unwrap().contains("Hello u-7"));
+    }
+
+    #[tokio::test]
+    async fn cancel_action_stops_a_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("wf.db");
+
+        let (run_id, _) = crate::workflow::run_workflow_json_async(
+            r#"{
+                "name": "cancel-me",
+                "steps": [
+                    {"name": "ask", "agent": "opencode", "prompt": "Ask: {{input}}", "mode": {"wait_event": {"name": "approve", "timeout_secs": 10}}}
+                ]
+            }"#,
+            "seed",
+            &db,
+            mock_send(),
+        )
+        .await
+        .unwrap();
+
+        let status_req = || {
+            let mut r = req("status", &db);
+            r.run_id = Some(run_id.to_string());
+            r
+        };
+        let mut armed = false;
+        for _ in 0..100 {
+            let status = mcp().workflow(Parameters(status_req())).await.unwrap();
+            let v: serde_json::Value = serde_json::from_str(&status).unwrap();
+            armed = v["journal_tail"]
+                .as_array()
+                .map(|t| t.iter().any(|e| e["entry_type"] == "wait_event"))
+                .unwrap_or(false);
+            if armed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(armed, "run never armed on the wait event");
+
+        let mut cancel_req = req("cancel", &db);
+        cancel_req.run_id = Some(run_id.to_string());
+        let out = mcp().workflow(Parameters(cancel_req)).await.unwrap();
+        assert!(out.contains("cancelled"));
+
+        let status = mcp().workflow(Parameters(status_req())).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(v["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_action_requires_run_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("wf.db");
+        let err = mcp()
+            .workflow(Parameters(req("cancel", &db)))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("run_id is required"));
     }
 
     #[tokio::test]
