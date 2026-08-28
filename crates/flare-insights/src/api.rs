@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -48,10 +47,7 @@ pub async fn serve(db_path: PathBuf, port: u16) -> anyhow::Result<()> {
     }
 }
 
-async fn handle_conn(
-    socket: &mut tokio::net::TcpStream,
-    db_path: &Path,
-) -> anyhow::Result<()> {
+async fn handle_conn(socket: &mut tokio::net::TcpStream, db_path: &Path) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 8192];
     let n = socket.read(&mut buf).await?;
     if n == 0 {
@@ -61,13 +57,25 @@ async fn handle_conn(
     let (method, path) = parse_request(&req);
 
     if method != "GET" {
-        return write_response(socket, 405, "Method Not Allowed", &serde_json::json!({"error":"method not allowed"})).await;
+        return write_response(
+            socket,
+            405,
+            "Method Not Allowed",
+            &serde_json::json!({"error":"method not allowed"}),
+        )
+        .await;
     }
 
     let store = match InsightsStore::open(db_path) {
         Ok(s) => s,
         Err(e) => {
-            return write_response(socket, 500, "DB error", &serde_json::json!({"error": e.to_string()})).await
+            return write_response(
+                socket,
+                500,
+                "DB error",
+                &serde_json::json!({"error": e.to_string()}),
+            )
+            .await
         }
     };
 
@@ -80,17 +88,27 @@ async fn handle_conn(
     }
 
     let (status, body) = match route {
-        "/api/health" => (200, serde_json::json!({"status":"ok","version": crate::VERSION})),
+        "/api/health" => (
+            200,
+            serde_json::json!({"status":"ok","version": crate::VERSION}),
+        ),
         "/api/sessions" => {
             let params = parse_query(query);
-            let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(20);
-            let offset = params.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let limit = params
+                .get("limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20);
+            let offset = params
+                .get("offset")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let source = params.get("source").cloned();
             let mut sessions = store.list_sessions(limit, offset).unwrap_or_default();
             if let Some(src) = source {
                 sessions.retain(|s| s.source.as_str() == src);
             }
-            serde_json::to_value(&sessions).unwrap()
+            serde_json::to_value(&sessions)
+                .unwrap()
                 .as_array()
                 .map(|arr| (200, serde_json::Value::Array(arr.clone())))
                 .unwrap_or((200, serde_json::json!([])))
@@ -102,7 +120,10 @@ async fn handle_conn(
                     let turns = store.get_turns(&s.id).unwrap_or_default();
                     let tools = store.get_tool_calls(&s.id).unwrap_or_default();
                     let files = store.get_file_events(&s.id).unwrap_or_default();
-                    (200, serde_json::json!({"session": s, "turns": turns, "tool_calls": tools, "file_events": files}))
+                    (
+                        200,
+                        serde_json::json!({"session": s, "turns": turns, "tool_calls": tools, "file_events": files}),
+                    )
                 }
                 None => (404, serde_json::json!({"error":"not found"})),
             }
@@ -110,7 +131,10 @@ async fn handle_conn(
         "/api/search" => {
             let params = parse_query(query);
             let q = params.get("q").cloned().unwrap_or_default();
-            let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(20);
+            let limit = params
+                .get("limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20);
             let opts = crate::search::SearchOptions {
                 query: q,
                 source: params.get("source").cloned(),
@@ -127,10 +151,14 @@ async fn handle_conn(
             let sessions = store.list_sessions(10000, 0).unwrap_or_default();
             let tools = store.list_tool_calls(100000).unwrap_or_default();
             let files = store.list_file_events(100000).unwrap_or_default();
-            let analytics = crate::analytics::compute_analytics_with_tools(&sessions, &tools, &files);
+            let analytics =
+                crate::analytics::compute_analytics_with_tools(&sessions, &tools, &files);
             (200, serde_json::to_value(&analytics).unwrap())
         }
-        _ => (404, serde_json::json!({"error":"not found", "hint":"/api/health, /api/sessions, /api/sessions/:id, /api/search?q=, /api/stats"})),
+        _ => (
+            404,
+            serde_json::json!({"error":"not found", "hint":"/api/health, /api/sessions, /api/sessions/:id, /api/search?q=, /api/stats"}),
+        ),
     };
 
     let status_text = match status {
@@ -267,6 +295,8 @@ mod urlencoding {
                 }
             }
         }
-        Ok(std::borrow::Cow::Owned(String::from_utf8_lossy(&out).into_owned()))
+        Ok(std::borrow::Cow::Owned(
+            String::from_utf8_lossy(&out).into_owned(),
+        ))
     }
 }

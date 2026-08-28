@@ -6,6 +6,9 @@ description = "Unified observability for AI coding agent sessions - ingest, repl
 license = "MIT"
 publish = false
 
+[lib]
+name = "flare_insights"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,6 +25,7 @@ hex = "0.4"
 anyhow = "1"
 dirs = "6"
 flare-search-kit = { path = "../flare-search-kit" }
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
 
 [dev-dependencies]
 tempfile = "3"

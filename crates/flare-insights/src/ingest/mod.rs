@@ -57,7 +57,10 @@ impl IngestManager {
     }
 
     /// DRY: scan all adapters, fail-open per source
-    pub fn scan_all(&self, config: &InsightsConfig) -> Vec<(String, Result<IngestBundle, IngestError>)> {
+    pub fn scan_all(
+        &self,
+        config: &InsightsConfig,
+    ) -> Vec<(String, Result<IngestBundle, IngestError>)> {
         let mut out = Vec::new();
         for a in &self.adapters {
             let name = a.source_name().to_string();

@@ -130,7 +130,12 @@ pub fn extract_file_path(tool: &str, input: &serde_json::Value) -> Option<String
     if let Some(obj) = input.as_object() {
         for (_, v) in obj {
             if let Some(s) = v.as_str() {
-                if s.contains('/') && (s.ends_with(".rs") || s.ends_with(".ts") || s.ends_with(".py") || s.contains('.')) {
+                if s.contains('/')
+                    && (s.ends_with(".rs")
+                        || s.ends_with(".ts")
+                        || s.ends_with(".py")
+                        || s.contains('.'))
+                {
                     return Some(s.to_string());
                 }
             }
@@ -138,7 +143,10 @@ pub fn extract_file_path(tool: &str, input: &serde_json::Value) -> Option<String
     }
     // fallback: for read/write/edit tools, try to find any string containing '/'
     // tool names vary by case across sources (Claude Code uses "Read"/"Write"/...)
-    if matches!(tool.to_lowercase().as_str(), "read" | "write" | "edit" | "glob" | "grep" | "bash") {
+    if matches!(
+        tool.to_lowercase().as_str(),
+        "read" | "write" | "edit" | "glob" | "grep" | "bash"
+    ) {
         if let Some(s) = input.as_str() {
             return Some(s.to_string());
         }

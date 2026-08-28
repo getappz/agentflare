@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, Turn, ToolCall};
+use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, ToolCall, Turn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -202,16 +202,14 @@ impl InsightsStore {
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>, StoreError> {
         let mut stmt = self.conn.prepare("SELECT * FROM sessions WHERE id=?1")?;
-        let row = stmt
-            .query_row(params![id], |r| row_to_session(r))
-            .optional()?;
+        let row = stmt.query_row(params![id], row_to_session).optional()?;
         Ok(row)
     }
 
     pub fn list_sessions(&self, limit: usize, offset: usize) -> Result<Vec<Session>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ?1 OFFSET ?2",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ?1 OFFSET ?2")?;
         let rows = stmt.query_map(params![limit as i64, offset as i64], row_to_session)?;
         let mut out = Vec::new();
         for r in rows {
@@ -235,23 +233,35 @@ impl InsightsStore {
         Ok(out)
     }
 
-    pub fn search_sessions_by_file_path(&self, pattern: &str, limit: usize) -> Result<Vec<Session>, StoreError> {
+    pub fn search_sessions_by_file_path(
+        &self,
+        pattern: &str,
+        limit: usize,
+    ) -> Result<Vec<Session>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT s.* FROM sessions s JOIN file_events f ON f.session_id = s.id WHERE f.path LIKE ?1 ORDER BY s.updated_at DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![pattern, limit as i64], row_to_session)?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
     }
 
-    pub fn search_sessions_by_tool(&self, pattern: &str, limit: usize) -> Result<Vec<Session>, StoreError> {
+    pub fn search_sessions_by_tool(
+        &self,
+        pattern: &str,
+        limit: usize,
+    ) -> Result<Vec<Session>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT s.* FROM sessions s JOIN tool_calls t ON t.session_id = s.id WHERE t.name LIKE ?1 ORDER BY s.updated_at DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![pattern, limit as i64], row_to_session)?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
     }
 
@@ -318,10 +328,14 @@ impl InsightsStore {
     }
 
     pub fn get_turns(&self, session_id: &str) -> Result<Vec<Turn>, StoreError> {
-        let mut stmt = self.conn.prepare("SELECT * FROM turns WHERE session_id=?1 ORDER BY seq ASC")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM turns WHERE session_id=?1 ORDER BY seq ASC")?;
         let rows = stmt.query_map(params![session_id], row_to_turn)?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
     }
 
@@ -372,14 +386,21 @@ impl InsightsStore {
     }
 
     pub fn get_tool_calls(&self, session_id: &str) -> Result<Vec<ToolCall>, StoreError> {
-        let mut stmt = self.conn.prepare("SELECT * FROM tool_calls WHERE session_id=?1 ORDER BY turn_seq ASC")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM tool_calls WHERE session_id=?1 ORDER BY turn_seq ASC")?;
         let rows = stmt.query_map(params![session_id], row_to_tool_call)?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
     }
 
-    pub fn upsert_file_events_batch(&self, events: &[crate::model::FileEvent]) -> Result<(), StoreError> {
+    pub fn upsert_file_events_batch(
+        &self,
+        events: &[crate::model::FileEvent],
+    ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         for e in events {
             tx.execute(
@@ -391,15 +412,25 @@ impl InsightsStore {
         Ok(())
     }
 
-    pub fn get_file_events(&self, session_id: &str) -> Result<Vec<crate::model::FileEvent>, StoreError> {
-        let mut stmt = self.conn.prepare("SELECT * FROM file_events WHERE session_id=?1 ORDER BY at ASC")?;
+    pub fn get_file_events(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::model::FileEvent>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM file_events WHERE session_id=?1 ORDER BY at ASC")?;
         let rows = stmt.query_map(params![session_id], row_to_file_event)?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
     }
 
-    pub fn upsert_subagents_batch(&self, subs: &[crate::model::Subagent]) -> Result<(), StoreError> {
+    pub fn upsert_subagents_batch(
+        &self,
+        subs: &[crate::model::Subagent],
+    ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         for s in subs {
             tx.execute(
@@ -411,11 +442,18 @@ impl InsightsStore {
         Ok(())
     }
 
-    pub fn get_subagents(&self, session_id: &str) -> Result<Vec<crate::model::Subagent>, StoreError> {
-        let mut stmt = self.conn.prepare("SELECT * FROM subagents WHERE session_id=?1")?;
+    pub fn get_subagents(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::model::Subagent>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM subagents WHERE session_id=?1")?;
         let rows = stmt.query_map(params![session_id], row_to_subagent)?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
     }
 
@@ -423,25 +461,47 @@ impl InsightsStore {
         let mut stmt = self.conn.prepare("SELECT * FROM tool_calls LIMIT ?1")?;
         let rows = stmt.query_map(params![limit as i64], row_to_tool_call)?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
     }
 
-    pub fn list_file_events(&self, limit: usize) -> Result<Vec<crate::model::FileEvent>, StoreError> {
+    pub fn list_file_events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::model::FileEvent>, StoreError> {
         let mut stmt = self.conn.prepare("SELECT * FROM file_events LIMIT ?1")?;
         let rows = stmt.query_map(params![limit as i64], row_to_file_event)?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
     }
 
     /// DRY transactional session+turns+tools+files+subagents
-    pub fn upsert_session_bundle(&self, s: &Session, turns: &[Turn], tools: &[ToolCall], files: &[crate::model::FileEvent], subs: &[crate::model::Subagent]) -> Result<(), StoreError> {
+    pub fn upsert_session_bundle(
+        &self,
+        s: &Session,
+        turns: &[Turn],
+        tools: &[ToolCall],
+        files: &[crate::model::FileEvent],
+        subs: &[crate::model::Subagent],
+    ) -> Result<(), StoreError> {
         self.upsert_session(s)?;
-        if !turns.is_empty() { self.upsert_turns_batch(turns)?; }
-        if !tools.is_empty() { self.upsert_tool_calls_batch(tools)?; }
-        if !files.is_empty() { self.upsert_file_events_batch(files)?; }
-        if !subs.is_empty() { self.upsert_subagents_batch(subs)?; }
+        if !turns.is_empty() {
+            self.upsert_turns_batch(turns)?;
+        }
+        if !tools.is_empty() {
+            self.upsert_tool_calls_batch(tools)?;
+        }
+        if !files.is_empty() {
+            self.upsert_file_events_batch(files)?;
+        }
+        if !subs.is_empty() {
+            self.upsert_subagents_batch(subs)?;
+        }
         Ok(())
     }
 }
@@ -467,7 +527,9 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         started_at: started.map(parse_dt),
         updated_at: parse_dt(updated),
         ended_at: ended.map(parse_dt),
-        duration_secs: row.get::<_, Option<i64>>("duration_secs")?.map(|v| v as u64),
+        duration_secs: row
+            .get::<_, Option<i64>>("duration_secs")?
+            .map(|v| v as u64),
         tokens: TokenUsage {
             input: row.get::<_, i64>("input_tokens")? as u64,
             output: row.get::<_, i64>("output_tokens")? as u64,
@@ -475,13 +537,15 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
             cache_write: row.get::<_, i64>("cache_write_tokens")? as u64,
             reasoning: row.get::<_, i64>("reasoning_tokens")? as u64,
         },
-        cost: row.get::<_, Option<f64>>("cost_usd")?.map(|total_usd| crate::model::Cost {
-            total_usd,
-            input_usd: 0.0,
-            output_usd: 0.0,
-            cache_read_usd: 0.0,
-            cache_write_usd: 0.0,
-        }),
+        cost: row
+            .get::<_, Option<f64>>("cost_usd")?
+            .map(|total_usd| crate::model::Cost {
+                total_usd,
+                input_usd: 0.0,
+                output_usd: 0.0,
+                cache_read_usd: 0.0,
+                cache_write_usd: 0.0,
+            }),
         turn_count: row.get::<_, i64>("turn_count")? as u32,
         tool_call_count: row.get::<_, i64>("tool_call_count")? as u32,
         subagent_count: row.get::<_, i64>("subagent_count")? as u32,
@@ -499,8 +563,20 @@ fn row_to_turn(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
     let input: Option<i64> = row.get("input_tokens")?;
     let output: Option<i64> = row.get("output_tokens")?;
     let tokens = match (input, output) {
-        (Some(i), Some(o)) => Some(TokenUsage { input: i as u64, output: o as u64, cache_read: 0, cache_write: 0, reasoning: 0 }),
-        (Some(i), None) => Some(TokenUsage { input: i as u64, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 }),
+        (Some(i), Some(o)) => Some(TokenUsage {
+            input: i as u64,
+            output: o as u64,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        }),
+        (Some(i), None) => Some(TokenUsage {
+            input: i as u64,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        }),
         _ => None,
     };
     Ok(Turn {
@@ -518,7 +594,9 @@ fn row_to_turn(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
 
 fn row_to_file_event(row: &rusqlite::Row) -> rusqlite::Result<crate::model::FileEvent> {
     let at_str: String = row.get("at")?;
-    let at = at_str.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now());
+    let at = at_str
+        .parse::<DateTime<Utc>>()
+        .unwrap_or_else(|_| Utc::now());
     Ok(crate::model::FileEvent {
         id: row.get("id")?,
         session_id: row.get("session_id")?,

@@ -219,6 +219,7 @@ dependencies = [
 name = "agentflare-flare-insights"
 version = "0.1.0"
 dependencies = [
+ "agentflare-workspace-hack",
  "anyhow",
  "chrono",
  "dirs",

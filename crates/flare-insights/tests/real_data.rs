@@ -57,5 +57,6 @@ fn ingest_real_claude_and_opencode_if_present() {
 
     let tools = store.list_tool_calls(1000).unwrap();
     let files = store.list_file_events(1000).unwrap();
-    let _ = flare_insights::analytics::compute_analytics_with_tools(&bundle.sessions, &tools, &files);
+    let _ =
+        flare_insights::analytics::compute_analytics_with_tools(&bundle.sessions, &tools, &files);
 }

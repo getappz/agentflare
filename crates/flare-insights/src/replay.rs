@@ -118,7 +118,7 @@ impl SessionReplay {
                 });
             }
         }
-        events.sort_by(|a, b| a.at.cmp(&b.at));
+        events.sort_by_key(|a| a.at);
         events
     }
 }

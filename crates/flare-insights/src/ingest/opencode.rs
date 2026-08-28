@@ -3,12 +3,12 @@
 // and .refs/opencode/packages/core/src/session/sql.ts
 
 use crate::config::InsightsConfig;
+use crate::config::PricingTable;
 use crate::ingest::{
     common::{extract_file_path, extract_tokens, file_kind_for_tool, parse_timestamp},
-    IngestBundle, IngestError, Adapter,
+    Adapter, IngestBundle, IngestError,
 };
-use crate::config::PricingTable;
-use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, Turn, ToolCall};
+use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, ToolCall, Turn};
 
 pub struct OpenCodeAdapter;
 
@@ -69,8 +69,12 @@ impl Adapter for OpenCodeAdapter {
         }
 
         // DRY: subagents are child sessions (parent_id != null) - fetch via SQL
-        if let Ok(mut stmt) = conn.prepare("SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL LIMIT 1000") {
-            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL LIMIT 1000")
+        {
+            if let Ok(rows) =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            {
                 for row in rows.filter_map(|r| r.ok()) {
                     let (child_id, parent_id) = row;
                     bundle.subagents.push(crate::model::Subagent {
@@ -94,7 +98,7 @@ impl Adapter for OpenCodeAdapter {
 }
 
 fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
-    let mut stmt = match conn.prepare("SELECT * FROM session LIMIT 1000") {
+    let stmt = match conn.prepare("SELECT * FROM session LIMIT 1000") {
         Ok(s) => s,
         Err(_) => return vec![],
     };
@@ -134,22 +138,24 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
         let project_id_raw: String = project_idx
             .and_then(|idx| row.get::<_, Option<String>>(idx).ok().flatten())
             .unwrap_or_else(|| "opencode".to_string());
-    let directory: Option<String> = find(&["directory", "path"])
+        let directory: Option<String> = find(&["directory", "path"])
             .and_then(|idx| row.get::<_, Option<String>>(idx).ok().flatten());
-        let title: Option<String> = title_idx
-            .and_then(|idx| row.get::<_, Option<String>>(idx).ok().flatten());
+        let title: Option<String> =
+            title_idx.and_then(|idx| row.get::<_, Option<String>>(idx).ok().flatten());
         let model: Option<String> = model_idx
             .and_then(|idx| row.get::<_, Option<String>>(idx).ok().flatten())
             .and_then(|s| {
                 // model is JSON {"id":"...","providerID":"..."}
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                    v.get("id").and_then(|id| id.as_str()).map(|s| s.to_string())
+                    v.get("id")
+                        .and_then(|id| id.as_str())
+                        .map(|s| s.to_string())
                 } else {
                     Some(s)
                 }
             });
-        let cost: Option<f64> = cost_idx
-            .and_then(|idx| row.get::<_, Option<f64>>(idx).ok().flatten());
+        let cost: Option<f64> =
+            cost_idx.and_then(|idx| row.get::<_, Option<f64>>(idx).ok().flatten());
         let tokens = TokenUsage {
             input: tokens_input_idx
                 .and_then(|idx| row.get::<_, Option<i64>>(idx).ok().flatten())
@@ -171,8 +177,7 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
             .and_then(|idx| row.get::<_, Option<i64>>(idx).ok().flatten())
             .map(|ms| ms.to_string())
             .or_else(|| {
-                time_updated_idx
-                    .and_then(|idx| row.get::<_, Option<String>>(idx).ok().flatten())
+                time_updated_idx.and_then(|idx| row.get::<_, Option<String>>(idx).ok().flatten())
             })
             .or_else(|| {
                 time_created_idx
@@ -181,7 +186,11 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
             });
         let updated_at = updated_str
             .as_deref()
-            .and_then(|s| s.parse::<i64>().ok().and_then(|ms| chrono::DateTime::from_timestamp_millis(ms)))
+            .and_then(|s| {
+                s.parse::<i64>()
+                    .ok()
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+            })
             .or_else(|| {
                 updated_str
                     .as_deref()
@@ -208,7 +217,23 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
         };
 
         let model_for_cost = model.clone();
-        let cost_for_session = cost.map(|total_usd| crate::model::Cost { total_usd, input_usd: 0.0, output_usd: 0.0, cache_read_usd: 0.0, cache_write_usd: 0.0, }).or_else(|| { let pricing = PricingTable::default(); let c = pricing.cost_for(model_for_cost.as_deref(), &tokens); if c.total_usd > 0.0 { Some(c) } else { None } });
+        let cost_for_session = cost
+            .map(|total_usd| crate::model::Cost {
+                total_usd,
+                input_usd: 0.0,
+                output_usd: 0.0,
+                cache_read_usd: 0.0,
+                cache_write_usd: 0.0,
+            })
+            .or_else(|| {
+                let pricing = PricingTable::default();
+                let c = pricing.cost_for(model_for_cost.as_deref(), &tokens);
+                if c.total_usd > 0.0 {
+                    Some(c)
+                } else {
+                    None
+                }
+            });
         out.push(Session {
             id,
             source: SessionSource::OpenCode,
@@ -343,11 +368,11 @@ fn ingest_messages_for_session(
         }
         seq += 1;
         let started_at = time_created
-            .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms))
+            .and_then(chrono::DateTime::from_timestamp_millis)
             .or_else(|| {
                 data.get("time")
                     .and_then(|t| t.get("created"))
-                    .and_then(|v| parse_timestamp(v))
+                    .and_then(parse_timestamp)
             });
 
         // tokens from message.data.tokens
@@ -395,7 +420,10 @@ fn ingest_messages_for_session(
                         }
                     }
                     "tool" => {
-                        let tool = part.get("tool").and_then(|t| t.as_str()).unwrap_or("unknown");
+                        let tool = part
+                            .get("tool")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("unknown");
                         let call_id = part
                             .get("callID")
                             .or_else(|| part.get("callId"))
@@ -419,7 +447,7 @@ fn ingest_messages_for_session(
                         let created_at = state
                             .and_then(|s| s.get("time"))
                             .and_then(|t| t.get("start"))
-                            .and_then(|v| parse_timestamp(v))
+                            .and_then(parse_timestamp)
                             .or(started_at);
                         // Normalize tool_call id to be unique
                         let tool_id = if call_id == "unknown" {
@@ -484,10 +512,7 @@ fn ingest_messages_for_session(
     (turns, tools, file_events)
 }
 
-fn get_parts_for_message(
-    conn: &rusqlite::Connection,
-    message_id: &str,
-) -> Vec<serde_json::Value> {
+fn get_parts_for_message(conn: &rusqlite::Connection, message_id: &str) -> Vec<serde_json::Value> {
     let mut stmt = match conn.prepare("SELECT data FROM part WHERE message_id = ?1 ORDER BY id") {
         Ok(s) => s,
         Err(_) => return vec![],

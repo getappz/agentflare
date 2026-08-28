@@ -19,6 +19,7 @@ mod github_bridge;
 mod handoff;
 mod hook;
 mod init;
+mod insights;
 mod mcp;
 mod memory;
 mod optimize;
@@ -32,7 +33,6 @@ mod vault;
 mod vent;
 pub(crate) mod work;
 mod workflow;
-mod insights;
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};

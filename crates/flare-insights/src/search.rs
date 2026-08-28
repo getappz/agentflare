@@ -43,7 +43,7 @@ pub fn search(store: &InsightsStore, opts: &SearchOptions) -> anyhow::Result<Vec
             }
         }
         // re-sort by updated_at desc and limit
-        results.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        results.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
         results.truncate(opts.limit + opts.offset);
     }
 
@@ -87,7 +87,10 @@ mod tests {
     use chrono::Utc;
     #[test]
     fn sanitize() {
-        assert_eq!(flare_search_kit::fts_phrase_query("hello world"), "\"hello\" \"world\"");
+        assert_eq!(
+            flare_search_kit::fts_phrase_query("hello world"),
+            "\"hello\" \"world\""
+        );
         assert_eq!(flare_search_kit::fts_phrase_query("hello"), "\"hello\"");
         assert_eq!(flare_search_kit::fts_phrase_query("gpt-4"), "\"gpt-4\"");
     }

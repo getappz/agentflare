@@ -111,14 +111,12 @@ impl InsightsArgs {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             PathBuf::from(home).join(".local/share/agentflare/insights/observatory.db")
         });
-        let cmd = self
-            .command
-            .unwrap_or(InsightsCommands::List(ListArgs {
-                limit: 20,
-                offset: 0,
-                source: None,
-                json: false,
-            }));
+        let cmd = self.command.unwrap_or(InsightsCommands::List(ListArgs {
+            limit: 20,
+            offset: 0,
+            source: None,
+            json: false,
+        }));
         match cmd {
             InsightsCommands::Sync(args) => run_sync(db_path, args),
             InsightsCommands::List(args) => run_list(db_path, args),
@@ -198,7 +196,9 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
 
 fn run_list(db: PathBuf, args: ListArgs) {
     let store = open_store(db);
-    let sessions = store.list_sessions(args.limit, args.offset).unwrap_or_default();
+    let sessions = store
+        .list_sessions(args.limit, args.offset)
+        .unwrap_or_default();
     if args.json {
         println!("{}", serde_json::to_string_pretty(&sessions).unwrap());
     } else {
@@ -268,10 +268,20 @@ fn run_show(db: PathBuf, args: ShowArgs) {
                 let turns = store.get_turns(&s.id).unwrap_or_default();
                 let tools = store.get_tool_calls(&s.id).unwrap_or_default();
                 let files = store.get_file_events(&s.id).unwrap_or_default();
-                let replay = flare_insights::replay::SessionReplay::from_parts(s.id.clone(), turns.clone(), tools.clone(), files.clone());
+                let replay = flare_insights::replay::SessionReplay::from_parts(
+                    s.id.clone(),
+                    turns.clone(),
+                    tools.clone(),
+                    files.clone(),
+                );
                 println!("--- replay timeline (first 10) ---");
                 for ev in replay.timeline().iter().take(10) {
-                    println!("  [{}] {}: {}", ev.seq, ev.kind, ev.detail.chars().take(100).collect::<String>());
+                    println!(
+                        "  [{}] {}: {}",
+                        ev.seq,
+                        ev.kind,
+                        ev.detail.chars().take(100).collect::<String>()
+                    );
                 }
                 for t in turns.iter().take(3) {
                     println!(
@@ -337,7 +347,8 @@ fn run_stats(db: PathBuf, args: StatsArgs) {
     let sessions = store.list_sessions(10000, 0).unwrap_or_default();
     let tools = store.list_tool_calls(100000).unwrap_or_default();
     let files = store.list_file_events(100000).unwrap_or_default();
-    let analytics = flare_insights::analytics::compute_analytics_with_tools(&sessions, &tools, &files);
+    let analytics =
+        flare_insights::analytics::compute_analytics_with_tools(&sessions, &tools, &files);
     if args.json {
         println!("{}", serde_json::to_string_pretty(&analytics).unwrap());
     } else {
@@ -403,9 +414,12 @@ fn run_handoff(db: PathBuf, args: HandoffArgs) {
 }
 
 fn run_watch(db: PathBuf, args: WatchArgs) {
-    use flare_insights::ingest::watcher::InsightsWatcher;
     use flare_insights::config::InsightsConfig;
-    println!("watching sources every {}s (ctrl-c to stop)", args.interval_secs);
+    use flare_insights::ingest::watcher::InsightsWatcher;
+    println!(
+        "watching sources every {}s (ctrl-c to stop)",
+        args.interval_secs
+    );
     let config = InsightsConfig::default();
     let store = open_store(db.clone());
     // initial sync
@@ -434,7 +448,9 @@ fn run_watch(db: PathBuf, args: WatchArgs) {
 
 fn run_serve(db: PathBuf, args: ServeArgs) {
     println!("flare-insights serve on 127.0.0.1:{} (API + WS)", args.port);
-    println!("endpoints: GET /api/health  GET /api/sessions  GET /api/sessions/:id  GET /api/search?q=  GET /api/stats");
+    println!(
+        "endpoints: GET /api/health  GET /api/sessions  GET /api/sessions/:id  GET /api/search?q=  GET /api/stats"
+    );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

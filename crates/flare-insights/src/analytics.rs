@@ -147,7 +147,7 @@ pub fn heatmap_by_weekday_hour(sessions: &[Session]) -> [[u32; 24]; 7] {
 pub fn top_files(files: &[FileEvent], n: usize) -> Vec<(String, usize)> {
     let mut freq = file_activity(files);
     let mut v: Vec<(String, usize)> = freq.drain().collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|a| std::cmp::Reverse(a.1));
     v.truncate(n);
     v
 }
@@ -155,7 +155,7 @@ pub fn top_files(files: &[FileEvent], n: usize) -> Vec<(String, usize)> {
 pub fn top_tools(tools: &[ToolCall], n: usize) -> Vec<(String, u64)> {
     let mut freq = tool_frequency(tools);
     let mut v: Vec<(String, u64)> = freq.drain().collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|a| std::cmp::Reverse(a.1));
     v.truncate(n);
     v
 }

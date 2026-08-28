@@ -4,9 +4,9 @@ use walkdir::WalkDir;
 use crate::config::InsightsConfig;
 use crate::ingest::{
     common::{extract_tokens, parse_timestamp},
-    IngestBundle, IngestError, Adapter,
+    Adapter, IngestBundle, IngestError,
 };
-use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, Turn, ToolCall};
+use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, ToolCall, Turn};
 
 pub struct CodexAdapter;
 
@@ -22,7 +22,11 @@ impl Adapter for CodexAdapter {
             return Ok(IngestBundle::default());
         }
         let mut bundle = IngestBundle::default();
-        for entry in WalkDir::new(dir).max_depth(5).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(dir)
+            .max_depth(5)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
@@ -61,7 +65,7 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
     let mut seq: u32 = 0;
 
     for v in &vals {
-        if let Some(ts) = v.get("timestamp").and_then(|t| parse_timestamp(t)) {
+        if let Some(ts) = v.get("timestamp").and_then(parse_timestamp) {
             updated_at = Some(updated_at.map_or(ts, |prev| prev.max(ts)));
         }
         if let Some(p) = v
@@ -86,7 +90,9 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
         let is_user = role == "user";
         let is_assistant = role == "assistant";
 
-        let usage = v.get("usage").or_else(|| v.get("payload").and_then(|p| p.get("usage")));
+        let usage = v
+            .get("usage")
+            .or_else(|| v.get("payload").and_then(|p| p.get("usage")));
         if let Some(u) = usage {
             let t = extract_tokens(u);
             tokens.input += t.input;
@@ -105,7 +111,7 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
             } else {
                 (None, Some(text))
             };
-            let started_at = v.get("timestamp").and_then(|t| parse_timestamp(t));
+            let started_at = v.get("timestamp").and_then(parse_timestamp);
             let turn_tokens = usage.map(extract_tokens);
             turns.push(Turn {
                 id: format!("{}-{}", id, seq),
@@ -152,7 +158,7 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
                 output: None,
                 status: "completed".into(),
                 duration_ms: None,
-                created_at: v.get("timestamp").and_then(|t| parse_timestamp(t)),
+                created_at: v.get("timestamp").and_then(parse_timestamp),
             });
         }
     }

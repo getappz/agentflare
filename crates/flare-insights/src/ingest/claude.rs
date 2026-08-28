@@ -4,12 +4,16 @@ use chrono::{DateTime, Utc};
 use walkdir::WalkDir;
 
 use crate::config::InsightsConfig;
-use crate::ingest::{
-    common::{extract_file_path, extract_tokens, file_kind_for_tool, parse_timestamp, title_from_text},
-    IngestBundle, IngestError, Adapter,
-};
 use crate::config::PricingTable;
-use crate::model::{FileEvent, Session, SessionSource, SessionStatus, Subagent, TokenUsage, Turn, ToolCall};
+use crate::ingest::{
+    common::{
+        extract_file_path, extract_tokens, file_kind_for_tool, parse_timestamp, title_from_text,
+    },
+    Adapter, IngestBundle, IngestError,
+};
+use crate::model::{
+    FileEvent, Session, SessionSource, SessionStatus, Subagent, TokenUsage, ToolCall, Turn,
+};
 
 pub struct ClaudeAdapter;
 
@@ -26,7 +30,11 @@ impl Adapter for ClaudeAdapter {
             return Ok(IngestBundle::default());
         }
         let mut bundle = IngestBundle::default();
-        for entry in WalkDir::new(dir).max_depth(5).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(dir)
+            .max_depth(5)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
@@ -84,7 +92,7 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
                 }
             }
         }
-        if let Some(ts) = v.get("timestamp").and_then(|t| parse_timestamp(t)) {
+        if let Some(ts) = v.get("timestamp").and_then(parse_timestamp) {
             updated_at = Some(updated_at.map_or(ts, |prev| prev.max(ts)));
         }
         if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
@@ -100,7 +108,9 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
 
         let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-        let usage = v.get("usage").or_else(|| v.get("message").and_then(|m| m.get("usage")));
+        let usage = v
+            .get("usage")
+            .or_else(|| v.get("message").and_then(|m| m.get("usage")));
         if let Some(u) = usage {
             let t = extract_tokens(u);
             tokens.input += t.input;
@@ -146,7 +156,7 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
                 let text = extract_text_from_message(msg);
                 (None, Some(text))
             };
-            let started_at = v.get("timestamp").and_then(|t| parse_timestamp(t));
+            let started_at = v.get("timestamp").and_then(parse_timestamp);
             let turn_tokens = usage.map(extract_tokens);
             let turn_id = format!("{}-{}", id, seq);
             turns.push(Turn {
@@ -188,14 +198,19 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
                             });
                         }
                         // subagent via Task tool
-                        if name.to_lowercase().contains("task") || name.to_lowercase().contains("agent") {
+                        if name.to_lowercase().contains("task")
+                            || name.to_lowercase().contains("agent")
+                        {
                             subagents.push(Subagent {
                                 id: call_id.clone(),
                                 session_id: id.clone(),
                                 parent_tool_call_id: Some(call_id.clone()),
                                 kind: name.clone(),
                                 status: "completed".into(),
-                                task: input.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                task: input
+                                    .get("description")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string()),
                             });
                         }
                         tool_calls.push(ToolCall {
@@ -218,7 +233,11 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
     let cost_for_session = {
         let pricing = PricingTable::default();
         let c = pricing.cost_for(model.as_deref(), &tokens);
-        if c.total_usd > 0.0 { Some(c) } else { None }
+        if c.total_usd > 0.0 {
+            Some(c)
+        } else {
+            None
+        }
     };
     let session = Session {
         id: id.clone(),
@@ -254,7 +273,9 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
 }
 
 fn extract_text_from_message(msg: Option<&serde_json::Value>) -> String {
-    let Some(msg) = msg else { return String::new(); };
+    let Some(msg) = msg else {
+        return String::new();
+    };
     if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
         return s.to_string();
     }
