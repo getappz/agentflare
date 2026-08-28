@@ -88,7 +88,7 @@ pub fn squash_since(worktree_path: &Path, base_sha: &str) -> Result<(), String> 
 /// reconstructed from the branch name afterward. `None` for items that
 /// predate this field (opened before this fix, or never pushed through
 /// `push_and_open_pr`).
-fn pr_number_from_metadata(item: &agentflare_backend::item::Item) -> Option<u64> {
+pub(crate) fn pr_number_from_metadata(item: &agentflare_backend::item::Item) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(&item.metadata)
         .ok()?
         .get("pr")?
