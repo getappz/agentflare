@@ -30,6 +30,8 @@ pub enum InsightsCommands {
     Serve(ServeArgs),
     /// Watch sources and re-sync on change (live)
     Watch(WatchArgs),
+    /// Check health of insights DB and sources (claude/opencode)
+    Doctor(DoctorArgs),
 }
 
 #[derive(Parser, Debug)]
