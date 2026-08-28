@@ -192,6 +192,29 @@ impl AgentflareMcp {
                     // bridge's own claim-liveness check already use) treats
                     // an expired claim as no claim, which is what "safe to
                     // re-queue" actually means here.
+                    // A prior dispatch cycle's `dispatched`/`needs-manual-dispatch`
+                    // label is stale evidence, not a live-work signal — a
+                    // human/PM explicitly handing this item off again means
+                    // "attempt it fresh," same intent `redispatch` already
+                    // acts on. Clearing it here (regardless of the live-claim
+                    // check below, which still gates the actual `READY_LABEL`
+                    // re-attach) is what makes a plain `handoff(item_id=...)`
+                    // onto an already-dispatched item behave the same as
+                    // `redispatch` instead of silently doing nothing (item
+                    // #197's follow-up — reproduced live twice more in one PM
+                    // session before this fix).
+                    if let Ok(labels) =
+                        agentflare_backend::label::list_by_project(conn, &project.id)
+                    {
+                        for label in &labels {
+                            if agentflare_backend::item::REDISPATCH_CLEARED_LABELS
+                                .contains(&label.name.as_str())
+                            {
+                                let _ = agentflare_backend::item::remove_label(conn, id, &label.id);
+                            }
+                        }
+                    }
+
                     let state = agentflare_backend::state::get(conn, &item.state_id)
                         .map_err(map_backend_err)?;
                     let now = crate::claims::now();
@@ -873,6 +896,81 @@ mod tests {
 
         assert!(
             item_label_names(&mcp, &item_id).contains(&crate::supervisor::READY_LABEL.to_string())
+        );
+    }
+
+    #[test]
+    fn an_explicit_item_id_handoff_clears_a_stale_dispatched_label_from_a_prior_cycle() {
+        // Reproduced live twice in one PM-mode session (items #192/#173,
+        // item #197's follow-up): `handoff` onto an item still carrying
+        // `dispatched` from a prior attempt only ever *added* `ready-for-work`
+        // -- it never cleared the stale label, so `run_discovery_tick`'s own
+        // downstream claim-liveness gate treated the item as still spoken
+        // for. Only `item(action="redispatch")` actually cleared it, which
+        // meant every re-handoff onto an already-dispatched item silently
+        // did nothing until someone remembered to call the other tool.
+        let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            agentflare_backend::label::create(
+                conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(project.id),
+                    workspace_id: project.workspace_id,
+                    name: crate::supervisor::DISPATCHED_LABEL.to_string(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap();
+        })
+        .unwrap();
+
+        let first = mcp.handoff_impl(base_request()).unwrap();
+        let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+            let dispatched = labels
+                .iter()
+                .find(|l| l.name == crate::supervisor::DISPATCHED_LABEL)
+                .unwrap();
+            let ready = labels
+                .iter()
+                .find(|l| l.name == crate::supervisor::READY_LABEL)
+                .unwrap();
+            agentflare_backend::item::remove_label(conn, &item_id, &ready.id).unwrap();
+            agentflare_backend::item::add_label(conn, &item_id, &dispatched.id).unwrap();
+        })
+        .unwrap();
+        assert!(
+            item_label_names(&mcp, &item_id)
+                .contains(&crate::supervisor::DISPATCHED_LABEL.to_string())
+        );
+
+        let reply = HandoffRequest {
+            item_id: Some(item_id.clone()),
+            completed: "more".to_string(),
+            remaining: "less".to_string(),
+            ..base_request()
+        };
+        mcp.handoff_impl(reply).unwrap();
+
+        let names = item_label_names(&mcp, &item_id);
+        assert!(
+            !names.contains(&crate::supervisor::DISPATCHED_LABEL.to_string()),
+            "stale dispatched label should have been cleared: {names:?}"
+        );
+        assert!(
+            names.contains(&crate::supervisor::READY_LABEL.to_string()),
+            "ready-for-work should have been re-attached: {names:?}"
         );
     }
 
