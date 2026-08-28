@@ -218,11 +218,12 @@ pub fn relabel_pr_completed(item: &agentflare_backend::item::Item, repo_root: &P
 
 /// CI signal the in-review sweep (`supervisor::run_review_sweep`, item #65)
 /// polls per item: merged (promote), failing (self-repair), CI-green with a
-/// human approval label attached (auto-merge, item #194), or nothing
-/// actionable yet. `Unknown` covers every soft-fail case `is_pr_merged`
-/// above also treats as "not merged yet" -- no credentials, no resolvable
-/// remote, no PR found, or a lookup error -- since the caller's fallback is
-/// simply to poll again next tick.
+/// human approval label attached (auto-merge, item #194), cleanly behind the
+/// base branch with no conflict (update-branch, item #197's follow-up), or
+/// nothing actionable yet. `Unknown` covers every soft-fail case
+/// `is_pr_merged` above also treats as "not merged yet" -- no credentials,
+/// no resolvable remote, no PR found, or a lookup error -- since the
+/// caller's fallback is simply to poll again next tick.
 pub enum PrCiStatus {
     Merged,
     Failing(Vec<String>),
@@ -233,6 +234,15 @@ pub enum PrCiStatus {
     Passing {
         number: u64,
         labels: Vec<String>,
+    },
+    /// GitHub's own `mergeable_state == "behind"` -- mergeable, no conflict,
+    /// just missing commits the base branch has gained since this PR was
+    /// opened/last updated. Checked before CI status is even fetched: a
+    /// stale-but-behind PR's existing check runs are stale too, and re-fetching
+    /// them here would be wasted work the branch update is about to
+    /// invalidate anyway.
+    Behind {
+        number: u64,
     },
     Unknown,
 }
@@ -297,6 +307,9 @@ fn pr_ci_status_impl(
     if pr.merged_at.is_some() {
         return PrCiStatus::Merged;
     }
+    if pr.mergeable == Some(true) && pr.mergeable_state.as_deref() == Some("behind") {
+        return PrCiStatus::Behind { number: pr.number };
+    }
     let Some(sha) = pr.head.as_ref().map(|h| h.sha.clone()) else {
         return PrCiStatus::Unknown;
     };
@@ -330,6 +343,30 @@ fn pr_ci_status_impl(
         }
     } else {
         PrCiStatus::Failing(failed)
+    }
+}
+
+/// Brings a cleanly-behind PR's branch up to date with the base branch via
+/// GitHub's own server-side "Update branch" operation -- only ever called
+/// from `run_review_sweep`'s `Behind` arm, so `mergeable_state == "behind"`
+/// is structurally already confirmed by the time this runs. Logs and
+/// returns `false` on failure (a concurrent push moving the branch head, a
+/// transient API error) rather than retrying in-line -- same "let the next
+/// sweep tick see the real current state and decide again" shape
+/// `merge_approved_pr` already uses for its own GitHub call.
+pub fn update_stale_branch(repo_root: &Path, number: u64) -> bool {
+    let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
+        return false;
+    };
+    let Ok(client) = crate::github::Client::new() else {
+        return false;
+    };
+    match crate::github::pulls::update_branch(&client, &repo, number) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("worktree: update-branch failed for PR #{number} in {repo}: {e}");
+            false
+        }
     }
 }
 
@@ -912,6 +949,33 @@ mod tests {
 
         assert!(matches!(status, PrCiStatus::Merged));
         assert_eq!(server.requests()[0].path, "/repos/o/r/pulls/619");
+    }
+
+    #[test]
+    fn pr_ci_status_reports_behind_before_ever_fetching_check_runs() {
+        // GitHub's own mergeable_state == "behind": mergeable, no conflict,
+        // just missing commits the base branch gained since. Only one
+        // request should fire -- the PR fetch itself -- confirming this is
+        // checked before `list_check_runs` would otherwise be called (item
+        // #197's follow-up: no point fetching CI status for checks the
+        // branch update is about to invalidate anyway).
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"{"number":621,"html_url":"u","state":"open","title":"t","mergeable":true,"mergeable_state":"behind"}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        let item = item_with_metadata(195, r#"{"pr":{"number":621,"branch":"whatever"}}"#);
+
+        let status = pr_ci_status_impl(&item, Path::new("/does/not/exist"), &client, &repo);
+
+        assert!(matches!(status, PrCiStatus::Behind { number: 621 }));
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]

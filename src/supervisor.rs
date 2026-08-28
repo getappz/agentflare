@@ -446,6 +446,12 @@ pub(crate) struct ReviewSweepResult {
     /// deferral counted as "skipped" reads to an operator as a decision
     /// that won't be revisited, which is exactly backwards (item #82).
     pub waiting: usize,
+    /// PRs cleanly behind the base branch (GitHub's own `mergeable_state`)
+    /// that this sweep brought up to date via `pulls::update_branch` (item
+    /// #197's follow-up) -- distinct from `promoted`/`self_repaired` since
+    /// neither the item's state nor its CI outcome changed, just its branch
+    /// content; the next tick re-evaluates it against fresh CI.
+    pub updated: usize,
 }
 
 /// Why `self_repair_or_gate` did or didn't dispatch. A plain `bool` can't
@@ -490,6 +496,7 @@ pub(crate) fn run_review_sweep(
         self_repaired: 0,
         skipped: 0,
         waiting: 0,
+        updated: 0,
     };
 
     let fetched = mcp.with_backend_db(|conn| {
@@ -560,6 +567,13 @@ pub(crate) fn run_review_sweep(
                 crate::worktree::PrCiStatus::Passing { number, labels } => {
                     if merge_if_approved(mcp, item, &repo_root, number, &labels) {
                         result.promoted += 1;
+                    } else {
+                        result.skipped += 1;
+                    }
+                }
+                crate::worktree::PrCiStatus::Behind { number } => {
+                    if crate::worktree::update_stale_branch(&repo_root, number) {
+                        result.updated += 1;
                     } else {
                         result.skipped += 1;
                     }
