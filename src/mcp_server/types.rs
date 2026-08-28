@@ -252,6 +252,11 @@ pub(crate) struct HandoffRequest {
     #[serde(default)]
     pub(crate) description: Option<String>,
     #[schemars(
+        description = "review | design-spec | implementation | bugfix | research | ... — merged into the item's metadata.task_type so work_item_pipeline::detect_review_only reads this structured signal instead of scanning free text for review/design-spec-sounding prose (item #170's false-positive class: a description that merely *mentions* \"design-spec\", e.g. referencing another item's spec, otherwise forces review-only mode even for a genuine implementation task). Any non-review/design-spec value short-circuits the free-text scan entirely. Set on every handoff whose task isn't ambiguous."
+    )]
+    #[serde(default)]
+    pub(crate) task_type: Option<String>,
+    #[schemars(
         description = "Knowledge facts to import into the recipient's memory on receive. Each item: {title, content, type, topic_key?}."
     )]
     #[serde(default)]
@@ -846,15 +851,20 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) reclaim: Option<bool>,
     #[schemars(
-        description = "doctor only: with reclaim=true, also delete lanes flagged dirty (uncommitted changes). Default false. DANGEROUS when `worktree` is omitted: it force-deletes EVERY dirty lane in the repo, not just the one you're trying to fix — always pass `worktree` alongside `force=true` unless you genuinely intend a repo-wide sweep."
+        description = "doctor only: with reclaim=true, also delete lanes flagged dirty (uncommitted changes). Default false. Refused when `worktree` is omitted (an unscoped force-reclaim force-deletes EVERY dirty lane in the repo, including other agents' uncommitted work) unless `repo_wide=true` explicitly confirms repo-wide intent."
     )]
     #[serde(default)]
     pub(crate) force: Option<bool>,
     #[schemars(
-        description = "doctor only: with reclaim=true, scope reclaim to a single lane by name (e.g. \"task/110\") or its worktree path. Omit to reclaim across every eligible lane repo-wide (the default). Strongly recommended whenever `force=true` is set, to avoid deleting unrelated dirty worktrees."
+        description = "doctor only: with reclaim=true, scope reclaim to a single lane by name (e.g. \"task/110\") or its worktree path. Always pass this alongside `force=true` to fix ONE broken worktree; omit only for a genuine repo-wide sweep."
     )]
     #[serde(default)]
     pub(crate) worktree: Option<String>,
+    #[schemars(
+        description = "doctor only: explicit confirmation that an unscoped `force=true` reclaim may delete EVERY dirty lane repo-wide. Required (true) whenever `reclaim=true` + `force=true` and `worktree` is omitted — the call is refused otherwise, since that combination would otherwise silently delete other agents' uncommitted work (2026-08-16 incident). Ignored when `worktree` is set or `force` is false."
+    )]
+    #[serde(default)]
+    pub(crate) repo_wide: Option<bool>,
 }
 
 /// Lean per-item projection for `item(list)` — the raw 19-field `Item` (full
@@ -1105,7 +1115,9 @@ pub(crate) struct SearchRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WorkflowRequest {
-    #[schemars(description = "Action: run|status|complete_event|list|list_definitions|metrics")]
+    #[schemars(
+        description = "Action: run|status|complete_event|cancel|list|list_definitions|metrics"
+    )]
     pub(crate) action: String,
     #[schemars(
         description = "JSON workflow definition (run) — OpenFang-style {name, steps}. Alternative to workflow_name."
@@ -1125,7 +1137,7 @@ pub(crate) struct WorkflowRequest {
     )]
     #[serde(default)]
     pub(crate) params: Option<String>,
-    #[schemars(description = "Run UUID (status, complete_event)")]
+    #[schemars(description = "Run UUID (status, complete_event, cancel)")]
     #[serde(default)]
     pub(crate) run_id: Option<String>,
     #[schemars(description = "WaitEvent name to resolve (complete_event)")]

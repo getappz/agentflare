@@ -446,6 +446,19 @@ pub(crate) struct ReviewSweepResult {
     /// deferral counted as "skipped" reads to an operator as a decision
     /// that won't be revisited, which is exactly backwards (item #82).
     pub waiting: usize,
+    /// PRs cleanly behind the base branch (GitHub's own `mergeable_state`)
+    /// that this sweep brought up to date via `pulls::update_branch` (item
+    /// #197's follow-up) -- distinct from `promoted`/`self_repaired` since
+    /// neither the item's state nor its CI outcome changed, just its branch
+    /// content; the next tick re-evaluates it against fresh CI.
+    pub updated: usize,
+    /// Trusted-author PRs found with no item tracking them yet, each just
+    /// given a synthesized `in_review` item via `worktree::discover_untracked_prs`
+    /// -- distinct from every other counter since nothing about a PR's own
+    /// state changed, only whether this sweep can see it; the newly created
+    /// item is picked up by the *next* tick's normal per-item loop, not this
+    /// one.
+    pub discovered: usize,
 }
 
 /// Why `self_repair_or_gate` did or didn't dispatch. A plain `bool` can't
@@ -461,9 +474,16 @@ enum SelfRepairOutcome {
 /// Everything one project contributes to a review sweep: its own
 /// `in_review` items, label lookup, and the folder its worktrees live
 /// under (from the `project_dirs` registry, not this process's cwd) --
-/// same shape `ProjectBatch` gives `run_discovery_tick`.
+/// same shape `ProjectBatch` gives `run_discovery_tick`. `project_id`,
+/// `in_review_state_id`, and `known_pr_numbers` exist only to let
+/// `discover_untracked_prs` create a correctly-scoped item directly (item
+/// creation needs an explicit project, unlike every other mutation here,
+/// which is addressed by an existing item's own id).
 struct ReviewBatch {
     folder_path: String,
+    project_id: String,
+    in_review_state_id: String,
+    known_pr_numbers: std::collections::HashSet<u64>,
     items: Vec<agentflare_backend::item::Item>,
     label_id_by_name: std::collections::HashMap<String, String>,
 }
@@ -490,7 +510,14 @@ pub(crate) fn run_review_sweep(
         self_repaired: 0,
         skipped: 0,
         waiting: 0,
+        updated: 0,
+        discovered: 0,
     };
+    // Computed once, not per-project/per-PR: identifies this workstation to
+    // `claim_pr_for_discovery`'s marker comment so two workstations racing to
+    // discover the same PR can tell each other apart. Same persisted id
+    // `github::bridge` itself uses.
+    let discovery_owner = crate::github::bridge::config::stable_instance_id();
 
     let fetched = mcp.with_backend_db(|conn| {
         let dirs = agentflare_backend::project_dir::list(conn).ok()?;
@@ -500,6 +527,20 @@ pub(crate) fn run_review_sweep(
             let states = agentflare_backend::state::list_by_project(conn, &dir.project_id).ok()?;
             let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
                 states.iter().map(|s| (s.id.as_str(), s)).collect();
+            // Every item, not just in_review ones -- an item could already be
+            // tracking a PR from `started` (agent still working) or any other
+            // state, and `discover_untracked_prs` must never create a second
+            // item for a PR one of those already owns.
+            let known_pr_numbers = crate::worktree::tracked_pr_numbers(&items);
+            let Some(in_review_state_id) = states
+                .iter()
+                .find(|s| s.group_name == "in_review")
+                .map(|s| s.id.clone())
+            else {
+                // No in_review state group in this project at all -- nothing
+                // for this sweep to do here regardless of discovery.
+                continue;
+            };
             let in_review: Vec<_> = items
                 .into_iter()
                 .filter(|i| {
@@ -515,6 +556,9 @@ pub(crate) fn run_review_sweep(
             }
             batches.push(ReviewBatch {
                 folder_path: dir.folder_path,
+                project_id: dir.project_id,
+                in_review_state_id,
+                known_pr_numbers,
                 items: in_review,
                 label_id_by_name,
             });
@@ -528,10 +572,32 @@ pub(crate) fn run_review_sweep(
     for batch in batches {
         let ReviewBatch {
             folder_path,
+            project_id,
+            in_review_state_id,
+            known_pr_numbers,
             items,
             label_id_by_name,
         } = batch;
         let repo_root = std::path::PathBuf::from(&folder_path);
+        if let (Some(repo), Ok(client)) = (
+            crate::github::RepoId::resolve_from_remote(&repo_root),
+            crate::github::Client::new(),
+        ) {
+            let discovered = mcp
+                .with_backend_db(|conn| {
+                    crate::worktree::discover_untracked_prs(
+                        conn,
+                        &client,
+                        &repo,
+                        &project_id,
+                        &in_review_state_id,
+                        &known_pr_numbers,
+                        &discovery_owner,
+                    )
+                })
+                .unwrap_or(0);
+            result.discovered += discovered;
+        }
         for item in &items {
             match crate::worktree::pr_ci_status(item, &repo_root) {
                 crate::worktree::PrCiStatus::Merged => {
@@ -560,6 +626,13 @@ pub(crate) fn run_review_sweep(
                 crate::worktree::PrCiStatus::Passing { number, labels } => {
                     if merge_if_approved(mcp, item, &repo_root, number, &labels) {
                         result.promoted += 1;
+                    } else {
+                        result.skipped += 1;
+                    }
+                }
+                crate::worktree::PrCiStatus::Behind { number } => {
+                    if crate::worktree::update_stale_branch(&repo_root, number) {
+                        result.updated += 1;
                     } else {
                         result.skipped += 1;
                     }

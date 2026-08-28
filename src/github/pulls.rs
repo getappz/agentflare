@@ -145,6 +145,23 @@ pub fn merge(client: &Client, repo: &RepoId, number: u64, method: &str) -> Resul
     Ok(())
 }
 
+/// Same server-side operation as the PR page's own "Update branch" button --
+/// GitHub creates the merge commit bringing the base branch in, entirely on
+/// its side, so this touches no local worktree/git state at all and can't
+/// race a concurrently-dispatched job still pushing to the same branch the
+/// way a local `git merge` would. Only ever called when the PR's
+/// `mergeable_state` is already GitHub's own "behind" (mergeable, no
+/// conflict) -- `worktree::run_review_sweep`'s job, not this function's, to
+/// check that first.
+pub fn update_branch(client: &Client, repo: &RepoId, number: u64) -> Result<(), GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/pulls/{number}/update-branch",
+        repo.owner, repo.repo
+    );
+    client.request("PUT", &path, None)?;
+    Ok(())
+}
+
 pub fn comment(client: &Client, repo: &RepoId, number: u64, body: &str) -> Result<(), GitHubError> {
     let path = format!(
         "/repos/{}/{}/issues/{number}/comments",
@@ -448,6 +465,16 @@ mod tests {
         assert_eq!(reqs[0].path, "/repos/o/r/pulls/3/merge");
         let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
         assert_eq!(sent["merge_method"], "squash");
+    }
+
+    #[test]
+    fn update_branch_puts_to_the_update_branch_endpoint() {
+        let server = MockServer::start(vec![MockResponse::json(202, r#"{"message":"Updating"}"#)]);
+        let client = server.client(Some("tok"));
+        update_branch(&client, &repo(), 7).unwrap();
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "PUT");
+        assert_eq!(reqs[0].path, "/repos/o/r/pulls/7/update-branch");
     }
 
     #[test]

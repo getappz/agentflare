@@ -41,11 +41,28 @@ impl AgentflareMcp {
         let staleness_days = req.staleness_days.unwrap_or(14).max(0) as u64;
         let item_states = self.item_state_groups_for_doctor();
         let report = flare_git_core::doctor::scan(&repo_root, staleness_days, &item_states);
-        let reclaimed = if req.reclaim.unwrap_or(false) {
+        let reclaim = req.reclaim.unwrap_or(false);
+        let force = req.force.unwrap_or(false);
+        // Safety guard for the 2026-08-16 incident: an unscoped force-reclaim
+        // (`force=true` with no `worktree`) does not just allow the intended
+        // lane to be force-deleted -- it force-deletes EVERY dirty lane in the
+        // report, including other agents' active worktrees with uncommitted
+        // changes. Refuse that combination unless the caller explicitly opts
+        // in to repo-wide intent via `repo_wide=true`.
+        if reclaim && force && req.worktree.is_none() && !req.repo_wide.unwrap_or(false) {
+            return Err(ErrorData::invalid_params(
+                "doctor: `reclaim=true` + `force=true` with no `worktree` is a repo-wide \
+                 sweep that force-deletes EVERY dirty lane, including other agents' \
+                 uncommitted work. Pass `worktree` to fix one broken worktree, or \
+                 `repo_wide=true` to explicitly confirm a repo-wide force-reclaim.",
+                None,
+            ));
+        }
+        let reclaimed = if reclaim {
             flare_git_core::doctor::reclaim_scoped(
                 &repo_root,
                 &report,
-                req.force.unwrap_or(false),
+                force,
                 req.worktree.as_deref(),
             )
         } else {

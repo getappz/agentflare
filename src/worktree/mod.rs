@@ -82,6 +82,23 @@ pub fn squash_since(worktree_path: &Path, base_sha: &str) -> Result<(), String> 
     flare_git_core::worktree::squash_since(worktree_path, base_sha)
 }
 
+/// The stored `metadata.pr.number` a prior `push_and_open_pr` call left on
+/// the item -- the authoritative PR identity once set, since it was read
+/// straight off GitHub's response at PR-creation time instead of
+/// reconstructed from the branch name afterward. `None` for items that
+/// predate this field (opened before this fix, or never pushed through
+/// `push_and_open_pr`).
+pub(crate) fn pr_number_from_metadata(item: &agentflare_backend::item::Item) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(&item.metadata)
+        .ok()?
+        .get("pr")?
+        .get("number")?
+        .as_u64()
+}
+
+mod discovery;
+pub(crate) use discovery::{discover_untracked_prs, tracked_pr_numbers};
+
 /// Checks whether `item`'s branch already has a merged PR — the promotion
 /// signal `check_merge` uses to move an item out of "in_review" (item
 /// #420). Soft-fails like `push_and_open_pr`: no GitHub credentials, no
@@ -89,13 +106,20 @@ pub fn squash_since(worktree_path: &Path, base_sha: &str) -> Result<(), String> 
 /// rather than erroring, since the caller's fallback is simply to check
 /// again later.
 ///
-/// `find_existing` matches on branch name alone, and branch names get
-/// reused across items over time, so a match is only trusted as this
-/// item's own PR when `marks_item` confirms it -- otherwise an unrelated,
-/// already-merged PR from a past item would fool `check_merge` into
-/// promoting this item off someone else's merge (item #63).
+/// Prefers `metadata.pr.number` (set by `push_and_open_pr` the moment the
+/// PR was actually created or found) when present, since a direct
+/// `pulls::get` by number needs no branch reconstruction at all. Only items
+/// that predate this field fall back to the old heuristic: `find_existing`
+/// matches on branch name alone, and branch names get reused across items
+/// over time, so a match is only trusted as this item's own PR when
+/// `marks_item` confirms it -- otherwise an unrelated, already-merged PR
+/// from a past item would fool `check_merge` into promoting this item off
+/// someone else's merge (item #63). That branch reconstruction can also
+/// simply be wrong: `resolve_item_task_branch` rebuilds it from whatever's
+/// checked out on disk (or a freshly recomputed slug once the worktree is
+/// gone), which can drift from the branch the PR was actually opened
+/// against (item #191).
 pub fn is_pr_merged(item: &agentflare_backend::item::Item, repo_root: &Path) -> bool {
-    let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
     let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
         return false;
     };
@@ -103,7 +127,29 @@ pub fn is_pr_merged(item: &agentflare_backend::item::Item, repo_root: &Path) -> 
         Ok(c) => c,
         Err(_) => return false,
     };
-    match crate::github::pulls::find_existing(&client, &repo, &branch) {
+    is_pr_merged_impl(item, repo_root, &client, &repo)
+}
+
+fn is_pr_merged_impl(
+    item: &agentflare_backend::item::Item,
+    repo_root: &Path,
+    client: &crate::github::Client,
+    repo: &RepoId,
+) -> bool {
+    if let Some(number) = pr_number_from_metadata(item) {
+        return match crate::github::pulls::get(client, repo, number) {
+            Ok(pr) => pr.merged_at.is_some(),
+            Err(e) => {
+                eprintln!(
+                    "worktree: could not check merge status for item {}: {e}",
+                    item.id
+                );
+                false
+            }
+        };
+    }
+    let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
+    match crate::github::pulls::find_existing(client, repo, &branch) {
         Ok(Some(pr)) => {
             pr.merged_at.is_some()
                 && crate::github::pulls::marks_item(pr.body.as_deref(), item.sequence_id)
@@ -175,11 +221,12 @@ pub fn relabel_pr_completed(item: &agentflare_backend::item::Item, repo_root: &P
 
 /// CI signal the in-review sweep (`supervisor::run_review_sweep`, item #65)
 /// polls per item: merged (promote), failing (self-repair), CI-green with a
-/// human approval label attached (auto-merge, item #194), or nothing
-/// actionable yet. `Unknown` covers every soft-fail case `is_pr_merged`
-/// above also treats as "not merged yet" -- no credentials, no resolvable
-/// remote, no PR found, or a lookup error -- since the caller's fallback is
-/// simply to poll again next tick.
+/// human approval label attached (auto-merge, item #194), cleanly behind the
+/// base branch with no conflict (update-branch, item #197's follow-up), or
+/// nothing actionable yet. `Unknown` covers every soft-fail case
+/// `is_pr_merged` above also treats as "not merged yet" -- no credentials,
+/// no resolvable remote, no PR found, or a lookup error -- since the
+/// caller's fallback is simply to poll again next tick.
 pub enum PrCiStatus {
     Merged,
     Failing(Vec<String>),
@@ -191,6 +238,15 @@ pub enum PrCiStatus {
         number: u64,
         labels: Vec<String>,
     },
+    /// GitHub's own `mergeable_state == "behind"` -- mergeable, no conflict,
+    /// just missing commits the base branch has gained since this PR was
+    /// opened/last updated. Checked before CI status is even fetched: a
+    /// stale-but-behind PR's existing check runs are stale too, and re-fetching
+    /// them here would be wasted work the branch update is about to
+    /// invalidate anyway.
+    Behind {
+        number: u64,
+    },
     Unknown,
 }
 
@@ -198,12 +254,13 @@ pub enum PrCiStatus {
 /// applied once instead of in a loop -- the sweep itself provides the retry
 /// cadence across ticks.
 ///
-/// Same branch-reuse hazard as `is_pr_merged`: a `find_existing` match is
-/// only trusted once `marks_item` confirms it's this item's own PR, so an
-/// unrelated PR sharing the branch name can't report its CI status as this
-/// item's (item #63).
+/// Same metadata-first / branch-heuristic-fallback contract as
+/// `is_pr_merged`: `metadata.pr.number` (when present) is fetched directly
+/// via `pulls::get`; otherwise a `find_existing` match is only trusted once
+/// `marks_item` confirms it's this item's own PR, so an unrelated PR
+/// sharing the branch name can't report its CI status as this item's (item
+/// #63).
 pub fn pr_ci_status(item: &agentflare_backend::item::Item, repo_root: &Path) -> PrCiStatus {
-    let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
     let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
         return PrCiStatus::Unknown;
     };
@@ -211,26 +268,55 @@ pub fn pr_ci_status(item: &agentflare_backend::item::Item, repo_root: &Path) -> 
         Ok(c) => c,
         Err(_) => return PrCiStatus::Unknown,
     };
-    let pr = match crate::github::pulls::find_existing(&client, &repo, &branch) {
-        Ok(Some(pr)) if crate::github::pulls::marks_item(pr.body.as_deref(), item.sequence_id) => {
-            pr
-        }
-        Ok(Some(_)) | Ok(None) => return PrCiStatus::Unknown,
-        Err(e) => {
-            eprintln!(
-                "worktree: could not check PR status for item {}: {e}",
-                item.id
-            );
-            return PrCiStatus::Unknown;
+    pr_ci_status_impl(item, repo_root, &client, &repo)
+}
+
+fn pr_ci_status_impl(
+    item: &agentflare_backend::item::Item,
+    repo_root: &Path,
+    client: &crate::github::Client,
+    repo: &RepoId,
+) -> PrCiStatus {
+    let pr = match pr_number_from_metadata(item) {
+        Some(number) => match crate::github::pulls::get(client, repo, number) {
+            Ok(pr) => pr,
+            Err(e) => {
+                eprintln!(
+                    "worktree: could not check PR status for item {}: {e}",
+                    item.id
+                );
+                return PrCiStatus::Unknown;
+            }
+        },
+        None => {
+            let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
+            match crate::github::pulls::find_existing(client, repo, &branch) {
+                Ok(Some(pr))
+                    if crate::github::pulls::marks_item(pr.body.as_deref(), item.sequence_id) =>
+                {
+                    pr
+                }
+                Ok(Some(_)) | Ok(None) => return PrCiStatus::Unknown,
+                Err(e) => {
+                    eprintln!(
+                        "worktree: could not check PR status for item {}: {e}",
+                        item.id
+                    );
+                    return PrCiStatus::Unknown;
+                }
+            }
         }
     };
     if pr.merged_at.is_some() {
         return PrCiStatus::Merged;
     }
+    if pr.mergeable == Some(true) && pr.mergeable_state.as_deref() == Some("behind") {
+        return PrCiStatus::Behind { number: pr.number };
+    }
     let Some(sha) = pr.head.as_ref().map(|h| h.sha.clone()) else {
         return PrCiStatus::Unknown;
     };
-    let checks = match crate::github::actions::list_check_runs(&client, &repo, &sha) {
+    let checks = match crate::github::actions::list_check_runs(client, repo, &sha) {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
@@ -260,6 +346,30 @@ pub fn pr_ci_status(item: &agentflare_backend::item::Item, repo_root: &Path) -> 
         }
     } else {
         PrCiStatus::Failing(failed)
+    }
+}
+
+/// Brings a cleanly-behind PR's branch up to date with the base branch via
+/// GitHub's own server-side "Update branch" operation -- only ever called
+/// from `run_review_sweep`'s `Behind` arm, so `mergeable_state == "behind"`
+/// is structurally already confirmed by the time this runs. Logs and
+/// returns `false` on failure (a concurrent push moving the branch head, a
+/// transient API error) rather than retrying in-line -- same "let the next
+/// sweep tick see the real current state and decide again" shape
+/// `merge_approved_pr` already uses for its own GitHub call.
+pub fn update_stale_branch(repo_root: &Path, number: u64) -> bool {
+    let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
+        return false;
+    };
+    let Ok(client) = crate::github::Client::new() else {
+        return false;
+    };
+    match crate::github::pulls::update_branch(&client, &repo, number) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("worktree: update-branch failed for PR #{number} in {repo}: {e}");
+            false
+        }
     }
 }
 
@@ -362,6 +472,57 @@ fn conventional_pr_title(name: &str) -> String {
     format!("{inferred}: {trimmed}")
 }
 
+/// Merges `{"pr": {"number": N, "branch": "..."}}` into `item`'s existing
+/// metadata (without clobbering unrelated keys like `size`/`workflow_run_id`)
+/// and persists it -- the identity `is_pr_merged`/`pr_ci_status` read back
+/// directly instead of reconstructing the branch name to rediscover the
+/// same PR (item #191: that reconstruction drifted from the PR's real
+/// branch, and `check_merge` reported "not merged yet" for a PR that had
+/// actually merged). Coerces non-object metadata to an empty object first,
+/// same defensive stance as `work_item_pipeline::persist_run_id` -- `Value`
+/// indexing panics assigning into anything that isn't already `Object`.
+fn merge_and_persist_pr_identity(
+    conn: &rusqlite::Connection,
+    item: &agentflare_backend::item::Item,
+    number: u64,
+    branch: &str,
+) {
+    let mut merged = serde_json::from_str::<serde_json::Value>(&item.metadata)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .map(serde_json::Value::Object)
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    merged["pr"] = serde_json::json!({ "number": number, "branch": branch });
+    if let Err(e) = agentflare_backend::item::update(
+        conn,
+        &item.id,
+        agentflare_backend::item::UpdateItem {
+            metadata: Some(merged.to_string()),
+            ..Default::default()
+        },
+    ) {
+        eprintln!(
+            "worktree: could not persist PR identity for item {}: {e}",
+            item.id
+        );
+    }
+}
+
+/// Best-effort wrapper around `merge_and_persist_pr_identity` for
+/// production callers, which have no database connection of their own to
+/// hand in: opens the shared backend db directly, same as `cli::review`'s
+/// performance-review path. A failure to even open the db must not stop
+/// `push_and_open_pr` from returning the PR it already found/created.
+fn persist_pr_identity(item: &agentflare_backend::item::Item, number: u64, branch: &str) {
+    match agentflare_backend::db::open_db(&crate::vent::paths::backend_db_path()) {
+        Ok(conn) => merge_and_persist_pr_identity(&conn, item, number, branch),
+        Err(e) => eprintln!(
+            "worktree: could not open backend db to persist PR identity for item {}: {e}",
+            item.id
+        ),
+    }
+}
+
 /// Pushes `item`'s isolated worktree branch and opens a PR against
 /// `target_branch` — the `done`-side counterpart to `create_worktree`.
 /// Deliberately never merges: unreviewed code should never land on the
@@ -437,6 +598,7 @@ pub fn push_and_open_pr(
             if existing.state == "open"
                 || crate::github::pulls::marks_item(existing.body.as_deref(), item.sequence_id) =>
         {
+            persist_pr_identity(item, existing.number, &branch);
             if let Some(p) = progress {
                 p.send(1.0, Some(1.0), Some("PR already exists".into()));
             }
@@ -465,6 +627,7 @@ pub fn push_and_open_pr(
         Some(&body),
     ) {
         Ok(pr) => {
+            persist_pr_identity(item, pr.number, &branch);
             if let Err(e) = crate::github::issues::add_labels(
                 &client,
                 &repo,
@@ -658,5 +821,222 @@ mod tests {
         // No git repo at `dir.path()`, so `RepoId::resolve_from_remote`
         // returns `None` -- must return without panicking.
         relabel_pr_completed(&item, dir.path());
+    }
+
+    fn item_with_metadata(sequence_id: i64, metadata: &str) -> agentflare_backend::item::Item {
+        agentflare_backend::item::Item {
+            id: format!("item-{sequence_id}"),
+            project_id: "p".into(),
+            state_id: "s".into(),
+            name: "n".into(),
+            description: String::new(),
+            priority: "none".into(),
+            parent_id: None,
+            assignee_agent: None,
+            sequence_id,
+            sort_order: 0.0,
+            started_at: None,
+            completed_at: None,
+            archived_at: None,
+            external_source: None,
+            external_id: None,
+            metadata: metadata.into(),
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn pr_number_from_metadata_reads_the_stored_pr_number() {
+        let item = item_with_metadata(191, r#"{"pr":{"number":619,"branch":"b"}}"#);
+        assert_eq!(pr_number_from_metadata(&item), Some(619));
+    }
+
+    #[test]
+    fn pr_number_from_metadata_is_none_when_absent() {
+        let item = item_with_metadata(191, r#"{"size":"S"}"#);
+        assert_eq!(pr_number_from_metadata(&item), None);
+    }
+
+    #[test]
+    fn pr_number_from_metadata_is_none_for_non_object_metadata() {
+        let item = item_with_metadata(191, "not json");
+        assert_eq!(pr_number_from_metadata(&item), None);
+    }
+
+    // Item #191: `check_merge` reported "PR not merged yet" for a PR that
+    // was demonstrably merged, because `resolve_item_task_branch`
+    // reconstructed a branch name that no longer matched what the PR was
+    // actually opened against. With `metadata.pr.number` set, `is_pr_merged`
+    // must go straight to `pulls::get` by number and never touch branch
+    // reconstruction at all.
+    #[test]
+    fn is_pr_merged_uses_metadata_pr_number_even_when_branch_name_would_not_resolve() {
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"{"number":619,"html_url":"u","state":"closed","title":"t","merged_at":"2026-08-20T00:00:00Z"}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        let item = item_with_metadata(
+            191,
+            r#"{"pr":{"number":619,"branch":"task/191-opencode-agentflare-work-dispatch-doesn"}}"#,
+        );
+
+        assert!(is_pr_merged_impl(
+            &item,
+            Path::new("/does/not/exist"),
+            &client,
+            &repo
+        ));
+
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "/repos/o/r/pulls/619");
+    }
+
+    #[test]
+    fn is_pr_merged_falls_back_to_branch_heuristic_when_metadata_pr_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = item_with_metadata(63, "{}");
+        let branch = flare_git_core::worktree::resolve_item_task_branch(&item, dir.path());
+        let body = format!(
+            "---\\n_Opened by `claude-code` on **box** for item #{} via agentflare._",
+            item.sequence_id
+        );
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                &format!(
+                    r#"[{{"number":5,"html_url":"u","state":"closed","title":"t","merged_at":"2026-08-20T00:00:00Z","head":{{"ref":"{branch}","sha":"abc"}},"body":"{body}"}}]"#
+                ),
+            ),
+        ]);
+        let client = server.client(None);
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        assert!(is_pr_merged_impl(&item, dir.path(), &client, &repo));
+
+        let reqs = server.requests();
+        assert_eq!(
+            reqs[0].path,
+            "/repos/o/r/pulls?state=all&per_page=100&page=1"
+        );
+    }
+
+    #[test]
+    fn pr_ci_status_uses_metadata_pr_number_to_report_merged() {
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"{"number":619,"html_url":"u","state":"closed","title":"t","merged_at":"2026-08-20T00:00:00Z"}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        let item = item_with_metadata(191, r#"{"pr":{"number":619,"branch":"whatever"}}"#);
+
+        let status = pr_ci_status_impl(&item, Path::new("/does/not/exist"), &client, &repo);
+
+        assert!(matches!(status, PrCiStatus::Merged));
+        assert_eq!(server.requests()[0].path, "/repos/o/r/pulls/619");
+    }
+
+    #[test]
+    fn pr_ci_status_reports_behind_before_ever_fetching_check_runs() {
+        // GitHub's own mergeable_state == "behind": mergeable, no conflict,
+        // just missing commits the base branch gained since. Only one
+        // request should fire -- the PR fetch itself -- confirming this is
+        // checked before `list_check_runs` would otherwise be called (item
+        // #197's follow-up: no point fetching CI status for checks the
+        // branch update is about to invalidate anyway).
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"{"number":621,"html_url":"u","state":"open","title":"t","mergeable":true,"mergeable_state":"behind"}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        let item = item_with_metadata(195, r#"{"pr":{"number":621,"branch":"whatever"}}"#);
+
+        let status = pr_ci_status_impl(&item, Path::new("/does/not/exist"), &client, &repo);
+
+        assert!(matches!(status, PrCiStatus::Behind { number: 621 }));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn merge_and_persist_pr_identity_merges_without_clobbering_existing_metadata_keys() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let ws = agentflare_backend::workspace::create(
+            &conn,
+            agentflare_backend::workspace::CreateWorkspace {
+                name: "Test".into(),
+                slug: "test".into(),
+                owner_agent: None,
+                item_label: None,
+            },
+        )
+        .unwrap();
+        let proj = agentflare_backend::project::create(
+            &conn,
+            agentflare_backend::project::CreateProject {
+                workspace_id: ws.id.clone(),
+                name: "Test".into(),
+                identifier: "T".into(),
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+        let state = agentflare_backend::state::list_by_project(&conn, &proj.id)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.is_default)
+            .unwrap();
+        let item = agentflare_backend::item::create(
+            &conn,
+            agentflare_backend::item::CreateItem {
+                project_id: proj.id,
+                state_id: state.id,
+                name: "Test Item".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: Some(r#"{"size":"S"}"#.into()),
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        merge_and_persist_pr_identity(&conn, &item, 619, "task/191-slug");
+
+        let updated = agentflare_backend::item::get(&conn, &item.id).unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
+        assert_eq!(metadata["size"], "S");
+        assert_eq!(metadata["pr"]["number"], 619);
+        assert_eq!(metadata["pr"]["branch"], "task/191-slug");
     }
 }
