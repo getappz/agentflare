@@ -293,6 +293,9 @@ fn skip_item(
             ..Default::default()
         });
     }
+    if first_time_gated(&item.id) {
+        notify_human_gate(item, &reason);
+    }
 }
 
 fn ask_item(
@@ -618,6 +621,15 @@ pub(crate) fn run_review_sweep(
                     }
                 }
                 crate::worktree::PrCiStatus::Passing { number, labels } => {
+                    if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) && first_time_gated(&item.id)
+                    {
+                        notify_human_gate(
+                            item,
+                            &format!(
+                                "PR #{number} is CI-green and mergeable, awaiting `{PR_APPROVAL_LABEL}`"
+                            ),
+                        );
+                    }
                     if merge_if_approved(mcp, item, &repo_root, number, &labels) {
                         result.promoted += 1;
                     } else {
@@ -815,7 +827,7 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
 /// configured, since notifications are opt-in and a bare install shouldn't
 /// spam stderr every tick; a configured-but-failing send only logs -- a
 /// notification failure must never block the gate itself.
-fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &str) {
+pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &str) {
     let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
         return;
     };
@@ -840,7 +852,7 @@ fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &str) {
 /// this keeps `notify_human_gate` firing once per gate instead of once per
 /// tick. In-memory and per-process by design: a daemon restart re-notifies
 /// once, which is preferable to a persistent marker for a one-line ping.
-fn first_time_gated(item_id: &str) -> bool {
+pub(crate) fn first_time_gated(item_id: &str) -> bool {
     static NOTIFIED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     NOTIFIED
