@@ -105,6 +105,12 @@ pub struct WatchArgs {
     pub interval_secs: u64,
 }
 
+#[derive(Parser, Debug)]
+pub struct DoctorArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
 impl InsightsArgs {
     pub fn run(self) {
         let db_path = self.db.unwrap_or_else(|| {
@@ -127,6 +133,7 @@ impl InsightsArgs {
             InsightsCommands::Handoff(args) => run_handoff(db_path, args),
             InsightsCommands::Serve(args) => run_serve(db_path, args),
             InsightsCommands::Watch(args) => run_watch(db_path, args),
+            InsightsCommands::Doctor(args) => run_doctor(db_path, args),
         }
     }
 }
@@ -203,10 +210,10 @@ fn run_list(db: PathBuf, args: ListArgs) {
         println!("{}", serde_json::to_string_pretty(&sessions).unwrap());
     } else {
         for s in sessions {
-            if let Some(filter) = &args.source {
-                if s.source.as_str() != filter {
-                    continue;
-                }
+            if let Some(filter) = &args.source
+                && s.source.as_str() != filter
+            {
+                continue;
             }
             let cost = s
                 .cost
@@ -439,7 +446,7 @@ fn run_watch(db: PathBuf, args: WatchArgs) {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(args.interval_secs));
         let store = open_store(db.clone());
-        let (s, t, tools) = InsightsWatcher::rescan_and_store(&config, &store);
+        let (s, t, _tools) = InsightsWatcher::rescan_and_store(&config, &store);
         if s > 0 {
             println!("tick: {s} sessions {t} turns");
         }
@@ -461,4 +468,42 @@ fn run_serve(db: PathBuf, args: ServeArgs) {
             std::process::exit(1);
         }
     });
+}
+
+fn run_doctor(db: PathBuf, args: DoctorArgs) {
+    let config = flare_insights::config::InsightsConfig::default();
+    let db_ok = flare_insights::store::InsightsStore::open(&db).is_ok();
+    let mut sources: Vec<(String, bool)> = config
+        .sources
+        .iter()
+        .map(|(name, path)| (name.clone(), path.exists()))
+        .collect();
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "db_path": db.display().to_string(),
+                "db_ok": db_ok,
+                "sources": sources.iter().map(|(name, present)| serde_json::json!({
+                    "name": name,
+                    "present": present,
+                })).collect::<Vec<_>>(),
+            }))
+            .unwrap()
+        );
+    } else {
+        println!(
+            "db: {} ({})",
+            db.display(),
+            if db_ok { "ok" } else { "failed to open" }
+        );
+        for (name, present) in &sources {
+            println!(
+                "source {name}: {}",
+                if *present { "found" } else { "missing" }
+            );
+        }
+    }
 }
