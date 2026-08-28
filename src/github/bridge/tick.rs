@@ -264,19 +264,13 @@ fn items_tracked(conn: &rusqlite::Connection, ctx: &Ctx) -> Vec<agentflare_backe
         .collect()
 }
 
-/// Whether GitHub's own `author_association` for an issue is trusted enough
-/// to let its raw title/body become a work item's description -- that
-/// description later becomes an autonomous agent's literal prompt (see
-/// `build_prompt` in `cli/work.rs`), run with a permission-bypass flag. The
-/// bar matches gh-aw's (github/gh-aw) own `min-integrity: approved` default
-/// for public repos: repo owners, members, and collaborators only. Anyone
-/// else who can get an issue opened -- which on a public repo is anyone at
-/// all -- must not be able to get its content executed as instructions.
+/// Whether an issue's `author_association` is trusted enough to let its raw
+/// title/body become a work item's description -- that description later
+/// becomes an autonomous agent's literal prompt (see `build_prompt` in
+/// `cli/work.rs`), run with a permission-bypass flag. See
+/// `github::is_trusted_author_association` for the trust bar itself.
 fn is_trusted_author(issue: &Issue) -> bool {
-    matches!(
-        issue.author_association.as_str(),
-        "OWNER" | "MEMBER" | "COLLABORATOR"
-    )
+    crate::github::is_trusted_author_association(&issue.author_association)
 }
 
 /// Optimistic two-step claim: post our marker, then re-read and check we are
