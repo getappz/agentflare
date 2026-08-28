@@ -96,6 +96,85 @@ pub(crate) fn pr_number_from_metadata(item: &agentflare_backend::item::Item) -> 
         .as_u64()
 }
 
+/// The set of PR numbers already tracked by *any* item in a project (not
+/// just `in_review` ones) via `metadata.pr.number` -- `run_review_sweep`
+/// diffs this against a repo's open PRs to find ones `discover_untracked_prs`
+/// still needs to create an item for.
+pub(crate) fn tracked_pr_numbers(
+    items: &[agentflare_backend::item::Item],
+) -> std::collections::HashSet<u64> {
+    items.iter().filter_map(pr_number_from_metadata).collect()
+}
+
+/// Creates an `in_review` item for every open, non-draft PR in `repo` not
+/// already in `known_pr_numbers` -- PRs opened outside the `item done` flow
+/// (by hand, or by an agent working ad hoc) would otherwise sit invisible to
+/// `run_review_sweep` forever, even once a human adds the approval label,
+/// since the sweep only ever iterates items it already knows about. Gated on
+/// `github::is_trusted_author_association` the same way issue intake is
+/// (`github::bridge::tick::is_trusted_author`): only the repo's own
+/// owner/member/collaborator PRs get auto-tracked -- an external
+/// contributor's PR must go through a human before it enters this pipeline
+/// at all. The synthesized item's `metadata.pr` shape matches
+/// `merge_and_persist_pr_identity` exactly, so every downstream sweep step
+/// (CI check, self-repair, branch update, merge) treats it identically to a
+/// normal item. Returns the number of items created; soft-fails to 0 on any
+/// GitHub error, same as this file's other PR-lookup functions.
+pub(crate) fn discover_untracked_prs(
+    conn: &rusqlite::Connection,
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    project_id: &str,
+    in_review_state_id: &str,
+    known_pr_numbers: &std::collections::HashSet<u64>,
+) -> usize {
+    let prs = match crate::github::pulls::list(client, repo, "open") {
+        Ok(prs) => prs,
+        Err(e) => {
+            eprintln!("worktree: could not list open PRs for {repo}: {e}");
+            return 0;
+        }
+    };
+    let mut created = 0;
+    for pr in prs {
+        if pr.draft
+            || known_pr_numbers.contains(&pr.number)
+            || !crate::github::is_trusted_author_association(&pr.author_association)
+        {
+            continue;
+        }
+        let Some(branch) = pr.head.as_ref().map(|h| h.git_ref.clone()) else {
+            continue;
+        };
+        let description = pr
+            .body
+            .clone()
+            .unwrap_or_else(|| format!("Auto-tracked PR: {}", pr.html_url));
+        let metadata = serde_json::json!({"pr": {"number": pr.number, "branch": branch}});
+        let input = agentflare_backend::item::CreateItem {
+            project_id: project_id.to_string(),
+            state_id: in_review_state_id.to_string(),
+            name: pr.title,
+            description: Some(description),
+            priority: None,
+            parent_id: None,
+            assignee_agent: None,
+            sort_order: None,
+            external_source: None,
+            external_id: None,
+            metadata: Some(metadata.to_string()),
+            label_ids: vec![],
+            assignee_ids: vec![],
+            dependency_ids: vec![],
+        };
+        match agentflare_backend::item::create(conn, input) {
+            Ok(_) => created += 1,
+            Err(e) => eprintln!("worktree: could not create item for PR #{}: {e}", pr.number),
+        }
+    }
+    created
+}
+
 /// Checks whether `item`'s branch already has a merged PR — the promotion
 /// signal `check_merge` uses to move an item out of "in_review" (item
 /// #420). Soft-fails like `push_and_open_pr`: no GitHub credentials, no
@@ -1035,5 +1114,182 @@ mod tests {
         assert_eq!(metadata["size"], "S");
         assert_eq!(metadata["pr"]["number"], 619);
         assert_eq!(metadata["pr"]["branch"], "task/191-slug");
+    }
+
+    fn test_project_with_in_review_state(conn: &rusqlite::Connection) -> (String, String) {
+        let ws = agentflare_backend::workspace::create(
+            conn,
+            agentflare_backend::workspace::CreateWorkspace {
+                name: "Test".into(),
+                slug: "test".into(),
+                owner_agent: None,
+                item_label: None,
+            },
+        )
+        .unwrap();
+        let proj = agentflare_backend::project::create(
+            conn,
+            agentflare_backend::project::CreateProject {
+                workspace_id: ws.id.clone(),
+                name: "Test".into(),
+                identifier: "T".into(),
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+        let in_review = agentflare_backend::state::list_by_project(conn, &proj.id)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.group_name == "in_review")
+            .unwrap();
+        (proj.id, in_review.id)
+    }
+
+    #[test]
+    fn tracked_pr_numbers_collects_from_items_with_pr_metadata() {
+        let items = vec![
+            item_with_metadata(1, r#"{"pr":{"number":10,"branch":"a"}}"#),
+            item_with_metadata(2, r#"{"pr":{"number":20,"branch":"b"}}"#),
+            item_with_metadata(3, "{}"),
+        ];
+
+        let tracked = tracked_pr_numbers(&items);
+
+        assert_eq!(tracked, [10, 20].into_iter().collect());
+    }
+
+    #[test]
+    fn discover_untracked_prs_creates_an_item_for_an_untracked_open_pr() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"[{"number":42,"html_url":"u","state":"open","title":"Fix thing","body":"does the fix","head":{"ref":"fix/thing","sha":"abc"},"author_association":"OWNER"}]"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        let known = std::collections::HashSet::new();
+
+        let created = discover_untracked_prs(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &known,
+        );
+
+        assert_eq!(created, 1);
+        let items = agentflare_backend::item::list_by_project(&conn, &project_id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Fix thing");
+        assert_eq!(items[0].state_id, in_review_state_id);
+        assert_eq!(items[0].description, "does the fix");
+        let metadata: serde_json::Value = serde_json::from_str(&items[0].metadata).unwrap();
+        assert_eq!(metadata["pr"]["number"], 42);
+        assert_eq!(metadata["pr"]["branch"], "fix/thing");
+    }
+
+    #[test]
+    fn discover_untracked_prs_skips_a_pr_already_tracked_by_an_item() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"[{"number":42,"html_url":"u","state":"open","title":"Fix thing","head":{"ref":"fix/thing","sha":"abc"},"author_association":"OWNER"}]"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        let known: std::collections::HashSet<u64> = [42].into_iter().collect();
+
+        let created = discover_untracked_prs(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &known,
+        );
+
+        assert_eq!(created, 0);
+        assert!(
+            agentflare_backend::item::list_by_project(&conn, &project_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn discover_untracked_prs_skips_a_pr_from_an_untrusted_author() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"[{"number":42,"html_url":"u","state":"open","title":"Fix thing","head":{"ref":"fix/thing","sha":"abc"},"author_association":"CONTRIBUTOR"}]"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        let known = std::collections::HashSet::new();
+
+        let created = discover_untracked_prs(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &known,
+        );
+
+        assert_eq!(created, 0);
+        assert!(
+            agentflare_backend::item::list_by_project(&conn, &project_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn discover_untracked_prs_skips_draft_prs() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"[{"number":42,"html_url":"u","state":"open","title":"WIP","draft":true,"head":{"ref":"wip","sha":"abc"},"author_association":"OWNER"}]"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        let known = std::collections::HashSet::new();
+
+        let created = discover_untracked_prs(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &known,
+        );
+
+        assert_eq!(created, 0);
     }
 }

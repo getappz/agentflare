@@ -58,6 +58,13 @@ pub struct PullRequest {
     // `supervisor::PR_APPROVAL_LABEL`) without a second round-trip.
     #[serde(default)]
     pub labels: Vec<Label>,
+    // Absent (empty-string default, never trusted) rather than a hard parse
+    // error, same fail-closed stance as `Issue::author_association` --
+    // `worktree::discover_untracked_prs` gates item creation on this so an
+    // external contributor's PR can't get itself auto-tracked/auto-merged
+    // just by opening one.
+    #[serde(default)]
+    pub author_association: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
