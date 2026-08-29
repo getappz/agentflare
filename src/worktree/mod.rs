@@ -227,6 +227,7 @@ pub fn relabel_pr_completed(item: &agentflare_backend::item::Item, repo_root: &P
 /// `is_pr_merged` above also treats as "not merged yet" -- no credentials,
 /// no resolvable remote, no PR found, or a lookup error -- since the
 /// caller's fallback is simply to poll again next tick.
+#[derive(Debug)]
 pub enum PrCiStatus {
     Merged,
     Failing(Vec<String>),
@@ -326,7 +327,24 @@ fn pr_ci_status_impl(
             return PrCiStatus::Unknown;
         }
     };
-    let summary = crate::github::mcp::checks_wait_summary(&checks, 0);
+    decide_from_checks(
+        pr.number,
+        &checks,
+        pr.labels.into_iter().map(|l| l.name).collect(),
+    )
+}
+
+/// The part of the CI-status decision tree that only needs check-run data
+/// (merged/behind are decided from the PR itself before this is reached) --
+/// shared verbatim by `pr_ci_status_impl`'s per-PR REST fetch and
+/// `pr_ci_status_from_batch`'s GraphQL-batch fetch, so the two fetch paths
+/// can never quietly disagree on what a given set of check runs means.
+fn decide_from_checks(
+    number: u64,
+    checks: &[crate::github::models::CheckRun],
+    labels: Vec<String>,
+) -> PrCiStatus {
+    let summary = crate::github::mcp::checks_wait_summary(checks, 0);
     let total = summary["total_checks"].as_u64().unwrap_or(0);
     if total == 0 || summary["pending"].as_bool().unwrap_or(true) {
         return PrCiStatus::Pending;
@@ -340,13 +358,31 @@ fn pr_ci_status_impl(
         })
         .unwrap_or_default();
     if failed.is_empty() {
-        PrCiStatus::Passing {
-            number: pr.number,
-            labels: pr.labels.into_iter().map(|l| l.name).collect(),
-        }
+        PrCiStatus::Passing { number, labels }
     } else {
         PrCiStatus::Failing(failed)
     }
+}
+
+/// `pr_ci_status_impl`'s decision tree applied to data already fetched in
+/// bulk by `github::graphql::batch_pr_status` instead of one REST call per
+/// PR -- see that module's doc comment for why. Deliberately reuses
+/// `decide_from_checks` for the post-merged/behind part of the tree instead
+/// of re-deriving it, so `run_review_sweep`'s batched fetch and
+/// `pr_ci_status`'s single-item fetch (still used by
+/// `cli::work_duplicate_pr`) can never diverge on what the same check-run
+/// data means.
+pub(crate) fn pr_ci_status_from_batch(
+    number: u64,
+    data: &crate::github::graphql::BatchPrData,
+) -> PrCiStatus {
+    if data.merged {
+        return PrCiStatus::Merged;
+    }
+    if data.mergeable == Some(true) && data.mergeable_state.as_deref() == Some("behind") {
+        return PrCiStatus::Behind { number };
+    }
+    decide_from_checks(number, &data.checks, data.labels.clone())
 }
 
 /// Brings a cleanly-behind PR's branch up to date with the base branch via
@@ -364,7 +400,21 @@ pub fn update_stale_branch(repo_root: &Path, number: u64) -> bool {
     let Ok(client) = crate::github::Client::new() else {
         return false;
     };
-    match crate::github::pulls::update_branch(&client, &repo, number) {
+    update_branch_pr(&client, &repo, number)
+}
+
+/// The actual GitHub update-branch call. Split out from `update_stale_branch`
+/// so tests can drive it against a mock server instead of `Client::new()`'s
+/// real credentials/host, mirroring `supervisor::merge_approved_pr`'s own
+/// test-seam split. Also the idempotency boundary a batched, snapshot-driven
+/// `run_review_sweep` now depends on: the batch's `Behind` verdict can be
+/// stale by the time this runs (CI/base-branch state moved on, or another
+/// sweep/daemon already updated it), so a rejection here -- GitHub itself
+/// refusing an already-current or already-merged branch -- must fall through
+/// to "log and skip", not panic or retry in-line, exactly like a duplicate
+/// `merge` call already does.
+fn update_branch_pr(client: &crate::github::Client, repo: &RepoId, number: u64) -> bool {
+    match crate::github::pulls::update_branch(client, repo, number) {
         Ok(()) => true,
         Err(e) => {
             eprintln!("worktree: update-branch failed for PR #{number} in {repo}: {e}");
@@ -979,6 +1029,139 @@ mod tests {
 
         assert!(matches!(status, PrCiStatus::Behind { number: 621 }));
         assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn update_branch_pr_succeeds_on_a_clean_update() {
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(202, r#"{"message":"Updating"}"#),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        assert!(update_branch_pr(&client, &repo, 7));
+    }
+
+    // Idempotency invariant (task #198): whether the branch was already
+    // brought up to date by a previous sweep tick, a concurrent daemon, or a
+    // human clicking "Update branch" by hand, GitHub answers a repeat
+    // update-branch call with an error rather than a silent success --
+    // `update_branch_pr` must turn that into a plain `false` (log and skip),
+    // never a panic or a retry loop, so a stale `Behind` verdict from a
+    // batched snapshot is always safe to act on twice.
+    #[test]
+    fn update_branch_pr_returns_false_and_does_not_panic_when_already_up_to_date() {
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                422,
+                r#"{"message":"Branch is already up-to-date"}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        assert!(!update_branch_pr(&client, &repo, 7));
+    }
+
+    fn check(
+        name: &str,
+        status: &str,
+        conclusion: Option<&str>,
+    ) -> crate::github::models::CheckRun {
+        crate::github::models::CheckRun {
+            name: name.into(),
+            status: status.into(),
+            conclusion: conclusion.map(str::to_string),
+        }
+    }
+
+    fn batch_data(
+        merged: bool,
+        mergeable: Option<bool>,
+        mergeable_state: Option<&str>,
+        checks: Vec<crate::github::models::CheckRun>,
+        labels: Vec<String>,
+    ) -> crate::github::graphql::BatchPrData {
+        crate::github::graphql::BatchPrData {
+            merged,
+            mergeable,
+            mergeable_state: mergeable_state.map(str::to_string),
+            checks,
+            labels,
+        }
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_reports_merged_before_looking_at_anything_else() {
+        let data = batch_data(true, Some(true), Some("behind"), vec![], vec![]);
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Merged
+        ));
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_reports_behind_before_checks() {
+        let data = batch_data(false, Some(true), Some("behind"), vec![], vec![]);
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Behind { number: 101 }
+        ));
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_reports_passing_with_labels_when_all_checks_succeed() {
+        let data = batch_data(
+            false,
+            Some(true),
+            Some("clean"),
+            vec![check("build", "completed", Some("success"))],
+            vec!["status:pr:approved".into()],
+        );
+        match pr_ci_status_from_batch(101, &data) {
+            PrCiStatus::Passing { number, labels } => {
+                assert_eq!(number, 101);
+                assert_eq!(labels, vec!["status:pr:approved".to_string()]);
+            }
+            other => panic!("expected Passing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_reports_failing_checks_by_name() {
+        let data = batch_data(
+            false,
+            Some(true),
+            Some("clean"),
+            vec![
+                check("build", "completed", Some("success")),
+                check("clippy", "completed", Some("failure")),
+            ],
+            vec![],
+        );
+        match pr_ci_status_from_batch(101, &data) {
+            PrCiStatus::Failing(names) => assert_eq!(names, vec!["clippy".to_string()]),
+            other => panic!("expected Failing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_reports_pending_when_a_check_is_still_running() {
+        let data = batch_data(
+            false,
+            Some(true),
+            Some("clean"),
+            vec![check("build", "in_progress", None)],
+            vec![],
+        );
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Pending
+        ));
     }
 
     #[test]
