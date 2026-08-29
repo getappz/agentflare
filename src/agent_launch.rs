@@ -562,8 +562,37 @@ fn run_headless_impl(
     let (launch_cmd, launch_args, hidden_console) = launch_command(&binary, &argv[1..]);
     #[cfg(not(windows))]
     let (launch_cmd, launch_args, _hidden_console) = launch_command(&binary, &argv[1..]);
-    let (sandboxed_command, sandboxed_args) =
-        agentflare_jobs::sandbox::wrap(&launch_cmd, &launch_args, cwd.as_deref(), true);
+    // A bounded tail of this dispatch's sandbox-side diagnostic log (e.g.
+    // opencode's own tool-call/reasoning trace, see `OPENCODE_STATE`'s
+    // `diagnostic_log`) survives here even though the mount it lives in is
+    // otherwise fully discarded when the sandboxed process exits (item
+    // #139). The `.filter` below covers the one fallible step -- creating
+    // the parent directory the sandbox's `.agentflare` bind needs to
+    // already exist -- so a directory-creation failure degrades to "no
+    // diagnostic capture" (`diagnostic_path` becomes `None`) rather than a
+    // failed dispatch.
+    let diagnostic_token = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let diagnostic_path =
+        agentflare_jobs::sandbox::diagnostic_path(&diagnostic_token).filter(|path| {
+            match path.parent() {
+                Some(parent) => std::fs::create_dir_all(parent).is_ok(),
+                None => false,
+            }
+        });
+    let (sandboxed_command, sandboxed_args) = agentflare_jobs::sandbox::wrap(
+        &launch_cmd,
+        &launch_args,
+        cwd.as_deref(),
+        true,
+        diagnostic_path.as_deref(),
+    );
     let mut cmd = Command::new(&sandboxed_command);
     cmd.args(&sandboxed_args);
     if let Some(dir) = explicit_cwd {
@@ -592,7 +621,12 @@ fn run_headless_impl(
     // process (item #19's in-process dispatch) has no single ambient value
     // that's correct for all of them — only an explicit per-spawn env var is.
     cmd.env("AGENTFLARE_AGENT", spec.id.as_str());
-    match run_captured(cmd, hard_cap, idle_timeout, Some(prompt)) {
+    let result = run_captured(cmd, hard_cap, idle_timeout, Some(prompt));
+    // Always taken (read + removed), win or lose, regardless of whether it
+    // ends up used below -- otherwise `~/.agentflare/sandbox-diagnostics`
+    // accumulates one file per headless dispatch forever.
+    let sandbox_log = take_diagnostic_log(diagnostic_path.as_deref());
+    match result {
         Ok(c) if c.success => {
             if request_json && json_output_args(spec.id).is_some() {
                 HeadlessOutcome::Ok(parse_json_reply(&c.stdout))
@@ -613,16 +647,29 @@ fn run_headless_impl(
             HeadlessOutcome::Failed(format!(
                 "{} timed out — {reason}{}",
                 spec.display_name,
-                diagnostic_suffix(&c)
+                diagnostic_suffix(&c, sandbox_log.as_deref())
             ))
         }
         Ok(c) => HeadlessOutcome::Failed(format!(
             "{} exited non-zero{}",
             spec.display_name,
-            diagnostic_suffix(&c)
+            diagnostic_suffix(&c, sandbox_log.as_deref())
         )),
         Err(e) => HeadlessOutcome::Failed(format!("failed to run {}: {e}", spec.display_name)),
     }
+}
+
+/// Reads and removes the bounded sandbox diagnostic-log tail (if any) a
+/// matched agent profile's wrapper script snapshotted before this dispatch's
+/// sandboxed process exited -- see `flare_sandbox::bwrap`'s
+/// `DIAGNOSTIC_WRAPPER_SCRIPT`. `None` (no read, nothing to remove) when
+/// `path` is `None`, the file was never written (no matching diagnostic
+/// log, or sandboxing unavailable on this platform), or it came back empty.
+fn take_diagnostic_log(path: Option<&Path>) -> Option<String> {
+    let path = path?;
+    let content = std::fs::read_to_string(path).ok();
+    let _ = std::fs::remove_file(path);
+    content.filter(|s| !s.trim().is_empty())
 }
 
 /// Claude Code's `--output-format stream-json` reply shape: one JSON object
@@ -684,19 +731,33 @@ pub(crate) fn clean_agent_reply(agent: &str, raw: String) -> String {
 /// turned every timeout into a black box with no way to tell "made real
 /// progress and got killed mid-verification" apart from "never did anything."
 /// Prefers stdout (the agent's actual reply stream); falls back to stderr
-/// when stdout is empty.
-fn diagnostic_suffix(captured: &Captured) -> String {
-    let (label, text) = if !captured.stdout.is_empty() {
-        ("stdout", captured.stdout.as_str())
+/// when stdout is empty. `sandbox_log`, when present, is the agent's own
+/// sandbox-side session/tool-call log tail (see `take_diagnostic_log`) —
+/// appended regardless of whether stdout/stderr had anything, since it's a
+/// different signal (the agent's internal trace, not its reply stream) that
+/// a failed headless dispatch would otherwise have no way to surface at all
+/// (item #139).
+fn diagnostic_suffix(captured: &Captured, sandbox_log: Option<&str>) -> String {
+    let mut suffix = if !captured.stdout.is_empty() {
+        format!(
+            " — last stdout before kill:\n{}",
+            tail_str(&captured.stdout, DIAGNOSTIC_TAIL_CHARS)
+        )
     } else if !captured.stderr.is_empty() {
-        ("stderr", captured.stderr.as_str())
+        format!(
+            " — last stderr before kill:\n{}",
+            tail_str(&captured.stderr, DIAGNOSTIC_TAIL_CHARS)
+        )
     } else {
-        return " (no output captured)".to_string();
+        " (no output captured)".to_string()
     };
-    format!(
-        " — last {label} before kill:\n{}",
-        tail_str(text, DIAGNOSTIC_TAIL_CHARS)
-    )
+    if let Some(log) = sandbox_log {
+        suffix.push_str(&format!(
+            "\n\n — sandbox-side agent log tail:\n{}",
+            tail_str(log, DIAGNOSTIC_TAIL_CHARS)
+        ));
+    }
+    suffix
 }
 
 /// Also reused by `cli::work` to cap a headless run's reply before it's

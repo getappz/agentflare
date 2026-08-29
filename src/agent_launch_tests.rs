@@ -595,7 +595,7 @@
             timed_out: true,
             idle_killed: false,
         };
-        assert_eq!(diagnostic_suffix(&c), " (no output captured)");
+        assert_eq!(diagnostic_suffix(&c, None), " (no output captured)");
     }
 
     #[test]
@@ -607,7 +607,7 @@
             timed_out: true,
             idle_killed: false,
         };
-        let suffix = diagnostic_suffix(&c);
+        let suffix = diagnostic_suffix(&c, None);
         assert!(suffix.contains("last stdout before kill"));
         assert!(suffix.contains("working on task 3..."));
     }
@@ -621,9 +621,27 @@
             timed_out: true,
             idle_killed: false,
         };
-        let suffix = diagnostic_suffix(&c);
+        let suffix = diagnostic_suffix(&c, None);
         assert!(suffix.contains("last stderr before kill"));
         assert!(suffix.contains("panic: something broke"));
+    }
+
+    #[test]
+    fn diagnostic_suffix_appends_sandbox_log_even_when_stdout_is_empty() {
+        // Item #139: the sandbox-side log (e.g. opencode's own tool-call
+        // trace) is a different signal from stdout/stderr and must survive
+        // even when the agent produced no reply text at all before being
+        // killed -- the exact "black box" case this feature exists for.
+        let c = Captured {
+            success: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: true,
+            idle_killed: true,
+        };
+        let suffix = diagnostic_suffix(&c, Some("level=INFO message=\"tool call\" tool=lean_ctx"));
+        assert!(suffix.contains("sandbox-side agent log tail"));
+        assert!(suffix.contains("tool=lean_ctx"));
     }
 
     #[test]
@@ -638,13 +656,37 @@
         let msg = match Ok::<_, std::io::Error>(captured) {
             Ok(c) if c.success => unreachable!(),
             Ok(c) if c.timed_out => unreachable!(),
-            Ok(c) => format!("test exited non-zero{}", diagnostic_suffix(&c)),
+            Ok(c) => format!("test exited non-zero{}", diagnostic_suffix(&c, None)),
             Err(_) => unreachable!(),
         };
         assert!(
             msg.contains("HTTP 429 Too Many Requests"),
             "expected captured stderr in the failure message, got: {msg}"
         );
+    }
+
+    #[test]
+    fn take_diagnostic_log_reads_and_removes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diag.log");
+        std::fs::write(&path, "some diagnostic content\n").unwrap();
+        let content = take_diagnostic_log(Some(&path));
+        assert_eq!(content.as_deref(), Some("some diagnostic content\n"));
+        assert!(!path.exists(), "diagnostic file should be removed after reading");
+    }
+
+    #[test]
+    fn take_diagnostic_log_returns_none_for_missing_or_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.log");
+        assert_eq!(take_diagnostic_log(Some(&missing)), None);
+
+        let empty = dir.path().join("empty.log");
+        std::fs::write(&empty, "   \n").unwrap();
+        assert_eq!(take_diagnostic_log(Some(&empty)), None);
+        assert!(!empty.exists());
+
+        assert_eq!(take_diagnostic_log(None), None);
     }
 
     #[test]

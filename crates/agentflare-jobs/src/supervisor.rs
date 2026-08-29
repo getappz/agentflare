@@ -56,9 +56,12 @@ impl Supervisor {
         // and macOS have no equivalent here yet, so they get the command
         // back unchanged (see `crate::sandbox`). `git_writable = false`: an
         // arbitrary job command dispatched through here (build/test/lint,
-        // ...) has no business rewriting git history.
+        // ...) has no business rewriting git history. `diagnostic_out:
+        // None` -- the bounded diagnostic-log capture (item #139) only
+        // applies to a headless coding-agent CLI dispatch, not an arbitrary
+        // build/test/lint job.
         let (sandboxed_command, sandboxed_args) =
-            crate::sandbox::wrap(&self.command, &self.args, self.cwd.as_deref(), false);
+            crate::sandbox::wrap(&self.command, &self.args, self.cwd.as_deref(), false, None);
 
         let mut cmd = Command::new(&sandboxed_command);
         cmd.args(&sandboxed_args)

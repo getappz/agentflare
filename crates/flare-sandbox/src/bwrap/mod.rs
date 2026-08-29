@@ -12,7 +12,7 @@
 //! workspaces, so that machinery isn't needed here.
 mod bwrap_install;
 
-use crate::{AgentStateMount, MountPolicy, SandboxConfig};
+use crate::{AgentProfile, AgentStateMount, MountPolicy, SandboxConfig};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -37,6 +37,7 @@ pub(super) fn wrap(
     cwd: Option<&Path>,
     git_writable: bool,
     config: &SandboxConfig,
+    diagnostic_out: Option<&Path>,
 ) -> Option<(String, Vec<String>)> {
     let bwrap = find_or_install_bwrap()?;
     // Resolved once up front (not inside `build_bwrap_args`) so an
@@ -51,7 +52,14 @@ pub(super) fn wrap(
     };
     Some((
         path_to_string(&bwrap),
-        build_bwrap_args(cwd.as_deref(), command, args, git_writable, config),
+        build_bwrap_args(
+            cwd.as_deref(),
+            command,
+            args,
+            git_writable,
+            config,
+            diagnostic_out,
+        ),
     ))
 }
 
@@ -61,15 +69,22 @@ fn build_bwrap_args(
     args: &[String],
     git_writable: bool,
     config: &SandboxConfig,
+    diagnostic_out: Option<&Path>,
 ) -> Vec<String> {
-    build_bwrap_args_with_home(
-        cwd,
-        command,
-        args,
-        std::env::var_os("HOME").as_deref(),
-        git_writable,
-        config,
-    )
+    let home = std::env::var_os("HOME");
+    let mut bwrap_args =
+        build_bwrap_args_with_home(cwd, command, args, home.as_deref(), git_writable, config);
+    if let Some(diagnostic_out) = diagnostic_out {
+        apply_diagnostic_wrapper(
+            &mut bwrap_args,
+            command,
+            args,
+            home.as_deref(),
+            config,
+            diagnostic_out,
+        );
+    }
+    bwrap_args
 }
 
 fn build_bwrap_args_with_home(
@@ -162,11 +177,7 @@ fn build_bwrap_args_with_home(
             }
         }
 
-        let command_file_name = Path::new(command).file_name();
-        for profile in config.agent_profiles {
-            if command_file_name != Some(std::ffi::OsStr::new(profile.binary_name)) {
-                continue;
-            }
+        if let Some(profile) = matching_profile(command, config) {
             for mount in profile.state_mounts {
                 push_agent_state_mount(&mut bwrap_args, home, mount);
             }
@@ -178,6 +189,17 @@ fn build_bwrap_args_with_home(
     bwrap_args.extend(args.iter().cloned());
 
     bwrap_args
+}
+
+/// The agent profile (if any) whose `binary_name` matches `command`'s final
+/// path component -- shared by the state-mount loop above and the
+/// diagnostic-log wrapper below so both agree on which profile applies.
+fn matching_profile<'a>(command: &str, config: &'a SandboxConfig) -> Option<&'a AgentProfile> {
+    let command_file_name = Path::new(command).file_name()?;
+    config
+        .agent_profiles
+        .iter()
+        .find(|profile| std::ffi::OsStr::new(profile.binary_name) == command_file_name)
 }
 
 /// Applies one agent's `$HOME` state-directory mount per its [`MountPolicy`].
@@ -206,6 +228,83 @@ fn push_agent_state_mount(
         bwrap_args.push("--tmpfs".to_string());
         bwrap_args.push(dir_str);
     }
+}
+
+/// Bytes of `diagnostic_log` kept per snapshot -- bounded so a runaway log
+/// never turns "diagnostic tail" into "second copy of the whole session".
+const DIAGNOSTIC_TAIL_BYTES: &str = "8192";
+
+/// POSIX-`sh` wrapper run in place of the bare `-- command args...`
+/// invocation when a diagnostic log applies (see [`apply_diagnostic_wrapper`]).
+/// Takes `out`, `source`, and `tail_bytes` as its first three positional
+/// params (never interpolated into the script text itself, so none of them
+/// can be mis-parsed as shell syntax), then `shift`s them off so `"$@"` is
+/// exactly the real command and its args -- preserving argv boundaries
+/// exactly as `Command`/bwrap already resolved them.
+///
+/// A background loop snapshots `source`'s tail to `out` every few seconds
+/// for as long as the real command runs, not just once at the end: `bwrap`
+/// wrapping this whole tree means `kill_tree`'s `SIGKILL -<pgid>` (the
+/// timeout/idle-kill path -- exactly the item #139 failure mode) kills this
+/// script before it would ever reach a single post-exit tail, leaving
+/// `out` with only the last periodic snapshot instead of nothing. The
+/// watcher's own stdio is redirected to `/dev/null` so it never holds the
+/// piped stdout/stderr fds `run_captured` reads open past the real
+/// command's own exit (see `kill_tree`'s doc comment for that failure
+/// shape in the unrelated case it guards against).
+const DIAGNOSTIC_WRAPPER_SCRIPT: &str = concat!(
+    "out=\"$1\"; shift; src=\"$1\"; shift; bytes=\"$1\"; shift; ",
+    "snapshot() { mkdir -p \"$(dirname \"$out\")\" 2>/dev/null; ",
+    "tail -c \"$bytes\" \"$src\" >\"$out\" 2>/dev/null; }; ",
+    "( while :; do snapshot; sleep 3; done ) </dev/null >/dev/null 2>&1 & ",
+    "watcher=$!; \"$@\"; status=$?; kill \"$watcher\" 2>/dev/null; snapshot; exit \"$status\""
+);
+
+/// Rewrites the trailing `-- command args...` invocation `build_bwrap_args`
+/// already appended into [`DIAGNOSTIC_WRAPPER_SCRIPT`] when `command`
+/// matches a profile with a mount that names a `diagnostic_log` -- the one
+/// artifact from that mount's `OverlayEphemeral` overlay (see
+/// `push_agent_state_mount`'s doc comment) that survives the sandboxed
+/// process's exit, so a failed headless run is diagnosable instead of a
+/// black box (item #139). No-op, leaving `bwrap_args` exactly as built,
+/// when there's no `--` marker, no matching profile, or no mount with a
+/// `diagnostic_log`.
+fn apply_diagnostic_wrapper(
+    bwrap_args: &mut Vec<String>,
+    command: &str,
+    args: &[String],
+    home: Option<&std::ffi::OsStr>,
+    config: &SandboxConfig,
+    diagnostic_out: &Path,
+) {
+    let Some(home) = home else { return };
+    let Some(profile) = matching_profile(command, config) else {
+        return;
+    };
+    let Some(source) = profile.state_mounts.iter().find_map(|mount| {
+        let log = mount.diagnostic_log?;
+        Some(Path::new(home).join(mount.relative_path).join(log))
+    }) else {
+        return;
+    };
+    // `build_bwrap_args_with_home` appends `--` exactly once, immediately
+    // before `command` -- everything from there to the end is the
+    // invocation this replaces.
+    let Some(marker) = bwrap_args.iter().rposition(|a| a == "--") else {
+        return;
+    };
+    bwrap_args.truncate(marker);
+
+    bwrap_args.push("--".to_string());
+    bwrap_args.push("/bin/sh".to_string());
+    bwrap_args.push("-c".to_string());
+    bwrap_args.push(DIAGNOSTIC_WRAPPER_SCRIPT.to_string());
+    bwrap_args.push("sh".to_string());
+    bwrap_args.push(path_to_string(diagnostic_out));
+    bwrap_args.push(path_to_string(&source));
+    bwrap_args.push(DIAGNOSTIC_TAIL_BYTES.to_string());
+    bwrap_args.push(command.to_string());
+    bwrap_args.extend(args.iter().cloned());
 }
 
 /// Resolves a `git worktree` checkout's `cwd/.git` gitfile
@@ -621,6 +720,7 @@ mod tests {
             &[AgentStateMount {
                 relative_path: ".testagent",
                 policy: MountPolicy::OverlayEphemeral,
+                diagnostic_log: None,
             }],
         );
         let args = build_bwrap_args_with_home(
@@ -653,6 +753,7 @@ mod tests {
             &[AgentStateMount {
                 relative_path: ".testagent",
                 policy: MountPolicy::OverlayEphemeral,
+                diagnostic_log: None,
             }],
         );
         let args = build_bwrap_args_with_home(
@@ -684,6 +785,7 @@ mod tests {
             &[AgentStateMount {
                 relative_path: ".testagent",
                 policy: MountPolicy::OverlayEphemeral,
+                diagnostic_log: None,
             }],
         );
         let args = build_bwrap_args_with_home(
@@ -714,10 +816,12 @@ mod tests {
                 AgentStateMount {
                     relative_path: ".config/opencode",
                     policy: MountPolicy::OverlayEphemeral,
+                    diagnostic_log: None,
                 },
                 AgentStateMount {
                     relative_path: ".local/share/opencode",
                     policy: MountPolicy::OverlayEphemeral,
+                    diagnostic_log: None,
                 },
             ],
         );
@@ -725,5 +829,110 @@ mod tests {
             build_bwrap_args_with_home(None, "/usr/bin/opencode", &[], Some(&home), false, &config);
         let overlay_count = args.iter().filter(|a| *a == "--overlay-src").count();
         assert_eq!(overlay_count, 2);
+    }
+
+    #[test]
+    fn apply_diagnostic_wrapper_wraps_invocation_when_log_configured() {
+        // Item #139: opencode's session log lives inside its own
+        // `OverlayEphemeral` mount and is otherwise fully discarded when the
+        // sandboxed process exits -- this is what makes it survive.
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let config = agent(
+            "opencode",
+            &[AgentStateMount {
+                relative_path: ".local/share/opencode",
+                policy: MountPolicy::OverlayEphemeral,
+                diagnostic_log: Some("log/opencode.log"),
+            }],
+        );
+        let mut bwrap_args = vec![
+            "--ro-bind".to_string(),
+            "/".to_string(),
+            "/".to_string(),
+            "--".to_string(),
+            "opencode".to_string(),
+            "run".to_string(),
+        ];
+        let args = vec!["run".to_string()];
+        let diagnostic_out = dir.path().join("diag.log");
+        apply_diagnostic_wrapper(
+            &mut bwrap_args,
+            "opencode",
+            &args,
+            Some(&home),
+            &config,
+            &diagnostic_out,
+        );
+
+        assert_eq!(
+            bwrap_args,
+            vec![
+                "--ro-bind".to_string(),
+                "/".to_string(),
+                "/".to_string(),
+                "--".to_string(),
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                DIAGNOSTIC_WRAPPER_SCRIPT.to_string(),
+                "sh".to_string(),
+                path_to_string(&diagnostic_out),
+                path_to_string(&dir.path().join(".local/share/opencode/log/opencode.log")),
+                DIAGNOSTIC_TAIL_BYTES.to_string(),
+                "opencode".to_string(),
+                "run".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_diagnostic_wrapper_noop_when_no_mount_has_diagnostic_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let config = agent(
+            "opencode",
+            &[AgentStateMount {
+                relative_path: ".local/share/opencode",
+                policy: MountPolicy::OverlayEphemeral,
+                diagnostic_log: None,
+            }],
+        );
+        let mut bwrap_args = vec!["--".to_string(), "opencode".to_string(), "run".to_string()];
+        let before = bwrap_args.clone();
+        let args = vec!["run".to_string()];
+        apply_diagnostic_wrapper(
+            &mut bwrap_args,
+            "opencode",
+            &args,
+            Some(&home),
+            &config,
+            dir.path(),
+        );
+        assert_eq!(bwrap_args, before);
+    }
+
+    #[test]
+    fn apply_diagnostic_wrapper_noop_for_non_matching_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let config = agent(
+            "opencode",
+            &[AgentStateMount {
+                relative_path: ".local/share/opencode",
+                policy: MountPolicy::OverlayEphemeral,
+                diagnostic_log: Some("log/opencode.log"),
+            }],
+        );
+        let mut bwrap_args = vec!["--".to_string(), "claude".to_string()];
+        let before = bwrap_args.clone();
+        apply_diagnostic_wrapper(
+            &mut bwrap_args,
+            "claude",
+            &[],
+            Some(&home),
+            &config,
+            dir.path(),
+        );
+        assert_eq!(bwrap_args, before);
     }
 }
