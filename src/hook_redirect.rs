@@ -279,15 +279,28 @@ const GATED_ITEM_ACTIONS: &[&str] = &["done", "check_merge"];
 /// Blocks `item done` / `item check_merge` until this session has a fresh,
 /// passing verification-evidence record (`crate::optimize::VerificationEvidence`,
 /// captured by the `PostToolUse` success hook when a test/build/lint command
-/// runs). Closes the `verification-before-completion` gap from item #168's
-/// gap analysis: nothing previously stopped an agent from claiming
-/// "done"/opening a PR without having actually run tests *now* -- "tests
-/// passed earlier this session" doesn't count once the evidence goes stale
-/// (see `VERIFICATION_FRESHNESS_SECS`).
+/// runs) AND a fresh review-evidence record (`crate::optimize::ReviewEvidence`,
+/// captured the same way when a `/code-review` skill call or a
+/// `requesting-code-review`-style subagent dispatch runs). Closes both the
+/// `verification-before-completion` gap from item #168's gap analysis and
+/// the review-before-completion gap from item #182: nothing previously
+/// stopped an agent from claiming "done"/opening a PR without having
+/// actually run tests, or requested a review, *now* -- evidence from earlier
+/// this session doesn't count once it goes stale (see
+/// `VERIFICATION_FRESHNESS_SECS`, reused as the review-freshness window
+/// too).
+///
+/// Applies to every caller of `item done`/`check_merge`, human or dispatched
+/// agent alike -- same as the pre-existing verification half of this gate,
+/// which draws no such distinction. A human calling `item done` directly
+/// already has to satisfy the verification gate; carving out an exemption
+/// here for the review half only would be a new, unrequested trust
+/// distinction, not a matching one.
 pub(crate) fn completion_gate_reason(
     tool_name: &str,
     tool_input: Option<&Value>,
     has_fresh_verification: bool,
+    has_fresh_review: bool,
 ) -> Option<String> {
     if tool_name != ITEM_TOOL_NAME && tool_name != "item" {
         return None;
@@ -296,13 +309,19 @@ pub(crate) fn completion_gate_reason(
     if !GATED_ITEM_ACTIONS.contains(&action) {
         return None;
     }
-    if has_fresh_verification {
-        return None;
+    if !has_fresh_verification {
+        return Some(format!(
+            "no fresh, passing verification evidence for this session -- run this project's test/build/lint command (e.g. `cargo test`, `npm test`, `pytest`) via Bash before calling `item` action={action}; a run more than {}m ago, or one that failed, doesn't count.",
+            crate::optimize::VERIFICATION_FRESHNESS_SECS / 60
+        ));
     }
-    Some(format!(
-        "no fresh, passing verification evidence for this session -- run this project's test/build/lint command (e.g. `cargo test`, `npm test`, `pytest`) via Bash before calling `item` action={action}; a run more than {}m ago, or one that failed, doesn't count.",
-        crate::optimize::VERIFICATION_FRESHNESS_SECS / 60
-    ))
+    if !has_fresh_review {
+        return Some(format!(
+            "no fresh code review evidence for this session -- request one (the `/code-review` skill, or dispatch a reviewer subagent per superpowers' `requesting-code-review`) before calling `item` action={action}; a review more than {}m ago doesn't count.",
+            crate::optimize::VERIFICATION_FRESHNESS_SECS / 60
+        ));
+    }
+    None
 }
 
 /// Classify one PreToolUse payload into a redirect reason, if any. Returns
@@ -803,7 +822,7 @@ mod tests {
     #[test]
     fn completion_gate_blocks_item_done_without_verification() {
         let input = json!({ "id": "abc", "action": "done" });
-        let reason = completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false).unwrap();
+        let reason = completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false).unwrap();
         assert!(reason.contains("verification"), "{reason}");
         assert!(reason.contains("action=done"), "{reason}");
     }
@@ -811,40 +830,49 @@ mod tests {
     #[test]
     fn completion_gate_blocks_check_merge_without_verification() {
         let input = json!({ "id": "abc", "action": "check_merge" });
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false).is_some());
+        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false).is_some());
     }
 
     #[test]
-    fn completion_gate_allows_item_done_with_fresh_verification() {
+    fn completion_gate_blocks_item_done_with_verification_but_no_review() {
         let input = json!({ "id": "abc", "action": "done" });
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), true).is_none());
+        let reason = completion_gate_reason(ITEM_TOOL_NAME, Some(&input), true, false).unwrap();
+        assert!(reason.contains("review"), "{reason}");
+        assert!(reason.contains("action=done"), "{reason}");
+        assert!(!reason.contains("verification evidence"), "{reason}");
+    }
+
+    #[test]
+    fn completion_gate_allows_item_done_with_fresh_verification_and_review() {
+        let input = json!({ "id": "abc", "action": "done" });
+        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), true, true).is_none());
     }
 
     #[test]
     fn completion_gate_ignores_other_item_actions() {
         let input = json!({ "id": "abc", "action": "claim" });
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false).is_none());
+        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false).is_none());
         let input = json!({ "id": "abc", "action": "update" });
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false).is_none());
+        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false).is_none());
     }
 
     #[test]
     fn completion_gate_ignores_unrelated_tools() {
         let input = json!({ "action": "done" });
-        assert!(completion_gate_reason("Bash", Some(&input), false).is_none());
-        assert!(completion_gate_reason("mcp__flare__comment", Some(&input), false).is_none());
+        assert!(completion_gate_reason("Bash", Some(&input), false, false).is_none());
+        assert!(completion_gate_reason("mcp__flare__comment", Some(&input), false, false).is_none());
     }
 
     #[test]
     fn completion_gate_ignores_missing_input_or_action() {
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, None, false).is_none());
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&json!({})), false).is_none());
+        assert!(completion_gate_reason(ITEM_TOOL_NAME, None, false, false).is_none());
+        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&json!({})), false, false).is_none());
     }
 
     #[test]
     fn completion_gate_matches_bare_item_tool_name() {
         let input = json!({ "id": "abc", "action": "done" });
-        assert!(completion_gate_reason("item", Some(&input), false).is_some());
+        assert!(completion_gate_reason("item", Some(&input), false, false).is_some());
     }
 
     #[test]

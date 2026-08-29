@@ -28,6 +28,13 @@ pub struct SessionRecord {
     /// [`VERIFICATION_FRESHNESS_SECS`] or a newer command superseded it.
     #[serde(default)]
     pub last_verification: Option<VerificationEvidence>,
+    /// Most recent code review this session actually requested, used by the
+    /// same completion gate to require fresh review evidence -- see
+    /// [`ReviewEvidence`]. Same staleness rule as `last_verification`: falls
+    /// out of [`VERIFICATION_FRESHNESS_SECS`], or a newer edit invalidates it
+    /// (a review of a since-changed tree doesn't cover the current diff).
+    #[serde(default)]
+    pub last_review: Option<ReviewEvidence>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -44,6 +51,20 @@ pub struct VerificationEvidence {
     pub command: String,
     pub exit_code: Option<i32>,
     pub passed: bool,
+    pub ts: u64,
+}
+
+/// Evidence that a code review was actually requested in this session,
+/// captured by the `PostToolUse` success hook (`hook_completion_gate::post_tool_use`)
+/// when a `Skill`/`Task`/`Agent` call matches [`is_review_command`] -- the
+/// `/code-review` skill, or the `requesting-code-review` subagent-dispatch
+/// pattern (a fresh subagent reviewing `BASE_SHA..HEAD_SHA`). Unlike
+/// [`VerificationEvidence`] there's no pass/fail: review either ran or it
+/// didn't, and its findings are for the agent to act on, not this gate to
+/// judge.
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct ReviewEvidence {
+    pub source: String,
     pub ts: u64,
 }
 
@@ -171,6 +192,49 @@ pub fn has_fresh_passing_verification(record: &SessionRecord, now: u64) -> bool 
         .is_some_and(|v| v.passed && now.saturating_sub(v.ts) < VERIFICATION_FRESHNESS_SECS)
 }
 
+/// Tool names a code review can plausibly be requested through: agentflare's
+/// own `/code-review` skill (invoked via the `Skill` tool), or a subagent
+/// dispatch (`Task`/`Agent`) following superpowers' `requesting-code-review`
+/// pattern. Both casings included defensively, same convention as
+/// `hook_redirect`'s tool-name matching elsewhere in this codebase.
+const REVIEW_TOOL_NAMES: &[&str] = &["Skill", "skill", "Task", "task", "Agent", "agent"];
+
+/// Substrings (lowercased) marking a `Skill`/`Task`/`Agent` call's relevant
+/// text (skill name, or subagent prompt/description) as a code-review
+/// request -- deliberately broad, same false-positive-permissive tradeoff as
+/// [`VERIFICATION_COMMAND_MARKERS`].
+const REVIEW_MARKERS: &[&str] = &[
+    "code-review",
+    "code_review",
+    "code review",
+    "review the diff",
+    "review this diff",
+    "review this change",
+    "requesting-code-review",
+];
+
+/// True when `tool_name` is a review-capable tool ([`REVIEW_TOOL_NAMES`])
+/// and `text` (the skill name, or subagent prompt/description) looks like a
+/// code-review request per [`REVIEW_MARKERS`].
+pub fn is_review_command(tool_name: &str, text: &str) -> bool {
+    REVIEW_TOOL_NAMES.contains(&tool_name)
+        && REVIEW_MARKERS
+            .iter()
+            .any(|marker| text.to_lowercase().contains(marker))
+}
+
+/// Whether `record` carries review evidence recent enough to satisfy the
+/// completion gate right now -- same freshness window as verification
+/// evidence ([`VERIFICATION_FRESHNESS_SECS`]), no separate window since both
+/// answer the same question: "does this evidence still cover the current
+/// tree".
+pub fn has_fresh_review(record: &SessionRecord, now: u64) -> bool {
+    record
+        .last_review
+        .as_ref()
+        .is_some_and(|r| now.saturating_sub(r.ts) < VERIFICATION_FRESHNESS_SECS)
+}
+
 /// Clears a session's recorded verification evidence -- called by the
 /// `PostToolUse` success hook (`hook::post_tool_use`) whenever a mutating
 /// tool (Write/Edit/MultiEdit/patch/ctx_patch/...) runs, because a test run
@@ -181,6 +245,16 @@ pub fn has_fresh_passing_verification(record: &SessionRecord, now: u64) -> bool 
 pub fn invalidate_verification(state: &mut RuntimeState, session_id: &str) {
     if let Some(record) = state.sessions.get_mut(session_id) {
         record.last_verification = None;
+    }
+}
+
+/// Clears a session's recorded review evidence -- called alongside
+/// [`invalidate_verification`] whenever a mutating tool runs, for the same
+/// reason: a review of the tree *before* this edit doesn't cover the tree
+/// *after* it.
+pub fn invalidate_review(state: &mut RuntimeState, session_id: &str) {
+    if let Some(record) = state.sessions.get_mut(session_id) {
+        record.last_review = None;
     }
 }
 
@@ -426,6 +500,7 @@ mod tests {
                     turn_count: 3,
                     recent_tool_calls: vec![],
                     last_verification: None,
+                    last_review: None,
                 },
             );
             save_runtime(&state);
@@ -454,6 +529,7 @@ mod tests {
                 turn_count: 1,
                 recent_tool_calls: vec![],
                 last_verification: None,
+                last_review: None,
             },
         );
         state.sessions.insert(
@@ -463,6 +539,7 @@ mod tests {
                 turn_count: 1,
                 recent_tool_calls: vec![],
                 last_verification: None,
+                last_review: None,
             },
         );
         let now = 100_100; // 100s after "recent", ~27.7h after "old"
@@ -478,6 +555,7 @@ mod tests {
             turn_count: 5,
             recent_tool_calls: vec![],
             last_verification: None,
+            last_review: None,
         };
         assert!(session_hygiene_nudge(&record, 100).is_none());
     }
@@ -489,6 +567,7 @@ mod tests {
             turn_count: 81,
             recent_tool_calls: vec![],
             last_verification: None,
+            last_review: None,
         };
         assert!(session_hygiene_nudge(&record, 100).is_some());
     }
@@ -500,6 +579,7 @@ mod tests {
             turn_count: 1,
             recent_tool_calls: vec![],
             last_verification: None,
+            last_review: None,
         };
         assert!(session_hygiene_nudge(&record, 2 * 60 * 60 + 1).is_some());
     }
@@ -599,6 +679,7 @@ mod tests {
                     passed: true,
                     ts: 1000,
                 }),
+                last_review: None,
             },
         );
         invalidate_verification(&mut state, "s1");
@@ -613,6 +694,109 @@ mod tests {
     }
 
     #[test]
+    fn is_review_command_matches_code_review_skill_invocation() {
+        assert!(is_review_command("Skill", "code-review"));
+        assert!(is_review_command("skill", "code-review ultra"));
+    }
+
+    #[test]
+    fn is_review_command_matches_subagent_dispatch_prompt() {
+        assert!(is_review_command(
+            "Task",
+            "Review the diff between BASE_SHA and HEAD_SHA against the requirements"
+        ));
+        assert!(is_review_command(
+            "Agent",
+            "Please do a code review of this change"
+        ));
+    }
+
+    #[test]
+    fn is_review_command_ignores_unrelated_tool_names() {
+        // Same marker text through a tool that can't plausibly be a review
+        // request (e.g. Bash echoing the words) must not count.
+        assert!(!is_review_command("Bash", "code-review"));
+    }
+
+    #[test]
+    fn is_review_command_ignores_unrelated_skill_or_prompt_text() {
+        assert!(!is_review_command("Skill", "brainstorming"));
+        assert!(!is_review_command("Task", "fix the failing test"));
+    }
+
+    #[test]
+    fn invalidate_review_clears_existing_evidence() {
+        let mut state = RuntimeState::default();
+        state.sessions.insert(
+            "s1".to_string(),
+            SessionRecord {
+                start_ts: 0,
+                turn_count: 0,
+                recent_tool_calls: vec![],
+                last_verification: None,
+                last_review: Some(ReviewEvidence {
+                    source: "code-review".into(),
+                    ts: 1000,
+                }),
+            },
+        );
+        invalidate_review(&mut state, "s1");
+        assert!(state.sessions["s1"].last_review.is_none());
+    }
+
+    #[test]
+    fn invalidate_review_is_a_noop_for_unknown_session() {
+        let mut state = RuntimeState::default();
+        invalidate_review(&mut state, "does-not-exist");
+        assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn has_fresh_review_true_for_recent_review() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: None,
+            last_review: Some(ReviewEvidence {
+                source: "code-review".into(),
+                ts: 1000,
+            }),
+        };
+        assert!(has_fresh_review(&record, 1000 + 60));
+    }
+
+    #[test]
+    fn has_fresh_review_false_when_stale() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: None,
+            last_review: Some(ReviewEvidence {
+                source: "code-review".into(),
+                ts: 1000,
+            }),
+        };
+        assert!(!has_fresh_review(
+            &record,
+            1000 + VERIFICATION_FRESHNESS_SECS + 1
+        ));
+    }
+
+    #[test]
+    fn has_fresh_review_false_when_absent() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: None,
+            last_review: None,
+        };
+        assert!(!has_fresh_review(&record, 1000));
+    }
+
+    #[test]
     fn has_fresh_passing_verification_true_for_recent_pass() {
         let record = SessionRecord {
             start_ts: 0,
@@ -624,6 +808,7 @@ mod tests {
                 passed: true,
                 ts: 1000,
             }),
+            last_review: None,
         };
         assert!(has_fresh_passing_verification(&record, 1000 + 60));
     }
@@ -640,6 +825,7 @@ mod tests {
                 passed: true,
                 ts: 1000,
             }),
+            last_review: None,
         };
         assert!(!has_fresh_passing_verification(
             &record,
@@ -659,6 +845,7 @@ mod tests {
                 passed: false,
                 ts: 1000,
             }),
+            last_review: None,
         };
         assert!(!has_fresh_passing_verification(&record, 1000));
     }
@@ -670,6 +857,7 @@ mod tests {
             turn_count: 0,
             recent_tool_calls: vec![],
             last_verification: None,
+            last_review: None,
         };
         assert!(!has_fresh_passing_verification(&record, 1000));
     }

@@ -394,15 +394,18 @@ pub fn pre_tool_use(_agent: &str) {
             turn_count: 0,
             recent_tool_calls: vec![],
             last_verification: None,
+            last_review: None,
         });
 
-    // Completion gate (item #169): `item done`/`check_merge` requires fresh,
-    // passing verification evidence for this session -- see
+    // Completion gate (item #169, extended by item #182): `item
+    // done`/`check_merge` requires fresh, passing verification evidence AND
+    // fresh review evidence for this session -- see
     // hook_redirect::completion_gate_reason's doc comment.
     if let Some(reason) = crate::hook_redirect::completion_gate_reason(
         &parsed.tool_name,
         parsed.tool_input.as_ref(),
         crate::optimize::has_fresh_passing_verification(record, now),
+        crate::optimize::has_fresh_review(record, now),
     ) {
         let decision = json!({
             "hookSpecificOutput": {
@@ -640,6 +643,7 @@ pub fn prompt_submit(agent: &str) {
                     turn_count: 0,
                     recent_tool_calls: vec![],
                     last_verification: None,
+                    last_review: None,
                 });
         first_turn = record.turn_count == 0;
         record.turn_count += 1;
