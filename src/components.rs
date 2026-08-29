@@ -35,6 +35,13 @@ fn cline_mcp_settings_path() -> PathBuf {
         .join("cline_mcp_settings.json")
 }
 
+// Cline auto-discovers any .js/.ts file in `~/.cline/plugins/` and loads its
+// default/named-`plugin` export as an AgentExtension - no registry step, so
+// the `cline-plugin` component just drops the file there (see rule_text.rs).
+fn cline_plugin_dir() -> PathBuf {
+    home().join(".cline").join("plugins")
+}
+
 /// `doctor` builds a fresh `Component` list per host (6+ hosts by default),
 /// but these three checks each spawn a subprocess (`git`, `where`/`which`)
 /// and their result never depends on which host is being checked — spawning
@@ -771,11 +778,11 @@ pub fn get_components(host: &str) -> Vec<Component> {
         // opencode has no PreToolUse hook of its own to wire agentflare's
         // branch guard into (that's Claude-Code-only) -- it does auto-load
         // any plugin file dropped directly in `~/.config/opencode/plugin/`,
-        // so ship the same branch-guard classifier as a local plugin there.
+// so ship the same branch-guard classifier as a local plugin there.
         Component {
             id: "opencode-branch-guard",
             needs_consent: true,
-            describe: "opencode branch-guard plugin (~/.config/opencode/plugin/branch-guard.js) — blocks write/edit/patch on master/main via `agentflare hook pre-tool-use`".to_string(),
+            describe: "opencode branch-guard plugin (~/.config/opencode/plugin/branch-guard.js) - blocks write/edit/patch on master/main via `agentflare hook pre-tool-use`".to_string(),
             check: {
                 let host = host_owned.clone();
                 Box::new(move || host != "opencode" || opencode_plugin_dir().join("branch-guard.js").exists())
@@ -788,6 +795,36 @@ pub fn get_components(host: &str) -> Vec<Component> {
                     }
                     let path = opencode_plugin_dir().join("branch-guard.js");
                     if write_if_absent(&path, rule_text::OPENCODE_BRANCH_GUARD_JS) {
+                        format!("{} written", path.display())
+                    } else {
+                        format!("{} exists, skipped", path.display())
+                    }
+                })
+            },
+        },
+        // Cline has no file-hook channel for context injection (file PreToolUse
+        // hooks can only cancel the whole run) - but Cline auto-loads any
+        // .js/.ts dropped into ~/.cline/plugins/, so ship the same
+        // agentflare-hook shim as a plugin there: beforeModel prepends
+        // session-start context, beforeTool skips write/edit/patch on the
+        // protected branch with a model-visible reason, afterTool/afterRun
+        // forward post-tool-failure and session-end.
+        Component {
+            id: "cline-plugin",
+            needs_consent: true,
+            describe: "cline plugin (~/.cline/plugins/agentflare.js) - session-start context injection + write/edit/patch branch-guard via `agentflare hook`".to_string(),
+            check: {
+                let host = host_owned.clone();
+                Box::new(move || host != "cline" || cline_plugin_dir().join("agentflare.js").exists())
+            },
+            apply: {
+                let host = host_owned.clone();
+                Box::new(move || {
+                    if host != "cline" {
+                        return "not applicable for this host".to_string();
+                    }
+                    let path = cline_plugin_dir().join("agentflare.js");
+                    if write_if_absent(&path, rule_text::CLINE_PLUGIN_JS) {
                         format!("{} written", path.display())
                     } else {
                         format!("{} exists, skipped", path.display())
@@ -1081,6 +1118,7 @@ mod tests {
             "githooks",
             "claude-code-bashenv-guard",
             "opencode-branch-guard",
+            "cline-plugin",
             "leanctx",
             "agentflare-mcp",
             "optimize-code-mode",
@@ -1095,6 +1133,7 @@ mod tests {
             "githooks",
             "claude-code-bashenv-guard",
             "opencode-branch-guard",
+            "cline-plugin",
             "leanctx",
             "agentflare-mcp",
             "optimize-code-mode",
@@ -1612,6 +1651,30 @@ mod tests {
                 .iter()
                 .find(|c| c.id == "opencode-branch-guard")
                 .unwrap();
+            assert!((guard.check)());
+        });
+    }
+
+    #[test]
+    fn cline_plugin_check_then_apply_then_check() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("cline");
+            let guard = components.iter().find(|c| c.id == "cline-plugin").unwrap();
+            assert!(!(guard.check)());
+            (guard.apply)();
+            assert!((guard.check)());
+            assert_eq!(
+                fs::read_to_string(cline_plugin_dir().join("agentflare.js")).unwrap(),
+                rule_text::CLINE_PLUGIN_JS
+            );
+        });
+    }
+
+    #[test]
+    fn cline_plugin_is_satisfied_for_non_cline_hosts() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("claude-code");
+            let guard = components.iter().find(|c| c.id == "cline-plugin").unwrap();
             assert!((guard.check)());
         });
     }
