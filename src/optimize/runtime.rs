@@ -54,11 +54,10 @@ pub struct VerificationEvidence {
     pub ts: u64,
 }
 
-/// Evidence that a code review was actually requested in this session,
+/// Evidence that a code review actually *completed* in this session,
 /// captured by the `PostToolUse` success hook (`hook_completion_gate::post_tool_use`)
-/// when a `Skill`/`Task`/`Agent` call matches [`is_review_command`] -- the
-/// `/code-review` skill, or the `requesting-code-review` subagent-dispatch
-/// pattern (a fresh subagent reviewing `BASE_SHA..HEAD_SHA`). Unlike
+/// when the `ReportFindings` tool is called -- see [`is_review_completion`]
+/// for why that tool call, specifically, is the trigger. Unlike
 /// [`VerificationEvidence`] there's no pass/fail: review either ran or it
 /// didn't, and its findings are for the agent to act on, not this gate to
 /// judge.
@@ -192,35 +191,33 @@ pub fn has_fresh_passing_verification(record: &SessionRecord, now: u64) -> bool 
         .is_some_and(|v| v.passed && now.saturating_sub(v.ts) < VERIFICATION_FRESHNESS_SECS)
 }
 
-/// Tool names a code review can plausibly be requested through: agentflare's
-/// own `/code-review` skill (invoked via the `Skill` tool), or a subagent
-/// dispatch (`Task`/`Agent`) following superpowers' `requesting-code-review`
-/// pattern. Both casings included defensively, same convention as
-/// `hook_redirect`'s tool-name matching elsewhere in this codebase.
-const REVIEW_TOOL_NAMES: &[&str] = &["Skill", "skill", "Task", "task", "Agent", "agent"];
-
-/// Substrings (lowercased) marking a `Skill`/`Task`/`Agent` call's relevant
-/// text (skill name, or subagent prompt/description) as a code-review
-/// request -- deliberately broad, same false-positive-permissive tradeoff as
-/// [`VERIFICATION_COMMAND_MARKERS`].
-const REVIEW_MARKERS: &[&str] = &[
-    "code-review",
-    "code_review",
-    "code review",
-    "review the diff",
-    "review this diff",
-    "review this change",
-    "requesting-code-review",
-];
-
-/// True when `tool_name` is a review-capable tool ([`REVIEW_TOOL_NAMES`])
-/// and `text` (the skill name, or subagent prompt/description) looks like a
-/// code-review request per [`REVIEW_MARKERS`].
-pub fn is_review_command(tool_name: &str, text: &str) -> bool {
-    REVIEW_TOOL_NAMES.contains(&tool_name)
-        && REVIEW_MARKERS
-            .iter()
-            .any(|marker| text.to_lowercase().contains(marker))
+/// True when `tool_name` is the structural signal that a code review just
+/// *finished* being synthesized, not merely requested. Earlier revisions of
+/// this gate matched `Skill`/`Task`/`Agent` calls by scanning their prompt/
+/// skill-name text for review-shaped substrings -- rejected on review
+/// (item #182): a `Skill` call only means the skill's instructions were
+/// loaded into context, not that any review work happened yet, and `Task`/
+/// `Agent` dispatch in this harness is background-by-default, returning a
+/// task handle before the dispatched reviewer produces anything -- so both
+/// credited evidence at the wrong moment (dispatch, not completion), and the
+/// free-text scan on `Task`/`Agent` prompts/descriptions could be satisfied
+/// by a prompt that merely *mentions* review in passing.
+///
+/// `ReportFindings` is the one structural, harness-provided signal that
+/// doesn't have either problem: it's the tool this session's code-review
+/// flow calls once (and only once) it has actually examined the diff and
+/// ranked its findings -- calling it, even with an empty findings list,
+/// requires the review work to have already happened. This narrows
+/// automatic detection to review flows that report through this tool (this
+/// session's `/code-review` skill does); a subagent dispatched per
+/// superpowers' `requesting-code-review` pattern that only returns prose
+/// won't be picked up automatically -- there is no tool call visible to this
+/// hook that reliably marks "the dispatching agent read and acted on that
+/// subagent's findings" for a backgrounded dispatch. That's a real coverage
+/// gap, not a nice-to-have: acknowledged rather than papered over with a
+/// heuristic that reintroduces the same failure mode this rejects.
+pub fn is_review_completion(tool_name: &str) -> bool {
+    tool_name == "ReportFindings"
 }
 
 /// Whether `record` carries review evidence recent enough to satisfy the
@@ -694,34 +691,18 @@ mod tests {
     }
 
     #[test]
-    fn is_review_command_matches_code_review_skill_invocation() {
-        assert!(is_review_command("Skill", "code-review"));
-        assert!(is_review_command("skill", "code-review ultra"));
+    fn is_review_completion_matches_report_findings_tool() {
+        assert!(is_review_completion("ReportFindings"));
     }
 
     #[test]
-    fn is_review_command_matches_subagent_dispatch_prompt() {
-        assert!(is_review_command(
-            "Task",
-            "Review the diff between BASE_SHA and HEAD_SHA against the requirements"
-        ));
-        assert!(is_review_command(
-            "Agent",
-            "Please do a code review of this change"
-        ));
-    }
-
-    #[test]
-    fn is_review_command_ignores_unrelated_tool_names() {
-        // Same marker text through a tool that can't plausibly be a review
-        // request (e.g. Bash echoing the words) must not count.
-        assert!(!is_review_command("Bash", "code-review"));
-    }
-
-    #[test]
-    fn is_review_command_ignores_unrelated_skill_or_prompt_text() {
-        assert!(!is_review_command("Skill", "brainstorming"));
-        assert!(!is_review_command("Task", "fix the failing test"));
+    fn is_review_completion_ignores_dispatch_and_unrelated_tools() {
+        // Regression: PR #182 review -- Skill/Task/Agent dispatch must NOT
+        // count as review completion, only the ReportFindings call itself.
+        assert!(!is_review_completion("Skill"));
+        assert!(!is_review_completion("Task"));
+        assert!(!is_review_completion("Agent"));
+        assert!(!is_review_completion("Bash"));
     }
 
     #[test]

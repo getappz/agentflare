@@ -19,11 +19,6 @@ struct PostToolUseInput {
     /// response shape couldn't be read at all (unparseable/missing), so
     /// callers should treat `None` as "unknown", not "failed".
     item_success: Option<bool>,
-    /// Skill name (`Skill` calls) or subagent prompt/description
-    /// (`Task`/`Agent` calls) -- fed to `optimize::is_review_command` to
-    /// decide whether this call is a code-review request worth recording as
-    /// completion-gate evidence.
-    review_text: Option<String>,
 }
 
 /// Best-effort parse of a `tool_response` value into a JSON object,
@@ -138,15 +133,6 @@ fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
     let item_success = item_action
         .as_deref()
         .and_then(|action| item_action_succeeded(action, response));
-    let review_text = tool_input
-        .and_then(|ti| {
-            ti.get("skill")
-                .or_else(|| ti.get("prompt"))
-                .or_else(|| ti.get("description"))
-                .or_else(|| ti.get("task"))
-        })
-        .and_then(Value::as_str)
-        .map(String::from);
     Some(PostToolUseInput {
         session_id,
         tool_name,
@@ -155,7 +141,6 @@ fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
         output_text,
         item_action,
         item_success,
-        review_text,
     })
 }
 
@@ -226,14 +211,16 @@ fn shows_finishing_branch_menu(tool_name: &str, action: &str, item_success: Opti
 /// gaps from item #169's completion gate (extended to cover review evidence
 /// by item #182): (1) records verification evidence for the session when a
 /// Bash-family call's command matches `optimize::is_verification_command`;
-/// (2) records review evidence when a `Skill`/`Task`/`Agent` call matches
-/// `optimize::is_review_command` -- these two are the ONLY places their
-/// respective evidence is ever recorded, so `hook_redirect::completion_gate_reason`
-/// has something to check; (3) surfaces the finishing-a-development-branch
-/// decision menu once `item done`/`check_merge` actually succeeds; (4)
-/// invalidates any recorded verification/review evidence when a mutating
-/// tool (Write/Edit/MultiEdit/patch/ctx_patch/...) runs, so evidence from
-/// before this edit can't cover a since-changed tree.
+/// (2) records review evidence when the `ReportFindings` tool call succeeds
+/// (`optimize::is_review_completion` -- see its doc comment for why this,
+/// specifically, is the trigger rather than a `Skill`/`Task`/`Agent`
+/// dispatch) -- these two are the ONLY places their respective evidence is
+/// ever recorded, so `hook_redirect::completion_gate_reason` has something
+/// to check; (3) surfaces the finishing-a-development-branch decision menu
+/// once `item done`/`check_merge` actually succeeds; (4) invalidates any
+/// recorded verification/review evidence when a mutating tool (Write/Edit/
+/// MultiEdit/patch/ctx_patch/...) runs, so evidence from before this edit
+/// can't cover a since-changed tree.
 pub fn post_tool_use(_agent: &str) {
     let Some(input) = read_stdin_or_skip("PostToolUse") else {
         return;
@@ -268,9 +255,7 @@ pub fn post_tool_use(_agent: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    if let Some(text) = &parsed.review_text
-        && crate::optimize::is_review_command(&parsed.tool_name, text)
-    {
+    if crate::optimize::is_review_completion(&parsed.tool_name) {
         let mut runtime = crate::optimize::load_runtime();
         crate::optimize::prune_stale_sessions(&mut runtime, now);
         let record = runtime
@@ -284,7 +269,7 @@ pub fn post_tool_use(_agent: &str) {
                 last_review: None,
             });
         record.last_review = Some(crate::optimize::ReviewEvidence {
-            source: text.clone(),
+            source: parsed.tool_name.clone(),
             ts: now,
         });
         crate::optimize::save_runtime(&runtime);
@@ -344,30 +329,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_post_tool_use_reads_skill_name_as_review_text() {
-        let input = r#"{"session_id":"s1","tool_name":"Skill","tool_input":{"skill":"code-review"},"tool_response":{}}"#;
+    fn parse_post_tool_use_reads_report_findings_tool_name() {
+        let input = r#"{"session_id":"s1","tool_name":"ReportFindings","tool_input":{"findings":[]},"tool_response":{}}"#;
         let parsed = parse_post_tool_use(input).unwrap();
-        assert_eq!(parsed.review_text.as_deref(), Some("code-review"));
-    }
-
-    #[test]
-    fn parse_post_tool_use_reads_agent_prompt_as_review_text() {
-        let input = r#"{"session_id":"s1","tool_name":"Task","tool_input":{"prompt":"Review the diff BASE_SHA..HEAD_SHA"},"tool_response":{}}"#;
-        let parsed = parse_post_tool_use(input).unwrap();
-        assert_eq!(
-            parsed.review_text.as_deref(),
-            Some("Review the diff BASE_SHA..HEAD_SHA")
-        );
-    }
-
-    #[test]
-    fn parse_post_tool_use_falls_back_to_description_for_review_text() {
-        let input = r#"{"session_id":"s1","tool_name":"Agent","tool_input":{"description":"code review this branch"},"tool_response":{}}"#;
-        let parsed = parse_post_tool_use(input).unwrap();
-        assert_eq!(
-            parsed.review_text.as_deref(),
-            Some("code review this branch")
-        );
+        assert_eq!(parsed.tool_name, "ReportFindings");
     }
 
     #[test]

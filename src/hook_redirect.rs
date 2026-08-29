@@ -280,22 +280,28 @@ const GATED_ITEM_ACTIONS: &[&str] = &["done", "check_merge"];
 /// passing verification-evidence record (`crate::optimize::VerificationEvidence`,
 /// captured by the `PostToolUse` success hook when a test/build/lint command
 /// runs) AND a fresh review-evidence record (`crate::optimize::ReviewEvidence`,
-/// captured the same way when a `/code-review` skill call or a
-/// `requesting-code-review`-style subagent dispatch runs). Closes both the
-/// `verification-before-completion` gap from item #168's gap analysis and
-/// the review-before-completion gap from item #182: nothing previously
-/// stopped an agent from claiming "done"/opening a PR without having
-/// actually run tests, or requested a review, *now* -- evidence from earlier
-/// this session doesn't count once it goes stale (see
-/// `VERIFICATION_FRESHNESS_SECS`, reused as the review-freshness window
-/// too).
+/// captured the same way when the `ReportFindings` tool call succeeds --
+/// see `optimize::is_review_completion`'s doc comment for why review
+/// *completion*, not a `/code-review` skill or reviewer-subagent *dispatch*,
+/// is the trigger). Closes both the `verification-before-completion` gap
+/// from item #168's gap analysis and the review-before-completion gap from
+/// item #182: nothing previously stopped an agent from claiming "done"/
+/// opening a PR without having actually run tests, or had a review actually
+/// complete, *now* -- evidence from earlier this session doesn't count once
+/// it goes stale (see `VERIFICATION_FRESHNESS_SECS`, reused as the
+/// review-freshness window too).
 ///
 /// Applies to every caller of `item done`/`check_merge`, human or dispatched
 /// agent alike -- same as the pre-existing verification half of this gate,
-/// which draws no such distinction. A human calling `item done` directly
-/// already has to satisfy the verification gate; carving out an exemption
-/// here for the review half only would be a new, unrequested trust
-/// distinction, not a matching one.
+/// which draws no such distinction. This is an explicit judgment call, made
+/// during implementation as the task instructions asked, not a conclusion
+/// drawn from examining `work_item_pipeline.rs`'s own trust model: a human
+/// calling `item done` directly already has to satisfy the verification
+/// gate, so carving out an exemption here for the review half only would be
+/// a new, unrequested trust distinction. If that turns out wrong for how
+/// humans actually use this tool, narrowing this to SDD-dispatched calls
+/// only is a small, contained change (one more parameter here) -- flagged
+/// for the user to weigh in on rather than treated as settled.
 pub(crate) fn completion_gate_reason(
     tool_name: &str,
     tool_input: Option<&Value>,
@@ -317,7 +323,7 @@ pub(crate) fn completion_gate_reason(
     }
     if !has_fresh_review {
         return Some(format!(
-            "no fresh code review evidence for this session -- request one (the `/code-review` skill, or dispatch a reviewer subagent per superpowers' `requesting-code-review`) before calling `item` action={action}; a review more than {}m ago doesn't count.",
+            "no fresh code review evidence for this session -- run a review that reports through the `ReportFindings` tool (this session's `/code-review` skill does) before calling `item` action={action}; a review more than {}m ago doesn't count, and dispatching a reviewer subagent isn't enough on its own -- its findings have to actually come back and get reported.",
             crate::optimize::VERIFICATION_FRESHNESS_SECS / 60
         ));
     }
