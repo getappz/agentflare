@@ -71,6 +71,7 @@ impl AgentflareMcp {
         let artifact_hits = self.artifact_search_hits(q, None).unwrap_or_default();
 
         self.with_store(|store| -> Result<String, ErrorData> {
+            let store_start = std::time::Instant::now();
             // Similarity cache (AI Search § similarity cache) — 5 min TTL via store_kv; bypass when filters present
             let use_cache = req.meta.is_none() && req.path_glob.is_none() && req.min_score.is_none();
             if use_cache {
@@ -224,12 +225,18 @@ impl AgentflareMcp {
                 );
             }
 
-            let result = serde_json::json!({
+            let mut result = serde_json::json!({
                 "query": q,
                 "source": "store",
                 "total": grouped.values().map(|v| v.len()).sum::<usize>(),
                 "groups": grouped,
             });
+            // Automatic scale warning: >50k chunks + >100ms → suggest sqlite-vec ANN
+            let elapsed_ms = store_start.elapsed().as_millis();
+            if let Some(w) = store.scale_warning(&ws_id, elapsed_ms) {
+                result["warning"] = serde_json::json!(w);
+                result["elapsed_ms"] = serde_json::json!(elapsed_ms);
+            }
             Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
         })?
     }

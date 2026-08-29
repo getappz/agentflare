@@ -1,6 +1,7 @@
 use crate::Store;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
@@ -203,6 +204,51 @@ impl Store {
         rows.collect()
     }
 
+    /// Total chunk count (optionally per project) — used for scale warning.
+    pub fn chunk_count(&self, project_id: Option<&str>) -> rusqlite::Result<usize> {
+        let conn = self.conn();
+        let n: i64 = if let Some(pid) = project_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM store_doc_chunks c JOIN store_documents d ON d.id = c.doc_id WHERE d.project_id = ?1 AND d.deleted_at IS NULL",
+                params![pid],
+                |r| r.get(0),
+            )?
+        } else {
+            conn.query_row("SELECT COUNT(*) FROM store_doc_chunks", [], |r| r.get(0))?
+        };
+        Ok(n as usize)
+    }
+
+    /// Pure predicate for scale warning — testable without DB.
+    pub fn should_warn(count: usize, elapsed_ms: u128) -> bool {
+        count > 50_000 && elapsed_ms > 100
+    }
+
+    /// Scale warning: >50k chunks + >100ms query → suggest sqlite-vec ANN.
+    /// Returns warning string if triggered, else None. Logs to stderr + tracing.
+    pub fn scale_warning(&self, project_id: &str, elapsed_ms: u128) -> Option<String> {
+        let count = self.chunk_count(Some(project_id)).ok()?;
+        if Self::should_warn(count, elapsed_ms) {
+            let msg = format!(
+                "scale warning: {} chunks in project '{}', query took {}ms (>100ms threshold) — consider enabling sqlite-vec vec0 ANN (cargo feature `vector`) for sub-10ms vector search",
+                count, project_id, elapsed_ms
+            );
+            eprintln!("⚠️  {}", msg);
+            return Some(msg);
+        }
+        // Also check global count for cross-project total
+        let global = self.chunk_count(None).ok()?;
+        if Self::should_warn(global, elapsed_ms) {
+            let msg = format!(
+                "scale warning: {} total chunks, query took {}ms (>100ms) — enable sqlite-vec ANN",
+                global, elapsed_ms
+            );
+            eprintln!("⚠️  {}", msg);
+            return Some(msg);
+        }
+        None
+    }
+
     /// Chunk-level BM25 search — returns `DocMatch` per chunk but deduplicated
     /// to best chunk per doc (so callers still get doc-level ranking).
     pub fn chunk_search(
@@ -211,43 +257,49 @@ impl Store {
         query: &str,
         limit: usize,
     ) -> rusqlite::Result<Vec<DocMatch>> {
-        let conn = self.conn();
-        let fts_query = flare_search_kit::fts_phrase_query(query);
-        let mut stmt = conn.prepare(
-            "SELECT d.id, d.project_id, d.path,
-                    snippet(store_chunks_fts, 0, '<b>', '</b>', '...', 48) AS snip,
-                    rank, c.chunk_index
-             FROM store_chunks_fts
-             JOIN store_doc_chunks c ON c.rowid = store_chunks_fts.rowid
-             JOIN store_documents d ON d.id = c.doc_id
-             WHERE store_chunks_fts MATCH ?1
-               AND d.project_id = ?2
-               AND d.deleted_at IS NULL
-             ORDER BY rank
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![fts_query, project_id, (limit * 2) as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3).unwrap_or_default(),
-                row.get::<_, f64>(4)?,
-                row.get::<_, i64>(5)?,
-            ))
-        })?;
-        // Deduplicate to first (best-ranked) chunk per doc; FTS rank is per-chunk.
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for r in rows {
-            let (id, pid, path, snip, rank, _) = r?;
-            if seen.insert(id.clone()) {
-                out.push(DocMatch { id, project_id: pid, path, snippet: snip, score: -rank });
-                if out.len() >= limit {
-                    break;
+        let start = Instant::now();
+        let out = {
+            let conn = self.conn();
+            let fts_query = flare_search_kit::fts_phrase_query(query);
+            let mut stmt = conn.prepare(
+                "SELECT d.id, d.project_id, d.path,
+                        snippet(store_chunks_fts, 0, '<b>', '</b>', '...', 48) AS snip,
+                        rank, c.chunk_index
+                 FROM store_chunks_fts
+                 JOIN store_doc_chunks c ON c.rowid = store_chunks_fts.rowid
+                 JOIN store_documents d ON d.id = c.doc_id
+                 WHERE store_chunks_fts MATCH ?1
+                   AND d.project_id = ?2
+                   AND d.deleted_at IS NULL
+                 ORDER BY rank
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![fts_query, project_id, (limit * 2) as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3).unwrap_or_default(),
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+            // Deduplicate to first (best-ranked) chunk per doc; FTS rank is per-chunk.
+            let mut seen = std::collections::HashSet::new();
+            let mut tmp = Vec::new();
+            for r in rows {
+                let (id, pid, path, snip, rank, _) = r?;
+                if seen.insert(id.clone()) {
+                    tmp.push(DocMatch { id, project_id: pid, path, snippet: snip, score: -rank });
+                    if tmp.len() >= limit {
+                        break;
+                    }
                 }
             }
-        }
+            tmp
+        };
+        let elapsed = start.elapsed().as_millis();
+        self.scale_warning(project_id, elapsed);
         Ok(out)
     }
 
@@ -260,62 +312,68 @@ impl Store {
         query_vec: &[f32],
         limit: usize,
     ) -> rusqlite::Result<Vec<DocMatch>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT d.id, d.project_id, d.path, v.embedding, c.content
-             FROM store_chunk_vec v
-             JOIN store_doc_chunks c ON c.id = v.chunk_id
-             JOIN store_documents d ON d.id = c.doc_id
-             WHERE d.project_id = ?1 AND d.deleted_at IS NULL",
-        )?;
-        let rows: Vec<(String, String, String, Vec<u8>, String)> = stmt
-            .query_map(params![project_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut results: Vec<(f64, DocMatch)> = rows
-            .into_iter()
-            .filter_map(|(id, pid, path, blob, content)| {
-                if blob.len() % 4 != 0 {
-                    return None;
-                }
-                let doc_vec: Vec<f32> = blob
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|c| f32::from_le_bytes(*c))
-                    .collect();
-                let sim = crate::embed::cosine_similarity(query_vec, &doc_vec)? as f64;
-                // Use first 200 chars of chunk as snippet for vector hits
-                let snippet = if content.len() > 200 {
-                    format!("{}...", &content[..200])
-                } else {
-                    content.clone()
-                };
-                Some((
-                    sim,
-                    DocMatch {
-                        id,
-                        project_id: pid,
-                        path,
-                        snippet,
-                        score: sim,
-                    },
-                ))
-            })
-            .collect();
-        results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        // Deduplicate to best chunk per doc (vector hits are per-chunk)
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for (_, m) in results {
-            if seen.insert(m.id.clone()) {
-                out.push(m);
-                if out.len() >= limit {
-                    break;
+        let start = Instant::now();
+        let out = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(
+                "SELECT d.id, d.project_id, d.path, v.embedding, c.content
+                 FROM store_chunk_vec v
+                 JOIN store_doc_chunks c ON c.id = v.chunk_id
+                 JOIN store_documents d ON d.id = c.doc_id
+                 WHERE d.project_id = ?1 AND d.deleted_at IS NULL",
+            )?;
+            let rows: Vec<(String, String, String, Vec<u8>, String)> = stmt
+                .query_map(params![project_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut results: Vec<(f64, DocMatch)> = rows
+                .into_iter()
+                .filter_map(|(id, pid, path, blob, content)| {
+                    if blob.len() % 4 != 0 {
+                        return None;
+                    }
+                    let doc_vec: Vec<f32> = blob
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c))
+                        .collect();
+                    let sim = crate::embed::cosine_similarity(query_vec, &doc_vec)? as f64;
+                    // Use first 200 chars of chunk as snippet for vector hits
+                    let snippet = if content.len() > 200 {
+                        format!("{}...", &content[..200])
+                    } else {
+                        content.clone()
+                    };
+                    Some((
+                        sim,
+                        DocMatch {
+                            id,
+                            project_id: pid,
+                            path,
+                            snippet,
+                            score: sim,
+                        },
+                    ))
+                })
+                .collect();
+            results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            // Deduplicate to best chunk per doc (vector hits are per-chunk)
+            let mut seen = std::collections::HashSet::new();
+            let mut tmp = Vec::new();
+            for (_, m) in results {
+                if seen.insert(m.id.clone()) {
+                    tmp.push(m);
+                    if tmp.len() >= limit {
+                        break;
+                    }
                 }
             }
-        }
+            tmp
+        };
+        let elapsed = start.elapsed().as_millis();
+        self.scale_warning(project_id, elapsed);
         Ok(out)
     }
 
