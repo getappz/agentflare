@@ -390,8 +390,12 @@ pub fn reclaim_scoped(
         }
         let path = Path::new(&lane.path);
         if path.exists() {
-            if let Err(e) = crate::snapshot::snapshot_before(
+            // Snapshot the lane's OWN contents: `snapshot_before(repo_root)`
+            // stages from the main checkout, where `.worktrees/` is excluded,
+            // so it captured nothing of the directory about to be deleted.
+            if let Err(e) = crate::snapshot::snapshot_worktree_before(
                 repo_root,
+                path,
                 &format!("doctor reclaim {}", lane.name),
             ) {
                 eprintln!(

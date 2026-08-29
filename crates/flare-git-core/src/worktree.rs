@@ -409,9 +409,18 @@ pub fn create_worktree(
         // unconditionally refuses to check out a branch git still considers
         // checked out elsewhere ("already checked out" / prunable registration
         // -- confirmed live on item #331, regenerating on every dispatch
-        // attempt without this). Prune first so a stale registration for this
-        // branch never survives to block reuse.
-        crate::shell::prune_worktree_metadata_if(repo_root, true);
+        // attempt without this). Clear that registration first so it never
+        // survives to block reuse.
+        //
+        // Deliberately NOT `git worktree prune`: prune is repo-wide, and it
+        // drops the admin entry of ANY worktree whose `gitdir` file points
+        // somewhere non-existent -- even one whose directory is fully intact
+        // and holds uncommitted work. That turned one item's failed-dispatch
+        // retry into another item's data loss: the victim's `.git` pointer
+        // became dangling, `audit_orphans` then classified it as a broken-
+        // gitdir orphan, and `gc_orphans` deleted it. Scope the cleanup to
+        // this branch's own stale registration instead.
+        remove_stale_registration_for(repo_root, &branch);
         // Check it out as-is, no `-b` -- git auto-creates the local tracking
         // branch when only the remote-tracking ref exists, same as `git
         // checkout <branch>`.
@@ -501,6 +510,60 @@ pub fn create_worktree(
             Err(msg)
         }
     }
+}
+
+/// Removes the stale `.git/worktrees/<name>` admin entry that claims
+/// `branch`, if there is one. Returns whether anything was removed.
+///
+/// This is the narrow, per-branch equivalent of `git worktree prune`, and
+/// exists because prune's blast radius is the whole repo. Prune deletes the
+/// admin entry of *every* registration whose `gitdir` file points at a
+/// missing path — including a worktree that is still fully present on disk
+/// with uncommitted work in it, whose admin entry merely went stale (a
+/// moved checkout, an interrupted operation, or a Windows path/locking
+/// hiccup). The victim is left with a dangling `.git` pointer, which
+/// `audit_orphans` reads as "broken gitdir" and `gc_orphans` then deletes.
+///
+/// Two guards keep this scoped: only registrations whose `HEAD` names
+/// `branch` are considered, and only ones whose checkout directory is
+/// actually gone. A registration pointing at a live directory is never
+/// touched, so another item's worktree can never be collateral damage.
+fn remove_stale_registration_for(repo_root: &Path, branch: &str) -> bool {
+    let Ok(common_dir) = run_git_in(repo_root, &["rev-parse", "--git-common-dir"]) else {
+        return false;
+    };
+    let admin_root = repo_root.join(common_dir.trim()).join("worktrees");
+    let Ok(entries) = std::fs::read_dir(&admin_root) else {
+        return false;
+    };
+    let wanted_head = format!("ref: refs/heads/{branch}");
+    let mut removed = false;
+    for entry in entries.flatten() {
+        let admin = entry.path();
+        if !admin.is_dir() {
+            continue;
+        }
+        // Does this registration claim our branch?
+        let head = std::fs::read_to_string(admin.join("HEAD")).unwrap_or_default();
+        if head.trim() != wanted_head {
+            continue;
+        }
+        // `gitdir` holds "<checkout>/.git" -- its parent is the checkout.
+        // Preserve the registration if that directory still exists (or if
+        // the file is unreadable): fail closed, since removing a live
+        // worktree's registration is the exact harm this function avoids.
+        let gitdir = std::fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
+        let still_live = std::path::Path::new(gitdir.trim())
+            .parent()
+            .is_none_or(std::path::Path::exists);
+        if still_live {
+            continue;
+        }
+        if std::fs::remove_dir_all(&admin).is_ok() {
+            removed = true;
+        }
+    }
+    removed
 }
 
 /// Kills `child` and its whole process tree — not just the direct child —
@@ -981,7 +1044,9 @@ pub fn gc_orphans(repo_root: &Path, names: &[String]) -> Vec<String> {
         // point a destructive delete has; deleting anyway would defeat the
         // whole point of snapshotting first.
         let reason = format!("gc orphan worktree {}", name);
-        if let Err(e) = crate::snapshot::snapshot_before(repo_root, &reason) {
+        if let Err(e) =
+            crate::snapshot::snapshot_worktree_before(repo_root, &worktree_path, &reason)
+        {
             eprintln!(
                 "worktree: skipping orphan '{}', snapshot failed: {}",
                 name, e

@@ -27,11 +27,14 @@ pub struct SnapshotMeta {
 
 /// `git <args>` with a temporary `GIT_INDEX_FILE`, so staging for a
 /// snapshot never touches the caller's real index.
-fn run_git_with_index(
-    repo_root: &Path,
-    index_file: &Path,
-    args: &[&str],
-) -> Result<String, String> {
+///
+/// `cwd` is the directory git runs in. It is the repo root for a plain
+/// repo-root snapshot, but `snapshot_worktree_before` points it at the
+/// worktree being captured instead — `git add -A` resolves pathspecs
+/// against the current directory, so running it from the repo root with
+/// only `--work-tree` set makes git refuse the paths as outside the
+/// repository.
+fn run_git_with_index(cwd: &Path, index_file: &Path, args: &[&str]) -> Result<String, String> {
     // A snapshot must capture exactly what's on disk right now -- `-c
     // core.autocrlf=false` stops git silently converting line endings
     // while staging, regardless of the caller's ambient/global git config
@@ -39,7 +42,7 @@ fn run_git_with_index(
     let mut cmd = Command::new(crate::shell::git_binary());
     cmd.args(["-c", "core.autocrlf=false"])
         .args(args)
-        .current_dir(repo_root)
+        .current_dir(cwd)
         .env("GIT_INDEX_FILE", index_file);
     crate::shell::apply_filtered_path(&mut cmd);
     let out = cmd
@@ -81,6 +84,72 @@ pub fn snapshot_before(repo_root: &Path, reason: &str) -> Result<SnapshotId, Str
     })();
     let _ = std::fs::remove_file(&tmp_index);
     result
+}
+
+/// Snapshots a *linked worktree's* contents into the main repo's object
+/// store, returning a recoverable commit under the private snapshot ref.
+///
+/// [`snapshot_before`] cannot do this job: it stages from `repo_root`, and
+/// `ensure_worktrees_ignored` puts `.worktrees/` in `.git/info/exclude`, so
+/// `git add -A` there captures exactly nothing of the worktree about to be
+/// deleted. Every "snapshot first, then remove" call site was therefore
+/// writing an empty safety net and destroying uncommitted work anyway.
+///
+/// Works even when the worktree's own `.git` pointer is broken (the
+/// orphan case): the object store is addressed explicitly via `--git-dir`
+/// on the main repo rather than discovered from the worktree. The
+/// worktree's own `.gitignore` still applies, so build artifacts
+/// (`target/`) and the generated `.cargo/` stay out of the snapshot.
+///
+/// The commit is deliberately parentless — the worktree's branch tip is
+/// not necessarily its content's ancestor (a broken-gitdir worktree may
+/// not have a resolvable branch at all), and recovery only needs the tree.
+pub fn snapshot_worktree_before(
+    repo_root: &Path,
+    worktree_path: &Path,
+    reason: &str,
+) -> Result<SnapshotId, String> {
+    if !worktree_path.exists() {
+        return Err(format!(
+            "worktree path does not exist: {}",
+            worktree_path.display()
+        ));
+    }
+    let common_dir = resolve_common_dir(repo_root);
+    let tmp_index = common_dir.join(format!(
+        "agentflare-worktree-snapshot-index-{}",
+        std::process::id()
+    ));
+    let git_dir = common_dir.to_string_lossy().to_string();
+    let result = (|| {
+        let stage_args = ["--git-dir", &git_dir, "add", "-A", "."];
+        run_git_with_index(worktree_path, &tmp_index, &stage_args)?;
+        let tree = run_git_with_index(
+            worktree_path,
+            &tmp_index,
+            &["--git-dir", &git_dir, "write-tree"],
+        )?;
+        let sha = run_in(repo_root, &["commit-tree", &tree, "-m", reason])?;
+        let refname = format!("{SNAPSHOT_REF_PREFIX}{sha}");
+        run_in(repo_root, &["update-ref", &refname, &sha])?;
+        Ok(SnapshotId(sha))
+    })();
+    let _ = std::fs::remove_file(&tmp_index);
+    result
+}
+
+/// Absolute path to the repo's common git dir — the shared `.git` of the
+/// main checkout, which is where linked worktrees' objects and admin
+/// entries actually live. Falls back to `<repo_root>/.git` when git can't
+/// answer, matching this module's best-effort style.
+fn resolve_common_dir(repo_root: &Path) -> std::path::PathBuf {
+    match run_in(
+        repo_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p.trim()),
+        _ => repo_root.join(".git"),
+    }
 }
 
 /// Checks out `commit_ish`'s tracked files into the current working tree and
