@@ -109,3 +109,51 @@ pub fn try_rerank(query: &str, docs: Vec<String>) -> Option<Vec<(String, f32)>> 
 pub fn try_rerank(_query: &str, _docs: Vec<String>) -> Option<Vec<(String, f32)>> {
     None
 }
+
+/// Local query rewriting (AI Search § query rewriting, local variant).
+/// Without LLM, we do lightweight normalization: trim, lowercased variant,
+/// and for sparse model available, SPLADE expansion (top lexical tokens).
+/// Returns `Some(expanded)` if rewriting adds value, else `None` → keep original.
+pub fn try_rewrite_query(query: &str) -> Option<String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    // Rule-based: if query contains uppercase, add lowercased variant for case-insensitive recall
+    let lower = q.to_lowercase();
+    if lower != q {
+        // Keep original plus lowercased (FTS is case-insensitive but this helps vector side)
+        return Some(format!("{q} {lower}"));
+    }
+    // Sparse SPLADE expansion when embeddings feature + model cached
+    #[cfg(feature = "embeddings")]
+    {
+        if let Some(expanded) = try_sparse_expand(q) {
+            if expanded != q {
+                return Some(expanded);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "embeddings")]
+fn try_sparse_expand(query: &str) -> Option<String> {
+    use fastembed::{SparseInitOptions, SparseModel, SparseTextEmbedding};
+    use std::sync::OnceLock;
+    static SPARSE_MODEL: OnceLock<std::sync::Mutex<Option<SparseTextEmbedding>>> = OnceLock::new();
+    let cell = SPARSE_MODEL.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = cell.lock().ok()?;
+    if guard.is_none() {
+        match SparseTextEmbedding::try_new(SparseInitOptions::new(SparseModel::SPLADEPPV1)) {
+            Ok(m) => *guard = Some(m),
+            Err(_) => return None,
+        }
+    }
+    let model = guard.as_mut()?;
+    // Embed query, get sparse indices → map to tokens via tokenizer vocab? For now, just return original
+    // SPLADE indices are vocab ids; detokenizing requires vocab lookup which fastembed doesn't expose directly.
+    // Keep as no-op until we vendor vocab map — fallback to rule-based above.
+    let _ = model.embed(vec![query], None).ok()?;
+    None
+}

@@ -53,6 +53,10 @@ impl AgentflareMcp {
             return Err(ErrorData::invalid_params("query must not be empty", None));
         }
         let limit = req.limit.unwrap_or(20);
+        // Local query rewriting (AI Search § query rewriting, local rule-based + sparse)
+        let effective_q = agentflare_store::fastembed::try_rewrite_query(q)
+            .unwrap_or_else(|| q.to_string());
+        let fts_q_raw = effective_q.as_str();
 
         let ws_id = match self.with_backend_db(Self::resolve_workspace_id) {
             Ok(Ok(id)) => id,
@@ -92,7 +96,7 @@ impl AgentflareMcp {
             }
             // ponytail: no valid FTS5 tokens (e.g. query is only quote chars) -- return
             // no matches instead of falling back to the unsanitized raw query.
-            let Some(fts_q) = fts_query(q, Default::default()) else {
+            let Some(fts_q) = fts_query(fts_q_raw, Default::default()) else {
                 let result = serde_json::json!({
                     "query": q,
                     "source": "store",
@@ -106,7 +110,7 @@ impl AgentflareMcp {
             let matches = if req.meta.is_some() || req.path_glob.is_some() {
                 let meta_vec: Option<Vec<(String, String)>> = req.meta.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
                 let mut hits = store
-                    .doc_search_filtered(&ws_id, q, limit, meta_vec.as_deref(), req.path_glob.as_deref())
+                    .doc_search_filtered(&ws_id, fts_q_raw, limit, meta_vec.as_deref(), req.path_glob.as_deref())
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 if let Some(min) = req.min_score {
                     hits.retain(|m| m.score >= min);
@@ -117,16 +121,16 @@ impl AgentflareMcp {
                 let doc_hits = store
                     .doc_search(&ws_id, &fts_q, limit)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                let chunk_hits = {
-                    let qvec = agentflare_store::fastembed::try_embed(q);
-                    if let Some(ref vec) = qvec {
-                        store
-                            .chunk_hybrid_search(&ws_id, q, Some(vec), limit)
-                            .unwrap_or_else(|_| store.chunk_search(&ws_id, q, limit).unwrap_or_default())
-                    } else {
-                        store.chunk_search(&ws_id, q, limit).unwrap_or_default()
-                    }
-                };
+            let chunk_hits = {
+                let qvec = agentflare_store::fastembed::try_embed(fts_q_raw);
+                if let Some(ref vec) = qvec {
+                    store
+                        .chunk_hybrid_search(&ws_id, fts_q_raw, Some(vec), limit)
+                        .unwrap_or_else(|_| store.chunk_search(&ws_id, fts_q_raw, limit).unwrap_or_default())
+                } else {
+                    store.chunk_search(&ws_id, fts_q_raw, limit).unwrap_or_default()
+                }
+            };
                 let mut out = if chunk_hits.is_empty() {
                     doc_hits
                 } else if doc_hits.is_empty() {
