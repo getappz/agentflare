@@ -1,49 +1,30 @@
 // Split out of `work.rs` to keep that file under the LOC gate.
 
-/// Serializes the "chdir into the item's worktree -> run `f` -> restore
-/// cwd" span against concurrent dispatch. `set_current_dir` mutates the
-/// whole PROCESS's cwd, not per-thread, but `WorkItemExecutor` dispatches
-/// jobs concurrently (`work_max_concurrency`) -- without this lock, two
-/// jobs racing here can have one item's pipeline run against a *different*
-/// item's worktree (observed live, twice, with two different item pairs).
-/// Same mitigation shape as `flare_git_core::worktree::WORKTREE_ADD_LOCK`;
-/// only this span is serialized, not the whole worker pool.
+/// Validates that `wpath` is enterable, then runs `f`.
 ///
-/// Returns `Err` if `wpath` itself can't be entered; otherwise `Ok` with
-/// whatever `f` returned.
+/// This used to chdir the whole process into `wpath` around `f`, serialized
+/// by a process-wide mutex: `std::env::set_current_dir` mutates the whole
+/// PROCESS's cwd, not per-thread, and `WorkItemExecutor` dispatches jobs
+/// concurrently (`work_max_concurrency`), so two jobs racing an unguarded
+/// chdir here were observed live, twice, running one item's pipeline
+/// against a *different* item's worktree. That's no longer a risk (item
+/// #205): every git/agent spawn this pipeline reaches now takes its
+/// directory explicitly instead of relying on the ambient cwd --
+/// `agent_launch::run_headless_impl`'s `Command::current_dir`,
+/// `flare_git_core::shell::run_in`/`diff`/`run_in_lines_bounded`, and
+/// `worktree::{head_sha,commit_uncommitted_at,squash_since}` are all passed
+/// the worktree path directly. Removing the chdir (and its lock) lets
+/// concurrent dispatches actually run their pipelines in parallel, which is
+/// what `work_max_concurrency` was already sized for.
+///
+/// Returns `Err` if `wpath` doesn't exist or isn't a directory; otherwise
+/// `Ok` with whatever `f` returned.
 fn run_in_worktree<T>(wpath: &std::path::Path, f: impl FnOnce() -> T) -> Result<T, String> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // Contended case only (uncontended is the common path and would just be
-    // noise): this span can run for minutes to hours (it wraps the whole
-    // headless agent turn), so a queued item's dispatch thread can otherwise
-    // sit silent for that entire time with no way to tell "waiting on
-    // another item's turn" apart from "actually hung" -- exactly the
-    // ambiguity that made a real, still-running dispatch look indistinguishable
-    // from a stuck one from the daemon logs / per-job log file alone.
-    let _guard = match LOCK.try_lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            let waited_since = std::time::Instant::now();
-            eprintln!(
-                "agentflare-work: waiting for worktree-cwd lock -- another dispatched item is still running its pipeline, {} is queued behind it",
-                wpath.display()
-            );
-            let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            eprintln!(
-                "agentflare-work: acquired worktree-cwd lock for {} after waiting {:?}",
-                wpath.display(),
-                waited_since.elapsed()
-            );
-            guard
-        }
-    };
-    let original_dir = std::env::current_dir().ok();
-    if std::env::set_current_dir(wpath).is_err() {
-        return Err(format!("failed to chdir into {}", wpath.display()));
+    if !wpath.is_dir() {
+        return Err(format!(
+            "worktree path {} does not exist or is not a directory",
+            wpath.display()
+        ));
     }
-    let result = f();
-    if let Some(d) = original_dir {
-        let _ = std::env::set_current_dir(d);
-    }
-    Ok(result)
+    Ok(f())
 }

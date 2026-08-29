@@ -62,12 +62,10 @@ fn run_dispatch_fixture(
          extra_args| {
             // Something real to commit -- otherwise `finalize`'s
             // `item_done` sees a never-diverged branch and treats the
-            // run as a no-op instead of a completion.
-            std::fs::write(
-                std::env::current_dir().unwrap().join("real_work.txt"),
-                "real work",
-            )
-            .unwrap();
+            // run as a no-op instead of a completion. `worktree_path` is
+            // this item's actual worktree; the pipeline no longer chdirs
+            // the process into it (item #205), so write there explicitly.
+            std::fs::write(worktree_path.join("real_work.txt"), "real work").unwrap();
             let _ = (timeout, idle_timeout, extra_args);
             crate::work_item_pipeline::run_or_resume_with_sender(
                 mcp,

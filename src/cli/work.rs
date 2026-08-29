@@ -925,10 +925,10 @@ fn execute_work_impl(
         resolved_model.as_deref(),
     );
 
-    // --- Run the sdd_loop -> finalize pipeline inside the worktree; the
-    // chdir must stay in effect for the whole call, not just one turn --
-    // `sdd_loop` reads/commits real files every iteration of a resumed run.
-    // `run_in_worktree` serializes this against a concurrent item's chdir. ---
+    // --- Run the sdd_loop -> finalize pipeline against the worktree.
+    // `run_in_worktree` just validates `wpath` is enterable -- the pipeline
+    // itself takes `wpath` explicitly rather than relying on process cwd,
+    // so concurrent dispatches (item #205) don't need to serialize here. ---
     let result = match run_in_worktree(wpath, || {
         run_pipeline(
             mcp.clone(),
