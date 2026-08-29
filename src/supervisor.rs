@@ -582,16 +582,22 @@ pub(crate) fn run_review_sweep(
             label_id_by_name,
         } = batch;
         let repo_root = std::path::PathBuf::from(&folder_path);
-        if let (Some(repo), Ok(client)) = (
+        // Resolved once per project and reused for discovery, the batched
+        // GraphQL fetch below, and (implicitly, inside `pr_ci_status`) the
+        // per-item REST fallback -- rather than every one of those re-doing
+        // the same remote/credential resolution, as the old one-call-per-item
+        // loop used to via its own internal `pr_ci_status` call.
+        let resolved = (
             crate::github::RepoId::resolve_from_remote(&repo_root),
             crate::github::Client::new(),
-        ) {
+        );
+        if let (Some(repo), Ok(client)) = &resolved {
             let discovered = mcp
                 .with_backend_db(|conn| {
                     crate::worktree::discover_untracked_prs(
                         conn,
-                        &client,
-                        &repo,
+                        client,
+                        repo,
                         &project_id,
                         &in_review_state_id,
                         &known_pr_numbers,
@@ -601,61 +607,148 @@ pub(crate) fn run_review_sweep(
                 .unwrap_or(0);
             result.discovered += discovered;
         }
+
+        // Items carrying `metadata.pr.number` (set by `push_and_open_pr` at
+        // PR-creation time) are batched into a handful of GraphQL queries
+        // instead of one REST call each -- see `github::graphql`'s doc
+        // comment for the rate-limit math this avoids. Only items that
+        // predate that field fall back to the old one-REST-call-per-item
+        // path below, which also carries the branch-name-heuristic lookup
+        // those items still need.
+        let mut numbered: Vec<(&agentflare_backend::item::Item, u64)> = Vec::new();
+        let mut unnumbered: Vec<&agentflare_backend::item::Item> = Vec::new();
         for item in &items {
-            match crate::worktree::pr_ci_status(item, &repo_root) {
-                crate::worktree::PrCiStatus::Merged => {
-                    if promote_merged_item(mcp, item) {
-                        result.promoted += 1;
-                    } else {
-                        result.skipped += 1;
-                    }
-                }
-                crate::worktree::PrCiStatus::Failing(failed_checks) => {
-                    match self_repair_or_gate(
-                        mcp,
-                        queue,
-                        auth_conn,
-                        host_policy,
-                        item,
-                        &failed_checks,
-                        &label_id_by_name,
-                        &folder_path,
-                    ) {
-                        SelfRepairOutcome::Dispatched => result.self_repaired += 1,
-                        SelfRepairOutcome::Deferred => result.waiting += 1,
-                        SelfRepairOutcome::Skipped => result.skipped += 1,
-                    }
-                }
-                crate::worktree::PrCiStatus::Passing { number, labels } => {
-                    if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) && first_time_gated(&item.id)
-                    {
-                        notify_human_gate(
-                            item,
-                            &format!(
-                                "PR #{number} is CI-green and mergeable, awaiting `{PR_APPROVAL_LABEL}`"
-                            ),
-                        );
-                    }
-                    if merge_if_approved(mcp, item, &repo_root, number, &labels) {
-                        result.promoted += 1;
-                    } else {
-                        result.skipped += 1;
-                    }
-                }
-                crate::worktree::PrCiStatus::Behind { number } => {
-                    if crate::worktree::update_stale_branch(&repo_root, number) {
-                        result.updated += 1;
-                    } else {
-                        result.skipped += 1;
-                    }
-                }
-                crate::worktree::PrCiStatus::Pending | crate::worktree::PrCiStatus::Unknown => {
-                    result.skipped += 1;
-                }
+            match crate::worktree::pr_number_from_metadata(item) {
+                Some(number) => numbered.push((item, number)),
+                None => unnumbered.push(item),
             }
+        }
+
+        let batch_data = if let (Some(repo), Ok(client)) = &resolved {
+            let numbers: Vec<u64> = numbered.iter().map(|(_, n)| *n).collect();
+            crate::github::graphql::batch_pr_status_chunked(client, repo, &numbers)
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        for (item, number) in numbered {
+            // A PR number missing from `batch_data` (query failed for its
+            // chunk, or GitHub couldn't resolve that PR) is treated exactly
+            // like any other soft-fail: `Unknown`, polled again next tick --
+            // never an error for the whole sweep.
+            let status = match batch_data.get(&number) {
+                Some(data) => crate::worktree::pr_ci_status_from_batch(number, data),
+                None => crate::worktree::PrCiStatus::Unknown,
+            };
+            handle_pr_status(
+                mcp,
+                queue,
+                auth_conn,
+                host_policy,
+                item,
+                status,
+                &label_id_by_name,
+                &folder_path,
+                &repo_root,
+                &mut result,
+            );
+        }
+        for item in unnumbered {
+            let status = crate::worktree::pr_ci_status(item, &repo_root);
+            handle_pr_status(
+                mcp,
+                queue,
+                auth_conn,
+                host_policy,
+                item,
+                status,
+                &label_id_by_name,
+                &folder_path,
+                &repo_root,
+                &mut result,
+            );
         }
     }
     result
+}
+
+/// Acts on one item's already-fetched `PrCiStatus`, however it was fetched --
+/// batched via GraphQL or singly via REST. Split out of `run_review_sweep`'s
+/// loop so both fetch paths (`numbered`/`unnumbered` above) drive the exact
+/// same decision-and-mutate logic instead of two copies that could drift.
+///
+/// Every mutating branch here (`promote_merged_item`, `merge_if_approved`,
+/// `update_stale_branch`) makes its own live GitHub call as the actual
+/// authority, regardless of how stale `status` (a point-in-time snapshot,
+/// batched or not) might be by the time this runs -- a rejection from that
+/// live call (already merged, already up to date, no longer mergeable) falls
+/// through to `skipped` rather than erroring, so acting on a stale snapshot
+/// is always safe. `self_repair_or_gate` additionally re-checks claim
+/// liveness before dispatching, guarding the one branch here that starts new
+/// work rather than just re-attempting an idempotent GitHub operation.
+#[allow(clippy::too_many_arguments)]
+fn handle_pr_status(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    auth_conn: &rusqlite::Connection,
+    host_policy: agentflare_resource_gate::Policy,
+    item: &agentflare_backend::item::Item,
+    status: crate::worktree::PrCiStatus,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+    folder_path: &str,
+    repo_root: &std::path::Path,
+    result: &mut ReviewSweepResult,
+) {
+    match status {
+        crate::worktree::PrCiStatus::Merged => {
+            if promote_merged_item(mcp, item) {
+                result.promoted += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
+        crate::worktree::PrCiStatus::Failing(failed_checks) => {
+            match self_repair_or_gate(
+                mcp,
+                queue,
+                auth_conn,
+                host_policy,
+                item,
+                &failed_checks,
+                label_id_by_name,
+                folder_path,
+            ) {
+                SelfRepairOutcome::Dispatched => result.self_repaired += 1,
+                SelfRepairOutcome::Deferred => result.waiting += 1,
+                SelfRepairOutcome::Skipped => result.skipped += 1,
+            }
+        }
+        crate::worktree::PrCiStatus::Passing { number, labels } => {
+            if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) && first_time_gated(&item.id) {
+                notify_human_gate(
+                    item,
+                    &format!(
+                        "PR #{number} is CI-green and mergeable, awaiting `{PR_APPROVAL_LABEL}`"
+                    ),
+                );
+            }
+            if merge_if_approved(mcp, item, repo_root, number, &labels) {
+                result.promoted += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
+        crate::worktree::PrCiStatus::Behind { number } => {
+            if crate::worktree::update_stale_branch(repo_root, number) {
+                result.updated += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
+        crate::worktree::PrCiStatus::Pending | crate::worktree::PrCiStatus::Unknown => {
+            result.skipped += 1;
+        }
+    }
 }
 
 fn promote_merged_item(mcp: &AgentflareMcp, item: &agentflare_backend::item::Item) -> bool {

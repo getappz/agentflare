@@ -967,6 +967,47 @@ fn run_review_sweep_skips_an_item_whose_pr_status_cannot_be_determined() {
     assert!(queue.list(None).unwrap().is_empty());
 }
 
+// Task #198: an item carrying `metadata.pr.number` takes the batched-GraphQL
+// fetch path instead of the old one-REST-call-per-item path. `throwaway_repo`
+// has no GitHub remote at all, so `RepoId::resolve_from_remote` fails before
+// any network call would even be attempted either way -- what this pins is
+// that the *new* numbered/batch code path degrades the same way the
+// pre-existing unnumbered path already does (`Unknown` -> `skipped`, no
+// panic), for an item shape (`metadata.pr.number` set) none of the other
+// `run_review_sweep` tests above exercise.
+#[test]
+fn run_review_sweep_skips_a_numbered_item_the_same_way_when_no_remote_resolves() {
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let queue = test_queue();
+    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    mcp.with_backend_db(|conn| {
+        agentflare_backend::item::update(
+            conn,
+            &item_id,
+            agentflare_backend::item::UpdateItem {
+                metadata: Some(r#"{"pr":{"number":501,"branch":"task/501"}}"#.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    })
+    .unwrap();
+
+    let auth_conn = test_auth_conn();
+    let result = run_review_sweep(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+
+    assert_eq!(result.promoted, 0);
+    assert_eq!(result.self_repaired, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(queue.list(None).unwrap().is_empty());
+}
+
 #[test]
 fn run_review_sweep_scans_in_review_items_from_every_registered_project_not_just_one() {
     // Item #124: review sweep used to resolve a single project via
