@@ -812,6 +812,7 @@ impl Store {
                 ],
             )?;
             tx.commit()?;
+            drop(conn);
             let _ = self.sync_chunks(&id, content);
             Ok(Document {
                 id,
