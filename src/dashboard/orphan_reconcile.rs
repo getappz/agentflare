@@ -254,6 +254,19 @@ fn restore_ready_for_work(
         }
     });
 
+    if at_cap
+        && crate::supervisor::first_time_gated(item_id)
+        && let Ok(Some(item)) =
+            mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, item_id).ok())
+    {
+        crate::supervisor::notify_human_gate(
+            &item,
+            &format!(
+                "dispatch-failure ceiling reached restarting orphaned job {job_id} for agent '{agent}'"
+            ),
+        );
+    }
+
     at_cap
 }
 
@@ -430,6 +443,16 @@ pub(super) fn handle_terminal_job_failure(job: &agentflare_jobs::AgentJob) {
         body: Some(body),
         ..Default::default()
     });
+
+    if crate::supervisor::first_time_gated(item_id)
+        && let Ok(Some(item)) =
+            mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, item_id).ok())
+    {
+        crate::supervisor::notify_human_gate(
+            &item,
+            "dispatch-failure ceiling reached — auto-redispatch stopped",
+        );
+    }
 }
 
 #[cfg(test)]
