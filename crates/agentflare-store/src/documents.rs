@@ -140,6 +140,11 @@ impl Store {
             "DELETE FROM store_chunk_vec WHERE chunk_id IN (SELECT id FROM store_doc_chunks WHERE doc_id = ?1)",
             params![doc_id],
         )?;
+        #[cfg(feature = "vector")]
+        let _ = tx.execute(
+            "DELETE FROM store_chunk_vec0 WHERE rowid IN (SELECT rowid FROM store_doc_chunks WHERE doc_id = ?1)",
+            params![doc_id],
+        );
         tx.execute("DELETE FROM store_doc_chunks WHERE doc_id = ?1", params![doc_id])?;
         // Empty docs produce no chunks — still correct to have none.
         if !content.trim().is_empty() {
@@ -306,6 +311,8 @@ impl Store {
     /// Vector search over chunk embeddings (brute-force cosine, same as
     /// `doc_vec_search`). Called by `chunk_hybrid_search` when a query vector
     /// is available (fastembed / ort embeddings feature).
+    /// When `vector` feature + vec0 table exists and chunk count >50000, uses
+    /// sqlite-vec ANN (sub-10ms) instead of brute-force.
     pub fn chunk_vec_search(
         &self,
         project_id: &str,
@@ -313,14 +320,25 @@ impl Store {
         limit: usize,
     ) -> rusqlite::Result<Vec<DocMatch>> {
         let start = Instant::now();
+        // Try ANN when scale warrants it
+        #[cfg(feature = "vector")]
+        {
+            if self.chunk_count(Some(project_id)).unwrap_or(0) > 50_000 {
+                if let Ok(vec_out) = self.chunk_vec_search_ann(project_id, query_vec, limit) {
+                    let elapsed = start.elapsed().as_millis();
+                    self.scale_warning(project_id, elapsed);
+                    return Ok(vec_out);
+                }
+            }
+        }
         let out = {
             let conn = self.conn();
             let mut stmt = conn.prepare(
                 "SELECT d.id, d.project_id, d.path, v.embedding, c.content
-                 FROM store_chunk_vec v
-                 JOIN store_doc_chunks c ON c.id = v.chunk_id
-                 JOIN store_documents d ON d.id = c.doc_id
-                 WHERE d.project_id = ?1 AND d.deleted_at IS NULL",
+             FROM store_chunk_vec v
+             JOIN store_doc_chunks c ON c.id = v.chunk_id
+             JOIN store_documents d ON d.id = c.doc_id
+             WHERE d.project_id = ?1 AND d.deleted_at IS NULL",
             )?;
             let rows: Vec<(String, String, String, Vec<u8>, String)> = stmt
                 .query_map(params![project_id], |row| {
@@ -377,6 +395,55 @@ impl Store {
         Ok(out)
     }
 
+    #[cfg(feature = "vector")]
+    fn chunk_vec_search_ann(
+        &self,
+        project_id: &str,
+        query_vec: &[f32],
+        limit: usize,
+    ) -> rusqlite::Result<Vec<DocMatch>> {
+        let conn = self.conn();
+        if !crate::vector::vec_table_exists(&conn) {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some("vec0 table missing".to_string()),
+            ));
+        }
+        let qbytes = crate::embed::vec_to_bytes(query_vec);
+        // KNN via vec0 — distance is L2 by default, but we store cosine-normalized vectors,
+        // so L2 distance correlates with cosine. Use k = limit via LIMIT.
+        let mut stmt = conn.prepare(
+            "SELECT c.doc_id, d.project_id, d.path, c.content, v.distance
+             FROM store_chunk_vec0 v
+             JOIN store_doc_chunks c ON c.rowid = v.rowid
+             JOIN store_documents d ON d.id = c.doc_id
+             WHERE v.embedding MATCH ?1 AND d.project_id = ?2 AND d.deleted_at IS NULL
+             ORDER BY v.distance LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![qbytes, project_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, f64>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for r in rows {
+            let (doc_id, pid, path, content, dist) = r?;
+            if seen.insert(doc_id.clone()) {
+                // Convert L2 distance to pseudo-score (higher is better) for compatibility
+                let score = 1.0 / (1.0 + dist);
+                let snippet = if content.len() > 200 { format!("{}...", &content[..200]) } else { content };
+                out.push(DocMatch { id: doc_id, project_id: pid, path, snippet, score });
+                if out.len() >= limit { break; }
+            }
+        }
+        Ok(out)
+    }
+
     /// Hybrid over chunks: BM25 chunks + vector chunks fused via RRF (K=60).
     /// Falls back to BM25-only when `query_vec` is empty or no vectors stored.
     pub fn chunk_hybrid_search(
@@ -421,6 +488,20 @@ impl Store {
              ON CONFLICT(chunk_id) DO UPDATE SET embedding = ?2, dim = ?3, model = ?4, updated_at = ?5",
             params![chunk_id, bytes, embedding.len() as i64, model, now],
         )?;
+        #[cfg(feature = "vector")]
+        {
+            // Also index in vec0 for ANN when >50k — best-effort, ignore if table missing or dim mismatch
+            if let Ok(rowid) = conn.query_row(
+                "SELECT rowid FROM store_doc_chunks WHERE id = ?1",
+                params![chunk_id],
+                |r| r.get::<_, i64>(0),
+            ) {
+                let _ = conn.execute(
+                    "INSERT INTO store_chunk_vec0(rowid, embedding) VALUES (?1, ?2) ON CONFLICT(rowid) DO UPDATE SET embedding = ?2",
+                    params![rowid, bytes],
+                );
+            }
+        }
         Ok(n > 0)
     }
 

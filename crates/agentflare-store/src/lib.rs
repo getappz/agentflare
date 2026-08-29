@@ -4,6 +4,7 @@ pub mod documents;
 pub mod embed;
 pub mod fastembed;
 pub mod kv;
+pub mod vector;
 pub mod leases;
 pub mod maintenance;
 pub mod migrate;
@@ -47,7 +48,11 @@ pub struct Store {
 
 impl Store {
     pub fn open_file(path: &Path) -> Result<Self, Error> {
+        #[cfg(feature = "vector")]
+        vector::ensure_init();
         let conn = db_kit::open_file(path, &migrations::migrations())?;
+        #[cfg(feature = "vector")]
+        let _ = vector::ensure_vec_table(&conn);
         let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let stem = path.file_stem().unwrap_or_default().to_string_lossy();
         let blob_dir = root.join(format!("blobs-{stem}"));
@@ -59,7 +64,11 @@ impl Store {
     }
 
     pub fn open_memory() -> Result<Self, Error> {
+        #[cfg(feature = "vector")]
+        vector::ensure_init();
         let conn = db_kit::open_memory(&migrations::migrations())?;
+        #[cfg(feature = "vector")]
+        let _ = vector::ensure_vec_table(&conn);
         Ok(Self {
             conn: parking_lot::Mutex::new(conn),
             root: PathBuf::from(":memory:"),

@@ -28,11 +28,13 @@ sha2 = { version = "0.10", optional = true }
 ndarray = { version = "0.17", optional = true }
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = true, features = ["ndarray"] }
 fastembed = { version = "6", optional = true, default-features = false, features = ["hf-hub"] }
+sqlite-vec = { version = "0.1", optional = true }
 agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
 
 [features]
 default = []
 embeddings = ["dep:anyhow", "dep:dirs", "dep:tracing", "dep:ureq", "dep:sha2", "dep:ndarray", "dep:ort", "dep:fastembed"]
+vector = ["dep:sqlite-vec", "embeddings"]
 
 [dev-dependencies]
 tempfile = "3"
