@@ -1,6 +1,8 @@
 pub mod blobs;
+pub mod chunk;
 pub mod documents;
 pub mod embed;
+pub mod fastembed;
 pub mod kv;
 pub mod leases;
 pub mod maintenance;

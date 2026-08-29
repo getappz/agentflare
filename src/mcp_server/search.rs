@@ -67,6 +67,29 @@ impl AgentflareMcp {
         let artifact_hits = self.artifact_search_hits(q, None).unwrap_or_default();
 
         self.with_store(|store| -> Result<String, ErrorData> {
+            // Similarity cache (AI Search § similarity cache) — 5 min TTL via store_kv; bypass when filters present
+            let use_cache = req.meta.is_none() && req.path_glob.is_none() && req.min_score.is_none();
+            if use_cache {
+                if let Some(cached) = store.search_cache_get(q, &ws_id) {
+                    let mut grouped: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+                        std::collections::BTreeMap::new();
+                    for m in cached.iter().take(limit) {
+                        if let Some(doc) = store.doc_get(&m.id).ok().flatten() {
+                            let entry = serde_json::json!({
+                                "id": doc.id, "path": doc.path, "title": doc.title,
+                                "doc_type": doc.doc_type, "snippet": m.snippet, "score": m.score,
+                                "source": doc.source, "mime": doc.mime, "size": doc.size,
+                                "created_at": doc.created_at, "updated_at": doc.updated_at,
+                            });
+                            grouped.entry(if doc.doc_type.is_empty() { "unknown".into() } else { doc.doc_type.clone() }).or_default().push(entry);
+                        }
+                    }
+                    if !grouped.is_empty() {
+                        let result = serde_json::json!({ "query": q, "source": "store", "total": grouped.values().map(|v| v.len()).sum::<usize>(), "groups": grouped, "cached": true });
+                        return Ok(serde_json::to_string_pretty(&result).unwrap_or_default());
+                    }
+                }
+            }
             // ponytail: no valid FTS5 tokens (e.g. query is only quote chars) -- return
             // no matches instead of falling back to the unsanitized raw query.
             let Some(fts_q) = fts_query(q, Default::default()) else {
@@ -78,9 +101,84 @@ impl AgentflareMcp {
                 });
                 return Ok(serde_json::to_string_pretty(&result).unwrap_or_default());
             };
-            let matches = store
-                .doc_search(&ws_id, &fts_q, limit)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            // Filtered path (AI Search § filtering + path filtering): when meta/path_glob present,
+            // use doc_search_filtered (exact meta, GLOB) and skip chunk hybrid + cache.
+            let matches = if req.meta.is_some() || req.path_glob.is_some() {
+                let meta_vec: Option<Vec<(String, String)>> = req.meta.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+                let mut hits = store
+                    .doc_search_filtered(&ws_id, q, limit, meta_vec.as_deref(), req.path_glob.as_deref())
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                if let Some(min) = req.min_score {
+                    hits.retain(|m| m.score >= min);
+                }
+                hits
+            } else {
+                // Local-first hybrid: doc BM25 + chunk BM25 fused via RRF (K=60).
+                let doc_hits = store
+                    .doc_search(&ws_id, &fts_q, limit)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                let chunk_hits = {
+                    let qvec = agentflare_store::fastembed::try_embed(q);
+                    if let Some(ref vec) = qvec {
+                        store
+                            .chunk_hybrid_search(&ws_id, q, Some(vec), limit)
+                            .unwrap_or_else(|_| store.chunk_search(&ws_id, q, limit).unwrap_or_default())
+                    } else {
+                        store.chunk_search(&ws_id, q, limit).unwrap_or_default()
+                    }
+                };
+                let mut out = if chunk_hits.is_empty() {
+                    doc_hits
+                } else if doc_hits.is_empty() {
+                    chunk_hits
+                } else {
+                    let doc_ids: Vec<String> = doc_hits.iter().map(|m| m.id.clone()).collect();
+                    let chunk_ids: Vec<String> = chunk_hits.iter().map(|m| m.id.clone()).collect();
+                    let fused = agentflare_store::retrieval::rrf_fuse(&doc_ids, &chunk_ids, 60.0);
+                    let doc_by_id: std::collections::HashMap<_, _> =
+                        doc_hits.into_iter().map(|m| (m.id.clone(), m)).collect();
+                    let chunk_by_id: std::collections::HashMap<_, _> =
+                        chunk_hits.into_iter().map(|m| (m.id.clone(), m)).collect();
+                    let mut o: Vec<agentflare_store::documents::DocMatch> = Vec::new();
+                    for (id, _) in fused {
+                        if let Some(m) = doc_by_id.get(&id).cloned().or_else(|| chunk_by_id.get(&id).cloned()) {
+                            o.push(m);
+                            if o.len() >= limit { break; }
+                        }
+                    }
+                    o
+                };
+                if let Some(min) = req.min_score {
+                    out.retain(|m| m.score >= min);
+                }
+                // Rerank toggle (default true when model available)
+                let do_rerank = req.rerank.unwrap_or(true) && out.len() > 1;
+                if do_rerank {
+                    let docs_for_rerank: Vec<String> = out
+                        .iter()
+                        .map(|m| if m.snippet.is_empty() { m.path.clone() } else { format!("{} — {}", m.path, m.snippet) })
+                        .collect();
+                    if let Some(reranked) = agentflare_store::fastembed::try_rerank(q, docs_for_rerank) {
+                        let mut by_doc: std::collections::HashMap<String, agentflare_store::documents::DocMatch> =
+                            out.into_iter().map(|m| {
+                                let key = if m.snippet.is_empty() { m.path.clone() } else { format!("{} — {}", m.path, m.snippet) };
+                                (key, m)
+                            }).collect();
+                        let mut reranked_out = Vec::new();
+                        for (doc_text, _score) in reranked {
+                            if let Some(m) = by_doc.remove(&doc_text) {
+                                reranked_out.push(m);
+                            }
+                        }
+                        reranked_out.extend(by_doc.into_values());
+                        out = reranked_out;
+                    }
+                }
+                if use_cache {
+                    store.search_cache_put(q, &ws_id, &out);
+                }
+                out
+            };
             let mut grouped: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
                 std::collections::BTreeMap::new();
 

@@ -122,6 +122,58 @@ pub(crate) const FTS_REBUILD_SQL: &str = "
         SELECT rowid, content FROM store_documents WHERE deleted_at IS NULL;
 ";
 
+/// Chunk tables for local-first hybrid search (AI Search § chunking).
+/// `store_doc_chunks` holds `text-splitter` Markdown-aware chunks.
+/// `store_chunks_fts` mirrors `store_docs_fts` but on chunks (external-content).
+/// `store_chunk_vec` holds per-chunk embeddings (fastembed ONNX, 384-d default).
+pub(crate) const CHUNK_TABLES_MIGRATION: &str = "
+    CREATE TABLE IF NOT EXISTS store_doc_chunks (
+        id          TEXT PRIMARY KEY NOT NULL,
+        doc_id      TEXT NOT NULL REFERENCES store_documents(id),
+        chunk_index INTEGER NOT NULL,
+        content     TEXT NOT NULL DEFAULT '',
+        token_count INTEGER NOT NULL DEFAULT 0,
+        created_at  INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_doc_idx ON store_doc_chunks(doc_id, chunk_index);
+    CREATE INDEX IF NOT EXISTS idx_chunks_doc ON store_doc_chunks(doc_id);
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS store_chunks_fts USING fts5(
+        content,
+        content='store_doc_chunks'
+    );
+    CREATE TRIGGER IF NOT EXISTS store_chunks_fts_ai AFTER INSERT ON store_doc_chunks BEGIN
+        INSERT INTO store_chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS store_chunks_fts_ad AFTER DELETE ON store_doc_chunks BEGIN
+        INSERT INTO store_chunks_fts(store_chunks_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS store_chunks_fts_au AFTER UPDATE OF content ON store_doc_chunks BEGIN
+        INSERT INTO store_chunks_fts(store_chunks_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+        INSERT INTO store_chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+
+    CREATE TABLE IF NOT EXISTS store_chunk_vec (
+        chunk_id   TEXT PRIMARY KEY NOT NULL REFERENCES store_doc_chunks(id),
+        embedding  BLOB NOT NULL,
+        dim        INTEGER NOT NULL,
+        model      TEXT NOT NULL DEFAULT '',
+        updated_at INTEGER NOT NULL
+    );
+";
+
+/// Metadata filtering (AI Search § custom attributes, 5 fields, 10KB, 64B prefix).
+pub(crate) const META_TABLES_MIGRATION: &str = "
+    CREATE TABLE IF NOT EXISTS store_doc_meta (
+        doc_id TEXT NOT NULL REFERENCES store_documents(id) ON DELETE CASCADE,
+        key    TEXT NOT NULL,
+        value  TEXT NOT NULL,
+        PRIMARY KEY (doc_id, key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_meta_key_value ON store_doc_meta(key, value);
+    CREATE INDEX IF NOT EXISTS idx_meta_doc ON store_doc_meta(doc_id);
+";
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(
@@ -210,6 +262,8 @@ pub fn migrations() -> Migrations<'static> {
         ),
         M::up(DEDUP_AND_UNIQUE_INDEX_MIGRATION),
         M::up(EXTERNAL_CONTENT_FTS_MIGRATION),
+        M::up(CHUNK_TABLES_MIGRATION),
+        M::up(META_TABLES_MIGRATION),
     ])
 }
 

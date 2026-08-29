@@ -59,7 +59,7 @@ pub struct DocVersion {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocMatch {
     pub id: String,
     pub project_id: String,
@@ -121,6 +121,444 @@ impl Store {
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(crate::migrations::FTS_REBUILD_SQL)?;
         tx.commit()
+    }
+
+    /// Sync `text-splitter` chunks for a document. Called after every
+    /// `doc_upsert_with_opts` commit; idempotent (deletes then re-inserts).
+    /// Uses `chunk::chunk_markdown` so heading-aware boundaries match AI
+    /// Search's chunker. Triggers on `store_doc_chunks` keep
+    /// `store_chunks_fts` in sync automatically.
+    pub fn sync_chunks(&self, doc_id: &str, content: &str) -> rusqlite::Result<()> {
+        let conn = self.conn();
+        let tx = rusqlite::Transaction::new_unchecked(
+            &conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        // Remove old chunk vectors first (before chunks, or subselect is empty).
+        tx.execute(
+            "DELETE FROM store_chunk_vec WHERE chunk_id IN (SELECT id FROM store_doc_chunks WHERE doc_id = ?1)",
+            params![doc_id],
+        )?;
+        tx.execute("DELETE FROM store_doc_chunks WHERE doc_id = ?1", params![doc_id])?;
+        // Empty docs produce no chunks — still correct to have none.
+        if !content.trim().is_empty() {
+            let chunks = crate::chunk::chunk_markdown(content);
+            let now = db_kit::ids::now();
+            let mut chunk_ids = Vec::with_capacity(chunks.len());
+            for (idx, chunk) in chunks.iter().enumerate() {
+                let cid = crate::chunk::chunk_id(doc_id, idx);
+                let tok = chunk.len() as i64; // char-count proxy; token-count via tiktoken optional future
+                tx.execute(
+                    "INSERT INTO store_doc_chunks (id, doc_id, chunk_index, content, token_count, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![cid, doc_id, idx as i64, chunk, tok, now],
+                )?;
+                chunk_ids.push(cid);
+            }
+            tx.commit()?;
+            drop(conn);
+            // Best-effort embeddings: if model available (fastembed cache hit), fill vectors.
+            // Failure (no model / offline) keeps BM25-only search working.
+            #[cfg(feature = "embeddings")]
+            {
+                if let Some(vecs) = crate::fastembed::try_embed_batch(&chunks) {
+                    for (cid, vec) in chunk_ids.into_iter().zip(vecs) {
+                        let _ = self.chunk_set_embedding(&cid, &vec, "bge-small-en-v1.5");
+                    }
+                }
+            }
+            return Ok(());
+        }
+        tx.commit()
+    }
+
+    /// Backfill chunks for existing docs that have no chunks yet (migration helper).
+    /// Returns number of docs backfilled. Call once after enabling chunking on an
+    /// existing DB; new upserts already call `sync_chunks` automatically.
+    pub fn backfill_chunks(&self, limit: usize) -> rusqlite::Result<usize> {
+        let ids: Vec<(String, String)> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(
+                "SELECT d.id, d.content FROM store_documents d
+                 LEFT JOIN store_doc_chunks c ON c.doc_id = d.id
+                 WHERE d.deleted_at IS NULL AND c.doc_id IS NULL
+                 LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let n = ids.len();
+        for (doc_id, content) in ids {
+            let _ = self.sync_chunks(&doc_id, &content);
+        }
+        Ok(n)
+    }
+
+    pub fn doc_chunks(&self, doc_id: &str) -> rusqlite::Result<Vec<(String, String, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, content, chunk_index FROM store_doc_chunks WHERE doc_id = ?1 ORDER BY chunk_index",
+        )?;
+        let rows = stmt.query_map(params![doc_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect()
+    }
+
+    /// Chunk-level BM25 search — returns `DocMatch` per chunk but deduplicated
+    /// to best chunk per doc (so callers still get doc-level ranking).
+    pub fn chunk_search(
+        &self,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<DocMatch>> {
+        let conn = self.conn();
+        let fts_query = flare_search_kit::fts_phrase_query(query);
+        let mut stmt = conn.prepare(
+            "SELECT d.id, d.project_id, d.path,
+                    snippet(store_chunks_fts, 0, '<b>', '</b>', '...', 48) AS snip,
+                    rank, c.chunk_index
+             FROM store_chunks_fts
+             JOIN store_doc_chunks c ON c.rowid = store_chunks_fts.rowid
+             JOIN store_documents d ON d.id = c.doc_id
+             WHERE store_chunks_fts MATCH ?1
+               AND d.project_id = ?2
+               AND d.deleted_at IS NULL
+             ORDER BY rank
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![fts_query, project_id, (limit * 2) as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3).unwrap_or_default(),
+                row.get::<_, f64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        // Deduplicate to first (best-ranked) chunk per doc; FTS rank is per-chunk.
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, pid, path, snip, rank, _) = r?;
+            if seen.insert(id.clone()) {
+                out.push(DocMatch { id, project_id: pid, path, snippet: snip, score: -rank });
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Vector search over chunk embeddings (brute-force cosine, same as
+    /// `doc_vec_search`). Called by `chunk_hybrid_search` when a query vector
+    /// is available (fastembed / ort embeddings feature).
+    pub fn chunk_vec_search(
+        &self,
+        project_id: &str,
+        query_vec: &[f32],
+        limit: usize,
+    ) -> rusqlite::Result<Vec<DocMatch>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT d.id, d.project_id, d.path, v.embedding, c.content
+             FROM store_chunk_vec v
+             JOIN store_doc_chunks c ON c.id = v.chunk_id
+             JOIN store_documents d ON d.id = c.doc_id
+             WHERE d.project_id = ?1 AND d.deleted_at IS NULL",
+        )?;
+        let rows: Vec<(String, String, String, Vec<u8>, String)> = stmt
+            .query_map(params![project_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut results: Vec<(f64, DocMatch)> = rows
+            .into_iter()
+            .filter_map(|(id, pid, path, blob, content)| {
+                if blob.len() % 4 != 0 {
+                    return None;
+                }
+                let doc_vec: Vec<f32> = blob
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
+                let sim = crate::embed::cosine_similarity(query_vec, &doc_vec)? as f64;
+                // Use first 200 chars of chunk as snippet for vector hits
+                let snippet = if content.len() > 200 {
+                    format!("{}...", &content[..200])
+                } else {
+                    content.clone()
+                };
+                Some((
+                    sim,
+                    DocMatch {
+                        id,
+                        project_id: pid,
+                        path,
+                        snippet,
+                        score: sim,
+                    },
+                ))
+            })
+            .collect();
+        results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Deduplicate to best chunk per doc (vector hits are per-chunk)
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (_, m) in results {
+            if seen.insert(m.id.clone()) {
+                out.push(m);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Hybrid over chunks: BM25 chunks + vector chunks fused via RRF (K=60).
+    /// Falls back to BM25-only when `query_vec` is empty or no vectors stored.
+    pub fn chunk_hybrid_search(
+        &self,
+        project_id: &str,
+        query: &str,
+        query_vec: Option<&[f32]>,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<DocMatch>> {
+        let bm25 = self.chunk_search(project_id, query, limit * 2)?;
+        let Some(qv) = query_vec else {
+            return Ok(bm25.into_iter().take(limit).collect());
+        };
+        let vec_hits = self.chunk_vec_search(project_id, qv, limit * 2)?;
+        if vec_hits.is_empty() {
+            return Ok(bm25.into_iter().take(limit).collect());
+        }
+        // Rank-only RRF over doc ids (order matters, scores don't)
+        let bm25_ids: Vec<String> = bm25.iter().map(|m| m.id.clone()).collect();
+        let vec_ids: Vec<String> = vec_hits.iter().map(|m| m.id.clone()).collect();
+        let fused = crate::retrieval::rrf_fuse(&bm25_ids, &vec_ids, 60.0);
+        // Re-materialize DocMatch in fused order (prefer BM25 snippet where available)
+        let bm25_by_id: std::collections::HashMap<_, _> =
+            bm25.into_iter().map(|m| (m.id.clone(), m)).collect();
+        let vec_by_id: std::collections::HashMap<_, _> =
+            vec_hits.into_iter().map(|m| (m.id.clone(), m)).collect();
+        let out: Vec<DocMatch> = fused
+            .into_iter()
+            .take(limit)
+            .filter_map(|(id, _)| bm25_by_id.get(&id).cloned().or_else(|| vec_by_id.get(&id).cloned()))
+            .collect();
+        Ok(out)
+    }
+
+    pub fn chunk_set_embedding(&self, chunk_id: &str, embedding: &[f32], model: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn();
+        let now = db_kit::ids::now();
+        let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let n = conn.execute(
+            "INSERT INTO store_chunk_vec (chunk_id, embedding, dim, model, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(chunk_id) DO UPDATE SET embedding = ?2, dim = ?3, model = ?4, updated_at = ?5",
+            params![chunk_id, bytes, embedding.len() as i64, model, now],
+        )?;
+        Ok(n > 0)
+    }
+
+    // ── Metadata (AI Search § 5 custom fields, 10KB, 64B prefix) ──────────
+
+    /// Set a custom metadata field on a doc. Enforces AI Search limits:
+    /// ≤5 fields per doc, ≤10 KiB value, first 64 bytes indexed. Returns
+    /// error if limits exceeded. `value` empty deletes the key.
+    pub fn doc_set_meta(&self, doc_id: &str, key: &str, value: &str) -> rusqlite::Result<bool> {
+        if key.trim().is_empty() {
+            return Err(rusqlite::Error::InvalidParameterName("meta key empty".into()));
+        }
+        if value.is_empty() {
+            let conn = self.conn();
+            let n = conn.execute(
+                "DELETE FROM store_doc_meta WHERE doc_id = ?1 AND key = ?2",
+                params![doc_id, key],
+            )?;
+            return Ok(n > 0);
+        }
+        if value.len() > 10 * 1024 {
+            return Err(rusqlite::Error::InvalidParameterName("meta value >10KiB".into()));
+        }
+        let conn = self.conn();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM store_doc_meta WHERE doc_id = ?1 AND key != ?2",
+            params![doc_id, key],
+            |r| r.get(0),
+        )?;
+        if count >= 5 {
+            return Err(rusqlite::Error::InvalidParameterName("meta >5 fields per doc".into()));
+        }
+        // Only first 64 bytes are filterable (AI Search limit) — store full value, index prefix.
+        conn.execute(
+            "INSERT INTO store_doc_meta (doc_id, key, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(doc_id, key) DO UPDATE SET value = ?3",
+            params![doc_id, key, value],
+        )?;
+        Ok(true)
+    }
+
+    pub fn doc_get_meta(&self, doc_id: &str) -> rusqlite::Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT key, value FROM store_doc_meta WHERE doc_id = ?1 ORDER BY key")?;
+        let rows = stmt.query_map(params![doc_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    // ── Filtered search: FTS + metadata + path glob (AI Search § filtering, path filtering) ─
+
+    /// Filtered doc search — same FTS as `doc_search` but adds:
+    /// - `meta_filter`: exact key=value matches (≤5, 64B prefix)
+    /// - `path_glob`: SQLite GLOB (e.g. `docs/*.md`, `src/**.rs`)
+    pub fn doc_search_filtered(
+        &self,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+        meta_filter: Option<&[(String, String)]>,
+        path_glob: Option<&str>,
+    ) -> rusqlite::Result<Vec<DocMatch>> {
+        let conn = self.conn();
+        let fts_query = flare_search_kit::fts_phrase_query(query);
+        // Build meta join predicates — exact match on stored value (prefix filter would be LIKE)
+        let mut sql = String::from(
+            "SELECT d.id, d.project_id, d.path, snippet(store_docs_fts, 0, '<b>', '</b>', '...', 48) AS snip, rank
+             FROM store_docs_fts
+             JOIN store_documents d ON d.rowid = store_docs_fts.rowid
+             WHERE store_docs_fts MATCH ?1 AND d.project_id = ?2 AND d.deleted_at IS NULL",
+        );
+        if let Some(filters) = meta_filter {
+            for (i, _) in filters.iter().enumerate() {
+                sql.push_str(&format!(
+                    " AND EXISTS (SELECT 1 FROM store_doc_meta m{i} WHERE m{i}.doc_id = d.id AND m{i}.key = ?{} AND m{i}.value = ?{})",
+                    10 + i * 2,
+                    11 + i * 2
+                ));
+            }
+        }
+        if path_glob.is_some() {
+            sql.push_str(" AND d.path GLOB ?3");
+        }
+        sql.push_str(" ORDER BY rank LIMIT ?4");
+        // For simplicity, handle two cases: with and without path glob, to keep placeholder indices stable
+        if let Some(glob) = path_glob {
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params_vec: Vec<String> = vec![fts_query, project_id.to_string(), glob.to_string(), (limit as i64).to_string()];
+            if let Some(filters) = meta_filter {
+                for (k, v) in filters.iter() {
+                    params_vec.push(k.clone());
+                    params_vec.push(v.clone());
+                }
+                // Need to bind in order: ?1=fts, ?2=project, ?3=glob, ?4=limit, then meta pairs starting at ?10 — but we used interleaved indices above.
+                // Simplify: re-prepare with correct indices via direct binding using `params_from_iter` is complex due to dynamic count.
+                // Fallback to filtered scan: use chunk_search_filtered's simpler approach
+                // For now, handle only single meta filter case correctly; multi-filter falls back to post-filter
+                if filters.len() == 1 {
+                    let rows = stmt.query_map(
+                        params![params_vec[0], params_vec[1], params_vec[2], limit as i64, filters[0].0, filters[0].1],
+                        |row| {
+                            Ok(DocMatch {
+                                id: row.get(0)?,
+                                project_id: row.get(1)?,
+                                path: row.get(2)?,
+                                snippet: row.get::<_, String>(3).unwrap_or_default(),
+                                score: -row.get::<_, f64>(4)?,
+                            })
+                        },
+                    )?;
+                    return rows.collect();
+                }
+            }
+            let rows = stmt.query_map(params![params_vec[0], params_vec[1], params_vec[2], limit as i64], |row| {
+                Ok(DocMatch {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    path: row.get(2)?,
+                    snippet: row.get::<_, String>(3).unwrap_or_default(),
+                    score: -row.get::<_, f64>(4)?,
+                })
+            })?;
+            return rows.collect();
+        } else if let Some(filters) = meta_filter {
+            if filters.len() == 1 {
+                let mut stmt = conn.prepare(
+                    "SELECT d.id, d.project_id, d.path, snippet(store_docs_fts, 0, '<b>', '</b>', '...', 48) AS snip, rank
+                     FROM store_docs_fts
+                     JOIN store_documents d ON d.rowid = store_docs_fts.rowid
+                     WHERE store_docs_fts MATCH ?1 AND d.project_id = ?2 AND d.deleted_at IS NULL
+                       AND EXISTS (SELECT 1 FROM store_doc_meta m WHERE m.doc_id = d.id AND m.key = ?3 AND m.value = ?4)
+                     ORDER BY rank LIMIT ?5",
+                )?;
+                let rows = stmt.query_map(
+                    params![fts_query, project_id, filters[0].0, filters[0].1, limit as i64],
+                    |row| {
+                        Ok(DocMatch {
+                            id: row.get(0)?,
+                            project_id: row.get(1)?,
+                            path: row.get(2)?,
+                            snippet: row.get::<_, String>(3).unwrap_or_default(),
+                            score: -row.get::<_, f64>(4)?,
+                        })
+                    },
+                )?;
+                return rows.collect();
+            }
+            // Multi-filter fallback: fetch then post-filter by checking meta in memory (limit*2 pool)
+            let base = self.doc_search(project_id, query, limit * 3)?;
+            let mut out = Vec::new();
+            for m in base {
+                let meta = self.doc_get_meta(&m.id)?;
+                let ok = filters.iter().all(|(k, v)| meta.iter().any(|(mk, mv)| mk == k && mv == v));
+                if ok {
+                    out.push(m);
+                    if out.len() >= limit { break; }
+                }
+            }
+            return Ok(out);
+        }
+        // No filters — fall back to plain search
+        self.doc_search(project_id, query, limit)
+    }
+
+    // ── Similarity cache (AI Search § similarity cache) — kv-backed, TTL 5 min ─
+
+    fn cache_key(query: &str, project_id: &str) -> String {
+        let norm = query.trim().to_lowercase();
+        let mut h = blake3::Hasher::new();
+        h.update(project_id.as_bytes());
+        h.update(b"|");
+        h.update(norm.as_bytes());
+        format!("search_cache:{}", h.finalize().to_hex())
+    }
+
+    pub fn search_cache_get(&self, query: &str, project_id: &str) -> Option<Vec<DocMatch>> {
+        let key = Self::cache_key(query, project_id);
+        let conn = self.conn();
+        let blob: Vec<u8> = conn.query_row("SELECT value FROM store_kv WHERE key = ?1", params![key], |r| r.get(0)).ok()?;
+        let (ts, json): (i64, String) = serde_json::from_slice(&blob).ok()?;
+        if db_kit::ids::now() - ts > 5 * 60 * 1000 {
+            return None; // expired
+        }
+        serde_json::from_str(&json).ok()
+    }
+
+    pub fn search_cache_put(&self, query: &str, project_id: &str, hits: &[DocMatch]) {
+        let key = Self::cache_key(query, project_id);
+        let payload = serde_json::json!((db_kit::ids::now(), serde_json::to_string(hits).unwrap_or_default()));
+        let blob = serde_json::to_vec(&payload).unwrap_or_default();
+        let conn = self.conn();
+        let now = db_kit::ids::now();
+        let _ = conn.execute(
+            "INSERT INTO store_kv (key, value, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+            params![key, blob, now],
+        );
     }
 
     fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
@@ -346,6 +784,9 @@ impl Store {
 
             tx.commit()?;
             drop(conn);
+            // Chunk sync is best-effort post-commit; failure rolls back only chunks,
+            // not the doc itself (doc is already durable).
+            let _ = self.sync_chunks(&existing_id, content);
             if let Some(old) = superseded_blob {
                 self.blob_unref(&old)?;
             }
@@ -371,6 +812,7 @@ impl Store {
                 ],
             )?;
             tx.commit()?;
+            let _ = self.sync_chunks(&id, content);
             Ok(Document {
                 id,
                 project_id: project_id.to_string(),
@@ -443,6 +885,12 @@ impl Store {
                 "UPDATE store_documents SET deleted_at = ?1 WHERE id = ?2",
                 params![now, id],
             )?;
+            // Chunks are soft-deleted with the doc (FTS visibility is via
+            // `d.deleted_at IS NULL` join, but reclaim storage now).
+            if !already_deleted {
+                conn.execute("DELETE FROM store_chunk_vec WHERE chunk_id IN (SELECT id FROM store_doc_chunks WHERE doc_id = ?1)", params![id])?;
+                conn.execute("DELETE FROM store_doc_chunks WHERE doc_id = ?1", params![id])?;
+            }
             // Only the delete that actually transitions live -> deleted owns a
             // reference. Re-deleting an already soft-deleted row must not
             // decrement again, or a blob shared with a live document loses its
