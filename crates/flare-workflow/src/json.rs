@@ -49,6 +49,12 @@ pub struct StepInvocation {
     /// scheduler, not inside whatever chdir span originally dispatched the
     /// run — see `agentflare::work_item_pipeline`'s `WorkItemData::worktree_path`).
     pub cwd: Option<std::path::PathBuf>,
+    /// Claim-owner identity (`<agent>:<instance>`) the spawned subprocess
+    /// should present as its own, so a daemon-dispatched coding agent's
+    /// `claims::owner_id()` reconstructs the same owner string the job's
+    /// claim was filed under instead of a fresh process-pid instance. `None`
+    /// for callers (e.g. the JSON pipeline) with no claim-owner concept.
+    pub owner: Option<String>,
 }
 
 impl StepInvocation {
@@ -313,6 +319,7 @@ impl StepExecutor<PipelineData> for PromptExecutor {
             hard_cap_secs: self.hard_cap_secs,
             idle_timeout_secs: self.idle_timeout_secs,
             cwd: None,
+            owner: None,
         };
         let (output, input_tokens, output_tokens) =
             (self.send)(invocation)

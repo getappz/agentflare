@@ -452,7 +452,35 @@ pub fn run_headless(
     extra_args: &[String],
     request_json: bool,
 ) -> HeadlessOutcome {
+    run_headless_with_owner(
+        None,
+        registry,
+        agent,
+        prompt,
+        hard_cap,
+        idle_timeout,
+        extra_args,
+        request_json,
+    )
+}
+
+/// Like `run_headless`, but threads an explicit claim-owner identity
+/// (`<agent>:<instance>`) into the child's env so the spawned agent's own
+/// `claims::owner_id()` reconstructs that exact string rather than a fresh
+/// process-pid instance — see `work_item_pipeline::real_agent_send_hook`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_headless_with_owner(
+    owner: Option<&str>,
+    registry: &[AgentSpec],
+    agent: &str,
+    prompt: &str,
+    hard_cap: Duration,
+    idle_timeout: Duration,
+    extra_args: &[String],
+    request_json: bool,
+) -> HeadlessOutcome {
     run_headless_impl(
+        owner,
         None,
         registry,
         agent,
@@ -482,7 +510,35 @@ pub fn run_headless_in(
     extra_args: &[String],
     request_json: bool,
 ) -> HeadlessOutcome {
+    run_headless_in_with_owner(
+        None,
+        cwd,
+        registry,
+        agent,
+        prompt,
+        hard_cap,
+        idle_timeout,
+        extra_args,
+        request_json,
+    )
+}
+
+/// Like `run_headless_in`, but with an explicit claim-owner identity — the
+/// `cwd`-aware counterpart of `run_headless_with_owner`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_headless_in_with_owner(
+    owner: Option<&str>,
+    cwd: &Path,
+    registry: &[AgentSpec],
+    agent: &str,
+    prompt: &str,
+    hard_cap: Duration,
+    idle_timeout: Duration,
+    extra_args: &[String],
+    request_json: bool,
+) -> HeadlessOutcome {
     run_headless_impl(
+        owner,
         Some(cwd),
         registry,
         agent,
@@ -496,6 +552,7 @@ pub fn run_headless_in(
 
 #[allow(clippy::too_many_arguments)]
 fn run_headless_impl(
+    owner: Option<&str>,
     explicit_cwd: Option<&Path>,
     registry: &[AgentSpec],
     agent: &str,
@@ -591,7 +648,22 @@ fn run_headless_impl(
     // caller running multiple work items as threads inside one long-lived
     // process (item #19's in-process dispatch) has no single ambient value
     // that's correct for all of them — only an explicit per-spawn env var is.
-    cmd.env("AGENTFLARE_AGENT", spec.id.as_str());
+    //
+    // When an explicit owner identity is supplied (in-process work dispatch),
+    // also pin the instance half into `AGENTFLARE_SESSION` so the spawned
+    // coding agent's own `claims::owner_id()` reconstructs the identical
+    // `<agent>:<instance>` string the job's claim was filed under (item #538)
+    // instead of falling through to its own process pid — which would make its
+    // `claim`/`done`/`release` calls on the item it's already claimed fail
+    // with "claimed by <agent>:<job-id>" (a *different* owner).
+    if let Some(owner) = owner
+        && let Some((agent, instance)) = owner.split_once(':')
+    {
+        cmd.env("AGENTFLARE_AGENT", agent);
+        cmd.env("AGENTFLARE_SESSION", instance);
+    } else {
+        cmd.env("AGENTFLARE_AGENT", spec.id.as_str());
+    }
     match run_captured(cmd, hard_cap, idle_timeout, Some(prompt)) {
         Ok(c) if c.success => {
             if request_json && json_output_args(spec.id).is_some() {
