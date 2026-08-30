@@ -494,6 +494,126 @@ fn create_wires_up_label_assignee_and_dependency_ids() {
     );
 }
 
+#[test]
+fn dependents_of_finds_reverse_edges() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let blocker = create(
+        &conn,
+        CreateItem {
+            project_id: pid.clone(),
+            state_id: sid.clone(),
+            name: "Blocker".into(),
+            description: None,
+            priority: None,
+            parent_id: None,
+            assignee_agent: None,
+            sort_order: None,
+            external_source: None,
+            external_id: None,
+            metadata: None,
+            label_ids: vec![],
+            assignee_ids: vec![],
+            dependency_ids: vec![],
+        },
+    )
+    .unwrap();
+    let dependent = create(
+        &conn,
+        CreateItem {
+            project_id: pid,
+            state_id: sid,
+            name: "Dependent".into(),
+            description: None,
+            priority: None,
+            parent_id: None,
+            assignee_agent: None,
+            sort_order: None,
+            external_source: None,
+            external_id: None,
+            metadata: None,
+            label_ids: vec![],
+            assignee_ids: vec![],
+            dependency_ids: vec![blocker.id.clone()],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        dependents_of(&conn, &blocker.id).unwrap(),
+        vec![dependent.id.clone()]
+    );
+    assert!(dependents_of(&conn, &dependent.id).unwrap().is_empty());
+}
+
+#[test]
+fn all_dependencies_completed_requires_every_dependency_done() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let mk = |conn: &Connection, name: &str, deps: Vec<String>| {
+        create(
+            conn,
+            CreateItem {
+                project_id: pid.clone(),
+                state_id: sid.clone(),
+                name: name.into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: deps,
+            },
+        )
+        .unwrap()
+    };
+    let dep_a = mk(&conn, "A", vec![]);
+    let dep_b = mk(&conn, "B", vec![]);
+    let dependent = mk(&conn, "Dependent", vec![dep_a.id.clone(), dep_b.id.clone()]);
+
+    // Neither dependency is done yet.
+    assert!(!all_dependencies_completed(&conn, &dependent.id).unwrap());
+
+    let completed = crate::state::first_in_group(&conn, &pid, "completed").unwrap();
+    update_state(&conn, &dep_a.id, &completed.id).unwrap();
+    // dep_b is still open -- not all done.
+    assert!(!all_dependencies_completed(&conn, &dependent.id).unwrap());
+
+    update_state(&conn, &dep_b.id, &completed.id).unwrap();
+    assert!(all_dependencies_completed(&conn, &dependent.id).unwrap());
+}
+
+#[test]
+fn all_dependencies_completed_false_for_item_with_no_dependencies() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = create(
+        &conn,
+        CreateItem {
+            project_id: pid,
+            state_id: sid,
+            name: "Solo".into(),
+            description: None,
+            priority: None,
+            parent_id: None,
+            assignee_agent: None,
+            sort_order: None,
+            external_source: None,
+            external_id: None,
+            metadata: None,
+            label_ids: vec![],
+            assignee_ids: vec![],
+            dependency_ids: vec![],
+        },
+    )
+    .unwrap();
+    assert!(!all_dependencies_completed(&conn, &item.id).unwrap());
+}
+
 fn state_in_group(conn: &Connection, project_id: &str, group: &str) -> String {
     crate::state::list_by_project(conn, project_id)
         .unwrap()

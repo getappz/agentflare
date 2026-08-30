@@ -83,21 +83,35 @@ pub fn snapshot_before(repo_root: &Path, reason: &str) -> Result<SnapshotId, Str
     result
 }
 
-/// Restores paths from a snapshot into the current working tree and index.
-/// Only restores paths that existed at snapshot time -- files created after
-/// the snapshot are untouched and survive.
+/// Checks out `commit_ish`'s tracked files into the current working tree and
+/// index, without moving HEAD. Only restores paths that existed at
+/// `commit_ish` -- files created since are untouched and survive.
 ///
 /// "-c core.autocrlf=false" for the same reason run_git_with_index sets it
 /// on the capture side: a restore is a promise of exact recovery, and git
 /// silently rewriting LF to CRLF on checkout (autocrlf=true, common on
 /// Windows) breaks that promise regardless of what was actually snapshotted.
-pub fn restore(repo_root: &Path, id: &SnapshotId) -> Result<(), String> {
-    let refname = format!("{SNAPSHOT_REF_PREFIX}{}", id.0);
+pub fn checkout_into_worktree(repo_root: &Path, commit_ish: &str) -> Result<(), String> {
     run_in(
         repo_root,
-        &["-c", "core.autocrlf=false", "checkout", &refname, "--", "."],
+        &[
+            "-c",
+            "core.autocrlf=false",
+            "checkout",
+            commit_ish,
+            "--",
+            ".",
+        ],
     )?;
     Ok(())
+}
+
+/// Restores paths from a snapshot into the current working tree and index.
+/// Only restores paths that existed at snapshot time -- files created after
+/// the snapshot are untouched and survive.
+pub fn restore(repo_root: &Path, id: &SnapshotId) -> Result<(), String> {
+    let refname = format!("{SNAPSHOT_REF_PREFIX}{}", id.0);
+    checkout_into_worktree(repo_root, &refname)
 }
 
 /// Lists snapshots, newest first.

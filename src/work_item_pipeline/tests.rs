@@ -71,6 +71,27 @@ const JUDGE_STREAM_JSON_TRANSCRIPT: &str = concat!(
 );
 
 #[test]
+fn detect_review_only_false_positives_on_a_description_that_merely_mentions_design_spec() {
+    // item #170's known false-positive class, reproduced live twice more in
+    // one PM-mode session (items #192/#173): the free-text fallback matches
+    // "design"+"spec" anywhere in the description, including a reference to
+    // a *different* item's design-spec, not just this item's own framing.
+    // Documents the current (undesired but expected-without-task_type)
+    // behavior; the paired test below shows the actual fix.
+    let description =
+        "Instead of X, do the Y ask per item #166's design-spec, which already covers Z.";
+    assert!(detect_review_only(description, &serde_json::json!({})));
+}
+
+#[test]
+fn detect_review_only_explicit_task_type_overrides_design_spec_mention_in_free_text() {
+    let description =
+        "Instead of X, do the Y ask per item #166's design-spec, which already covers Z.";
+    let metadata = serde_json::json!({"task_type": "implementation"});
+    assert!(!detect_review_only(description, &metadata));
+}
+
+#[test]
 fn uncleaned_claude_stream_json_transcript_breaks_judge_parsing() {
     let err = parse_judge_decision(JUDGE_STREAM_JSON_TRANSCRIPT).unwrap_err();
     assert!(
@@ -87,6 +108,56 @@ fn clean_agent_reply_fixes_claude_stream_json_so_judge_parsing_succeeds() {
     );
     let decision = parse_judge_decision(&cleaned).expect("should parse after cleaning");
     assert_eq!(decision.action, JudgeAction::AdvanceTask);
+}
+
+// Item #193 regression: falling back to the ambient process cwd for a
+// checkpoint `git commit` (the way `real_agent_send_hook` safely does for
+// agent dispatch on a run persisted before item #191 threaded a real
+// worktree path through) is not safe here -- ambient cwd during `cargo
+// test` is this very repo, and an earlier version of this fallback
+// committed the test process's own uncommitted work into it.
+#[test]
+fn checkpoint_implementer_turn_is_a_noop_without_a_worktree_path() {
+    let mut data = WorkItemData::default();
+    checkpoint_implementer_turn(&mut data, 0);
+    assert!(data.checkpoint_base_sha.is_none());
+}
+
+#[test]
+fn checkpoint_implementer_turn_commits_and_squash_since_folds_turns_back_together() {
+    let (_mcp, _backend_tmp, _repo_tmp, _item_id, _project_id, worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Checkpoint commit test item");
+    let head_before = crate::worktree::head_sha(&worktree_path).unwrap();
+
+    let mut data = WorkItemData {
+        worktree_path: worktree_path.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+
+    std::fs::write(worktree_path.join("real_work.txt"), "turn 1").unwrap();
+    checkpoint_implementer_turn(&mut data, 0);
+    assert_eq!(
+        data.checkpoint_base_sha.as_deref(),
+        Some(head_before.as_str())
+    );
+    let head_after_first = crate::worktree::head_sha(&worktree_path).unwrap();
+    assert_ne!(
+        head_after_first, head_before,
+        "first turn should have committed"
+    );
+
+    std::fs::write(worktree_path.join("real_work.txt"), "turn 2").unwrap();
+    checkpoint_implementer_turn(&mut data, 0);
+    // Base is captured once, not re-captured on the second checkpoint.
+    assert_eq!(
+        data.checkpoint_base_sha.as_deref(),
+        Some(head_before.as_str())
+    );
+
+    crate::worktree::squash_since(&worktree_path, &head_before).unwrap();
+    assert_eq!(crate::worktree::head_sha(&worktree_path), Some(head_before));
+    let content = std::fs::read_to_string(worktree_path.join("real_work.txt")).unwrap();
+    assert_eq!(content, "turn 2");
 }
 
 use flare_workflow::store::InMemoryStore;
@@ -412,6 +483,7 @@ fn run_or_resume_persists_run_id_and_resume_skips_completed_coder_step() {
         run_or_resume(
             mcp.clone(),
             &item,
+            &worktree_path,
             agent_registry::Agent::ClaudeCode,
             agent_registry::Agent::ClaudeCode,
             "implement it".to_string(),
@@ -481,6 +553,7 @@ fn run_or_resume_with_sender_persists_run_id_on_success() {
         run_or_resume_with_sender(
             mcp.clone(),
             &item,
+            &worktree_path,
             agent_registry::Agent::ClaudeCode,
             agent_registry::Agent::ClaudeCode,
             "implement it".to_string(),
@@ -505,6 +578,73 @@ fn run_or_resume_with_sender_persists_run_id_on_success() {
         .unwrap();
     let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
     assert!(metadata["workflow_run_id"].as_str().is_some());
+}
+
+// Item #191: a run resumed by `engine().recover()` after a daemon restart
+// executes `sdd_loop`'s steps on the engine's own scheduler, never
+// re-entering `execute_work`'s `run_in_worktree` chdir -- so the agent
+// dispatch can no longer rely on the process's ambient cwd matching this
+// item's worktree (two concurrently-active items would race on that global
+// state, see `work_cwd_race_tests.rs`'s regression coverage for the
+// sibling bug this same class of race caused in `execute_work_impl`
+// itself). `build_sdd_loop_step` must instead thread `ctx.data.worktree_path`
+// through every `StepInvocation` it sends, explicitly, so the actual
+// dispatch (`real_agent_send_hook`) never depends on ambient cwd at all.
+#[test]
+fn sdd_loop_step_invocations_carry_the_item_s_own_worktree_path_as_cwd() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Worktree-cwd-threading test item");
+    std::fs::write(worktree_path.join("real_work.txt"), "real work").unwrap();
+    let mcp = Arc::new(mcp);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
+        .unwrap()
+        .unwrap();
+
+    let seen_cwds: Arc<std::sync::Mutex<Vec<Option<std::path::PathBuf>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_cwds_for_send = seen_cwds.clone();
+    let send: flare_workflow::json::SendMessage = Arc::new(move |inv| {
+        seen_cwds_for_send.lock().unwrap().push(inv.cwd.clone());
+        let prompt = inv.prompt;
+        Box::pin(async move {
+            if prompt.contains("You are the judge") {
+                Ok((
+                    r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#
+                        .to_string(),
+                    1u64,
+                    0u64,
+                ))
+            } else {
+                Ok(("DONE: did the work".to_string(), 1u64, 0u64))
+            }
+        })
+    });
+
+    let _ = crate::paths::test_support::with_temp_home(|| {
+        run_or_resume_with_sender(
+            mcp.clone(),
+            &item,
+            &worktree_path,
+            agent_registry::Agent::ClaudeCode,
+            agent_registry::Agent::ClaudeCode,
+            "implement it".to_string(),
+            None,
+            None,
+            send,
+        )
+    });
+
+    let seen_cwds = seen_cwds.lock().unwrap();
+    assert!(!seen_cwds.is_empty(), "sdd_loop never dispatched an agent");
+    let expected = Some(worktree_path.clone());
+    for cwd in seen_cwds.iter() {
+        assert_eq!(
+            cwd, &expected,
+            "StepInvocation.cwd must be the item's own claimed worktree, \
+             not left for the SendMessage hook to guess from ambient cwd"
+        );
+    }
 }
 
 // Item #512: bare `task/<N>` checkout + renamed slug hid divergence from

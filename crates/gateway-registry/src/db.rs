@@ -5,85 +5,35 @@
 
 use crate::types::ToolEntry;
 use rusqlite::{Connection, params};
+use rusqlite_migration::{M, Migrations};
 use std::path::Path;
 
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS tools (
-  server TEXT NOT NULL,
-  name TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  input_schema TEXT NOT NULL DEFAULT '{}',
-  PRIMARY KEY (server, name)
-);
-CREATE VIRTUAL TABLE IF NOT EXISTS tools_fts USING fts5(
-  server, name, description, content='tools'
-);
-CREATE TRIGGER IF NOT EXISTS tools_fts_ai AFTER INSERT ON tools BEGIN
-  INSERT INTO tools_fts(rowid, server, name, description)
-  VALUES (new.rowid, new.server, new.name, new.description);
-END;
-CREATE TRIGGER IF NOT EXISTS tools_fts_ad AFTER DELETE ON tools BEGIN
-  INSERT INTO tools_fts(tools_fts, rowid, server, name, description)
-  VALUES ('delete', old.rowid, old.server, old.name, old.description);
-END;
-CREATE TRIGGER IF NOT EXISTS tools_fts_au
-AFTER UPDATE OF server, name, description ON tools BEGIN
-  INSERT INTO tools_fts(tools_fts, rowid, server, name, description)
-  VALUES ('delete', old.rowid, old.server, old.name, old.description);
-  INSERT INTO tools_fts(rowid, server, name, description)
-  VALUES (new.rowid, new.server, new.name, new.description);
-END;
-";
+/// Schema history, oldest first -- mirrors the crate's real history:
+/// `0001_initial` is the original (#104) `tools` table + standalone FTS5
+/// index; `0002_fts_triggers` (#347) converts it to the external-content
+/// shape with sync triggers. Unlike `crates/skill-registry/src/db.rs`
+/// (which this crate otherwise mirrors), `tools`'s columns have never
+/// changed since #104, so no `ALTER TABLE`/migration hook is needed here --
+/// `0002` unconditionally drops and recreates `tools_fts` (`DROP ... IF
+/// EXISTS` before a fresh `CREATE`), which is correct whether the table
+/// never existed, is the pre-external-content standalone shape, or already
+/// matches this exact shape. `IF NOT EXISTS` throughout 0001 means replaying
+/// it against a pre-migration db (`user_version` still 0) is a harmless
+/// no-op. Future schema changes are new `000N_*.sql` files appended here,
+/// never edits to these.
+const MIGRATION_LIST: &[M<'static>] = &[
+    M::up(include_str!("migrations/0001_initial.sql")),
+    M::up(include_str!("migrations/0002_fts_triggers.sql")),
+];
+const MIGRATIONS: Migrations = Migrations::from_slice(MIGRATION_LIST);
 
-/// Databases written before `tools_fts` became external-content carry the old
-/// standalone table, which `CREATE VIRTUAL TABLE IF NOT EXISTS` would leave
-/// in place. Drop it so `SCHEMA` recreates the trigger-backed shape, then
-/// refill from `tools` -- the last-known-good tool list `Registry` falls back
-/// on must stay searchable across the upgrade, not just after the next
-/// `rebuild`. (Mirrors `crates/skill-registry/src/db.rs`.)
-///
-/// All of it in one transaction, because the halfway state is not
-/// self-correcting: with `tools_fts` dropped but not yet refilled, the next
-/// open finds no such table, reads `legacy` as 0, and recreates an empty
-/// index over a populated `tools` — search silently missing every tool until
-/// something forces a full `rebuild`. SQLite makes DDL transactional, so the
-/// conversion either lands whole or never happened.
-fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
-    let legacy: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master
-          WHERE type = 'table' AND name = 'tools_fts' AND sql NOT LIKE '%content=%'",
-        [],
-        |r| r.get(0),
-    )?;
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    if legacy > 0 {
-        tx.execute_batch("DROP TABLE tools_fts;")?;
-    }
-    tx.execute_batch(SCHEMA)?;
-    if legacy > 0 {
-        tx.execute_batch(
-            "INSERT INTO tools_fts(rowid, server, name, description)
-             SELECT rowid, server, name, description FROM tools;",
-        )?;
-    }
-    tx.commit()
+pub fn open_db(path: &Path) -> Result<Connection, db_kit::open::Error> {
+    // `db_kit::open_file` already sets a busy_timeout and WAL journal mode.
+    db_kit::open_file(path, &MIGRATIONS)
 }
 
-pub fn open_db(path: &Path) -> rusqlite::Result<Connection> {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    apply_schema(&conn)?;
-    Ok(conn)
-}
-
-pub fn open_in_memory() -> rusqlite::Result<Connection> {
-    let conn = Connection::open_in_memory()?;
-    apply_schema(&conn)?;
-    Ok(conn)
+pub fn open_in_memory() -> Result<Connection, db_kit::open::Error> {
+    db_kit::open_memory(&MIGRATIONS)
 }
 
 /// One backend's discovered tools, tagged with the server name they came from.

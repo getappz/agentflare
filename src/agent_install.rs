@@ -2,7 +2,7 @@
 // Each agent's package manager and package name come from agent_registry.rs.
 // Dry-run mode prints commands instead of executing them.
 use agent_registry::{self, AgentSpec};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 pub enum Outcome {
     Ok(String),
@@ -15,7 +15,7 @@ fn run_cmd(cmd: &str, args: &[&str], dry_run: bool) -> Outcome {
     if dry_run {
         return Outcome::Ok(format!("[dry-run] would run: {label}"));
     }
-    match Command::new(cmd)
+    match flare_process::command(cmd)
         .args(args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

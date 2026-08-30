@@ -131,3 +131,36 @@ fn resolve_dispatch_model_passes_through_a_non_claude_name_for_cline_unchanged()
     );
     assert_eq!(model, Some("cline-pass/glm-5.3".to_string()));
 }
+
+#[test]
+fn resolve_agent_explicit_flag_still_picks_up_a_matching_rules_model() {
+    // Item #162: this path used to always return `model: None` without
+    // ever consulting `[router]` rules. It's the path every normal
+    // daemon dispatch takes (the daemon always passes an explicit
+    // agent), so a rule's `model` never reached dispatch in practice.
+    let item = test_item();
+    let config = agent_registry::RouterConfig {
+        default: None,
+        rules: vec![agent_registry::RouterRule {
+            when: agent_registry::RuleMatch {
+                labels: vec!["urgent".to_string()],
+                ..Default::default()
+            },
+            use_agents: vec![agent_registry::Agent::Opencode],
+            rotate: false,
+            model: Some("sonnet".to_string()),
+        }],
+    };
+    let (agent, _, _, model) = resolve_agent(
+        Some("cline"),
+        &item,
+        &["urgent".to_string()],
+        &config,
+        &[],
+        None,
+        &mut Default::default(),
+    )
+    .unwrap();
+    assert_eq!(agent, agent_registry::Agent::Cline);
+    assert_eq!(model.as_deref(), Some("sonnet"));
+}

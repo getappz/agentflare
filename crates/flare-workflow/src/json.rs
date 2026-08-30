@@ -41,6 +41,14 @@ pub struct StepInvocation {
     pub args: Vec<String>,
     pub hard_cap_secs: Option<u64>,
     pub idle_timeout_secs: Option<u64>,
+    /// Explicit working directory the agent subprocess must run in, when the
+    /// caller has one (e.g. a work item's claimed worktree). `None` leaves
+    /// the `SendMessage` hook free to fall back to the ambient process cwd
+    /// — never safe across a step that can outlive the caller who set that
+    /// cwd (a crash-resumed run's steps execute on the engine's own
+    /// scheduler, not inside whatever chdir span originally dispatched the
+    /// run — see `agentflare::work_item_pipeline`'s `WorkItemData::worktree_path`).
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl StepInvocation {
@@ -106,6 +114,12 @@ pub struct JsonStep {
     /// Overrides the send hook's default idle-output timeout for this step.
     #[serde(default)]
     pub idle_timeout_secs: Option<u64>,
+    /// Skip this step (no agent dispatch) unless the condition holds.
+    /// Supports `{{var}} == 'literal'` / `{{var}} != 'literal'` (string
+    /// equality after `{{var}}`/`{{params.x}}` expansion) or a bare
+    /// `{{var}}` truthiness check (non-empty and not `"false"`/`"0"`).
+    #[serde(default)]
+    pub run_if: Option<String>,
 }
 
 fn default_prompt() -> String {
@@ -227,6 +241,9 @@ pub fn compile_workflow(
                     max_retries: s.max_retries,
                 },
             });
+        if let Some(expr) = &s.run_if {
+            def = def.run_if(compile_run_if(expr));
+        }
         if !deps.is_empty() {
             def = def.depends_on(&deps);
         }
@@ -245,6 +262,32 @@ pub fn compile_workflow(
     wf.validate()
         .map_err(|e| format!("invalid workflow: {e}"))?;
     Ok(wf)
+}
+
+/// Compile a `run_if` expression into a step-skip predicate. Grammar is
+/// deliberately minimal: `LHS == RHS`, `LHS != RHS` (string equality after
+/// `{{var}}`/`{{params.x}}` expansion on both sides, quotes trimmed off a
+/// literal RHS), or a bare `LHS` truthiness check when no operator is
+/// present.
+fn compile_run_if(
+    expr: &str,
+) -> impl Fn(&WorkflowContext<PipelineData>) -> bool + Send + Sync + 'static {
+    let expr = expr.to_string();
+    move |ctx: &WorkflowContext<PipelineData>| {
+        let expand = |s: &str| {
+            expand_variables(s.trim(), &ctx.input, &ctx.variables, &ctx.params)
+                .trim()
+                .to_string()
+        };
+        if let Some((lhs, rhs)) = expr.split_once("!=") {
+            expand(lhs) != expand(rhs).trim_matches(['\'', '"'])
+        } else if let Some((lhs, rhs)) = expr.split_once("==") {
+            expand(lhs) == expand(rhs).trim_matches(['\'', '"'])
+        } else {
+            let v = expand(&expr);
+            !v.is_empty() && v != "false" && v != "0"
+        }
+    }
 }
 
 /// Executor that expands the prompt template and sends it to an agent.
@@ -269,6 +312,7 @@ impl StepExecutor<PipelineData> for PromptExecutor {
             args: self.args.clone(),
             hard_cap_secs: self.hard_cap_secs,
             idle_timeout_secs: self.idle_timeout_secs,
+            cwd: None,
         };
         let (output, input_tokens, output_tokens) =
             (self.send)(invocation)
@@ -464,5 +508,116 @@ mod tests {
         assert_eq!(inv.args, vec!["--dangerously-skip-permissions"]);
         assert_eq!(inv.hard_cap_secs, Some(42));
         assert_eq!(inv.idle_timeout_secs, Some(7));
+    }
+
+    #[tokio::test]
+    async fn run_if_skips_step_when_condition_false() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_clone = std::sync::Arc::clone(&calls);
+        // Echo the prompt verbatim so `set-flag`'s output_var takes on exactly
+        // the string its prompt names, letting the run_if condition below
+        // check against a known value.
+        let send: SendMessage = Arc::new(move |inv: StepInvocation| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok((inv.prompt, 0, 0)) })
+        });
+
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "conditional-pipeline",
+                "steps": [
+                    {
+                        "name": "set-flag",
+                        "agent": "setter",
+                        "prompt": "cached",
+                        "output_var": "cache_check"
+                    },
+                    {
+                        "name": "maybe-analyze",
+                        "agent": "analyzer",
+                        "prompt": "analyze",
+                        "run_if": "{{cache_check}} != 'cached'"
+                    },
+                    {
+                        "name": "always-record",
+                        "agent": "recorder",
+                        "prompt": "record"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let wf = compile_workflow(&json, send).unwrap();
+        let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
+        engine.register_workflow(wf).unwrap();
+        let run = engine
+            .start_workflow(
+                crate::types::WorkflowId::new("conditional-pipeline"),
+                PipelineData,
+                "go".into(),
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_for_completion(run, "wf", std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let state = engine.get_status(run).await.unwrap();
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        // set-flag and always-record ran; maybe-analyze was skipped (no dispatch).
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn run_if_runs_step_when_condition_true() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_clone = std::sync::Arc::clone(&calls);
+        let send: SendMessage = Arc::new(move |inv: StepInvocation| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok((inv.prompt, 0, 0)) })
+        });
+
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "conditional-pipeline-2",
+                "steps": [
+                    {
+                        "name": "set-flag",
+                        "agent": "setter",
+                        "prompt": "stale",
+                        "output_var": "cache_check"
+                    },
+                    {
+                        "name": "maybe-analyze",
+                        "agent": "analyzer",
+                        "prompt": "analyze",
+                        "run_if": "{{cache_check}} != 'cached'"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let wf = compile_workflow(&json, send).unwrap();
+        let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
+        engine.register_workflow(wf).unwrap();
+        let run = engine
+            .start_workflow(
+                crate::types::WorkflowId::new("conditional-pipeline-2"),
+                PipelineData,
+                "go".into(),
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_for_completion(run, "wf", std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let state = engine.get_status(run).await.unwrap();
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

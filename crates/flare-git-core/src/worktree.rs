@@ -25,6 +25,11 @@ pub trait Progress {
     fn send(&self, progress: f64, total: Option<f64>, message: Option<String>);
 }
 
+/// Serializes `git worktree add` invocations against `.git/config`/
+/// `.git/worktrees` admin state -- see the comment at its use site in
+/// `create_worktree` below.
+static WORKTREE_ADD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn resolve_target_branch(conn: &rusqlite::Connection, item: &Item, repo_root: &Path) -> String {
     if let Some(ref parent_id) = item.parent_id
         && let Ok(parent) = agentflare_backend::item::get(conn, parent_id)
@@ -209,7 +214,7 @@ fn isolate_worktree_target_dir(worktree_path: &Path) {
 
 /// True when the `sccache` binary is reachable on `PATH`.
 fn sccache_available() -> bool {
-    Command::new("sccache")
+    flare_process::command("sccache")
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -469,7 +474,20 @@ pub fn create_worktree(
         ]
     };
     let arg_refs: Vec<&str> = worktree_add_args.iter().map(String::as_str).collect();
-    match run_git_in(repo_root, &arg_refs) {
+    // `git worktree add` takes its own lock on `.git/config`/`.git/worktrees`
+    // admin state; two calls against the same repo at the same instant race
+    // on that lock and the loser fails outright with no retry ("could not
+    // lock config file .git/config: File exists"). Serialize in-process so
+    // concurrent claims from the same daemon (e.g. two items dispatched in
+    // the same supervisor tick) queue instead of racing. Deliberately a
+    // separate lock from `with_backend_db`'s -- this is a subprocess call,
+    // not DB access, and item.rs already runs it outside that lock on
+    // purpose.
+    let git_result = {
+        let _guard = WORKTREE_ADD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        run_git_in(repo_root, &arg_refs)
+    };
+    match git_result {
         Ok(_) => {
             if let Some(p) = progress {
                 p.send(1.0, Some(1.0), Some("Worktree created".into()));
@@ -542,7 +560,7 @@ pub(crate) fn run_output_timeout(
     timeout_secs: u64,
 ) -> Result<std::process::Output, String> {
     let program = program.as_ref().to_owned();
-    let mut cmd = Command::new(&program);
+    let mut cmd = flare_process::command(&program);
     cmd.args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -659,6 +677,21 @@ pub fn branch_diverged(repo_root: &Path, branch: &str, target_branch: &str) -> b
 /// `None`) on any failure — nothing here should block `done` since the
 /// item's completion is already committed to the DB by the time this runs.
 ///
+/// Rebases onto `target_branch`'s latest tip (via [`rebase_item_worktree`])
+/// before pushing — the work session between claim and `done` can easily
+/// outlive other agents' merges to `target_branch`, so without this the PR
+/// opened next can already be behind the base it's meant to land on (item
+/// #161). A conflict there just aborts the rebase and pushes the branch
+/// unchanged, same as if this call weren't here at all.
+///
+/// Pushes with `--force-with-lease` rather than a plain push: a successful
+/// rebase rewrites this branch's commits, so a plain push to a branch this
+/// process already pushed in an earlier `done` call would be rejected as
+/// non-fast-forward. `--force-with-lease` only overwrites the remote branch
+/// if it still matches what this process last saw (its own remote-tracking
+/// ref, refreshed by the rebase's own fetch above), so it's safe even when
+/// nothing was actually rebased this call.
+///
 /// Deliberately does NOT open a PR — that's a GitHub-API concern kept out
 /// of this crate; see the thin wrapper in the main binary's
 /// `src/worktree.rs::push_and_open_pr`.
@@ -675,6 +708,22 @@ pub fn push_branch(
     if !worktree_path.exists() {
         return None; // nothing was ever claimed into a worktree for this item
     }
+    match rebase_item_worktree(item, repo_root, target_branch) {
+        RebaseOutcome::Rebased => {
+            eprintln!(
+                "worktree: rebased item {}'s branch onto latest {target_branch} before push",
+                item.id
+            );
+        }
+        RebaseOutcome::Conflict(detail) => {
+            eprintln!(
+                "worktree: rebase onto latest {target_branch} conflicted for item {} \
+                 (pushing the branch unchanged instead): {detail}",
+                item.id
+            );
+        }
+        RebaseOutcome::Skipped | RebaseOutcome::UpToDate | RebaseOutcome::Dirty => {}
+    }
     let branch = resolve_item_task_branch(item, repo_root);
     // Nothing to push (and nothing worth a PR) if the branch never
     // diverged from its target — e.g. `done` called with no commits made.
@@ -687,7 +736,7 @@ pub fn push_branch(
     let push_timeout = 120;
     match run_output_timeout(
         crate::shell::git_binary(),
-        &["push", "-u", "origin", &branch],
+        &["push", "--force-with-lease", "-u", "origin", &branch],
         repo_root,
         push_timeout,
     ) {
@@ -706,6 +755,98 @@ pub fn push_branch(
         _ => {}
     }
     Some(branch)
+}
+
+/// Outcome of [`rebase_item_worktree`].
+pub enum RebaseOutcome {
+    /// No worktree exists yet, or the fetch itself didn't land (no remote,
+    /// offline, or the fetched ref didn't resolve) -- soft-failed like
+    /// every other network step in this file rather than blocking the
+    /// caller.
+    Skipped,
+    /// The worktree's branch already contains the fetched target tip --
+    /// nothing to rebase.
+    UpToDate,
+    /// Rebased cleanly onto the fetched target tip.
+    Rebased,
+    /// The worktree had uncommitted changes -- rebasing over them risks
+    /// losing or corrupting in-progress work, so nothing ran.
+    Dirty,
+    /// The rebase hit a conflict and was aborted; the branch is exactly as
+    /// it was before this call. Carries `git rebase`'s stderr for whoever
+    /// surfaces this to a human.
+    Conflict(String),
+}
+
+/// Fetches the current tip of `target_branch` and rebases `item`'s worktree
+/// branch onto it, if the worktree exists and is clean.
+///
+/// `create_worktree`'s own fetch only ever runs once, at initial creation --
+/// a worktree that's re-claimed/redispatched, or that simply sits idle while
+/// other agents merge unrelated PRs into `target_branch`, never gets
+/// refreshed, so work (and the PR eventually opened from it) can proceed
+/// against an already-stale base. Callers are expected to invoke this both
+/// right after a claim resolves a worktree (covering the re-claim/redispatch
+/// case) and again right before opening a PR (covering drift that happened
+/// during the work session itself) (item #161).
+///
+/// Never forces or discards anything: a dirty tree is left untouched
+/// (`Dirty`), and a real conflict aborts the rebase immediately (`Conflict`)
+/// rather than leaving the worktree mid-rebase or resolving anything
+/// automatically. Soft-fails (`Skipped`) on no worktree / no reachable
+/// remote, matching every other network step in this file.
+pub fn rebase_item_worktree(item: &Item, repo_root: &Path, target_branch: &str) -> RebaseOutcome {
+    let worktree_path = repo_root
+        .join(".worktrees")
+        .join("task")
+        .join(item.sequence_id.to_string());
+    if !worktree_path.is_dir() {
+        return RebaseOutcome::Skipped;
+    }
+    let fetch_timeout_secs = 30;
+    let fetch_result = fetch_with_retry(
+        crate::shell::git_binary(),
+        &["fetch", "origin", target_branch],
+        &worktree_path,
+        fetch_timeout_secs,
+    );
+    let remote_ref = format!("origin/{target_branch}");
+    let fetched = matches!(&fetch_result, Ok(out) if out.status.success())
+        && run_git_in_ok(
+            &worktree_path,
+            &["rev-parse", "--verify", "--quiet", &remote_ref],
+        );
+    if !fetched {
+        return RebaseOutcome::Skipped;
+    }
+    match run_git_in(&worktree_path, &["status", "--porcelain"]) {
+        Ok(out) if out.trim().is_empty() => {}
+        _ => return RebaseOutcome::Dirty,
+    }
+    if run_git_in_ok(
+        &worktree_path,
+        &["merge-base", "--is-ancestor", &remote_ref, "HEAD"],
+    ) {
+        return RebaseOutcome::UpToDate;
+    }
+    let rebase_timeout_secs = 60;
+    match run_output_timeout(
+        crate::shell::git_binary(),
+        &["rebase", &remote_ref],
+        &worktree_path,
+        rebase_timeout_secs,
+    ) {
+        Ok(out) if out.status.success() => RebaseOutcome::Rebased,
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let _ = run_git_in(&worktree_path, &["rebase", "--abort"]);
+            RebaseOutcome::Conflict(stderr)
+        }
+        Err(e) => {
+            let _ = run_git_in(&worktree_path, &["rebase", "--abort"]);
+            RebaseOutcome::Conflict(e)
+        }
+    }
 }
 
 /// Information about an orphaned worktree detected during audit.
@@ -933,17 +1074,61 @@ pub fn commit_uncommitted(item: &Item, repo_root: &Path, message: &str) -> Commi
         .join(".worktrees")
         .join("task")
         .join(item.sequence_id.to_string());
-    match run_git_in(&worktree_path, &["status", "--porcelain"]) {
+    commit_uncommitted_at(&worktree_path, message, false)
+}
+
+/// Same mechanics as `commit_uncommitted`, but against an already-resolved
+/// worktree path instead of one derived from `Item::sequence_id` -- used by
+/// the SDD loop's per-implementer-turn checkpoint commits (item #193),
+/// where the caller already holds the path via `WorkItemData::worktree_path`
+/// rather than an `Item`.
+///
+/// `no_verify` skips local git hooks, including the repo's LOC-freeze
+/// pre-commit gate (`scripts/loc-gate.sh`, item #141) -- a checkpoint commit
+/// intentionally bypasses it, since an in-progress turn's diff can
+/// legitimately, if only temporarily, exceed the gate; `finalize`'s
+/// squashed commit (see `squash_since`) is what the gate actually evaluates.
+pub fn commit_uncommitted_at(
+    worktree_path: &Path,
+    message: &str,
+    no_verify: bool,
+) -> CommitOutcome {
+    match run_git_in(worktree_path, &["status", "--porcelain"]) {
         Ok(out) if !out.trim().is_empty() => {}
         _ => return CommitOutcome::NothingToCommit,
     }
-    if let Err(e) = run_git_in(&worktree_path, &["add", "-A"]) {
+    if let Err(e) = run_git_in(worktree_path, &["add", "-A"]) {
         return CommitOutcome::Failed(format!("git add failed: {e}"));
     }
-    match run_git_in(&worktree_path, &["commit", "-m", message]) {
+    let mut args = vec!["commit", "-m", message];
+    if no_verify {
+        args.push("--no-verify");
+    }
+    match run_git_in(worktree_path, &args) {
         Ok(_) => CommitOutcome::Committed,
         Err(e) => CommitOutcome::Failed(format!("git commit failed: {e}")),
     }
+}
+
+/// The worktree's current `HEAD` commit SHA, if resolvable -- used to
+/// capture the SDD loop's pre-checkpoint base (item #193) before its first
+/// per-turn commit, so `finalize` can later fold every checkpoint commit
+/// back into an uncommitted diff via `squash_since`.
+pub fn head_sha(worktree_path: &Path) -> Option<String> {
+    run_git_in(worktree_path, &["rev-parse", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Folds every commit made since `base_sha` back into the index and working
+/// tree as one uncommitted diff, without touching any file content --
+/// `git reset --soft` under the hood. Used by `finalize` (item #193) to
+/// squash the SDD loop's per-turn checkpoint commits into a single diff
+/// right before its own `commit_uncommitted` call, so the repo's LOC-freeze
+/// gate evaluates the whole run's changes as one commit instead of turn by
+/// turn. A no-op if `base_sha` is already `HEAD`.
+pub fn squash_since(worktree_path: &Path, base_sha: &str) -> Result<(), String> {
+    run_git_in(worktree_path, &["reset", "--soft", base_sha]).map(|_| ())
 }
 
 /// Remove a worktree directory, with retry + Windows fallback.
@@ -966,7 +1151,7 @@ fn remove_worktree_dir(path: &Path, name: &str) -> bool {
 
     #[cfg(windows)]
     {
-        if std::process::Command::new("cmd")
+        if flare_process::command("cmd")
             .args(["/c", "rmdir", "/s", "/q", &path.to_string_lossy()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -995,7 +1180,7 @@ fn remove_worktree_dir(path: &Path, name: &str) -> bool {
                 "/C".to_string(),
                 "/Q".to_string(),
             ];
-            let _ = std::process::Command::new("icacls")
+            let _ = flare_process::command("icacls")
                 .args(&icacls_args)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -1006,7 +1191,7 @@ fn remove_worktree_dir(path: &Path, name: &str) -> bool {
         }
 
         for handle_exe in &["handle64.exe", "handle.exe"] {
-            if let Ok(output) = std::process::Command::new(handle_exe)
+            if let Ok(output) = flare_process::command(handle_exe)
                 .args(["-accepteula", "-nobanner", &path.to_string_lossy()])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())

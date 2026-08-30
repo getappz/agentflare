@@ -2,7 +2,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Build the `agentflare` binary from the current source tree and return the
 /// path cargo actually wrote it to.
@@ -29,7 +29,7 @@ pub(crate) fn build_and_locate(release: bool) -> Result<PathBuf, String> {
         ));
     }
 
-    let mut cmd = Command::new("cargo");
+    let mut cmd = flare_process::command("cargo");
     cmd.args([
         "build",
         "-p",
@@ -110,7 +110,7 @@ fn parse_named_executable_path(build_json: &str, target_name: &str) -> Option<Pa
 /// (see `shim_install`'s module doc), so a compile error here must never
 /// abort `dev-install`'s main-binary swap. Returns `(shim, git_shim)`.
 pub(crate) fn build_shims(release: bool) -> Result<(PathBuf, PathBuf), String> {
-    let mut cmd = Command::new("cargo");
+    let mut cmd = flare_process::command("cargo");
     cmd.args([
         "build",
         "-p",

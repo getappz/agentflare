@@ -15,6 +15,8 @@ pub struct BundleEntry {
     pub description: String,
     pub body: String,
     pub tags: String,
+    #[serde(default)]
+    pub category: String,
     pub est_tokens: i64,
 }
 
@@ -34,6 +36,7 @@ impl SkillBundle {
                     description: e.description.clone(),
                     body: e.body.clone(),
                     tags: e.tags.clone(),
+                    category: e.category.clone(),
                     est_tokens: e.est_tokens,
                 })
                 .collect(),
@@ -63,6 +66,7 @@ impl SkillBundle {
                 body: be.body.clone(),
                 neg_text: String::new(),
                 tags: be.tags.clone(),
+                category: be.category.clone(),
                 est_tokens: be.est_tokens,
                 mtime: 0,
                 bandit_alpha: 1.0,
@@ -115,6 +119,7 @@ mod tests {
             body: "body".into(),
             neg_text: String::new(),
             tags: String::new(),
+            category: String::new(),
             est_tokens: 10,
             mtime: 0,
             bandit_alpha: 1.0,
@@ -144,6 +149,7 @@ mod tests {
                     description: "first".into(),
                     body: "".into(),
                     tags: "".into(),
+                    category: "".into(),
                     est_tokens: 0,
                 },
                 BundleEntry {
@@ -152,6 +158,7 @@ mod tests {
                     description: "second duplicate".into(),
                     body: "".into(),
                     tags: "".into(),
+                    category: "".into(),
                     est_tokens: 0,
                 },
             ],

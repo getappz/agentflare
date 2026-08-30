@@ -879,16 +879,19 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                                 t.skipped.insert(step_id.clone());
                                 (StepResult::Skip, false)
                             }
-                            Ok(StepResult::Failure) | Err(_) => match step.on_failure {
-                                FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => {
-                                    t.failed.insert(step_id.clone());
-                                    (StepResult::Failure, false)
+                            Ok(StepResult::Failure) | Ok(StepResult::Failed(_)) | Err(_) => {
+                                match step.on_failure {
+                                    FailureAction::FailWorkflow
+                                    | FailureAction::RetryIndefinitely => {
+                                        t.failed.insert(step_id.clone());
+                                        (StepResult::Failure, false)
+                                    }
+                                    FailureAction::ContinueNextStep => {
+                                        t.skipped.insert(step_id.clone());
+                                        (StepResult::Skip, true)
+                                    }
                                 }
-                                FailureAction::ContinueNextStep => {
-                                    t.skipped.insert(step_id.clone());
-                                    (StepResult::Skip, true)
-                                }
-                            },
+                            }
                         };
 
                         if let Err(e) = tx.try_send((step_id.clone(), sig)) {
@@ -1124,6 +1127,12 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                             s.output = Some(out.clone());
                             if let Some(var) = step.output_var.as_deref() {
                                 capture_output(&mut s.variables, Some(var), &out);
+                                // Keep the persisted context's variables (what
+                                // `run_if` reads via `get_context`) in sync
+                                // with this step's own just-captured output —
+                                // otherwise a downstream step's run_if sees a
+                                // one-step-stale snapshot.
+                                s.context.variables = s.variables.clone();
                             }
                             if let Some(ss) = s.step_states.get_mut(&step.id) {
                                 ss.status = StepStatus::Succeeded;
@@ -1159,13 +1168,18 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 Ok(Ok(StepResult::Skip)) => {
                     return Ok(StepResult::Skip);
                 }
-                Ok(Ok(StepResult::Failure)) | Ok(Err(_)) | Err(_) => {
+                Ok(Ok(StepResult::Failure))
+                | Ok(Ok(StepResult::Failed(_)))
+                | Ok(Err(_))
+                | Err(_) => {
                     let (error_msg, should_retry) = match result {
                         Ok(Err(e)) => {
                             let retryable = step.executor.is_retryable(&e);
                             (format!("{e}"), retryable)
                         }
                         Err(_) => (format!("Step timeout after {step_timeout:?}"), true),
+                        // Carries its own reason — never retried, same as `Failure`.
+                        Ok(Ok(StepResult::Failed(ref msg))) => (msg.clone(), false),
                         _ => ("Step failed".to_string(), false),
                     };
 
@@ -1348,7 +1362,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     Err(format!("Workflow failed at step {step_name}: {error_msg}"))
                 }
                 WorkflowStatus::Cancelled => Err(format!("Workflow cancelled for {label}")),
-                WorkflowStatus::Pending | WorkflowStatus::Paused | WorkflowStatus::Running => {
+                WorkflowStatus::Pending
+                | WorkflowStatus::Paused
+                | WorkflowStatus::Running
+                | WorkflowStatus::Waiting => {
                     tokio::time::sleep(poll_interval).await;
                     poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
                     continue;

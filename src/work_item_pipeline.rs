@@ -110,6 +110,22 @@ pub(crate) struct WorkItemData {
     /// silently skips them as unreadable.
     #[serde(default)]
     pub review_only: bool,
+    /// Set from `detect_tdd_mode` at dispatch time (item #179) — an
+    /// opt-in, item-level flag (no free-text fallback like `review_only`
+    /// needs, since this has no legacy callers to support) that appends
+    /// red-green-refactor instructions to the implementer prompt and a
+    /// test-first-evidence check to the task-reviewer prompt.
+    ///
+    /// If `review_only` is also set, `review_only` takes precedence and
+    /// `tdd` has no effect — every dispatch site branches on `review_only`
+    /// first, routing to the analysis-only prompts regardless of `tdd`.
+    /// This is intentional, not a bug: TDD is a discipline for writing
+    /// code, and a review-only task never writes any.
+    ///
+    /// `#[serde(default)]` for the same reason as `review_only`: runs
+    /// started before this field existed must still deserialize.
+    #[serde(default)]
+    pub tdd: bool,
     /// Provider session id last observed for each agent name dispatched in
     /// this run (implementer and judge/reviewer are usually different
     /// agents and get independent entries). Used to pass `--resume <id>` on
@@ -117,6 +133,22 @@ pub(crate) struct WorkItemData {
     /// session.
     #[serde(default)]
     pub agent_sessions: std::collections::HashMap<String, String>,
+    /// The item's claimed worktree, captured once at dispatch time and
+    /// threaded through every `sdd_loop` agent call as `StepInvocation::cwd`
+    /// (item #191) — a run resumed by `engine().recover()` after a daemon
+    /// restart executes on the engine's own scheduler, never re-entering
+    /// `execute_work`'s `run_in_worktree` chdir, so it can't rely on the
+    /// process's ambient cwd matching this item's worktree. Empty for runs
+    /// persisted before this field existed; `real_agent_send_hook` falls
+    /// back to ambient cwd in that case.
+    #[serde(default)]
+    pub worktree_path: String,
+    /// SHA captured before the SDD loop's first checkpoint commit (item
+    /// #193). `finalize` squashes back to this point before its own
+    /// auto-commit, so the LOC-freeze gate sees one commit, not per-turn
+    /// fragments. `None` until then, and for review-only runs.
+    #[serde(default)]
+    pub checkpoint_base_sha: Option<String>,
 }
 
 impl flare_workflow::WorkflowData for WorkItemData {
@@ -125,111 +157,7 @@ impl flare_workflow::WorkflowData for WorkItemData {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum JudgeAction {
-    ContinueTask,
-    FixRound,
-    Escalate,
-    ParkFinding,
-    RuleAndContinue,
-    InsertTask,
-    SkipTask,
-    AdvanceTask,
-    CompletePipeline,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct JudgeDecision {
-    pub action: JudgeAction,
-    pub rationale: String,
-    pub ledger_line: String,
-    pub task_model_tier: Option<TaskModelTier>,
-}
-
-#[derive(Debug)]
-pub(crate) enum JudgeParseError {
-    InvalidJson(String),
-}
-
-impl std::fmt::Display for JudgeParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            JudgeParseError::InvalidJson(msg) => {
-                write!(f, "judge reply is not valid decision JSON: {msg}")
-            }
-        }
-    }
-}
-
-/// The first fenced code block in `reply` (` ```json ... ``` ` or a bare
-/// ` ``` ... ``` `), if any -- an explicit fence is an unambiguous boundary
-/// the judge only produces on purpose, so it's tried before brace-scanning.
-fn extract_fenced_block(reply: &str) -> Option<&str> {
-    let after_open = reply.find("```")? + 3;
-    let rest = &reply[after_open..];
-    // Skip an optional language tag (e.g. `json`) up to the fence's newline.
-    let body_start = rest.find('\n').map(|i| i + 1).unwrap_or(0);
-    let body = &rest[body_start..];
-    let end = body.find("```")?;
-    Some(body[..end].trim())
-}
-
-/// Scans forward from the first `{` for its own matching `}`, tracking
-/// nesting depth and skipping brace-like bytes inside JSON string literals
-/// (so a `{`/`}` embedded in a string value, or in unrelated commentary
-/// after the object, can't extend or corrupt the span). Returns the first
-/// complete top-level object instead of naively spanning from the first `{`
-/// to the *last* `}` anywhere in the reply, which a second unrelated
-/// brace-shaped span later in the text could throw off.
-fn extract_first_balanced_object(reply: &str) -> Option<&str> {
-    let start = reply.find('{')?;
-    let bytes = reply.as_bytes();
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
-        if in_string {
-            match b {
-                _ if escaped => escaped = false,
-                b'\\' => escaped = true,
-                b'"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&reply[start..=i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// The judge is prompted to reply with exactly one JSON object; this
-/// tolerates a reply that wraps the object in prose, a fenced code block, or
-/// trailing commentary containing its own unrelated braces, but does not
-/// otherwise repair malformed JSON — a genuine parse failure (including
-/// syntactically valid JSON missing a required field) is a step Failure,
-/// retried by the step's own RetryPolicy.
-pub(crate) fn parse_judge_decision(reply: &str) -> Result<JudgeDecision, JudgeParseError> {
-    if let Some(fenced) = extract_fenced_block(reply)
-        && let Ok(decision) = serde_json::from_str(fenced)
-    {
-        return Ok(decision);
-    }
-    let candidate = extract_first_balanced_object(reply).ok_or_else(|| {
-        JudgeParseError::InvalidJson("no balanced '{...}' object found".to_string())
-    })?;
-    serde_json::from_str(candidate).map_err(|e| JudgeParseError::InvalidJson(e.to_string()))
-}
+include!("work_item_pipeline/judge_decision.rs");
 
 use flare_workflow::executor::FunctionStep;
 use flare_workflow::sqlite_store::SqliteStore;
@@ -290,6 +218,16 @@ fn resume_args_for(
     }
 }
 
+/// True when a `send` failure means the resumed provider session no longer
+/// exists — e.g. it was born under a daemon process that crashed/restarted
+/// mid-run (item #159) — rather than a transient failure worth retrying
+/// as-is. Matches Claude Code's `claude --resume <dead-id>` stderr; other
+/// `resume_arg` agents (Cursor) are expected to fail the same recognizable
+/// way, but none has been observed yet to confirm the exact text.
+fn is_stale_session_error(message: &str) -> bool {
+    message.to_lowercase().contains("no conversation found")
+}
+
 /// Cap on fix rounds for a single SDD task before the loop gives up on it —
 /// mirrors `MAX_REVIEW_CYCLES`'s existing cap-constant pattern for the
 /// `coder`/`review_or_fix` pipeline.
@@ -323,6 +261,52 @@ const SDD_PIPELINE_COMPLETE_MARKER: &str = "PIPELINE_COMPLETE";
 /// closed over here) so a run resumed by `engine().recover()` after a crash
 /// dispatches against the real agent identity the crashed run persisted,
 /// not whatever happened to be registered at boot.
+/// Fills `WorkItemData::reply_text` when the pipeline completes, so
+/// `build_finalize_step` has an actual summary instead of an empty string
+/// (see that function's `item_done` call and success-comment body).
+/// `last_report` is the natural choice — the latest substantive role
+/// report — but `AdvanceTask`/`SkipTask` clear it on every task boundary
+/// (see the judge-decision handler below), so it's `None` by the time the
+/// final task's completion is detected via the tasks-exhausted check.
+/// Falling back to the ledger, which accumulates one line per task/round
+/// across the whole run, still yields a real summary instead of nothing.
+fn synthesize_reply_text(last_report: Option<&str>, ledger: &[String]) -> String {
+    match last_report {
+        Some(report) if !report.trim().is_empty() => report.to_string(),
+        _ => ledger.join("\n"),
+    }
+}
+
+/// Commits whatever an implementer turn just changed, so a crash/timeout
+/// later in the run (item #191's #186/#187) has something to resume from
+/// besides a raw, possibly-corrupted diff (item #193). `--no-verify` skips
+/// the LOC-freeze gate — an in-progress turn can legitimately exceed it
+/// temporarily; `finalize`'s squash+`commit_uncommitted` is what runs it.
+/// Captures `checkpoint_base_sha` lazily for `finalize` to reset back to.
+///
+/// No-ops when `worktree_path` is empty (a run persisted before item #191
+/// threaded it through): unlike agent dispatch, which has an ambient-cwd
+/// fallback for that legacy case, a `git commit` has no safe ambient
+/// fallback — the process cwd is never guaranteed to BE that item's
+/// worktree, and committing into whatever it actually is would be a
+/// correctness hazard, not just a missed checkpoint. Best-effort otherwise:
+/// a commit failure is logged, not fatal.
+fn checkpoint_implementer_turn(data: &mut WorkItemData, task_id: usize) {
+    if data.worktree_path.is_empty() {
+        return;
+    }
+    let worktree_path = std::path::PathBuf::from(&data.worktree_path);
+    if data.checkpoint_base_sha.is_none() {
+        data.checkpoint_base_sha = crate::worktree::head_sha(&worktree_path);
+    }
+    let message = format!("wip(sdd-loop): task {task_id} checkpoint");
+    if let crate::worktree::CommitOutcome::Failed(e) =
+        crate::worktree::commit_uncommitted_at(&worktree_path, &message, true)
+    {
+        eprintln!("sdd_loop: checkpoint commit for task {task_id} failed: {e}");
+    }
+}
+
 pub(crate) fn build_sdd_loop_step(
     send: flare_workflow::json::SendMessage,
 ) -> StepDefinition<WorkItemData> {
@@ -331,10 +315,15 @@ pub(crate) fn build_sdd_loop_step(
             let send = send.clone();
             Box::pin(async move {
                 if ctx.data.current_task_index >= MAX_TASKS_PROCESSED {
-                    return Ok(StepResult::Failure);
+                    return Ok(StepResult::Failed(format!(
+                        "current_task_index {} reached MAX_TASKS_PROCESSED ({})",
+                        ctx.data.current_task_index, MAX_TASKS_PROCESSED
+                    )));
                 }
                 if ctx.data.tasks.is_empty() || ctx.data.current_task_index >= ctx.data.tasks.len()
                 {
+                    ctx.data.reply_text =
+                        synthesize_reply_text(ctx.data.last_report.as_deref(), &ctx.data.ledger);
                     ctx.output = SDD_PIPELINE_COMPLETE_MARKER.to_string();
                     return Ok(StepResult::Success);
                 }
@@ -348,7 +337,9 @@ pub(crate) fn build_sdd_loop_step(
                 let agent_name = ctx.data.agent_name.clone();
                 let judge_agent_name = ctx.data.judge_agent_name.clone();
                 if agent_name.is_empty() || judge_agent_name.is_empty() {
-                    return Ok(StepResult::Failure);
+                    return Ok(StepResult::Failed(format!(
+                        "sdd_loop missing agent identity: agent_name={agent_name:?} judge_agent_name={judge_agent_name:?}"
+                    )));
                 }
 
                 let task = ctx.data.tasks[ctx.data.current_task_index].clone();
@@ -361,60 +352,78 @@ pub(crate) fn build_sdd_loop_step(
                 // dispatch further down), so a usage-threshold fallback that
                 // swaps `agent_name` to another CLI still leaves real code
                 // review running on the reserved agent.
-                let (role_agent, role_prompt) = if ctx.data.review_issues.is_some() {
-                    if ctx.data.last_report.is_some() {
-                        // A fix has already been submitted for the current
-                        // issues — re-review it.
-                        let findings = ctx.data.review_issues.clone().unwrap_or_default();
-                        let fix_report = ctx.data.last_report.clone().unwrap_or_default();
-                        (
-                            judge_agent_name.clone(),
-                            build_re_reviewer_prompt(&task, &findings, &fix_report),
-                        )
-                    } else {
-                        // Issues open, no fix attempt yet — dispatch the
-                        // implementer to fix them (or, for a review-only
-                        // task, the analyst to revise their findings).
-                        let fix_context = ctx.data.review_issues.as_deref();
-                        let prompt = if ctx.data.review_only {
-                            build_review_analyst_prompt(&task, fix_context)
+                let (role_agent, role_prompt, is_implementer_turn) =
+                    if ctx.data.review_issues.is_some() {
+                        if ctx.data.last_report.is_some() {
+                            // A fix has already been submitted for the current
+                            // issues — re-review it.
+                            let findings = ctx.data.review_issues.clone().unwrap_or_default();
+                            let fix_report = ctx.data.last_report.clone().unwrap_or_default();
+                            (
+                                judge_agent_name.clone(),
+                                build_re_reviewer_prompt(&task, &findings, &fix_report),
+                                false,
+                            )
                         } else {
-                            build_implementer_prompt(&task, fix_context)
+                            // Issues open, no fix attempt yet — dispatch the
+                            // implementer to fix them (or, for a review-only
+                            // task, the analyst to revise their findings).
+                            let fix_context = ctx.data.review_issues.as_deref();
+                            let prompt = if ctx.data.review_only {
+                                build_review_analyst_prompt(&task, fix_context)
+                            } else {
+                                build_implementer_prompt(&task, fix_context, ctx.data.tdd)
+                            };
+                            (agent_name.clone(), prompt, !ctx.data.review_only)
+                        }
+                    } else if ctx.data.last_report.is_some() {
+                        // No open issues; a report is pending review.
+                        let report = ctx.data.last_report.clone().unwrap_or_default();
+                        let prompt = if ctx.data.review_only {
+                            build_review_of_analysis_prompt(&task, &report)
+                        } else {
+                            build_task_reviewer_prompt(&task, &report, ctx.data.tdd)
                         };
-                        (agent_name.clone(), prompt)
-                    }
-                } else if ctx.data.last_report.is_some() {
-                    // No open issues; a report is pending review.
-                    let report = ctx.data.last_report.clone().unwrap_or_default();
-                    let prompt = if ctx.data.review_only {
-                        build_review_of_analysis_prompt(&task, &report)
+                        (judge_agent_name.clone(), prompt, false)
                     } else {
-                        build_task_reviewer_prompt(&task, &report)
+                        // Fresh task, nothing dispatched yet.
+                        let prompt = if ctx.data.review_only {
+                            build_review_analyst_prompt(&task, None)
+                        } else {
+                            build_implementer_prompt(&task, None, ctx.data.tdd)
+                        };
+                        (agent_name.clone(), prompt, !ctx.data.review_only)
                     };
-                    (judge_agent_name.clone(), prompt)
-                } else {
-                    // Fresh task, nothing dispatched yet.
-                    let prompt = if ctx.data.review_only {
-                        build_review_analyst_prompt(&task, None)
-                    } else {
-                        build_implementer_prompt(&task, None)
-                    };
-                    (agent_name.clone(), prompt)
-                };
 
+                let cwd = (!ctx.data.worktree_path.is_empty())
+                    .then(|| std::path::PathBuf::from(&ctx.data.worktree_path));
                 let role_invocation = flare_workflow::json::StepInvocation {
                     args: resume_args_for(&role_agent, &ctx.data.agent_sessions),
+                    cwd: cwd.clone(),
                     ..flare_workflow::json::StepInvocation::simple(role_agent.clone(), role_prompt)
                 };
                 let (raw_role_reply, in_tok, out_tok) =
-                    send(role_invocation)
-                        .await
-                        .map_err(|message| WorkflowError::StepFailed {
+                    send(role_invocation).await.map_err(|message| {
+                        // A dead resumed session would otherwise fail the
+                        // same way on every one of this step's retry
+                        // attempts (same session_id -> same `--resume`
+                        // failure) until `RetryPolicy` gives up — clearing
+                        // it here makes the very next attempt fall back to
+                        // a fresh prompt instead.
+                        if is_stale_session_error(&message) {
+                            ctx.data.agent_sessions.remove(&role_agent);
+                        }
+                        WorkflowError::StepFailed {
                             step_id: StepId::new("sdd_loop"),
                             message,
-                        })?;
+                        }
+                    })?;
                 ctx.input_tokens += in_tok;
                 ctx.output_tokens += out_tok;
+
+                if is_implementer_turn {
+                    checkpoint_implementer_turn(&mut ctx.data, task.id);
+                }
 
                 let (role_reply, role_session_id) = strip_session_marker(&raw_role_reply);
                 if let Some(id) = role_session_id {
@@ -448,18 +457,22 @@ pub(crate) fn build_sdd_loop_step(
                 );
                 let judge_invocation = flare_workflow::json::StepInvocation {
                     args: resume_args_for(&judge_agent_name, &ctx.data.agent_sessions),
+                    cwd,
                     ..flare_workflow::json::StepInvocation::simple(
                         judge_agent_name.clone(),
                         judge_prompt,
                     )
                 };
                 let (raw_judge_reply, jin_tok, jout_tok) =
-                    send(judge_invocation)
-                        .await
-                        .map_err(|message| WorkflowError::StepFailed {
+                    send(judge_invocation).await.map_err(|message| {
+                        if is_stale_session_error(&message) {
+                            ctx.data.agent_sessions.remove(&judge_agent_name);
+                        }
+                        WorkflowError::StepFailed {
                             step_id: StepId::new("sdd_loop"),
                             message,
-                        })?;
+                        }
+                    })?;
                 ctx.input_tokens += jin_tok;
                 ctx.output_tokens += jout_tok;
 
@@ -492,7 +505,10 @@ pub(crate) fn build_sdd_loop_step(
                     JudgeAction::FixRound => {
                         ctx.data.fix_round += 1;
                         if ctx.data.fix_round > MAX_FIX_ROUNDS {
-                            return Ok(StepResult::Failure);
+                            return Ok(StepResult::Failed(format!(
+                                "task {} exceeded MAX_FIX_ROUNDS ({}) without converging",
+                                task.id, MAX_FIX_ROUNDS
+                            )));
                         }
                     }
                     JudgeAction::Escalate => {
@@ -506,7 +522,11 @@ pub(crate) fn build_sdd_loop_step(
                     }
                     JudgeAction::InsertTask => {
                         if ctx.data.tasks.len() >= MAX_TASKS_PROCESSED {
-                            return Ok(StepResult::Failure);
+                            return Ok(StepResult::Failed(format!(
+                                "cannot insert task: tasks.len() {} reached MAX_TASKS_PROCESSED ({})",
+                                ctx.data.tasks.len(),
+                                MAX_TASKS_PROCESSED
+                            )));
                         }
                         let new_id = ctx.data.tasks.len();
                         ctx.data.tasks.push(SddTask {
@@ -517,6 +537,10 @@ pub(crate) fn build_sdd_loop_step(
                         });
                     }
                     JudgeAction::CompletePipeline => {
+                        ctx.data.reply_text = synthesize_reply_text(
+                            ctx.data.last_report.as_deref(),
+                            &ctx.data.ledger,
+                        );
                         ctx.output = SDD_PIPELINE_COMPLETE_MARKER.to_string();
                         return Ok(StepResult::Success);
                     }
@@ -629,7 +653,9 @@ pub(crate) fn build_finalize_step(
                 // the boot-time recovery definition closed over a
                 // placeholder id.
                 if ctx.data.item_id.is_empty() {
-                    return Ok(StepResult::Failure);
+                    return Ok(StepResult::Failed(
+                        "finalize: item_id is empty, cannot reconstruct run identity".to_string(),
+                    ));
                 }
                 let item_id = ctx.data.item_id.clone();
                 let notify_recipient = ctx.data.notify_recipient.clone();
@@ -688,6 +714,22 @@ pub(crate) fn build_finalize_step(
                             ..Default::default()
                         });
                         return Ok(StepResult::Success);
+                    }
+
+                    // Squash checkpoint commits (item #193) into one diff
+                    // before `item_done`'s own commit, so the LOC-freeze
+                    // gate sees the whole run at once. `.take()`: a retry
+                    // of this step must not re-squash an already-squashed
+                    // commit.
+                    if let Some(base_sha) = ctx.data.checkpoint_base_sha.take()
+                        && !ctx.data.worktree_path.is_empty()
+                    {
+                        let worktree_path = std::path::PathBuf::from(&ctx.data.worktree_path);
+                        if let Err(e) = crate::worktree::squash_since(&worktree_path, &base_sha) {
+                            eprintln!(
+                                "finalize: squashing sdd_loop checkpoint commits for item {item_id} failed: {e}"
+                            );
+                        }
                     }
 
                     let done_resp = mcp
@@ -781,11 +823,19 @@ fn real_agent_send_hook(
     std::sync::Arc::new(move |inv: flare_workflow::json::StepInvocation| {
         let mut all_args = extra_args.clone();
         all_args.extend(inv.args.clone());
-        let flare_workflow::json::StepInvocation { agent, prompt, .. } = inv;
+        let flare_workflow::json::StepInvocation {
+            agent, prompt, cwd, ..
+        } = inv;
         Box::pin(async move {
             let agent_for_reply = agent.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                crate::agent_launch::run_headless(
+            let outcome = tokio::task::spawn_blocking(move || match &cwd {
+                // Explicit cwd (the item's own worktree, threaded through
+                // `WorkItemData::worktree_path`) instead of the ambient
+                // process cwd — required for a run resumed by
+                // `engine().recover()`, which never re-enters
+                // `execute_work`'s `run_in_worktree` chdir (item #191).
+                Some(cwd) => crate::agent_launch::run_headless_in(
+                    cwd,
                     agent_registry::REGISTRY,
                     &agent,
                     &prompt,
@@ -793,7 +843,16 @@ fn real_agent_send_hook(
                     idle_timeout,
                     &all_args,
                     true,
-                )
+                ),
+                None => crate::agent_launch::run_headless(
+                    agent_registry::REGISTRY,
+                    &agent,
+                    &prompt,
+                    timeout,
+                    idle_timeout,
+                    &all_args,
+                    true,
+                ),
             })
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
@@ -872,6 +931,7 @@ pub(crate) fn engine() -> &'static WorkflowEngine<WorkItemData, SqliteStore<Work
 pub(crate) fn run_or_resume(
     mcp: std::sync::Arc<AgentflareMcp>,
     item: &agentflare_backend::item::Item,
+    worktree_path: &std::path::Path,
     implementer_agent: agent_registry::Agent,
     review_agent: agent_registry::Agent,
     item_description: String,
@@ -884,6 +944,7 @@ pub(crate) fn run_or_resume(
     run_or_resume_with_sender(
         mcp,
         item,
+        worktree_path,
         implementer_agent,
         review_agent,
         item_description,
@@ -902,6 +963,7 @@ pub(crate) fn run_or_resume(
 pub(crate) fn run_or_resume_with_sender(
     mcp: std::sync::Arc<AgentflareMcp>,
     item: &agentflare_backend::item::Item,
+    worktree_path: &std::path::Path,
     implementer_agent: agent_registry::Agent,
     review_agent: agent_registry::Agent,
     item_description: String,
@@ -929,6 +991,8 @@ pub(crate) fn run_or_resume_with_sender(
     // Seeds `WorkItemData::review_only` (item #507) the same way — computed
     // once here so both `start_workflow` call sites below agree.
     let review_only = detect_review_only(&item_description, &existing_metadata);
+    // Seeds `WorkItemData::tdd` (item #179) the same way.
+    let tdd = detect_tdd_mode(&existing_metadata);
 
     let agent_name = implementer_agent.as_str().to_string();
     let judge_agent_name = review_agent.as_str().to_string();
@@ -946,6 +1010,7 @@ pub(crate) fn run_or_resume_with_sender(
     eng.register_workflow(definition)
         .map_err(|e| e.to_string())?;
 
+    let worktree_path = worktree_path.display().to_string();
     crate::workflow::blocking_runtime().block_on(async move {
         // Seeded onto every fresh `start_workflow` call below (not carried
         // by the definition itself, see `build_work_item_pipeline_with_sender`)
@@ -961,6 +1026,8 @@ pub(crate) fn run_or_resume_with_sender(
             notify_recipient: notify_recipient.clone(),
             tasks: tasks.clone(),
             review_only,
+            tdd,
+            worktree_path: worktree_path.clone(),
             ..Default::default()
         };
         let run_id = match existing_run_id {
@@ -1066,179 +1133,9 @@ fn persist_run_id(
     .map_err(|e| e.message.to_string())
 }
 
-/// Decides whether a dispatched item is a review-only task (item #507):
-/// `sdd_loop` should analyze and report rather than implement, and
-/// `finalize` should post a findings comment rather than running
-/// `item_done`/PR flow. `metadata["task_type"] == "review"` is the
-/// authoritative signal — set it at handoff/dispatch time when the caller
-/// already knows the task type (e.g. PM-mode's own task-type routing).
-/// Falls back to matching the "review only" framing a human/agent handoff
-/// uses in prose when no structured field is set — item #502's own handoff
-/// read "REVIEW ONLY — do not fix, do not push, do not open a PR." with
-/// nothing else marking it as such, and the pipeline implemented it anyway.
-pub(crate) fn detect_review_only(item_description: &str, metadata: &serde_json::Value) -> bool {
-    if metadata["task_type"].as_str() == Some("review") {
-        return true;
-    }
-    item_description.to_lowercase().contains("review only")
-}
+include!("work_item_pipeline/task_sourcing.rs");
 
-/// Parses `### Task N: <title>` headings (the convention this codebase's
-/// own plans already use — see docs on item #110) into a task list; falls
-/// back to a single synthesized task from the item's own description when
-/// no plan doc is attached or it contains no recognizable task headings.
-pub(crate) fn load_or_synthesize_tasks(
-    item_description: &str,
-    plan_doc: Option<&str>,
-) -> Vec<SddTask> {
-    if let Some(doc) = plan_doc.filter(|d| !d.trim().is_empty()) {
-        let tasks = parse_task_headings(doc);
-        if !tasks.is_empty() {
-            return tasks;
-        }
-    }
-    vec![SddTask {
-        id: 0,
-        title: "Item work".to_string(),
-        body: item_description.to_string(),
-        model_tier: None,
-    }]
-}
-
-fn parse_task_headings(doc: &str) -> Vec<SddTask> {
-    let mut tasks = Vec::new();
-    let mut current: Option<(String, String)> = None;
-
-    for line in doc.lines() {
-        if let Some(title) = line.strip_prefix("### Task ").and_then(|rest| {
-            let (_num, title) = rest.split_once(':')?;
-            Some(title.trim().to_string())
-        }) {
-            if let Some((title, body)) = current.take() {
-                tasks.push(SddTask {
-                    id: tasks.len(),
-                    title,
-                    body: body.trim().to_string(),
-                    model_tier: None,
-                });
-            }
-            current = Some((title, String::new()));
-        } else if let Some((_, body)) = current.as_mut() {
-            body.push_str(line);
-            body.push('\n');
-        }
-    }
-    if let Some((title, body)) = current {
-        tasks.push(SddTask {
-            id: tasks.len(),
-            title,
-            body: body.trim().to_string(),
-            model_tier: None,
-        });
-    }
-    tasks
-}
-
-/// Builds the prompt for the implementer role: given a task, it must implement
-/// it. If `fix_context` is provided (a prior reviewer's findings), the prompt
-/// instructs them to address those issues.
-pub(crate) fn build_implementer_prompt(task: &SddTask, fix_context: Option<&str>) -> String {
-    let mut prompt = format!(
-        "You are implementing one task from a larger plan.\n\nTask: {}\n\n{}\n",
-        task.title, task.body
-    );
-    if let Some(ctx) = fix_context {
-        prompt.push_str(&format!(
-            "\nA reviewer found issues with your prior attempt:\n{ctx}\n\nAddress them, re-run any tests you touched, and reply with your status.\n"
-        ));
-    }
-    prompt.push_str("\nReply with a short status: what you did, tests run, and any concerns.\n");
-    prompt
-}
-
-/// Review-only counterpart of `build_implementer_prompt` (item #507): same
-/// fix-round re-dispatch shape, but the role is constrained to analysis —
-/// it must never write, edit, or commit code, or open a pull request.
-pub(crate) fn build_review_analyst_prompt(task: &SddTask, fix_context: Option<&str>) -> String {
-    let mut prompt = format!(
-        "You are reviewing one task from a larger plan — analysis only. Do not write, edit, or commit any code, and do not open a pull request.\n\nTask: {}\n\n{}\n",
-        task.title, task.body
-    );
-    if let Some(ctx) = fix_context {
-        prompt.push_str(&format!(
-            "\nA second reviewer flagged gaps in your prior analysis:\n{ctx}\n\nAddress them and reply with your updated findings.\n"
-        ));
-    }
-    prompt.push_str(
-        "\nReply with your findings: what you reviewed and any issues found (or none).\n",
-    );
-    prompt
-}
-
-/// Builds the prompt for the task reviewer role: given a task and the
-/// implementer's report, review it for spec compliance and code quality.
-pub(crate) fn build_task_reviewer_prompt(task: &SddTask, implementer_report: &str) -> String {
-    format!(
-        "Review this task's implementation for spec compliance and code quality.\n\nTask: {}\n{}\n\nImplementer's report:\n{implementer_report}\n\nReply REVIEW_APPROVED if both spec and quality pass, or REVIEW_ISSUES: followed by a bulleted list of findings.\n",
-        task.title, task.body
-    )
-}
-
-/// Review-only counterpart of `build_task_reviewer_prompt` (item #507):
-/// checks the analyst's findings for completeness/accuracy instead of "spec
-/// compliance and code quality" — there's no code for this second pass to
-/// check, only the first pass's own analysis.
-pub(crate) fn build_review_of_analysis_prompt(task: &SddTask, analyst_report: &str) -> String {
-    format!(
-        "Review this analysis for completeness and accuracy — is anything missing or wrong?\n\nTask: {}\n{}\n\nAnalyst's report:\n{analyst_report}\n\nReply REVIEW_APPROVED if the analysis is thorough and accurate, or REVIEW_ISSUES: followed by a bulleted list of gaps.\n",
-        task.title, task.body
-    )
-}
-
-/// Builds the prompt for the re-reviewer role: given a task, the original
-/// findings, and a fix report, re-review only those specific findings.
-pub(crate) fn build_re_reviewer_prompt(task: &SddTask, findings: &str, fix_report: &str) -> String {
-    format!(
-        "Re-review a fix for this task's findings only — do not look for new issues.\n\nTask: {}\n\nOriginal findings:\n{findings}\n\nFix report:\n{fix_report}\n\nReply REVIEW_APPROVED if every finding is addressed, or REVIEW_ISSUES: followed by what remains.\n",
-        task.title
-    )
-}
-
-/// Builds the prompt for the judge: given the task list, current task index,
-/// ledger history, and the latest role reply, the judge decides what happens next.
-pub(crate) fn build_judge_prompt(
-    tasks: &[SddTask],
-    current_task_index: usize,
-    ledger: &[String],
-    role_reply: &str,
-    review_only: bool,
-) -> String {
-    let task_list: String = tasks
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            format!(
-                "{}. {}{}\n",
-                i,
-                t.title,
-                if i == current_task_index {
-                    " <- current"
-                } else {
-                    ""
-                }
-            )
-        })
-        .collect();
-    let ledger_text: String = ledger.join("\n");
-    let mode_note = if review_only {
-        "This is a review-only task: no code should be written; the role's job is to analyze and report findings, not implement fixes.\n\n"
-    } else {
-        ""
-    };
-    format!(
-        "You are the judge for an autonomous multi-task execution pipeline.\n\n{mode_note}Plan:\n{task_list}\n\nLedger so far:\n{ledger_text}\n\nLatest role reply:\n{role_reply}\n\nDecide what happens next. Reply with ONE JSON object and nothing else, matching exactly:\n{{\"action\": \"continue_task|fix_round|escalate|park_finding|rule_and_continue|insert_task|skip_task|advance_task|complete_pipeline\", \"rationale\": \"...\", \"ledger_line\": \"...\", \"task_model_tier\": \"mechanical|integration|architecture|null\"}}\n"
-    )
-}
+include!("work_item_pipeline/prompt_builders.rs");
 
 #[cfg(test)]
 mod cap_tests;
@@ -1258,5 +1155,7 @@ mod sdd_loop_tests;
 mod sdd_test_support;
 #[cfg(test)]
 mod task_sourcing_tests;
+#[cfg(test)]
+mod tdd_mode_tests;
 #[cfg(test)]
 mod tests;

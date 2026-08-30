@@ -19,6 +19,12 @@ pub struct PullRequest {
     pub html_url: String,
     pub state: String,
     pub title: String,
+    // Present on the single-PR endpoint (`pulls::get`) but not on `list`'s
+    // items -- used by `find_by_item_marker`/`marks_item` to confirm a
+    // search hit is the literal footer stamp, not just incidental proximity
+    // of those words.
+    #[serde(default)]
+    pub body: Option<String>,
     #[serde(default)]
     pub draft: bool,
     // Present (non-null) on both the list and single-PR endpoints, unlike
@@ -27,6 +33,11 @@ pub struct PullRequest {
     // merge status straight off `find_existing`'s list call.
     #[serde(default)]
     pub merged_at: Option<String>,
+    // Present on both the list and single-PR endpoints -- `work_duplicate_pr`
+    // reads this to decide whether a still-open, CI-red duplicate is stale
+    // enough to stop blocking redispatch.
+    #[serde(default)]
+    pub created_at: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
     pub mergeable: Option<bool>,
@@ -42,6 +53,18 @@ pub struct PullRequest {
     pub head: Option<RefInfo>,
     #[serde(default)]
     pub base: Option<RefInfo>,
+    // Present on both the list and single-PR endpoints -- `worktree::pr_ci_status`
+    // reads these to spot the auto-merge approval marker (see
+    // `supervisor::PR_APPROVAL_LABEL`) without a second round-trip.
+    #[serde(default)]
+    pub labels: Vec<Label>,
+    // Absent (empty-string default, never trusted) rather than a hard parse
+    // error, same fail-closed stance as `Issue::author_association` --
+    // `worktree::discover_untracked_prs` gates item creation on this so an
+    // external contributor's PR can't get itself auto-tracked/auto-merged
+    // just by opening one.
+    #[serde(default)]
+    pub author_association: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -273,6 +296,26 @@ mod pr_status_model_tests {
         assert_eq!(pr.additions, Some(10));
         assert_eq!(pr.head.unwrap().sha, "abc123");
         assert_eq!(pr.base.unwrap().git_ref, "main");
+    }
+
+    #[test]
+    fn pull_request_deserializes_labels() {
+        let json = serde_json::json!({
+            "number": 5, "html_url": "u", "state": "open", "title": "t",
+            "labels": [{"name": "status:pr:approved"}, {"name": "size/s"}]
+        });
+        let pr: PullRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(pr.labels.len(), 2);
+        assert_eq!(pr.labels[0].name, "status:pr:approved");
+    }
+
+    #[test]
+    fn pull_request_tolerates_absent_labels() {
+        let json = serde_json::json!({
+            "number": 5, "html_url": "u", "state": "open", "title": "t"
+        });
+        let pr: PullRequest = serde_json::from_value(json).unwrap();
+        assert!(pr.labels.is_empty());
     }
 
     #[test]

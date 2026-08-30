@@ -22,6 +22,7 @@ mod workflow;
 
 use crate::optimize;
 use crate::progress::{PROGRESS_SENDER, ProgressSender};
+use crate::project_toolchain::{detect_project_type, rank_skills_for_project};
 use base64::Engine as _;
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -39,6 +40,8 @@ use rmcp::{
 };
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
+use skill_registry::search::MatchMode;
+use std::path::PathBuf;
 
 use types::*;
 
@@ -303,10 +306,110 @@ impl AgentflareMcp {
         Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
     }
     #[tool(
+        description = "Recommend skills based on project toolchain detection (Cargo.toml, package.json, pyproject.toml, etc.). Distinct from skill_detect which classifies user intent from prompts — this analyzes the actual project files to recommend relevant skills."
+    )]
+    async fn skill_recommend(
+        &self,
+        Parameters(req): Parameters<SkillRecommendRequest>,
+    ) -> Result<String, ErrorData> {
+        let cwd = req
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let profile = detect_project_type(&cwd);
+        let limit = req.limit.unwrap_or(10);
+
+        let skills = self
+            .with_fresh_registry(|reg| reg.search("", limit * 3, MatchMode::Any))
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let skills = match skills {
+            Ok(s) => s,
+            Err(e) => return Err(ErrorData::internal_error(e.to_string(), None)),
+        };
+
+        let ranked = rank_skills_for_project(&profile, skills);
+        let top_skills: Vec<_> = ranked.into_iter().take(limit).collect();
+
+        let result = serde_json::json!({
+            "project_profile": {
+                "languages": profile.languages,
+                "frameworks": profile.frameworks,
+                "package_managers": profile.package_managers,
+                "build_tools": profile.build_tools,
+                "is_monorepo": profile.is_monorepo,
+            },
+            "skills": top_skills.iter().map(|s| {
+                let mut obj = serde_json::json!({
+                    "name": s.name,
+                    "source": s.source,
+                    "description": s.description,
+                    "score": s.score,
+                    "match_reasons": s.match_reasons,
+                    "est_tokens": s.est_tokens,
+                });
+                if req.include_body
+                    && let Ok(Ok(loaded)) =
+                        self.with_fresh_registry(|reg| reg.load(&s.name, false))
+                    {
+                        obj["body"] = serde_json::json!(loaded.body);
+                    }
+                obj
+            }).collect::<Vec<_>>(),
+        });
+        Ok(result.to_string())
+    }
+    #[tool(
         description = "Skill operations — search installed skills or load one by name. Single consolidated tool with `action` field (search|load)."
     )]
     async fn skill(&self, Parameters(req): Parameters<SkillRequest>) -> Result<String, ErrorData> {
         self.skill_impl(req).await
+    }
+
+    #[tool(
+        description = "Create a new skill from a template. Scaffolds a skill directory with SKILL.md frontmatter and body. Templates: web-development, api-development, testing, base (default). Writes to .claude/skills/<name>/ by default."
+    )]
+    async fn skill_create(
+        &self,
+        Parameters(req): Parameters<SkillCreateRequest>,
+    ) -> Result<String, ErrorData> {
+        self.skill_create_impl(req).await
+    }
+
+    #[tool(
+        description = "List skill categories (derived from each skill's `category:` frontmatter, or its first tag when unset). Omit `category` for every category with its skill count; pass one to list the skills in it. Read-only."
+    )]
+    async fn skill_categories(
+        &self,
+        Parameters(req): Parameters<SkillCategoriesRequest>,
+    ) -> Result<String, ErrorData> {
+        let result = match req.category {
+            None => {
+                let categories = self
+                    .with_fresh_registry(|reg| reg.list_categories())?
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                serde_json::json!({
+                    "categories": categories.into_iter().map(|(category, count)| {
+                        serde_json::json!({
+                            "category": if category.is_empty() { "uncategorized".to_string() } else { category },
+                            "count": count,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            }
+            Some(category) => {
+                let skills = self
+                    .with_fresh_registry(|reg| reg.skills_in_category(&category))?
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                serde_json::json!({
+                    "category": category,
+                    "skills": skills.into_iter().map(|(name, source)| {
+                        serde_json::json!({"name": name, "source": source})
+                    }).collect::<Vec<_>>(),
+                })
+            }
+        };
+        Ok(result.to_string())
     }
     /// Filesystem/URL-safe stem derived from a display name — lowercased,
     /// non-alphanumerics collapsed to `-`, falling back to "handoff" if that
@@ -1247,7 +1350,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|redispatch|groom|standup|health|doctor). `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck/bottlenecks scorecard (`bottlenecks` = items handed between agents ≥2× in the window; history starts at the assignment-log migration). The read-only reporting actions groom|standup|health accept a `project` override (name or UUID from `project action=list`) for portfolio roll-ups. `done` moves an item to \"in_review\" (not \"completed\") when it results in an open PR, and leaves the worktree in place for follow-up commits; call `check_merge` once the PR is confirmed merged to promote it to \"completed\" and clean up the worktree. Pass `summary` on `done` with what you changed and why — it becomes the PR body; omitting it leaves the PR with a generic placeholder description. `redispatch` is the AI-agent-safe way to re-arm a stuck or failed item for the daemon's own supervisor to pick back up -- `agentflare work <id>` refuses to run under an AI agent on purpose. It atomically resets state to backlog, clears stale `dispatched`/`needs-manual-dispatch` labels, re-attaches `ready-for-work`, and normalizes `assignee_agent` (pass one explicitly to override, or it reuses the item's existing one); errors on a completed/cancelled item, and returns an error asking for `assignee_agent` if the item has none. `doctor` is the MCP equivalent of `agentflare git doctor`: scans every worktree in this repo for dirty/stale/orphaned/duplicate-branch/missing-upstream health flags (respects `staleness_days`, default 14) and, with `reclaim=true`, deletes the clean stale/orphaned ones (never the main worktree; add `force=true` to also delete dirty ones) — this is the tool to reach for a `git worktree remove/prune` shim denial, not a specific item's `check_merge`/`release`. To fix ONE broken worktree, always pass `worktree=\"<lane name or path>\"` alongside `reclaim=true`/`force=true` — omitting it reclaims/force-deletes every eligible lane repo-wide, including unrelated dirty worktrees belonging to other items (2026-08-16 incident: an unscoped force reclaim meant to fix one lane deleted two others' uncommitted work)."
+        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|redispatch|groom|standup|health|doctor). `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck/bottlenecks scorecard (`bottlenecks` = items handed between agents ≥2× in the window; history starts at the assignment-log migration). The read-only reporting actions groom|standup|health accept a `project` override (name or UUID from `project action=list`) for portfolio roll-ups. `done` moves an item to \"in_review\" (not \"completed\") when it results in an open PR, and leaves the worktree in place for follow-up commits; call `check_merge` once the PR is confirmed merged to promote it to \"completed\" and clean up the worktree. Pass `summary` on `done` with what you changed and why — it becomes the PR body; omitting it leaves the PR with a generic placeholder description. `redispatch` is the AI-agent-safe way to re-arm a stuck or failed item for the daemon's own supervisor to pick back up -- `agentflare work <id>` refuses to run under an AI agent on purpose. It atomically resets state to backlog, clears stale `dispatched`/`needs-manual-dispatch` labels, re-attaches `ready-for-work`, and normalizes `assignee_agent` (pass one explicitly to override, or it reuses the item's existing one); errors on a completed/cancelled item, and returns an error asking for `assignee_agent` if the item has none. `doctor` is the MCP equivalent of `agentflare git doctor`: scans every worktree in this repo for dirty/stale/orphaned/duplicate-branch/missing-upstream health flags (respects `staleness_days`, default 14) and, with `reclaim=true`, deletes the clean stale/orphaned ones (never the main worktree; add `force=true` to also delete dirty ones) — this is the tool to reach for a `git worktree remove/prune` shim denial, not a specific item's `check_merge`/`release`. To fix ONE broken worktree, always pass `worktree=\"<lane name or path>\"` alongside `reclaim=true`/`force=true`. An unscoped `force=true` (no `worktree`) is now refused — pass `repo_wide=true` to explicitly confirm a repo-wide force-reclaim, since omitting it otherwise silently deletes every dirty lane, including other items' uncommitted work (2026-08-16 incident: an unscoped force reclaim meant to fix one lane deleted two others' uncommitted work)."
     )]
     fn item(&self, Parameters(req): Parameters<ItemRequest>) -> Result<String, ErrorData> {
         self.item_inner(req)
@@ -1463,7 +1566,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Workflow operations — durable agent pipelines. Single consolidated tool with `action` field: run (start a workflow from an inline `definition` JSON string OR a project-local `workflow_name`, resolved from <repo_root>/.agentflare/workflows/<name>.json), status (run state + per-step results + journal tail), complete_event (resolve a human-in-the-loop WaitEvent), list (run summaries), list_definitions (names of this project's .agentflare/workflows/*.json files)."
+        description = "Workflow operations — durable agent pipelines. Single consolidated tool with `action` field: run (start a workflow from an inline `definition` JSON string OR a project-local `workflow_name`, resolved from <repo_root>/.agentflare/workflows/<name>.json), status (run state + per-step results + journal tail), complete_event (resolve a human-in-the-loop WaitEvent), cancel (stop a running/waiting workflow; already-succeeded steps are left uncompensated), list (run summaries), list_definitions (names of this project's .agentflare/workflows/*.json files)."
     )]
     async fn workflow(
         &self,

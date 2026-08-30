@@ -224,6 +224,73 @@ fn agent_in_cooldown_is_skipped_not_dispatched() {
     );
 }
 
+#[test]
+fn needs_decision_label_blocks_dispatch_even_though_ready_for_work_is_present() {
+    // The gated branch now fires a best-effort Telegram notify -- run under
+    // an isolated home so this can't read (or send through) the developer's
+    // real vault, same reasoning as channels.rs's own vault-touching tests.
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let auth_conn = test_auth_conn();
+        let item_id = seed_ready_item(&mcp, Some("claude-code"));
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            agentflare_backend::label::create(
+                conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(project.id.clone()),
+                    workspace_id: project.workspace_id.clone(),
+                    name: NEEDS_DECISION_LABEL.into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap();
+            let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+            let gate_id = &labels
+                .iter()
+                .find(|l| l.name == NEEDS_DECISION_LABEL)
+                .unwrap()
+                .id;
+            agentflare_backend::item::add_label(conn, &item_id, gate_id).unwrap();
+            Some(())
+        })
+        .unwrap();
+
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
+
+        assert_eq!(result.dispatched, 0);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(
+            result.waiting, 1,
+            "a go/no-go item gated on a pending decision must count as waiting, not dispatch"
+        );
+        assert!(
+            queue.list(None).unwrap().is_empty(),
+            "a needs-decision item must never reach the job queue, regardless of ready-for-work"
+        );
+
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(
+            labels_contain_name(&mcp, &labels, "ready-for-work"),
+            "the gate must not touch ready-for-work -- redispatch re-attaches it unconditionally, \
+             so needs-decision has to keep blocking on its own"
+        );
+        assert!(labels_contain_name(&mcp, &labels, NEEDS_DECISION_LABEL));
+    });
+}
+
 #[path = "supervisor/tests/host_gate_tests.rs"]
 mod host_gate_tests;
 
@@ -466,28 +533,35 @@ fn under_cap_self_repairs_and_dispatches() {
 
 #[test]
 fn at_cap_forces_ask_instead_of_dispatching() {
-    let mcp = test_mcp();
-    let queue = test_queue();
-    let (item_id, _goal_id) =
-        seed_ready_item_under_active_goal_with_repairs(&mcp, crate::quota::decide::SELF_REPAIR_CAP);
+    // ask_item now fires a best-effort Telegram notify -- run under an
+    // isolated home so this can't read (or send through) the developer's
+    // real vault, same reasoning as channels.rs's own vault-touching tests.
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let (item_id, _goal_id) = seed_ready_item_under_active_goal_with_repairs(
+            &mcp,
+            crate::quota::decide::SELF_REPAIR_CAP,
+        );
 
-    let auth_conn = test_auth_conn();
-    let result = run_discovery_tick(
-        &mcp,
-        &queue,
-        &auth_conn,
-        agentflare_resource_gate::Policy::Normal,
-    );
+        let auth_conn = test_auth_conn();
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
 
-    assert_eq!(
-        result.dispatched, 0,
-        "the cap must force ask, not another self-repair dispatch"
-    );
-    assert!(queue.list(None).unwrap().is_empty());
-    let labels = mcp
-        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
-        .unwrap();
-    assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
+        assert_eq!(
+            result.dispatched, 0,
+            "the cap must force ask, not another self-repair dispatch"
+        );
+        assert!(queue.list(None).unwrap().is_empty());
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
+    });
 }
 
 #[test]
@@ -893,6 +967,47 @@ fn run_review_sweep_skips_an_item_whose_pr_status_cannot_be_determined() {
     assert!(queue.list(None).unwrap().is_empty());
 }
 
+// Task #198: an item carrying `metadata.pr.number` takes the batched-GraphQL
+// fetch path instead of the old one-REST-call-per-item path. `throwaway_repo`
+// has no GitHub remote at all, so `RepoId::resolve_from_remote` fails before
+// any network call would even be attempted either way -- what this pins is
+// that the *new* numbered/batch code path degrades the same way the
+// pre-existing unnumbered path already does (`Unknown` -> `skipped`, no
+// panic), for an item shape (`metadata.pr.number` set) none of the other
+// `run_review_sweep` tests above exercise.
+#[test]
+fn run_review_sweep_skips_a_numbered_item_the_same_way_when_no_remote_resolves() {
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let queue = test_queue();
+    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    mcp.with_backend_db(|conn| {
+        agentflare_backend::item::update(
+            conn,
+            &item_id,
+            agentflare_backend::item::UpdateItem {
+                metadata: Some(r#"{"pr":{"number":501,"branch":"task/501"}}"#.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    })
+    .unwrap();
+
+    let auth_conn = test_auth_conn();
+    let result = run_review_sweep(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+
+    assert_eq!(result.promoted, 0);
+    assert_eq!(result.self_repaired, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(queue.list(None).unwrap().is_empty());
+}
+
 #[test]
 fn run_review_sweep_scans_in_review_items_from_every_registered_project_not_just_one() {
     // Item #124: review sweep used to resolve a single project via
@@ -925,6 +1040,115 @@ fn run_review_sweep_scans_in_review_items_from_every_registered_project_not_just
         result.skipped, 2,
         "both projects' in-review items must be scanned, not just one"
     );
+}
+
+// --- auto-merge on CI-green + approval label (item #194) ---
+
+#[test]
+fn merge_approved_pr_merges_via_squash_on_success() {
+    let server = crate::github::test_support::MockServer::start(vec![
+        crate::github::test_support::MockResponse::json(200, r#"{"merged":true}"#),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = crate::github::RepoId {
+        owner: "o".into(),
+        repo: "r".into(),
+    };
+
+    assert!(merge_approved_pr(&client, &repo, 42));
+
+    let reqs = server.requests();
+    assert_eq!(reqs[0].method, "PUT");
+    assert_eq!(reqs[0].path, "/repos/o/r/pulls/42/merge");
+    let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+    assert_eq!(sent["merge_method"], "squash");
+}
+
+#[test]
+fn merge_approved_pr_returns_false_and_does_not_panic_on_github_error() {
+    // Branch protection / an unresolved conflict -- GitHub answers 405 on
+    // the merge endpoint. The safety property is that this falls through to
+    // `skipped` (no panic, no retry loop here); the sweep just polls again
+    // next tick.
+    let server = crate::github::test_support::MockServer::start(vec![
+        crate::github::test_support::MockResponse::json(405, r#"{"message":"not mergeable"}"#),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = crate::github::RepoId {
+        owner: "o".into(),
+        repo: "r".into(),
+    };
+
+    assert!(!merge_approved_pr(&client, &repo, 42));
+}
+
+#[test]
+fn merge_if_approved_skips_without_touching_network_when_label_is_absent() {
+    // No approval label on the PR -- CI green alone must never be enough to
+    // merge. The label check must happen before any GitHub call, so this
+    // must return false even with an unresolvable repo/no credentials.
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+
+    let merged = merge_if_approved(&mcp, &item, repo.path(), 42, &["size/s".to_string()]);
+
+    assert!(!merged);
+    let still_in_review = mcp
+        .with_backend_db(|conn| {
+            let refetched = agentflare_backend::item::get(conn, &item_id).unwrap();
+            let state = agentflare_backend::state::get(conn, &refetched.state_id).unwrap();
+            state.group_name == "in_review"
+        })
+        .unwrap();
+    assert!(still_in_review, "an unapproved item must not be promoted");
+}
+
+#[test]
+fn run_review_sweep_never_merges_when_the_approval_label_only_exists_on_the_project_not_the_pr() {
+    // Regression for the safety property in item #194's spec: the approval
+    // label must gate on the PR's OWN GitHub labels (carried by
+    // `PrCiStatus::Passing`), never merely on the label existing somewhere
+    // in the project's label table. A throwaway repo with no remote always
+    // resolves to `PrCiStatus::Unknown`, so this also covers Pending/Failing
+    // by construction -- none of those variants carry PR labels for
+    // `merge_if_approved` to check in the first place.
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let _item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    mcp.with_backend_db(|conn| {
+        let project = mcp.resolve_project(conn).unwrap();
+        agentflare_backend::label::create(
+            conn,
+            agentflare_backend::label::CreateLabel {
+                project_id: Some(project.id.clone()),
+                workspace_id: project.workspace_id.clone(),
+                name: PR_APPROVAL_LABEL.into(),
+                color: None,
+                parent_id: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+    })
+    .unwrap();
+    let queue = test_queue();
+    let auth_conn = test_auth_conn();
+
+    let result = run_review_sweep(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+
+    assert_eq!(result.promoted, 0);
+    assert_eq!(result.skipped, 1);
 }
 
 #[test]
@@ -979,44 +1203,50 @@ fn self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment() {
 
 #[test]
 fn self_repair_or_gate_gates_instead_of_dispatching_once_the_cap_is_reached() {
-    let mcp = test_mcp();
-    let queue = test_queue();
-    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
-    let label_id_by_name = seed_gate_label(&mcp);
-    let auth_conn = test_auth_conn();
+    // The cap-reached branch now fires a best-effort Telegram notify -- run
+    // under an isolated home so this can't read (or send through) the
+    // developer's real vault, same reasoning as channels.rs's own
+    // vault-touching tests.
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+        let label_id_by_name = seed_gate_label(&mcp);
+        let auth_conn = test_auth_conn();
 
-    // Pre-seed SELF_REPAIR_CAP prior marker comments -- as if this many
-    // repair rounds already ran with CI still red.
-    for _ in 0..crate::quota::decide::SELF_REPAIR_CAP {
-        mcp.comment_impl(CommentRequest {
-            action: "create".into(),
-            item_id: Some(item_id.clone()),
-            body: Some(format!("{CI_SELF_REPAIR_MARKER}\n\njob: prior")),
-            ..Default::default()
-        })
-        .unwrap();
-    }
-    let item = mcp
-        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
-        .unwrap();
+        // Pre-seed SELF_REPAIR_CAP prior marker comments -- as if this many
+        // repair rounds already ran with CI still red.
+        for _ in 0..crate::quota::decide::SELF_REPAIR_CAP {
+            mcp.comment_impl(CommentRequest {
+                action: "create".into(),
+                item_id: Some(item_id.clone()),
+                body: Some(format!("{CI_SELF_REPAIR_MARKER}\n\njob: prior")),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap();
 
-    let outcome = self_repair_or_gate(
-        &mcp,
-        &queue,
-        &auth_conn,
-        agentflare_resource_gate::Policy::Normal,
-        &item,
-        &["clippy".to_string()],
-        &label_id_by_name,
-        "/repo",
-    );
+        let outcome = self_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            &["clippy".to_string()],
+            &label_id_by_name,
+            "/repo",
+        );
 
-    assert!(matches!(outcome, SelfRepairOutcome::Skipped));
-    assert!(queue.list(None).unwrap().is_empty());
-    let labels = mcp
-        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
-        .unwrap();
-    assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
+        assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+        assert!(queue.list(None).unwrap().is_empty());
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
+    });
 }
 
 #[test]
@@ -1127,5 +1357,236 @@ fn self_repair_or_gate_defers_instead_of_dispatching_into_a_still_live_claim() {
             .any(|c| c.body.starts_with(CI_SELF_REPAIR_MARKER)),
         "a deferred attempt must not post a self-repair-dispatched marker, \
          or it would count against the cap on a later real attempt"
+    );
+}
+
+#[test]
+fn first_time_gated_is_true_once_then_false_for_the_same_id() {
+    // Unique per-test id -- the backing set is a single process-wide static
+    // shared by every test in this binary, so a literal like "item-1" would
+    // collide with another test using the same id.
+    let id = "first-time-gated-test-item-9f3a";
+    assert!(
+        first_time_gated(id),
+        "the first sighting of a newly-gated item must notify"
+    );
+    assert!(
+        !first_time_gated(id),
+        "a later tick re-seeing the same still-gated item must not notify again"
+    );
+}
+
+#[test]
+fn first_time_gated_treats_different_ids_independently() {
+    let a = "first-time-gated-test-item-a1";
+    let b = "first-time-gated-test-item-b2";
+    assert!(first_time_gated(a));
+    assert!(
+        first_time_gated(b),
+        "a different item id must still get its own first-sighting notify"
+    );
+}
+
+/// Sets up a project with the `ready-for-work` label and an item, optionally
+/// with dependencies and an assignee -- shared by the `cascade_unblock_dependents`
+/// tests below.
+fn seed_item_with_deps(
+    mcp: &AgentflareMcp,
+    name: &str,
+    assignee: Option<&str>,
+    dependency_ids: Vec<String>,
+) -> String {
+    mcp.with_backend_db(|conn| {
+        let project = mcp.resolve_project(conn).unwrap();
+        if agentflare_backend::label::list_by_project(conn, &project.id)
+            .unwrap()
+            .iter()
+            .all(|l| l.name != READY_LABEL)
+        {
+            agentflare_backend::label::create(
+                conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(project.id.clone()),
+                    workspace_id: project.workspace_id.clone(),
+                    name: READY_LABEL.into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap();
+        }
+        let states = agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+        let state_id = states.iter().find(|s| s.is_default).unwrap().id.clone();
+        agentflare_backend::item::create(
+            conn,
+            agentflare_backend::item::CreateItem {
+                project_id: project.id,
+                state_id,
+                name: name.into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: assignee.map(str::to_string),
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids,
+            },
+        )
+        .unwrap()
+        .id
+    })
+    .unwrap()
+}
+
+fn complete_item(mcp: &AgentflareMcp, item_id: &str) {
+    mcp.with_backend_db(|conn| {
+        let item = agentflare_backend::item::get(conn, item_id).unwrap();
+        let completed =
+            agentflare_backend::state::first_in_group(conn, &item.project_id, "completed").unwrap();
+        agentflare_backend::item::update_state(conn, item_id, &completed.id).unwrap();
+    })
+    .unwrap();
+}
+
+fn item_has_ready_label(mcp: &AgentflareMcp, item_id: &str) -> bool {
+    // Two sequential with_backend_db calls, not nested -- the backing
+    // connection lock is a plain (non-reentrant) Mutex.
+    let labels = mcp
+        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, item_id).unwrap())
+        .unwrap();
+    labels_contain_name(mcp, &labels, READY_LABEL)
+}
+
+#[test]
+fn cascade_unblock_dependents_labels_dependent_once_its_only_dependency_completes() {
+    let mcp = test_mcp();
+    let blocker = seed_item_with_deps(&mcp, "Blocker", None, vec![]);
+    let dependent = seed_item_with_deps(
+        &mcp,
+        "Dependent",
+        Some("claude-code"),
+        vec![blocker.clone()],
+    );
+    complete_item(&mcp, &blocker);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
+        .unwrap();
+
+    assert!(
+        item_has_ready_label(&mcp, &dependent),
+        "dependent's only dependency is completed -- it must be auto-labeled ready-for-work"
+    );
+}
+
+#[test]
+fn cascade_unblock_dependents_leaves_dependent_with_a_still_open_sibling_dependency() {
+    let mcp = test_mcp();
+    let blocker_a = seed_item_with_deps(&mcp, "BlockerA", None, vec![]);
+    let blocker_b = seed_item_with_deps(&mcp, "BlockerB", None, vec![]);
+    let dependent = seed_item_with_deps(
+        &mcp,
+        "Dependent",
+        Some("claude-code"),
+        vec![blocker_a.clone(), blocker_b.clone()],
+    );
+    complete_item(&mcp, &blocker_a);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker_a))
+        .unwrap();
+
+    assert!(
+        !item_has_ready_label(&mcp, &dependent),
+        "blocker_b is still open -- the dependent must not be auto-labeled yet"
+    );
+}
+
+#[test]
+fn cascade_unblock_dependents_skips_a_dependent_when_completed_item_has_no_assignee_either() {
+    let mcp = test_mcp();
+    let blocker = seed_item_with_deps(&mcp, "Blocker", None, vec![]);
+    let dependent = seed_item_with_deps(&mcp, "Dependent", None, vec![blocker.clone()]);
+    complete_item(&mcp, &blocker);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
+        .unwrap();
+
+    assert!(
+        !item_has_ready_label(&mcp, &dependent),
+        "an unassigned dependent has nothing to inherit from an equally-unassigned \
+         completed blocker -- it must not be silently auto-labeled"
+    );
+}
+
+#[test]
+fn cascade_unblock_dependents_unassigned_dependent_inherits_completed_items_assignee() {
+    let mcp = test_mcp();
+    let blocker = seed_item_with_deps(&mcp, "Blocker", Some("claude-code:instance-1"), vec![]);
+    let dependent = seed_item_with_deps(&mcp, "Dependent", None, vec![blocker.clone()]);
+    complete_item(&mcp, &blocker);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
+        .unwrap();
+
+    assert!(
+        item_has_ready_label(&mcp, &dependent),
+        "dependent had no assignee -- it should inherit the completed item's and get labeled"
+    );
+    let dependent_assignee = mcp
+        .with_backend_db(|conn| {
+            agentflare_backend::item::get(conn, &dependent)
+                .unwrap()
+                .assignee_agent
+        })
+        .unwrap();
+    assert_eq!(
+        dependent_assignee.as_deref(),
+        Some("claude-code"),
+        "inherited assignee must be stripped down to the bare agent id, not the \
+         agent:instance form"
+    );
+}
+
+#[test]
+fn cascade_unblock_dependents_is_idempotent_across_repeated_calls() {
+    let mcp = test_mcp();
+    let blocker = seed_item_with_deps(&mcp, "Blocker", None, vec![]);
+    let dependent = seed_item_with_deps(
+        &mcp,
+        "Dependent",
+        Some("claude-code"),
+        vec![blocker.clone()],
+    );
+    complete_item(&mcp, &blocker);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
+        .unwrap();
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
+        .unwrap();
+
+    let labels = mcp
+        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &dependent).unwrap())
+        .unwrap();
+    let ready_count = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let ready_id = agentflare_backend::label::list_by_project(conn, &project.id)
+                .unwrap()
+                .into_iter()
+                .find(|l| l.name == READY_LABEL)
+                .unwrap()
+                .id;
+            labels.iter().filter(|id| **id == ready_id).count()
+        })
+        .unwrap();
+    assert_eq!(
+        ready_count, 1,
+        "add_label's INSERT OR IGNORE must keep repeated cascade calls idempotent"
     );
 }

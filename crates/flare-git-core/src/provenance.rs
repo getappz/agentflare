@@ -1,5 +1,8 @@
-//! Commit provenance trailers — self-reported agent/branch/item identity
-//! appended to commit messages via a `prepare-commit-msg` hook.
+//! Commit provenance trailers — self-reported agent/branch/item/session
+//! identity appended to commit messages via a `prepare-commit-msg` hook.
+//! `agentflare git explain`/`rewind` (see `src/cli/git.rs`) read these back
+//! off a commit to link it to the agent session (and, transitively, the
+//! prompt) that produced it.
 //!
 //! Deliberately NOT cryptographically attested: agentflare has no
 //! signing/binding system for this, so a trailer is a bare string an agent
@@ -16,6 +19,7 @@ pub struct Trailers {
     pub agent: Option<String>,
     pub branch: Option<String>,
     pub item_id: Option<String>,
+    pub session_id: Option<String>,
 }
 
 /// Extracts the `<sequence_id>` from a `task/<sequence_id>` or
@@ -32,10 +36,46 @@ fn item_id_from_branch(branch: Option<&str>) -> Option<String> {
     }
 }
 
+/// Resolves the current session id: an explicit `AGENTFLARE_SESSION_ID`
+/// override, falling back to `CLAUDE_CODE_SESSION_ID` -- set by Claude Code
+/// on every session it runs, and the same id its local transcript
+/// (`~/.claude/projects/<slug>/<session_id>.jsonl`) is keyed by. That
+/// transcript is what `agentflare git explain` reads the originating
+/// prompt back out of.
+///
+/// `CLAUDE_CODE_SESSION_ID` does the real work today: it's inherited by any
+/// `git commit` a live Claude Code session runs directly (interactively, or
+/// via its own Bash tool), which is how `explain`/`rewind` link a commit to
+/// a session in practice. `AGENTFLARE_SESSION_ID` is an override escape
+/// hatch in the same spirit as this crate's `AGENTFLARE_AGENT`/
+/// `AGENTFLARE_SESSION` -- for a caller that already knows the session id
+/// it wants stamped and isn't relying on env inheritance. No in-repo
+/// dispatch path sets it (unlike `AGENTFLARE_AGENT`, which `agent_launch.rs`
+/// and `work.rs` genuinely set before spawning): the one headless
+/// coding-agent spawn path (`agent_launch.rs::run_headless`) doesn't know
+/// the child's session id until the child reports it in its own post-hoc
+/// JSON reply, well after any commit it makes has already happened. A
+/// headless dispatch commit therefore gets a session trailer only when
+/// `CLAUDE_CODE_SESSION_ID` happens to be inherited (i.e. the child is
+/// itself Claude Code and passes its env through) -- otherwise it has none,
+/// which `explain`/`rewind` report accurately as "commit ... wasn't
+/// agent-made" rather than falsely attributing it.
+fn resolve_session_id() -> Option<String> {
+    std::env::var("AGENTFLARE_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("CLAUDE_CODE_SESSION_ID")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+}
+
 /// Resolves the current commit's provenance: agent identity
 /// (`AGENTFLARE_AGENT`, falling back to auto-detection), the current
-/// branch, and — if the branch matches the `task/<sequence_id>` convention
-/// `flare_git_core::worktree` uses — the item id it belongs to.
+/// branch, the item id it belongs to (if the branch matches the
+/// `task/<sequence_id>` convention `flare_git_core::worktree` uses), and the
+/// agent session id (see `resolve_session_id`).
 #[must_use]
 pub fn build_trailers(repo_root: &Path) -> Trailers {
     let agent = std::env::var("AGENTFLARE_AGENT")
@@ -44,10 +84,12 @@ pub fn build_trailers(repo_root: &Path) -> Trailers {
         .or_else(agent_detector::agent_name);
     let branch = current_branch(repo_root);
     let item_id = item_id_from_branch(branch.as_deref());
+    let session_id = resolve_session_id();
     Trailers {
         agent,
         branch,
         item_id,
+        session_id,
     }
 }
 
@@ -61,6 +103,7 @@ pub fn append_trailers(msg: &str, t: &Trailers) -> String {
     if msg.contains("Agentflare-Agent:")
         || msg.contains("Agentflare-Branch:")
         || msg.contains("Agentflare-Item:")
+        || msg.contains("Agentflare-Session:")
     {
         return msg.to_string();
     }
@@ -74,6 +117,9 @@ pub fn append_trailers(msg: &str, t: &Trailers) -> String {
     if let Some(item_id) = &t.item_id {
         lines.push(format!("Agentflare-Item: {item_id}"));
     }
+    if let Some(session_id) = &t.session_id {
+        lines.push(format!("Agentflare-Session: {session_id}"));
+    }
     if lines.is_empty() {
         return msg.to_string();
     }
@@ -82,6 +128,29 @@ pub fn append_trailers(msg: &str, t: &Trailers) -> String {
     out.push_str(&lines.join("\n"));
     out.push('\n');
     out
+}
+
+/// The inverse of `append_trailers` -- reads a commit message back into a
+/// `Trailers`, tolerating any surrounding message body. Unknown fields are
+/// simply absent (`None`), never an error: a commit made before this field
+/// existed, or by a non-agentflare tool, is just a `Trailers::default()`.
+/// Used by `agentflare git explain`/`rewind` to recover the provenance of an
+/// already-made commit.
+#[must_use]
+pub fn parse_trailers(msg: &str) -> Trailers {
+    let mut t = Trailers::default();
+    for line in msg.lines() {
+        if let Some(v) = line.strip_prefix("Agentflare-Agent: ") {
+            t.agent = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("Agentflare-Branch: ") {
+            t.branch = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("Agentflare-Item: ") {
+            t.item_id = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("Agentflare-Session: ") {
+            t.session_id = Some(v.to_string());
+        }
+    }
+    t
 }
 
 #[cfg(test)]
@@ -93,6 +162,7 @@ mod tests {
             agent: Some("claude-code".to_string()),
             branch: Some("task/42".to_string()),
             item_id: Some("42".to_string()),
+            session_id: Some("sess-abc".to_string()),
         }
     }
 
@@ -101,7 +171,7 @@ mod tests {
         let out = append_trailers("fix: thing\n", &trailers());
         assert_eq!(
             out,
-            "fix: thing\n\nAgentflare-Agent: claude-code\nAgentflare-Branch: task/42\nAgentflare-Item: 42\n"
+            "fix: thing\n\nAgentflare-Agent: claude-code\nAgentflare-Branch: task/42\nAgentflare-Item: 42\nAgentflare-Session: sess-abc\n"
         );
     }
 
@@ -111,9 +181,21 @@ mod tests {
             agent: Some("claude-code".to_string()),
             branch: None,
             item_id: None,
+            session_id: None,
         };
         let out = append_trailers("fix: thing\n", &t);
         assert_eq!(out, "fix: thing\n\nAgentflare-Agent: claude-code\n");
+    }
+
+    #[test]
+    fn parse_trailers_round_trips_append_trailers() {
+        let stamped = append_trailers("fix: thing\n", &trailers());
+        assert_eq!(parse_trailers(&stamped), trailers());
+    }
+
+    #[test]
+    fn parse_trailers_on_a_plain_message_is_all_none() {
+        assert_eq!(parse_trailers("fix: thing\n"), Trailers::default());
     }
 
     #[test]

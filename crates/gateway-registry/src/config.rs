@@ -10,7 +10,7 @@ pub struct GatewayConfig {
     pub servers: HashMap<String, ServerConfig>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServerConfig {
     McpStdio {

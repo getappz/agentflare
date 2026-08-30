@@ -175,6 +175,9 @@ pub enum BackoffStrategy {
 pub enum WorkflowStatus {
     Pending,
     Running,
+    /// Parked in a durable `Sleep`/`SleepUntil`/`WaitEvent` step — no step is
+    /// actively executing, distinct from `Running`.
+    Waiting,
     Paused,
     Completed,
     Failed,
@@ -457,10 +460,17 @@ impl<D: WorkflowData> WorkflowState<D> {
 }
 
 /// Result returned by a step execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepResult {
     Success,
+    /// Terminal failure with no more specific reason available. Prefer
+    /// `Failed` when the executor has real context to give.
     Failure,
+    /// Terminal failure carrying the concrete reason, so it reaches
+    /// `step_state.last_error`/the eventual item comment instead of the
+    /// generic "Step failed" placeholder. Never retried — same as
+    /// `Failure`, just with a message attached.
+    Failed(String),
     Skip,
 }
 

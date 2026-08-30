@@ -1,5 +1,6 @@
 mod agents;
 mod alias;
+mod apps;
 mod artifacts;
 mod auth;
 mod channel;
@@ -18,6 +19,7 @@ mod github_bridge;
 mod handoff;
 mod hook;
 mod init;
+mod insights;
 mod mcp;
 mod memory;
 mod optimize;
@@ -142,6 +144,10 @@ pub enum Commands {
     Docs(docs::DocsArgs),
     /// Run and inspect durable agent pipelines through the workflow engine.
     Workflow(workflow::WorkflowArgs),
+    /// Unified observability for AI coding sessions (Claude/Codex/OpenCode/Cursor/Gemini) — local-first.
+    Insights(insights::InsightsArgs),
+    /// Run and manage AgentFlare Apps — self-contained agentic domain modules.
+    Apps(apps::AppsArgs),
 }
 
 impl Commands {
@@ -181,6 +187,8 @@ impl Commands {
             Self::Work(cmd) => cmd.run(),
             Self::Docs(cmd) => docs::run(cmd),
             Self::Workflow(cmd) => cmd.run(),
+            Self::Insights(cmd) => cmd.run(),
+            Self::Apps(cmd) => cmd.run(),
         }
     }
 }

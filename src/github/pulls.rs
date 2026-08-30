@@ -1,6 +1,15 @@
 use crate::github::models::{PullRequest, Review, ReviewComment};
 use crate::github::{Client, GitHubError, RepoId};
 
+/// Extractor for the Search API's `{"items": [...], "total_count": N}`
+/// envelope, mirroring `actions::workflow_runs`/`check_runs`.
+fn search_items(page: &serde_json::Value) -> Vec<serde_json::Value> {
+    page.get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn create_body(title: &str, head: &str, base: &str, body: Option<&str>) -> serde_json::Value {
     let mut v = serde_json::json!({ "title": title, "head": head, "base": base });
     if let Some(b) = body {
@@ -51,6 +60,75 @@ pub fn find_existing(
         .find(|pr| pr.head.as_ref().is_some_and(|h| h.git_ref == branch)))
 }
 
+/// The `for item #<sequence_id> ` marker `pr_footer` stamps onto every PR
+/// agentflare opens, shared by `find_by_item_marker`'s search query and
+/// `marks_item`'s body check below.
+fn item_marker(sequence_id: i64) -> String {
+    format!("for item #{sequence_id} ")
+}
+
+/// True if `body` carries `item_marker(sequence_id)` -- i.e. this PR really
+/// is `sequence_id`'s own, as opposed to an unrelated PR that only happens
+/// to share the same branch name. Branch names get reused across items over
+/// time, so a closed/merged `find_existing` match needs this confirmation
+/// before a caller treats it as "this item's PR already exists" (item #63:
+/// a stale, unrelated, already-merged PR from a prior item was returned as
+/// the current item's `pr_url`, which made `in_review` true and skipped the
+/// `nothing_was_ever_committed` safety net for real, uncommitted work).
+pub fn marks_item(body: Option<&str>, sequence_id: i64) -> bool {
+    body.is_some_and(|b| b.contains(&item_marker(sequence_id)))
+}
+
+/// Finds every PR (open, merged, or closed) whose body carries the
+/// `for item #<sequence_id>` marker `pr_footer` stamps onto every PR
+/// agentflare opens (see `push_and_open_pr`) -- the pre-dispatch
+/// duplicate-work check (item #164). Unlike `find_existing`, this doesn't
+/// depend on the item's own tracked branch name, so it still finds a PR
+/// that merged while the item's tracked state fell out of sync (items
+/// #122/#156: the state-side promotion never ran, so a routine redispatch
+/// nearly re-did already-merged work).
+///
+/// GitHub's search API (used here as a candidate filter, mirroring the exact
+/// `gh pr list --search "\"for item #N \" in:body"` query a human ran to
+/// catch that incident) doesn't guarantee an exact phrase match -- it
+/// tokenizes on punctuation like `#`, so a PR whose body merely mentions the
+/// item nearby unrelated prose can surface as a false hit. PR #599's body
+/// ("Motivated by two items (#184, #185 ...)") matched this way and got
+/// item #184 auto-completed even though the PR never touched its code
+/// (caught live, item #190). So each candidate's *actual* body is checked
+/// locally afterward for the literal fixed suffix `pr_footer` always
+/// stamps -- `for item #N via agentflare.` -- before it counts as a real
+/// duplicate.
+pub fn find_by_item_marker(
+    client: &Client,
+    repo: &RepoId,
+    sequence_id: i64,
+) -> Result<Vec<PullRequest>, GitHubError> {
+    let query = format!(
+        "repo:{}/{} type:pr \"{}\" in:body",
+        repo.owner,
+        repo.repo,
+        item_marker(sequence_id)
+    );
+    let path = format!("/search/issues?q={}", crate::github::encode_query(&query));
+    let items = client.get_paginated(&path, search_items)?;
+    let numbers: Vec<u64> = items
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["number"].as_u64())
+        .collect();
+    let marker = format!("for item #{sequence_id} via agentflare.");
+    let prs: Vec<PullRequest> = numbers
+        .into_iter()
+        .map(|n| get(client, repo, n))
+        .collect::<Result<_, _>>()?;
+    Ok(prs
+        .into_iter()
+        .filter(|pr| pr.body.as_deref().is_some_and(|b| b.contains(&marker)))
+        .collect())
+}
+
 pub fn get(client: &Client, repo: &RepoId, number: u64) -> Result<PullRequest, GitHubError> {
     let path = format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.repo);
     let json = client.request("GET", &path, None)?;
@@ -64,6 +142,23 @@ pub fn merge(client: &Client, repo: &RepoId, number: u64, method: &str) -> Resul
         &path,
         Some(serde_json::json!({ "merge_method": method })),
     )?;
+    Ok(())
+}
+
+/// Same server-side operation as the PR page's own "Update branch" button --
+/// GitHub creates the merge commit bringing the base branch in, entirely on
+/// its side, so this touches no local worktree/git state at all and can't
+/// race a concurrently-dispatched job still pushing to the same branch the
+/// way a local `git merge` would. Only ever called when the PR's
+/// `mergeable_state` is already GitHub's own "behind" (mergeable, no
+/// conflict) -- `worktree::run_review_sweep`'s job, not this function's, to
+/// check that first.
+pub fn update_branch(client: &Client, repo: &RepoId, number: u64) -> Result<(), GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/pulls/{number}/update-branch",
+        repo.owner, repo.repo
+    );
+    client.request("PUT", &path, None)?;
     Ok(())
 }
 
@@ -255,6 +350,100 @@ mod tests {
     }
 
     #[test]
+    fn marks_item_true_when_body_carries_the_marker() {
+        assert!(marks_item(
+            Some("---\n_Opened by `claude-code` on **box** for item #63 via agentflare._"),
+            63
+        ));
+    }
+
+    #[test]
+    fn marks_item_false_when_body_is_none() {
+        assert!(!marks_item(None, 63));
+    }
+
+    #[test]
+    fn marks_item_false_when_body_has_no_marker_at_all() {
+        assert!(!marks_item(Some("just a regular PR description"), 63));
+    }
+
+    #[test]
+    fn marks_item_does_not_let_a_shorter_id_match_a_longer_ones_marker() {
+        // A PR marked "for item #63 " must not also count as evidence for
+        // item #6 -- naive substring matching without the marker's own
+        // digit-boundary delimiter would let "for item #6" match inside
+        // "for item #63 ".
+        assert!(!marks_item(
+            Some("---\n_Opened by `claude-code` on **box** for item #63 via agentflare._"),
+            6
+        ));
+    }
+
+    #[test]
+    fn marks_item_does_not_let_a_longer_id_match_a_shorter_ones_marker() {
+        assert!(!marks_item(
+            Some("---\n_Opened by `claude-code` on **box** for item #6 via agentflare._"),
+            63
+        ));
+    }
+
+    #[test]
+    fn find_by_item_marker_searches_and_fetches_each_matching_pr() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, r#"{"items":[{"number":42}]}"#),
+            MockResponse::json(
+                200,
+                r#"{"number":42,"html_url":"u","state":"closed","title":"t","merged_at":"2026-08-01T00:00:00Z","body":"---\n_Opened by `claude-code` on **box** for item #164 via agentflare._"}"#,
+            ),
+        ]);
+        let client = server.client(None);
+        let found = find_by_item_marker(&client, &repo(), 164).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].number, 42);
+        assert!(found[0].merged_at.is_some());
+
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "GET");
+        assert!(reqs[0].path.starts_with("/search/issues?q="));
+        assert!(reqs[0].path.contains("repo%3Ao/r"));
+        assert!(reqs[0].path.contains("%22for%20item%20%23164%20%22"));
+        assert_eq!(reqs[1].path, "/repos/o/r/pulls/42");
+    }
+
+    #[test]
+    fn find_by_item_marker_returns_empty_when_search_finds_nothing() {
+        let server = MockServer::start(vec![MockResponse::json(200, r#"{"items":[]}"#)]);
+        let client = server.client(None);
+        assert!(
+            find_by_item_marker(&client, &repo(), 999)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // Regression for item #190: GitHub's search API matched PR #599's body
+    // ("Motivated by two items (#184, #185 ...)") against the `"for item
+    // #184 " in:body` query even though the PR never carries the actual
+    // `pr_footer` stamp for #184, which nearly got #184 auto-completed as
+    // a false-positive duplicate.
+    #[test]
+    fn find_by_item_marker_drops_a_search_hit_that_lacks_the_literal_footer() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, r#"{"items":[{"number":599}]}"#),
+            MockResponse::json(
+                200,
+                r#"{"number":599,"html_url":"u","state":"closed","title":"t","body":"Motivated by two items (#184, #185 in the linked project) for item #184 discovery."}"#,
+            ),
+        ]);
+        let client = server.client(None);
+        assert!(
+            find_by_item_marker(&client, &repo(), 184)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn get_fetches_a_single_pull() {
         let server = MockServer::start(vec![MockResponse::json(
             200,
@@ -276,6 +465,16 @@ mod tests {
         assert_eq!(reqs[0].path, "/repos/o/r/pulls/3/merge");
         let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
         assert_eq!(sent["merge_method"], "squash");
+    }
+
+    #[test]
+    fn update_branch_puts_to_the_update_branch_endpoint() {
+        let server = MockServer::start(vec![MockResponse::json(202, r#"{"message":"Updating"}"#)]);
+        let client = server.client(Some("tok"));
+        update_branch(&client, &repo(), 7).unwrap();
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "PUT");
+        assert_eq!(reqs[0].path, "/repos/o/r/pulls/7/update-branch");
     }
 
     #[test]

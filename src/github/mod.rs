@@ -8,6 +8,7 @@ pub mod auth;
 pub mod bridge;
 pub mod client;
 pub mod contents;
+pub mod graphql;
 pub mod identity;
 pub mod init_auth;
 pub mod issues;
@@ -22,6 +23,20 @@ pub(crate) mod test_support;
 
 pub use client::Client;
 pub use identity::RepoId;
+
+/// Whether GitHub's own `author_association` is trusted enough to let an
+/// issue or PR's content drive automated action -- an issue's body becoming
+/// an autonomous agent's prompt (`github::bridge::tick`), or a PR becoming
+/// something `run_review_sweep` will track and eventually auto-merge
+/// (`worktree::discover_untracked_prs`) -- without a human explicitly
+/// vetting it first. Repo owners, members, and collaborators only, matching
+/// gh-aw's (github/gh-aw) own `min-integrity: approved` default for public
+/// repos: anyone else who can get an issue or PR opened -- which on a public
+/// repo is anyone at all -- must not be able to get automated trust just by
+/// opening one.
+pub(crate) fn is_trusted_author_association(assoc: &str) -> bool {
+    matches!(assoc, "OWNER" | "MEMBER" | "COLLABORATOR")
+}
 
 /// Percent-encode a dynamic value for a URL query string so reserved
 /// characters cannot alter query semantics. Unreserved chars and slash

@@ -214,6 +214,48 @@ async fn terminal_failure_marks_run_failed() {
 }
 
 #[tokio::test]
+async fn typed_step_failure_carries_its_real_reason_not_the_generic_placeholder() {
+    let engine = build_engine();
+    let wf = WorkflowDefinition::new("wf", "wf").add_step(StepDefinition::new(
+        "boom",
+        "boom",
+        Arc::new(FunctionStep::new(|_ctx: &mut WorkflowContext<Ctx>| {
+            Box::pin(async move {
+                Ok(StepResult::Failed(
+                    "expired Claude Code CLI session".to_string(),
+                ))
+            })
+        })),
+    ));
+    engine.register_workflow(wf).unwrap();
+
+    let run = engine
+        .start_workflow(
+            WorkflowId::new("wf"),
+            Ctx {
+                count: 0,
+                log: vec![],
+            },
+            "in".into(),
+        )
+        .await
+        .unwrap();
+    let _ = engine
+        .wait_for_completion(run, "wf", Duration::from_secs(5))
+        .await;
+
+    let state = engine.get_status(run).await.unwrap();
+    let last_error = state.step_states[&StepId::new("boom")]
+        .last_error
+        .clone()
+        .expect("failed step must record a last_error");
+    assert_eq!(
+        last_error, "expired Claude Code CLI session",
+        "a StepResult::Failed's real reason must reach last_error, not collapse to the generic \"Step failed\" placeholder"
+    );
+}
+
+#[tokio::test]
 async fn dependent_of_failed_step_gets_terminal_status() {
     let engine = build_engine();
     let wf = WorkflowDefinition::new("wf", "wf")

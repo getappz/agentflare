@@ -1,0 +1,14 @@
+[package]
+name = "flare-process"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+description = "Console-window-safe child-process spawning for agentflare -- one constructor every background spawn goes through so children never flash a terminal over the user's desktop on Windows."
+publish = false
+
+[dependencies]
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
+
+[lints.rust]
+unsafe_code = "warn"

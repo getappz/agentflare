@@ -7,7 +7,7 @@
 
 use crate::error::CavemanError;
 use std::io::Write as _;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 pub trait Llm {
     /// # Errors
@@ -64,7 +64,7 @@ fn call_via_api(api_key: &str, prompt: &str) -> Result<String, CavemanError> {
 fn call_via_cli(prompt: &str) -> Result<String, CavemanError> {
     let claude_bin =
         which::which("claude").map_or_else(|_| "claude".to_string(), |p| p.display().to_string());
-    let mut child = Command::new(&claude_bin)
+    let mut child = flare_process::command(&claude_bin)
         .arg("--print")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

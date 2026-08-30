@@ -1,0 +1,509 @@
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+pub struct InsightsArgs {
+    #[command(subcommand)]
+    pub command: Option<InsightsCommands>,
+    /// Path to insights DB (default: ~/.local/share/agentflare/insights/observatory.db)
+    #[arg(long)]
+    pub db: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum InsightsCommands {
+    /// Scan all agent sources and ingest into local DB
+    Sync(SyncArgs),
+    /// List sessions (recent first)
+    List(ListArgs),
+    /// Show one session with turns and tool calls
+    Show(ShowArgs),
+    /// Search sessions (FTS5 + trigram)
+    Search(SearchArgs),
+    /// Analytics: cost, tokens, heatmap
+    Stats(StatsArgs),
+    /// Export sessions (json/jsonl/html/deepeval/openai)
+    Export(ExportArgs),
+    /// Generate handoff doc to continue in another agent
+    Handoff(HandoffArgs),
+    /// Run local dashboard (127.0.0.1 only)
+    Serve(ServeArgs),
+    /// Watch sources and re-sync on change (live)
+    Watch(WatchArgs),
+    /// Check health of insights DB and sources (claude/opencode)
+    Doctor(DoctorArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct SyncArgs {
+    #[arg(long, default_value = "0")]
+    pub prune_days: u32,
+}
+
+#[derive(Parser, Debug)]
+pub struct ListArgs {
+    #[arg(long, default_value = "20")]
+    pub limit: usize,
+    #[arg(long, default_value = "0")]
+    pub offset: usize,
+    #[arg(long)]
+    pub source: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct ShowArgs {
+    pub session_id: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct SearchArgs {
+    pub query: String,
+    #[arg(long, default_value = "20")]
+    pub limit: usize,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct StatsArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct ExportArgs {
+    #[arg(long, default_value = "json")]
+    pub format: String,
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    #[arg(long)]
+    pub source: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct HandoffArgs {
+    pub session_id: String,
+    #[arg(long, default_value = "codex")]
+    pub target: String,
+    #[arg(long, default_value = "standard")]
+    pub verbosity: String,
+}
+
+#[derive(Parser, Debug)]
+pub struct ServeArgs {
+    #[arg(long, default_value = "3456")]
+    pub port: u16,
+}
+
+#[derive(Parser, Debug)]
+pub struct WatchArgs {
+    #[arg(long, default_value = "5")]
+    pub interval_secs: u64,
+}
+
+#[derive(Parser, Debug)]
+pub struct DoctorArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl InsightsArgs {
+    pub fn run(self) {
+        let db_path = self.db.unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".local/share/agentflare/insights/observatory.db")
+        });
+        let cmd = self.command.unwrap_or(InsightsCommands::List(ListArgs {
+            limit: 20,
+            offset: 0,
+            source: None,
+            json: false,
+        }));
+        match cmd {
+            InsightsCommands::Sync(args) => run_sync(db_path, args),
+            InsightsCommands::List(args) => run_list(db_path, args),
+            InsightsCommands::Show(args) => run_show(db_path, args),
+            InsightsCommands::Search(args) => run_search(db_path, args),
+            InsightsCommands::Stats(args) => run_stats(db_path, args),
+            InsightsCommands::Export(args) => run_export(db_path, args),
+            InsightsCommands::Handoff(args) => run_handoff(db_path, args),
+            InsightsCommands::Serve(args) => run_serve(db_path, args),
+            InsightsCommands::Watch(args) => run_watch(db_path, args),
+            InsightsCommands::Doctor(args) => run_doctor(db_path, args),
+        }
+    }
+}
+
+fn open_store(db: PathBuf) -> flare_insights::store::InsightsStore {
+    flare_insights::store::InsightsStore::open(&db).unwrap_or_else(|e| {
+        eprintln!("failed to open insights DB {}: {e}", db.display());
+        std::process::exit(1);
+    })
+}
+
+fn run_sync(db: PathBuf, args: SyncArgs) {
+    let store = open_store(db.clone());
+    let config = flare_insights::config::InsightsConfig::default();
+    let mgr = flare_insights::ingest::IngestManager::new();
+    let mut total_sessions = 0;
+    let mut total_turns = 0;
+    let mut total_tools = 0;
+    let mut total_files = 0;
+    let mut total_subs = 0;
+    for (source, res) in mgr.scan_all(&config) {
+        match res {
+            Ok(bundle) => {
+                println!(
+                    "{source}: {} sessions {} turns {} tools",
+                    bundle.sessions.len(),
+                    bundle.turns.len(),
+                    bundle.tool_calls.len()
+                );
+                // DRY: transactional bundle via store helpers
+                for s in &bundle.sessions {
+                    let _ = store.upsert_session(s);
+                }
+                if !bundle.turns.is_empty() {
+                    let _ = store.upsert_turns_batch(&bundle.turns);
+                }
+                if !bundle.tool_calls.is_empty() {
+                    let _ = store.upsert_tool_calls_batch(&bundle.tool_calls);
+                }
+                if !bundle.file_events.is_empty() {
+                    let _ = store.upsert_file_events_batch(&bundle.file_events);
+                }
+                if !bundle.subagents.is_empty() {
+                    let _ = store.upsert_subagents_batch(&bundle.subagents);
+                }
+                total_sessions += bundle.sessions.len();
+                total_turns += bundle.turns.len();
+                total_tools += bundle.tool_calls.len();
+                total_files += bundle.file_events.len();
+                total_subs += bundle.subagents.len();
+            }
+            Err(e) => eprintln!("{source}: error {e}"),
+        }
+    }
+    println!(
+        "synced {total_sessions} sessions {total_turns} turns {total_tools} tools {total_files} files {total_subs} subs -> {}",
+        db.display()
+    );
+    if args.prune_days > 0 {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(args.prune_days as i64);
+        match store.prune_older_than(cutoff) {
+            Ok(n) => println!("pruned {n} sessions older than {} days", args.prune_days),
+            Err(e) => eprintln!("prune error: {e}"),
+        }
+    }
+}
+
+fn run_list(db: PathBuf, args: ListArgs) {
+    let store = open_store(db);
+    let sessions = store
+        .list_sessions(args.limit, args.offset)
+        .unwrap_or_default();
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&sessions).unwrap());
+    } else {
+        for s in sessions {
+            if let Some(filter) = &args.source
+                && s.source.as_str() != filter
+            {
+                continue;
+            }
+            let cost = s
+                .cost
+                .as_ref()
+                .map(|c| format!("${:.2}", c.total_usd))
+                .unwrap_or_else(|| "-".into());
+            println!(
+                "{:<36} {:<12} {:<16} {:>4} turns {:>4} tools {} {}",
+                s.id,
+                s.source.as_str(),
+                s.project,
+                s.turn_count,
+                s.tool_call_count,
+                cost,
+                s.updated_at.format("%Y-%m-%d %H:%M")
+            );
+        }
+    }
+}
+
+fn run_show(db: PathBuf, args: ShowArgs) {
+    let store = open_store(db);
+    match store.get_session(&args.session_id) {
+        Ok(Some(s)) => {
+            if args.json {
+                let turns = store.get_turns(&s.id).unwrap_or_default();
+                let tools = store.get_tool_calls(&s.id).unwrap_or_default();
+                let files = store.get_file_events(&s.id).unwrap_or_default();
+                let subs = store.get_subagents(&s.id).unwrap_or_default();
+                let bundle = serde_json::json!({"session": s, "turns": turns, "tool_calls": tools, "file_events": files, "subagents": subs});
+                println!("{}", serde_json::to_string_pretty(&bundle).unwrap());
+            } else {
+                println!("{} [{}] {}", s.id, s.source.as_str(), s.project);
+                println!(
+                    "model: {} status: {:?} updated: {}",
+                    s.model.as_deref().unwrap_or("-"),
+                    s.status,
+                    s.updated_at
+                );
+                println!(
+                    "tokens: in={} out={} cache_read={} cache_write={} total={}",
+                    s.tokens.input,
+                    s.tokens.output,
+                    s.tokens.cache_read,
+                    s.tokens.cache_write,
+                    s.tokens.total()
+                );
+                if let Some(c) = s.cost {
+                    println!("cost: ${:.4}", c.total_usd);
+                }
+                println!(
+                    "turns: {} tools: {} subagents: {}",
+                    s.turn_count, s.tool_call_count, s.subagent_count
+                );
+                if let Some(t) = s.title.clone() {
+                    println!("title: {t}");
+                }
+                // DRY: replay timeline for opencode/claude
+                let turns = store.get_turns(&s.id).unwrap_or_default();
+                let tools = store.get_tool_calls(&s.id).unwrap_or_default();
+                let files = store.get_file_events(&s.id).unwrap_or_default();
+                let replay = flare_insights::replay::SessionReplay::from_parts(
+                    s.id.clone(),
+                    turns.clone(),
+                    tools.clone(),
+                    files.clone(),
+                );
+                println!("--- replay timeline (first 10) ---");
+                for ev in replay.timeline().iter().take(10) {
+                    println!(
+                        "  [{}] {}: {}",
+                        ev.seq,
+                        ev.kind,
+                        ev.detail.chars().take(100).collect::<String>()
+                    );
+                }
+                for t in turns.iter().take(3) {
+                    println!(
+                        "  turn {}: {}",
+                        t.seq,
+                        t.user_text
+                            .as_deref()
+                            .or(t.assistant_text.as_deref())
+                            .unwrap_or("-")
+                            .chars()
+                            .take(120)
+                            .collect::<String>()
+                    );
+                }
+                for tc in tools.iter().take(5) {
+                    println!("  tool {}: {}", tc.name, tc.id);
+                }
+                for fe in files.iter().take(5) {
+                    println!("  file {}: {}", fe.kind, fe.path);
+                }
+            }
+        }
+        Ok(None) => {
+            eprintln!("session not found: {}", args.session_id);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_search(db: PathBuf, args: SearchArgs) {
+    let store = open_store(db);
+    let opts = flare_insights::search::SearchOptions {
+        query: args.query.clone(),
+        source: None,
+        project: None,
+        limit: args.limit,
+        offset: 0,
+        include_files: true,
+        include_tools: true,
+    };
+    let res = flare_insights::search::search(&store, &opts).unwrap_or_default();
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&res).unwrap());
+    } else {
+        for s in res {
+            println!(
+                "{:<36} {:<12} {} {}",
+                s.id,
+                s.source.as_str(),
+                s.project,
+                s.title.as_deref().unwrap_or("")
+            )
+        }
+    }
+}
+
+fn run_stats(db: PathBuf, args: StatsArgs) {
+    let store = open_store(db);
+    let sessions = store.list_sessions(10000, 0).unwrap_or_default();
+    let tools = store.list_tool_calls(100000).unwrap_or_default();
+    let files = store.list_file_events(100000).unwrap_or_default();
+    let analytics =
+        flare_insights::analytics::compute_analytics_with_tools(&sessions, &tools, &files);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&analytics).unwrap());
+    } else {
+        println!(
+            "sessions: {} tokens: {} cost: ${:.2} cache_hit: {:.1}% tools:{} files:{}",
+            analytics.total_sessions,
+            analytics.total_tokens,
+            analytics.total_cost_usd,
+            analytics.cache_hit_rate * 100.0,
+            tools.len(),
+            files.len()
+        );
+        println!("by_source: {:?}", analytics.by_source);
+        println!("by_project: {:?}", analytics.by_project);
+        let top_tools = flare_insights::analytics::top_tools(&tools, 5);
+        let top_files = flare_insights::analytics::top_files(&files, 5);
+        println!("top_tools: {:?}", top_tools);
+        println!("top_files: {:?}", top_files);
+        for b in &analytics.by_day {
+            println!("{}: {} sessions ${:.2}", b.date, b.sessions, b.cost_usd);
+        }
+    }
+}
+
+fn run_export(db: PathBuf, args: ExportArgs) {
+    let store = open_store(db);
+    let sessions = store.list_sessions(10000, 0).unwrap_or_default();
+    let turns: Vec<flare_insights::model::Turn> = sessions
+        .iter()
+        .flat_map(|s| store.get_turns(&s.id).unwrap_or_default())
+        .collect();
+    let fmt = match args.format.as_str() {
+        "jsonl" => flare_insights::export::ExportFormat::Jsonl,
+        "html" => flare_insights::export::ExportFormat::Html,
+        "deepeval" => flare_insights::export::ExportFormat::Deepeval,
+        "openai" | "openai-evals" => flare_insights::export::ExportFormat::OpenAiEvals,
+        _ => flare_insights::export::ExportFormat::Json,
+    };
+    let out = flare_insights::export::export_sessions(&sessions, &turns, fmt);
+    if let Some(path) = args.output {
+        std::fs::write(&path, out).unwrap();
+        println!("exported to {}", path.display());
+    } else {
+        println!("{out}");
+    }
+}
+
+fn run_handoff(db: PathBuf, args: HandoffArgs) {
+    let store = open_store(db);
+    let Some(session) = store.get_session(&args.session_id).unwrap_or(None) else {
+        eprintln!("session not found");
+        std::process::exit(1);
+    };
+    let turns = store.get_turns(&session.id).unwrap_or_default();
+    let verbosity = match args.verbosity.as_str() {
+        "minimal" => flare_insights::handoff::Verbosity::Minimal,
+        "verbose" => flare_insights::handoff::Verbosity::Verbose,
+        "full" => flare_insights::handoff::Verbosity::Full,
+        _ => flare_insights::handoff::Verbosity::Standard,
+    };
+    let doc = flare_insights::handoff::handoff_doc(&session, &turns, &args.target, verbosity);
+    println!("{doc}");
+}
+
+fn run_watch(db: PathBuf, args: WatchArgs) {
+    use flare_insights::config::InsightsConfig;
+    use flare_insights::ingest::watcher::InsightsWatcher;
+    println!(
+        "watching sources every {}s (ctrl-c to stop)",
+        args.interval_secs
+    );
+    let config = InsightsConfig::default();
+    let store = open_store(db.clone());
+    // initial sync
+    let (s, t, tools) = InsightsWatcher::rescan_and_store(&config, &store);
+    println!("initial: {s} sessions {t} turns {tools} tools");
+    // spawn watcher - clone config for closure
+    let db_clone = db.clone();
+    let config_clone = config.clone();
+    let _ = InsightsWatcher::from_config(&config).spawn(move |ev| {
+        println!("change: {:?} -> resync", ev);
+        if let Ok(store) = flare_insights::store::InsightsStore::open(&db_clone) {
+            let (s, t, tools) = InsightsWatcher::rescan_and_store(&config_clone, &store);
+            println!("resynced: {s} sessions {t} turns {tools} tools");
+        }
+    });
+    // keep alive + poll fallback
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(args.interval_secs));
+        let store = open_store(db.clone());
+        let (s, t, _tools) = InsightsWatcher::rescan_and_store(&config, &store);
+        if s > 0 {
+            println!("tick: {s} sessions {t} turns");
+        }
+    }
+}
+
+fn run_serve(db: PathBuf, args: ServeArgs) {
+    println!("flare-insights serve on 127.0.0.1:{} (API + WS)", args.port);
+    println!(
+        "endpoints: GET /api/health  GET /api/sessions  GET /api/sessions/:id  GET /api/search?q=  GET /api/stats"
+    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        if let Err(e) = flare_insights::api::serve(db, args.port).await {
+            eprintln!("serve error: {e}");
+            std::process::exit(1);
+        }
+    });
+}
+
+fn run_doctor(db: PathBuf, args: DoctorArgs) {
+    let config = flare_insights::config::InsightsConfig::default();
+    let db_ok = flare_insights::store::InsightsStore::open(&db).is_ok();
+    let mut sources: Vec<(String, bool)> = config
+        .sources
+        .iter()
+        .map(|(name, path)| (name.clone(), path.exists()))
+        .collect();
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "db_path": db.display().to_string(),
+                "db_ok": db_ok,
+                "sources": sources.iter().map(|(name, present)| serde_json::json!({
+                    "name": name,
+                    "present": present,
+                })).collect::<Vec<_>>(),
+            }))
+            .unwrap()
+        );
+    } else {
+        println!(
+            "db: {} ({})",
+            db.display(),
+            if db_ok { "ok" } else { "failed to open" }
+        );
+        for (name, present) in &sources {
+            println!(
+                "source {name}: {}",
+                if *present { "found" } else { "missing" }
+            );
+        }
+    }
+}

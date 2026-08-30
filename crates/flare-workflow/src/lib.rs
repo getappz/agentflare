@@ -37,6 +37,6 @@ pub use json::{
 };
 pub use retry::{Backoff, Retryable, apply_jitter};
 pub use sqlite_store::{SqliteStore, SqliteStoreError};
-pub use store::{InMemoryStore, StateStore};
+pub use store::{InMemoryStore, StateStore, smoke_test};
 pub use types::*;
 pub use variables::{capture_output, expand_variables};

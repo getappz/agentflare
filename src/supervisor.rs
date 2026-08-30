@@ -15,12 +15,42 @@ pub(crate) const READY_LABEL: &str = "ready-for-work";
 /// the two can't drift, same rationale as `READY_LABEL` above.
 pub(crate) const DISPATCHED_LABEL: &str = "dispatched";
 /// Also read by `dashboard::orphan_reconcile::handle_terminal_job_failure`
-/// -- once `dispatch_failure_ceiling::DISPATCH_FAILURE_CAP` consecutive
-/// dispatch cycles end with the same terminal failure reason, it lands here
-/// rather than back on `READY_LABEL`, so it doesn't retry-loop against the
-/// same broken agent (items #463/#506).
+/// and `restore_ready_for_work` -- once `dispatch_failure_ceiling`'s
+/// identical-reason or any-reason cap trips, it lands here rather than back
+/// on `READY_LABEL`, so it doesn't retry-loop against the same broken agent
+/// or a persistently orphaning job (items #463/#506/#164).
 pub(crate) const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
 const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
+/// Blocks auto-dispatch even while `READY_LABEL` is also present -- for a
+/// go/no-go candidate item whose description says "not dispatched, awaiting
+/// decision" but which was created (or handed off) with `ready-for-work`
+/// attached anyway. That prose was previously the *only* gate, which nothing
+/// actually enforced: `run_discovery_tick` dispatches on `READY_LABEL` alone,
+/// so items #184/#185/#186/#187 (all four go/no-go candidates from #166's
+/// spec) got auto-dispatched and re-dispatched across multiple agents dozens
+/// of times before anyone made the call. Removing `READY_LABEL` isn't
+/// enough on its own either -- `redispatch` re-attaches it unconditionally
+/// (see `item::claim::REDISPATCH_CLEARED_LABELS`) -- so this label is a
+/// belt-and-suspenders check that survives that path too, cleared only once
+/// a human actually decides (remove the label, or `redispatch`
+/// after removing it).
+const NEEDS_DECISION_LABEL: &str = "needs-decision";
+
+/// GitHub label a human applies to a CI-green PR to explicitly sign off on
+/// `run_review_sweep`'s `Passing` branch auto-merging it (item #194). CI
+/// green is what routes an item into that branch in the first place, so
+/// this label only ever adds a gate on top of CI, never bypasses it --
+/// mirrors item #192's "never bypass CI" principle for the duplicate-PR
+/// guard. Single named constant so the label convention has one place to
+/// rename.
+const PR_APPROVAL_LABEL: &str = "status:pr:approved";
+
+/// `vault` secret holding the Telegram chat id human-gate pings go to.
+/// Reuses the same `channels`/`vault` path as `agentflare channel send`
+/// rather than inventing a separate config store for one setting -- set it
+/// with `agentflare vault set telegram_notify_chat_id <chat_id>` alongside
+/// `telegram_bot_token` (see `channels::Platform::secret_name`).
+const TELEGRAM_NOTIFY_CHAT_ID_SECRET: &str = "telegram_notify_chat_id";
 
 /// Since item #19, work items run in-process via `WorkItemExecutor` rather
 /// than as a spawned `agentflare work` subprocess, so this is no longer an
@@ -133,6 +163,24 @@ pub(crate) fn run_discovery_tick(
             ready_id,
         } = batch;
         for item in items {
+            if let Some(gate_id) = label_id_by_name.get(NEEDS_DECISION_LABEL) {
+                let gated = mcp
+                    .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
+                    .ok()
+                    .and_then(Result::ok)
+                    .is_some_and(|ids| ids.contains(gate_id));
+                if gated {
+                    eprintln!(
+                        "agentflare-supervisor: item #{} ({}) is ready-for-work but gated pending a go/no-go decision ({NEEDS_DECISION_LABEL})",
+                        item.sequence_id, item.id
+                    );
+                    if first_time_gated(&item.id) {
+                        notify_human_gate(&item, "gated pending a go/no-go decision");
+                    }
+                    result.waiting += 1;
+                    continue;
+                }
+            }
             match crate::quota::decide::decide_for_supervisor(mcp, &item) {
                 crate::quota::decide::EffectiveAction::Run
                 | crate::quota::decide::EffectiveAction::SelfRepair => {
@@ -245,6 +293,9 @@ fn skip_item(
             ..Default::default()
         });
     }
+    if first_time_gated(&item.id) {
+        notify_human_gate(item, &reason);
+    }
 }
 
 fn ask_item(
@@ -274,6 +325,7 @@ fn ask_item(
             ..Default::default()
         });
     }
+    notify_human_gate(item, question);
 }
 
 /// Runs in-process via `WorkItemExecutor` (registered on the daemon's
@@ -397,6 +449,19 @@ pub(crate) struct ReviewSweepResult {
     /// deferral counted as "skipped" reads to an operator as a decision
     /// that won't be revisited, which is exactly backwards (item #82).
     pub waiting: usize,
+    /// PRs cleanly behind the base branch (GitHub's own `mergeable_state`)
+    /// that this sweep brought up to date via `pulls::update_branch` (item
+    /// #197's follow-up) -- distinct from `promoted`/`self_repaired` since
+    /// neither the item's state nor its CI outcome changed, just its branch
+    /// content; the next tick re-evaluates it against fresh CI.
+    pub updated: usize,
+    /// Trusted-author PRs found with no item tracking them yet, each just
+    /// given a synthesized `in_review` item via `worktree::discover_untracked_prs`
+    /// -- distinct from every other counter since nothing about a PR's own
+    /// state changed, only whether this sweep can see it; the newly created
+    /// item is picked up by the *next* tick's normal per-item loop, not this
+    /// one.
+    pub discovered: usize,
 }
 
 /// Why `self_repair_or_gate` did or didn't dispatch. A plain `bool` can't
@@ -412,9 +477,16 @@ enum SelfRepairOutcome {
 /// Everything one project contributes to a review sweep: its own
 /// `in_review` items, label lookup, and the folder its worktrees live
 /// under (from the `project_dirs` registry, not this process's cwd) --
-/// same shape `ProjectBatch` gives `run_discovery_tick`.
+/// same shape `ProjectBatch` gives `run_discovery_tick`. `project_id`,
+/// `in_review_state_id`, and `known_pr_numbers` exist only to let
+/// `discover_untracked_prs` create a correctly-scoped item directly (item
+/// creation needs an explicit project, unlike every other mutation here,
+/// which is addressed by an existing item's own id).
 struct ReviewBatch {
     folder_path: String,
+    project_id: String,
+    in_review_state_id: String,
+    known_pr_numbers: std::collections::HashSet<u64>,
     items: Vec<agentflare_backend::item::Item>,
     label_id_by_name: std::collections::HashMap<String, String>,
 }
@@ -441,7 +513,14 @@ pub(crate) fn run_review_sweep(
         self_repaired: 0,
         skipped: 0,
         waiting: 0,
+        updated: 0,
+        discovered: 0,
     };
+    // Computed once, not per-project/per-PR: identifies this workstation to
+    // `claim_pr_for_discovery`'s marker comment so two workstations racing to
+    // discover the same PR can tell each other apart. Same persisted id
+    // `github::bridge` itself uses.
+    let discovery_owner = crate::github::bridge::config::stable_instance_id();
 
     let fetched = mcp.with_backend_db(|conn| {
         let dirs = agentflare_backend::project_dir::list(conn).ok()?;
@@ -451,6 +530,20 @@ pub(crate) fn run_review_sweep(
             let states = agentflare_backend::state::list_by_project(conn, &dir.project_id).ok()?;
             let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
                 states.iter().map(|s| (s.id.as_str(), s)).collect();
+            // Every item, not just in_review ones -- an item could already be
+            // tracking a PR from `started` (agent still working) or any other
+            // state, and `discover_untracked_prs` must never create a second
+            // item for a PR one of those already owns.
+            let known_pr_numbers = crate::worktree::tracked_pr_numbers(&items);
+            let Some(in_review_state_id) = states
+                .iter()
+                .find(|s| s.group_name == "in_review")
+                .map(|s| s.id.clone())
+            else {
+                // No in_review state group in this project at all -- nothing
+                // for this sweep to do here regardless of discovery.
+                continue;
+            };
             let in_review: Vec<_> = items
                 .into_iter()
                 .filter(|i| {
@@ -466,6 +559,9 @@ pub(crate) fn run_review_sweep(
             }
             batches.push(ReviewBatch {
                 folder_path: dir.folder_path,
+                project_id: dir.project_id,
+                in_review_state_id,
+                known_pr_numbers,
                 items: in_review,
                 label_id_by_name,
             });
@@ -479,44 +575,180 @@ pub(crate) fn run_review_sweep(
     for batch in batches {
         let ReviewBatch {
             folder_path,
+            project_id,
+            in_review_state_id,
+            known_pr_numbers,
             items,
             label_id_by_name,
         } = batch;
         let repo_root = std::path::PathBuf::from(&folder_path);
+        // Resolved once per project and reused for discovery, the batched
+        // GraphQL fetch below, and (implicitly, inside `pr_ci_status`) the
+        // per-item REST fallback -- rather than every one of those re-doing
+        // the same remote/credential resolution, as the old one-call-per-item
+        // loop used to via its own internal `pr_ci_status` call.
+        let resolved = (
+            crate::github::RepoId::resolve_from_remote(&repo_root),
+            crate::github::Client::new(),
+        );
+        if let (Some(repo), Ok(client)) = &resolved {
+            let discovered = mcp
+                .with_backend_db(|conn| {
+                    crate::worktree::discover_untracked_prs(
+                        conn,
+                        client,
+                        repo,
+                        &project_id,
+                        &in_review_state_id,
+                        &known_pr_numbers,
+                        &discovery_owner,
+                    )
+                })
+                .unwrap_or(0);
+            result.discovered += discovered;
+        }
+
+        // Items carrying `metadata.pr.number` (set by `push_and_open_pr` at
+        // PR-creation time) are batched into a handful of GraphQL queries
+        // instead of one REST call each -- see `github::graphql`'s doc
+        // comment for the rate-limit math this avoids. Only items that
+        // predate that field fall back to the old one-REST-call-per-item
+        // path below, which also carries the branch-name-heuristic lookup
+        // those items still need.
+        let mut numbered: Vec<(&agentflare_backend::item::Item, u64)> = Vec::new();
+        let mut unnumbered: Vec<&agentflare_backend::item::Item> = Vec::new();
         for item in &items {
-            match crate::worktree::pr_ci_status(item, &repo_root) {
-                crate::worktree::PrCiStatus::Merged => {
-                    if promote_merged_item(mcp, item) {
-                        result.promoted += 1;
-                    } else {
-                        result.skipped += 1;
-                    }
-                }
-                crate::worktree::PrCiStatus::Failing(failed_checks) => {
-                    match self_repair_or_gate(
-                        mcp,
-                        queue,
-                        auth_conn,
-                        host_policy,
-                        item,
-                        &failed_checks,
-                        &label_id_by_name,
-                        &folder_path,
-                    ) {
-                        SelfRepairOutcome::Dispatched => result.self_repaired += 1,
-                        SelfRepairOutcome::Deferred => result.waiting += 1,
-                        SelfRepairOutcome::Skipped => result.skipped += 1,
-                    }
-                }
-                crate::worktree::PrCiStatus::Pending
-                | crate::worktree::PrCiStatus::Passing
-                | crate::worktree::PrCiStatus::Unknown => {
-                    result.skipped += 1;
-                }
+            match crate::worktree::pr_number_from_metadata(item) {
+                Some(number) => numbered.push((item, number)),
+                None => unnumbered.push(item),
             }
+        }
+
+        let batch_data = if let (Some(repo), Ok(client)) = &resolved {
+            let numbers: Vec<u64> = numbered.iter().map(|(_, n)| *n).collect();
+            crate::github::graphql::batch_pr_status_chunked(client, repo, &numbers)
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        for (item, number) in numbered {
+            // A PR number missing from `batch_data` (query failed for its
+            // chunk, or GitHub couldn't resolve that PR) is treated exactly
+            // like any other soft-fail: `Unknown`, polled again next tick --
+            // never an error for the whole sweep.
+            let status = match batch_data.get(&number) {
+                Some(data) => crate::worktree::pr_ci_status_from_batch(number, data),
+                None => crate::worktree::PrCiStatus::Unknown,
+            };
+            handle_pr_status(
+                mcp,
+                queue,
+                auth_conn,
+                host_policy,
+                item,
+                status,
+                &label_id_by_name,
+                &folder_path,
+                &repo_root,
+                &mut result,
+            );
+        }
+        for item in unnumbered {
+            let status = crate::worktree::pr_ci_status(item, &repo_root);
+            handle_pr_status(
+                mcp,
+                queue,
+                auth_conn,
+                host_policy,
+                item,
+                status,
+                &label_id_by_name,
+                &folder_path,
+                &repo_root,
+                &mut result,
+            );
         }
     }
     result
+}
+
+/// Acts on one item's already-fetched `PrCiStatus`, however it was fetched --
+/// batched via GraphQL or singly via REST. Split out of `run_review_sweep`'s
+/// loop so both fetch paths (`numbered`/`unnumbered` above) drive the exact
+/// same decision-and-mutate logic instead of two copies that could drift.
+///
+/// Every mutating branch here (`promote_merged_item`, `merge_if_approved`,
+/// `update_stale_branch`) makes its own live GitHub call as the actual
+/// authority, regardless of how stale `status` (a point-in-time snapshot,
+/// batched or not) might be by the time this runs -- a rejection from that
+/// live call (already merged, already up to date, no longer mergeable) falls
+/// through to `skipped` rather than erroring, so acting on a stale snapshot
+/// is always safe. `self_repair_or_gate` additionally re-checks claim
+/// liveness before dispatching, guarding the one branch here that starts new
+/// work rather than just re-attempting an idempotent GitHub operation.
+#[allow(clippy::too_many_arguments)]
+fn handle_pr_status(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    auth_conn: &rusqlite::Connection,
+    host_policy: agentflare_resource_gate::Policy,
+    item: &agentflare_backend::item::Item,
+    status: crate::worktree::PrCiStatus,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+    folder_path: &str,
+    repo_root: &std::path::Path,
+    result: &mut ReviewSweepResult,
+) {
+    match status {
+        crate::worktree::PrCiStatus::Merged => {
+            if promote_merged_item(mcp, item) {
+                result.promoted += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
+        crate::worktree::PrCiStatus::Failing(failed_checks) => {
+            match self_repair_or_gate(
+                mcp,
+                queue,
+                auth_conn,
+                host_policy,
+                item,
+                &failed_checks,
+                label_id_by_name,
+                folder_path,
+            ) {
+                SelfRepairOutcome::Dispatched => result.self_repaired += 1,
+                SelfRepairOutcome::Deferred => result.waiting += 1,
+                SelfRepairOutcome::Skipped => result.skipped += 1,
+            }
+        }
+        crate::worktree::PrCiStatus::Passing { number, labels } => {
+            if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) && first_time_gated(&item.id) {
+                notify_human_gate(
+                    item,
+                    &format!(
+                        "PR #{number} is CI-green and mergeable, awaiting `{PR_APPROVAL_LABEL}`"
+                    ),
+                );
+            }
+            if merge_if_approved(mcp, item, repo_root, number, &labels) {
+                result.promoted += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
+        crate::worktree::PrCiStatus::Behind { number } => {
+            if crate::worktree::update_stale_branch(repo_root, number) {
+                result.updated += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
+        crate::worktree::PrCiStatus::Pending | crate::worktree::PrCiStatus::Unknown => {
+            result.skipped += 1;
+        }
+    }
 }
 
 fn promote_merged_item(mcp: &AgentflareMcp, item: &agentflare_backend::item::Item) -> bool {
@@ -533,6 +765,145 @@ fn promote_merged_item(mcp: &AgentflareMcp, item: &agentflare_backend::item::Ite
         .unwrap_or(false)
 }
 
+/// Auto-merges a CI-green PR and promotes its item, but only once a human
+/// has attached `PR_APPROVAL_LABEL` to the PR itself -- checked first and
+/// short-circuits before any GitHub call so an unapproved item never touches
+/// the network here. Only ever called from `run_review_sweep`'s `Passing`
+/// arm, so CI green is structurally required: the label can add a gate on
+/// top of it, never bypass it.
+fn merge_if_approved(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    repo_root: &std::path::Path,
+    number: u64,
+    labels: &[String],
+) -> bool {
+    if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) {
+        return false;
+    }
+    let Some(repo) = crate::github::RepoId::resolve_from_remote(repo_root) else {
+        return false;
+    };
+    let Ok(client) = crate::github::Client::new() else {
+        return false;
+    };
+    merge_approved_pr(&client, &repo, number) && promote_merged_item(mcp, item)
+}
+
+/// The actual GitHub merge call for an approved, CI-green PR. Split out from
+/// `merge_if_approved` so tests can drive it against a mock server instead
+/// of `Client::new()`'s real credentials/host, mirroring `github::pulls`'
+/// own test style. Squash matches this repo's existing single-commit-per-item
+/// convention. Logs and falls through (never retries in-line) on failure --
+/// branch protection or a merge conflict just means the item sits until the
+/// next sweep tick, same as any other `skipped` outcome.
+fn merge_approved_pr(
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    number: u64,
+) -> bool {
+    match crate::github::pulls::merge(client, repo, number, "squash") {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("agentflare-supervisor: auto-merge failed for PR #{number} in {repo}: {e}");
+            false
+        }
+    }
+}
+
+/// Called from `item_check_merge` right after `item_id` is promoted to
+/// `completed` (both the automatic path via `promote_merged_item` above and
+/// manual/reconciliation calls funnel through that one function) -- for
+/// every item that declared a dependency on `item_id`, once *all* of its
+/// dependencies are completed, apply `READY_LABEL` so `run_discovery_tick`
+/// picks it up without a human/PM having to notice and `handoff` it by hand
+/// (item #195).
+///
+/// `run_discovery_tick` only dispatches items with a resolvable
+/// `assignee_agent`, so a dependent with none would just sit inert once
+/// labeled -- a dependent with no assignee inherits the just-completed
+/// item's own assignee (the agent that finished the blocking work is a
+/// reasonable default owner for what it unblocked) before being labeled.
+/// Only skipped, loudly, when the completed item itself has no assignee to
+/// inherit from.
+///
+/// Idempotent and safe under concurrent sibling completions:
+/// `item::add_label`'s `INSERT OR IGNORE` makes re-labeling a no-op, and an
+/// already-`dispatched` item won't be relabeled `ready-for-work` by this
+/// (it only ever adds the ready label, never touches `dispatched`).
+pub(crate) fn cascade_unblock_dependents(conn: &rusqlite::Connection, item_id: &str) {
+    let Ok(dependents) = agentflare_backend::item::dependents_of(conn, item_id) else {
+        return;
+    };
+    if dependents.is_empty() {
+        return;
+    }
+    let Ok(completed) = agentflare_backend::item::get(conn, item_id) else {
+        return;
+    };
+    let inherited_assignee = completed
+        .assignee_agent
+        .as_deref()
+        .map(agentflare_backend::item::agent_part);
+    for dependent_id in dependents {
+        if !agentflare_backend::item::all_dependencies_completed(conn, &dependent_id)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Ok(dependent) = agentflare_backend::item::get(conn, &dependent_id) else {
+            continue;
+        };
+        if dependent.assignee_agent.is_none() {
+            let Some(agent) = &inherited_assignee else {
+                // The just-completed item has no assignee of its own to hand
+                // off, so there's nothing sensible to inherit -- leave this
+                // loudly unassigned rather than silently no-op'ing.
+                eprintln!(
+                    "agentflare-supervisor: item #{} ({}) has all dependencies completed but no assignee_agent to inherit (completed item {item_id} has none either) -- not auto-labeled {READY_LABEL}, needs manual dispatch",
+                    dependent.sequence_id, dependent.id
+                );
+                continue;
+            };
+            if let Err(e) = agentflare_backend::item::update(
+                conn,
+                &dependent.id,
+                agentflare_backend::item::UpdateItem {
+                    assignee_agent: Some(agent.clone()),
+                    ..Default::default()
+                },
+            ) {
+                eprintln!(
+                    "agentflare-supervisor: failed to inherit assignee {agent} onto item #{} ({}) after dependency {item_id} completed: {e}",
+                    dependent.sequence_id, dependent.id
+                );
+                continue;
+            }
+        }
+        let Ok(labels) = agentflare_backend::label::list_by_project(conn, &dependent.project_id)
+        else {
+            continue;
+        };
+        let Some(ready_id) = labels
+            .into_iter()
+            .find(|l| l.name == READY_LABEL)
+            .map(|l| l.id)
+        else {
+            continue;
+        };
+        match agentflare_backend::item::add_label(conn, &dependent.id, &ready_id) {
+            Ok(()) => eprintln!(
+                "agentflare-supervisor: item #{} ({}) all dependencies completed -- auto-labeled {READY_LABEL}",
+                dependent.sequence_id, dependent.id
+            ),
+            Err(e) => eprintln!(
+                "agentflare-supervisor: failed to auto-label item #{} ({}) {READY_LABEL} after dependency {item_id} completed: {e}",
+                dependent.sequence_id, dependent.id
+            ),
+        }
+    }
+}
+
 /// Whether an `agentflare-work` job is already queued or running for
 /// `item_id` -- guards the (small) window between `enqueue_work_job`
 /// returning and the job actually reaching `item_claim`, during which the
@@ -547,6 +918,47 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
     .filter_map(|state| queue.list(Some(state)).ok())
     .flatten()
     .any(|job| job.args.contains(&item_id.to_string()))
+}
+
+/// Best-effort Telegram ping for an item that just landed on a human gate
+/// (a go/no-go decision, an unanswerable question, or a CI self-repair cap).
+/// Silently does nothing when `TELEGRAM_NOTIFY_CHAT_ID_SECRET` isn't
+/// configured, since notifications are opt-in and a bare install shouldn't
+/// spam stderr every tick; a configured-but-failing send only logs -- a
+/// notification failure must never block the gate itself.
+pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &str) {
+    let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
+        return;
+    };
+    let text = format!(
+        "agentflare: item #{} ({}) needs a human -- {reason}",
+        item.sequence_id, item.id
+    );
+    if let Err(e) =
+        crate::channels::send_message(crate::channels::Platform::Telegram, &chat_id, &text)
+    {
+        eprintln!(
+            "agentflare-supervisor: telegram notify failed for item #{}: {e}",
+            item.sequence_id
+        );
+    }
+}
+
+/// True the first time a given item id is seen gated since this process
+/// started, false on every later call for the same id -- `run_discovery_tick`
+/// re-visits an already-gated item on every tick (it stays in the
+/// `ready-for-work` query until a human clears `NEEDS_DECISION_LABEL`), so
+/// this keeps `notify_human_gate` firing once per gate instead of once per
+/// tick. In-memory and per-process by design: a daemon restart re-notifies
+/// once, which is preferable to a persistent marker for a one-line ping.
+pub(crate) fn first_time_gated(item_id: &str) -> bool {
+    static NOTIFIED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    NOTIFIED
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(item_id.to_string())
 }
 
 /// Dispatches a self-repair job for an item whose PR has failing CI checks,
@@ -607,6 +1019,14 @@ fn self_repair_or_gate(
                 ..Default::default()
             });
         }
+        notify_human_gate(
+            item,
+            &format!(
+                "CI self-repair cap reached ({} attempt(s), still failing: {})",
+                crate::quota::decide::SELF_REPAIR_CAP,
+                failed_checks.join(", ")
+            ),
+        );
         return SelfRepairOutcome::Skipped;
     }
 

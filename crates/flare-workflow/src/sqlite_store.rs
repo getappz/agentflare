@@ -224,9 +224,14 @@ impl<D: WorkflowData> SqliteStore<D> {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| WorkflowError::Store(format!("begin delete tx: {e}")))?;
-        for table in ["workflow_runs", "journal", "step_state", "run_vars"] {
+        for (table, id_col) in [
+            ("workflow_runs", "id"),
+            ("journal", "run_id"),
+            ("step_state", "run_id"),
+            ("run_vars", "run_id"),
+        ] {
             tx.execute(
-                &format!("DELETE FROM {table} WHERE run_id = ?1"),
+                &format!("DELETE FROM {table} WHERE {id_col} = ?1"),
                 params![run_id],
             )
             .map_err(|e| WorkflowError::Store(format!("delete from {table}: {e}")))?;
@@ -246,6 +251,7 @@ impl StatusAsStr for WorkflowStatus {
         match self {
             WorkflowStatus::Pending => "pending",
             WorkflowStatus::Running => "running",
+            WorkflowStatus::Waiting => "waiting",
             WorkflowStatus::Paused => "paused",
             WorkflowStatus::Completed => "completed",
             WorkflowStatus::Failed => "failed",
@@ -270,6 +276,7 @@ impl StatusAsStr for StepStatus {
 fn status_from_str(s: &str) -> WorkflowStatus {
     match s {
         "running" => WorkflowStatus::Running,
+        "waiting" => WorkflowStatus::Waiting,
         "paused" => WorkflowStatus::Paused,
         "completed" => WorkflowStatus::Completed,
         "failed" => WorkflowStatus::Failed,
@@ -424,7 +431,7 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
                 .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, state_json FROM workflow_runs WHERE status IN ('pending','running')",
+                    "SELECT id, state_json FROM workflow_runs WHERE status IN ('pending','running','waiting')",
                 )
                 .map_err(|e| WorkflowError::Store(format!("prepare list_active: {e}")))?;
             let rows = stmt
@@ -493,7 +500,7 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
             .to_rfc3339();
             let ids: Vec<String> = {
                 let mut stmt = conn
-                    .prepare("SELECT id FROM workflow_runs WHERE status NOT IN ('pending','running','paused') AND updated_at < ?1")
+                    .prepare("SELECT id FROM workflow_runs WHERE status NOT IN ('pending','running','waiting','paused') AND updated_at < ?1")
                     .map_err(|e| WorkflowError::Store(format!("prepare cleanup: {e}")))?;
                 let rows = stmt
                     .query_map(params![cutoff], |row| row.get::<_, String>(0))
@@ -690,7 +697,7 @@ mod tests {
     use super::*;
     use crate::types::{JournalEntry, StepId, StepState, WorkflowId, WorkflowRunId};
 
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
     struct TestData {
         value: i32,
     }
@@ -846,5 +853,93 @@ mod tests {
         let reopened = SqliteStore::<TestData>::open_file(&path).unwrap();
         let loaded = reopened.load(s.run_id).await.unwrap();
         assert_eq!(loaded.input, "hello");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_state_from_all_tables() {
+        let store = SqliteStore::<TestData>::open_memory().unwrap();
+        let original = state(&store).await;
+
+        store.delete(original.run_id).await.unwrap();
+
+        let err = store.load(original.run_id).await.unwrap_err();
+        assert!(matches!(err, WorkflowError::NotFound(_)));
+    }
+
+    /// Boot-time gate (item #164): `crate::store::smoke_test` must pass
+    /// against the real on-disk `SqliteStore` schema, not just an in-memory
+    /// double, since it's what actually caught nothing for the ~33h
+    /// `delete_state`'s wrong column name (item #576) went unnoticed.
+    #[tokio::test]
+    async fn store_smoke_test_passes_against_the_real_sqlite_schema() {
+        let store = SqliteStore::<TestData>::open_memory().unwrap();
+        crate::store::smoke_test(&store).await.unwrap();
+    }
+
+    /// Item #164's other acceptance criterion, driven through the real
+    /// rusqlite code path rather than a trait double: `write_state` only
+    /// ever inserts into `workflow_runs` (keyed on `id`) for a smoke test's
+    /// empty-steps/empty-vars `WorkflowState`, so `save` succeeds here and
+    /// the schema defect — `journal` missing the `run_id` column
+    /// `delete_state` unconditionally deletes by, the exact shape of #576's
+    /// regression — is only reached by `delete_state`'s real SQL, not
+    /// silently swallowed as a save failure.
+    #[tokio::test]
+    async fn smoke_test_fails_against_a_schema_missing_the_id_run_id_distinction() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workflow_runs (
+                id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                current_step TEXT,
+                input TEXT,
+                output TEXT,
+                error TEXT,
+                state_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE journal (
+                bad_run_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                entry_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (bad_run_id, seq)
+             );
+             CREATE TABLE step_state (
+                run_id TEXT NOT NULL,
+                step_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempt INTEGER,
+                last_error TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                duration_ms INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                PRIMARY KEY (run_id, step_id)
+             );
+             CREATE TABLE run_vars (
+                run_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT,
+                PRIMARY KEY (run_id, key)
+             );",
+        )
+        .unwrap();
+
+        let store = SqliteStore::<TestData> {
+            conn: Arc::new(Mutex::new(conn)),
+            update_lock: Arc::new(tokio::sync::Mutex::new(())),
+            _marker: PhantomData,
+        };
+
+        let err = crate::store::smoke_test(&store).await.unwrap_err();
+        assert!(matches!(err, WorkflowError::Store(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("journal"),
+            "expected the failure to come from delete_state's journal delete, got: {err}"
+        );
     }
 }

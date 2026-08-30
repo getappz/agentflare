@@ -8,6 +8,7 @@
 
 mod cargo;
 
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -44,6 +45,20 @@ pub fn run(release: bool, dry_run: bool) {
     // build never overwrites a working install.
     if let Err(e) = verify_runs(&built) {
         crate::ui::error(&format!("built binary failed verification: {e}"));
+        std::process::exit(1);
+    }
+
+    // Same reasoning, one layer deeper (item #164): `--version` proves the
+    // binary starts, not that its storage layer actually works. A binary
+    // swap is the exact trigger that let a broken `SqliteStore::delete_state`
+    // (item #576) go undetected for ~33h -- this process is still running
+    // the *old* code, so only a subprocess of `built` itself can prove the
+    // *new* code's save/delete/load round-trip works before anything
+    // overwrites the installed binary.
+    if let Err(e) = verify_workflow_store(&built) {
+        crate::ui::error(&format!(
+            "built binary failed its workflow-store smoke test: {e}"
+        ));
         std::process::exit(1);
     }
 
@@ -108,7 +123,28 @@ fn install_shims(release: bool, target: &Path) {
         (crate::shim_install::generic_shim_binary_name(), shim),
         (crate::cli::git::shim_dest_name().to_string(), git_shim),
     ] {
-        if let Err(e) = crate::update::swap::replace_binary(&src, &bin_dir.join(&name)) {
+        // Stage-then-rename, not `swap::replace_binary`: these are inert
+        // staging files, not the currently-running agentflare image, so they
+        // don't need its lock-safe rename-aside dance. That dance actively
+        // breaks the git shim here -- its staging file is deleted at the end
+        // of every run (see below), so on the *next* run the target is always
+        // absent, `replace_binary`'s Windows path always takes that as "the
+        // file is locked" and defers the copy to a post-exit `.bat`, and
+        // `shim_install::install()` (called synchronously right after this
+        // loop) never sees it in time.
+        //
+        // A direct `fs::copy` over the destination would overwrite
+        // `agentflare-shim`/`git` in place -- if it failed partway (disk
+        // full, the destination momentarily locked), every one of the
+        // GENERIC_SHIM_TOOLS hardlinks pointing at that same file would break.
+        // Copy to a pid-scoped sibling first and only rename over the real
+        // destination once the copy has fully succeeded, so a failure never
+        // touches the pre-existing shared binary.
+        let dest = bin_dir.join(&name);
+        let staged = bin_dir.join(format!("{name}.{}.new", std::process::id()));
+        let result = fs::copy(&src, &staged).and_then(|_| fs::rename(&staged, &dest));
+        if let Err(e) = result {
+            let _ = fs::remove_file(&staged);
             crate::ui::info(&format!("could not place {name} next to agentflare: {e}"));
             return;
         }
@@ -151,6 +187,38 @@ fn verify_runs(binary: &Path) -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => return Err(format!("waiting on --version: {e}")),
+        }
+    }
+}
+
+/// Run `<binary> daemon workflow-store-smoke-test` (the hidden verb behind
+/// [`crate::cli::daemon::DaemonSubcommand::WorkflowStoreSmokeTest`]) and
+/// confirm it exits successfully within [`VERIFY_TIMEOUT`] — same
+/// spawn/try_wait/kill pattern as [`verify_runs`], so a hung smoke test
+/// can't block `dev-install` indefinitely.
+fn verify_workflow_store(binary: &Path) -> Result<(), String> {
+    let mut child = Command::new(binary)
+        .args(["daemon", "workflow-store-smoke-test"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn workflow-store-smoke-test: {e}"))?;
+
+    let deadline = Instant::now() + VERIFY_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(format!("workflow-store-smoke-test exited with {status}"));
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return Err("workflow-store-smoke-test timed out".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("waiting on workflow-store-smoke-test: {e}")),
         }
     }
 }
@@ -235,5 +303,15 @@ mod tests {
         // path is reported as an error rather than panicking.
         let missing = std::env::temp_dir().join("agentflare-nonexistent-binary-xyz");
         assert!(verify_runs(&missing).is_err());
+    }
+
+    #[test]
+    fn verify_workflow_store_errors_for_a_missing_binary() {
+        // Same guard as `verify_runs_errors_for_a_missing_binary`, for the
+        // workflow-store smoke-test subprocess -- the happy path (a real
+        // built binary passing its store round-trip) is exercised by the
+        // real `dev-install` flow, not unit tests.
+        let missing = std::env::temp_dir().join("agentflare-nonexistent-binary-xyz");
+        assert!(verify_workflow_store(&missing).is_err());
     }
 }

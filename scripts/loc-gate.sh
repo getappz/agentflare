@@ -13,10 +13,6 @@ FROZEN_LIMIT=2100
 ALLOWLIST=(
   src/mcp_server.rs
   src/components.rs
-  # Already 1604 lines on master before item #441's git-shim polish touched
-  # it -- pre-existing debt, same situation as tick.rs/work.rs above. Frozen
-  # at <= FROZEN_LIMIT; a real split is separate work.
-  crates/flare-git-core/src/classify.rs
   # Already 1790 lines on master before this fix touched it -- pre-existing
   # debt, not something a security patch should take on splitting. Frozen
   # at <= FROZEN_LIMIT like the others; a real split is separate work.
@@ -26,11 +22,6 @@ ALLOWLIST=(
   # small, unrelated fix shouldn't be blocked on splitting. Frozen at
   # <= FROZEN_LIMIT; a real split is separate work.
   src/cli/work.rs
-  # Task 4 added SDD prompt builders to work_item_pipeline, pushing it to
-  # 1508 lines. A split into a dedicated prompt-builders module is separate
-  # work; this file was already approaching the gate limit. Frozen at
-  # <= FROZEN_LIMIT; a real split is separate work.
-  src/work_item_pipeline.rs
   # At 1493 lines on master, item #109's push/PR-failure completion gate
   # (mirroring the existing auto-commit-failure gate right above it) pushed
   # it over LIMIT. Splitting item.rs's per-action handlers into submodules
@@ -48,6 +39,11 @@ ALLOWLIST=(
   # doing but is a separate, larger refactor than this nitpick-followup fix
   # should carry. Frozen at <= FROZEN_LIMIT; a real split is separate work.
   src/cli/git.rs
+  # Already 1542 lines on master before item #195's cascade_unblock_dependents
+  # tests were added, same situation as item/tests.rs above -- a small,
+  # scoped feature's own tests shouldn't have to carry a pre-existing test-
+  # module split. Frozen at <= FROZEN_LIMIT; a real split is separate work.
+  src/supervisor_tests.rs
 )
 
 cd "$(dirname "$0")/.."

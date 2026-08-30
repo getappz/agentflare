@@ -70,6 +70,7 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                 args,
                 hard_cap_secs,
                 idle_timeout_secs,
+                cwd: _,
             } = inv;
             // `--model` ahead of any caller-supplied flags, mirroring
             // `run_launch_env`'s existing `--model` placement for the
@@ -107,6 +108,90 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                     // honest (unknown rather than fabricated).
                     Ok((reply.text, 0, 0))
                 }
+                crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
+                | crate::agent_launch::HeadlessOutcome::NotHeadless(e)
+                | crate::agent_launch::HeadlessOutcome::NotFound(e)
+                | crate::agent_launch::HeadlessOutcome::Failed(e) => Err(e),
+            }
+        })
+    })
+}
+
+/// Same role as [`agent_send_hook`], but for a workflow that belongs to an
+/// AgentFlare App: before dispatching each step, projects the App's
+/// agent-neutral personas/skills/tools into a fresh, per-invocation scratch
+/// directory (never the App's own directory), then launches the step's
+/// agent with that directory as its cwd via `run_headless_in` so the
+/// agent's own native project-local discovery (`.claude/agents`,
+/// `.claude/skills`, `.mcp.json`) picks it up. The scratch directory is
+/// torn down after the step completes, win or lose.
+pub(crate) fn app_send_hook(
+    app_dir: PathBuf,
+    tools: Option<agentflare_apps::ToolsManifest>,
+) -> SendMessage {
+    std::sync::Arc::new(move |inv: flare_workflow::json::StepInvocation| {
+        let app_dir = app_dir.clone();
+        let tools = tools.clone();
+        Box::pin(async move {
+            let scratch =
+                tempfile::tempdir().map_err(|e| format!("could not create scratch dir: {e}"))?;
+            agentflare_apps::project::project_for_claude_code(
+                &app_dir,
+                scratch.path(),
+                tools.as_ref(),
+            )?;
+
+            let flare_workflow::json::StepInvocation {
+                agent,
+                prompt,
+                model,
+                args,
+                hard_cap_secs,
+                idle_timeout_secs,
+                cwd: _,
+            } = inv;
+            let mut extra_args = Vec::with_capacity(args.len() + 2);
+            if let Some(m) = model {
+                extra_args.push("--model".to_string());
+                extra_args.push(m);
+            }
+            extra_args.extend(args);
+            let hard_cap = Duration::from_secs(hard_cap_secs.unwrap_or(DEFAULT_HARD_CAP_SECS));
+            let idle_timeout =
+                Duration::from_secs(idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS));
+            let scratch_path = scratch.path().to_path_buf();
+
+            // Same spawn_blocking rationale as `agent_send_hook`: the
+            // subprocess launch blocks synchronously and must run inside
+            // this async block so it's polled on a blocking-pool thread,
+            // not eagerly on whatever thread first called this closure.
+            //
+            // `scratch` itself (not just its path) moves into the closure so
+            // it stays alive until `run_headless_in` returns. The engine
+            // wraps each step's `execute` in `tokio::time::timeout`
+            // (`execute_step_with_retry`), which drops this whole future on
+            // expiry — a `spawn_blocking` task can't be cancelled once
+            // started (it keeps running on its own thread regardless), so a
+            // `scratch` owned by the *outer* future would be deleted out
+            // from under a still-running `run_headless_in` call.
+            let outcome = tokio::task::spawn_blocking(move || {
+                let _scratch = scratch;
+                crate::agent_launch::run_headless_in(
+                    &scratch_path,
+                    agent_registry::REGISTRY,
+                    &agent,
+                    &prompt,
+                    hard_cap,
+                    idle_timeout,
+                    &extra_args,
+                    false,
+                )
+            })
+            .await
+            .map_err(|e| format!("agent task panicked: {e}"))?;
+
+            match outcome {
+                crate::agent_launch::HeadlessOutcome::Ok(reply) => Ok((reply.text, 0, 0)),
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
                 | crate::agent_launch::HeadlessOutcome::NotHeadless(e)
                 | crate::agent_launch::HeadlessOutcome::NotFound(e)
@@ -247,9 +332,9 @@ pub(crate) async fn run_workflow_json_with_params_async(
     Ok((run_id, workflow_id))
 }
 
-/// Same as [`run_workflow_json`] with an injectable `SendMessage` hook — used
-/// by tests to drive steps without an installed agent binary.
-#[cfg(test)]
+/// Same as [`run_workflow_json`] with an injectable `SendMessage` hook — the
+/// actual hook-in point for [`app_send_hook`] (via `agentflare apps run`) as
+/// well as tests that drive steps without an installed agent binary.
 pub(crate) fn run_workflow_json_with_sender(
     definition_json: &str,
     input: &str,
@@ -591,12 +676,13 @@ fn parse_status_str(s: &str) -> Result<WorkflowStatus, String> {
     match s {
         "pending" => Ok(WorkflowStatus::Pending),
         "running" => Ok(WorkflowStatus::Running),
+        "waiting" => Ok(WorkflowStatus::Waiting),
         "paused" => Ok(WorkflowStatus::Paused),
         "completed" => Ok(WorkflowStatus::Completed),
         "failed" => Ok(WorkflowStatus::Failed),
         "cancelled" => Ok(WorkflowStatus::Cancelled),
         other => Err(format!(
-            "unknown status '{other}' (want one of: pending, running, paused, completed, failed, cancelled)"
+            "unknown status '{other}' (want one of: pending, running, waiting, paused, completed, failed, cancelled)"
         )),
     }
 }
@@ -634,10 +720,31 @@ pub(crate) async fn complete_workflow_event_async(
     Ok(())
 }
 
+/// Cancel a running workflow. Already-succeeded steps are left
+/// uncompensated (no saga rollback) — mirrors the engine's own
+/// `cancel_workflow` doc comment. Sync wrapper — see
+/// [`cancel_workflow_async`].
+pub fn cancel_workflow(run_id: &str, db_path: &Path) -> Result<(), String> {
+    WORKFLOW_RT
+        .block_on(cancel_workflow_async(run_id, db_path))
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn cancel_workflow_async(run_id: &str, db_path: &Path) -> Result<(), String> {
+    let store = open_store(db_path)?;
+    let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
+    let run_id = parse_run_id(run_id)?;
+    engine
+        .cancel_workflow(run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 fn status_str(s: &WorkflowStatus) -> &'static str {
     match s {
         WorkflowStatus::Pending => "pending",
         WorkflowStatus::Running => "running",
+        WorkflowStatus::Waiting => "waiting",
         WorkflowStatus::Paused => "paused",
         WorkflowStatus::Completed => "completed",
         WorkflowStatus::Failed => "failed",
@@ -934,6 +1041,55 @@ mod tests {
     }
 
     #[test]
+    fn cancel_workflow_stops_a_waiting_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wf.db");
+
+        let (run_id, _) = run_workflow_json_with_sender(
+            r#"{
+                "name": "cancellable",
+                "steps": [
+                    {"name": "ask", "agent": "opencode", "prompt": "Ask: {{input}}", "mode": {"wait_event": {"name": "approve", "timeout_secs": 10}}},
+                    {"name": "after", "agent": "opencode", "prompt": "After: {{input}}"}
+                ]
+            }"#,
+            "needs approval",
+            &db,
+            mock_send(),
+        )
+        .unwrap();
+
+        // Wait for the run to arm on the wait event before cancelling it.
+        let mut armed = false;
+        for _ in 0..100 {
+            let status = workflow_status(&run_id.to_string(), &db).unwrap();
+            armed = status["journal_tail"]
+                .as_array()
+                .map(|t| t.iter().any(|e| e["entry_type"] == "wait_event"))
+                .unwrap_or(false);
+            if armed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(armed, "run never armed on the wait event");
+
+        cancel_workflow(&run_id.to_string(), &db).unwrap();
+
+        let status = workflow_status(&run_id.to_string(), &db).unwrap();
+        assert_eq!(status["status"], "cancelled");
+    }
+
+    #[test]
+    fn cancel_workflow_rejects_unknown_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wf.db");
+        // Any DB error, including a nonexistent store file with no matching
+        // row, is surfaced as an `Err` rather than silently succeeding.
+        assert!(cancel_workflow("not-a-uuid", &db).is_err());
+    }
+
+    #[test]
     fn invalid_json_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("wf.db");
@@ -1154,5 +1310,132 @@ mod tests {
     fn list_workflow_definitions_empty_when_no_directory() {
         let repo = tempfile::tempdir().unwrap();
         assert!(list_workflow_definitions(repo.path()).is_empty());
+    }
+
+    /// `app_send_hook`'s dispatch is not injectable (unlike `mock_send`, it
+    /// always ends at the real `run_headless_in`), so an unknown agent id is
+    /// the deterministic way to exercise the full chain — scratch dir
+    /// creation, persona/skill projection, `run_headless_in` dispatch, and
+    /// `HeadlessOutcome` -> `Result` mapping — without depending on any CLI
+    /// agent binary being installed on the test machine's PATH.
+    #[test]
+    fn app_send_hook_projects_then_reports_the_dispatch_error() {
+        let app_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_dir.path().join("personas")).unwrap();
+        std::fs::write(app_dir.path().join("personas/ceo.md"), "# CEO").unwrap();
+
+        let send = app_send_hook(app_dir.path().to_path_buf(), None);
+        let inv = flare_workflow::json::StepInvocation::simple("no-such-agent", "hi");
+        let result = blocking_runtime().block_on((send)(inv));
+
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unknown agent: no-such-agent"),
+            "expected an unknown-agent error, got: {err}"
+        );
+    }
+
+    /// Regression guard for the `app_send_hook` TempDir race CodeRabbit
+    /// flagged on PR #611: `run_headless_in`'s dispatch isn't injectable
+    /// (see the doc comment on
+    /// `app_send_hook_projects_then_reports_the_dispatch_error` above), so
+    /// this exercises the same ownership pattern directly instead of
+    /// through the full hook — a `Drop`-on-drop guard moved *into* a
+    /// `spawn_blocking` closure (exactly how `app_send_hook` now moves
+    /// `scratch` in) must outlive the outer task being aborted mid-flight,
+    /// the same thing the engine's per-step `tokio::time::timeout` does to
+    /// a step's `execute` future on expiry (see `execute_step_with_retry`
+    /// in `flare-workflow`).
+    #[test]
+    fn spawn_blocking_owned_guard_outlives_outer_future_drop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (finish_tx, finish_rx) = mpsc::channel::<()>();
+
+        let rt = blocking_runtime();
+        let outer = rt.spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _guard = guard; // moved in, like `scratch` now is
+                started_tx.send(()).unwrap();
+                finish_rx.recv().unwrap(); // block until the test says go
+            })
+            .await
+            .unwrap();
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("blocking task never started");
+
+        // Simulate the engine's per-step timeout dropping the outer future
+        // while the blocking work is still running.
+        outer.abort();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "guard must still be alive: it was moved into spawn_blocking, \
+             which keeps running on its own thread and can't be cancelled \
+             once started, regardless of the outer task being aborted"
+        );
+
+        finish_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "guard should finally drop once the blocking closure returns"
+        );
+    }
+
+    #[test]
+    fn app_send_hook_wired_through_run_workflow_json_with_sender_reaches_failed() {
+        let app_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_dir.path().join("personas")).unwrap();
+        std::fs::write(app_dir.path().join("personas/ceo.md"), "# CEO").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wf.db");
+
+        let send = app_send_hook(app_dir.path().to_path_buf(), None);
+        let (run_id, _workflow_id) = run_workflow_json_with_sender(
+            r#"{
+                "name": "app-pipeline",
+                "steps": [
+                    {"name": "a", "agent": "no-such-agent", "prompt": "Do: {{input}}"}
+                ]
+            }"#,
+            "seed",
+            &db,
+            send,
+        )
+        .unwrap();
+
+        let rt = blocking_runtime();
+        rt.block_on(async {
+            for _ in 0..200 {
+                let store = SqliteStore::<PipelineData>::open_file(&db).unwrap();
+                let engine = WorkflowEngine::<PipelineData, _>::with_store(store);
+                if let Ok(s) = engine.get_status(run_id).await
+                    && s.status == WorkflowStatus::Failed
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("workflow did not reach Failed status");
+        });
+
+        let status = workflow_status(&run_id.to_string(), &db).unwrap();
+        assert_eq!(status["status"], "failed");
     }
 }

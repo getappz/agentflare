@@ -220,23 +220,18 @@ fn stage_and_attach_asset(
 }
 
 /// Per-agent extra argv inserted before the prompt: the confirmed
-/// permission-bypass flag, plus — Claude Code only, since it's the only
-/// agent with a confirmed structured-output flag and native turn/cost caps
-/// — `--output-format stream-json` (plus the `--verbose` Claude Code
-/// requires alongside it — confirmed by hand: omitting it errors with
-/// "--print with stream-json output requires --verbose") and any
-/// `--max-turns`/`--max-cost-usd` the caller asked for. Other agents get
-/// only their bypass flag; a caller-supplied cap for them is dropped with a
-/// warning rather than guessed at.
-///
-/// NOT plain `--output-format json`: that format writes nothing to
-/// stdout/stderr until the entire run finishes (confirmed by hand: 0 bytes
-/// for 54s+ on a trivial 2-tool-call task), so `run_captured`'s idle-timeout
-/// (default 300s) kills any real, longer task as a false-positive hang
-/// before it can ever finish — the actual cause behind item #43's repeated
-/// "went idle for 300s (no output captured)" failures. `stream-json` emits
-/// one JSON object per turn/tool-call as it happens, giving genuine
-/// liveness; `parse_claude_reply` reads the result back off its final line.
+/// permission-bypass flag, plus — for Claude Code and cursor-agent, the
+/// only agents with a confirmed `--output-format stream-json` headless mode
+/// — that flag (Claude Code also needs `--verbose`, confirmed by hand:
+/// omitting it errors with "--print with stream-json output requires
+/// --verbose", plus any `--max-turns`/`--max-cost-usd` asked for). Others
+/// get only their bypass flag; a caller-supplied cap is dropped with a
+/// warning rather than guessed at. NOT plain `--output-format json`: it
+/// writes nothing until the run finishes (confirmed by hand: 0 bytes for
+/// 54s+ on a trivial task), so `run_captured`'s idle-timeout (300s default)
+/// kills a real, longer task as a false positive — item #43's cause (and
+/// cursor-agent's default `text` format, item #183's). `parse_claude_reply`
+/// reads the reply off stream-json's final line.
 fn build_extra_args(
     agent: agent_registry::Agent,
     max_turns: Option<u64>,
@@ -248,9 +243,12 @@ fn build_extra_args(
         .flatten()
         .map(|s| s.to_string())
         .collect();
-    if agent == agent_registry::Agent::ClaudeCode {
+    use agent_registry::Agent::{ClaudeCode, Cursor};
+    if matches!(agent, ClaudeCode | Cursor) {
         args.push("--output-format".to_string());
         args.push("stream-json".to_string());
+    }
+    if agent == ClaudeCode {
         args.push("--verbose".to_string());
         if let Some(turns) = max_turns {
             args.push(format!("--max-turns={turns}"));
@@ -360,10 +358,23 @@ fn resolve_agent(
     ),
     String,
 > {
+    let task_context =
+        |assigned_agent: Option<agent_registry::Agent>| agent_registry::TaskContext {
+            labels: labels.to_vec(),
+            kind: crate::mcp_server::item::parsed_kind(&item.metadata),
+            size: crate::mcp_server::item::parsed_size(&item.metadata),
+            repo: None,
+            assigned_agent,
+            role: role.map(str::to_string),
+        };
+
     if let Some(name) = explicit {
-        return agent_registry::agent_by_name(name)
-            .map(|agent| (agent, "explicit --agent flag".to_string(), None, None))
-            .ok_or_else(|| format!("unknown agent: {name} — use `agentflare agents list`"));
+        let agent = agent_registry::agent_by_name(name)
+            .ok_or_else(|| format!("unknown agent: {name} — use `agentflare agents list`"))?;
+        // Agent is already fixed by the flag/dispatch — still consult
+        // `[router]` rules for a model (item #162).
+        let model = agent_registry::model_for_task(&task_context(None), config);
+        return Ok((agent, "explicit --agent flag".to_string(), None, model));
     }
 
     let assigned_agent = item
@@ -372,14 +383,7 @@ fn resolve_agent(
         .map(agentflare_backend::item::agent_part)
         .as_deref()
         .and_then(agent_registry::agent_by_name);
-    let task = agent_registry::TaskContext {
-        labels: labels.to_vec(),
-        kind: crate::mcp_server::item::parsed_kind(&item.metadata),
-        size: crate::mcp_server::item::parsed_size(&item.metadata),
-        repo: None,
-        assigned_agent,
-        role: role.map(str::to_string),
-    };
+    let task = task_context(assigned_agent);
     let decision = agent_registry::route(&task, config, installed, rotation).ok_or_else(|| {
         "no --agent given, and no route decision (item has no assignee and no router \
          rule matched) — pass --agent explicitly"
@@ -538,6 +542,7 @@ pub(crate) fn notify(recipient: &str, body: &str, item_id: &str) {
     }
 }
 
+include!("work_duplicate_pr.rs");
 impl WorkArgs {
     pub fn run(self) {
         if let Some(agent) = agent_detector::agent_name() {
@@ -563,20 +568,15 @@ impl WorkArgs {
     }
 }
 
-/// `execute_work`'s result: the process exit code (0 = success), plus — set
-/// only when the failure was classified as rate-limit shaped — a hint for
-/// how long the job queue should wait before retrying this item, and
-/// `fatal` for a structural setup failure (see its doc comment below).
-/// `WorkItemExecutor` converts this into `agentflare_jobs::JobFailure`.
+/// `execute_work`'s result: exit code, an optional rate-limit retry-after
+/// hint, and `fatal` for a structural setup failure (see below). Converted
+/// into `agentflare_jobs::JobFailure` by `WorkItemExecutor`.
 pub(crate) struct WorkOutcome {
     pub exit_code: i32,
     pub retry_after_secs: Option<u64>,
-    /// Set for a failure that happened while establishing the working
-    /// environment (e.g. "claim succeeded but no worktree was created") as
-    /// opposed to a failure during the agent run itself. The underlying
-    /// cause of a structural setup failure doesn't change between attempts
-    /// — see `agentflare_jobs::JobFailure::fatal`, which this maps onto so
-    /// the job queue fails it straight to terminal instead of retrying.
+    /// Set for a failure establishing the working environment (vs. during
+    /// the agent run) — maps onto `JobFailure::fatal` to fail straight to
+    /// terminal instead of retrying, since the cause won't change on retry.
     pub fatal: bool,
 }
 
@@ -614,13 +614,10 @@ const DEFAULT_COOLDOWN_PROFILE: &str = "__default__";
 /// interactive path's rate-limit rotation.
 const RATE_LIMIT_COOLDOWN_MINUTES: u32 = 30;
 
-/// Classifies a headless run's failure message the same way the interactive
-/// `agentflare run` path does (`auth_runner::is_rate_limited`) and, if it
-/// looks rate-limit shaped, records a cooldown so `auth_db::is_cooling_down`
-/// (checked by the discovery tick before dispatching the next item for this
-/// agent, and by `auth rotate`) sees it too. Returns the seconds until that
-/// cooldown clears, for the caller to pass through as the job queue's
-/// retry-after delay.
+/// Classifies a headless failure the same way `auth_runner::is_rate_limited`
+/// does for the interactive path and, if rate-limit shaped, records a
+/// cooldown so `auth_db::is_cooling_down` (discovery tick, `auth rotate`)
+/// sees it too. Returns seconds until clear, as the job queue's retry delay.
 fn classify_and_cooldown(agent: &str, failure_message: &str) -> Option<u64> {
     if !crate::auth_runner::is_rate_limited(failure_message) {
         return None;
@@ -641,27 +638,24 @@ fn classify_and_cooldown(agent: &str, failure_message: &str) -> Option<u64> {
 
 /// Claims `args.target`, runs the resolved agent on it, and reports the
 /// outcome back onto the item — the whole body of `agentflare work`.
-/// Progress lines that used to go straight to stdout now go through `log`
-/// instead, so this same logic can run in-process inside the daemon
-/// (`WorkItemExecutor`, called from `agentflare_jobs::WorkerPool`) with its
-/// progress captured into that job's own log file — the exact same file the
-/// dashboard already tails for subprocess-dispatched jobs — rather than only
-/// working when there's a real subprocess's stdout to capture.
+/// Progress goes through `log` instead of straight to stdout, so this same
+/// logic can run in-process inside the daemon (`WorkItemExecutor`, called
+/// from `agentflare_jobs::WorkerPool`), captured into that job's own log
+/// file — the same file the dashboard already tails for subprocess jobs.
 ///
-/// `args.repo_root`, when set (daemon dispatch — see `WorkItemExecutor`),
-/// scopes project/worktree resolution to the claimed item's own project
-/// directory instead of this process's cwd (item #63) — a human running
-/// `agentflare work` directly leaves it unset and keeps the prior
-/// cwd-resolved behavior.
+/// `args.repo_root`, when set (daemon dispatch), scopes project/worktree
+/// resolution to the claimed item's own project directory instead of this
+/// process's cwd (item #63); a human running `agentflare work` directly
+/// leaves it unset and keeps the prior cwd-resolved behavior.
 pub(crate) fn execute_work(args: WorkArgs, log: &mut dyn std::io::Write) -> WorkOutcome {
     execute_work_impl(args, log, crate::work_item_pipeline::run_or_resume)
 }
 
+include!("work_cwd_lock.rs");
+
 /// Test seam: same as [`execute_work`], with the `sdd_loop`→`finalize`
 /// pipeline runner injected — mirrors `work_item_pipeline`'s own
-/// `_with_sender` pattern, one level up (this file doesn't touch
-/// `flare_workflow::json::SendMessage` directly, only whatever runs the
-/// whole pipeline for a given item).
+/// `_with_sender` pattern, one level up.
 #[allow(clippy::too_many_arguments)]
 fn execute_work_impl(
     args: WorkArgs,
@@ -669,6 +663,7 @@ fn execute_work_impl(
     run_pipeline: impl FnOnce(
         std::sync::Arc<AgentflareMcp>,
         &agentflare_backend::item::Item,
+        &std::path::Path,
         agent_registry::Agent,
         agent_registry::Agent,
         String,
@@ -749,10 +744,9 @@ fn execute_work_impl(
     let status = claim["status"].as_str().unwrap_or("unknown");
     if status != "acquired" {
         // "held" (a live claim by another owner) and "blocked" (an unaccepted
-        // handoff — see `ClaimOutcome::BlockedByAssignee`) are different
-        // shapes: "blocked" has no `owner`/`age_secs` at all, so formatting
-        // it as if it were "held" printed the nonsensical "held by ? (0s)"
-        // instead of the actionable reason the claim response already carries.
+        // handoff, `ClaimOutcome::BlockedByAssignee`) differ: "blocked" has
+        // no `owner`/`age_secs`, so formatting it as "held" printed the
+        // nonsensical "held by ? (0s)" instead of the real reason.
         let msg = match status {
             "blocked" => claim["reason"]
                 .as_str()
@@ -823,6 +817,17 @@ fn execute_work_impl(
             return 1.into();
         }
     };
+
+    if let Some(outcome) = duplicate_pr_short_circuit(
+        &mcp,
+        &item_detail,
+        wpath,
+        args.notify.as_deref(),
+        &mut claim_guard,
+        log,
+    ) {
+        return outcome;
+    }
 
     // --- Resolve agent (explicit flag, else route from the item) ---
     // Only pay for detecting installed agents / loading the router config
@@ -920,42 +925,39 @@ fn execute_work_impl(
         resolved_model.as_deref(),
     );
 
-    // --- Change to worktree dir and run the sdd_loop -> finalize pipeline;
-    // the chdir must stay in effect for the whole `run_or_resume` call, not
-    // just one turn -- `sdd_loop` reads/commits real files across every
-    // iteration of a resumed run. ---
-    let original_dir = std::env::current_dir().ok();
-    if std::env::set_current_dir(wpath).is_err() {
-        let msg = format!("failed to chdir into {}", wpath.display());
-        release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
-        crate::ui::error(&msg);
-        // Same structural category as the missing-worktree case above: the
-        // claimed worktree path came back from `item::claim` but doesn't
-        // actually exist/isn't enterable, which won't change on retry.
-        return WorkOutcome {
-            exit_code: 1,
-            retry_after_secs: None,
-            fatal: true,
-        };
-    }
-
-    let result = run_pipeline(
-        mcp.clone(),
-        &item_detail,
-        implementer_agent,
-        review_agent,
-        item_description,
-        plan_doc,
-        args.notify.clone(),
-        timeout,
-        idle_timeout,
-        extra_args,
-    );
-
-    // Restore cwd regardless of outcome.
-    if let Some(d) = original_dir {
-        let _ = std::env::set_current_dir(d);
-    }
+    // --- Run the sdd_loop -> finalize pipeline against the worktree.
+    // `run_in_worktree` just validates `wpath` is enterable -- the pipeline
+    // itself takes `wpath` explicitly rather than relying on process cwd,
+    // so concurrent dispatches (item #205) don't need to serialize here. ---
+    let result = match run_in_worktree(wpath, || {
+        run_pipeline(
+            mcp.clone(),
+            &item_detail,
+            wpath,
+            implementer_agent,
+            review_agent,
+            item_description,
+            plan_doc,
+            args.notify.clone(),
+            timeout,
+            idle_timeout,
+            extra_args,
+        )
+    }) {
+        Ok(result) => result,
+        Err(msg) => {
+            release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
+            crate::ui::error(&msg);
+            // Same structural category as the missing-worktree case above: the
+            // claimed worktree path came back from `item::claim` but doesn't
+            // actually exist/isn't enterable, which won't change on retry.
+            return WorkOutcome {
+                exit_code: 1,
+                retry_after_secs: None,
+                fatal: true,
+            };
+        }
+    };
 
     // `run_or_resume`'s `finalize` step already performed every bit of
     // report-back the old inline `HeadlessOutcome::Ok` arm did (hold-signal
@@ -1038,6 +1040,8 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
     }
 }
 
+#[cfg(test)]
+mod cursor_dispatch_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1746,150 +1750,7 @@ rotate = true
     }
 
     include!("work_worktree_error_tests.rs");
-    /// Mock `SendMessage` for `sdd_loop`-driven tests below: answers the judge's prompt ("You are
-    /// the judge") with a `complete_pipeline` decision, everything else with a plain role reply.
-    const JUDGE_COMPLETE_DECISION: &str = r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#;
-    fn mock_sdd_send() -> flare_workflow::json::SendMessage {
-        std::sync::Arc::new(move |inv: flare_workflow::json::StepInvocation| {
-            let p = inv.prompt;
-            Box::pin(async move {
-                if p.contains("You are the judge") {
-                    Ok((JUDGE_COMPLETE_DECISION.to_string(), 1u64, 0u64))
-                } else {
-                    Ok(("DONE: did the work".to_string(), 1u64, 0u64))
-                }
-            })
-        })
-    }
-
-    /// Shared setup for the two `execute_work_impl` dispatch tests below,
-    /// which differ only in what they assert afterward: seeds a project +
-    /// item under `repo_root`, dispatches it through `execute_work_impl`
-    /// with a mocked `sdd_loop` pipeline (`mock_sdd_send`), and returns the
-    /// seeding `AgentflareMcp` + item + outcome for the caller to inspect.
-    /// Must run inside `crate::paths::test_support::with_temp_home` (see
-    /// callers) -- `AgentflareMcp::for_project_dir` only overrides the
-    /// project-link/worktree axes, not `backend_db`, which resolves via
-    /// `crate::paths::home()`.
-    fn run_dispatch_fixture(
-        repo_root: &std::path::Path,
-    ) -> (AgentflareMcp, agentflare_backend::item::Item, WorkOutcome) {
-        let seed_mcp = AgentflareMcp::for_project_dir(repo_root.to_path_buf());
-        let item = seed_mcp
-            .with_backend_db(|conn| seeded_item(&seed_mcp, conn))
-            .unwrap();
-        let work_args = WorkArgs {
-            target: item.id.clone(),
-            agent: Some(agent_registry::Agent::ClaudeCode.as_str().to_string()),
-            timeout: DEFAULT_TIMEOUT_SECS,
-            idle_timeout: DEFAULT_IDLE_TIMEOUT_SECS,
-            max_turns: None,
-            max_cost_usd: None,
-            model: None,
-            notify: None,
-            repo_root: Some(repo_root.to_path_buf()),
-        };
-        let mut log = Vec::new();
-        let outcome = execute_work_impl(
-            work_args,
-            &mut log,
-            |mcp,
-             item,
-             implementer_agent,
-             review_agent,
-             item_description,
-             plan_doc,
-             notify,
-             timeout,
-             idle_timeout,
-             extra_args| {
-                // Something real to commit -- otherwise `finalize`'s
-                // `item_done` sees a never-diverged branch and treats the
-                // run as a no-op instead of a completion.
-                std::fs::write(
-                    std::env::current_dir().unwrap().join("real_work.txt"),
-                    "real work",
-                )
-                .unwrap();
-                let _ = (timeout, idle_timeout, extra_args);
-                crate::work_item_pipeline::run_or_resume_with_sender(
-                    mcp,
-                    item,
-                    implementer_agent,
-                    review_agent,
-                    item_description,
-                    plan_doc,
-                    notify,
-                    mock_sdd_send(),
-                )
-            },
-        );
-        (seed_mcp, item, outcome)
-    }
-
-    #[test]
-    fn execute_work_runs_through_the_pipeline_but_hard_errors_without_a_github_remote() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_root = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo_root).unwrap();
-        // A local bare "origin" so `git push` itself succeeds -- same
-        // fixture shape as item_pr_failure_tests.rs. It's still not a
-        // GitHub remote, so `push_and_open_pr` can't resolve a repo to
-        // open a PR against; that's the known, deliberately-tested
-        // soft-fail path (item #109 / PR #482), not this test's concern.
-        init_test_repo_with_origin(&repo_root);
-
-        crate::paths::test_support::with_temp_home(|| {
-            let (seed_mcp, item, outcome) = run_dispatch_fixture(&repo_root);
-            // The pipeline itself (coder -> review -> finalize) ran through
-            // successfully and a real commit landed -- but `origin` here is
-            // a local bare repo, not a real GitHub remote, so finalize's
-            // push/PR step correctly soft-fails to open a PR and reports a
-            // hard error (item #109 / PR #482) rather than false-completing
-            // a claim whose work was never actually published.
-            assert_eq!(outcome.exit_code, 1);
-
-            let comments = seed_mcp
-                .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
-                .unwrap()
-                .unwrap();
-            assert!(
-                comments
-                    .iter()
-                    .any(|c| c.body.contains("PR creation failed")),
-                "expected a PR-creation-failed comment, got: {comments:?}"
-            );
-        });
-    }
-
-    /// Task 8: `execute_work_impl` dispatches through `run_or_resume`, which
-    /// persists `workflow_run_id` onto the item's metadata before polling
-    /// for completion (see `work_item_pipeline::persist_run_id`) — exercises
-    /// that persistence through the real `execute_work_impl` call site with
-    /// the new `item_description`/`plan_doc` params. `persist_run_id` runs
-    /// at dispatch time, well before `finalize`'s push/PR step, so the
-    /// metadata write survives even though this fixture's `origin` (a local
-    /// bare repo, not a real GitHub remote) makes `finalize` hard-error the
-    /// same way the sibling test above does (item #109 / PR #482).
-    #[test]
-    fn execute_work_persists_workflow_run_id_on_dispatch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_root = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo_root).unwrap();
-        init_test_repo_with_origin(&repo_root);
-
-        crate::paths::test_support::with_temp_home(|| {
-            let (seed_mcp, item, outcome) = run_dispatch_fixture(&repo_root);
-            assert_eq!(outcome.exit_code, 1);
-
-            let updated_item = seed_mcp
-                .with_backend_db(|conn| agentflare_backend::item::get(conn, &item.id).ok())
-                .unwrap()
-                .unwrap();
-            let metadata: serde_json::Value = serde_json::from_str(&updated_item.metadata).unwrap();
-            assert!(metadata.get("workflow_run_id").is_some());
-        });
-    }
+    include!("work_dispatch_fixture_tests.rs");
 
     /// Sets up a claimed item and returns `(tmp, mcp, item)` with the claim
     /// held under the calling thread's own `owner_id()` — the same fixture
@@ -2091,4 +1952,6 @@ rotate = true
         // exercised cross-module from `cli::work`.
         let _ = AgentflareMcp::item_update;
     }
+
+    include!("work_duplicate_pr_tests.rs");
 }

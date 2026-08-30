@@ -29,3 +29,68 @@ fn plain_implementation_request_is_not_review_only() {
 fn missing_metadata_field_does_not_panic() {
     assert!(!detect_review_only("implement it", &json!({"size": "M"})));
 }
+
+#[test]
+fn hyphenated_review_only_phrase_is_detected() {
+    assert!(detect_review_only(
+        "State it's review-only up front. Report findings, don't fix.",
+        &json!({}),
+    ));
+}
+
+#[test]
+fn design_spec_task_type_metadata_is_detected() {
+    assert!(detect_review_only(
+        "propose an approach",
+        &json!({"task_type": "design-spec"})
+    ));
+    assert!(detect_review_only(
+        "propose an approach",
+        &json!({"task_type": "design_spec"})
+    ));
+}
+
+#[test]
+fn design_spec_phrase_in_description_is_detected() {
+    assert!(detect_review_only(
+        "Task type: design-spec (no code). Do not propose implementation code — findings/proposal only.",
+        &json!({}),
+    ));
+}
+
+#[test]
+fn plain_design_mention_without_spec_framing_is_not_review_only() {
+    assert!(!detect_review_only(
+        "Redesign the login button to be blue",
+        &json!({}),
+    ));
+}
+
+#[test]
+fn design_specification_phrase_is_not_review_only() {
+    assert!(!detect_review_only(
+        "Update the API design specification to add pagination",
+        &json!({}),
+    ));
+    assert!(!detect_review_only(
+        "Write design specs for the new caching layer, then implement it",
+        &json!({}),
+    ));
+}
+
+#[test]
+fn explicit_non_forcing_task_type_overrides_the_free_text_scan() {
+    // Built via concatenation rather than a literal adjacent token, same
+    // convention item #170's own description had to adopt once it kept
+    // re-triggering the bug it was describing.
+    let trigger = format!("{}-{}", "design", "spec");
+    let description = format!("Full {trigger}: see the doc, this builds it");
+    assert!(
+        detect_review_only(&description, &json!({})),
+        "sanity check: without task_type, the phrase must still trigger review-only"
+    );
+    assert!(
+        !detect_review_only(&description, &json!({"task_type": "implementation"})),
+        "an explicit non-forcing task_type must skip the free-text scan entirely"
+    );
+}
