@@ -16,6 +16,8 @@ pub enum ItemCommands {
         limit: Option<i64>,
         #[arg(long)]
         state_group: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Update item state (e.g. --state "Started")
     UpdateState {
@@ -45,10 +47,14 @@ pub enum ItemCommands {
 impl ItemArgs {
     pub fn run(self) {
         match self.command {
-            ItemCommands::List { json: _, limit, state_group } => {
+            ItemCommands::List { json: _, limit, state_group, project: project_filter } => {
                 let mcp = crate::mcp_server::AgentflareMcp::default();
                 let res = mcp.with_backend_db(|conn| {
-                    let project = mcp.resolve_project(conn)?;
+                    let project = if let Some(p) = project_filter {
+                        mcp.resolve_project_for_read(conn, Some(&p))?
+                    } else {
+                        mcp.resolve_project(conn)?
+                    };
                     let mut items = agentflare_backend::item::list_by_project(conn, &project.id).map_err(crate::mcp_server::types::map_backend_err)?;
                     let states = agentflare_backend::state::list_by_project(conn, &project.id).map_err(crate::mcp_server::types::map_backend_err)?;
                     let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =

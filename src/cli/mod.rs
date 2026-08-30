@@ -33,6 +33,7 @@ mod vault;
 mod vent;
 pub(crate) mod work;
 mod item;
+mod project;
 mod workflow;
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
@@ -151,6 +152,8 @@ pub enum Commands {
     Apps(apps::AppsArgs),
     /// Manage work items (list/get)
     Item(item::ItemArgs),
+    /// Manage projects
+    Project(project::ProjectArgs),
 }
 
 impl Commands {
@@ -193,6 +196,7 @@ impl Commands {
             Self::Insights(cmd) => cmd.run(),
             Self::Apps(cmd) => cmd.run(),
             Self::Item(cmd) => cmd.run(),
+            Self::Project(cmd) => cmd.run(),
         }
     }
 }
