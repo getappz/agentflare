@@ -778,11 +778,11 @@ pub fn get_components(host: &str) -> Vec<Component> {
         // opencode has no PreToolUse hook of its own to wire agentflare's
         // branch guard into (that's Claude-Code-only) -- it does auto-load
         // any plugin file dropped directly in `~/.config/opencode/plugin/`,
-// so ship the same branch-guard classifier as a local plugin there.
+        // so ship the same branch-guard classifier as a local plugin there.
         Component {
             id: "opencode-branch-guard",
             needs_consent: true,
-            describe: "opencode branch-guard plugin (~/.config/opencode/plugin/branch-guard.js) - blocks write/edit/patch on master/main via `agentflare hook pre-tool-use`".to_string(),
+            describe: "opencode branch-guard plugin (~/.config/opencode/plugin/branch-guard.js) — blocks write/edit/patch on master/main via `agentflare hook pre-tool-use`".to_string(),
             check: {
                 let host = host_owned.clone();
                 Box::new(move || host != "opencode" || opencode_plugin_dir().join("branch-guard.js").exists())
