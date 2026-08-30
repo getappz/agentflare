@@ -10,15 +10,21 @@ pub struct ItemArgs {
 pub enum ItemCommands {
     /// List work items for current project (JSON)
     List {
-        /// Output JSON (default)
         #[arg(long, default_value_t = true)]
         json: bool,
-        /// Limit
         #[arg(long)]
         limit: Option<i64>,
-        /// Filter by state group (e.g. backlog,unstarted,started,in_review,completed)
         #[arg(long)]
         state_group: Option<String>,
+    },
+    /// Update item state (e.g. --state "Started")
+    UpdateState {
+        /// Item id (#1 or UUID)
+        #[arg(long)]
+        id: String,
+        /// State name (Backlog, Unstarted, Started, In Review, Completed) or group
+        #[arg(long)]
+        state: String,
     },
 }
 
@@ -68,6 +74,22 @@ impl ItemArgs {
                         .collect();
 
                     Ok::<_, rmcp::model::ErrorData>(serde_json::to_string_pretty(&out).unwrap_or_default())
+                });
+                match res {
+                    Ok(Ok(json)) => println!("{json}"),
+                    Ok(Err(e)) => crate::ui::error(&e.to_string()),
+                    Err(e) => crate::ui::error(&e.to_string()),
+                }
+            }
+            ItemCommands::UpdateState { id, state } => {
+                let mcp = crate::mcp_server::AgentflareMcp::default();
+                let res = mcp.with_backend_db(|conn| {
+                    let item_id = mcp.resolve_item_id(conn, &id)?;
+                    let project = mcp.resolve_project(conn)?;
+                    let states = agentflare_backend::state::list_by_project(conn, &project.id).map_err(crate::mcp_server::types::map_backend_err)?;
+                    let target = states.iter().find(|s| s.name.to_lowercase() == state.to_lowercase() || s.group_name.to_lowercase() == state.to_lowercase().replace(' ', "_")).cloned().ok_or_else(|| rmcp::model::ErrorData::invalid_params(format!("state '{}' not found", state), None))?;
+                    let item = agentflare_backend::item::update_state(conn, &item_id, &target.id).map_err(crate::mcp_server::types::map_backend_err)?;
+                    Ok::<_, rmcp::model::ErrorData>(serde_json::to_string_pretty(&item).unwrap_or_default())
                 });
                 match res {
                     Ok(Ok(json)) => println!("{json}"),
