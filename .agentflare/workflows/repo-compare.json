@@ -45,6 +45,7 @@
     {
       "name": "record",
       "agent": "claude-code",
+      "run_if": "{{cache_check}} != 'MISS' OR {{verdict}} != ''",
       "prompt": "If {{cache_check}} is exactly 'MISS': publish {{verdict}} for {{params.repo_name}} as an artifact in agentflare's OWN artifact store — call the mcp__flare__artifact tool (action=publish), NOT the Claude Code Artifact tool and NOT an item comment. Write a self-contained HTML page (type='html') presenting the comparison table and bottom-line summary; name it '{{params.repo_name}} vs agentflare'; set description to a one-sentence summary and favicon to a fitting emoji. The publish call returns an artifact id/URL — then persist it for future cache hits: run `bash .agentflare/scripts/repo-compare-cache.sh write {{params.repo_path}} {{params.repo_name}} <the-returned-artifact-url-or-id>`. If {{cache_check}} is NOT 'MISS', it already IS the cached artifact URL/id from a prior run whose inputs haven't changed — skip publishing and skip the cache write entirely. In both cases, reply with nothing else — just the final artifact URL or id, alone on the last line.",
       "timeout_secs": 1800,
       "output_var": "artifact_url"
