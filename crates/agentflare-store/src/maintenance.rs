@@ -216,17 +216,23 @@ impl Store {
                     hashes.extend(own);
                 }
 
-                // store_doc_history has a REFERENCES on store_documents, so
-                // with foreign keys enforced this ordering is required, not
-                // just tidy. store_docs_vec has no constraint and would
-                // simply be orphaned.
+                // store_doc_history and store_doc_chunks both have
+                // REFERENCES on store_documents, so with foreign keys
+                // enforced this ordering is required. store_chunk_vec
+                // references store_doc_chunks, so it must go first.
                 tx.execute(
                     "DELETE FROM store_doc_history WHERE doc_id = ?1",
                     params![id],
                 )?;
                 tx.execute("DELETE FROM store_docs_vec WHERE doc_id = ?1", params![id])?;
+                tx.execute(
+                    "DELETE FROM store_chunk_vec WHERE chunk_id IN (SELECT id FROM store_doc_chunks WHERE doc_id = ?1)",
+                    params![id],
+                )?;
+                tx.execute("DELETE FROM store_doc_chunks WHERE doc_id = ?1", params![id])?;
                 // Dropping the row out of store_docs_fts is the AFTER DELETE
                 // trigger's job — see migrations::EXTERNAL_CONTENT_FTS_MIGRATION.
+                // store_chunks_fts is similarly handled by its own triggers on store_doc_chunks.
                 tx.execute("DELETE FROM store_documents WHERE id = ?1", params![id])?;
             }
             tx.commit()?;

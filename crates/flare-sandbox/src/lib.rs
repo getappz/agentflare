@@ -33,6 +33,13 @@ pub enum MountPolicy {
 pub struct AgentStateMount {
     pub relative_path: &'static str,
     pub policy: MountPolicy,
+    /// Path, relative to this mount's own directory, of a log file worth
+    /// tailing out to the caller's `diagnostic_out` path (see [`wrap`])
+    /// before the sandboxed process exits -- otherwise this mount's entire
+    /// `OverlayEphemeral` overlay, log included, is discarded with it,
+    /// leaving a failed headless run undiagnosable (item #139). `None` when
+    /// this agent has no known diagnostic log.
+    pub diagnostic_log: Option<&'static str>,
 }
 
 /// Sandbox policy for one agent CLI: which resolved binary this applies to
@@ -65,6 +72,13 @@ pub struct SandboxConfig {
 /// writable cwd. Pass `true` only for a caller whose job IS to commit (a
 /// headless coding-agent CLI itself) -- re-protecting `.git` read-only
 /// there would leave every staged/committed change stranded.
+///
+/// `diagnostic_out`: when `Some`, and the resolved `command` matches a
+/// profile with a mount whose `diagnostic_log` is set, a bounded tail of
+/// that log is periodically snapshotted to this (real, host-visible) path
+/// for as long as the sandboxed command runs -- surviving even a hard
+/// kill, not just a clean exit (item #139). `None` (or no match) leaves the
+/// sandboxed command unwrapped, same as before this parameter existed.
 #[cfg(target_os = "linux")]
 pub fn wrap(
     command: &str,
@@ -72,8 +86,9 @@ pub fn wrap(
     cwd: Option<&Path>,
     git_writable: bool,
     config: &SandboxConfig,
+    diagnostic_out: Option<&Path>,
 ) -> (String, Vec<String>) {
-    bwrap::wrap(command, args, cwd, git_writable, config)
+    bwrap::wrap(command, args, cwd, git_writable, config, diagnostic_out)
         .unwrap_or_else(|| (command.to_string(), args.to_vec()))
 }
 
@@ -84,6 +99,7 @@ pub fn wrap(
     _cwd: Option<&Path>,
     _git_writable: bool,
     _config: &SandboxConfig,
+    _diagnostic_out: Option<&Path>,
 ) -> (String, Vec<String>) {
     (command.to_string(), args.to_vec())
 }

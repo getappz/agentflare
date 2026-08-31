@@ -462,6 +462,137 @@ fn audit_orphans_ignores_a_claimed_or_own_branch_worktree() {
     assert!(orphans.is_empty());
 }
 
+/// Cross-item data loss (vent, severity critical): dispatching several
+/// items in quick succession caused worktree-creation retries, after which
+/// two UNRELATED items' dirty worktrees vanished from disk — with no
+/// `reclaim`/`force` anywhere in the picture.
+///
+/// The mechanism, reproduced here: `create_worktree` used to run a
+/// repo-wide `git worktree prune` to clear its own branch's stale
+/// registration. Prune drops the admin entry of *any* registration whose
+/// `gitdir` file points at a missing path — including a worktree that is
+/// fully intact on disk with uncommitted work in it. The victim was left
+/// with a dangling `.git`, which `audit_orphans` reads as a broken-gitdir
+/// orphan and `gc_orphans` then deletes.
+#[test]
+fn create_worktree_does_not_orphan_another_items_live_worktree() {
+    let repo = init_repo();
+    let target = resolve_default_branch(&repo.path);
+
+    // Victim: another item's worktree, live on disk, with real uncommitted
+    // work in it.
+    let victim_item = test_item(110);
+    let victim = create_worktree(&victim_item, &repo.path, &target, None).unwrap();
+    std::fs::write(victim.join("precious.txt"), "uncommitted work").unwrap();
+
+    // Make the victim's admin entry stale the way a partial/interrupted or
+    // path-shifted operation does -- its `gitdir` file now names a path
+    // that does not exist, while the checkout itself is untouched.
+    let admin = repo.path.join(".git").join("worktrees").join("110");
+    assert!(admin.is_dir(), "victim registration missing at {admin:?}");
+    std::fs::write(
+        admin.join("gitdir"),
+        "C:/nonexistent/path/.git
+",
+    )
+    .unwrap();
+
+    // Now drive the retry path on a DIFFERENT item: an already-existing
+    // branch, which is the branch_exists arm that used to prune repo-wide.
+    let other = test_item(475);
+    let other_branch = task_branch_name(&other);
+    assert!(crate::shell::run_in_ok(
+        &repo.path,
+        &["branch", &other_branch, &target]
+    ));
+    let created = create_worktree(&other, &repo.path, &target, None);
+    assert!(created.is_ok(), "dispatch failed: {created:?}");
+
+    // The victim must survive, registration and contents both.
+    assert!(
+        admin.is_dir(),
+        "another item's worktree registration was pruned as collateral damage"
+    );
+    assert!(
+        victim.join("precious.txt").exists(),
+        "uncommitted work destroyed"
+    );
+    assert!(
+        audit_orphans(&repo.path, Some(&std::collections::HashSet::new()))
+            .iter()
+            .all(|o| o.name != "110"),
+        "live worktree was reclassified as a prunable orphan"
+    );
+}
+
+/// The stale registration `create_worktree` *is* meant to clear (its own
+/// branch, checkout genuinely gone) still gets cleared -- the scoping fix
+/// must not regress the item #331 case it replaced.
+#[test]
+fn create_worktree_clears_its_own_stale_registration() {
+    let repo = init_repo();
+    let target = resolve_default_branch(&repo.path);
+    let item = test_item(331);
+    let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+    let branch = resolve_worktree_branch(&item, &worktree_path);
+
+    // Directory removed out-of-band (crash, manual cleanup): git still
+    // considers `branch` checked out here, which blocks `worktree add`.
+    std::fs::remove_dir_all(&worktree_path).unwrap();
+    let admin = repo.path.join(".git").join("worktrees").join("331");
+    assert!(admin.is_dir());
+    assert!(remove_stale_registration_for(&repo.path, &branch));
+    assert!(!admin.exists());
+
+    // And the re-dispatch it was blocking now succeeds.
+    let again = create_worktree(&item, &repo.path, &target, None);
+    assert!(again.is_ok(), "re-dispatch still blocked: {again:?}");
+}
+
+/// `gc_orphans` snapshots "before deletion" so a destructive sweep is
+/// recoverable. That snapshot used to stage from `repo_root`, where
+/// `ensure_worktrees_ignored` excludes `.worktrees/` -- so it captured
+/// nothing of the directory being deleted and the work was simply gone.
+/// A broken-gitdir orphan is also the one case `audit_orphans` never
+/// dirty-checks (it cannot: `git status` needs a working gitdir), which is
+/// exactly why the snapshot has to be real.
+#[test]
+fn gc_orphans_snapshot_actually_captures_the_deleted_worktrees_work() {
+    let repo = init_repo();
+    let target = resolve_default_branch(&repo.path);
+    let item = test_item(473);
+    let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+    std::fs::write(worktree_path.join("precious.txt"), "uncommitted work").unwrap();
+
+    // Break the gitdir pointer -> audit_orphans sees a broken-gitdir orphan.
+    std::fs::write(
+        worktree_path.join(".git"),
+        "gitdir: C:/nonexistent/.git
+",
+    )
+    .unwrap();
+    let orphans = audit_orphans(&repo.path, Some(&std::collections::HashSet::new()));
+    assert_eq!(orphans.len(), 1);
+    assert!(orphans[0].has_broken_gitdir);
+
+    let deleted = gc_orphans(&repo.path, &["473".to_string()]);
+    assert_eq!(deleted, vec!["473".to_string()]);
+    assert!(!worktree_path.exists());
+
+    // The whole point: the work is still recoverable from the snapshot.
+    let snapshots = crate::snapshot::list(&repo.path);
+    let snap = snapshots
+        .iter()
+        .find(|m| m.reason.contains("gc orphan worktree 473"))
+        .expect("no snapshot recorded for the deleted orphan");
+    let listing =
+        crate::shell::run_in(&repo.path, &["ls-tree", "-r", "--name-only", &snap.id.0]).unwrap();
+    assert!(
+        listing.lines().any(|l| l.trim() == "precious.txt"),
+        "snapshot did not capture the deleted worktree's uncommitted work; got: {listing}"
+    );
+}
+
 #[test]
 fn commit_uncommitted_commits_a_dirty_worktree() {
     let repo = init_repo();

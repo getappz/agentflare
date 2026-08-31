@@ -5,7 +5,7 @@
     {
       "name": "check-cache",
       "agent": "claude-code",
-      "prompt": "Run: bash .agentflare/scripts/repo-compare-cache.sh check {{params.repo_path}} {{params.repo_name}} (from the agentflare repo root). If it prints a URL and exits 0, that's a cache hit for the current SHAs of both {{params.repo_name}} and agentflare — reply with nothing but that URL, verbatim, on its own line. If it exits non-zero, reply with exactly the single word: MISS. Do no other analysis in this step.",
+      "prompt": "Run: bash .agentflare/scripts/repo-compare-cache.sh check {{params.repo_path}} {{params.repo_name}} (from the agentflare repo root). Your ENTIRE reply must be ONLY one of the two things below — no explanation, no 'Exit code' commentary, no leading/trailing text or blank lines, nothing else on any line: (1) if the command prints a URL and exits 0, reply with just that URL; (2) if the command exits non-zero or prints nothing, reply with just the four characters MISS. Do no other analysis in this step.",
       "timeout_secs": 120,
       "output_var": "cache_check"
     },
@@ -31,6 +31,7 @@
       "run_if": "{{cache_check}} == 'MISS'",
       "prompt": "Compare this feature list for {{params.repo_name}} against agentflare's own codebase (this repo's project root — use ctx_search/ctx_compose to check whether/how agentflare already covers each item). For every feature output one row of a markdown table: | Feature | In {{params.repo_name}} | In agentflare | Verdict (adopt / already-covered / not-applicable / needs-more-research) | Better implementation ({{params.repo_name}} / agentflare / tie / n-a) | Why |. Default to 'not-applicable' or 'needs-more-research' when unsure on Verdict — only mark 'adopt' for a concrete, low-risk win. For 'Better implementation', judge only features both sides actually implement (even via a different mechanism) on correctness, robustness, and fit for their respective use case — not just presence; use 'n-a' when only one side has it. The 'Why' column must justify both the Verdict and the Better-implementation call.\n\nFeatures:\n{{features}}",
       "timeout_secs": 1800,
+      "idle_timeout_secs": 900,
       "output_var": "verdict"
     },
     {
@@ -45,6 +46,8 @@
     {
       "name": "record",
       "agent": "claude-code",
+      "run_if": "{{cache_check}} != 'MISS' OR {{verdict}} != ''",
+      "args": ["--dangerously-skip-permissions"],
       "prompt": "If {{cache_check}} is exactly 'MISS': publish {{verdict}} for {{params.repo_name}} as an artifact in agentflare's OWN artifact store — call the mcp__flare__artifact tool (action=publish), NOT the Claude Code Artifact tool and NOT an item comment. Write a self-contained HTML page (type='html') presenting the comparison table and bottom-line summary; name it '{{params.repo_name}} vs agentflare'; set description to a one-sentence summary and favicon to a fitting emoji. The publish call returns an artifact id/URL — then persist it for future cache hits: run `bash .agentflare/scripts/repo-compare-cache.sh write {{params.repo_path}} {{params.repo_name}} <the-returned-artifact-url-or-id>`. If {{cache_check}} is NOT 'MISS', it already IS the cached artifact URL/id from a prior run whose inputs haven't changed — skip publishing and skip the cache write entirely. In both cases, reply with nothing else — just the final artifact URL or id, alone on the last line.",
       "timeout_secs": 1800,
       "output_var": "artifact_url"

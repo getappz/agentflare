@@ -13,7 +13,7 @@
 //! ephemeral, see `OverlayEphemeral`'s doc comment).
 
 use flare_sandbox::{AgentProfile, AgentStateMount, MountPolicy, SandboxConfig};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const OVERLAY: MountPolicy = MountPolicy::OverlayEphemeral;
 
@@ -21,6 +21,22 @@ const fn mount(relative_path: &'static str) -> AgentStateMount {
     AgentStateMount {
         relative_path,
         policy: OVERLAY,
+        diagnostic_log: None,
+    }
+}
+
+/// Like [`mount`], but names a log file (relative to `relative_path`) worth
+/// tailing out before the sandbox tears down its `OverlayEphemeral` overlay
+/// -- see `flare_sandbox::AgentStateMount::diagnostic_log`'s doc comment and
+/// item #139.
+const fn mount_with_diagnostic_log(
+    relative_path: &'static str,
+    diagnostic_log: &'static str,
+) -> AgentStateMount {
+    AgentStateMount {
+        relative_path,
+        policy: OVERLAY,
+        diagnostic_log: Some(diagnostic_log),
     }
 }
 
@@ -45,8 +61,10 @@ const CLAUDE_STATE: &[AgentStateMount] = &[mount(".claude")];
 /// once that's worked around). It also holds `auth.json`, so it can't just
 /// go read-only. `.config/opencode` (MCP/tool config) is mounted alongside
 /// it, matching ai-jail's own `command_state_paths` coverage for opencode.
-const OPENCODE_STATE: &[AgentStateMount] =
-    &[mount(".config/opencode"), mount(".local/share/opencode")];
+const OPENCODE_STATE: &[AgentStateMount] = &[
+    mount(".config/opencode"),
+    mount_with_diagnostic_log(".local/share/opencode", "log/opencode.log"),
+];
 
 /// cursor-agent's own config/state dirs. `.cursor` holds `mcp.json`/
 /// `hooks.json` (read) plus a per-project tracking directory cursor-agent
@@ -129,6 +147,28 @@ const CONFIG: SandboxConfig = SandboxConfig {
     writable_home_dirs: WRITABLE_HOME_DIRS,
 };
 
+/// `.agentflare`-relative directory a sandboxed run's diagnostic-log tail
+/// (see `OPENCODE_STATE`'s `diagnostic_log`) gets written to -- nested under
+/// `.agentflare` because that's already a real, host-persistent writable
+/// bind (`WRITABLE_HOME_DIRS`), so no additional bind is needed.
+const DIAGNOSTIC_SUBDIR: &str = ".agentflare/sandbox-diagnostics";
+
+/// Absolute host path a sandboxed run's diagnostic-log tail (if any) would
+/// be written to for the given unique `token`. The caller creates this
+/// path's parent directory before spawning (so the bind exists even on a
+/// box's very first sandboxed run) and reads + removes it after the child
+/// exits -- see `agent_launch::run_headless_impl`. `None` if `$HOME` can't
+/// be resolved, mirroring `wrap`'s own fallback when sandboxing is
+/// unavailable.
+pub fn diagnostic_path(token: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        Path::new(&home)
+            .join(DIAGNOSTIC_SUBDIR)
+            .join(format!("{token}.log")),
+    )
+}
+
 /// Returns the command/args that should actually be spawned for a job:
 /// wrapped in a sandbox where one is available, or unchanged otherwise
 /// (non-Linux platforms, or Linux without `bwrap` on `PATH`).
@@ -141,13 +181,21 @@ const CONFIG: SandboxConfig = SandboxConfig {
 /// `agent_launch::run_headless`) -- re-protecting `.git` read-only there
 /// made every headless work-item dispatch unable to ever `git add`/`git
 /// commit` its own staged changes (item #88).
+///
+/// `diagnostic_out`: forwarded to `flare_sandbox::wrap` -- see its doc
+/// comment. Pass `None` for a job whose own output has no diagnostic value
+/// beyond stdout/stderr (e.g. `Supervisor::spawn`'s arbitrary build/lint/
+/// test commands); pass `diagnostic_path(token)` for a headless coding-agent
+/// CLI dispatch (`agent_launch::run_headless`) so a failure is diagnosable
+/// from more than a short stdout/stderr tail (item #139).
 pub fn wrap(
     command: &str,
     args: &[String],
     cwd: Option<&Path>,
     git_writable: bool,
+    diagnostic_out: Option<&Path>,
 ) -> (String, Vec<String>) {
-    flare_sandbox::wrap(command, args, cwd, git_writable, &CONFIG)
+    flare_sandbox::wrap(command, args, cwd, git_writable, &CONFIG, diagnostic_out)
 }
 
 #[cfg(test)]
@@ -186,8 +234,26 @@ mod tests {
         // machine -- keeps the test deterministic across CI runners.
         let bogus_cwd = Path::new("/definitely-does-not-exist-agentflare-sandbox-test");
         let args = vec!["--help".to_string()];
-        let (command, out_args) = wrap("cursor-agent", &args, Some(bogus_cwd), true);
+        let (command, out_args) = wrap("cursor-agent", &args, Some(bogus_cwd), true, None);
         assert_eq!(command, "cursor-agent");
         assert_eq!(out_args, args);
+    }
+
+    #[test]
+    fn diagnostic_path_is_nested_under_agentflare_home_dir() {
+        let path = diagnostic_path("some-token").expect("HOME is set in test environment");
+        assert!(path.ends_with(".agentflare/sandbox-diagnostics/some-token.log"));
+    }
+
+    #[test]
+    fn opencode_state_names_a_diagnostic_log_for_its_data_dir_mount() {
+        // Item #139: opencode's own tool-call/reasoning trace lives in
+        // `log/opencode.log` under `.local/share/opencode`, which otherwise
+        // vanishes entirely with the rest of that mount's discarded overlay.
+        let data_dir_mount = OPENCODE_STATE
+            .iter()
+            .find(|m| m.relative_path == ".local/share/opencode")
+            .expect(".local/share/opencode mount present");
+        assert_eq!(data_dir_mount.diagnostic_log, Some("log/opencode.log"));
     }
 }

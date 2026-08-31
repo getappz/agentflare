@@ -1,10 +1,12 @@
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use walkdir::WalkDir;
 
 use crate::config::InsightsConfig;
 use crate::ingest::{
-    common::{extract_tokens, parse_timestamp},
-    Adapter, IngestBundle, IngestError,
+    common::{extract_tokens, file_cursor, parse_timestamp},
+    Adapter, FileCursors, IngestBundle, IngestError,
 };
 use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, ToolCall, Turn};
 
@@ -14,27 +16,41 @@ impl Adapter for CodexAdapter {
     fn source_name(&self) -> &'static str {
         "codex"
     }
-    fn scan(&self, config: &InsightsConfig) -> Result<IngestBundle, IngestError> {
+    fn scan(
+        &self,
+        config: &InsightsConfig,
+        cursors: &FileCursors,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<IngestBundle, IngestError> {
         let Some(dir) = config.sources.get("codex") else {
             return Ok(IngestBundle::default());
         };
         if !dir.exists() {
             return Ok(IngestBundle::default());
         }
-        let mut bundle = IngestBundle::default();
-        for entry in WalkDir::new(dir)
+        let files: Vec<PathBuf> = WalkDir::new(dir)
             .max_depth(5)
             .into_iter()
             .filter_map(|e| e.ok())
-        {
-            if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .map(|e| e.path().to_path_buf())
+            .collect();
+        let total = files.len();
+        let mut bundle = IngestBundle::default();
+        for (i, path) in files.iter().enumerate() {
+            on_progress(i + 1, total);
+            let Some(cursor) = file_cursor(path) else {
                 continue;
+            };
+            if cursors.get(path) == Some(&cursor) {
+                continue; // unchanged since last sync
             }
-            if let Some((s, turns, tools)) = parse_codex_jsonl(entry.path()) {
+            if let Some((s, turns, tools)) = parse_codex_jsonl(path) {
                 bundle.sessions.push(s);
                 bundle.turns.extend(turns);
                 bundle.tool_calls.extend(tools);
             }
+            bundle.file_cursors.push((path.clone(), cursor.0, cursor.1));
         }
         Ok(bundle)
     }

@@ -1798,6 +1798,41 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
+/// Serve the MCP server over Streamable HTTP/SSE so one persistent agentflare
+/// process backs many concurrent agent sessions, instead of one cold-started
+/// OS process per connecting agent (the stdio default).
+pub async fn run_http(
+    host: &str,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+
+    // One server instance shared across every session: the point of HTTP mode
+    // is that a single process (and its lazily-opened skills/gateway registries
+    // and backend/store DB connections) backs many concurrent agent sessions,
+    // instead of cold-starting one per connection. The factory clones the Arc,
+    // so each rmcp session routes into the same `AgentflareMcp`.
+    let shared = std::sync::Arc::new(AgentflareMcp::from_env());
+
+    let service: StreamableHttpService<std::sync::Arc<AgentflareMcp>, LocalSessionManager> =
+        StreamableHttpService::new(
+            {
+                let shared = shared.clone();
+                move || Ok(shared.clone())
+            },
+            std::sync::Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+    let app = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind((host, port)).await?;
+    let addr = listener.local_addr()?;
+    eprintln!("agentflare MCP listening on http://{addr}/mcp (streamable HTTP)");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod optimize_instructions_tests {
     use super::build_optimize_instructions;

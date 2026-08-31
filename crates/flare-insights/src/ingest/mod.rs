@@ -4,10 +4,12 @@ pub mod common;
 pub mod opencode;
 pub mod watcher;
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::config::InsightsConfig;
 use crate::model::{FileEvent, Session, Subagent, ToolCall, Turn};
+use crate::store::InsightsStore;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
@@ -21,6 +23,10 @@ pub enum IngestError {
     Unsupported(String),
 }
 
+/// Per-source `path -> (mtime_ms, size)` cache from the last successful sync,
+/// used by file-walking adapters to skip re-parsing unchanged session files.
+pub type FileCursors = HashMap<PathBuf, (i64, u64)>;
+
 #[derive(Debug, Default, Clone)]
 pub struct IngestBundle {
     pub sessions: Vec<Session>,
@@ -28,11 +34,19 @@ pub struct IngestBundle {
     pub tool_calls: Vec<ToolCall>,
     pub file_events: Vec<FileEvent>,
     pub subagents: Vec<Subagent>,
+    /// Updated cursor entries for files this scan actually parsed (not for
+    /// files skipped because they were already up to date).
+    pub file_cursors: Vec<(PathBuf, i64, u64)>,
 }
 
 pub trait Adapter: Send + Sync {
     fn source_name(&self) -> &'static str;
-    fn scan(&self, config: &InsightsConfig) -> Result<IngestBundle, IngestError>;
+    fn scan(
+        &self,
+        config: &InsightsConfig,
+        cursors: &FileCursors,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<IngestBundle, IngestError>;
 }
 
 pub struct IngestManager {
@@ -56,32 +70,25 @@ impl IngestManager {
         }
     }
 
-    /// DRY: scan all adapters, fail-open per source
+    /// DRY: scan all adapters, fail-open per source. `on_progress` is called
+    /// as `(source, files_done, files_total)` while each adapter walks its
+    /// files, so callers can render live sync progress.
     pub fn scan_all(
         &self,
         config: &InsightsConfig,
+        store: &InsightsStore,
+        mut on_progress: impl FnMut(&str, usize, usize),
     ) -> Vec<(String, Result<IngestBundle, IngestError>)> {
         let mut out = Vec::new();
         for a in &self.adapters {
             let name = a.source_name().to_string();
-            let res = a.scan(config);
+            let cursors = store.load_file_cursors(&name).unwrap_or_default();
+            let res = a.scan(config, &cursors, &mut |done, total| {
+                on_progress(&name, done, total)
+            });
             out.push((name, res));
         }
         out
-    }
-
-    pub fn scan_all_flat(&self, config: &InsightsConfig) -> IngestBundle {
-        let mut bundle = IngestBundle::default();
-        for (_, res) in self.scan_all(config) {
-            if let Ok(b) = res {
-                bundle.sessions.extend(b.sessions);
-                bundle.turns.extend(b.turns);
-                bundle.tool_calls.extend(b.tool_calls);
-                bundle.file_events.extend(b.file_events);
-                bundle.subagents.extend(b.subagents);
-            }
-        }
-        bundle
     }
 }
 

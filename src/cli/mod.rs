@@ -27,11 +27,14 @@ mod review;
 mod run;
 mod serve;
 mod skill;
+mod store;
 mod uninstall;
 mod update;
 mod vault;
 mod vent;
 pub(crate) mod work;
+mod item;
+mod project;
 mod workflow;
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
@@ -148,6 +151,12 @@ pub enum Commands {
     Insights(insights::InsightsArgs),
     /// Run and manage AgentFlare Apps — self-contained agentic domain modules.
     Apps(apps::AppsArgs),
+    /// Manage work items (list/get)
+    Item(item::ItemArgs),
+    /// Manage projects
+    Project(project::ProjectArgs),
+    /// Local store (chunks, vectors, meta, cache) — hybrid search internals.
+    Store(store::StoreArgs),
 }
 
 impl Commands {
@@ -189,6 +198,9 @@ impl Commands {
             Self::Workflow(cmd) => cmd.run(),
             Self::Insights(cmd) => cmd.run(),
             Self::Apps(cmd) => cmd.run(),
+            Self::Item(cmd) => cmd.run(),
+            Self::Project(cmd) => cmd.run(),
+            Self::Store(cmd) => cmd.run(),
         }
     }
 }
