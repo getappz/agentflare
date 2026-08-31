@@ -667,7 +667,9 @@ fn run_headless_impl(
 /// log, or sandboxing unavailable on this platform), or it came back empty.
 fn take_diagnostic_log(path: Option<&Path>) -> Option<String> {
     let path = path?;
-    let content = std::fs::read_to_string(path).ok();
+    let content = std::fs::read(path)
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
     let _ = std::fs::remove_file(path);
     content.filter(|s| !s.trim().is_empty())
 }

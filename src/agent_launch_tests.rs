@@ -690,6 +690,29 @@
     }
 
     #[test]
+    fn take_diagnostic_log_survives_a_truncated_utf8_boundary() {
+        // The wrapper script tails the log with `tail -c "$bytes"`, a raw
+        // byte-count cut with no UTF-8 awareness, so the tail can legally
+        // land mid-character (e.g. inside an em dash) whenever the agent's
+        // log/reasoning trace has non-ASCII text anywhere near the boundary.
+        // `read_to_string` errors (and `.ok()` swallows that into `None`) on
+        // any such split, silently discarding the whole tail -- exactly the
+        // failure this item exists to prevent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diag.log");
+        let full = "hello — world".as_bytes();
+        // "—" is 3 bytes (E2 80 94); cut after the first byte of it so the
+        // file ends mid-character.
+        let cut = "hello ".len() + 1;
+        std::fs::write(&path, &full[..cut]).unwrap();
+        let content = take_diagnostic_log(Some(&path));
+        assert!(
+            content.is_some(),
+            "a truncated UTF-8 boundary must not silently discard the diagnostic tail"
+        );
+    }
+
+    #[test]
     fn parse_json_reply_extracts_result_session_and_cost() {
         let reply = parse_json_reply(
             r#"{"type":"result","result":"pong","session_id":"abc-123","total_cost_usd":0.05}"#,

@@ -287,10 +287,17 @@ fn apply_diagnostic_wrapper(
     }) else {
         return;
     };
-    // `build_bwrap_args_with_home` appends `--` exactly once, immediately
-    // before `command` -- everything from there to the end is the
-    // invocation this replaces.
-    let Some(marker) = bwrap_args.iter().rposition(|a| a == "--") else {
+    // `build_bwrap_args_with_home` appends exactly `["--", command,
+    // args...]` -- computing the marker's index from `args.len()` (rather
+    // than searching for the last literal `"--"`) is immune to `args`
+    // itself containing a `"--"` token, which would otherwise make a
+    // rposition scan match the wrong occurrence and silently corrupt the
+    // rewritten argv.
+    let Some(marker) = bwrap_args
+        .len()
+        .checked_sub(args.len() + 2)
+        .filter(|&i| bwrap_args.get(i).map(String::as_str) == Some("--"))
+    else {
         return;
     };
     bwrap_args.truncate(marker);
@@ -881,6 +888,66 @@ mod tests {
                 DIAGNOSTIC_TAIL_BYTES.to_string(),
                 "opencode".to_string(),
                 "run".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_diagnostic_wrapper_handles_literal_dashdash_in_args() {
+        // A literal `"--"` token inside the real command's own args used to
+        // make a `rposition` scan for the separator match that occurrence
+        // instead of the one `build_bwrap_args_with_home` actually appended,
+        // corrupting the rewritten argv. Computing the marker index from
+        // `args.len()` instead is immune to this.
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let config = agent(
+            "opencode",
+            &[AgentStateMount {
+                relative_path: ".local/share/opencode",
+                policy: MountPolicy::OverlayEphemeral,
+                diagnostic_log: Some("log/opencode.log"),
+            }],
+        );
+        let mut bwrap_args = vec![
+            "--ro-bind".to_string(),
+            "/".to_string(),
+            "/".to_string(),
+            "--".to_string(),
+            "opencode".to_string(),
+            "run".to_string(),
+            "--".to_string(),
+            "extra".to_string(),
+        ];
+        let args = vec!["run".to_string(), "--".to_string(), "extra".to_string()];
+        let diagnostic_out = dir.path().join("diag.log");
+        apply_diagnostic_wrapper(
+            &mut bwrap_args,
+            "opencode",
+            &args,
+            Some(&home),
+            &config,
+            &diagnostic_out,
+        );
+
+        assert_eq!(
+            bwrap_args,
+            vec![
+                "--ro-bind".to_string(),
+                "/".to_string(),
+                "/".to_string(),
+                "--".to_string(),
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                DIAGNOSTIC_WRAPPER_SCRIPT.to_string(),
+                "sh".to_string(),
+                path_to_string(&diagnostic_out),
+                path_to_string(&dir.path().join(".local/share/opencode/log/opencode.log")),
+                DIAGNOSTIC_TAIL_BYTES.to_string(),
+                "opencode".to_string(),
+                "run".to_string(),
+                "--".to_string(),
+                "extra".to_string(),
             ]
         );
     }
