@@ -57,3 +57,6 @@ node_modules/
 /.superpowers/
 /.agent-scratch/
 .sccache-cache/
+ 
+# Flare Desktop -- private sibling repo getappz/flare-desktop, not part of agentflare 
+/flare-desktop/ 
