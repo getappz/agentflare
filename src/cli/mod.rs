@@ -27,6 +27,7 @@ mod review;
 mod run;
 mod serve;
 mod skill;
+mod store;
 mod uninstall;
 mod update;
 mod vault;
@@ -148,6 +149,8 @@ pub enum Commands {
     Insights(insights::InsightsArgs),
     /// Run and manage AgentFlare Apps — self-contained agentic domain modules.
     Apps(apps::AppsArgs),
+    /// Local store (chunks, vectors, meta, cache) — hybrid search internals.
+    Store(store::StoreArgs),
 }
 
 impl Commands {
@@ -189,6 +192,7 @@ impl Commands {
             Self::Workflow(cmd) => cmd.run(),
             Self::Insights(cmd) => cmd.run(),
             Self::Apps(cmd) => cmd.run(),
+            Self::Store(cmd) => cmd.run(),
         }
     }
 }
