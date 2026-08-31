@@ -1392,6 +1392,19 @@ mod tests {
         // remember it -- which is the class of bug #334/#337 was.
         let s = store();
         s.doc_upsert("p", "/purge.md", "ephemeral").unwrap();
+        // Chunk tables now reference store_documents; raw purge must clear
+        // them first (production path goes through hard_delete_docs which
+        // does this, but this test exercises the raw-SQL trigger contract).
+        let _ = s.conn().execute(
+                "DELETE FROM store_chunk_vec WHERE chunk_id IN (SELECT id FROM store_doc_chunks WHERE doc_id IN (SELECT id FROM store_documents WHERE path = '/purge.md'))",
+                [],
+            );
+        s.conn()
+            .execute(
+                "DELETE FROM store_doc_chunks WHERE doc_id IN (SELECT id FROM store_documents WHERE path = '/purge.md')",
+                [],
+            )
+            .unwrap();
         s.conn()
             .execute("DELETE FROM store_documents WHERE path = '/purge.md'", [])
             .unwrap();
