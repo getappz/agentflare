@@ -1111,6 +1111,18 @@ pub(crate) struct SearchRequest {
     )]
     #[serde(default)]
     pub(crate) limit: Option<usize>,
+    #[schemars(description = "Filter store docs by custom metadata key=value (≤5 fields, 64B prefix) — local-first only, requires doc_set_meta")]
+    #[serde(default)]
+    pub(crate) meta: Option<std::collections::HashMap<String, String>>,
+    #[schemars(description = "Filter store docs by path glob (e.g. docs/*.md, src/**/*.rs) — SQLite GLOB")]
+    #[serde(default)]
+    pub(crate) path_glob: Option<String>,
+    #[schemars(description = "Minimum score threshold (BM25 negated rank or cosine) — filters low-relevance hits")]
+    #[serde(default)]
+    pub(crate) min_score: Option<f64>,
+    #[schemars(description = "Enable cross-encoder rerank (BGERerankerBase via fastembed, requires embeddings feature + cached model). Default true when model available.")]
+    #[serde(default)]
+    pub(crate) rerank: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]

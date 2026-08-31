@@ -3,7 +3,9 @@
 //! Adopted from agent-trail / agentsview REST shapes.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -12,6 +14,24 @@ use crate::config::InsightsConfig;
 use crate::store::InsightsStore;
 
 pub const DEFAULT_PORT: u16 = 3456;
+
+/// `/api/stats` scans every session/tool_call/file_event row, which on a
+/// real history can itself take longer than a short poll interval -- so
+/// this TTL must be comfortably longer than that compute, not shorter,
+/// or every "cached" call still recomputes and the cache buys nothing.
+const STATS_CACHE_TTL: Duration = Duration::from_secs(30);
+
+struct AppState {
+    // Separate connections for the background writer and for request reads.
+    // The DB runs in WAL mode specifically so a writer doesn't block
+    // readers -- funneling both through one shared connection/mutex would
+    // throw that away and serialize every request behind each ~5-10s
+    // background resync, which is worse than the per-request reopen this
+    // replaced.
+    read_store: Mutex<InsightsStore>,
+    write_store: Mutex<InsightsStore>,
+    stats_cache: Mutex<Option<(Instant, serde_json::Value)>>,
+}
 
 pub async fn serve(db_path: PathBuf, port: u16) -> anyhow::Result<()> {
     let addr = format!("127.0.0.1:{}", port);
@@ -23,31 +43,40 @@ pub async fn serve(db_path: PathBuf, port: u16) -> anyhow::Result<()> {
     println!("  GET /api/search?q=hello&limit=20");
     println!("  GET /api/stats");
 
+    let state = Arc::new(AppState {
+        read_store: Mutex::new(InsightsStore::open(&db_path)?),
+        write_store: Mutex::new(InsightsStore::open(&db_path)?),
+        stats_cache: Mutex::new(None),
+    });
+
     // DRY: spawn watcher in background to keep DB fresh
-    let db_clone = db_path.clone();
+    let state_bg = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
-            let config = InsightsConfig::default();
-            if let Ok(store) = InsightsStore::open(&db_clone) {
-                let _ = crate::ingest::watcher::InsightsWatcher::rescan_and_store(&config, &store);
-            }
+            let state = state_bg.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let config = InsightsConfig::default();
+                let store = state.write_store.lock().unwrap();
+                crate::ingest::watcher::InsightsWatcher::rescan_and_store(&config, &store);
+            })
+            .await;
         }
     });
 
     loop {
         let (mut socket, _) = listener.accept().await?;
-        let db_path = db_path.clone();
+        let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(&mut socket, &db_path).await {
+            if let Err(e) = handle_conn(&mut socket, &state).await {
                 eprintln!("api error: {e}");
             }
         });
     }
 }
 
-async fn handle_conn(socket: &mut tokio::net::TcpStream, db_path: &Path) -> anyhow::Result<()> {
+async fn handle_conn(socket: &mut tokio::net::TcpStream, state: &Arc<AppState>) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 8192];
     let n = socket.read(&mut buf).await?;
     if n == 0 {
@@ -66,19 +95,6 @@ async fn handle_conn(socket: &mut tokio::net::TcpStream, db_path: &Path) -> anyh
         .await;
     }
 
-    let store = match InsightsStore::open(db_path) {
-        Ok(s) => s,
-        Err(e) => {
-            return write_response(
-                socket,
-                500,
-                "DB error",
-                &serde_json::json!({"error": e.to_string()}),
-            )
-            .await
-        }
-    };
-
     let (route, query) = split_query(path);
 
     // DRY dashboard for claude/opencode (simple HTML, no build)
@@ -87,7 +103,22 @@ async fn handle_conn(socket: &mut tokio::net::TcpStream, db_path: &Path) -> anyh
         return write_html_response(socket, &html).await;
     }
 
-    let (status, body) = match route {
+    let (status, body) = route_request(state, route, query);
+
+    let status_text = match status {
+        200 => "OK",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "OK",
+    };
+    write_response(socket, status, status_text, &body).await
+}
+
+/// Synchronous request handling -- the store lock never has to survive
+/// across an `.await` point.
+fn route_request(state: &Arc<AppState>, route: &str, query: Option<&str>) -> (u16, serde_json::Value) {
+    let store = state.read_store.lock().unwrap();
+    match route {
         "/api/health" => (
             200,
             serde_json::json!({"status":"ok","version": crate::VERSION}),
@@ -148,26 +179,26 @@ async fn handle_conn(socket: &mut tokio::net::TcpStream, db_path: &Path) -> anyh
             (200, serde_json::to_value(&res).unwrap())
         }
         "/api/stats" => {
-            let sessions = store.list_sessions(10000, 0).unwrap_or_default();
-            let tools = store.list_tool_calls(100000).unwrap_or_default();
-            let files = store.list_file_events(100000).unwrap_or_default();
-            let analytics =
-                crate::analytics::compute_analytics_with_tools(&sessions, &tools, &files);
-            (200, serde_json::to_value(&analytics).unwrap())
+            let mut cache = state.stats_cache.lock().unwrap();
+            let fresh = cache
+                .as_ref()
+                .map(|(t, _)| t.elapsed() < STATS_CACHE_TTL)
+                .unwrap_or(false);
+            if !fresh {
+                let sessions = store.list_sessions(10000, 0).unwrap_or_default();
+                let tools = store.list_tool_calls(100000).unwrap_or_default();
+                let files = store.list_file_events(100000).unwrap_or_default();
+                let analytics =
+                    crate::analytics::compute_analytics_with_tools(&sessions, &tools, &files);
+                *cache = Some((Instant::now(), serde_json::to_value(&analytics).unwrap()));
+            }
+            (200, cache.as_ref().unwrap().1.clone())
         }
         _ => (
             404,
             serde_json::json!({"error":"not found", "hint":"/api/health, /api/sessions, /api/sessions/:id, /api/search?q=, /api/stats"}),
         ),
-    };
-
-    let status_text = match status {
-        200 => "OK",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "OK",
-    };
-    write_response(socket, status, status_text, &body).await
+    }
 }
 
 fn parse_request(req: &str) -> (&str, &str) {
@@ -236,7 +267,19 @@ async fn write_html_response(socket: &mut tokio::net::TcpStream, html: &str) -> 
 
 fn dashboard_html() -> String {
     r#"<!doctype html><html><head><meta charset="utf-8"><title>flare-insights — claude / opencode</title>
-<style>body{font-family:system-ui, sans-serif; max-width:900px; margin:2rem auto; padding:0 1rem} pre{background:#f6f6f6; padding:1rem; overflow:auto} a{color:#0366d6}</style>
+<style>
+body{font-family:system-ui, sans-serif; max-width:1000px; margin:2rem auto; padding:0 1rem; color:#1a1a1a}
+a{color:#0366d6}
+code{background:#f6f6f6; padding:0.1rem 0.3rem; border-radius:4px}
+.stats{display:flex; gap:1rem; flex-wrap:wrap; margin:1.5rem 0}
+.stat{background:#f6f6f6; border-radius:8px; padding:0.75rem 1rem; min-width:110px}
+.stat .label{font-size:0.75rem; color:#666; text-transform:uppercase; letter-spacing:0.03em}
+.stat .value{font-size:1.4rem; font-weight:600}
+table{width:100%; border-collapse:collapse; font-size:0.85rem}
+th,td{text-align:left; padding:0.4rem 0.6rem; border-bottom:1px solid #eee}
+th{color:#666; font-weight:600}
+#status{font-size:0.8rem; color:#888}
+</style>
 </head><body>
 <h1>flare-insights — Claude Code + OpenCode</h1>
 <p>Local-first, 127.0.0.1 only. Sources: <code>~/.agentflare/projects</code> (claude) + <code>~/.local/share/opencode/opencode.db</code></p>
@@ -246,19 +289,54 @@ fn dashboard_html() -> String {
 <li><a href="/api/stats">/api/stats</a> — tokens, cost, by_source</li>
 <li><a href="/api/search?q=agentflare">/api/search?q=agentflare</a> — FTS + file/tool</li>
 </ul>
-<div id="sessions">Loading...</div>
+<div class="stats" id="stats"><div class="stat"><div class="label">Loading…</div></div></div>
+<h2>Recent sessions</h2>
+<table id="sessions"><thead><tr><th>Project</th><th>Source</th><th>Turns</th><th>Tools</th><th>Cost</th><th>Updated</th></tr></thead><tbody></tbody></table>
+<p id="status"></p>
 <script>
-async function load(){
-  const [s, stats] = await Promise.all([
-    fetch('/api/sessions?limit=10').then(r=>r.json()),
-    fetch('/api/stats').then(r=>r.json())
-  ]);
-  document.getElementById('sessions').innerHTML =
-    '<h2>Stats</h2><pre>'+JSON.stringify(stats,null,2)+'</pre>'+
-    '<h2>Recent sessions</h2><pre>'+JSON.stringify(s,null,2)+'</pre>';
+function fmtCost(c){ return (c === null || c === undefined) ? '-' : '$' + Number(c).toFixed(2); }
+function fmtTokens(n){
+  n = Number(n) || 0;
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
 }
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+}
+async function load(){
+  const [sessions, stats] = await Promise.all([
+    fetch('/api/sessions?limit=20').then(r => r.json()),
+    fetch('/api/stats').then(r => r.json())
+  ]);
+  document.getElementById('stats').innerHTML = `
+    <div class="stat"><div class="label">Sessions</div><div class="value">${stats.total_sessions ?? 0}</div></div>
+    <div class="stat"><div class="label">Tokens</div><div class="value">${fmtTokens(stats.total_tokens)}</div></div>
+    <div class="stat"><div class="label">Cost</div><div class="value">${fmtCost(stats.total_cost_usd)}</div></div>
+    <div class="stat"><div class="label">Cache hit</div><div class="value">${((stats.cache_hit_rate ?? 0) * 100).toFixed(0)}%</div></div>
+  `;
+  document.querySelector('#sessions tbody').innerHTML = sessions.map(s => `
+    <tr>
+      <td>${esc(s.project)}</td>
+      <td>${esc(s.source)}</td>
+      <td>${s.turn_count ?? 0}</td>
+      <td>${s.tool_call_count ?? 0}</td>
+      <td>${fmtCost(s.cost && s.cost.total_usd)}</td>
+      <td>${esc((s.updated_at || '').replace('T', ' ').slice(0, 16))}</td>
+    </tr>
+  `).join('');
+  document.getElementById('status').textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+
 load();
-setInterval(load, 5000);
+let timer = setInterval(load, 20000);
+document.addEventListener('visibilitychange', () => {
+  clearInterval(timer);
+  if (document.visibilityState === 'visible') {
+    load();
+    timer = setInterval(load, 20000);
+  }
+});
 </script>
 </body></html>"#.to_string()
 }

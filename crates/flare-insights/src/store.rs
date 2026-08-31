@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, ToolCall, Turn};
 
@@ -141,6 +142,14 @@ impl InsightsStore {
             CREATE INDEX IF NOT EXISTS idx_tool_calls_name ON tool_calls(name);
             CREATE INDEX IF NOT EXISTS idx_file_events_session ON file_events(session_id);
             CREATE INDEX IF NOT EXISTS idx_file_events_path ON file_events(path);
+
+            CREATE TABLE IF NOT EXISTS ingest_file_cursors (
+                source TEXT NOT NULL,
+                path TEXT NOT NULL,
+                mtime_ms INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                PRIMARY KEY (source, path)
+            );
             "#,
         )?;
         Ok(())
@@ -149,54 +158,19 @@ impl InsightsStore {
     // ---- sessions ----
 
     pub fn upsert_session(&self, s: &Session) -> Result<(), StoreError> {
-        let tags = serde_json::to_string(&s.tags)?;
-        self.conn.execute(
-            r#"INSERT INTO sessions(
-                id,source,project,project_path,title,model,status,awaiting_reason,
-                started_at,updated_at,ended_at,duration_secs,
-                input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,
-                cost_usd,turn_count,tool_call_count,subagent_count,tags,starred,pid,cwd
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
-            ON CONFLICT(id) DO UPDATE SET
-                source=excluded.source, project=excluded.project, project_path=excluded.project_path,
-                title=excluded.title, model=excluded.model, status=excluded.status,
-                awaiting_reason=excluded.awaiting_reason, started_at=excluded.started_at,
-                updated_at=excluded.updated_at, ended_at=excluded.ended_at, duration_secs=excluded.duration_secs,
-                input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
-                cache_read_tokens=excluded.cache_read_tokens, cache_write_tokens=excluded.cache_write_tokens,
-                reasoning_tokens=excluded.reasoning_tokens, cost_usd=excluded.cost_usd,
-                turn_count=excluded.turn_count, tool_call_count=excluded.tool_call_count,
-                subagent_count=excluded.subagent_count, tags=excluded.tags, starred=excluded.starred,
-                pid=excluded.pid, cwd=excluded.cwd
-            "#,
-            params![
-                s.id,
-                serde_json::to_string(&s.source).unwrap(),
-                s.project,
-                s.project_path,
-                s.title,
-                s.model,
-                serde_json::to_string(&s.status).unwrap(),
-                s.awaiting_reason.as_ref().map(|v| serde_json::to_string(v).unwrap()),
-                s.started_at.map(|v| v.to_rfc3339()),
-                s.updated_at.to_rfc3339(),
-                s.ended_at.map(|v| v.to_rfc3339()),
-                s.duration_secs.map(|v| v as i64),
-                s.tokens.input as i64,
-                s.tokens.output as i64,
-                s.tokens.cache_read as i64,
-                s.tokens.cache_write as i64,
-                s.tokens.reasoning as i64,
-                s.cost.as_ref().map(|c| c.total_usd),
-                s.turn_count as i64,
-                s.tool_call_count as i64,
-                s.subagent_count as i64,
-                tags,
-                if s.starred { 1 } else { 0 },
-                s.pid.map(|v| v as i64),
-                s.cwd,
-            ],
-        )?;
+        exec_upsert_session(&self.conn, s)
+    }
+
+    /// Batched, single-transaction session upsert. Prefer this over calling
+    /// `upsert_session` in a loop -- one commit/fsync per session is the
+    /// dominant cost of a large sync, unlike turns/tool_calls/file_events
+    /// which already batch into one transaction.
+    pub fn upsert_sessions_batch(&self, sessions: &[Session]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for s in sessions {
+            exec_upsert_session(&tx, s)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -480,6 +454,43 @@ impl InsightsStore {
         Ok(out)
     }
 
+    // ---- ingest file cursors (skip-unchanged-file cache for `sync`) ----
+
+    pub fn load_file_cursors(&self, source: &str) -> Result<HashMap<PathBuf, (i64, u64)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, mtime_ms, size FROM ingest_file_cursors WHERE source=?1")?;
+        let rows = stmt.query_map(params![source], |r| {
+            let path: String = r.get(0)?;
+            let mtime_ms: i64 = r.get(1)?;
+            let size: i64 = r.get(2)?;
+            Ok((PathBuf::from(path), (mtime_ms, size as u64)))
+        })?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (path, cursor) = r?;
+            out.insert(path, cursor);
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_file_cursors_batch(
+        &self,
+        source: &str,
+        entries: &[(PathBuf, i64, u64)],
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (path, mtime_ms, size) in entries {
+            tx.execute(
+                "INSERT INTO ingest_file_cursors(source, path, mtime_ms, size) VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(source, path) DO UPDATE SET mtime_ms=excluded.mtime_ms, size=excluded.size",
+                params![source, path.to_string_lossy(), mtime_ms, *size as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// DRY transactional session+turns+tools+files+subagents
     pub fn upsert_session_bundle(
         &self,
@@ -504,6 +515,58 @@ impl InsightsStore {
         }
         Ok(())
     }
+}
+
+fn exec_upsert_session(conn: &Connection, s: &Session) -> Result<(), StoreError> {
+    let tags = serde_json::to_string(&s.tags)?;
+    conn.execute(
+        r#"INSERT INTO sessions(
+            id,source,project,project_path,title,model,status,awaiting_reason,
+            started_at,updated_at,ended_at,duration_secs,
+            input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,
+            cost_usd,turn_count,tool_call_count,subagent_count,tags,starred,pid,cwd
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
+        ON CONFLICT(id) DO UPDATE SET
+            source=excluded.source, project=excluded.project, project_path=excluded.project_path,
+            title=excluded.title, model=excluded.model, status=excluded.status,
+            awaiting_reason=excluded.awaiting_reason, started_at=excluded.started_at,
+            updated_at=excluded.updated_at, ended_at=excluded.ended_at, duration_secs=excluded.duration_secs,
+            input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
+            cache_read_tokens=excluded.cache_read_tokens, cache_write_tokens=excluded.cache_write_tokens,
+            reasoning_tokens=excluded.reasoning_tokens, cost_usd=excluded.cost_usd,
+            turn_count=excluded.turn_count, tool_call_count=excluded.tool_call_count,
+            subagent_count=excluded.subagent_count, tags=excluded.tags, starred=excluded.starred,
+            pid=excluded.pid, cwd=excluded.cwd
+        "#,
+        params![
+            s.id,
+            serde_json::to_string(&s.source).unwrap(),
+            s.project,
+            s.project_path,
+            s.title,
+            s.model,
+            serde_json::to_string(&s.status).unwrap(),
+            s.awaiting_reason.as_ref().map(|v| serde_json::to_string(v).unwrap()),
+            s.started_at.map(|v| v.to_rfc3339()),
+            s.updated_at.to_rfc3339(),
+            s.ended_at.map(|v| v.to_rfc3339()),
+            s.duration_secs.map(|v| v as i64),
+            s.tokens.input as i64,
+            s.tokens.output as i64,
+            s.tokens.cache_read as i64,
+            s.tokens.cache_write as i64,
+            s.tokens.reasoning as i64,
+            s.cost.as_ref().map(|c| c.total_usd),
+            s.turn_count as i64,
+            s.tool_call_count as i64,
+            s.subagent_count as i64,
+            tags,
+            if s.starred { 1 } else { 0 },
+            s.pid.map(|v| v as i64),
+            s.cwd,
+        ],
+    )?;
+    Ok(())
 }
 
 fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {

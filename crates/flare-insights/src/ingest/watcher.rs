@@ -110,17 +110,23 @@ impl InsightsWatcher {
         store: &InsightsStore,
     ) -> (usize, usize, usize) {
         let mgr = IngestManager::new();
-        let bundle = mgr.scan_all_flat(config);
-        let sess = bundle.sessions.len();
-        let turns = bundle.turns.len();
-        let tools = bundle.tool_calls.len();
-        for s in &bundle.sessions {
-            let _ = store.upsert_session(s);
+        let mut sess = 0;
+        let mut turns = 0;
+        let mut tools = 0;
+        for (source, res) in mgr.scan_all(config, store, |_, _, _| {}) {
+            let Ok(bundle) = res else { continue };
+            sess += bundle.sessions.len();
+            turns += bundle.turns.len();
+            tools += bundle.tool_calls.len();
+            let _ = store.upsert_sessions_batch(&bundle.sessions);
+            let _ = store.upsert_turns_batch(&bundle.turns);
+            let _ = store.upsert_tool_calls_batch(&bundle.tool_calls);
+            let _ = store.upsert_file_events_batch(&bundle.file_events);
+            let _ = store.upsert_subagents_batch(&bundle.subagents);
+            if !bundle.file_cursors.is_empty() {
+                let _ = store.upsert_file_cursors_batch(&source, &bundle.file_cursors);
+            }
         }
-        let _ = store.upsert_turns_batch(&bundle.turns);
-        let _ = store.upsert_tool_calls_batch(&bundle.tool_calls);
-        let _ = store.upsert_file_events_batch(&bundle.file_events);
-        let _ = store.upsert_subagents_batch(&bundle.subagents);
         (sess, turns, tools)
     }
 }
