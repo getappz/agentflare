@@ -76,6 +76,95 @@ fn item_groom_capacity_buckets_now_next_later_and_needs_estimation() {
     assert_eq!(needs_est, expected);
 }
 
+#[test]
+fn item_groom_computes_overdue_from_due_date_and_state_group() {
+    let (tmp, s) = harness();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let past_due: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            due_date: Some(now - 86_400),
+            ..empty_item_create("Past due")
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let future_due: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            due_date: Some(now + 86_400),
+            ..empty_item_create("Future due")
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let no_due: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("No due"))).unwrap()).unwrap();
+    let completed_but_overdue: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            due_date: Some(now - 86_400),
+            ..empty_item_create("Completed but overdue")
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let project_id = completed_but_overdue["project_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let completed_state_id = {
+        let conn = backend_conn(&tmp);
+        agentflare_backend::state::list_by_project(&conn, &project_id)
+            .unwrap()
+            .into_iter()
+            .find(|st| st.group_name == "completed")
+            .unwrap()
+            .id
+    };
+    s.item(Parameters(ItemRequest {
+        action: "update_state".into(),
+        id: Some(completed_but_overdue["id"].as_str().unwrap().to_string()),
+        state_id: Some(completed_state_id),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let groomed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "groom".into(),
+            state_group: Some("backlog,unstarted,completed,cancelled".into()),
+            limit: Some(50),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let overdue_by_id: std::collections::HashMap<String, bool> = groomed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| {
+            (
+                i["id"].as_str().unwrap().to_string(),
+                i["overdue"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+
+    assert_eq!(overdue_by_id[past_due["id"].as_str().unwrap()], true);
+    assert_eq!(overdue_by_id[future_due["id"].as_str().unwrap()], false);
+    assert_eq!(overdue_by_id[no_due["id"].as_str().unwrap()], false);
+    assert_eq!(
+        overdue_by_id[completed_but_overdue["id"].as_str().unwrap()],
+        false,
+        "a completed item past its due date is not overdue"
+    );
+}
+
 /// Regression (CodeRabbit): standup's "done" filter and health's
 /// velocity bucketing must key off `completed_at`, not `updated_at` —
 /// editing an already-completed item (e.g. fixing a typo) bumps

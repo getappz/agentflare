@@ -144,6 +144,8 @@ impl ItemArgs {
                             label_ids: vec![],
                             assignee_ids: vec![],
                             dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
                         },
                     )
                     .map_err(crate::mcp_server::types::map_backend_err)?;

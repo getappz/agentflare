@@ -867,6 +867,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             deleted_at: None,
+            start_date: None,
+            due_date: None,
         };
         // No git repo at `dir.path()`, so `RepoId::resolve_from_remote`
         // returns `None` -- must return without panicking.
@@ -894,6 +896,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             deleted_at: None,
+            start_date: None,
+            due_date: None,
         }
     }
 
@@ -1210,6 +1214,8 @@ mod tests {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();

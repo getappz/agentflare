@@ -1,0 +1,2 @@
+ALTER TABLE items ADD COLUMN start_date INTEGER;
+ALTER TABLE items ADD COLUMN due_date INTEGER;

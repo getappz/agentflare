@@ -27,12 +27,13 @@ pub fn create(conn: &Connection, input: CreateItem) -> Result<Item> {
             input.state_id, input.project_id
         )));
     }
+    validate_date_range(input.start_date, input.due_date)?;
 
     let tx = conn.unchecked_transaction()?;
     let seq = next_sequence_id(&tx, &input.project_id)?;
     tx.execute(
-        "INSERT INTO items (id, project_id, state_id, name, description, priority, parent_id, assignee_agent, sequence_id, sort_order, external_source, external_id, metadata, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT INTO items (id, project_id, state_id, name, description, priority, parent_id, assignee_agent, sequence_id, sort_order, external_source, external_id, metadata, created_at, updated_at, start_date, due_date)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         rusqlite::params![
             id,
             input.project_id,
@@ -49,6 +50,8 @@ pub fn create(conn: &Connection, input: CreateItem) -> Result<Item> {
             metadata,
             ts,
             ts,
+            input.start_date,
+            input.due_date,
         ],
     )?;
     for label_id in &input.label_ids {
@@ -76,7 +79,7 @@ pub fn create(conn: &Connection, input: CreateItem) -> Result<Item> {
 
 pub fn get(conn: &Connection, id: &str) -> Result<Item> {
     conn.query_row(
-        "SELECT id, project_id, state_id, name, description, priority, parent_id, assignee_agent, sequence_id, sort_order, started_at, completed_at, archived_at, external_source, external_id, metadata, created_at, updated_at, deleted_at
+        "SELECT id, project_id, state_id, name, description, priority, parent_id, assignee_agent, sequence_id, sort_order, started_at, completed_at, archived_at, external_source, external_id, metadata, created_at, updated_at, deleted_at, start_date, due_date
          FROM items WHERE id = ?1 AND deleted_at IS NULL",
         rusqlite::params![id],
         row_to_item,
@@ -120,7 +123,7 @@ pub fn resolve_id(conn: &Connection, project_id: Option<&str>, id_or_seq: &str) 
 
 pub fn list_by_project(conn: &Connection, project_id: &str) -> Result<Vec<Item>> {
     let mut stmt = conn.prepare(
-        "SELECT id, project_id, state_id, name, description, priority, parent_id, assignee_agent, sequence_id, sort_order, started_at, completed_at, archived_at, external_source, external_id, metadata, created_at, updated_at, deleted_at
+        "SELECT id, project_id, state_id, name, description, priority, parent_id, assignee_agent, sequence_id, sort_order, started_at, completed_at, archived_at, external_source, external_id, metadata, created_at, updated_at, deleted_at, start_date, due_date
          FROM items WHERE project_id = ?1 AND deleted_at IS NULL ORDER BY sort_order",
     )?;
     let rows = stmt.query_map(rusqlite::params![project_id], row_to_item)?;
@@ -129,7 +132,7 @@ pub fn list_by_project(conn: &Connection, project_id: &str) -> Result<Vec<Item>>
 
 pub fn list_by_label(conn: &Connection, project_id: &str, label_id: &str) -> Result<Vec<Item>> {
     let mut stmt = conn.prepare(
-        "SELECT items.id, items.project_id, items.state_id, items.name, items.description, items.priority, items.parent_id, items.assignee_agent, items.sequence_id, items.sort_order, items.started_at, items.completed_at, items.archived_at, items.external_source, items.external_id, items.metadata, items.created_at, items.updated_at, items.deleted_at
+        "SELECT items.id, items.project_id, items.state_id, items.name, items.description, items.priority, items.parent_id, items.assignee_agent, items.sequence_id, items.sort_order, items.started_at, items.completed_at, items.archived_at, items.external_source, items.external_id, items.metadata, items.created_at, items.updated_at, items.deleted_at, items.start_date, items.due_date
          FROM items
          INNER JOIN item_labels ON item_labels.item_id = items.id
          WHERE item_labels.label_id = ?1 AND items.project_id = ?2 AND items.deleted_at IS NULL
@@ -150,7 +153,8 @@ pub fn list_by_assignee_agent(
                 i.priority, i.parent_id, i.assignee_agent, i.sequence_id,
                 i.sort_order, i.started_at, i.completed_at, i.archived_at,
                 i.external_source, i.external_id, i.metadata,
-                i.created_at, i.updated_at, i.deleted_at
+                i.created_at, i.updated_at, i.deleted_at,
+                i.start_date, i.due_date
          FROM items i
          JOIN states s ON s.id = i.state_id
          WHERE i.project_id = ?1
@@ -177,6 +181,20 @@ fn parent_of(conn: &Connection, id: &str) -> Result<Option<String>> {
         )
         .optional()?
         .flatten())
+}
+
+/// No CHECK constraint enforces this at the schema level (migration 0012
+/// added `start_date`/`due_date` as plain nullable columns) — validated here
+/// instead so either bound can be set independently without a table rebuild.
+fn validate_date_range(start_date: Option<i64>, due_date: Option<i64>) -> Result<()> {
+    if let (Some(start), Some(due)) = (start_date, due_date)
+        && due < start
+    {
+        return Err(crate::error::Error::Validation(format!(
+            "due_date ({due}) cannot be before start_date ({start})"
+        )));
+    }
+    Ok(())
 }
 
 /// Rejects a re-parent that would make `id` its own ancestor. Only `update`
@@ -215,6 +233,12 @@ pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
     let ts = now();
     if let Some(Some(parent_id)) = input.parent_id.as_ref() {
         validate_parent(conn, id, parent_id)?;
+    }
+    if input.start_date.is_some() || input.due_date.is_some() {
+        let current = get(conn, id)?;
+        let effective_start = input.start_date.or(current.start_date);
+        let effective_due = input.due_date.or(current.due_date);
+        validate_date_range(effective_start, effective_due)?;
     }
     let assignee_agent = input
         .assignee_agent
@@ -259,6 +283,14 @@ pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
     }
     if input.parent_id.is_some() {
         sets.push(format!("parent_id = ?{param_idx}"));
+        param_idx += 1;
+    }
+    if input.start_date.is_some() {
+        sets.push(format!("start_date = ?{param_idx}"));
+        param_idx += 1;
+    }
+    if input.due_date.is_some() {
+        sets.push(format!("due_date = ?{param_idx}"));
     }
     let sql = format!(
         "UPDATE items SET {} WHERE id = ?1 AND deleted_at IS NULL",
@@ -291,6 +323,12 @@ pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
     }
     if let Some(ref parent_id) = input.parent_id {
         param_values.push(Box::new(parent_id.clone()));
+    }
+    if let Some(start_date) = input.start_date {
+        param_values.push(Box::new(start_date));
+    }
+    if let Some(due_date) = input.due_date {
+        param_values.push(Box::new(due_date));
     }
     let changed = stmt.execute(rusqlite::params_from_iter(param_values.iter()))?;
     if changed == 0 {
@@ -379,4 +417,53 @@ pub fn delete(conn: &Connection, id: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Clears `start_date` back to NULL — direct SQL, not `update()`, mirroring
+/// `claim::release`'s clear of `assignee_agent`: `UpdateItem.start_date` is a
+/// plain `Option<i64>` where `None` means "leave untouched", so it has no way
+/// to express an explicit clear.
+pub fn clear_item_start_date(conn: &Connection, id: &str) -> Result<Item> {
+    let ts = now();
+    let changed = conn.execute(
+        "UPDATE items SET start_date = NULL, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+        rusqlite::params![id, ts],
+    )?;
+    if changed == 0 {
+        return Err(crate::error::Error::NotFound(id.to_string()));
+    }
+    let item = get(conn, id)?;
+    if let Ok(wid) = workspace_id_for_project(conn, &item.project_id) {
+        events::emit(
+            conn,
+            &wid,
+            "item",
+            "update",
+            serde_json::to_value(&item).unwrap_or_default(),
+        );
+    }
+    Ok(item)
+}
+
+/// Clears `due_date` back to NULL — same shape as `clear_item_start_date`.
+pub fn clear_item_due_date(conn: &Connection, id: &str) -> Result<Item> {
+    let ts = now();
+    let changed = conn.execute(
+        "UPDATE items SET due_date = NULL, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+        rusqlite::params![id, ts],
+    )?;
+    if changed == 0 {
+        return Err(crate::error::Error::NotFound(id.to_string()));
+    }
+    let item = get(conn, id)?;
+    if let Ok(wid) = workspace_id_for_project(conn, &item.project_id) {
+        events::emit(
+            conn,
+            &wid,
+            "item",
+            "update",
+            serde_json::to_value(&item).unwrap_or_default(),
+        );
+    }
+    Ok(item)
 }
