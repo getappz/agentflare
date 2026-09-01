@@ -183,7 +183,7 @@ fn parent_of(conn: &Connection, id: &str) -> Result<Option<String>> {
         .flatten())
 }
 
-/// No CHECK constraint enforces this at the schema level (migration 0012
+/// No CHECK constraint enforces this at the schema level (migration 0013
 /// added `start_date`/`due_date` as plain nullable columns) — validated here
 /// instead so either bound can be set independently without a table rebuild.
 fn validate_date_range(start_date: Option<i64>, due_date: Option<i64>) -> Result<()> {

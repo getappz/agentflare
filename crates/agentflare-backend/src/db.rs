@@ -20,7 +20,7 @@ const MIGRATION_LIST: &[M<'static>] = &[
     M::up(include_str!("migrations/0009_vent_escalation.sql")),
     M::up(include_str!("migrations/0010_project_dirs.sql")),
     M::up(include_str!("migrations/0011_item_assignment_events.sql")),
-    M::up(include_str!("migrations/0012_item_dates.sql")),
+    M::up(include_str!("migrations/0013_item_dates.sql")),
 ];
 const MIGRATIONS: Migrations = Migrations::from_slice(MIGRATION_LIST);
 
@@ -194,11 +194,11 @@ mod tests {
     }
 
     #[test]
-    fn migration_0012_adds_nullable_date_columns_without_data_loss() {
+    fn migration_0013_adds_nullable_date_columns_without_data_loss() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("backend.db");
 
-        // Simulate a db at 0011 (pre-0012), with an existing item row that
+        // Simulate a db at 0011 (pre-0013), with an existing item row that
         // must survive the ALTER TABLE untouched.
         {
             let pre = Migrations::new(vec![
