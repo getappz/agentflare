@@ -44,6 +44,11 @@ ALLOWLIST=(
   # scoped feature's own tests shouldn't have to carry a pre-existing test-
   # module split. Frozen at <= FROZEN_LIMIT; a real split is separate work.
   src/supervisor_tests.rs
+  # Already 1519 lines on master before this fix touched it (typed item
+  # relations work only added and then moved back out its own tests into
+  # item_tests_relations.rs) -- pre-existing debt this fix didn't create.
+  # Frozen at <= FROZEN_LIMIT; a real split is separate work.
+  src/mcp_server/tests/item_tests.rs
 )
 
 cd "$(dirname "$0")/.."

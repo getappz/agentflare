@@ -1590,3 +1590,56 @@ fn cascade_unblock_dependents_is_idempotent_across_repeated_calls() {
         "add_label's INSERT OR IGNORE must keep repeated cascade calls idempotent"
     );
 }
+
+/// Regression test for the typed-relations migration (0012): a `duplicate`
+/// relation with no `blocks` edge must never be treated as a blocking
+/// dependency by `cascade_unblock_dependents` -- `dependents_of` only reads
+/// `relation_type = 'blocks'` rows.
+#[test]
+fn cascade_unblock_dependents_ignores_a_pure_duplicate_relation() {
+    let mcp = test_mcp();
+    let a = seed_item_with_deps(&mcp, "A", None, vec![]);
+    let b = seed_item_with_deps(&mcp, "B", Some("claude-code"), vec![]);
+    mcp.with_backend_db(|conn| {
+        agentflare_backend::item::add_relation(conn, &b, &a, "duplicate").unwrap()
+    })
+    .unwrap();
+    complete_item(&mcp, &a);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &a))
+        .unwrap();
+
+    assert!(
+        !item_has_ready_label(&mcp, &b),
+        "a duplicate-only relation must not be read as a blocking dependency"
+    );
+}
+
+/// A `duplicate` relation coexisting alongside a real `blocks` edge between
+/// the same pair must not change `cascade_unblock_dependents`'s behavior
+/// for the `blocks` edge -- the load-bearing constraint from item #3's spec
+/// §3.
+#[test]
+fn cascade_unblock_dependents_unaffected_by_coexisting_duplicate_relation() {
+    let mcp = test_mcp();
+    let blocker = seed_item_with_deps(&mcp, "Blocker", None, vec![]);
+    let dependent = seed_item_with_deps(
+        &mcp,
+        "Dependent",
+        Some("claude-code"),
+        vec![blocker.clone()],
+    );
+    mcp.with_backend_db(|conn| {
+        agentflare_backend::item::add_relation(conn, &dependent, &blocker, "duplicate").unwrap()
+    })
+    .unwrap();
+    complete_item(&mcp, &blocker);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
+        .unwrap();
+
+    assert!(
+        item_has_ready_label(&mcp, &dependent),
+        "a coexisting duplicate relation must not suppress the real blocks-edge cascade"
+    );
+}
