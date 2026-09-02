@@ -150,6 +150,58 @@ fn list_by_project_scopes() {
 }
 
 #[test]
+fn list_by_project_paginated_pages_and_counts() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    for n in 0..5 {
+        create(
+            &conn,
+            CreateItem {
+                project_id: pid.clone(),
+                state_id: sid.clone(),
+                name: format!("Item {n}"),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: Some(n as f64),
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
+            },
+        )
+        .unwrap();
+    }
+
+    let (page, total) = list_by_project_paginated(&conn, &pid, 2, 0).unwrap();
+    assert_eq!(total, 5);
+    assert_eq!(
+        page.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+        vec!["Item 0", "Item 1"]
+    );
+
+    let (page, total) = list_by_project_paginated(&conn, &pid, 2, 2).unwrap();
+    assert_eq!(total, 5);
+    assert_eq!(
+        page.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+        vec!["Item 2", "Item 3"]
+    );
+
+    // A page past the end still reports the true total, not zero.
+    let (page, total) = list_by_project_paginated(&conn, &pid, 2, 10).unwrap();
+    assert!(page.is_empty());
+    assert_eq!(total, 5);
+
+    assert!(list_by_project_paginated(&conn, &pid, -1, 0).is_err());
+    assert!(list_by_project_paginated(&conn, &pid, 0, -1).is_err());
+}
+
+#[test]
 fn add_and_remove_labels() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
