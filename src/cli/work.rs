@@ -692,9 +692,9 @@ fn execute_work_impl(
     // the claimed item's own attributes, so it's resolved further down.
     if let Some(explicit) = args.agent.as_deref() {
         let Some(resolved) = agent_registry::agent_by_name(explicit) else {
-            crate::ui::error(&format!(
-                "unknown agent: {explicit} — use `agentflare agents list`"
-            ));
+            let msg = format!("unknown agent: {explicit} — use `agentflare agents list`");
+            let _ = writeln!(log, "{msg}");
+            crate::ui::error(&msg);
             return 1.into();
         };
         // The claim below identifies its own owner via `claims::owner_id()`,
@@ -735,7 +735,9 @@ fn execute_work_impl(
     }) {
         Ok(json) => json,
         Err(e) => {
-            crate::ui::error(&format!("claim failed: {}", e.message));
+            let msg = format!("claim failed: {}", e.message);
+            let _ = writeln!(log, "{msg}");
+            crate::ui::error(&msg);
             return 1.into();
         }
     };
@@ -759,6 +761,7 @@ fn execute_work_impl(
                 format!("item held by {owner} ({age}s, ttl {ttl}s) — cannot claim")
             }
         };
+        let _ = writeln!(log, "{msg}");
         crate::ui::error(&msg);
         return 1.into();
     }
@@ -786,6 +789,7 @@ fn execute_work_impl(
         };
         release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
         crate::ui::error(&msg);
+        let _ = writeln!(log, "{msg}");
         // Structural failure (item #467): fail straight to terminal instead of retrying.
         return WorkOutcome {
             exit_code: 1,
@@ -814,6 +818,7 @@ fn execute_work_impl(
             let msg = "failed to read item details after claim";
             release_and_comment(&mcp, item_id, msg, args.notify.as_deref());
             crate::ui::error(msg);
+            let _ = writeln!(log, "{msg}");
             return 1.into();
         }
     };
@@ -869,6 +874,7 @@ fn execute_work_impl(
             crate::state::save(&state);
             release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
             crate::ui::error(&msg);
+            let _ = writeln!(log, "{msg}");
             return 1.into();
         }
     };
@@ -904,6 +910,7 @@ fn execute_work_impl(
         let msg = format!("agent {name} has no headless print mode");
         release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
         crate::ui::error(&msg);
+        let _ = writeln!(log, "{msg}");
         return 1.into();
     }
     let _ = writeln!(log, "agent: {name} ({route_reason})");
@@ -948,6 +955,7 @@ fn execute_work_impl(
         Err(msg) => {
             release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
             crate::ui::error(&msg);
+            let _ = writeln!(log, "{msg}");
             // Same structural category as the missing-worktree case above: the
             // claimed worktree path came back from `item::claim` but doesn't
             // actually exist/isn't enterable, which won't change on retry.
@@ -1755,6 +1763,7 @@ rotate = true
 
     include!("work_worktree_error_tests.rs");
     include!("work_dispatch_fixture_tests.rs");
+    include!("work_claim_denied_tests.rs");
 
     /// Sets up a claimed item and returns `(tmp, mcp, item)` with the claim
     /// held under the calling thread's own `owner_id()` — the same fixture
