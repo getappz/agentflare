@@ -232,63 +232,33 @@ fn capacity_buckets(
 }
 
 impl AgentflareMcp {
-    /// Resolve a user-supplied id to an item UUID.
-    /// Accepts a UUID (pass-through) or a numeric `sequence_id`.
+    /// Resolve a user-supplied id (UUID or numeric `sequence_id`) to an item
+    /// UUID, and prove it both exists and belongs to the session's linked
+    /// project. `resolve_id`'s UUID branch passes any raw id straight
+    /// through unchecked, so without the follow-up lookup here, a caller on
+    /// one project's connection could read or mutate another project's item
+    /// just by knowing its UUID — every project in this workspace shares the
+    /// same database. An unknown or cross-project id gets the same generic
+    /// "no item matches" error either way, so a caller can't distinguish
+    /// "doesn't exist" from "exists in a different project" — otherwise this
+    /// would leak cross-project existence. This also means the id is proven
+    /// to exist before it's ever written as a foreign key, avoiding a raw
+    /// "FOREIGN KEY constraint failed" (#375) that names nothing.
     pub(crate) fn resolve_item_id(
         &self,
         conn: &Connection,
         id_or_seq: &str,
     ) -> Result<String, ErrorData> {
         let project = self.resolve_project(conn)?;
-        agentflare_backend::item::resolve_id(conn, Some(&project.id), id_or_seq)
-            .map_err(map_backend_err)
-    }
-
-    /// [`Self::resolve_item_id`] plus proof that the item actually exists.
-    /// `resolve_id` passes a non-numeric id straight through, so an unknown
-    /// UUID otherwise reaches the write and surfaces as a raw
-    /// "FOREIGN KEY constraint failed" (#375) that names nothing. Use this
-    /// wherever an id is about to be written as a foreign key rather than
-    /// read back through a call that would 404 on its own.
-    pub(crate) fn resolve_existing_item_id(
-        &self,
-        conn: &Connection,
-        raw: &str,
-    ) -> Result<String, ErrorData> {
-        let id = self.resolve_item_id(conn, raw)?;
+        let id = agentflare_backend::item::resolve_id(conn, Some(&project.id), id_or_seq)
+            .map_err(map_backend_err)?;
         match agentflare_backend::item::get(conn, &id) {
-            Ok(_) => Ok(id),
-            Err(agentflare_backend::Error::NotFound(_)) => Err(ErrorData::invalid_params(
-                format!("no item matches id '{raw}'"),
-                None,
-            )),
+            Ok(item) if item.project_id == project.id => Ok(id),
+            Ok(_) | Err(agentflare_backend::Error::NotFound(_)) => Err(
+                ErrorData::invalid_params(format!("no item matches id '{id_or_seq}'"), None),
+            ),
             Err(e) => Err(map_backend_err(e)),
         }
-    }
-
-    /// [`Self::resolve_existing_item_id`] plus proof the item belongs to the
-    /// session's linked project. `resolve_id`'s UUID branch passes any raw id
-    /// straight through with no project check, so without this a caller on
-    /// one project's connection could add/remove/list relations against
-    /// another project's items just by knowing their UUID — every project in
-    /// this workspace shares the same database. Use for any id that becomes
-    /// part of a persisted cross-item relationship, not just a same-item
-    /// read/write.
-    pub(crate) fn resolve_item_id_in_project(
-        &self,
-        conn: &Connection,
-        project: &agentflare_backend::project::Project,
-        raw: &str,
-    ) -> Result<String, ErrorData> {
-        let id = self.resolve_existing_item_id(conn, raw)?;
-        let item = agentflare_backend::item::get(conn, &id).map_err(map_backend_err)?;
-        if item.project_id != project.id {
-            return Err(ErrorData::invalid_params(
-                format!("no item matches id '{raw}'"),
-                None,
-            ));
-        }
-        Ok(id)
     }
 
     /// Resolve a target state from exactly one of `state_id`, `state_name`
@@ -403,7 +373,7 @@ impl AgentflareMcp {
             let parent_id = match req.parent_id.as_deref() {
                 None => None,
                 Some(p) if p.trim().is_empty() => None,
-                Some(p) => Some(self.resolve_existing_item_id(conn, p)?),
+                Some(p) => Some(self.resolve_item_id(conn, p)?),
             };
             let input = agentflare_backend::item::CreateItem {
                 project_id: project.id,
@@ -547,7 +517,7 @@ impl AgentflareMcp {
             let parent_id = match req.parent_id.as_deref() {
                 None => None,
                 Some(p) if p.trim().is_empty() => Some(None),
-                Some(p) => Some(Some(self.resolve_existing_item_id(conn, p)?)),
+                Some(p) => Some(Some(self.resolve_item_id(conn, p)?)),
             };
             let input = agentflare_backend::item::UpdateItem {
                 name: req.name,
@@ -1261,9 +1231,8 @@ impl AgentflareMcp {
         })?;
         Self::validate_relation_type(&relation_type)?;
         self.with_backend_db(|conn| {
-            let project = self.resolve_project(conn)?;
-            let item_id = self.resolve_item_id_in_project(conn, &project, &raw)?;
-            let related_id = self.resolve_item_id_in_project(conn, &project, &related_raw)?;
+            let item_id = self.resolve_item_id(conn, &raw)?;
+            let related_id = self.resolve_item_id(conn, &related_raw)?;
             agentflare_backend::item::add_relation(conn, &item_id, &related_id, &relation_type)
                 .map_err(map_backend_err)?;
             Ok(serde_json::json!({
@@ -1288,9 +1257,8 @@ impl AgentflareMcp {
         })?;
         Self::validate_relation_type(&relation_type)?;
         self.with_backend_db(|conn| {
-            let project = self.resolve_project(conn)?;
-            let item_id = self.resolve_item_id_in_project(conn, &project, &raw)?;
-            let related_id = self.resolve_item_id_in_project(conn, &project, &related_raw)?;
+            let item_id = self.resolve_item_id(conn, &raw)?;
+            let related_id = self.resolve_item_id(conn, &related_raw)?;
             agentflare_backend::item::remove_relation(conn, &item_id, &related_id, &relation_type)
                 .map_err(map_backend_err)?;
             Ok(serde_json::json!({
@@ -1313,8 +1281,7 @@ impl AgentflareMcp {
             Self::validate_relation_type(relation_type)?;
         }
         self.with_backend_db(|conn| {
-            let project = self.resolve_project(conn)?;
-            let item_id = self.resolve_item_id_in_project(conn, &project, &raw)?;
+            let item_id = self.resolve_item_id(conn, &raw)?;
             let relations: Vec<(String, String)> = match req.relation_type.as_deref() {
                 Some(relation_type) => {
                     agentflare_backend::item::list_relations_by_type(conn, &item_id, relation_type)
