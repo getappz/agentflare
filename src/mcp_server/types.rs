@@ -743,11 +743,11 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ItemRequest {
     #[schemars(
-        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|redispatch|groom|standup|health|doctor|clear_start_date|clear_due_date"
+        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|groom|standup|health|doctor|clear_start_date|clear_due_date"
     )]
     pub(crate) action: String,
     #[schemars(
-        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, redispatch, clear_start_date, clear_due_date"
+        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, add_relation, remove_relation, list_relations, redispatch, clear_start_date, clear_due_date"
     )]
     #[serde(default)]
     pub(crate) id: Option<String>,
@@ -804,6 +804,16 @@ pub(crate) struct ItemRequest {
     #[schemars(description = "Label ID (add_label, remove_label)")]
     #[serde(default)]
     pub(crate) label_id: Option<String>,
+    #[schemars(
+        description = "Relation type: blocks|duplicate|relates_to (add_relation, remove_relation; list_relations optional filter — omit to return all three types)"
+    )]
+    #[serde(default)]
+    pub(crate) relation_type: Option<String>,
+    #[schemars(
+        description = "The other item ID this item relates to (UUID or numeric sequence_id) (add_relation, remove_relation; required for both)"
+    )]
+    #[serde(default)]
+    pub(crate) related_item_id: Option<String>,
     #[schemars(
         description = "Filter by state group (list): one of backlog|unstarted|started|in_review|completed|cancelled|triage, or a comma-separated list (e.g. \"backlog,unstarted,started\") to match any. Also usable as a target for update_state (single group only) — an alternative to state_id/state_name; errors if zero or more than one state in the project shares that group. Mutually exclusive with state_id and state_name for update_state"
     )]
@@ -939,6 +949,10 @@ pub(crate) struct GroomItem {
     pub(crate) depended_on_by_count: i64,
     /// Other shortlisted items with a near-identical name (token-Jaccard ≥ 0.5).
     pub(crate) possible_duplicates: Vec<String>,
+    /// True when this item has a confirmed `duplicate` relation on file
+    /// (persisted via `add_relation`), distinct from the unconfirmed
+    /// name-similarity heuristic in `possible_duplicates`.
+    pub(crate) confirmed_duplicate: bool,
 }
 
 /// One-call groom result: priority+staleness-ranked shortlist with all the

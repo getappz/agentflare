@@ -1997,3 +1997,6 @@ fn redispatch_rejects_a_completed_item() {
         "{err:?}"
     );
 }
+
+#[path = "tests_relations.rs"]
+mod tests_relations;

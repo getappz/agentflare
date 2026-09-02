@@ -165,6 +165,36 @@ fn near_duplicates(
     duplicates
 }
 
+/// Which of `item_ids` have at least one confirmed `duplicate` relation on
+/// file (from either column, since `duplicate` is a symmetric type) — feeds
+/// `GroomItem.confirmed_duplicate`, distinct from `near_duplicates`'s
+/// unconfirmed name-similarity heuristic.
+fn confirmed_duplicate_ids(
+    conn: &Connection,
+    item_ids: &[String],
+) -> Result<std::collections::HashSet<String>, ErrorData> {
+    if item_ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT item_id FROM item_dependencies WHERE relation_type = 'duplicate' AND item_id IN ({placeholders})
+         UNION
+         SELECT depends_on_item_id FROM item_dependencies WHERE relation_type = 'duplicate' AND depends_on_item_id IN ({placeholders})"
+    );
+    let params: Vec<&String> = item_ids.iter().chain(item_ids.iter()).collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+    rows.collect::<std::result::Result<_, _>>()
+        .map_err(|e: rusqlite::Error| ErrorData::internal_error(e.to_string(), None))
+}
+
 fn to_standup_item(i: &agentflare_backend::item::Item) -> StandupItem {
     StandupItem {
         id: i.id.clone(),
@@ -234,6 +264,31 @@ impl AgentflareMcp {
             )),
             Err(e) => Err(map_backend_err(e)),
         }
+    }
+
+    /// [`Self::resolve_existing_item_id`] plus proof the item belongs to the
+    /// session's linked project. `resolve_id`'s UUID branch passes any raw id
+    /// straight through with no project check, so without this a caller on
+    /// one project's connection could add/remove/list relations against
+    /// another project's items just by knowing their UUID — every project in
+    /// this workspace shares the same database. Use for any id that becomes
+    /// part of a persisted cross-item relationship, not just a same-item
+    /// read/write.
+    pub(crate) fn resolve_item_id_in_project(
+        &self,
+        conn: &Connection,
+        project: &agentflare_backend::project::Project,
+        raw: &str,
+    ) -> Result<String, ErrorData> {
+        let id = self.resolve_existing_item_id(conn, raw)?;
+        let item = agentflare_backend::item::get(conn, &id).map_err(map_backend_err)?;
+        if item.project_id != project.id {
+            return Err(ErrorData::invalid_params(
+                format!("no item matches id '{raw}'"),
+                None,
+            ));
+        }
+        Ok(id)
     }
 
     /// Resolve a target state from exactly one of `state_id`, `state_name`
@@ -1181,6 +1236,106 @@ impl AgentflareMcp {
         })?
     }
 
+    fn validate_relation_type(relation_type: &str) -> Result<(), ErrorData> {
+        if agentflare_backend::item::RELATION_TYPES.contains(&relation_type) {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_params(
+                format!(
+                    "relation_type must be one of blocks|duplicate|relates_to, got '{relation_type}'"
+                ),
+                None,
+            ))
+        }
+    }
+
+    pub(crate) fn item_add_relation(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for add_relation", None))?;
+        let related_raw = req.related_item_id.ok_or_else(|| {
+            ErrorData::invalid_params("related_item_id is required for add_relation", None)
+        })?;
+        let relation_type = req.relation_type.ok_or_else(|| {
+            ErrorData::invalid_params("relation_type is required for add_relation", None)
+        })?;
+        Self::validate_relation_type(&relation_type)?;
+        self.with_backend_db(|conn| {
+            let project = self.resolve_project(conn)?;
+            let item_id = self.resolve_item_id_in_project(conn, &project, &raw)?;
+            let related_id = self.resolve_item_id_in_project(conn, &project, &related_raw)?;
+            agentflare_backend::item::add_relation(conn, &item_id, &related_id, &relation_type)
+                .map_err(map_backend_err)?;
+            Ok(serde_json::json!({
+                "added": true,
+                "item_id": item_id,
+                "related_item_id": related_id,
+                "relation_type": relation_type,
+            })
+            .to_string())
+        })?
+    }
+
+    pub(crate) fn item_remove_relation(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req.id.ok_or_else(|| {
+            ErrorData::invalid_params("id is required for remove_relation", None)
+        })?;
+        let related_raw = req.related_item_id.ok_or_else(|| {
+            ErrorData::invalid_params("related_item_id is required for remove_relation", None)
+        })?;
+        let relation_type = req.relation_type.ok_or_else(|| {
+            ErrorData::invalid_params("relation_type is required for remove_relation", None)
+        })?;
+        Self::validate_relation_type(&relation_type)?;
+        self.with_backend_db(|conn| {
+            let project = self.resolve_project(conn)?;
+            let item_id = self.resolve_item_id_in_project(conn, &project, &raw)?;
+            let related_id = self.resolve_item_id_in_project(conn, &project, &related_raw)?;
+            agentflare_backend::item::remove_relation(conn, &item_id, &related_id, &relation_type)
+                .map_err(map_backend_err)?;
+            Ok(serde_json::json!({
+                "removed": true,
+                "item_id": item_id,
+                "related_item_id": related_id,
+                "relation_type": relation_type,
+            })
+            .to_string())
+        })?
+    }
+
+    /// Returns `list_all_relations`'s shape (all three types at once) unless
+    /// `relation_type` is passed, in which case only that type is returned.
+    pub(crate) fn item_list_relations(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for list_relations", None))?;
+        if let Some(relation_type) = req.relation_type.as_deref() {
+            Self::validate_relation_type(relation_type)?;
+        }
+        self.with_backend_db(|conn| {
+            let project = self.resolve_project(conn)?;
+            let item_id = self.resolve_item_id_in_project(conn, &project, &raw)?;
+            let relations: Vec<(String, String)> = match req.relation_type.as_deref() {
+                Some(relation_type) => {
+                    agentflare_backend::item::list_relations_by_type(conn, &item_id, relation_type)
+                        .map_err(map_backend_err)?
+                        .into_iter()
+                        .map(|other_id| (relation_type.to_string(), other_id))
+                        .collect()
+                },
+                None => agentflare_backend::item::list_all_relations(conn, &item_id)
+                    .map_err(map_backend_err)?,
+            };
+            let relations: Vec<_> = relations
+                .into_iter()
+                .map(|(relation_type, other_id)| {
+                    serde_json::json!({"relation_type": relation_type, "item_id": other_id})
+                })
+                .collect();
+            Ok(serde_json::json!({"item_id": item_id, "relations": relations}).to_string())
+        })?
+    }
+
     /// Direct SQL clear — `UpdateItem.start_date` is a plain `Option<i64>`
     /// where `None` means "leave untouched", so `update` alone can't express
     /// clearing the column back to NULL.
@@ -1338,6 +1493,7 @@ impl AgentflareMcp {
             let fanin = agentflare_backend::item::dependency_fanin_for_items(conn, &ids)
                 .map_err(map_backend_err)?;
             let duplicates = near_duplicates(&shortlist);
+            let confirmed_duplicates = confirmed_duplicate_ids(conn, &ids)?;
 
             let groom_items: Vec<GroomItem> = shortlist
                 .into_iter()
@@ -1354,6 +1510,7 @@ impl AgentflareMcp {
                         blocked_by: blocked_by.get(&i.id).cloned().unwrap_or_default(),
                         depended_on_by_count: *fanin.get(&i.id).unwrap_or(&0),
                         possible_duplicates: duplicates.get(&i.id).cloned().unwrap_or_default(),
+                        confirmed_duplicate: confirmed_duplicates.contains(&i.id),
                         id: i.id,
                         sequence_id: i.sequence_id,
                         name: i.name,
