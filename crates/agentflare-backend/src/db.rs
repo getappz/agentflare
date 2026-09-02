@@ -20,6 +20,7 @@ const MIGRATION_LIST: &[M<'static>] = &[
     M::up(include_str!("migrations/0009_vent_escalation.sql")),
     M::up(include_str!("migrations/0010_project_dirs.sql")),
     M::up(include_str!("migrations/0011_item_assignment_events.sql")),
+    M::up(include_str!("migrations/0012_item_relation_types.sql")),
 ];
 const MIGRATIONS: Migrations = Migrations::from_slice(MIGRATION_LIST);
 
@@ -190,5 +191,78 @@ mod tests {
             )
             .unwrap_err();
         assert!(is_constraint_violation(&err), "{err}");
+    }
+
+    #[test]
+    fn migration_0012_backfills_relation_type_and_widens_pk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("backend.db");
+
+        // Simulate a db at the state right before 0012: pre-existing
+        // item_dependencies rows with no relation_type column at all.
+        {
+            let pre_0012 = Migrations::new(
+                MIGRATION_LIST[..MIGRATION_LIST.len() - 1].to_vec(),
+            );
+            let mut conn = Connection::open(&path).unwrap();
+            pre_0012.to_latest(&mut conn).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            conn.execute_batch(
+                "INSERT INTO workspaces (id, name, slug, item_label, created_at, updated_at)
+                   VALUES ('w1', 'W', 'w', 'Item', 1, 1);
+                 INSERT INTO projects (id, workspace_id, name, identifier, created_at, updated_at)
+                   VALUES ('p1', 'w1', 'P', 'P', 1, 1);
+                 INSERT INTO states (id, project_id, name, group_name, sequence, created_at, updated_at)
+                   VALUES ('s1', 'p1', 'Backlog', 'backlog', 1.0, 1, 1);
+                 INSERT INTO items (id, project_id, state_id, name, created_at, updated_at)
+                   VALUES ('i1', 'p1', 's1', 'I1', 1, 1);
+                 INSERT INTO items (id, project_id, state_id, name, created_at, updated_at)
+                   VALUES ('i2', 'p1', 's1', 'I2', 1, 1);
+                 INSERT INTO item_dependencies (item_id, depends_on_item_id) VALUES ('i1', 'i2');",
+            )
+            .unwrap();
+        }
+
+        let conn = open_db(&path).unwrap();
+
+        let (item_id, depends_on, relation_type): (String, String, String) = conn
+            .query_row(
+                "SELECT item_id, depends_on_item_id, relation_type FROM item_dependencies",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(item_id, "i1");
+        assert_eq!(depends_on, "i2");
+        assert_eq!(
+            relation_type, "blocks",
+            "pre-existing rows must backfill to relation_type='blocks'"
+        );
+
+        // The widened PK now allows the same pair to also hold a 'duplicate'
+        // relation without clobbering the 'blocks' row.
+        conn.execute(
+            "INSERT INTO item_dependencies (item_id, depends_on_item_id, relation_type) VALUES ('i1', 'i2', 'duplicate')",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM item_dependencies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // An invalid relation_type is rejected.
+        let err = conn
+            .execute(
+                "INSERT INTO item_dependencies (item_id, depends_on_item_id, relation_type) VALUES ('i1', 'i2', 'bogus')",
+                [],
+            )
+            .unwrap_err();
+        assert!(is_constraint_violation(&err), "{err}");
+
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(user_version, MIGRATION_LIST.len() as i64);
     }
 }

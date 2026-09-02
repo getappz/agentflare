@@ -430,6 +430,7 @@ mod item_commit_failure_tests;
 mod item_doctor_tests;
 mod item_pr_failure_tests;
 mod item_tests;
+mod item_tests_relations;
 mod item_tests_reporting;
 mod project_resolution_tests;
 mod search_tests;

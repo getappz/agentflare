@@ -65,7 +65,7 @@ pub fn list_assignees(conn: &Connection, item_id: &str) -> Result<Vec<String>> {
 
 pub fn add_dependency(conn: &Connection, item_id: &str, depends_on: &str) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO item_dependencies (item_id, depends_on_item_id) VALUES (?1, ?2)",
+        "INSERT OR IGNORE INTO item_dependencies (item_id, depends_on_item_id, relation_type) VALUES (?1, ?2, 'blocks')",
         rusqlite::params![item_id, depends_on],
     )?;
     Ok(())
@@ -73,15 +73,16 @@ pub fn add_dependency(conn: &Connection, item_id: &str, depends_on: &str) -> Res
 
 pub fn remove_dependency(conn: &Connection, item_id: &str, depends_on: &str) -> Result<()> {
     conn.execute(
-        "DELETE FROM item_dependencies WHERE item_id = ?1 AND depends_on_item_id = ?2",
+        "DELETE FROM item_dependencies WHERE item_id = ?1 AND depends_on_item_id = ?2 AND relation_type = 'blocks'",
         rusqlite::params![item_id, depends_on],
     )?;
     Ok(())
 }
 
 pub fn list_dependencies(conn: &Connection, item_id: &str) -> Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare("SELECT depends_on_item_id FROM item_dependencies WHERE item_id = ?1")?;
+    let mut stmt = conn.prepare(
+        "SELECT depends_on_item_id FROM item_dependencies WHERE item_id = ?1 AND relation_type = 'blocks'",
+    )?;
     let rows = stmt.query_map(rusqlite::params![item_id], |row| row.get::<_, String>(0))?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
@@ -93,7 +94,7 @@ pub fn dependents_of(conn: &Connection, item_id: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT d.item_id FROM item_dependencies d
          JOIN items i ON i.id = d.item_id AND i.deleted_at IS NULL
-         WHERE d.depends_on_item_id = ?1",
+         WHERE d.depends_on_item_id = ?1 AND d.relation_type = 'blocks'",
     )?;
     let rows = stmt.query_map(rusqlite::params![item_id], |row| row.get::<_, String>(0))?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -134,7 +135,7 @@ pub fn dependency_edges_for_items(
          FROM item_dependencies d
          JOIN items i ON i.id = d.depends_on_item_id AND i.deleted_at IS NULL
          JOIN states s ON s.id = i.state_id
-         WHERE d.item_id IN ({placeholders})"
+         WHERE d.item_id IN ({placeholders}) AND d.relation_type = 'blocks'"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(item_ids.iter()), |row| {
@@ -162,7 +163,7 @@ pub fn dependency_fanin_for_items(
         "SELECT d.depends_on_item_id, COUNT(*)
          FROM item_dependencies d
          JOIN items i ON i.id = d.item_id AND i.deleted_at IS NULL
-         WHERE d.depends_on_item_id IN ({placeholders})
+         WHERE d.depends_on_item_id IN ({placeholders}) AND d.relation_type = 'blocks'
          GROUP BY d.depends_on_item_id"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -170,4 +171,96 @@ pub fn dependency_fanin_for_items(
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// The three stored relation types (see `0012_item_relation_types.sql`).
+/// `blocks` is directional (matches `add_dependency`'s existing semantics);
+/// `duplicate` and `relates_to` are symmetric.
+pub const RELATION_TYPES: [&str; 3] = ["blocks", "duplicate", "relates_to"];
+
+/// Canonicalize a symmetric-relation pair's storage order so `(A, B)` and
+/// `(B, A)` always land as the same row instead of two independent ones.
+/// Only meaningful for symmetric types -- callers handle `blocks`
+/// separately, since it must stay directional.
+fn canonicalize_pair<'a>(item_id: &'a str, other_id: &'a str) -> (&'a str, &'a str) {
+    if item_id <= other_id {
+        (item_id, other_id)
+    } else {
+        (other_id, item_id)
+    }
+}
+
+/// Add a relation of any type. `blocks` delegates to `add_dependency`
+/// unchanged (directional, zero behavior change). Symmetric types
+/// (`duplicate`, `relates_to`) canonicalize storage order first so either
+/// insertion order produces the same row.
+pub fn add_relation(
+    conn: &Connection,
+    item_id: &str,
+    other_id: &str,
+    relation_type: &str,
+) -> Result<()> {
+    if relation_type == "blocks" {
+        return add_dependency(conn, item_id, other_id);
+    }
+    let (a, b) = canonicalize_pair(item_id, other_id);
+    conn.execute(
+        "INSERT OR IGNORE INTO item_dependencies (item_id, depends_on_item_id, relation_type) VALUES (?1, ?2, ?3)",
+        rusqlite::params![a, b, relation_type],
+    )?;
+    Ok(())
+}
+
+/// Remove a relation of any type -- the inverse of `add_relation`, with the
+/// same `blocks`-delegates / symmetric-canonicalize split.
+pub fn remove_relation(
+    conn: &Connection,
+    item_id: &str,
+    other_id: &str,
+    relation_type: &str,
+) -> Result<()> {
+    if relation_type == "blocks" {
+        return remove_dependency(conn, item_id, other_id);
+    }
+    let (a, b) = canonicalize_pair(item_id, other_id);
+    conn.execute(
+        "DELETE FROM item_dependencies WHERE item_id = ?1 AND depends_on_item_id = ?2 AND relation_type = ?3",
+        rusqlite::params![a, b, relation_type],
+    )?;
+    Ok(())
+}
+
+/// Other item IDs related to `item_id` by `relation_type`. `blocks` matches
+/// `list_dependencies`'s directional semantics (what `item_id` depends on).
+/// Symmetric types read from either column, so `(A, B)` and `(B, A)`
+/// produce the identical result from either item's perspective.
+pub fn list_relations_by_type(
+    conn: &Connection,
+    item_id: &str,
+    relation_type: &str,
+) -> Result<Vec<String>> {
+    if relation_type == "blocks" {
+        return list_dependencies(conn, item_id);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT CASE WHEN item_id = ?1 THEN depends_on_item_id ELSE item_id END
+         FROM item_dependencies
+         WHERE (item_id = ?1 OR depends_on_item_id = ?1) AND relation_type = ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![item_id, relation_type], |row| {
+        row.get::<_, String>(0)
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// `(relation_type, other_item_id)` pairs across all three types, for a
+/// detail panel to render everything about `item_id` in one call.
+pub fn list_all_relations(conn: &Connection, item_id: &str) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for relation_type in RELATION_TYPES {
+        for other_id in list_relations_by_type(conn, item_id, relation_type)? {
+            out.push((relation_type.to_string(), other_id));
+        }
+    }
+    Ok(out)
 }
