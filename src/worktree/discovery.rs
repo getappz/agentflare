@@ -170,6 +170,8 @@ pub(crate) fn discover_untracked_prs(
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         };
         match agentflare_backend::item::create(conn, input) {
             Ok(_) => created += 1,
@@ -204,6 +206,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             deleted_at: None,
+            start_date: None,
+            due_date: None,
         }
     }
 

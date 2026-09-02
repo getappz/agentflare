@@ -312,6 +312,8 @@ impl AgentflareMcp {
                             label_ids: ready_label_id.into_iter().collect(),
                             assignee_ids: vec![],
                             dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
                         };
                         agentflare_backend::item::create(conn, input).map_err(map_backend_err)?
                     }

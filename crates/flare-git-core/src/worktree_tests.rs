@@ -137,6 +137,8 @@ fn test_item(sequence_id: i64) -> Item {
         created_at: 0,
         updated_at: 0,
         deleted_at: None,
+        start_date: None,
+        due_date: None,
     }
 }
 

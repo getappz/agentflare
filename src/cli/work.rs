@@ -1101,6 +1101,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             deleted_at: None,
+            start_date: None,
+            due_date: None,
         }
     }
 
@@ -1642,6 +1644,8 @@ rotate = true
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap()

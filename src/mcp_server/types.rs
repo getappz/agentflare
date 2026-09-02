@@ -743,11 +743,11 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ItemRequest {
     #[schemars(
-        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|groom|standup|health|doctor"
+        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|groom|standup|health|doctor|clear_start_date|clear_due_date"
     )]
     pub(crate) action: String,
     #[schemars(
-        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, add_relation, remove_relation, list_relations, redispatch"
+        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, add_relation, remove_relation, list_relations, redispatch, clear_start_date, clear_due_date"
     )]
     #[serde(default)]
     pub(crate) id: Option<String>,
@@ -785,6 +785,16 @@ pub(crate) struct ItemRequest {
     )]
     #[serde(default)]
     pub(crate) metadata: Option<serde_json::Value>,
+    #[schemars(
+        description = "Start date as a Unix timestamp in seconds (create, update). Validated against due_date (start_date <= due_date) whenever both are set on the item."
+    )]
+    #[serde(default)]
+    pub(crate) start_date: Option<i64>,
+    #[schemars(
+        description = "Due date as a Unix timestamp in seconds (create, update). Validated against start_date (start_date <= due_date) whenever both are set on the item. `groom` also derives `overdue` from this."
+    )]
+    #[serde(default)]
+    pub(crate) due_date: Option<i64>,
     #[schemars(description = "Label IDs to attach on creation (create)")]
     #[serde(default)]
     pub(crate) label_ids: Option<Vec<String>>,
@@ -925,6 +935,10 @@ pub(crate) struct GroomItem {
     pub(crate) updated_at: i64,
     pub(crate) stale: bool,
     pub(crate) unassigned: bool,
+    pub(crate) due_date: Option<i64>,
+    /// True when `due_date` is in the past and the item's state group isn't
+    /// completed/cancelled — a done-but-late item isn't "overdue" anymore.
+    pub(crate) overdue: bool,
     /// Parsed from `metadata.size` ("S"|"M"|"L"); `None` when absent — see `unestimated`.
     pub(crate) size: Option<String>,
     /// True when `metadata.size` is missing — add a size label to enable real RICE scoring.

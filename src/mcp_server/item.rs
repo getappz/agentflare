@@ -420,6 +420,8 @@ impl AgentflareMcp {
                 label_ids: req.label_ids.unwrap_or_default(),
                 assignee_ids: vec![],
                 dependency_ids: req.dependency_ids.unwrap_or_default(),
+                start_date: req.start_date,
+                due_date: req.due_date,
             };
             let item = agentflare_backend::item::create(conn, input).map_err(map_backend_err)?;
             Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
@@ -556,6 +558,8 @@ impl AgentflareMcp {
                 sort_order: None,
                 metadata: req.metadata.map(metadata_to_json_string),
                 parent_id,
+                start_date: req.start_date,
+                due_date: req.due_date,
             };
             let item =
                 agentflare_backend::item::update(conn, &id, input).map_err(map_backend_err)?;
@@ -1332,6 +1336,40 @@ impl AgentflareMcp {
         })?
     }
 
+    /// Direct SQL clear — `UpdateItem.start_date` is a plain `Option<i64>`
+    /// where `None` means "leave untouched", so `update` alone can't express
+    /// clearing the column back to NULL.
+    pub(crate) fn item_clear_start_date(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req.id.ok_or_else(|| {
+            ErrorData::invalid_params("id is required for clear_start_date", None)
+        })?;
+        if raw.trim().is_empty() {
+            return Err(ErrorData::invalid_params("id is required", None));
+        }
+        self.with_backend_db(|conn| {
+            let id = self.resolve_item_id(conn, &raw)?;
+            let item = agentflare_backend::item::clear_item_start_date(conn, &id)
+                .map_err(map_backend_err)?;
+            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
+        })?
+    }
+
+    /// Same shape as `item_clear_start_date`, for `due_date`.
+    pub(crate) fn item_clear_due_date(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for clear_due_date", None))?;
+        if raw.trim().is_empty() {
+            return Err(ErrorData::invalid_params("id is required", None));
+        }
+        self.with_backend_db(|conn| {
+            let id = self.resolve_item_id(conn, &raw)?;
+            let item = agentflare_backend::item::clear_item_due_date(conn, &id)
+                .map_err(map_backend_err)?;
+            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
+        })?
+    }
+
     /// AI-agent-safe alternative to `agentflare work <id>` (which is
     /// human-only-gated): re-arms a stuck or failed item so the daemon's own
     /// supervisor discovery tick dispatches it, instead of the caller trying
@@ -1465,6 +1503,9 @@ impl AgentflareMcp {
                     let unassigned = i.assignee_agent.is_none();
                     let size = parsed_size(&i.metadata);
                     let unestimated = size.is_none();
+                    let state_group = state.map(|s| s.group_name.clone()).unwrap_or_default();
+                    let overdue = i.due_date.is_some_and(|d| d < now)
+                        && !matches!(state_group.as_str(), "completed" | "cancelled");
                     GroomItem {
                         blocked_by: blocked_by.get(&i.id).cloned().unwrap_or_default(),
                         depended_on_by_count: *fanin.get(&i.id).unwrap_or(&0),
@@ -1475,7 +1516,7 @@ impl AgentflareMcp {
                         name: i.name,
                         description: i.description,
                         state: state.map(|s| s.name.clone()).unwrap_or_default(),
-                        state_group: state.map(|s| s.group_name.clone()).unwrap_or_default(),
+                        state_group,
                         priority: i.priority,
                         assignee_agent: i.assignee_agent,
                         updated_at: i.updated_at,
@@ -1483,6 +1524,8 @@ impl AgentflareMcp {
                         unassigned,
                         size,
                         unestimated,
+                        due_date: i.due_date,
+                        overdue,
                     }
                 })
                 .collect();

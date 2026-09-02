@@ -85,6 +85,8 @@ fn seed_ready_item(mcp: &AgentflareMcp, assignee: Option<&str>) -> String {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -346,6 +348,8 @@ fn seed_ready_item_under_gated_goal(mcp: &AgentflareMcp) -> String {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -366,6 +370,8 @@ fn seed_ready_item_under_gated_goal(mcp: &AgentflareMcp) -> String {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -463,6 +469,8 @@ fn seed_ready_item_under_active_goal_with_repairs(
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -498,6 +506,8 @@ fn seed_ready_item_under_active_goal_with_repairs(
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -679,6 +689,8 @@ fn seed_ready_item_in_project(mcp: &AgentflareMcp, name: &str, folder_path: &str
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -759,6 +771,8 @@ fn seed_in_review_item_with_claim_age(
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -829,6 +843,8 @@ fn seed_in_review_item_in_project(mcp: &AgentflareMcp, name: &str, folder_path: 
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -1437,6 +1453,8 @@ fn seed_item_with_deps(
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids,
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap()

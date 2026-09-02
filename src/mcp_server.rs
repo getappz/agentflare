@@ -1343,9 +1343,11 @@ impl AgentflareMcp {
             "standup" => self.item_standup(req),
             "health" => self.item_health(req),
             "doctor" => self.item_doctor(req),
+            "clear_start_date" => self.item_clear_start_date(req),
+            "clear_due_date" => self.item_clear_due_date(req),
             other => Err(ErrorData::invalid_params(
                 format!(
-                    "unknown item action: '{other}' — expected create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|groom|standup|health|doctor"
+                    "unknown item action: '{other}' — expected create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|groom|standup|health|doctor|clear_start_date|clear_due_date"
                 ),
                 None,
             )),
