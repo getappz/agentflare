@@ -72,8 +72,17 @@ fn item_action_succeeded(action: &str, response: Option<&Value>) -> Option<bool>
 fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
     let v: serde_json::Value = serde_json::from_str(input).ok()?;
     let session_id = v.get("session_id")?.as_str()?.to_string();
-    let tool_name = v.get("tool_name")?.as_str()?.to_string();
-    let tool_input = v.get("tool_input");
+    let raw_tool_name = v.get("tool_name")?.as_str()?.to_string();
+    let raw_tool_input = v.get("tool_input").cloned();
+    // Unwrap flare-gateway `action="execute"` calls (item #559) -- a
+    // verification command run via `mcp__flare__tool(action="execute",
+    // server="leanctx", tool="ctx_shell", args={"command": ...})` must be
+    // recorded exactly like a direct Bash call, or the completion gate
+    // never sees it as evidence and rejects `item done`/`check_merge` even
+    // right after a passing run.
+    let (tool_name, tool_input) =
+        crate::hook_redirect::unwrap_gateway_call(&raw_tool_name, raw_tool_input.as_ref());
+    let tool_input = tool_input.as_ref();
     let command = tool_input
         .and_then(|ti| {
             ti.get("command")
@@ -99,11 +108,26 @@ fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
         .map(|r| {
             let stdout = r.get("stdout").and_then(Value::as_str).unwrap_or("");
             let stderr = r.get("stderr").and_then(Value::as_str).unwrap_or("");
-            if stdout.is_empty() && stderr.is_empty() {
-                r.as_str().unwrap_or_default().to_string()
-            } else {
-                format!("{stdout}\n{stderr}")
+            if !stdout.is_empty() || !stderr.is_empty() {
+                return format!("{stdout}\n{stderr}");
             }
+            if let Some(s) = r.as_str() {
+                return s.to_string();
+            }
+            // A gateway-forwarded response (item #559) comes back as the
+            // MCP content-block envelope (`{"content":[{"type":"text",
+            // "text":"..."}]}`), same shape `response_as_json` unwraps for
+            // item actions -- without this, exit_code and output_text are
+            // both blank for every gateway-routed verification command, so
+            // a genuine failure would default to "passed" via
+            // `verification_passed`'s permissive fallback below.
+            r.get("content")
+                .and_then(Value::as_array)
+                .and_then(|blocks| blocks.first())
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
         })
         .unwrap_or_default();
     let item_success = item_action
@@ -349,6 +373,35 @@ mod tests {
     #[test]
     fn parse_post_tool_use_returns_none_on_invalid_json() {
         assert!(parse_post_tool_use("not json").is_none());
+    }
+
+    #[test]
+    fn parse_post_tool_use_unwraps_gateway_routed_verification_command() {
+        // Regression for item #559: a verification command run through the
+        // flare gateway (`mcp__flare__tool(action="execute", server=
+        // "leanctx", tool="ctx_shell", args={"command": ...})`) must be
+        // recognized exactly like a direct Bash call.
+        let input = r#"{"session_id":"s1","tool_name":"mcp__flare__tool","tool_input":{"action":"execute","server":"leanctx","tool":"ctx_shell","args":{"command":"cargo test"}},"tool_response":{"content":[{"type":"text","text":"test result: ok"}]}}"#;
+        let parsed = parse_post_tool_use(input).unwrap();
+        assert_eq!(parsed.tool_name, "mcp__lean-ctx__ctx_shell");
+        assert_eq!(parsed.command.as_deref(), Some("cargo test"));
+        assert_eq!(parsed.output_text, "test result: ok");
+    }
+
+    #[test]
+    fn parse_post_tool_use_gateway_search_action_has_no_command() {
+        let input = r#"{"session_id":"s1","tool_name":"mcp__flare__tool","tool_input":{"action":"search","query":"ctx_shell"},"tool_response":{}}"#;
+        let parsed = parse_post_tool_use(input).unwrap();
+        assert_eq!(parsed.tool_name, "mcp__flare__tool");
+        assert!(parsed.command.is_none());
+    }
+
+    #[test]
+    fn output_text_falls_back_to_mcp_content_block_envelope() {
+        let input = r#"{"session_id":"s1","tool_name":"Bash","tool_input":{"command":"cargo test"},"tool_response":{"content":[{"type":"text","text":"3 failures:\n  test_foo"}]}}"#;
+        let parsed = parse_post_tool_use(input).unwrap();
+        assert_eq!(parsed.output_text, "3 failures:\n  test_foo");
+        assert!(!verification_passed(parsed.exit_code, &parsed.output_text));
     }
 
     #[test]

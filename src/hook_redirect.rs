@@ -216,6 +216,54 @@ fn branch_guard_reason_for(branch: Option<&str>, default: Option<&str>) -> Optio
     })
 }
 
+/// MCP tool name Claude Code sends for the flare gateway's own `tool` MCP
+/// tool. `apply_gateway_permissions` (components.rs) steers agents toward
+/// calling lean-ctx exclusively through this gateway (`action="execute"`)
+/// and actively strips their direct `mcp__lean-ctx__*` permissions -- so
+/// once that's applied, every `ctx_shell`/`ctx_patch`/`ctx_edit` call this
+/// module or `hook_completion_gate` needs to classify arrives wrapped in
+/// this envelope instead of at the top level.
+const GATEWAY_TOOL_NAME: &str = "mcp__flare__tool";
+
+/// Unwraps a flare-gateway `action="execute"` call (`mcp__flare__tool(
+/// action="execute", server="leanctx", tool="ctx_shell", args={"command":
+/// "..."})`) to the real tool name and arguments it forwards, so
+/// `is_verification_command`, `MUTATING_TOOLS`, and
+/// `destructive_data_file_reason` all see the actual command/tool instead of
+/// the gateway envelope one level up. Every other call (non-gateway, or
+/// gateway `action="search"`, or `server` other than `"leanctx"`) passes
+/// through with `tool_name`/`tool_input` unchanged.
+///
+/// Root cause of item #559: without this, a verification command (or a
+/// `ctx_patch`/`ctx_edit` edit) run through the gateway was invisible to
+/// every classifier in this module -- `is_verification_command` never saw
+/// the real command, so the completion gate (`completion_gate_reason`)
+/// rejected `item done`/`check_merge` even seconds after a passing test run,
+/// on every single retry, once gateway routing was in effect.
+pub(crate) fn unwrap_gateway_call(
+    tool_name: &str,
+    tool_input: Option<&Value>,
+) -> (String, Option<Value>) {
+    let passthrough = || (tool_name.to_string(), tool_input.cloned());
+    if tool_name != GATEWAY_TOOL_NAME {
+        return passthrough();
+    }
+    let Some(input) = tool_input else {
+        return passthrough();
+    };
+    if input.get("action").and_then(Value::as_str) != Some("execute") {
+        return passthrough();
+    }
+    if input.get("server").and_then(Value::as_str) != Some("leanctx") {
+        return passthrough();
+    }
+    let Some(real_tool) = input.get("tool").and_then(Value::as_str) else {
+        return passthrough();
+    };
+    let args = input.get("args").cloned().unwrap_or_else(|| json!({}));
+    (format!("mcp__lean-ctx__{real_tool}"), Some(args))
+}
+
 /// MCP tool name Claude Code sends for the `flare` server's `item` tool
 /// (`mcp__<server>__<tool>`). opencode's MCP bridge is expected to use the
 /// same convention -- if a harness turns out to send a bare `item` instead,
@@ -290,7 +338,12 @@ fn classify(
                 )
             })
         }
-        "Bash" | "bash" | "PowerShell" | "powershell" | "shell" => {
+        "Bash" | "bash" | "PowerShell" | "powershell" | "shell" | "mcp__lean-ctx__ctx_shell" => {
+            // Includes ctx_shell (direct or gateway-unwrapped, see
+            // `unwrap_gateway_call`) -- item #559: a destructive `rm
+            // ~/.agentflare/*.db` run via ctx_shell must be caught exactly
+            // like the same command run via Bash.
+            //
             // "command" is Claude Code's and (by convention) opencode's bash
             // tool field; "cmd"/"script" are cheap insurance against a
             // harness using a different name rather than a hard dependency
@@ -410,6 +463,15 @@ mod tests {
     fn classify_blocks_recursive_delete_of_whole_agentflare_dir() {
         let input = json!({ "command": "rm -rf ~/.agentflare" });
         assert!(classify("Bash", Some(&input), NOT_A_REPO).is_some());
+    }
+
+    #[test]
+    fn classify_blocks_rm_of_agentflare_db_via_ctx_shell() {
+        // item #559: ctx_shell (direct tool name, matching what
+        // unwrap_gateway_call produces for a gateway-routed call) must be
+        // covered by the same destructive-command guard as Bash.
+        let input = json!({ "command": "rm ~/.agentflare/store.db" });
+        assert!(classify("mcp__lean-ctx__ctx_shell", Some(&input), NOT_A_REPO).is_some());
     }
 
     #[test]
@@ -680,6 +742,62 @@ mod tests {
                 reason
             );
         }
+    }
+
+    #[test]
+    fn unwrap_gateway_call_unwraps_leanctx_execute() {
+        let input = json!({
+            "action": "execute",
+            "server": "leanctx",
+            "tool": "ctx_shell",
+            "args": {"command": "cargo test"},
+        });
+        let (name, unwrapped) = unwrap_gateway_call(GATEWAY_TOOL_NAME, Some(&input));
+        assert_eq!(name, "mcp__lean-ctx__ctx_shell");
+        assert_eq!(unwrapped, Some(json!({"command": "cargo test"})));
+    }
+
+    #[test]
+    fn unwrap_gateway_call_unwraps_ctx_patch_for_mutating_tool_classification() {
+        let input = json!({
+            "action": "execute",
+            "server": "leanctx",
+            "tool": "ctx_patch",
+            "args": {"path": "src/main.rs"},
+        });
+        let (name, _) = unwrap_gateway_call(GATEWAY_TOOL_NAME, Some(&input));
+        assert!(MUTATING_TOOLS.contains(&name.as_str()), "{name}");
+    }
+
+    #[test]
+    fn unwrap_gateway_call_passes_through_non_gateway_tool() {
+        let input = json!({"command": "cargo test"});
+        let (name, unwrapped) = unwrap_gateway_call("Bash", Some(&input));
+        assert_eq!(name, "Bash");
+        assert_eq!(unwrapped, Some(input));
+    }
+
+    #[test]
+    fn unwrap_gateway_call_passes_through_gateway_search_action() {
+        let input = json!({"action": "search", "query": "ctx_shell"});
+        let (name, unwrapped) = unwrap_gateway_call(GATEWAY_TOOL_NAME, Some(&input));
+        assert_eq!(name, GATEWAY_TOOL_NAME);
+        assert_eq!(unwrapped, Some(input));
+    }
+
+    #[test]
+    fn unwrap_gateway_call_passes_through_non_leanctx_server() {
+        let input = json!({"action": "execute", "server": "other", "tool": "foo", "args": {}});
+        let (name, _) = unwrap_gateway_call(GATEWAY_TOOL_NAME, Some(&input));
+        assert_eq!(name, GATEWAY_TOOL_NAME);
+    }
+
+    #[test]
+    fn unwrap_gateway_call_handles_missing_args() {
+        let input = json!({"action": "execute", "server": "leanctx", "tool": "ctx_shell"});
+        let (name, unwrapped) = unwrap_gateway_call(GATEWAY_TOOL_NAME, Some(&input));
+        assert_eq!(name, "mcp__lean-ctx__ctx_shell");
+        assert_eq!(unwrapped, Some(json!({})));
     }
 
     #[test]
