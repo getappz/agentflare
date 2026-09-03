@@ -229,8 +229,14 @@ struct PreToolUseInput {
 fn parse_pre_tool_use(input: &str) -> Option<PreToolUseInput> {
     let v: serde_json::Value = serde_json::from_str(input).ok()?;
     let session_id = v.get("session_id")?.as_str()?.to_string();
-    let tool_name = v.get("tool_name")?.as_str()?.to_string();
-    let tool_input = v.get("tool_input").cloned();
+    let raw_tool_name = v.get("tool_name")?.as_str()?.to_string();
+    let raw_tool_input = v.get("tool_input").cloned();
+    // Unwrap flare-gateway `action="execute"` calls to the real tool they
+    // forward -- every classifier downstream (branch guard, completion
+    // gate) needs to see the actual tool/args, not the gateway envelope
+    // (item #559).
+    let (tool_name, tool_input) =
+        crate::hook_redirect::unwrap_gateway_call(&raw_tool_name, raw_tool_input.as_ref());
     let delay_seconds = tool_input
         .as_ref()
         .and_then(|ti| ti.get("delaySeconds"))
