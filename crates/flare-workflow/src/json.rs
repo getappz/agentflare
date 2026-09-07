@@ -407,34 +407,37 @@ impl StepExecutor<PipelineData> for CommandExecutor {
         let program = expanded[0].clone();
         let args = expanded[1..].to_vec();
 
-        // `std::process::Command::output` blocks the calling thread, so run
-        // it off the async runtime via `spawn_blocking` rather than stalling
-        // a worker thread for the subprocess's whole lifetime.
-        let program_for_task = program.clone();
-        let spawned = tokio::task::spawn_blocking(move || {
-            std::process::Command::new(&program_for_task)
-                .args(&args)
-                .stdin(std::process::Stdio::null())
-                .output()
-        })
-        .await
-        .map_err(|e| WorkflowError::StepFailed {
-            step_id: StepId::new(&program),
-            message: format!("command task panicked: {e}"),
-        })?
-        .map_err(|e| WorkflowError::StepFailed {
-            step_id: StepId::new(&program),
-            message: format!("failed to run `{program}`: {e}"),
-        })?;
+        // `tokio::process::Command` (not `std::process::Command`) so the
+        // engine's `tokio::time::timeout` around step execution actually
+        // bounds the child process: on timeout the future is dropped, and
+        // `kill_on_drop` kills the child instead of leaking it to run to
+        // completion in the background.
+        let output = tokio::process::Command::new(&program)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| WorkflowError::StepFailed {
+                step_id: StepId::new(&program),
+                message: format!("failed to run `{program}`: {e}"),
+            })?;
 
-        if !spawned.status.success() {
-            let stderr = String::from_utf8_lossy(&spawned.stderr).trim().to_string();
+        // Not inherited from a prior step: a command step produces no LLM
+        // tokens, and `WorkflowContext` persists token counts across steps,
+        // so an unset field here would otherwise leak the previous step's
+        // counts into this step's recorded metrics.
+        ctx.input_tokens = 0;
+        ctx.output_tokens = 0;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Ok(StepResult::Failed(format!(
                 "`{program}` exited with {}: {stderr}",
-                spawned.status
+                output.status
             )));
         }
-        ctx.output = String::from_utf8_lossy(&spawned.stdout).trim().to_string();
+        ctx.output = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Ok(StepResult::Success)
     }
 
@@ -870,6 +873,50 @@ mod tests {
             .and_then(|s| s.last_error.clone())
             .expect("step recorded an error");
         assert!(err.contains("oops"), "error was: {err}");
+    }
+
+    #[tokio::test]
+    async fn command_step_does_not_inherit_a_prior_agent_steps_token_counts() {
+        // `WorkflowContext` token counts persist across steps within a run;
+        // a command step must zero them rather than leaving the prior
+        // agent step's nonzero counts in place.
+        let send: SendMessage =
+            Arc::new(|inv: StepInvocation| Box::pin(async move { Ok((inv.prompt, 100, 50)) }));
+
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "agent-then-command-pipeline",
+                "steps": [
+                    { "name": "agent-step", "agent": "writer", "prompt": "hi" },
+                    { "name": "echo-step", "command": ["echo", "-n", "done"] }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let wf = compile_workflow(&json, send).unwrap();
+        let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
+        engine.register_workflow(wf).unwrap();
+        let run = engine
+            .start_workflow(
+                crate::types::WorkflowId::new("agent-then-command-pipeline"),
+                PipelineData,
+                "go".into(),
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_for_completion(run, "wf", std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let state = engine.get_status(run).await.unwrap();
+        let command_step = state
+            .step_states
+            .get(&StepId::new("echo-step"))
+            .expect("command step ran");
+        assert_eq!(command_step.input_tokens, 0);
+        assert_eq!(command_step.output_tokens, 0);
     }
 
     #[test]
