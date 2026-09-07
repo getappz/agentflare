@@ -1621,6 +1621,7 @@ dependencies = [
  "agentflare-workspace-hack",
  "async-trait",
  "chrono",
+ "flare-process",
  "parking_lot",
  "rand 0.8.6",
  "rusqlite",
