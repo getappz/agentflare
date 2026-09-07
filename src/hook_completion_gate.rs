@@ -207,20 +207,24 @@ fn shows_finishing_branch_menu(tool_name: &str, action: &str, item_success: Opti
         && item_success != Some(false)
 }
 
-/// PostToolUse (success) command hook. Four independent jobs, all closing
+/// PostToolUse (success) command hook. Five independent jobs, all closing
 /// gaps from item #169's completion gate (extended to cover review evidence
-/// by item #182): (1) records verification evidence for the session when a
-/// Bash-family call's command matches `optimize::is_verification_command`;
-/// (2) records review evidence when the `ReportFindings` tool call succeeds
+/// by item #182, and diagnosis evidence by item #203): (1) records
+/// verification evidence for the session when a Bash-family call's command
+/// matches `optimize::is_verification_command`; (2) records diagnosis
+/// evidence the same way when it matches `optimize::is_diagnosis_command`
+/// (both checks run off the same parsed command -- not mutually exclusive);
+/// (3) records review evidence when the `ReportFindings` tool call succeeds
 /// (`optimize::is_review_completion` -- see its doc comment for why this,
 /// specifically, is the trigger rather than a `Skill`/`Task`/`Agent`
-/// dispatch) -- these two are the ONLY places their respective evidence is
-/// ever recorded, so `hook_redirect::completion_gate_reason` has something
-/// to check; (3) surfaces the finishing-a-development-branch decision menu
-/// once `item done`/`check_merge` actually succeeds; (4) invalidates any
-/// recorded verification/review evidence when a mutating tool (Write/Edit/
-/// MultiEdit/patch/ctx_patch/...) runs, so evidence from before this edit
-/// can't cover a since-changed tree.
+/// dispatch) -- these are the ONLY places their respective evidence is ever
+/// recorded, so `hook_redirect::completion_gate_reason` has something to
+/// check; (4) surfaces the finishing-a-development-branch decision menu once
+/// `item done`/`check_merge` actually succeeds; (5) invalidates recorded
+/// verification/review evidence when a mutating tool (Write/Edit/MultiEdit/
+/// patch/ctx_patch/...) runs, so evidence from before this edit can't cover
+/// a since-changed tree -- diagnosis evidence is deliberately NOT cleared
+/// here, see `SessionRecord::last_diagnosis`'s doc comment.
 pub fn post_tool_use(_agent: &str) {
     let Some(input) = read_stdin_or_skip("PostToolUse") else {
         return;
@@ -267,6 +271,7 @@ pub fn post_tool_use(_agent: &str) {
                 recent_tool_calls: vec![],
                 last_verification: None,
                 last_review: None,
+                last_diagnosis: None,
             });
         record.last_review = Some(crate::optimize::ReviewEvidence {
             source: parsed.tool_name.clone(),
@@ -279,7 +284,9 @@ pub fn post_tool_use(_agent: &str) {
     let Some(command) = &parsed.command else {
         return;
     };
-    if !crate::optimize::is_verification_command(command) {
+    let is_verification = crate::optimize::is_verification_command(command);
+    let is_diagnosis = crate::optimize::is_diagnosis_command(command);
+    if !is_verification && !is_diagnosis {
         return;
     }
 
@@ -296,13 +303,22 @@ pub fn post_tool_use(_agent: &str) {
             recent_tool_calls: vec![],
             last_verification: None,
             last_review: None,
+            last_diagnosis: None,
         });
-    record.last_verification = Some(crate::optimize::VerificationEvidence {
-        command: command.clone(),
-        exit_code: parsed.exit_code,
-        passed,
-        ts: now,
-    });
+    if crate::optimize::is_verification_command(command) {
+        record.last_verification = Some(crate::optimize::VerificationEvidence {
+            command: command.clone(),
+            exit_code: parsed.exit_code,
+            passed,
+            ts: now,
+        });
+    }
+    if crate::optimize::is_diagnosis_command(command) {
+        record.last_diagnosis = Some(crate::optimize::DiagnosisEvidence {
+            command: command.clone(),
+            ts: now,
+        });
+    }
     crate::optimize::save_runtime(&runtime);
 }
 

@@ -349,6 +349,41 @@ pub fn post_tool_failure(_agent: &str) {
 // #169) -- split out to stay under this file's LOC gate.
 pub use crate::hook_completion_gate::post_tool_use;
 
+/// Resolves an `item done`/`check_merge` call's target item to its
+/// `metadata.task_type`, for the systematic-debugging completion gate (item
+/// #203) -- `None` for any other tool call, action, or lookup failure (bad
+/// id, missing DB, item not found, unparseable metadata). Same "unknown, not
+/// failed" fail-open convention used throughout this file: a lookup failure
+/// must never add a diagnosis requirement that wasn't already there. This is
+/// a synchronous local SQLite read, precedented by `session_start_message`'s
+/// own unconditional `agentflare_backend::db::open_db` call above -- no
+/// timeout wrapper needed.
+fn resolve_item_task_type(
+    tool_name: &str,
+    tool_input: Option<&serde_json::Value>,
+) -> Option<String> {
+    if tool_name != crate::hook_redirect::ITEM_TOOL_NAME && tool_name != "item" {
+        return None;
+    }
+    let action = tool_input?.get("action")?.as_str()?;
+    if !crate::hook_redirect::GATED_ITEM_ACTIONS.contains(&action) {
+        return None;
+    }
+    let id_or_seq = tool_input?.get("id")?.as_str()?;
+    let db_path = crate::paths::home().join(".agentflare").join("backend.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = agentflare_backend::db::open_db(&db_path).ok()?;
+    let item_id = agentflare_backend::item::resolve_id(&conn, None, id_or_seq).ok()?;
+    let item = agentflare_backend::item::get(&conn, &item_id).ok()?;
+    let metadata: serde_json::Value = serde_json::from_str(&item.metadata).ok()?;
+    metadata
+        .get("task_type")
+        .and_then(serde_json::Value::as_str)
+        .map(String::from)
+}
+
 pub fn pre_tool_use(_agent: &str) {
     let Some(input) = read_stdin_or_skip("PreToolUse") else {
         return;
@@ -395,17 +430,22 @@ pub fn pre_tool_use(_agent: &str) {
             recent_tool_calls: vec![],
             last_verification: None,
             last_review: None,
+            last_diagnosis: None,
         });
 
-    // Completion gate (item #169, extended by item #182): `item
-    // done`/`check_merge` requires fresh, passing verification evidence AND
-    // fresh review evidence for this session -- see
+    // Completion gate (item #169, extended by item #182, extended by item
+    // #203): `item done`/`check_merge` requires fresh, passing verification
+    // evidence AND fresh review evidence for this session, AND (for a
+    // task_type=bugfix item) diagnosis evidence -- see
     // hook_redirect::completion_gate_reason's doc comment.
+    let task_type = resolve_item_task_type(&parsed.tool_name, parsed.tool_input.as_ref());
     if let Some(reason) = crate::hook_redirect::completion_gate_reason(
         &parsed.tool_name,
         parsed.tool_input.as_ref(),
         crate::optimize::has_fresh_passing_verification(record, now),
         crate::optimize::has_fresh_review(record, now),
+        crate::optimize::has_fresh_diagnosis_evidence(record),
+        task_type.as_deref(),
     ) {
         let decision = json!({
             "hookSpecificOutput": {
@@ -644,6 +684,7 @@ pub fn prompt_submit(agent: &str) {
                     recent_tool_calls: vec![],
                     last_verification: None,
                     last_review: None,
+                    last_diagnosis: None,
                 });
         first_turn = record.turn_count == 0;
         record.turn_count += 1;

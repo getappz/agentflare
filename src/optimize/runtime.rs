@@ -35,6 +35,16 @@ pub struct SessionRecord {
     /// (a review of a since-changed tree doesn't cover the current diff).
     #[serde(default)]
     pub last_review: Option<ReviewEvidence>,
+    /// Most recent root-cause-investigation command this session actually
+    /// ran, used by the completion gate (item #203) to require evidence of
+    /// diagnosis before `item done`/`check_merge` on a `task_type=bugfix`
+    /// item -- see [`DiagnosisEvidence`]. Unlike `last_verification`/
+    /// `last_review`, this is NOT cleared by a later mutating tool call: a
+    /// test run stops proving anything once the tree changes underneath it,
+    /// but "did you look at recent history/a working analog before fixing"
+    /// isn't undone by the edit that follows it.
+    #[serde(default)]
+    pub last_diagnosis: Option<DiagnosisEvidence>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -64,6 +74,18 @@ pub struct VerificationEvidence {
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct ReviewEvidence {
     pub source: String,
+    pub ts: u64,
+}
+
+/// Evidence that a root-cause-investigation command was actually run in this
+/// session, captured by the `PostToolUse` success hook
+/// (`hook_completion_gate::post_tool_use`) when a Bash-family call's command
+/// matches [`is_diagnosis_command`]. Mirrors [`VerificationEvidence`], minus
+/// the pass/fail signal -- a diagnosis command has no exit-code notion of
+/// "succeeded," it either ran or it didn't.
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct DiagnosisEvidence {
+    pub command: String,
     pub ts: u64,
 }
 
@@ -150,13 +172,13 @@ fn strip_quoted_substrings(s: &str) -> String {
     out
 }
 
-/// True when `command` looks like a test/build/lint invocation -- see
-/// [`VERIFICATION_COMMAND_MARKERS`]. Splits on shell statement separators
-/// and checks each statement independently (same convention as
-/// `hook_redirect::destructive_data_file_reason`) so a marker string only
-/// counts when some statement actually looks like it invokes that program,
-/// not merely mentions it as a quoted argument to `grep`/`echo`/etc.
-pub fn is_verification_command(command: &str) -> bool {
+/// Splits `command` on shell statement separators and checks each statement
+/// independently (same convention as `hook_redirect::destructive_data_file_reason`)
+/// against `markers`, so a marker string only counts when some statement
+/// actually looks like it invokes that program, not merely mentions it as a
+/// quoted argument to `grep`/`echo`/etc. Shared by [`is_verification_command`]
+/// and [`is_diagnosis_command`] -- same detection style, different marker set.
+fn command_matches_any_marker(command: &str, markers: &[&str]) -> bool {
     for statement in command
         .split(['\n', ';'])
         .flat_map(|s| s.split("&&"))
@@ -172,14 +194,17 @@ pub fn is_verification_command(command: &str) -> bool {
         if NON_EXECUTING_FIRST_WORDS.contains(&first_word) {
             continue;
         }
-        if VERIFICATION_COMMAND_MARKERS
-            .iter()
-            .any(|marker| trimmed.contains(marker))
-        {
+        if markers.iter().any(|marker| trimmed.contains(marker)) {
             return true;
         }
     }
     false
+}
+
+/// True when `command` looks like a test/build/lint invocation -- see
+/// [`VERIFICATION_COMMAND_MARKERS`].
+pub fn is_verification_command(command: &str) -> bool {
+    command_matches_any_marker(command, VERIFICATION_COMMAND_MARKERS)
 }
 
 /// Whether `record` carries verification evidence recent and passing enough
@@ -189,6 +214,30 @@ pub fn has_fresh_passing_verification(record: &SessionRecord, now: u64) -> bool 
         .last_verification
         .as_ref()
         .is_some_and(|v| v.passed && now.saturating_sub(v.ts) < VERIFICATION_FRESHNESS_SECS)
+}
+
+/// Substrings (lowercased) that mark a shell command as a root-cause-
+/// investigation step worth recording as diagnosis evidence for the
+/// systematic-debugging completion gate (item #203) -- "check recent
+/// changes," the mechanical footprint of `systematic-debugging`'s Phase 1
+/// step 3 / Phase 2 step 1. Same false-positive-tolerant philosophy as
+/// [`VERIFICATION_COMMAND_MARKERS`]: an accidental match only makes the gate
+/// slightly more permissive, never less safe.
+const DIAGNOSIS_COMMAND_MARKERS: &[&str] =
+    &["git log", "git blame", "git diff", "git show", "git bisect"];
+
+/// True when `command` looks like a diagnosis/investigation step -- see
+/// [`DIAGNOSIS_COMMAND_MARKERS`].
+pub fn is_diagnosis_command(command: &str) -> bool {
+    command_matches_any_marker(command, DIAGNOSIS_COMMAND_MARKERS)
+}
+
+/// Whether `record` carries diagnosis evidence recorded this session at all.
+/// Unlike [`has_fresh_passing_verification`], there's no pass/fail and --
+/// per [`SessionRecord::last_diagnosis`]'s doc comment -- no invalidation on
+/// a later edit, so recency here is just "exists," not a freshness window.
+pub fn has_fresh_diagnosis_evidence(record: &SessionRecord) -> bool {
+    record.last_diagnosis.is_some()
 }
 
 /// True when `tool_name` is the structural signal that a code review just
@@ -498,6 +547,7 @@ mod tests {
                     recent_tool_calls: vec![],
                     last_verification: None,
                     last_review: None,
+                    last_diagnosis: None,
                 },
             );
             save_runtime(&state);
@@ -527,6 +577,7 @@ mod tests {
                 recent_tool_calls: vec![],
                 last_verification: None,
                 last_review: None,
+                last_diagnosis: None,
             },
         );
         state.sessions.insert(
@@ -537,6 +588,7 @@ mod tests {
                 recent_tool_calls: vec![],
                 last_verification: None,
                 last_review: None,
+                last_diagnosis: None,
             },
         );
         let now = 100_100; // 100s after "recent", ~27.7h after "old"
@@ -553,6 +605,7 @@ mod tests {
             recent_tool_calls: vec![],
             last_verification: None,
             last_review: None,
+            last_diagnosis: None,
         };
         assert!(session_hygiene_nudge(&record, 100).is_none());
     }
@@ -565,6 +618,7 @@ mod tests {
             recent_tool_calls: vec![],
             last_verification: None,
             last_review: None,
+            last_diagnosis: None,
         };
         assert!(session_hygiene_nudge(&record, 100).is_some());
     }
@@ -577,6 +631,7 @@ mod tests {
             recent_tool_calls: vec![],
             last_verification: None,
             last_review: None,
+            last_diagnosis: None,
         };
         assert!(session_hygiene_nudge(&record, 2 * 60 * 60 + 1).is_some());
     }
@@ -662,6 +717,89 @@ mod tests {
     }
 
     #[test]
+    fn is_diagnosis_command_matches_investigation_commands() {
+        assert!(is_diagnosis_command("git log --oneline -- src/foo.rs"));
+        assert!(is_diagnosis_command("git blame src/foo.rs"));
+        assert!(is_diagnosis_command("git diff HEAD~3 -- src/foo.rs"));
+        assert!(is_diagnosis_command("git show abc123"));
+        assert!(is_diagnosis_command("git bisect start"));
+    }
+
+    #[test]
+    fn is_diagnosis_command_ignores_unrelated_commands() {
+        assert!(!is_diagnosis_command("ls -la"));
+        assert!(!is_diagnosis_command("cargo test"));
+        assert!(!is_diagnosis_command("git status"));
+    }
+
+    #[test]
+    fn is_diagnosis_command_ignores_marker_mentioned_in_quoted_grep_pattern() {
+        assert!(!is_diagnosis_command("grep -rn \"git log\" src/"));
+        assert!(!is_diagnosis_command("echo \"remember to run git blame\""));
+    }
+
+    #[test]
+    fn is_diagnosis_command_still_matches_real_invocation_after_pipe_or_chain() {
+        assert!(is_diagnosis_command(
+            "grep -rn \"git log\" src/ ; git log --oneline"
+        ));
+        assert!(is_diagnosis_command("cd foo && git diff | less"));
+    }
+
+    #[test]
+    fn has_fresh_diagnosis_evidence_true_when_recorded() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: None,
+            last_review: None,
+            last_diagnosis: Some(DiagnosisEvidence {
+                command: "git log".into(),
+                ts: 1000,
+            }),
+        };
+        assert!(has_fresh_diagnosis_evidence(&record));
+    }
+
+    #[test]
+    fn has_fresh_diagnosis_evidence_false_when_absent() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: None,
+            last_review: None,
+            last_diagnosis: None,
+        };
+        assert!(!has_fresh_diagnosis_evidence(&record));
+    }
+
+    #[test]
+    fn invalidate_verification_does_not_clear_diagnosis_evidence() {
+        // The one behavioral difference from last_verification/last_review:
+        // a mutating tool call must NOT undo diagnosis evidence -- see
+        // SessionRecord::last_diagnosis's doc comment for why.
+        let mut state = RuntimeState::default();
+        state.sessions.insert(
+            "s1".to_string(),
+            SessionRecord {
+                start_ts: 0,
+                turn_count: 0,
+                recent_tool_calls: vec![],
+                last_verification: None,
+                last_review: None,
+                last_diagnosis: Some(DiagnosisEvidence {
+                    command: "git log".into(),
+                    ts: 1000,
+                }),
+            },
+        );
+        invalidate_verification(&mut state, "s1");
+        assert!(state.sessions["s1"].last_diagnosis.is_some());
+    }
+
+    #[test]
     fn invalidate_verification_clears_existing_evidence() {
         let mut state = RuntimeState::default();
         state.sessions.insert(
@@ -677,6 +815,7 @@ mod tests {
                     ts: 1000,
                 }),
                 last_review: None,
+                last_diagnosis: None,
             },
         );
         invalidate_verification(&mut state, "s1");
@@ -719,6 +858,7 @@ mod tests {
                     source: "code-review".into(),
                     ts: 1000,
                 }),
+                last_diagnosis: None,
             },
         );
         invalidate_review(&mut state, "s1");
@@ -743,6 +883,7 @@ mod tests {
                 source: "code-review".into(),
                 ts: 1000,
             }),
+            last_diagnosis: None,
         };
         assert!(has_fresh_review(&record, 1000 + 60));
     }
@@ -758,6 +899,7 @@ mod tests {
                 source: "code-review".into(),
                 ts: 1000,
             }),
+            last_diagnosis: None,
         };
         assert!(!has_fresh_review(
             &record,
@@ -773,6 +915,7 @@ mod tests {
             recent_tool_calls: vec![],
             last_verification: None,
             last_review: None,
+            last_diagnosis: None,
         };
         assert!(!has_fresh_review(&record, 1000));
     }
@@ -790,6 +933,7 @@ mod tests {
                 ts: 1000,
             }),
             last_review: None,
+            last_diagnosis: None,
         };
         assert!(has_fresh_passing_verification(&record, 1000 + 60));
     }
@@ -807,6 +951,7 @@ mod tests {
                 ts: 1000,
             }),
             last_review: None,
+            last_diagnosis: None,
         };
         assert!(!has_fresh_passing_verification(
             &record,
@@ -827,6 +972,7 @@ mod tests {
                 ts: 1000,
             }),
             last_review: None,
+            last_diagnosis: None,
         };
         assert!(!has_fresh_passing_verification(&record, 1000));
     }
@@ -839,6 +985,7 @@ mod tests {
             recent_tool_calls: vec![],
             last_verification: None,
             last_review: None,
+            last_diagnosis: None,
         };
         assert!(!has_fresh_passing_verification(&record, 1000));
     }
