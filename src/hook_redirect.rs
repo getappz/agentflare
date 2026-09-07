@@ -274,7 +274,7 @@ pub(crate) const ITEM_TOOL_NAME: &str = "mcp__flare__item";
 /// updates a PR and moves the item to in_review; `check_merge` promotes
 /// in_review -> completed once that PR is confirmed merged. Both are the
 /// completion-claim moment the verification gate protects (item #169).
-const GATED_ITEM_ACTIONS: &[&str] = &["done", "check_merge"];
+pub(crate) const GATED_ITEM_ACTIONS: &[&str] = &["done", "check_merge"];
 
 /// Blocks `item done` / `item check_merge` until this session has a fresh,
 /// passing verification-evidence record (`crate::optimize::VerificationEvidence`,
@@ -302,11 +302,21 @@ const GATED_ITEM_ACTIONS: &[&str] = &["done", "check_merge"];
 /// humans actually use this tool, narrowing this to SDD-dispatched calls
 /// only is a small, contained change (one more parameter here) -- flagged
 /// for the user to weigh in on rather than treated as settled.
+///
+/// Also requires a diagnosis-evidence record (`crate::optimize::DiagnosisEvidence`,
+/// item #203) when `task_type` resolves to `"bugfix"` -- see
+/// `optimize::is_diagnosis_command`'s doc comment. `task_type` and
+/// `has_fresh_diagnosis` are resolved in `hook.rs::pre_tool_use` (a backend
+/// DB lookup, fail-open to `None` on any failure) and passed in already-
+/// resolved, same as `has_fresh_verification`/`has_fresh_review`, so this
+/// function stays a pure decision core with no IO of its own.
 pub(crate) fn completion_gate_reason(
     tool_name: &str,
     tool_input: Option<&Value>,
     has_fresh_verification: bool,
     has_fresh_review: bool,
+    has_fresh_diagnosis: bool,
+    task_type: Option<&str>,
 ) -> Option<String> {
     if tool_name != ITEM_TOOL_NAME && tool_name != "item" {
         return None;
@@ -325,6 +335,11 @@ pub(crate) fn completion_gate_reason(
         return Some(format!(
             "no fresh code review evidence for this session -- run a review that reports through the `ReportFindings` tool (this session's `/code-review` skill does) before calling `item` action={action}; a review more than {}m ago doesn't count, and dispatching a reviewer subagent isn't enough on its own -- its findings have to actually come back and get reported.",
             crate::optimize::VERIFICATION_FRESHNESS_SECS / 60
+        ));
+    }
+    if task_type == Some("bugfix") && !has_fresh_diagnosis {
+        return Some(format!(
+            "no root-cause-investigation evidence for this session -- this is a bugfix item, so run a diagnosis command (e.g. `git log`, `git diff`, `git blame` on the affected paths) via Bash before calling `item` action={action}; systematic-debugging's Iron Law is NO FIX WITHOUT ROOT-CAUSE INVESTIGATION FIRST."
         ));
     }
     None
@@ -828,7 +843,9 @@ mod tests {
     #[test]
     fn completion_gate_blocks_item_done_without_verification() {
         let input = json!({ "id": "abc", "action": "done" });
-        let reason = completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false).unwrap();
+        let reason =
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false, false, None)
+                .unwrap();
         assert!(reason.contains("verification"), "{reason}");
         assert!(reason.contains("action=done"), "{reason}");
     }
@@ -836,13 +853,17 @@ mod tests {
     #[test]
     fn completion_gate_blocks_check_merge_without_verification() {
         let input = json!({ "id": "abc", "action": "check_merge" });
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false).is_some());
+        assert!(
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false, false, None)
+                .is_some()
+        );
     }
 
     #[test]
     fn completion_gate_blocks_item_done_with_verification_but_no_review() {
         let input = json!({ "id": "abc", "action": "done" });
-        let reason = completion_gate_reason(ITEM_TOOL_NAME, Some(&input), true, false).unwrap();
+        let reason =
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), true, false, false, None).unwrap();
         assert!(reason.contains("review"), "{reason}");
         assert!(reason.contains("action=done"), "{reason}");
         assert!(!reason.contains("verification evidence"), "{reason}");
@@ -851,34 +872,111 @@ mod tests {
     #[test]
     fn completion_gate_allows_item_done_with_fresh_verification_and_review() {
         let input = json!({ "id": "abc", "action": "done" });
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), true, true).is_none());
+        assert!(
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), true, true, false, None).is_none()
+        );
     }
 
     #[test]
     fn completion_gate_ignores_other_item_actions() {
         let input = json!({ "id": "abc", "action": "claim" });
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false).is_none());
+        assert!(
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false, false, None)
+                .is_none()
+        );
         let input = json!({ "id": "abc", "action": "update" });
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false).is_none());
+        assert!(
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false, false, None)
+                .is_none()
+        );
     }
 
     #[test]
     fn completion_gate_ignores_unrelated_tools() {
         let input = json!({ "action": "done" });
-        assert!(completion_gate_reason("Bash", Some(&input), false, false).is_none());
-        assert!(completion_gate_reason("mcp__flare__comment", Some(&input), false, false).is_none());
+        assert!(completion_gate_reason("Bash", Some(&input), false, false, false, None).is_none());
+        assert!(
+            completion_gate_reason(
+                "mcp__flare__comment",
+                Some(&input),
+                false,
+                false,
+                false,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn completion_gate_ignores_missing_input_or_action() {
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, None, false, false).is_none());
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&json!({})), false, false).is_none());
+        assert!(completion_gate_reason(ITEM_TOOL_NAME, None, false, false, false, None).is_none());
+        assert!(
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&json!({})), false, false, false, None)
+                .is_none()
+        );
     }
 
     #[test]
     fn completion_gate_matches_bare_item_tool_name() {
         let input = json!({ "id": "abc", "action": "done" });
-        assert!(completion_gate_reason("item", Some(&input), false, false).is_some());
+        assert!(completion_gate_reason("item", Some(&input), false, false, false, None).is_some());
+    }
+
+    #[test]
+    fn completion_gate_blocks_bugfix_item_done_with_verification_and_review_but_no_diagnosis() {
+        let input = json!({ "id": "abc", "action": "done" });
+        let reason = completion_gate_reason(
+            ITEM_TOOL_NAME,
+            Some(&input),
+            true,
+            true,
+            false,
+            Some("bugfix"),
+        )
+        .unwrap();
+        assert!(reason.contains("root-cause"), "{reason}");
+        assert!(reason.contains("action=done"), "{reason}");
+    }
+
+    #[test]
+    fn completion_gate_allows_bugfix_item_done_once_diagnosis_is_fresh_too() {
+        let input = json!({ "id": "abc", "action": "done" });
+        assert!(
+            completion_gate_reason(
+                ITEM_TOOL_NAME,
+                Some(&input),
+                true,
+                true,
+                true,
+                Some("bugfix"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn completion_gate_ignores_diagnosis_requirement_for_non_bugfix_item() {
+        let input = json!({ "id": "abc", "action": "done" });
+        assert!(
+            completion_gate_reason(
+                ITEM_TOOL_NAME,
+                Some(&input),
+                true,
+                true,
+                false,
+                Some("research"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn completion_gate_ignores_diagnosis_requirement_for_untagged_item() {
+        let input = json!({ "id": "abc", "action": "done" });
+        assert!(
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), true, true, false, None).is_none()
+        );
     }
 
     #[test]
