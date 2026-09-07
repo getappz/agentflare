@@ -21,6 +21,7 @@ tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 db_kit = { package = "agentflare-db-kit", path = "../agentflare-db-kit" }
+flare-process = { path = "../flare-process" }
 agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
 
 [dev-dependencies]

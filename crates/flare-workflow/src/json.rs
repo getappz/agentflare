@@ -407,13 +407,17 @@ impl StepExecutor<PipelineData> for CommandExecutor {
         let program = expanded[0].clone();
         let args = expanded[1..].to_vec();
 
+        // `flare_process::command` (not raw `Command::new`) so the child
+        // doesn't flash a console window on Windows, same as every other
+        // background spawn in this workspace. Wrapped in
         // `tokio::process::Command` (not `std::process::Command`) so the
         // engine's `tokio::time::timeout` around step execution actually
         // bounds the child process: on timeout the future is dropped, and
         // `kill_on_drop` kills the child instead of leaking it to run to
         // completion in the background.
-        let output = tokio::process::Command::new(&program)
-            .args(&args)
+        let mut std_cmd = flare_process::command(&program);
+        std_cmd.args(&args);
+        let output = tokio::process::Command::from(std_cmd)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .output()
