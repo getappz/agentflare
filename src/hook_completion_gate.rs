@@ -207,16 +207,20 @@ fn shows_finishing_branch_menu(tool_name: &str, action: &str, item_success: Opti
         && item_success != Some(false)
 }
 
-/// PostToolUse (success) command hook. Three independent jobs, all closing
-/// gaps from item #169's completion gate: (1) records verification evidence
-/// for the session when a Bash-family call's command matches
-/// `optimize::is_verification_command` -- this is the ONLY place that
-/// evidence is ever recorded, so `hook_redirect::completion_gate_reason`
-/// has something to check; (2) surfaces the finishing-a-development-branch
-/// decision menu once `item done`/`check_merge` actually succeeds; (3)
-/// invalidates any recorded verification evidence when a mutating tool
-/// (Write/Edit/MultiEdit/patch/ctx_patch/...) runs, so a test run that
-/// passed before this edit can't cover a since-changed tree.
+/// PostToolUse (success) command hook. Four independent jobs, all closing
+/// gaps from item #169's completion gate (extended to cover review evidence
+/// by item #182): (1) records verification evidence for the session when a
+/// Bash-family call's command matches `optimize::is_verification_command`;
+/// (2) records review evidence when the `ReportFindings` tool call succeeds
+/// (`optimize::is_review_completion` -- see its doc comment for why this,
+/// specifically, is the trigger rather than a `Skill`/`Task`/`Agent`
+/// dispatch) -- these two are the ONLY places their respective evidence is
+/// ever recorded, so `hook_redirect::completion_gate_reason` has something
+/// to check; (3) surfaces the finishing-a-development-branch decision menu
+/// once `item done`/`check_merge` actually succeeds; (4) invalidates any
+/// recorded verification/review evidence when a mutating tool (Write/Edit/
+/// MultiEdit/patch/ctx_patch/...) runs, so evidence from before this edit
+/// can't cover a since-changed tree.
 pub fn post_tool_use(_agent: &str) {
     let Some(input) = read_stdin_or_skip("PostToolUse") else {
         return;
@@ -241,6 +245,33 @@ pub fn post_tool_use(_agent: &str) {
     if crate::hook_redirect::MUTATING_TOOLS.contains(&parsed.tool_name.as_str()) {
         let mut runtime = crate::optimize::load_runtime();
         crate::optimize::invalidate_verification(&mut runtime, &parsed.session_id);
+        crate::optimize::invalidate_review(&mut runtime, &parsed.session_id);
+        crate::optimize::save_runtime(&runtime);
+        return;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if crate::optimize::is_review_completion(&parsed.tool_name) {
+        let mut runtime = crate::optimize::load_runtime();
+        crate::optimize::prune_stale_sessions(&mut runtime, now);
+        let record = runtime
+            .sessions
+            .entry(parsed.session_id.clone())
+            .or_insert_with(|| crate::optimize::SessionRecord {
+                start_ts: now,
+                turn_count: 0,
+                recent_tool_calls: vec![],
+                last_verification: None,
+                last_review: None,
+            });
+        record.last_review = Some(crate::optimize::ReviewEvidence {
+            source: parsed.tool_name.clone(),
+            ts: now,
+        });
         crate::optimize::save_runtime(&runtime);
         return;
     }
@@ -252,10 +283,6 @@ pub fn post_tool_use(_agent: &str) {
         return;
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     let passed = verification_passed(parsed.exit_code, &parsed.output_text);
 
     let mut runtime = crate::optimize::load_runtime();
@@ -268,6 +295,7 @@ pub fn post_tool_use(_agent: &str) {
             turn_count: 0,
             recent_tool_calls: vec![],
             last_verification: None,
+            last_review: None,
         });
     record.last_verification = Some(crate::optimize::VerificationEvidence {
         command: command.clone(),
@@ -298,6 +326,13 @@ mod tests {
         let parsed = parse_post_tool_use(input).unwrap();
         assert_eq!(parsed.item_action.as_deref(), Some("done"));
         assert!(parsed.command.is_none());
+    }
+
+    #[test]
+    fn parse_post_tool_use_reads_report_findings_tool_name() {
+        let input = r#"{"session_id":"s1","tool_name":"ReportFindings","tool_input":{"findings":[]},"tool_response":{}}"#;
+        let parsed = parse_post_tool_use(input).unwrap();
+        assert_eq!(parsed.tool_name, "ReportFindings");
     }
 
     #[test]
