@@ -6,7 +6,8 @@
 # Usage:
 #   repo-compare-cache.sh check <repo_path> <repo_name>
 #     Prints the cached artifact URL and exits 0 on a hit (both SHAs match).
-#     Prints nothing and exits 1 on a miss.
+#     Prints "MISS" and exits 0 on a miss (always exits 0, so the workflow's
+#     command step can treat the output as the cache-check result itself).
 #   repo-compare-cache.sh write <repo_path> <repo_name> <artifact_url>
 #     Records the current SHA pair + artifact URL for <repo_name>.
 set -euo pipefail
@@ -32,7 +33,8 @@ case "$cmd" in
         exit 0
       fi
     fi
-    exit 1
+    echo "MISS"
+    exit 0
     ;;
   write)
     artifact_url="${4:?artifact_url required for write}"

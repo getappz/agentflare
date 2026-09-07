@@ -87,9 +87,20 @@ pub struct JsonWorkflow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonStep {
     pub name: String,
-    pub agent: String,
+    /// Target agent for a prompt step. Mutually exclusive with `command` —
+    /// exactly one of the two must be set.
+    #[serde(default)]
+    pub agent: Option<String>,
     #[serde(default = "default_prompt")]
     pub prompt: String,
+    /// Run this step as a deterministic subprocess (`argv[0]` + args) instead
+    /// of dispatching a full agent turn. Each element is expanded via
+    /// `{{var}}`/`{{params.x}}` before exec; the program is run directly
+    /// (never through a shell), and its captured stdout becomes the step
+    /// output. A non-zero exit maps to `StepResult::Failed`. Mutually
+    /// exclusive with `agent`.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
     #[serde(default)]
     pub mode: JsonMode,
     #[serde(default = "default_timeout")]
@@ -201,15 +212,37 @@ pub fn compile_workflow(
         };
         let deps: Vec<&str> = deps.iter().map(String::as_str).collect();
 
-        let executor = Arc::new(PromptExecutor {
-            agent: s.agent.clone(),
-            template: s.prompt.clone(),
-            send: Arc::clone(&send),
-            model: s.model.clone(),
-            args: s.args.clone(),
-            hard_cap_secs: s.hard_cap_secs,
-            idle_timeout_secs: s.idle_timeout_secs,
-        });
+        let executor: Arc<dyn StepExecutor<PipelineData>> = match (&s.command, &s.agent) {
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "step '{}': 'command' and 'agent' are mutually exclusive",
+                    s.name
+                ));
+            }
+            (None, None) => {
+                return Err(format!(
+                    "step '{}': one of 'command' or 'agent' must be set",
+                    s.name
+                ));
+            }
+            (Some(command), None) => {
+                if command.is_empty() {
+                    return Err(format!("step '{}': 'command' must not be empty", s.name));
+                }
+                Arc::new(CommandExecutor {
+                    command: command.clone(),
+                })
+            }
+            (None, Some(agent)) => Arc::new(PromptExecutor {
+                agent: agent.clone(),
+                template: s.prompt.clone(),
+                send: Arc::clone(&send),
+                model: s.model.clone(),
+                args: s.args.clone(),
+                hard_cap_secs: s.hard_cap_secs,
+                idle_timeout_secs: s.idle_timeout_secs,
+            }),
+        };
         let mut def = StepDefinition::new(s.name.clone(), s.name.clone(), executor)
             .with_timeout(std::time::Duration::from_secs(s.timeout_secs))
             .with_mode(match &s.mode {
@@ -351,6 +384,61 @@ impl StepExecutor<PipelineData> for PromptExecutor {
 
     fn is_retryable(&self, error: &WorkflowError) -> bool {
         // Agent/prompt steps retry on any step failure by default.
+        !matches!(error, WorkflowError::ShuttingDown)
+    }
+}
+
+/// Executor that expands each `command` element and runs it as a subprocess
+/// directly — never through `sh -c`/`cmd /c` — so behavior doesn't depend on
+/// a shell dialect. Captured stdout becomes the step output; a non-zero exit
+/// fails the step with stderr attached.
+struct CommandExecutor {
+    command: Vec<String>,
+}
+
+#[async_trait]
+impl StepExecutor<PipelineData> for CommandExecutor {
+    async fn execute(&self, ctx: &mut WorkflowContext<PipelineData>) -> WorkflowResult<StepResult> {
+        let expanded: Vec<String> = self
+            .command
+            .iter()
+            .map(|arg| expand_variables(arg, &ctx.input, &ctx.variables, &ctx.params))
+            .collect();
+        let program = expanded[0].clone();
+        let args = expanded[1..].to_vec();
+
+        // `std::process::Command::output` blocks the calling thread, so run
+        // it off the async runtime via `spawn_blocking` rather than stalling
+        // a worker thread for the subprocess's whole lifetime.
+        let program_for_task = program.clone();
+        let spawned = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(&program_for_task)
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .output()
+        })
+        .await
+        .map_err(|e| WorkflowError::StepFailed {
+            step_id: StepId::new(&program),
+            message: format!("command task panicked: {e}"),
+        })?
+        .map_err(|e| WorkflowError::StepFailed {
+            step_id: StepId::new(&program),
+            message: format!("failed to run `{program}`: {e}"),
+        })?;
+
+        if !spawned.status.success() {
+            let stderr = String::from_utf8_lossy(&spawned.stderr).trim().to_string();
+            return Ok(StepResult::Failed(format!(
+                "`{program}` exited with {}: {stderr}",
+                spawned.status
+            )));
+        }
+        ctx.output = String::from_utf8_lossy(&spawned.stdout).trim().to_string();
+        Ok(StepResult::Success)
+    }
+
+    fn is_retryable(&self, error: &WorkflowError) -> bool {
         !matches!(error, WorkflowError::ShuttingDown)
     }
 }
@@ -681,5 +769,136 @@ mod tests {
         let state = engine.get_status(run).await.unwrap();
         assert_eq!(state.status, WorkflowStatus::Completed);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn command_step_runs_without_dispatching_an_agent() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_clone = std::sync::Arc::clone(&calls);
+        let send: SendMessage = Arc::new(move |inv: StepInvocation| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok((inv.prompt, 0, 0)) })
+        });
+
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "command-pipeline",
+                "steps": [
+                    {
+                        "name": "echo-step",
+                        "command": ["echo", "-n", "hello {{params.who}}"],
+                        "output_var": "greeting"
+                    },
+                    {
+                        "name": "agent-step",
+                        "agent": "writer",
+                        "prompt": "got: {{greeting}}"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let wf = compile_workflow(&json, send).unwrap();
+        let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
+        engine.register_workflow(wf).unwrap();
+        let run = engine
+            .start_workflow_with_params(
+                crate::types::WorkflowId::new("command-pipeline"),
+                PipelineData,
+                "go".into(),
+                serde_json::json!({"who": "world"}),
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_for_completion(run, "wf", std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let state = engine.get_status(run).await.unwrap();
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        assert_eq!(
+            state.variables.get("greeting").map(String::as_str),
+            Some("hello world")
+        );
+        // Only the agent step dispatched via `send`; the command step ran
+        // as a subprocess.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn command_step_nonzero_exit_fails_with_stderr() {
+        let send: SendMessage =
+            Arc::new(|inv: StepInvocation| Box::pin(async move { Ok((inv.prompt, 0, 0)) }));
+
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "failing-command-pipeline",
+                "steps": [
+                    {
+                        "name": "boom",
+                        "command": ["sh", "-c", "echo oops >&2; exit 3"]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let wf = compile_workflow(&json, send).unwrap();
+        let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
+        engine.register_workflow(wf).unwrap();
+        let run = engine
+            .start_workflow(
+                crate::types::WorkflowId::new("failing-command-pipeline"),
+                PipelineData,
+                "go".into(),
+            )
+            .await
+            .unwrap();
+        let out = engine
+            .wait_for_completion(run, "wf", std::time::Duration::from_secs(10))
+            .await;
+        assert!(out.is_err());
+        assert!(out.unwrap_err().contains("oops"));
+
+        let state = engine.get_status(run).await.unwrap();
+        assert_eq!(state.status, WorkflowStatus::Failed);
+        let err = state
+            .step_states
+            .get(&StepId::new("boom"))
+            .and_then(|s| s.last_error.clone())
+            .expect("step recorded an error");
+        assert!(err.contains("oops"), "error was: {err}");
+    }
+
+    #[test]
+    fn command_and_agent_are_mutually_exclusive() {
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "bad-pipeline",
+                "steps": [
+                    { "name": "bad", "agent": "writer", "command": ["echo", "hi"] }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let err = compile_workflow(&json, mock_send()).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "error was: {err}");
+    }
+
+    #[test]
+    fn missing_command_and_agent_is_rejected() {
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "bad-pipeline-2",
+                "steps": [
+                    { "name": "bad" }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let err = compile_workflow(&json, mock_send()).unwrap_err();
+        assert!(err.contains("must be set"), "error was: {err}");
     }
 }

@@ -4,8 +4,7 @@
   "steps": [
     {
       "name": "check-cache",
-      "agent": "claude-code",
-      "prompt": "Run: bash .agentflare/scripts/repo-compare-cache.sh check {{params.repo_path}} {{params.repo_name}} (from the agentflare repo root). Your ENTIRE reply must be ONLY one of the two things below — no explanation, no 'Exit code' commentary, no leading/trailing text or blank lines, nothing else on any line: (1) if the command prints a URL and exits 0, reply with just that URL; (2) if the command exits non-zero or prints nothing, reply with just the four characters MISS. Do no other analysis in this step.",
+      "command": ["bash", ".agentflare/scripts/repo-compare-cache.sh", "check", "{{params.repo_path}}", "{{params.repo_name}}"],
       "timeout_secs": 120,
       "output_var": "cache_check"
     },
