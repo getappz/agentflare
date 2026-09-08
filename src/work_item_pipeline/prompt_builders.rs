@@ -1,3 +1,13 @@
+/// Shared across every role prompt dispatched through the resume-capable
+/// one-shot mechanism (`resume_args_for` / `send`): a fix round may resume
+/// the conversation later, but each round is a separate process, so a
+/// verification command backgrounded in one round is unrecoverable in the
+/// next. Applied to every role that might run its own build/test/lint
+/// commands (implementer, review analyst, task reviewer, analysis reviewer,
+/// re-reviewer). The judge is excluded: its job is to emit one JSON decision
+/// from already-completed role replies, not to run verification itself.
+const RESUME_VERIFICATION_NOTE: &str = "A later fix round may resume this conversation, but each round runs as a separate process: anything you background dies with it, and the resumed round has no way to check on it. Never run build, test, or lint commands as a background task planning to report back later -- run all verification synchronously in the foreground and wait for it to complete before ending your turn.";
+
 /// Builds the prompt for the implementer role: given a task, it must implement
 /// it. If `fix_context` is provided (a prior reviewer's findings), the prompt
 /// instructs them to address those issues. When `tdd` is set (item #179),
@@ -21,9 +31,7 @@ pub(crate) fn build_implementer_prompt(
             "\nFollow test-driven development for this task: write a failing test first, confirm it fails, then write the minimal code to pass it, then refactor. Do not write implementation code before its test.\n"
         );
     }
-    prompt.push_str(
-        "\nThe judge may resume this conversation for a later fix round, but each round runs as a separate process: anything you background dies with it, and the resumed round has no way to check on it. Never run build, test, or lint commands as a background task planning to report back later -- run all verification synchronously in the foreground and wait for it to complete before ending your turn.\n"
-    );
+    prompt.push_str(&format!("\n{RESUME_VERIFICATION_NOTE}\n"));
     prompt.push_str("\nReply with a short status: what you did, tests run, and any concerns.\n");
     prompt
 }
@@ -41,6 +49,7 @@ pub(crate) fn build_review_analyst_prompt(task: &SddTask, fix_context: Option<&s
             "\nA second reviewer flagged gaps in your prior analysis:\n{ctx}\n\nAddress them and reply with your updated findings.\n"
         ));
     }
+    prompt.push_str(&format!("\n{RESUME_VERIFICATION_NOTE}\n"));
     prompt.push_str(
         "\nReply with your findings: what you reviewed and any issues found (or none).\n",
     );
@@ -62,7 +71,7 @@ pub(crate) fn build_task_reviewer_prompt(
         ""
     };
     format!(
-        "Review this task's implementation for spec compliance and code quality.{tdd_note}\n\nTask: {}\n{}\n\nImplementer's report:\n{implementer_report}\n\nReply REVIEW_APPROVED if both spec and quality pass, or REVIEW_ISSUES: followed by a bulleted list of findings.\n",
+        "Review this task's implementation for spec compliance and code quality.{tdd_note}\n\nTask: {}\n{}\n\nImplementer's report:\n{implementer_report}\n\n{RESUME_VERIFICATION_NOTE}\n\nReply REVIEW_APPROVED if both spec and quality pass, or REVIEW_ISSUES: followed by a bulleted list of findings.\n",
         task.title, task.body
     )
 }
@@ -73,7 +82,7 @@ pub(crate) fn build_task_reviewer_prompt(
 /// check, only the first pass's own analysis.
 pub(crate) fn build_review_of_analysis_prompt(task: &SddTask, analyst_report: &str) -> String {
     format!(
-        "Review this analysis for completeness and accuracy — is anything missing or wrong?\n\nTask: {}\n{}\n\nAnalyst's report:\n{analyst_report}\n\nReply REVIEW_APPROVED if the analysis is thorough and accurate, or REVIEW_ISSUES: followed by a bulleted list of gaps.\n",
+        "Review this analysis for completeness and accuracy — is anything missing or wrong?\n\nTask: {}\n{}\n\nAnalyst's report:\n{analyst_report}\n\n{RESUME_VERIFICATION_NOTE}\n\nReply REVIEW_APPROVED if the analysis is thorough and accurate, or REVIEW_ISSUES: followed by a bulleted list of gaps.\n",
         task.title, task.body
     )
 }
@@ -82,7 +91,7 @@ pub(crate) fn build_review_of_analysis_prompt(task: &SddTask, analyst_report: &s
 /// findings, and a fix report, re-review only those specific findings.
 pub(crate) fn build_re_reviewer_prompt(task: &SddTask, findings: &str, fix_report: &str) -> String {
     format!(
-        "Re-review a fix for this task's findings only — do not look for new issues.\n\nTask: {}\n\nOriginal findings:\n{findings}\n\nFix report:\n{fix_report}\n\nReply REVIEW_APPROVED if every finding is addressed, or REVIEW_ISSUES: followed by what remains.\n",
+        "Re-review a fix for this task's findings only — do not look for new issues.\n\nTask: {}\n\nOriginal findings:\n{findings}\n\nFix report:\n{fix_report}\n\n{RESUME_VERIFICATION_NOTE}\n\nReply REVIEW_APPROVED if every finding is addressed, or REVIEW_ISSUES: followed by what remains.\n",
         task.title
     )
 }

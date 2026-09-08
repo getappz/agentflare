@@ -52,6 +52,42 @@ fn implementer_prompt_forbids_backgrounding_verification() {
 }
 
 #[test]
+fn review_analyst_prompt_forbids_backgrounding_verification() {
+    // Same failure mode as the implementer (item #71/#438): the review
+    // analyst is dispatched through the identical one-shot-with-`--resume`
+    // mechanism and has the same full tool access, so it can just as easily
+    // background a verification command and lose it on resume.
+    let prompt = build_review_analyst_prompt(&sample_task(), None);
+    assert!(prompt.contains("separate process"));
+    assert!(prompt.contains("Never run build, test, or lint commands as a background task"));
+    assert!(prompt.contains("synchronously in the foreground"));
+}
+
+#[test]
+fn task_reviewer_prompt_forbids_backgrounding_verification() {
+    let prompt = build_task_reviewer_prompt(&sample_task(), "DONE: added the flag", false);
+    assert!(prompt.contains("separate process"));
+    assert!(prompt.contains("Never run build, test, or lint commands as a background task"));
+    assert!(prompt.contains("synchronously in the foreground"));
+}
+
+#[test]
+fn review_of_analysis_prompt_forbids_backgrounding_verification() {
+    let prompt = build_review_of_analysis_prompt(&sample_task(), "Found no issues");
+    assert!(prompt.contains("separate process"));
+    assert!(prompt.contains("Never run build, test, or lint commands as a background task"));
+    assert!(prompt.contains("synchronously in the foreground"));
+}
+
+#[test]
+fn re_reviewer_prompt_forbids_backgrounding_verification() {
+    let prompt = build_re_reviewer_prompt(&sample_task(), "Missing test", "Added the test");
+    assert!(prompt.contains("separate process"));
+    assert!(prompt.contains("Never run build, test, or lint commands as a background task"));
+    assert!(prompt.contains("synchronously in the foreground"));
+}
+
+#[test]
 fn task_reviewer_prompt_includes_task_and_report() {
     let prompt = build_task_reviewer_prompt(&sample_task(), "DONE: added the flag", false);
     assert!(prompt.contains("Add --verbose"));
