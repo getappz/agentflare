@@ -21,6 +21,9 @@ pub(crate) fn build_implementer_prompt(
             "\nFollow test-driven development for this task: write a failing test first, confirm it fails, then write the minimal code to pass it, then refactor. Do not write implementation code before its test.\n"
         );
     }
+    prompt.push_str(
+        "\nThe judge may resume this conversation for a later fix round, but each round runs as a separate process: anything you background dies with it, and the resumed round has no way to check on it. Never run build, test, or lint commands as a background task planning to report back later -- run all verification synchronously in the foreground and wait for it to complete before ending your turn.\n"
+    );
     prompt.push_str("\nReply with a short status: what you did, tests run, and any concerns.\n");
     prompt
 }
