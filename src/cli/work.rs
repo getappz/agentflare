@@ -1104,7 +1104,7 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
         if matches!(state_group.as_deref(), Some("completed" | "cancelled")) {
             let group = state_group.unwrap();
             return Err(agentflare_jobs::JobFailure {
-                message: format!("item {item_id} is already {group}; skipping stale queued dispatch job"),
+                message: format!("item {item_id} already {group}; skipping stale queued job"),
                 retry_after_secs: None,
                 fatal: true,
             });
