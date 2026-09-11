@@ -289,7 +289,7 @@ pub(crate) struct HandoffRequest {
     #[serde(default)]
     pub(crate) blockers: Option<Vec<String>>,
     #[schemars(
-        description = "Escape hatch for an intentional credential handoff: skips the pre-handoff secret scan (content/summary/completed/remaining/facts/findings/decisions) that otherwise rejects the call before any item/asset is written. Default false -- deny by default."
+        description = "Escape hatch for an intentional credential handoff: skips the pre-handoff secret scan (content/description/summary/completed/remaining/facts/findings/decisions/files_touched/evidence/blockers) that otherwise rejects the call before any item/asset is written. Default false -- deny by default."
     )]
     #[serde(default)]
     pub(crate) allow_secrets: Option<bool>,

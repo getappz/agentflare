@@ -1,7 +1,10 @@
 //! Pre-handoff secret scan — fail-closed guard so a pasted credential in a
 //! `handoff` payload never becomes a stored asset/item. `handoff_impl`
-//! persists `content` (+ facts/summary/findings/decisions) straight to
-//! `blob_store`/`doc_upsert_with_opts` with no check of its own;
+//! persists `content` (+ description/facts/summary/findings/decisions/
+//! files_touched/evidence/blockers) straight to `blob_store`/
+//! `doc_upsert_with_opts` — and `description` doubles as a local item's
+//! `CreateItem.description` column and, on the `recipient="github"` path, a
+//! public GitHub issue body — with no check of its own;
 //! `gateway_registry::redact_error_for_llm` only ever runs on *error*
 //! strings, not on payloads a caller supplies on purpose.
 //!

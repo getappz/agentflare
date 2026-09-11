@@ -81,6 +81,9 @@ impl AgentflareMcp {
         // error strings, not on a payload a caller supplies on purpose.
         if !allow_secrets.unwrap_or(false) {
             let mut owned: Vec<(&str, String)> = Vec::new();
+            if let Some(s) = &description {
+                owned.push(("description", s.clone()));
+            }
             if let Some(s) = &summary {
                 owned.push(("summary", s.clone()));
             }
@@ -99,6 +102,21 @@ impl AgentflareMcp {
             if let Some(decisions) = &decisions {
                 for d in decisions {
                     owned.push(("decisions[]", d.to_string()));
+                }
+            }
+            if let Some(files_touched) = &files_touched {
+                for f in files_touched {
+                    owned.push(("files_touched[]", f.to_string()));
+                }
+            }
+            if let Some(evidence) = &evidence {
+                for e in evidence {
+                    owned.push(("evidence[]", e.to_string()));
+                }
+            }
+            if let Some(blockers) = &blockers {
+                for b in blockers {
+                    owned.push(("blockers[]", b.clone()));
                 }
             }
             secret_scan::check_fields(
@@ -1235,6 +1253,82 @@ mod tests {
         };
         let err = mcp.handoff_impl(req).unwrap_err();
         assert!(err.to_string().contains("findings[]"), "{err}");
+    }
+
+    #[test]
+    fn secret_solely_in_description_is_blocked_even_with_clean_content() {
+        // `description` lands directly in `CreateItem.description` (a local
+        // item column, no blob indirection) and, on the recipient="github"
+        // path, in a public GitHub issue body -- a secret confined to this
+        // field alone, with clean content/summary/facts, must not sail
+        // through either.
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            description: Some("uses ghp_abcdefghijklmnopqrstuvwxyz012345 to auth".to_string()),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("description"), "{msg}");
+        assert!(
+            !msg.contains("ghp_abcdefghijklmnopqrstuvwxyz012345"),
+            "{msg}"
+        );
+
+        let items = mcp
+            .with_backend_db(|conn| {
+                let project = mcp.resolve_project(conn).unwrap();
+                agentflare_backend::item::list_by_assignee_agent(
+                    conn,
+                    &project.id,
+                    &agent_registry::canonicalize("claude-code"),
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(
+            items.is_empty(),
+            "a secret confined to description must not leave an orphan item behind"
+        );
+    }
+
+    #[test]
+    fn secret_in_files_touched_is_blocked() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            files_touched: Some(vec![serde_json::json!({
+                "path": "src/lib.rs",
+                "modified": "left AKIAABCDEFGHIJKLMNOP in a log line",
+            })]),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        assert!(err.to_string().contains("files_touched[]"), "{err}");
+    }
+
+    #[test]
+    fn secret_in_evidence_is_blocked() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            evidence: Some(vec![serde_json::json!({
+                "kind": "log",
+                "detail": "Authorization: Bearer abc123.def456-ghi",
+            })]),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        assert!(err.to_string().contains("evidence[]"), "{err}");
+    }
+
+    #[test]
+    fn secret_in_blockers_is_blocked() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            blockers: Some(vec!["blocked on rotating xoxb-1234567890-abcdefghij".to_string()]),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        assert!(err.to_string().contains("blockers[]"), "{err}");
     }
 
     #[test]
