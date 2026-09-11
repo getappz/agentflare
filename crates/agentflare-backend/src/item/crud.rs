@@ -167,12 +167,19 @@ pub fn list_by_project_paginated(
     Ok((paged.into_iter().map(|(item, _)| item).collect(), total))
 }
 
+/// List non-deleted items carrying a given label (excludes completed/cancelled,
+/// same as `list_by_assignee_agent` below). `run_discovery_tick`'s dispatch
+/// candidate query is this function's only production caller, so a label left
+/// on a completed/cancelled item — e.g. `item_cancel` not clearing
+/// `ready-for-work` — used to keep that item dispatchable forever (item #225).
 pub fn list_by_label(conn: &Connection, project_id: &str, label_id: &str) -> Result<Vec<Item>> {
     let mut stmt = conn.prepare(
         "SELECT items.id, items.project_id, items.state_id, items.name, items.description, items.priority, items.parent_id, items.assignee_agent, items.sequence_id, items.sort_order, items.started_at, items.completed_at, items.archived_at, items.external_source, items.external_id, items.metadata, items.created_at, items.updated_at, items.deleted_at, items.start_date, items.due_date
          FROM items
          INNER JOIN item_labels ON item_labels.item_id = items.id
+         JOIN states s ON s.id = items.state_id
          WHERE item_labels.label_id = ?1 AND items.project_id = ?2 AND items.deleted_at IS NULL
+           AND s.group_name NOT IN ('completed', 'cancelled')
          ORDER BY items.sort_order",
     )?;
     let rows = stmt.query_map(rusqlite::params![label_id, project_id], row_to_item)?;
