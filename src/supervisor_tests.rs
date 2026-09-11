@@ -944,6 +944,53 @@ fn job_in_flight_detects_a_queued_job_for_the_item() {
 }
 
 #[test]
+fn second_tick_does_not_reenqueue_while_job_still_queued() {
+    // Item #221: every discovery tick enqueued a fresh row per ready item
+    // (96+ dupes observed live) because dispatch_item never checked for an
+    // existing queued/running row. Re-arm the ready label the way a failed
+    // swap or a reconcile-restore would, tick again: still exactly one row.
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_ready_item(&mcp, Some("claude-code"));
+
+    let auth_conn = test_auth_conn();
+    let first = run_discovery_tick(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+    assert_eq!(first.dispatched, 1);
+    assert_eq!(queue.list(None).unwrap().len(), 1);
+
+    mcp.with_backend_db(|conn| {
+        let project = mcp.resolve_project(conn).unwrap();
+        let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+        let ready_id = labels
+            .iter()
+            .find(|l| l.name == "ready-for-work")
+            .unwrap()
+            .id
+            .clone();
+        agentflare_backend::item::add_label(conn, &item_id, &ready_id).unwrap();
+    })
+    .unwrap();
+
+    let second = run_discovery_tick(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+    assert_eq!(second.dispatched, 0);
+    assert_eq!(
+        queue.list(None).unwrap().len(),
+        1,
+        "re-armed ready label must not produce a second queued row"
+    );
+}
+
+#[test]
 fn run_review_sweep_ignores_items_not_in_review() {
     let mcp = test_mcp();
     let queue = test_queue();
