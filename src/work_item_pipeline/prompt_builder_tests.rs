@@ -57,7 +57,7 @@ fn review_analyst_prompt_forbids_backgrounding_verification() {
     // analyst is dispatched through the identical one-shot-with-`--resume`
     // mechanism and has the same full tool access, so it can just as easily
     // background a verification command and lose it on resume.
-    let prompt = build_review_analyst_prompt(&sample_task(), None);
+    let prompt = build_review_analyst_prompt(&sample_task(), None, false);
     assert!(prompt.contains("separate process"));
     assert!(prompt.contains("Never run build, test, or lint commands as a background task"));
     assert!(prompt.contains("synchronously in the foreground"));
@@ -109,7 +109,7 @@ fn task_reviewer_prompt_omits_test_first_check_by_default() {
 
 #[test]
 fn review_analyst_prompt_forbids_writing_code() {
-    let prompt = build_review_analyst_prompt(&sample_task(), None);
+    let prompt = build_review_analyst_prompt(&sample_task(), None, false);
     assert!(prompt.contains("analysis only"));
     assert!(prompt.contains("Do not write, edit, or commit any code"));
     assert!(prompt.contains("Add --verbose"));
@@ -118,9 +118,22 @@ fn review_analyst_prompt_forbids_writing_code() {
 
 #[test]
 fn review_analyst_prompt_includes_fix_context_when_present() {
-    let prompt =
-        build_review_analyst_prompt(&sample_task(), Some("Second reviewer found: gap in X"));
+    let prompt = build_review_analyst_prompt(
+        &sample_task(),
+        Some("Second reviewer found: gap in X"),
+        false,
+    );
     assert!(prompt.contains("Second reviewer found: gap in X"));
+}
+
+#[test]
+fn review_analyst_prompt_instructs_writing_a_spec_when_design_spec() {
+    let prompt = build_review_analyst_prompt(&sample_task(), None, true);
+    assert!(prompt.contains("design-spec task"));
+    assert!(prompt.contains("write no application code"));
+    assert!(prompt.contains("written design/analysis document"));
+    assert!(prompt.contains("spec file's path"));
+    assert!(!prompt.contains("analysis only"));
 }
 
 #[test]
@@ -133,19 +146,41 @@ fn review_of_analysis_prompt_does_not_mention_code_quality() {
 
 #[test]
 fn judge_prompt_notes_review_only_mode_when_set() {
-    let prompt = build_judge_prompt(&[sample_task()], 0, &[], "Findings: none", true);
+    let prompt = build_judge_prompt(&[sample_task()], 0, &[], "Findings: none", true, false);
     assert!(prompt.contains("review-only task"));
 }
 
 #[test]
 fn judge_prompt_omits_review_only_note_by_default() {
-    let prompt = build_judge_prompt(&[sample_task()], 0, &[], "DONE: implemented flag", false);
+    let prompt = build_judge_prompt(
+        &[sample_task()],
+        0,
+        &[],
+        "DONE: implemented flag",
+        false,
+        false,
+    );
+    assert!(!prompt.contains("review-only task"));
+}
+
+#[test]
+fn judge_prompt_notes_design_spec_deliverable_when_set() {
+    let prompt = build_judge_prompt(&[sample_task()], 0, &[], "Findings: none", true, true);
+    assert!(prompt.contains("design-spec task"));
+    assert!(prompt.contains("written spec/design document"));
     assert!(!prompt.contains("review-only task"));
 }
 
 #[test]
 fn judge_prompt_instructs_json_only_output() {
-    let prompt = build_judge_prompt(&[sample_task()], 0, &[], "DONE: implemented flag", false);
+    let prompt = build_judge_prompt(
+        &[sample_task()],
+        0,
+        &[],
+        "DONE: implemented flag",
+        false,
+        false,
+    );
     assert!(prompt.contains("JSON"));
     assert!(prompt.contains("DONE: implemented flag"));
 }
@@ -153,7 +188,7 @@ fn judge_prompt_instructs_json_only_output() {
 #[test]
 fn judge_prompt_includes_ledger_history() {
     let ledger = vec!["Task 0: fix round 1/5 (1 addressed)".to_string()];
-    let prompt = build_judge_prompt(&[sample_task()], 0, &ledger, "REVIEW_APPROVED", false);
+    let prompt = build_judge_prompt(&[sample_task()], 0, &ledger, "REVIEW_APPROVED", false, false);
     assert!(prompt.contains("fix round 1/5"));
 }
 
@@ -179,7 +214,7 @@ fn judge_prompt_formats_multiple_tasks_on_separate_lines() {
             model_tier: None,
         },
     ];
-    let prompt = build_judge_prompt(&tasks, 1, &[], "Test role reply", false);
+    let prompt = build_judge_prompt(&tasks, 1, &[], "Test role reply", false, false);
 
     // Split the prompt by newlines and verify each task appears on its own line
     let lines: Vec<&str> = prompt.lines().collect();

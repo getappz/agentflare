@@ -1,4 +1,4 @@
-use super::detect_review_only;
+use super::{detect_design_spec, detect_review_only};
 use serde_json::json;
 
 #[test]
@@ -93,4 +93,48 @@ fn explicit_non_forcing_task_type_overrides_the_free_text_scan() {
         !detect_review_only(&description, &json!({"task_type": "implementation"})),
         "an explicit non-forcing task_type must skip the free-text scan entirely"
     );
+}
+
+#[test]
+fn detect_design_spec_true_for_explicit_task_type() {
+    assert!(detect_design_spec(
+        "propose an approach",
+        &json!({"task_type": "design-spec"})
+    ));
+    assert!(detect_design_spec(
+        "propose an approach",
+        &json!({"task_type": "design_spec"})
+    ));
+}
+
+#[test]
+fn detect_design_spec_false_for_plain_review_task_type() {
+    assert!(!detect_design_spec(
+        "review this",
+        &json!({"task_type": "review"})
+    ));
+}
+
+#[test]
+fn detect_design_spec_true_for_free_text_phrase_without_task_type() {
+    assert!(detect_design_spec(
+        "Task type: design-spec (no code). Do not propose implementation code — findings/proposal only.",
+        &json!({}),
+    ));
+}
+
+#[test]
+fn detect_design_spec_false_for_review_only_phrase_without_design_spec_wording() {
+    assert!(!detect_design_spec(
+        "REVIEW ONLY — do not fix, do not push, do not open a PR.",
+        &json!({}),
+    ));
+}
+
+#[test]
+fn detect_design_spec_false_for_plain_implementation_request() {
+    assert!(!detect_design_spec(
+        "Fix the null pointer in parser.rs",
+        &json!({}),
+    ));
 }

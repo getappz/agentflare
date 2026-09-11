@@ -110,6 +110,16 @@ pub(crate) struct WorkItemData {
     /// silently skips them as unreadable.
     #[serde(default)]
     pub review_only: bool,
+    /// Set from `detect_design_spec` at dispatch time (item #216) — narrows
+    /// `review_only`'s generic "no code, no artifacts" framing for the
+    /// design-spec flavor of review-only task, whose deliverable is a
+    /// written spec document rather than zero output. Meaningless unless
+    /// `review_only` is also set; routes `sdd_loop`'s role/judge prompts to
+    /// the design-spec wording instead of the plain-review one.
+    ///
+    /// `#[serde(default)]` for the same reason as `review_only`.
+    #[serde(default)]
+    pub design_spec: bool,
     /// Set from `detect_tdd_mode` at dispatch time (item #179) — an
     /// opt-in, item-level flag (no free-text fallback like `review_only`
     /// needs, since this has no legacy callers to support) that appends
@@ -370,7 +380,11 @@ pub(crate) fn build_sdd_loop_step(
                             // task, the analyst to revise their findings).
                             let fix_context = ctx.data.review_issues.as_deref();
                             let prompt = if ctx.data.review_only {
-                                build_review_analyst_prompt(&task, fix_context)
+                                build_review_analyst_prompt(
+                                    &task,
+                                    fix_context,
+                                    ctx.data.design_spec,
+                                )
                             } else {
                                 build_implementer_prompt(&task, fix_context, ctx.data.tdd)
                             };
@@ -388,7 +402,7 @@ pub(crate) fn build_sdd_loop_step(
                     } else {
                         // Fresh task, nothing dispatched yet.
                         let prompt = if ctx.data.review_only {
-                            build_review_analyst_prompt(&task, None)
+                            build_review_analyst_prompt(&task, None, ctx.data.design_spec)
                         } else {
                             build_implementer_prompt(&task, None, ctx.data.tdd)
                         };
@@ -454,6 +468,7 @@ pub(crate) fn build_sdd_loop_step(
                     &ctx.data.ledger,
                     &role_reply,
                     ctx.data.review_only,
+                    ctx.data.design_spec,
                 );
                 let judge_invocation = flare_workflow::json::StepInvocation {
                     args: resume_args_for(&judge_agent_name, &ctx.data.agent_sessions),
@@ -991,6 +1006,9 @@ pub(crate) fn run_or_resume_with_sender(
     // Seeds `WorkItemData::review_only` (item #507) the same way — computed
     // once here so both `start_workflow` call sites below agree.
     let review_only = detect_review_only(&item_description, &existing_metadata);
+    // Seeds `WorkItemData::design_spec` (item #216) the same way — only
+    // meaningful when `review_only` is also set.
+    let design_spec = detect_design_spec(&item_description, &existing_metadata);
     // Seeds `WorkItemData::tdd` (item #179) the same way.
     let tdd = detect_tdd_mode(&existing_metadata);
 
@@ -1026,6 +1044,7 @@ pub(crate) fn run_or_resume_with_sender(
             notify_recipient: notify_recipient.clone(),
             tasks: tasks.clone(),
             review_only,
+            design_spec,
             tdd,
             worktree_path: worktree_path.clone(),
             ..Default::default()

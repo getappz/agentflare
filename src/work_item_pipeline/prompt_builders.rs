@@ -39,20 +39,39 @@ pub(crate) fn build_implementer_prompt(
 /// Review-only counterpart of `build_implementer_prompt` (item #507): same
 /// fix-round re-dispatch shape, but the role is constrained to analysis —
 /// it must never write, edit, or commit code, or open a pull request.
-pub(crate) fn build_review_analyst_prompt(task: &SddTask, fix_context: Option<&str>) -> String {
-    let mut prompt = format!(
-        "You are reviewing one task from a larger plan — analysis only. Do not write, edit, or commit any code, and do not open a pull request.\n\nTask: {}\n\n{}\n",
-        task.title, task.body
-    );
+///
+/// `design_spec` (item #216) narrows that framing for the design-spec flavor
+/// of review-only task: unlike a plain review, whose deliverable is zero
+/// artifacts (just findings), a design-spec task's deliverable *is* a written
+/// document. Without this distinction the role only ever heard "don't write
+/// code", read that as "don't produce anything", and declined to author the
+/// spec it was asked for.
+pub(crate) fn build_review_analyst_prompt(
+    task: &SddTask,
+    fix_context: Option<&str>,
+    design_spec: bool,
+) -> String {
+    let opening = if design_spec {
+        "You are working a design-spec task from a larger plan — write no application code. Your deliverable is a written design/analysis document (e.g. a spec file under docs/superpowers/specs/); produce it, don't just report that nothing exists yet. Do not open a pull request."
+    } else {
+        "You are reviewing one task from a larger plan — analysis only. Do not write, edit, or commit any code, and do not open a pull request."
+    };
+    let mut prompt = format!("{opening}\n\nTask: {}\n\n{}\n", task.title, task.body);
     if let Some(ctx) = fix_context {
         prompt.push_str(&format!(
             "\nA second reviewer flagged gaps in your prior analysis:\n{ctx}\n\nAddress them and reply with your updated findings.\n"
         ));
     }
     prompt.push_str(&format!("\n{RESUME_VERIFICATION_NOTE}\n"));
-    prompt.push_str(
-        "\nReply with your findings: what you reviewed and any issues found (or none).\n",
-    );
+    if design_spec {
+        prompt.push_str(
+            "\nReply with what you wrote: the spec file's path and a summary of its contents.\n",
+        );
+    } else {
+        prompt.push_str(
+            "\nReply with your findings: what you reviewed and any issues found (or none).\n",
+        );
+    }
     prompt
 }
 
@@ -104,6 +123,7 @@ pub(crate) fn build_judge_prompt(
     ledger: &[String],
     role_reply: &str,
     review_only: bool,
+    design_spec: bool,
 ) -> String {
     let task_list: String = tasks
         .iter()
@@ -122,7 +142,9 @@ pub(crate) fn build_judge_prompt(
         })
         .collect();
     let ledger_text: String = ledger.join("\n");
-    let mode_note = if review_only {
+    let mode_note = if design_spec {
+        "This is a design-spec task: no application code should be written, but the role's deliverable is a written spec/design document (e.g. under docs/superpowers/specs/) — completion requires that document to exist, not just a reply saying there's nothing to build.\n\n"
+    } else if review_only {
         "This is a review-only task: no code should be written; the role's job is to analyze and report findings, not implement fixes.\n\n"
     } else {
         ""
