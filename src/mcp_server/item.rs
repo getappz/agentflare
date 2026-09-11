@@ -1134,6 +1134,22 @@ impl AgentflareMcp {
             // claim_done release). No-ops if someone else holds it
             // or nobody does — `release` is owner-scoped.
             let _ = agentflare_backend::claim::release(conn, &item_id, &owner);
+            // Best-effort: strip dispatch-lifecycle labels, mirroring what
+            // `redispatch` already does in reverse (item #225) — without
+            // this a cancel shortly after handoff, before any orphan/failure
+            // cycle would've swapped the label off, leaves the item labeled
+            // `ready-for-work` and the daemon keeps re-dispatching it.
+            if let Ok(labels) = agentflare_backend::label::list_by_project(conn, &project.id) {
+                for name in [
+                    crate::supervisor::READY_LABEL,
+                    crate::supervisor::DISPATCHED_LABEL,
+                    crate::supervisor::NEEDS_MANUAL_LABEL,
+                ] {
+                    if let Some(label) = labels.iter().find(|l| l.name == name) {
+                        let _ = agentflare_backend::item::remove_label(conn, &item_id, &label.id);
+                    }
+                }
+            }
             Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
         })?
     }
