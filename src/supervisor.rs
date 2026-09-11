@@ -402,23 +402,48 @@ fn dispatch_item(
     label_id_by_name: &std::collections::HashMap<String, String>,
     ready_id: &str,
 ) -> bool {
+    // Single-flight guard (item #221): a row already queued/running for this
+    // item means a prior tick dispatched it — its ready→dispatched swap may
+    // have failed, or reconcile re-armed it for auto-retry — and enqueueing
+    // again just floods agent_jobs while workers never catch up. Skip; the
+    // existing row will run.
+    if job_in_flight(queue, &item.id) {
+        eprintln!(
+            "agentflare-supervisor: item #{} ({}) already has a queued/running job — skipping duplicate dispatch",
+            item.sequence_id, item.id
+        );
+        return false;
+    }
     let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), None) else {
         return false;
     };
 
-    let _ = mcp.item_remove_label(ItemRequest {
+    // Label-swap failures are logged, not swallowed: a failed swap leaves
+    // the item visible to the next tick's discovery query, silently
+    // re-arming the loop above (item #221).
+    if let Err(e) = mcp.item_remove_label(ItemRequest {
         action: "remove_label".into(),
         id: Some(item.id.clone()),
         label_id: Some(ready_id.to_string()),
         ..Default::default()
-    });
+    }) {
+        eprintln!(
+            "agentflare-supervisor: failed to remove {READY_LABEL} from item #{} ({}): {e}",
+            item.sequence_id, item.id
+        );
+    }
     if let Some(dispatched_id) = label_id_by_name.get(DISPATCHED_LABEL) {
-        let _ = mcp.item_add_label(ItemRequest {
+        if let Err(e) = mcp.item_add_label(ItemRequest {
             action: "add_label".into(),
             id: Some(item.id.clone()),
             label_id: Some(dispatched_id.clone()),
             ..Default::default()
-        });
+        }) {
+            eprintln!(
+                "agentflare-supervisor: failed to add {DISPATCHED_LABEL} to item #{} ({}): {e}",
+                item.sequence_id, item.id
+            );
+        }
     }
     let _ = mcp.comment_impl(CommentRequest {
         action: "create".into(),
