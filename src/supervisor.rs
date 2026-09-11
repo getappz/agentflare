@@ -355,7 +355,7 @@ fn ask_item(
 /// passed straight through to `--model <name>` (see `build_extra_args` in
 /// `cli/work.rs`) — model catalogs change too often to hardcode, and the
 /// underlying agent CLI already errors on an unknown name.
-pub(crate) fn item_model_override(metadata: &str) -> Option<String> {
+fn item_model_override(metadata: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(metadata)
         .ok()?
         .get("model")?

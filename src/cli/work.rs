@@ -1007,58 +1007,6 @@ fn execute_work_impl(
 /// item #63/#103 — `[item_id, agent]` or `[item_id, agent, folder_path]`
 /// only — still runs (against this process's cwd, or with no model
 /// override) instead of failing outright on daemon upgrade.
-///
-/// Pure core of `fresh_dispatch_pair` below: overlay the payload's
-/// enqueue-time agent/model with the live item's current assignment, so a
-/// retry running long after enqueue picks up an operator reassignment or
-/// model re-pin instead of replaying stale args. Live values win when they
-/// resolve; anything unresolvable falls back to the payload (fail-open —
-/// a lookup miss must never refuse to run). Human CLI invocations never
-/// reach this: `WorkArgs::run` keeps explicit-flag-wins (see
-/// `resolve_agent_explicit_flag_wins_even_over_item_assignment`).
-pub(crate) fn apply_fresh_overrides(
-    payload_agent: &str,
-    payload_model: Option<String>,
-    assignee_agent: Option<&str>,
-    metadata: &str,
-) -> (String, Option<String>) {
-    let agent = assignee_agent
-        .and_then(crate::supervisor::resolve_confirmed_agent)
-        .map(|a| a.as_str().to_string())
-        .unwrap_or_else(|| payload_agent.to_string());
-    let model = crate::supervisor::item_model_override(metadata).or(payload_model);
-    (agent, model)
-}
-
-/// Re-read the item at execution time and apply `apply_fresh_overrides`.
-/// Best-effort fail-open: any DB/resolve failure returns the payload pair
-/// unchanged (today's behavior), so a missing backend can never block a run.
-fn fresh_dispatch_pair(
-    item_id: &str,
-    payload_agent: &str,
-    payload_model: Option<String>,
-) -> (String, Option<String>) {
-    let mcp = crate::mcp_server::AgentflareMcp::default();
-    let item = mcp
-        .with_backend_db(|conn| {
-            let resolved =
-                agentflare_backend::item::resolve_id(conn, None, item_id).ok()?;
-            agentflare_backend::item::get(conn, &resolved).ok()
-        })
-        .ok()
-        .flatten();
-    let Some(item) = item else {
-        return (payload_agent.to_string(), payload_model);
-    };
-    apply_fresh_overrides(
-        payload_agent,
-        payload_model,
-        item.assignee_agent.as_deref(),
-        &item.metadata,
-    )
-}
-
-/// Runs dispatched work items in-process.
 pub struct WorkItemExecutor;
 
 impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
@@ -1075,11 +1023,7 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
             .into());
         };
         let repo_root = args.get(2).map(std::path::PathBuf::from);
-        // Execution-time re-resolve (not enqueue-time replay): a retry may
-        // run long after the payload was frozen, and the operator may have
-        // reassigned the item or re-pinned its model since. Fail-open —
-        // any lookup miss keeps the payload pair.
-        let (agent, model) = fresh_dispatch_pair(item_id, agent, args.get(3).cloned());
+        let model = args.get(3).cloned();
         let work_args = WorkArgs {
             target: item_id.clone(),
             agent: Some(agent.clone()),
@@ -1220,60 +1164,6 @@ mod tests {
         assert_eq!(item.external_source, None);
         let wrapped = wrap_if_external(&item, "fix the flaky test");
         assert_eq!(wrapped, "fix the flaky test");
-    }
-
-    #[test]
-    fn fresh_overrides_live_assignee_beats_stale_payload_agent() {
-        // Item reassigned opencode -> claude-code after enqueue: the retry
-        // must follow the live assignment, not the frozen payload.
-        let (agent, _) = apply_fresh_overrides("opencode", None, Some("claude-code"), "{}");
-        assert_eq!(agent, "claude-code");
-    }
-
-    #[test]
-    fn fresh_overrides_unknown_assignee_keeps_payload_agent() {
-        // Typo'd/thematic assignee resolves to nothing — fail open on the
-        // payload rather than refusing to run.
-        let (agent, _) = apply_fresh_overrides("opencode", None, Some("gastown"), "{}");
-        assert_eq!(agent, "opencode");
-    }
-
-    #[test]
-    fn fresh_overrides_unassigned_item_keeps_payload_agent() {
-        let (agent, _) = apply_fresh_overrides("opencode", None, None, "{}");
-        assert_eq!(agent, "opencode");
-    }
-
-    #[test]
-    fn fresh_overrides_live_model_beats_stale_payload_model() {
-        let (_, model) = apply_fresh_overrides(
-            "opencode",
-            Some("opencode/nemotron-3-ultra-free".to_string()),
-            Some("opencode"),
-            r#"{"model": "opencode/muse-spark-1.3-contributor-free"}"#,
-        );
-        assert_eq!(
-            model.as_deref(),
-            Some("opencode/muse-spark-1.3-contributor-free")
-        );
-    }
-
-    #[test]
-    fn fresh_overrides_empty_metadata_keeps_payload_model() {
-        let (_, model) = apply_fresh_overrides(
-            "opencode",
-            Some("opencode/nemotron-3-ultra-free".to_string()),
-            Some("opencode"),
-            "{}",
-        );
-        assert_eq!(model.as_deref(), Some("opencode/nemotron-3-ultra-free"));
-    }
-
-    #[test]
-    fn fresh_overrides_nothing_stale_nothing_live_is_identity() {
-        let (agent, model) = apply_fresh_overrides("opencode", None, None, "{}");
-        assert_eq!(agent, "opencode");
-        assert_eq!(model, None);
     }
 
     #[test]
