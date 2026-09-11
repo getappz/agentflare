@@ -1,6 +1,11 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
 use serde::Deserialize;
 use serde_json::json;
 
+use super::observations::Observation;
 use super::store;
 use super::{observations, relations, search, sessions, summaries};
 
@@ -41,6 +46,11 @@ pub fn handle_remember(input: RememberInput) -> Result<String, String> {
         observations::SaveOutcome::Updated(id) => ("updated", id),
         observations::SaveOutcome::Duplicate(id) => ("duplicate", id),
     };
+    // The write may have changed what this project's recalls return
+    // (including `duplicate`, which bumps duplicate_count/last_seen_at).
+    if let Ok(mut cache) = recall_cache().lock() {
+        cache.invalidate_project(input.project.as_deref());
+    }
     // Best-effort semantic index; failure must never fail the remember.
     // Duplicates keep their existing vector — content is unchanged by definition.
     if status != "duplicate" {
@@ -76,6 +86,125 @@ pub struct RecallInput {
     pub limit: Option<usize>,
 }
 
+/// Short-TTL in-process dedup cache for recall.
+///
+/// Session-start / prompt-submit paths re-issue identical recalls
+/// back-to-back; without this every call re-runs FTS (+ embedding) and can
+/// return duplicate rows across calls. Process-local only — no
+/// cross-machine semantics. Only successful non-empty query results are
+/// cached; `id=` lookups and query-less listings bypass it.
+struct RecallCacheEntry {
+    inserted: Instant,
+    /// Lowercased project this entry belongs to (`""` when unscoped), so a
+    /// `remember`/`curate` can invalidate exactly its own project's entries.
+    project: String,
+    /// Serialized response (`json!(results).to_string()`), ready to return.
+    response: String,
+}
+
+struct RecallCache {
+    entries: HashMap<String, RecallCacheEntry>,
+    ttl: Duration,
+    cap: usize,
+}
+
+const RECALL_CACHE_TTL_SECS: u64 = 45;
+const RECALL_CACHE_CAP: usize = 128;
+
+impl RecallCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl: Duration::from_secs(RECALL_CACHE_TTL_SECS),
+            cap: RECALL_CACHE_CAP,
+        }
+    }
+
+    /// Cache key: normalized(query) + project + type + limit, using the same
+    /// normalizer as `observations::hash_normalized` so queries differing
+    /// only in case/whitespace share an entry.
+    fn key(query: &str, project: Option<&str>, r#type: Option<&str>, limit: usize) -> String {
+        format!(
+            "{}|{}|{}|{limit}",
+            observations::normalize_text(query),
+            project.unwrap_or("").to_lowercase(),
+            r#type.unwrap_or("").to_lowercase(),
+        )
+    }
+
+    fn get(&mut self, key: &str) -> Option<String> {
+        match self.entries.get(key) {
+            Some(e) if e.inserted.elapsed() < self.ttl => Some(e.response.clone()),
+            Some(_) => {
+                self.entries.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn insert(&mut self, key: String, project: String, response: String) {
+        self.entries
+            .retain(|_, e| e.inserted.elapsed() < self.ttl);
+        if self.entries.len() >= self.cap
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.inserted)
+                .map(|(k, _)| k.to_string())
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(
+            key,
+            RecallCacheEntry {
+                inserted: Instant::now(),
+                project,
+                response,
+            },
+        );
+    }
+
+    fn invalidate_project(&mut self, project: Option<&str>) {
+        let norm = project.unwrap_or("").to_lowercase();
+        self.entries.retain(|_, e| e.project != norm);
+    }
+}
+
+fn recall_cache() -> &'static Mutex<RecallCache> {
+    static CACHE: OnceLock<Mutex<RecallCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(RecallCache::new()))
+}
+
+/// Best-effort invalidation of one observation's project after a mutation.
+/// Failures (poisoned lock, missing row) are ignored: the TTL bounds any
+/// staleness, so invalidation must never fail the write itself.
+fn invalidate_project_of(conn: &rusqlite::Connection, id: i64) {
+    let project = observations::get(conn, id)
+        .ok()
+        .flatten()
+        .and_then(|o| o.project);
+    if let Ok(mut cache) = recall_cache().lock() {
+        cache.invalidate_project(project.as_deref());
+    }
+}
+
+#[cfg(test)]
+fn clear_recall_cache() {
+    if let Ok(mut cache) = recall_cache().lock() {
+        cache.entries.clear();
+    }
+}
+
+/// Serializes the recall-cache tests: the cache is process-global and test
+/// threads run in parallel, so one test's `clear_recall_cache` could
+/// otherwise land between another test's two fetches and flake its counts.
+#[cfg(test)]
+fn recall_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 pub fn handle_recall(input: RecallInput) -> Result<String, String> {
     let conn = open_db()?;
     recall_with_conn(&conn, input)
@@ -84,30 +213,68 @@ pub fn handle_recall(input: RecallInput) -> Result<String, String> {
 /// Core of `handle_recall`, taking an explicit connection so tests can run
 /// against an isolated in-memory database instead of the real brain.db.
 fn recall_with_conn(conn: &rusqlite::Connection, input: RecallInput) -> Result<String, String> {
+    recall_with_fetch(conn, input, &|conn, q, project, r#type, limit| {
+        search::search_hybrid(conn, q, project, r#type, limit, super::engine::embed_query)
+    })
+}
+
+/// `recall_with_conn` with the underlying search injected, so tests can
+/// count invocations and prove repeated identical recalls do one search.
+/// Production passes `search::search_hybrid` (+ the real embedder).
+fn recall_with_fetch(
+    conn: &rusqlite::Connection,
+    input: RecallInput,
+    fetch: &dyn Fn(
+        &rusqlite::Connection,
+        &str,
+        Option<&str>,
+        Option<&str>,
+        usize,
+    ) -> Result<Vec<Observation>, rusqlite::Error>,
+) -> Result<String, String> {
     if let Some(id) = input.id {
         let obs = observations::get(conn, id).map_err(|e| format!("lookup failed: {e}"))?;
         return Ok(json!(obs).to_string());
     }
     let limit = input.limit.unwrap_or(10).min(50);
-    let results = if let Some(ref q) = input.query.filter(|q| !q.trim().is_empty()) {
-        search::search_hybrid(
+    if let Some(ref q) = input.query.filter(|q| !q.trim().is_empty()) {
+        let key = RecallCache::key(q, input.project.as_deref(), input.r#type.as_deref(), limit);
+        if let Ok(mut cache) = recall_cache().lock()
+            && let Some(hit) = cache.get(&key)
+        {
+            return Ok(hit);
+        }
+        let mut results = fetch(
             conn,
             q,
             input.project.as_deref(),
             input.r#type.as_deref(),
             limit,
-            super::engine::embed_query,
         )
-        .map_err(|e| format!("search failed: {e}"))?
-    } else {
-        observations::list_recent(
-            conn,
-            input.project.as_deref(),
-            input.r#type.as_deref(),
-            limit,
-        )
-        .map_err(|e| format!("list failed: {e}"))?
-    };
+        .map_err(|e| format!("search failed: {e}"))?;
+        // Never return the same observation twice from one recall
+        // (FTS/vector merge paths can overlap).
+        let mut seen = HashSet::new();
+        results.retain(|o| seen.insert(o.id));
+        let response = json!(results).to_string();
+        if !results.is_empty()
+            && let Ok(mut cache) = recall_cache().lock()
+        {
+            cache.insert(
+                key,
+                input.project.as_deref().unwrap_or("").to_lowercase(),
+                response.clone(),
+            );
+        }
+        return Ok(response);
+    }
+    let results = observations::list_recent(
+        conn,
+        input.project.as_deref(),
+        input.r#type.as_deref(),
+        limit,
+    )
+    .map_err(|e| format!("list failed: {e}"))?;
     Ok(json!(results).to_string())
 }
 
@@ -386,20 +553,32 @@ pub fn handle_curate(input: CurateInput) -> Result<String, String> {
                 input.pinned,
             )
             .map_err(|e| format!("update: {e}"))?;
+            if ok {
+                invalidate_project_of(&conn, input.id);
+            }
             Ok(json!({"status": if ok { "updated" } else { "not_found" }}).to_string())
         }
         "delete" => {
             let ok =
                 observations::soft_delete(&conn, input.id).map_err(|e| format!("delete: {e}"))?;
+            if ok {
+                invalidate_project_of(&conn, input.id);
+            }
             Ok(json!({"status": if ok { "deleted" } else { "not_found" }}).to_string())
         }
         "pin" => {
             let ok = observations::pin(&conn, input.id, true).map_err(|e| format!("pin: {e}"))?;
+            if ok {
+                invalidate_project_of(&conn, input.id);
+            }
             Ok(json!({"status": if ok { "pinned" } else { "not_found" }}).to_string())
         }
         "unpin" => {
             let ok =
                 observations::pin(&conn, input.id, false).map_err(|e| format!("unpin: {e}"))?;
+            if ok {
+                invalidate_project_of(&conn, input.id);
+            }
             Ok(json!({"status": if ok { "unpinned" } else { "not_found" }}).to_string())
         }
         other => Err(format!(
@@ -412,6 +591,7 @@ pub fn handle_curate(input: CurateInput) -> Result<String, String> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use std::cell::Cell;
 
     fn new_db() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -524,6 +704,179 @@ mod tests {
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["type"], "decision");
+    }
+
+    // Item 217: repeated identical recalls within the TTL must run a single
+    // underlying search; the second call is served from the dedup cache.
+    // (Cache keys use per-test-unique tokens because the cache is
+    // process-global and tests run in parallel threads.)
+    #[test]
+    fn recall_caches_identical_query_within_ttl() {
+        let _cache_guard = recall_test_lock().lock().unwrap();
+        clear_recall_cache();
+        let conn = new_db();
+        observations::save(
+            &conn,
+            None,
+            "decision",
+            "dedup cache marker alpha",
+            "content about the dedup cache marker alpha",
+            None,
+            Some("proj-cache"),
+            None,
+            None,
+        )
+        .unwrap();
+        let calls = Cell::new(0usize);
+        let fetch = |conn: &rusqlite::Connection,
+                     q: &str,
+                     project: Option<&str>,
+                     r#type: Option<&str>,
+                     limit: usize| {
+            calls.set(calls.get() + 1);
+            search::search_hybrid(conn, q, project, r#type, limit, |_| None)
+        };
+        let mk_input = || RecallInput {
+            query: Some("dedup cache marker alpha".to_string()),
+            id: None,
+            r#type: None,
+            project: Some("proj-cache".to_string()),
+            limit: Some(10),
+        };
+        let first = recall_with_fetch(&conn, mk_input(), &fetch).unwrap();
+        let second = recall_with_fetch(&conn, mk_input(), &fetch).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            calls.get(),
+            1,
+            "second identical recall must hit the cache"
+        );
+        let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert!(!v.as_array().unwrap().is_empty());
+    }
+
+    // Item 217: project/type/limit are part of the cache key (each misses),
+    // while case/whitespace-only differences hit the same entry.
+    #[test]
+    fn recall_cache_key_covers_project_type_limit_not_case() {
+        let _cache_guard = recall_test_lock().lock().unwrap();
+        clear_recall_cache();
+        let conn = new_db();
+        for (typ, project) in [
+            ("decision", "proj-kb-a"),
+            ("bugfix", "proj-kb-a"),
+            ("decision", "proj-kb-b"),
+        ] {
+            observations::save(
+                &conn,
+                None,
+                typ,
+                "key coverage marker beta",
+                "content about the key coverage marker beta",
+                None,
+                Some(project),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let calls = Cell::new(0usize);
+        let fetch = |conn: &rusqlite::Connection,
+                     q: &str,
+                     project: Option<&str>,
+                     r#type: Option<&str>,
+                     limit: usize| {
+            calls.set(calls.get() + 1);
+            search::search_hybrid(conn, q, project, r#type, limit, |_| None)
+        };
+        let mk = |project: &str, typ: Option<&str>, limit: usize, query: &str| RecallInput {
+            query: Some(query.to_string()),
+            id: None,
+            r#type: typ.map(|t| t.to_string()),
+            project: Some(project.to_string()),
+            limit: Some(limit),
+        };
+        recall_with_fetch(&conn, mk("proj-kb-a", None, 10, "key coverage marker beta"), &fetch)
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        // Identical again: hit.
+        recall_with_fetch(&conn, mk("proj-kb-a", None, 10, "key coverage marker beta"), &fetch)
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        // Case + whitespace noise: same normalized key, still a hit.
+        recall_with_fetch(
+            &conn,
+            mk("proj-kb-a", None, 10, "  KEY   Coverage Marker Beta "),
+            &fetch,
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        // Different project / type / limit: each misses exactly once.
+        recall_with_fetch(&conn, mk("proj-kb-b", None, 10, "key coverage marker beta"), &fetch)
+            .unwrap();
+        assert_eq!(calls.get(), 2);
+        recall_with_fetch(
+            &conn,
+            mk("proj-kb-a", Some("bugfix"), 10, "key coverage marker beta"),
+            &fetch,
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 3);
+        recall_with_fetch(&conn, mk("proj-kb-a", None, 5, "key coverage marker beta"), &fetch)
+            .unwrap();
+        assert_eq!(calls.get(), 4);
+    }
+
+    // Item 217: empty results are never cached, and invalidating a project
+    // forces the next identical recall to re-search.
+    #[test]
+    fn recall_skips_cache_for_empty_results_and_honors_invalidation() {
+        let _cache_guard = recall_test_lock().lock().unwrap();
+        clear_recall_cache();
+        let conn = new_db();
+        observations::save(
+            &conn,
+            None,
+            "decision",
+            "invalidation marker gamma",
+            "content about the invalidation marker gamma",
+            None,
+            Some("proj-inv"),
+            None,
+            None,
+        )
+        .unwrap();
+        let calls = Cell::new(0usize);
+        let fetch = |conn: &rusqlite::Connection,
+                     q: &str,
+                     project: Option<&str>,
+                     r#type: Option<&str>,
+                     limit: usize| {
+            calls.set(calls.get() + 1);
+            search::search_hybrid(conn, q, project, r#type, limit, |_| None)
+        };
+        let mk = |query: &str| RecallInput {
+            query: Some(query.to_string()),
+            id: None,
+            r#type: None,
+            project: Some("proj-inv".to_string()),
+            limit: Some(10),
+        };
+        // Empty: two calls, two searches — never cached.
+        let empty = recall_with_fetch(&conn, mk("zzz-no-such-token-gamma"), &fetch).unwrap();
+        assert_eq!(empty, "[]");
+        recall_with_fetch(&conn, mk("zzz-no-such-token-gamma"), &fetch).unwrap();
+        assert_eq!(calls.get(), 2);
+        // Non-empty: second call hits the cache...
+        recall_with_fetch(&conn, mk("invalidation marker gamma"), &fetch).unwrap();
+        recall_with_fetch(&conn, mk("invalidation marker gamma"), &fetch).unwrap();
+        assert_eq!(calls.get(), 3);
+        // ...until its project is invalidated.
+        if let Ok(mut cache) = recall_cache().lock() {
+            cache.invalidate_project(Some("proj-inv"));
+        }
+        recall_with_fetch(&conn, mk("invalidation marker gamma"), &fetch).unwrap();
+        assert_eq!(calls.get(), 4);
     }
     #[test]
     fn handle_compact_fills_quota_by_relevance_not_transcript_order() {
