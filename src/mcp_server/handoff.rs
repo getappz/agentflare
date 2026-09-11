@@ -51,6 +51,7 @@ impl AgentflareMcp {
             completed,
             remaining,
             blockers,
+            allow_secrets,
         }: HandoffRequest,
     ) -> Result<String, ErrorData> {
         if recipient.trim().is_empty() {
@@ -71,6 +72,46 @@ impl AgentflareMcp {
                 None,
             ));
         }
+
+        // Fail-closed pre-handoff secret scan — before either persistence
+        // path below (local item/asset, or the bridge queue's GitHub issue
+        // body) so a pasted credential never becomes a stored artifact, and
+        // before any DB mutation so a match can't orphan an item.
+        // `redact_error_for_llm` doesn't cover this: it only ever runs on
+        // error strings, not on a payload a caller supplies on purpose.
+        if !allow_secrets.unwrap_or(false) {
+            let mut owned: Vec<(&str, String)> = Vec::new();
+            if let Some(s) = &summary {
+                owned.push(("summary", s.clone()));
+            }
+            if let Some(facts) = &facts {
+                for fact in facts {
+                    if let Some(body) = fact.get("content").and_then(|v| v.as_str()) {
+                        owned.push(("facts[].content", body.to_string()));
+                    }
+                }
+            }
+            if let Some(findings) = &findings {
+                for f in findings {
+                    owned.push(("findings[]", f.to_string()));
+                }
+            }
+            if let Some(decisions) = &decisions {
+                for d in decisions {
+                    owned.push(("decisions[]", d.to_string()));
+                }
+            }
+            secret_scan::check_fields(
+                [
+                    ("content", content.as_str()),
+                    ("completed", completed.as_str()),
+                    ("remaining", remaining.as_str()),
+                ]
+                .into_iter()
+                .chain(owned.iter().map(|(field, text)| (*field, text.as_str()))),
+            )?;
+        }
+
         let recipient = recipient.trim().to_string();
         let name = name.trim().to_string();
 
@@ -1133,5 +1174,83 @@ mod tests {
                 .contains("completed and remaining are required"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn secret_in_content_blocks_before_any_item_is_created() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            content: "here is my token: ghp_abcdefghijklmnopqrstuvwxyz012345".to_string(),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("content"), "{msg}");
+        assert!(msg.contains("GitHub token"), "{msg}");
+        assert!(
+            !msg.contains("ghp_abcdefghijklmnopqrstuvwxyz012345"),
+            "{msg}"
+        );
+
+        let items = mcp
+            .with_backend_db(|conn| {
+                let project = mcp.resolve_project(conn).unwrap();
+                agentflare_backend::item::list_by_assignee_agent(
+                    conn,
+                    &project.id,
+                    &agent_registry::canonicalize("claude-code"),
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(
+            items.is_empty(),
+            "a secret-bearing handoff must not leave an orphan item behind"
+        );
+    }
+
+    #[test]
+    fn secret_in_a_fact_content_is_blocked() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            facts: Some(vec![serde_json::json!({
+                "title": "cred",
+                "content": "AKIAABCDEFGHIJKLMNOP",
+            })]),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        assert!(err.to_string().contains("facts[].content"), "{err}");
+    }
+
+    #[test]
+    fn secret_in_a_finding_is_blocked() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            findings: Some(vec![serde_json::json!({
+                "file": "src/lib.rs",
+                "summary": "left a live key sk-live-51H8xyzABCDEFghij in a comment",
+            })]),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        assert!(err.to_string().contains("findings[]"), "{err}");
+    }
+
+    #[test]
+    fn allow_secrets_bypasses_the_scan() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            content: "ghp_abcdefghijklmnopqrstuvwxyz012345".to_string(),
+            allow_secrets: Some(true),
+            ..base_request()
+        };
+        mcp.handoff_impl(req).unwrap();
+    }
+
+    #[test]
+    fn clean_handoff_passes_unchanged() {
+        let (_tmp, mcp) = test_mcp();
+        mcp.handoff_impl(base_request()).unwrap();
     }
 }
