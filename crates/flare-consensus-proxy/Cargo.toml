@@ -1,0 +1,26 @@
+[package]
+name = "flare-consensus-proxy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+description = "flare-consensus::ModelCaller backed by flare-proxy's in-process router — no new per-provider HTTP code."
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+axum = "0.8"
+flare-consensus = { path = "../flare-consensus" }
+flare-proxy = { path = "../flare-proxy" }
+futures = "0.3"
+http = "1"
+serde_json = "1"
+thiserror = "2"
+tower = { version = "0.5", features = ["util"] }
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints.rust]
+unsafe_code = "warn"

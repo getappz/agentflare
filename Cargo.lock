@@ -1508,6 +1508,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "flare-consensus-proxy"
+version = "0.1.0"
+dependencies = [
+ "agentflare-workspace-hack",
+ "async-trait",
+ "axum",
+ "flare-consensus",
+ "flare-proxy",
+ "futures",
+ "http",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "flare-docs"
 version = "0.1.0"
 dependencies = [

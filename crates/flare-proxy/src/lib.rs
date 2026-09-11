@@ -16,6 +16,19 @@ pub use providers::ProviderConfig;
 use std::time::Duration;
 
 pub fn router() -> Router {
+    router_with_config(ProviderConfig::from_env())
+}
+
+/// Same as [`router`], but with an explicit [`ProviderConfig`] instead of
+/// one read from `MODEL`/`MODEL_OPUS`/`MODEL_SONNET`/`MODEL_HAIKU` env vars.
+///
+/// For embedders that build their own routing table — e.g. a multi-model
+/// consensus engine mapping several participant model handles to explicit
+/// `(provider, upstream_model)` pairs, which doesn't fit `from_env()`'s
+/// single-active-model-per-role shape. Build each provider's `ProviderEntry`
+/// via [`providers::provider_entry`] and add one [`providers::ModelRoute`]
+/// per handle.
+pub fn router_with_config(config: ProviderConfig) -> Router {
     // Best-effort, short-timeout refresh of the provider registry before
     // the first ProviderConfig::from_env() read — see
     // providers::ensure_fresh_registry for what "on demand" means here.
@@ -28,7 +41,7 @@ pub fn router() -> Router {
     Router::new()
         .route("/proxy/v1/messages", post(v1_messages_handler))
         .with_state(AppState {
-            config: ProviderConfig::from_env(),
+            config,
             sc_config: shortcircuit::ShortCircuitConfig::from_env(),
             client,
         })
