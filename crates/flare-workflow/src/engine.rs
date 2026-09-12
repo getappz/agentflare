@@ -705,18 +705,26 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 }
 
                 let failed_step = tracker.read().failed.iter().next().cloned();
-                let error_message: &'static str = if failed_step.is_some() {
+                let base_message = if failed_step.is_some() {
                     "Workflow failed due to step dependency failure"
                 } else {
                     "Workflow deadlocked: no steps ready and none running"
                 };
-                self.finish_workflow_failed(
-                    run_id,
-                    &definition,
-                    failed_step,
-                    error_message.to_string(),
-                )
-                .await?;
+                let last_error = match &failed_step {
+                    Some(step_id) => self
+                        .state_store
+                        .load(run_id)
+                        .await
+                        .ok()
+                        .and_then(|s| s.step_states.get(step_id).and_then(|ss| ss.last_error.clone())),
+                    None => None,
+                };
+                let error_message = match last_error {
+                    Some(err) => format!("{base_message}: {err}"),
+                    None => base_message.to_string(),
+                };
+                self.finish_workflow_failed(run_id, &definition, failed_step, error_message)
+                    .await?;
                 return Ok(());
             }
 
@@ -960,13 +968,18 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         };
 
         if let Some(step) = failed_step {
-            self.finish_workflow_failed(
-                run_id,
-                &definition,
-                Some(step),
-                "One or more steps failed".to_string(),
-            )
-            .await?;
+            let last_error = self
+                .state_store
+                .load(run_id)
+                .await
+                .ok()
+                .and_then(|s| s.step_states.get(&step).and_then(|ss| ss.last_error.clone()));
+            let error_message = match last_error {
+                Some(err) => format!("One or more steps failed: {err}"),
+                None => "One or more steps failed".to_string(),
+            };
+            self.finish_workflow_failed(run_id, &definition, Some(step), error_message)
+                .await?;
         } else {
             let output = self
                 .state_store
