@@ -732,26 +732,34 @@ pub(crate) fn clean_agent_reply(agent: &str, raw: String) -> String {
 /// what it was doing right up to the kill — dropping it (the old behavior)
 /// turned every timeout into a black box with no way to tell "made real
 /// progress and got killed mid-verification" apart from "never did anything."
-/// Prefers stdout (the agent's actual reply stream); falls back to stderr
-/// when stdout is empty. `sandbox_log`, when present, is the agent's own
-/// sandbox-side session/tool-call log tail (see `take_diagnostic_log`) —
-/// appended regardless of whether stdout/stderr had anything, since it's a
-/// different signal (the agent's internal trace, not its reply stream) that
-/// a failed headless dispatch would otherwise have no way to surface at all
-/// (item #139).
+/// Includes both streams whenever they're non-empty, stdout first — item
+/// #173's incident showed a CLI agent can emit some stdout (e.g. partial
+/// stream-json) before dying on a real failure whose text is only on
+/// stderr; preferring stdout and only falling back to stderr on an *empty*
+/// stdout silently dropped that failure text (e.g. an auth-expiry message)
+/// from every downstream classifier (`auth_runner::is_auth_expired`,
+/// `is_rate_limited`) that only ever sees this string. `sandbox_log`, when
+/// present, is the agent's own sandbox-side session/tool-call log tail (see
+/// `take_diagnostic_log`) — appended regardless of whether stdout/stderr had
+/// anything, since it's a different signal (the agent's internal trace, not
+/// its reply stream) that a failed headless dispatch would otherwise have no
+/// way to surface at all (item #139).
 fn diagnostic_suffix(captured: &Captured, sandbox_log: Option<&str>) -> String {
-    let mut suffix = if !captured.stdout.is_empty() {
-        format!(
+    let mut suffix = match (captured.stdout.is_empty(), captured.stderr.is_empty()) {
+        (true, true) => " (no output captured)".to_string(),
+        (false, true) => format!(
             " — last stdout before kill:\n{}",
             tail_str(&captured.stdout, DIAGNOSTIC_TAIL_CHARS)
-        )
-    } else if !captured.stderr.is_empty() {
-        format!(
+        ),
+        (true, false) => format!(
             " — last stderr before kill:\n{}",
             tail_str(&captured.stderr, DIAGNOSTIC_TAIL_CHARS)
-        )
-    } else {
-        " (no output captured)".to_string()
+        ),
+        (false, false) => format!(
+            " — last stdout before kill:\n{}\n\n — last stderr before kill:\n{}",
+            tail_str(&captured.stdout, DIAGNOSTIC_TAIL_CHARS),
+            tail_str(&captured.stderr, DIAGNOSTIC_TAIL_CHARS)
+        ),
     };
     if let Some(log) = sandbox_log {
         suffix.push_str(&format!(

@@ -618,6 +618,12 @@ const RATE_LIMIT_COOLDOWN_MINUTES: u32 = 30;
 /// does for the interactive path and, if rate-limit shaped, records a
 /// cooldown so `auth_db::is_cooling_down` (discovery tick, `auth rotate`)
 /// sees it too. Returns seconds until clear, as the job queue's retry delay.
+///
+/// Only ever called once `handle_auth_expired` (see call site below) has
+/// already ruled out an auth-expiry failure -- unlike rate-limiting,
+/// retrying an auth-expired dispatch against the same expired credential is
+/// guaranteed-useless, so that case is routed to `fatal: true` instead of a
+/// cooldown-and-retry (item #164's incident: 15h of exactly that).
 fn classify_and_cooldown(agent: &str, failure_message: &str) -> Option<u64> {
     if !crate::auth_runner::is_rate_limited(failure_message) {
         return None;
@@ -635,6 +641,8 @@ fn classify_and_cooldown(agent: &str, failure_message: &str) -> Option<u64> {
     );
     Some(RATE_LIMIT_COOLDOWN_MINUTES as u64 * 60)
 }
+
+include!("work_auth_expiry.rs");
 
 /// Claims `args.target`, runs the resolved agent on it, and reports the
 /// outcome back onto the item — the whole body of `agentflare work`.
@@ -987,6 +995,9 @@ fn execute_work_impl(
             release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
             crate::ui::error(&msg);
             let _ = writeln!(log, "failed: {msg}");
+            if let Some(outcome) = handle_auth_expired(&mcp, &item_detail, &msg, log) {
+                return outcome;
+            }
             let retry_after_secs = classify_and_cooldown(implementer_agent.as_str(), &msg);
             WorkOutcome {
                 exit_code: 1,
@@ -1731,6 +1742,8 @@ rotate = true
             assert!(crate::auth_db::is_cooling_down(&conn, "claude-code"));
         });
     }
+
+    include!("work_auth_expiry_tests.rs");
 
     include!("work_model_routing_tests.rs");
 

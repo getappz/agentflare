@@ -15,6 +15,28 @@ const RATE_LIMIT_PATTERNS: &[&str] = &[
     "billing limit",
     "try again",
 ];
+/// Conservative starter list (item #173's incident postmortem): none of these
+/// were sampled from real expired-auth CLI output per agent (claude-code,
+/// cursor, opencode, cline likely word this differently) -- ship this
+/// documented, deliberately narrow set now rather than block the fix on
+/// gathering samples, and widen per-agent once real text is seen. Unlike
+/// `RATE_LIMIT_PATTERNS`, retrying against any of these is guaranteed-useless:
+/// the same expired credential fails identically every time, so
+/// `is_auth_expired` exists to route around retry entirely (see
+/// `cli::work::classify_and_cooldown`'s caller and this module's own `run`).
+const AUTH_EXPIRED_PATTERNS: &[&str] = &[
+    "please re-authenticate",
+    "authentication expired",
+    "auth expired",
+    "session expired",
+    "invalid api key",
+    "401 unauthorized",
+    "not authenticated",
+    "token expired",
+    "credentials expired",
+    "please log in again",
+    "please login again",
+];
 const MAX_RETRIES: usize = 5;
 
 pub fn run(agent: &str, args: &[String], json: bool) {
@@ -46,6 +68,24 @@ pub fn run(agent: &str, args: &[String], json: bool) {
                 // flare-code: short backoff, linear increase if rate limits persist
                 thread::sleep(Duration::from_secs(1 + (MAX_RETRIES - remaining) as u64));
             }
+            ExitKind::AuthExpired => {
+                // Unlike `RateLimited`, rotating to another profile doesn't
+                // help here -- the credential itself is dead. Feed health
+                // scoring the same as `Failure`, then stop: prompting a human
+                // to re-authenticate is the only useful next step, and
+                // looping through the retry budget against the same expired
+                // credential would just repeat item #164's incident.
+                let conn = auth_db::open_or_rebuild();
+                if let Some((profile, _)) = auth_db::get_rotation_last(&conn, agent) {
+                    auth_db::record_error(&conn, agent, &profile, &stderr);
+                }
+                crate::ui::error(&format!(
+                    "{agent}: authentication has expired — re-authenticate this agent \
+                     (e.g. `agentflare auth login {agent} <profile> -- <agent's own login command>`) \
+                     and rerun; retrying will not help."
+                ));
+                std::process::exit(1);
+            }
             ExitKind::Failure(code) => {
                 // Feed health scoring even for non-retryable failures so
                 // smart_pick can demote profiles that keep erroring.
@@ -62,6 +102,7 @@ pub fn run(agent: &str, args: &[String], json: bool) {
 enum ExitKind {
     Success,
     RateLimited,
+    AuthExpired,
     Failure(i32),
 }
 
@@ -76,12 +117,25 @@ pub(crate) fn is_rate_limited(text: &str) -> bool {
     RATE_LIMIT_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
+/// Pattern-matches `text` against `AUTH_EXPIRED_PATTERNS` -- same shape as
+/// `is_rate_limited`, but a distinct classification with distinct
+/// remediation: an expired credential fails identically on every retry, so
+/// callers (this module's own `run`, and `cli::work::classify_and_cooldown`)
+/// must NOT cooldown-and-retry the way they do for a rate limit.
+pub(crate) fn is_auth_expired(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    AUTH_EXPIRED_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
 fn categorize_exit(code: i32, stderr: &str) -> ExitKind {
     if code == 0 {
         return ExitKind::Success;
     }
     if is_rate_limited(stderr) {
         return ExitKind::RateLimited;
+    }
+    if is_auth_expired(stderr) {
+        return ExitKind::AuthExpired;
     }
     ExitKind::Failure(code)
 }
@@ -196,6 +250,27 @@ mod tests {
     fn categorize_failure_on_unknown_error() {
         let result = categorize_exit(1, "something went wrong");
         assert!(matches!(result, ExitKind::Failure(1)));
+    }
+
+    #[test]
+    fn categorize_auth_expired_detects_expired_session() {
+        let result = categorize_exit(1, "Error: session expired, please re-authenticate");
+        assert!(matches!(result, ExitKind::AuthExpired));
+    }
+
+    #[test]
+    fn categorize_auth_expired_detects_401() {
+        let result = categorize_exit(1, "401 Unauthorized");
+        assert!(matches!(result, ExitKind::AuthExpired));
+    }
+
+    #[test]
+    fn is_auth_expired_matches_common_phrases() {
+        assert!(is_auth_expired("Your session has expired. Please re-authenticate."));
+        assert!(is_auth_expired("Error: invalid API key"));
+        assert!(is_auth_expired("401 Unauthorized"));
+        assert!(!is_auth_expired("HTTP 429 Too Many Requests"));
+        assert!(!is_auth_expired("something went wrong"));
     }
 
     #[test]
