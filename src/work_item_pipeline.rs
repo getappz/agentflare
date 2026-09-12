@@ -104,12 +104,32 @@ pub(crate) struct WorkItemData {
     /// handoff explicitly asking for a review only (see item #502) still
     /// gets silently converted into an implementation attempt.
     ///
+    /// `finalize`'s findings-comment-only routing only applies when
+    /// `design_spec` is unset (item #216) — a design-spec task is
+    /// `review_only` too (no application code), but its deliverable is a
+    /// real file that must still go through `item_done`/PR, not just get
+    /// mentioned in a comment.
+    ///
     /// `#[serde(default)]`: persisted `state_json` from runs started before
     /// this field existed has no `review_only` key — without a default,
     /// `SqliteStore::load` fails to deserialize those rows and `recover()`
     /// silently skips them as unreadable.
     #[serde(default)]
     pub review_only: bool,
+    /// Set from `detect_design_spec` at dispatch time (item #216) — narrows
+    /// `review_only`'s generic "no code, no artifacts" framing for the
+    /// design-spec flavor of review-only task, whose deliverable is a
+    /// written spec document rather than zero output. Meaningless unless
+    /// `review_only` is also set; routes `sdd_loop`'s role/judge prompts to
+    /// the design-spec wording instead of the plain-review one, and routes
+    /// `finalize` through the normal `item_done`/PR completion path instead
+    /// of `review_only`'s findings-comment-only one — a written spec file is
+    /// a real artifact that needs to be committed and land in a PR, not
+    /// commentary on someone else's code.
+    ///
+    /// `#[serde(default)]` for the same reason as `review_only`.
+    #[serde(default)]
+    pub design_spec: bool,
     /// Set from `detect_tdd_mode` at dispatch time (item #179) — an
     /// opt-in, item-level flag (no free-text fallback like `review_only`
     /// needs, since this has no legacy callers to support) that appends
@@ -352,48 +372,51 @@ pub(crate) fn build_sdd_loop_step(
                 // dispatch further down), so a usage-threshold fallback that
                 // swaps `agent_name` to another CLI still leaves real code
                 // review running on the reserved agent.
-                let (role_agent, role_prompt, is_implementer_turn) =
-                    if ctx.data.review_issues.is_some() {
-                        if ctx.data.last_report.is_some() {
-                            // A fix has already been submitted for the current
-                            // issues — re-review it.
-                            let findings = ctx.data.review_issues.clone().unwrap_or_default();
-                            let fix_report = ctx.data.last_report.clone().unwrap_or_default();
-                            (
-                                judge_agent_name.clone(),
-                                build_re_reviewer_prompt(&task, &findings, &fix_report),
-                                false,
-                            )
-                        } else {
-                            // Issues open, no fix attempt yet — dispatch the
-                            // implementer to fix them (or, for a review-only
-                            // task, the analyst to revise their findings).
-                            let fix_context = ctx.data.review_issues.as_deref();
-                            let prompt = if ctx.data.review_only {
-                                build_review_analyst_prompt(&task, fix_context)
-                            } else {
-                                build_implementer_prompt(&task, fix_context, ctx.data.tdd)
-                            };
-                            (agent_name.clone(), prompt, !ctx.data.review_only)
-                        }
-                    } else if ctx.data.last_report.is_some() {
-                        // No open issues; a report is pending review.
-                        let report = ctx.data.last_report.clone().unwrap_or_default();
-                        let prompt = if ctx.data.review_only {
-                            build_review_of_analysis_prompt(&task, &report)
-                        } else {
-                            build_task_reviewer_prompt(&task, &report, ctx.data.tdd)
-                        };
-                        (judge_agent_name.clone(), prompt, false)
+                let (role_agent, role_prompt, is_implementer_turn) = if ctx
+                    .data
+                    .review_issues
+                    .is_some()
+                {
+                    if ctx.data.last_report.is_some() {
+                        // A fix has already been submitted for the current
+                        // issues — re-review it.
+                        let findings = ctx.data.review_issues.clone().unwrap_or_default();
+                        let fix_report = ctx.data.last_report.clone().unwrap_or_default();
+                        (
+                            judge_agent_name.clone(),
+                            build_re_reviewer_prompt(&task, &findings, &fix_report),
+                            false,
+                        )
                     } else {
-                        // Fresh task, nothing dispatched yet.
+                        // Issues open, no fix attempt yet — dispatch the
+                        // implementer to fix them (or, for a review-only
+                        // task, the analyst to revise their findings).
+                        let fix_context = ctx.data.review_issues.as_deref();
                         let prompt = if ctx.data.review_only {
-                            build_review_analyst_prompt(&task, None)
+                            build_review_analyst_prompt(&task, fix_context, ctx.data.design_spec)
                         } else {
-                            build_implementer_prompt(&task, None, ctx.data.tdd)
+                            build_implementer_prompt(&task, fix_context, ctx.data.tdd)
                         };
                         (agent_name.clone(), prompt, !ctx.data.review_only)
+                    }
+                } else if ctx.data.last_report.is_some() {
+                    // No open issues; a report is pending review.
+                    let report = ctx.data.last_report.clone().unwrap_or_default();
+                    let prompt = if ctx.data.review_only {
+                        build_review_of_analysis_prompt(&task, &report)
+                    } else {
+                        build_task_reviewer_prompt(&task, &report, ctx.data.tdd)
                     };
+                    (judge_agent_name.clone(), prompt, false)
+                } else {
+                    // Fresh task, nothing dispatched yet.
+                    let prompt = if ctx.data.review_only {
+                        build_review_analyst_prompt(&task, None, ctx.data.design_spec)
+                    } else {
+                        build_implementer_prompt(&task, None, ctx.data.tdd)
+                    };
+                    (agent_name.clone(), prompt, !ctx.data.review_only)
+                };
 
                 let cwd = (!ctx.data.worktree_path.is_empty())
                     .then(|| std::path::PathBuf::from(&ctx.data.worktree_path));
@@ -471,6 +494,7 @@ pub(crate) fn build_sdd_loop_step(
                     &ctx.data.ledger,
                     &role_reply,
                     ctx.data.review_only,
+                    ctx.data.design_spec,
                 );
                 let judge_invocation = flare_workflow::json::StepInvocation {
                     args: resume_args_for(&judge_agent_name, &ctx.data.agent_sessions),
@@ -618,10 +642,15 @@ pub(crate) fn build_sdd_loop_step(
 ///    `AGENTFLARE_HOLD:` signal) — release the claim and post an "on hold"
 ///    comment instead of calling `item_done`, same as `execute_work`'s hold
 ///    branch.
-/// 2. `ctx.data.review_only` set (item #507 — the dispatched item asked for
-///    analysis, not implementation) — release the claim and post the
-///    accumulated findings as a comment instead of ever reaching
-///    `item_done`/PR flow, regardless of `review_issues` state.
+/// 2. `ctx.data.review_only` set and `ctx.data.design_spec` unset (item #507
+///    — the dispatched item asked for analysis, not implementation) —
+///    release the claim and post the accumulated findings as a comment
+///    instead of ever reaching `item_done`/PR flow, regardless of
+///    `review_issues` state. A design-spec task (item #216) skips this
+///    branch even though it's also `review_only`: its deliverable is a
+///    written spec file, a real artifact that needs to be committed and
+///    land in a PR via the success path below, not just described in a
+///    comment.
 /// 3. `ctx.data.review_issues` still set (Task 4's `review_or_fix` loop hit
 ///    `MAX_REVIEW_CYCLES` without ever reaching approval) — gate for a
 ///    human with a comment instead of opening a PR on unreviewed code, since
@@ -702,7 +731,7 @@ pub(crate) fn build_finalize_step(
                         return Ok(StepResult::Success);
                     }
 
-                    if ctx.data.review_only {
+                    if ctx.data.review_only && !ctx.data.design_spec {
                         let findings = if ctx.data.review_findings.is_empty() {
                             ctx.data
                                 .last_report
@@ -1017,6 +1046,9 @@ pub(crate) fn run_or_resume_with_sender(
     // Seeds `WorkItemData::review_only` (item #507) the same way — computed
     // once here so both `start_workflow` call sites below agree.
     let review_only = detect_review_only(&item_description, &existing_metadata);
+    // Seeds `WorkItemData::design_spec` (item #216) the same way — only
+    // meaningful when `review_only` is also set.
+    let design_spec = detect_design_spec(&item_description, &existing_metadata);
     // Seeds `WorkItemData::tdd` (item #179) the same way.
     let tdd = detect_tdd_mode(&existing_metadata);
 
@@ -1052,6 +1084,7 @@ pub(crate) fn run_or_resume_with_sender(
             notify_recipient: notify_recipient.clone(),
             tasks: tasks.clone(),
             review_only,
+            design_spec,
             tdd,
             worktree_path: worktree_path.clone(),
             ..Default::default()

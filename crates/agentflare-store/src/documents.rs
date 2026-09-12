@@ -131,10 +131,8 @@ impl Store {
     /// `store_chunks_fts` in sync automatically.
     pub fn sync_chunks(&self, doc_id: &str, content: &str) -> rusqlite::Result<()> {
         let conn = self.conn();
-        let tx = rusqlite::Transaction::new_unchecked(
-            &conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
         // Remove old chunk vectors first (before chunks, or subselect is empty).
         tx.execute(
             "DELETE FROM store_chunk_vec WHERE chunk_id IN (SELECT id FROM store_doc_chunks WHERE doc_id = ?1)",
@@ -145,7 +143,10 @@ impl Store {
             "DELETE FROM store_chunk_vec0 WHERE rowid IN (SELECT rowid FROM store_doc_chunks WHERE doc_id = ?1)",
             params![doc_id],
         );
-        tx.execute("DELETE FROM store_doc_chunks WHERE doc_id = ?1", params![doc_id])?;
+        tx.execute(
+            "DELETE FROM store_doc_chunks WHERE doc_id = ?1",
+            params![doc_id],
+        )?;
         // Empty docs produce no chunks — still correct to have none.
         if !content.trim().is_empty() {
             let chunks = crate::chunk::chunk_markdown(content);
@@ -279,23 +280,30 @@ impl Store {
                  ORDER BY rank
                  LIMIT ?3",
             )?;
-            let rows = stmt.query_map(params![fts_query, project_id, (limit * 2) as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3).unwrap_or_default(),
-                    row.get::<_, f64>(4)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            })?;
+            let rows =
+                stmt.query_map(params![fts_query, project_id, (limit * 2) as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3).unwrap_or_default(),
+                        row.get::<_, f64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                })?;
             // Deduplicate to first (best-ranked) chunk per doc; FTS rank is per-chunk.
             let mut seen = std::collections::HashSet::new();
             let mut tmp = Vec::new();
             for r in rows {
                 let (id, pid, path, snip, rank, _) = r?;
                 if seen.insert(id.clone()) {
-                    tmp.push(DocMatch { id, project_id: pid, path, snippet: snip, score: -rank });
+                    tmp.push(DocMatch {
+                        id,
+                        project_id: pid,
+                        path,
+                        snippet: snip,
+                        score: -rank,
+                    });
                     if tmp.len() >= limit {
                         break;
                     }
@@ -323,12 +331,12 @@ impl Store {
         // Try ANN when scale warrants it
         #[cfg(feature = "vector")]
         {
-            if self.chunk_count(Some(project_id)).unwrap_or(0) > 50_000 {
-                if let Ok(vec_out) = self.chunk_vec_search_ann(project_id, query_vec, limit) {
-                    let elapsed = start.elapsed().as_millis();
-                    self.scale_warning(project_id, elapsed);
-                    return Ok(vec_out);
-                }
+            if self.chunk_count(Some(project_id)).unwrap_or(0) > 50_000
+                && let Ok(vec_out) = self.chunk_vec_search_ann(project_id, query_vec, limit)
+            {
+                let elapsed = start.elapsed().as_millis();
+                self.scale_warning(project_id, elapsed);
+                return Ok(vec_out);
             }
         }
         let out = {
@@ -342,7 +350,13 @@ impl Store {
             )?;
             let rows: Vec<(String, String, String, Vec<u8>, String)> = stmt
                 .query_map(params![project_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut results: Vec<(f64, DocMatch)> = rows
@@ -436,9 +450,21 @@ impl Store {
             if seen.insert(doc_id.clone()) {
                 // Convert L2 distance to pseudo-score (higher is better) for compatibility
                 let score = 1.0 / (1.0 + dist);
-                let snippet = if content.len() > 200 { format!("{}...", &content[..200]) } else { content };
-                out.push(DocMatch { id: doc_id, project_id: pid, path, snippet, score });
-                if out.len() >= limit { break; }
+                let snippet = if content.len() > 200 {
+                    format!("{}...", &content[..200])
+                } else {
+                    content
+                };
+                out.push(DocMatch {
+                    id: doc_id,
+                    project_id: pid,
+                    path,
+                    snippet,
+                    score,
+                });
+                if out.len() >= limit {
+                    break;
+                }
             }
         }
         Ok(out)
@@ -473,12 +499,22 @@ impl Store {
         let out: Vec<DocMatch> = fused
             .into_iter()
             .take(limit)
-            .filter_map(|(id, _)| bm25_by_id.get(&id).cloned().or_else(|| vec_by_id.get(&id).cloned()))
+            .filter_map(|(id, _)| {
+                bm25_by_id
+                    .get(&id)
+                    .cloned()
+                    .or_else(|| vec_by_id.get(&id).cloned())
+            })
             .collect();
         Ok(out)
     }
 
-    pub fn chunk_set_embedding(&self, chunk_id: &str, embedding: &[f32], model: &str) -> rusqlite::Result<bool> {
+    pub fn chunk_set_embedding(
+        &self,
+        chunk_id: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> rusqlite::Result<bool> {
         let conn = self.conn();
         let now = db_kit::ids::now();
         let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -512,7 +548,9 @@ impl Store {
     /// error if limits exceeded. `value` empty deletes the key.
     pub fn doc_set_meta(&self, doc_id: &str, key: &str, value: &str) -> rusqlite::Result<bool> {
         if key.trim().is_empty() {
-            return Err(rusqlite::Error::InvalidParameterName("meta key empty".into()));
+            return Err(rusqlite::Error::InvalidParameterName(
+                "meta key empty".into(),
+            ));
         }
         if value.is_empty() {
             let conn = self.conn();
@@ -523,7 +561,9 @@ impl Store {
             return Ok(n > 0);
         }
         if value.len() > 10 * 1024 {
-            return Err(rusqlite::Error::InvalidParameterName("meta value >10KiB".into()));
+            return Err(rusqlite::Error::InvalidParameterName(
+                "meta value >10KiB".into(),
+            ));
         }
         let conn = self.conn();
         let count: i64 = conn.query_row(
@@ -532,7 +572,9 @@ impl Store {
             |r| r.get(0),
         )?;
         if count >= 5 {
-            return Err(rusqlite::Error::InvalidParameterName("meta >5 fields per doc".into()));
+            return Err(rusqlite::Error::InvalidParameterName(
+                "meta >5 fields per doc".into(),
+            ));
         }
         // Only first 64 bytes are filterable (AI Search limit) — store full value, index prefix.
         conn.execute(
@@ -545,7 +587,8 @@ impl Store {
 
     pub fn doc_get_meta(&self, doc_id: &str) -> rusqlite::Result<Vec<(String, String)>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT key, value FROM store_doc_meta WHERE doc_id = ?1 ORDER BY key")?;
+        let mut stmt =
+            conn.prepare("SELECT key, value FROM store_doc_meta WHERE doc_id = ?1 ORDER BY key")?;
         let rows = stmt.query_map(params![doc_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect()
     }
@@ -588,7 +631,12 @@ impl Store {
         // For simplicity, handle two cases: with and without path glob, to keep placeholder indices stable
         if let Some(glob) = path_glob {
             let mut stmt = conn.prepare(&sql)?;
-            let mut params_vec: Vec<String> = vec![fts_query, project_id.to_string(), glob.to_string(), (limit as i64).to_string()];
+            let mut params_vec: Vec<String> = vec![
+                fts_query,
+                project_id.to_string(),
+                glob.to_string(),
+                (limit as i64).to_string(),
+            ];
             if let Some(filters) = meta_filter {
                 for (k, v) in filters.iter() {
                     params_vec.push(k.clone());
@@ -600,7 +648,14 @@ impl Store {
                 // For now, handle only single meta filter case correctly; multi-filter falls back to post-filter
                 if filters.len() == 1 {
                     let rows = stmt.query_map(
-                        params![params_vec[0], params_vec[1], params_vec[2], limit as i64, filters[0].0, filters[0].1],
+                        params![
+                            params_vec[0],
+                            params_vec[1],
+                            params_vec[2],
+                            limit as i64,
+                            filters[0].0,
+                            filters[0].1
+                        ],
                         |row| {
                             Ok(DocMatch {
                                 id: row.get(0)?,
@@ -614,15 +669,18 @@ impl Store {
                     return rows.collect();
                 }
             }
-            let rows = stmt.query_map(params![params_vec[0], params_vec[1], params_vec[2], limit as i64], |row| {
-                Ok(DocMatch {
-                    id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    path: row.get(2)?,
-                    snippet: row.get::<_, String>(3).unwrap_or_default(),
-                    score: -row.get::<_, f64>(4)?,
-                })
-            })?;
+            let rows = stmt.query_map(
+                params![params_vec[0], params_vec[1], params_vec[2], limit as i64],
+                |row| {
+                    Ok(DocMatch {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        path: row.get(2)?,
+                        snippet: row.get::<_, String>(3).unwrap_or_default(),
+                        score: -row.get::<_, f64>(4)?,
+                    })
+                },
+            )?;
             return rows.collect();
         } else if let Some(filters) = meta_filter {
             if filters.len() == 1 {
@@ -635,7 +693,13 @@ impl Store {
                      ORDER BY rank LIMIT ?5",
                 )?;
                 let rows = stmt.query_map(
-                    params![fts_query, project_id, filters[0].0, filters[0].1, limit as i64],
+                    params![
+                        fts_query,
+                        project_id,
+                        filters[0].0,
+                        filters[0].1,
+                        limit as i64
+                    ],
                     |row| {
                         Ok(DocMatch {
                             id: row.get(0)?,
@@ -653,10 +717,14 @@ impl Store {
             let mut out = Vec::new();
             for m in base {
                 let meta = self.doc_get_meta(&m.id)?;
-                let ok = filters.iter().all(|(k, v)| meta.iter().any(|(mk, mv)| mk == k && mv == v));
+                let ok = filters
+                    .iter()
+                    .all(|(k, v)| meta.iter().any(|(mk, mv)| mk == k && mv == v));
                 if ok {
                     out.push(m);
-                    if out.len() >= limit { break; }
+                    if out.len() >= limit {
+                        break;
+                    }
                 }
             }
             return Ok(out);
@@ -679,7 +747,13 @@ impl Store {
     pub fn search_cache_get(&self, query: &str, project_id: &str) -> Option<Vec<DocMatch>> {
         let key = Self::cache_key(query, project_id);
         let conn = self.conn();
-        let blob: Vec<u8> = conn.query_row("SELECT value FROM store_kv WHERE key = ?1", params![key], |r| r.get(0)).ok()?;
+        let blob: Vec<u8> = conn
+            .query_row(
+                "SELECT value FROM store_kv WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .ok()?;
         let (ts, json): (i64, String) = serde_json::from_slice(&blob).ok()?;
         if db_kit::ids::now() - ts > 5 * 60 * 1000 {
             return None; // expired
@@ -689,7 +763,10 @@ impl Store {
 
     pub fn search_cache_put(&self, query: &str, project_id: &str, hits: &[DocMatch]) {
         let key = Self::cache_key(query, project_id);
-        let payload = serde_json::json!((db_kit::ids::now(), serde_json::to_string(hits).unwrap_or_default()));
+        let payload = serde_json::json!((
+            db_kit::ids::now(),
+            serde_json::to_string(hits).unwrap_or_default()
+        ));
         let blob = serde_json::to_vec(&payload).unwrap_or_default();
         let conn = self.conn();
         let now = db_kit::ids::now();
@@ -1029,7 +1106,10 @@ impl Store {
             // `d.deleted_at IS NULL` join, but reclaim storage now).
             if !already_deleted {
                 conn.execute("DELETE FROM store_chunk_vec WHERE chunk_id IN (SELECT id FROM store_doc_chunks WHERE doc_id = ?1)", params![id])?;
-                conn.execute("DELETE FROM store_doc_chunks WHERE doc_id = ?1", params![id])?;
+                conn.execute(
+                    "DELETE FROM store_doc_chunks WHERE doc_id = ?1",
+                    params![id],
+                )?;
             }
             // Only the delete that actually transitions live -> deleted owns a
             // reference. Re-deleting an already soft-deleted row must not

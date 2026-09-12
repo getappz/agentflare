@@ -381,8 +381,7 @@ impl AgentflareMcp {
                                 None,
                             ));
                         }
-                        let mut metadata_str =
-                            merge_handoff_depth(&item.metadata, next_depth);
+                        let mut metadata_str = merge_handoff_depth(&item.metadata, next_depth);
                         if let Some(t) = &task_type {
                             metadata_str = merge_task_type(&metadata_str, t);
                         }
@@ -390,15 +389,14 @@ impl AgentflareMcp {
                             && !metadata_str.contains("\"thread\"")
                         {
                             metadata_str = {
-                                let mut v = serde_json::from_str::<serde_json::Value>(
-                                    &metadata_str,
-                                )
-                                .ok()
-                                .and_then(|v| v.as_object().cloned())
-                                .map(serde_json::Value::Object)
-                                .unwrap_or_else(|| {
-                                    serde_json::Value::Object(Default::default())
-                                });
+                                let mut v =
+                                    serde_json::from_str::<serde_json::Value>(&metadata_str)
+                                        .ok()
+                                        .and_then(|v| v.as_object().cloned())
+                                        .map(serde_json::Value::Object)
+                                        .unwrap_or_else(|| {
+                                            serde_json::Value::Object(Default::default())
+                                        });
                                 v["thread"] = serde_json::Value::String(t.clone());
                                 v.to_string()
                             };
@@ -430,10 +428,8 @@ impl AgentflareMcp {
                                 Some(merge_task_type(metadata.as_deref().unwrap_or("{}"), t));
                         }
                         // New handoff chain starts at depth 1.
-                        metadata = Some(merge_handoff_depth(
-                            metadata.as_deref().unwrap_or("{}"),
-                            1,
-                        ));
+                        metadata =
+                            Some(merge_handoff_depth(metadata.as_deref().unwrap_or("{}"), 1));
                         // A brand-new handed-off item is real, undone work —
                         // labeling it `ready-for-work` (when the project has
                         // that label at all; skipped otherwise rather than
@@ -1358,9 +1354,12 @@ mod tests {
             let depth = mcp
                 .with_backend_db(|conn| {
                     let project = mcp.resolve_project(conn).unwrap();
-                    let items =
-                        agentflare_backend::item::list_by_assignee_agent(conn, &project.id, "claude-code")
-                            .unwrap();
+                    let items = agentflare_backend::item::list_by_assignee_agent(
+                        conn,
+                        &project.id,
+                        "claude-code",
+                    )
+                    .unwrap();
                     items
                         .into_iter()
                         .find(|i| i.name == "do the thing")
@@ -1514,7 +1513,9 @@ mod tests {
     fn secret_in_blockers_is_blocked() {
         let (_tmp, mcp) = test_mcp();
         let req = HandoffRequest {
-            blockers: Some(vec!["blocked on rotating xoxb-1234567890-abcdefghij".to_string()]),
+            blockers: Some(vec![
+                "blocked on rotating xoxb-1234567890-abcdefghij".to_string(),
+            ]),
             ..base_request()
         };
         let err = mcp.handoff_impl(req).unwrap_err();

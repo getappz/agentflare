@@ -52,10 +52,7 @@ pub fn try_embed_batch(texts: &[String]) -> Option<Vec<Vec<f32>>> {
     let mut guard = get_or_init_model()?;
     let model = guard.as_mut()?;
     // fastembed batch size default 256 — pass None
-    match model.embed(texts.to_vec(), None) {
-        Ok(v) => Some(v),
-        Err(_) => None,
-    }
+    model.embed(texts, None).ok()
 }
 
 #[cfg(not(feature = "embeddings"))]
@@ -69,7 +66,7 @@ pub fn try_embed_batch(_texts: &[String]) -> Option<Vec<Vec<f32>>> {
 
 /// Reranker wrapper — same once-lock pattern, model `BGERerankerBase`.
 #[cfg(feature = "embeddings")]
-use fastembed::{RerankerModel, RerankInitOptions, TextRerank};
+use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
 
 #[cfg(feature = "embeddings")]
 static RERANK_MODEL: OnceLock<std::sync::Mutex<Option<TextRerank>>> = OnceLock::new();
@@ -128,10 +125,10 @@ pub fn try_rewrite_query(query: &str) -> Option<String> {
     // Sparse SPLADE expansion when embeddings feature + model cached
     #[cfg(feature = "embeddings")]
     {
-        if let Some(expanded) = try_sparse_expand(q) {
-            if expanded != q {
-                return Some(expanded);
-            }
+        if let Some(expanded) = try_sparse_expand(q)
+            && expanded != q
+        {
+            return Some(expanded);
         }
     }
     None

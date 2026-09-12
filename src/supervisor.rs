@@ -432,18 +432,18 @@ fn dispatch_item(
             item.sequence_id, item.id
         );
     }
-    if let Some(dispatched_id) = label_id_by_name.get(DISPATCHED_LABEL) {
-        if let Err(e) = mcp.item_add_label(ItemRequest {
+    if let Some(dispatched_id) = label_id_by_name.get(DISPATCHED_LABEL)
+        && let Err(e) = mcp.item_add_label(ItemRequest {
             action: "add_label".into(),
             id: Some(item.id.clone()),
             label_id: Some(dispatched_id.clone()),
             ..Default::default()
-        }) {
-            eprintln!(
-                "agentflare-supervisor: failed to add {DISPATCHED_LABEL} to item #{} ({}): {e}",
-                item.sequence_id, item.id
-            );
-        }
+        })
+    {
+        eprintln!(
+            "agentflare-supervisor: failed to add {DISPATCHED_LABEL} to item #{} ({}): {e}",
+            item.sequence_id, item.id
+        );
     }
     let _ = mcp.comment_impl(CommentRequest {
         action: "create".into(),

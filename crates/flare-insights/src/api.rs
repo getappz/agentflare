@@ -76,7 +76,10 @@ pub async fn serve(db_path: PathBuf, port: u16) -> anyhow::Result<()> {
     }
 }
 
-async fn handle_conn(socket: &mut tokio::net::TcpStream, state: &Arc<AppState>) -> anyhow::Result<()> {
+async fn handle_conn(
+    socket: &mut tokio::net::TcpStream,
+    state: &Arc<AppState>,
+) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 8192];
     let n = socket.read(&mut buf).await?;
     if n == 0 {
@@ -116,7 +119,11 @@ async fn handle_conn(socket: &mut tokio::net::TcpStream, state: &Arc<AppState>) 
 
 /// Synchronous request handling -- the store lock never has to survive
 /// across an `.await` point.
-fn route_request(state: &Arc<AppState>, route: &str, query: Option<&str>) -> (u16, serde_json::Value) {
+fn route_request(
+    state: &Arc<AppState>,
+    route: &str,
+    query: Option<&str>,
+) -> (u16, serde_json::Value) {
     let store = state.read_store.lock().unwrap();
     match route {
         "/api/health" => (

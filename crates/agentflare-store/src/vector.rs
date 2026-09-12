@@ -15,7 +15,14 @@ pub fn ensure_init() -> bool {
     *VEC_INIT.get_or_init(|| {
         unsafe {
             // SAFETY: sqlite3_vec_init is the extension entrypoint, transmuted to auto_extension sig.
-            let rc = rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            let rc = rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+                *const (),
+                unsafe extern "C" fn(
+                    *mut rusqlite::ffi::sqlite3,
+                    *mut *mut std::os::raw::c_char,
+                    *const rusqlite::ffi::sqlite3_api_routines,
+                ) -> std::os::raw::c_int,
+            >(
                 sqlite_vec::sqlite3_vec_init as *const (),
             )));
             rc == rusqlite::ffi::SQLITE_OK

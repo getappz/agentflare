@@ -300,17 +300,18 @@ pub fn post_tool_use(agent: &str) {
 
     let mut runtime = crate::optimize::load_runtime();
     crate::optimize::prune_stale_sessions(&mut runtime, now);
-    let record = runtime
-        .sessions
-        .entry(session_key)
-        .or_insert_with(|| crate::optimize::SessionRecord {
-            start_ts: now,
-            turn_count: 0,
-            recent_tool_calls: vec![],
-            last_verification: None,
-            last_review: None,
-            last_diagnosis: None,
-        });
+    let record =
+        runtime
+            .sessions
+            .entry(session_key)
+            .or_insert_with(|| crate::optimize::SessionRecord {
+                start_ts: now,
+                turn_count: 0,
+                recent_tool_calls: vec![],
+                last_verification: None,
+                last_review: None,
+                last_diagnosis: None,
+            });
     if crate::optimize::is_verification_command(command) {
         record.last_verification = Some(crate::optimize::VerificationEvidence {
             command: command.clone(),

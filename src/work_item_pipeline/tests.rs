@@ -454,6 +454,84 @@ async fn finalize_step_releases_claim_after_review_only_success() {
     panic!("finalize step did not complete");
 }
 
+/// Item #216: a design-spec task is `review_only` too, but its deliverable
+/// is a real written file, not commentary — `finalize` must not take the
+/// findings-comment-only short-circuit for it, even though it would for a
+/// plain review-only task (see
+/// `finalize_step_posts_review_findings_comment_and_skips_item_done_when_review_only`
+/// above). Proven the same way `finalize_step_calls_item_done_on_success` is
+/// (but without its `#[ignore]`): `item_done` hard-fails in this sandbox
+/// (#482 — no real GitHub remote to open a PR against), so reaching it
+/// deterministically fails the step. If this branch fell through to the
+/// review-only short-circuit instead, the step would succeed with exactly
+/// one findings comment, like the plain review-only test above. Since
+/// `item_done` posts its own "PR creation failed" comment before erroring
+/// (see `finalize_step_fails_when_branch_slug_mismatch_hides_divergence`),
+/// the absence of the review-only "review findings" wording — not an empty
+/// comment list — is what proves the short-circuit was skipped.
+#[tokio::test]
+async fn finalize_step_attempts_item_done_for_design_spec_instead_of_findings_comment() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Design-spec finalize test item");
+    // A real file to commit — the design-spec analyst's actual deliverable.
+    std::fs::write(worktree_path.join("spec.md"), "# Design spec\n").unwrap();
+    let mcp = Arc::new(mcp);
+
+    let data = WorkItemData {
+        item_id: item_id.clone(),
+        owner: crate::claims::owner_id(),
+        review_only: true,
+        design_spec: true,
+        last_report: Some("Wrote docs/superpowers/specs/spec.md".to_string()),
+        reply_text: "Wrote docs/superpowers/specs/spec.md".to_string(),
+        ..Default::default()
+    };
+    let step = build_finalize_step(mcp.clone());
+    let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
+    let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
+    engine.register_workflow(wf).unwrap();
+    let run_id = engine
+        .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+        .await
+        .unwrap();
+
+    // `finalize` retries StepFailed up to 3x with 1s exponential backoff.
+    for _ in 0..200 {
+        let state = engine.get_status(run_id).await.unwrap();
+        match state.status {
+            flare_workflow::WorkflowStatus::Failed => {
+                let comments: serde_json::Value = serde_json::from_str(
+                    &mcp.comment_impl(CommentRequest {
+                        action: "list".into(),
+                        item_id: Some(item_id.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+                let arr = comments.as_array().unwrap();
+                assert!(
+                    !arr.iter().any(|c| c["body"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("review findings")),
+                    "design-spec finalize must not post the review-only findings comment: {arr:?}"
+                );
+                return;
+            }
+            flare_workflow::WorkflowStatus::Completed => {
+                panic!(
+                    "design-spec finalize unexpectedly succeeded without a real GitHub \
+                     remote -- it must have taken the review-only short-circuit instead \
+                     of attempting item_done/PR flow"
+                );
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    panic!("finalize step did not complete");
+}
+
 // requires a real headless agent binary; run manually / in an
 // environment with one installed — the mock-sender variant right below
 // covers the same metadata-persistence assertion unconditionally.

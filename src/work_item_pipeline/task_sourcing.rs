@@ -39,14 +39,38 @@ pub(crate) fn detect_review_only(item_description: &str, metadata: &serde_json::
     if normalized.contains("review only") {
         return true;
     }
-    // Word-boundary match on "design spec" so "design specification"/"design
-    // specs" (ordinary implementation-task phrasing) doesn't false-positive
-    // on the "spec" prefix.
-    let words: Vec<&str> = normalized.split_whitespace().collect();
+    has_design_spec_phrase(&normalized)
+}
+
+/// Word-boundary match on "design spec" so "design specification"/"design
+/// specs" (ordinary implementation-task phrasing) doesn't false-positive on
+/// the "spec" prefix. Shared by `detect_review_only`'s free-text fallback and
+/// `detect_design_spec` below. Takes an already-lowercased,
+/// hyphen-normalized description, matching what both callers already have on
+/// hand.
+fn has_design_spec_phrase(normalized_description: &str) -> bool {
+    let words: Vec<&str> = normalized_description.split_whitespace().collect();
     words.windows(2).any(|pair| {
         pair[0].trim_matches(|c: char| !c.is_alphanumeric()) == "design"
             && pair[1].trim_matches(|c: char| !c.is_alphanumeric()) == "spec"
     })
+}
+
+/// Narrows `detect_review_only`'s signal to specifically the design-spec
+/// flavor (item #216): `"review"` and `"design-spec"`/`"design_spec"` both
+/// make `detect_review_only` true, but they need different judge/role
+/// instructions downstream — a design-spec task's deliverable is a written
+/// spec document, not zero artifacts, unlike a plain review. Only meaningful
+/// when `detect_review_only` is already true for the same inputs; mirrors its
+/// task_type/free-text detection but narrowed to the design-spec case.
+pub(crate) fn detect_design_spec(item_description: &str, metadata: &serde_json::Value) -> bool {
+    match metadata["task_type"].as_str() {
+        Some("design-spec") | Some("design_spec") => return true,
+        Some(_) => return false,
+        None => {}
+    }
+    let normalized = item_description.to_lowercase().replace('-', " ");
+    has_design_spec_phrase(&normalized)
 }
 
 /// Whether TDD mode (item #179) is on for this dispatch: a deliberate,

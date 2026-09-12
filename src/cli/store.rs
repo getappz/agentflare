@@ -44,7 +44,11 @@ impl StoreArgs {
                 };
                 let total_docs: i64 = store
                     .conn()
-                    .query_row("SELECT COUNT(*) FROM store_documents WHERE deleted_at IS NULL", [], |r| r.get(0))
+                    .query_row(
+                        "SELECT COUNT(*) FROM store_documents WHERE deleted_at IS NULL",
+                        [],
+                        |r| r.get(0),
+                    )
                     .unwrap_or(0);
                 let total_chunks = store.chunk_count(None).unwrap_or(0);
                 let total_vecs: i64 = store
