@@ -402,8 +402,24 @@ pub(crate) fn build_sdd_loop_step(
                     cwd: cwd.clone(),
                     ..flare_workflow::json::StepInvocation::simple(role_agent.clone(), role_prompt)
                 };
-                let (raw_role_reply, in_tok, out_tok) =
-                    send(role_invocation).await.map_err(|message| {
+                let (raw_role_reply, in_tok, out_tok) = match send(role_invocation).await {
+                    Ok(v) => v,
+                    Err(message) => {
+                        // Item #164's incident: an expired credential fails
+                        // identically on every retry, so this step's
+                        // `RetryPolicy` (3 attempts, exponential backoff) is
+                        // pure waste here -- unlike a plain `Err`, returning
+                        // `Ok(StepResult::Failed(_))` skips the policy
+                        // entirely (`execute_step_with_retry` hardcodes
+                        // `should_retry = false` for it, see the judge-reply
+                        // parse error case below for the same pattern) while
+                        // still surfacing `message` unchanged as this run's
+                        // terminal error for `cli::work`'s
+                        // `handle_auth_expired`/`classify_and_cooldown` to
+                        // classify.
+                        if crate::auth_runner::is_auth_expired(&message) {
+                            return Ok(StepResult::Failed(message));
+                        }
                         // A dead resumed session would otherwise fail the
                         // same way on every one of this step's retry
                         // attempts (same session_id -> same `--resume`
@@ -413,11 +429,12 @@ pub(crate) fn build_sdd_loop_step(
                         if is_stale_session_error(&message) {
                             ctx.data.agent_sessions.remove(&role_agent);
                         }
-                        WorkflowError::StepFailed {
+                        return Err(WorkflowError::StepFailed {
                             step_id: StepId::new("sdd_loop"),
                             message,
-                        }
-                    })?;
+                        });
+                    }
+                };
                 ctx.input_tokens += in_tok;
                 ctx.output_tokens += out_tok;
 
@@ -463,16 +480,25 @@ pub(crate) fn build_sdd_loop_step(
                         judge_prompt,
                     )
                 };
-                let (raw_judge_reply, jin_tok, jout_tok) =
-                    send(judge_invocation).await.map_err(|message| {
+                let (raw_judge_reply, jin_tok, jout_tok) = match send(judge_invocation).await {
+                    Ok(v) => v,
+                    Err(message) => {
+                        // See the matching arm on the role dispatch above —
+                        // same item #164 rationale: skip this step's
+                        // `RetryPolicy` entirely for an auth-expiry failure
+                        // instead of burning 3 guaranteed-useless attempts.
+                        if crate::auth_runner::is_auth_expired(&message) {
+                            return Ok(StepResult::Failed(message));
+                        }
                         if is_stale_session_error(&message) {
                             ctx.data.agent_sessions.remove(&judge_agent_name);
                         }
-                        WorkflowError::StepFailed {
+                        return Err(WorkflowError::StepFailed {
                             step_id: StepId::new("sdd_loop"),
                             message,
-                        }
-                    })?;
+                        });
+                    }
+                };
                 ctx.input_tokens += jin_tok;
                 ctx.output_tokens += jout_tok;
 

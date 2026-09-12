@@ -599,17 +599,26 @@
     }
 
     #[test]
-    fn diagnostic_suffix_prefers_stdout_over_stderr() {
+    fn diagnostic_suffix_includes_both_streams_when_both_are_non_empty() {
+        // Item #173's incident: a CLI agent can emit some stdout (e.g. a
+        // partial stream-json event) before dying on a real failure whose
+        // text is only on stderr (e.g. an auth-expiry message). Dropping
+        // stderr whenever stdout was non-empty silently discarded that text
+        // from every downstream classifier -- both streams must survive,
+        // stdout first.
         let c = Captured {
             success: false,
             stdout: "working on task 3...".to_string(),
-            stderr: "some warning".to_string(),
+            stderr: "authentication expired, please re-authenticate".to_string(),
             timed_out: true,
             idle_killed: false,
         };
         let suffix = diagnostic_suffix(&c, None);
         assert!(suffix.contains("last stdout before kill"));
         assert!(suffix.contains("working on task 3..."));
+        assert!(suffix.contains("last stderr before kill"));
+        assert!(suffix.contains("authentication expired, please re-authenticate"));
+        assert!(suffix.find("last stdout").unwrap() < suffix.find("last stderr").unwrap());
     }
 
     #[test]
