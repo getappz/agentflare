@@ -240,6 +240,12 @@ mod tests {
     }
 
     #[test]
+    // Sandboxing (`wrap`'s bwrap path) only ever engages on Linux -- this
+    // function's Unix-`$HOME` lookup mirrors that, per its own doc comment.
+    // GitHub Actions' Windows runners don't set `HOME` (they use
+    // `USERPROFILE`), so this test would otherwise fail there for a code
+    // path that's dead weight on that platform anyway.
+    #[cfg(unix)]
     fn diagnostic_path_is_nested_under_agentflare_home_dir() {
         let path = diagnostic_path("some-token").expect("HOME is set in test environment");
         assert!(path.ends_with(".agentflare/sandbox-diagnostics/some-token.log"));
