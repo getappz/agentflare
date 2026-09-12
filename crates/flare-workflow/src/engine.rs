@@ -711,12 +711,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     "Workflow deadlocked: no steps ready and none running"
                 };
                 let last_error = match &failed_step {
-                    Some(step_id) => self
-                        .state_store
-                        .load(run_id)
-                        .await
-                        .ok()
-                        .and_then(|s| s.step_states.get(step_id).and_then(|ss| ss.last_error.clone())),
+                    Some(step_id) => self.state_store.load(run_id).await.ok().and_then(|s| {
+                        s.step_states
+                            .get(step_id)
+                            .and_then(|ss| ss.last_error.clone())
+                    }),
                     None => None,
                 };
                 let error_message = match last_error {
@@ -968,12 +967,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         };
 
         if let Some(step) = failed_step {
-            let last_error = self
-                .state_store
-                .load(run_id)
-                .await
-                .ok()
-                .and_then(|s| s.step_states.get(&step).and_then(|ss| ss.last_error.clone()));
+            let last_error = self.state_store.load(run_id).await.ok().and_then(|s| {
+                s.step_states
+                    .get(&step)
+                    .and_then(|ss| ss.last_error.clone())
+            });
             let error_message = match last_error {
                 Some(err) => format!("One or more steps failed: {err}"),
                 None => "One or more steps failed".to_string(),

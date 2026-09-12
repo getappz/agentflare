@@ -254,9 +254,10 @@ impl AgentflareMcp {
             .map_err(map_backend_err)?;
         match agentflare_backend::item::get(conn, &id) {
             Ok(item) if item.project_id == project.id => Ok(id),
-            Ok(_) | Err(agentflare_backend::Error::NotFound(_)) => Err(
-                ErrorData::invalid_params(format!("no item matches id '{id_or_seq}'"), None),
-            ),
+            Ok(_) | Err(agentflare_backend::Error::NotFound(_)) => Err(ErrorData::invalid_params(
+                format!("no item matches id '{id_or_seq}'"),
+                None,
+            )),
             Err(e) => Err(map_backend_err(e)),
         }
     }
@@ -1262,9 +1263,9 @@ impl AgentflareMcp {
     }
 
     pub(crate) fn item_remove_relation(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req.id.ok_or_else(|| {
-            ErrorData::invalid_params("id is required for remove_relation", None)
-        })?;
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for remove_relation", None))?;
         let related_raw = req.related_item_id.ok_or_else(|| {
             ErrorData::invalid_params("related_item_id is required for remove_relation", None)
         })?;
@@ -1305,7 +1306,7 @@ impl AgentflareMcp {
                         .into_iter()
                         .map(|other_id| (relation_type.to_string(), other_id))
                         .collect()
-                },
+                }
                 None => agentflare_backend::item::list_all_relations(conn, &item_id)
                     .map_err(map_backend_err)?,
             };

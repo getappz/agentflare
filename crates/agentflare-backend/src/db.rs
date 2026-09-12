@@ -202,9 +202,7 @@ mod tests {
         // Simulate a db at the state right before 0012: pre-existing
         // item_dependencies rows with no relation_type column at all.
         {
-            let pre_0012 = Migrations::new(
-                MIGRATION_LIST[..MIGRATION_LIST.len() - 2].to_vec(),
-            );
+            let pre_0012 = Migrations::new(MIGRATION_LIST[..MIGRATION_LIST.len() - 2].to_vec());
             let mut conn = Connection::open(&path).unwrap();
             pre_0012.to_latest(&mut conn).unwrap();
             conn.pragma_update(None, "foreign_keys", "ON").unwrap();
@@ -309,7 +307,10 @@ mod tests {
         let name: String = conn
             .query_row("SELECT name FROM items WHERE id = 'i1'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(name, "I1", "pre-existing item row must survive the ALTER TABLE");
+        assert_eq!(
+            name, "I1",
+            "pre-existing item row must survive the ALTER TABLE"
+        );
 
         let (start_date, due_date): (Option<i64>, Option<i64>) = conn
             .query_row(

@@ -4,12 +4,12 @@ pub mod documents;
 pub mod embed;
 pub mod fastembed;
 pub mod kv;
-pub mod vector;
 pub mod leases;
 pub mod maintenance;
 pub mod migrate;
 pub mod migrations;
 pub mod retrieval;
+pub mod vector;
 
 #[cfg(feature = "embeddings")]
 pub mod embedding_pipeline;

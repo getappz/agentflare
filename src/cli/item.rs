@@ -47,7 +47,12 @@ pub enum ItemCommands {
 impl ItemArgs {
     pub fn run(self) {
         match self.command {
-            ItemCommands::List { json: _, limit, state_group, project: project_filter } => {
+            ItemCommands::List {
+                json: _,
+                limit,
+                state_group,
+                project: project_filter,
+            } => {
                 let mcp = crate::mcp_server::AgentflareMcp::default();
                 let res = mcp.with_backend_db(|conn| {
                     let project = if let Some(p) = project_filter {
@@ -55,10 +60,14 @@ impl ItemArgs {
                     } else {
                         mcp.resolve_project(conn)?
                     };
-                    let mut items = agentflare_backend::item::list_by_project(conn, &project.id).map_err(crate::mcp_server::types::map_backend_err)?;
-                    let states = agentflare_backend::state::list_by_project(conn, &project.id).map_err(crate::mcp_server::types::map_backend_err)?;
-                    let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
-                        states.iter().map(|s| (s.id.as_str(), s)).collect();
+                    let mut items = agentflare_backend::item::list_by_project(conn, &project.id)
+                        .map_err(crate::mcp_server::types::map_backend_err)?;
+                    let states = agentflare_backend::state::list_by_project(conn, &project.id)
+                        .map_err(crate::mcp_server::types::map_backend_err)?;
+                    let state_by_id: std::collections::HashMap<
+                        &str,
+                        &agentflare_backend::state::State,
+                    > = states.iter().map(|s| (s.id.as_str(), s)).collect();
 
                     if let Some(group) = &state_group {
                         let wanted: Vec<&str> = group.split(',').map(str::trim).collect();
@@ -78,7 +87,8 @@ impl ItemArgs {
                         .map(|i| {
                             let state = state_by_id.get(i.state_id.as_str());
                             let state_name = state.map(|s| s.name.clone()).unwrap_or_default();
-                            let state_group = state.map(|s| s.group_name.clone()).unwrap_or_default();
+                            let state_group =
+                                state.map(|s| s.group_name.clone()).unwrap_or_default();
                             serde_json::json!({
                                 "id": format!("#{}", i.sequence_id),
                                 "name": i.name,
@@ -93,7 +103,9 @@ impl ItemArgs {
                         })
                         .collect();
 
-                    Ok::<_, rmcp::model::ErrorData>(serde_json::to_string_pretty(&out).unwrap_or_default())
+                    Ok::<_, rmcp::model::ErrorData>(
+                        serde_json::to_string_pretty(&out).unwrap_or_default(),
+                    )
                 });
                 match res {
                     Ok(Ok(json)) => println!("{json}"),
@@ -106,10 +118,27 @@ impl ItemArgs {
                 let res = mcp.with_backend_db(|conn| {
                     let item_id = mcp.resolve_item_id(conn, &id)?;
                     let project = mcp.resolve_project(conn)?;
-                    let states = agentflare_backend::state::list_by_project(conn, &project.id).map_err(crate::mcp_server::types::map_backend_err)?;
-                    let target = states.iter().find(|s| s.name.to_lowercase() == state.to_lowercase() || s.group_name.to_lowercase() == state.to_lowercase().replace(' ', "_")).cloned().ok_or_else(|| rmcp::model::ErrorData::invalid_params(format!("state '{}' not found", state), None))?;
-                    let item = agentflare_backend::item::update_state(conn, &item_id, &target.id).map_err(crate::mcp_server::types::map_backend_err)?;
-                    Ok::<_, rmcp::model::ErrorData>(serde_json::to_string_pretty(&item).unwrap_or_default())
+                    let states = agentflare_backend::state::list_by_project(conn, &project.id)
+                        .map_err(crate::mcp_server::types::map_backend_err)?;
+                    let target = states
+                        .iter()
+                        .find(|s| {
+                            s.name.to_lowercase() == state.to_lowercase()
+                                || s.group_name.to_lowercase()
+                                    == state.to_lowercase().replace(' ', "_")
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            rmcp::model::ErrorData::invalid_params(
+                                format!("state '{}' not found", state),
+                                None,
+                            )
+                        })?;
+                    let item = agentflare_backend::item::update_state(conn, &item_id, &target.id)
+                        .map_err(crate::mcp_server::types::map_backend_err)?;
+                    Ok::<_, rmcp::model::ErrorData>(
+                        serde_json::to_string_pretty(&item).unwrap_or_default(),
+                    )
                 });
                 match res {
                     Ok(Ok(json)) => println!("{json}"),
@@ -117,15 +146,39 @@ impl ItemArgs {
                     Err(e) => crate::ui::error(&e.to_string()),
                 }
             }
-            ItemCommands::Create { name, description, priority, state } => {
+            ItemCommands::Create {
+                name,
+                description,
+                priority,
+                state,
+            } => {
                 let mcp = crate::mcp_server::AgentflareMcp::default();
                 let res = mcp.with_backend_db(|conn| {
                     let project = mcp.resolve_project(conn)?;
-                    let states = agentflare_backend::state::list_by_project(conn, &project.id).map_err(crate::mcp_server::types::map_backend_err)?;
+                    let states = agentflare_backend::state::list_by_project(conn, &project.id)
+                        .map_err(crate::mcp_server::types::map_backend_err)?;
                     let state_id = if let Some(s) = state {
-                        states.iter().find(|st| st.name.to_lowercase() == s.to_lowercase() || st.group_name.to_lowercase() == s.to_lowercase().replace(' ', "_")).map(|st| st.id.clone()).unwrap_or_else(|| states.iter().find(|st| st.is_default).map(|st| st.id.clone()).unwrap_or_else(|| states[0].id.clone()))
+                        states
+                            .iter()
+                            .find(|st| {
+                                st.name.to_lowercase() == s.to_lowercase()
+                                    || st.group_name.to_lowercase()
+                                        == s.to_lowercase().replace(' ', "_")
+                            })
+                            .map(|st| st.id.clone())
+                            .unwrap_or_else(|| {
+                                states
+                                    .iter()
+                                    .find(|st| st.is_default)
+                                    .map(|st| st.id.clone())
+                                    .unwrap_or_else(|| states[0].id.clone())
+                            })
                     } else {
-                        states.iter().find(|st| st.is_default).map(|st| st.id.clone()).unwrap_or_else(|| states[0].id.clone())
+                        states
+                            .iter()
+                            .find(|st| st.is_default)
+                            .map(|st| st.id.clone())
+                            .unwrap_or_else(|| states[0].id.clone())
                     };
                     let item = agentflare_backend::item::create(
                         conn,
@@ -149,7 +202,9 @@ impl ItemArgs {
                         },
                     )
                     .map_err(crate::mcp_server::types::map_backend_err)?;
-                    Ok::<_, rmcp::model::ErrorData>(serde_json::to_string_pretty(&item).unwrap_or_default())
+                    Ok::<_, rmcp::model::ErrorData>(
+                        serde_json::to_string_pretty(&item).unwrap_or_default(),
+                    )
                 });
                 match res {
                     Ok(Ok(json)) => println!("{json}"),
@@ -161,8 +216,10 @@ impl ItemArgs {
                 let mcp = crate::mcp_server::AgentflareMcp::default();
                 let res = mcp.with_backend_db(|conn| {
                     let item_id = mcp.resolve_item_id(conn, &id)?;
-                    let item = agentflare_backend::item::get(conn, &item_id).map_err(crate::mcp_server::types::map_backend_err)?;
-                    let state = agentflare_backend::state::get(conn, &item.state_id).map_err(crate::mcp_server::types::map_backend_err)?;
+                    let item = agentflare_backend::item::get(conn, &item_id)
+                        .map_err(crate::mcp_server::types::map_backend_err)?;
+                    let state = agentflare_backend::state::get(conn, &item.state_id)
+                        .map_err(crate::mcp_server::types::map_backend_err)?;
                     let out = serde_json::json!({
                         "id": format!("#{}", item.sequence_id),
                         "uuid": item.id,
@@ -176,7 +233,9 @@ impl ItemArgs {
                         "created_at": item.created_at,
                         "updated_at": item.updated_at,
                     });
-                    Ok::<_, rmcp::model::ErrorData>(serde_json::to_string_pretty(&out).unwrap_or_default())
+                    Ok::<_, rmcp::model::ErrorData>(
+                        serde_json::to_string_pretty(&out).unwrap_or_default(),
+                    )
                 });
                 match res {
                     Ok(Ok(json)) => println!("{json}"),

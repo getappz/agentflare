@@ -16,11 +16,29 @@ fn validate_hybrid() {
     assert!(!hits.is_empty());
     assert_eq!(hits[0].id, doc.id);
     store.doc_set_meta(&doc.id, "lang", "rust").unwrap();
-    let filtered = store.doc_search_filtered("proj1", "UNIQUE_TERM_TWO", 5, Some(&[("lang".to_string(),"rust".to_string())]), None).unwrap();
+    let filtered = store
+        .doc_search_filtered(
+            "proj1",
+            "UNIQUE_TERM_TWO",
+            5,
+            Some(&[("lang".to_string(), "rust".to_string())]),
+            None,
+        )
+        .unwrap();
     assert_eq!(filtered.len(), 1);
-    let filtered_zero = store.doc_search_filtered("proj1", "UNIQUE_TERM_TWO", 5, Some(&[("lang".to_string(),"py".to_string())]), None).unwrap();
+    let filtered_zero = store
+        .doc_search_filtered(
+            "proj1",
+            "UNIQUE_TERM_TWO",
+            5,
+            Some(&[("lang".to_string(), "py".to_string())]),
+            None,
+        )
+        .unwrap();
     assert!(filtered_zero.is_empty());
-    let glob_hit = store.doc_search_filtered("proj1", "UNIQUE_TERM_TWO", 5, None, Some("docs/*.md")).unwrap();
+    let glob_hit = store
+        .doc_search_filtered("proj1", "UNIQUE_TERM_TWO", 5, None, Some("docs/*.md"))
+        .unwrap();
     assert_eq!(glob_hit.len(), 1);
     store.search_cache_put("UNIQUE_TERM_TWO", "proj1", &hits);
     let cached = store.search_cache_get("UNIQUE_TERM_TWO", "proj1").unwrap();

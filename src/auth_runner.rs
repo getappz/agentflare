@@ -266,7 +266,9 @@ mod tests {
 
     #[test]
     fn is_auth_expired_matches_common_phrases() {
-        assert!(is_auth_expired("Your session has expired. Please re-authenticate."));
+        assert!(is_auth_expired(
+            "Your session has expired. Please re-authenticate."
+        ));
         assert!(is_auth_expired("Error: invalid API key"));
         assert!(is_auth_expired("401 Unauthorized"));
         assert!(!is_auth_expired("HTTP 429 Too Many Requests"));

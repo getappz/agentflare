@@ -188,7 +188,14 @@ fn judge_prompt_instructs_json_only_output() {
 #[test]
 fn judge_prompt_includes_ledger_history() {
     let ledger = vec!["Task 0: fix round 1/5 (1 addressed)".to_string()];
-    let prompt = build_judge_prompt(&[sample_task()], 0, &ledger, "REVIEW_APPROVED", false, false);
+    let prompt = build_judge_prompt(
+        &[sample_task()],
+        0,
+        &ledger,
+        "REVIEW_APPROVED",
+        false,
+        false,
+    );
     assert!(prompt.contains("fix round 1/5"));
 }
 

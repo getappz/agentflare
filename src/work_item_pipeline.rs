@@ -372,52 +372,51 @@ pub(crate) fn build_sdd_loop_step(
                 // dispatch further down), so a usage-threshold fallback that
                 // swaps `agent_name` to another CLI still leaves real code
                 // review running on the reserved agent.
-                let (role_agent, role_prompt, is_implementer_turn) =
-                    if ctx.data.review_issues.is_some() {
-                        if ctx.data.last_report.is_some() {
-                            // A fix has already been submitted for the current
-                            // issues — re-review it.
-                            let findings = ctx.data.review_issues.clone().unwrap_or_default();
-                            let fix_report = ctx.data.last_report.clone().unwrap_or_default();
-                            (
-                                judge_agent_name.clone(),
-                                build_re_reviewer_prompt(&task, &findings, &fix_report),
-                                false,
-                            )
-                        } else {
-                            // Issues open, no fix attempt yet — dispatch the
-                            // implementer to fix them (or, for a review-only
-                            // task, the analyst to revise their findings).
-                            let fix_context = ctx.data.review_issues.as_deref();
-                            let prompt = if ctx.data.review_only {
-                                build_review_analyst_prompt(
-                                    &task,
-                                    fix_context,
-                                    ctx.data.design_spec,
-                                )
-                            } else {
-                                build_implementer_prompt(&task, fix_context, ctx.data.tdd)
-                            };
-                            (agent_name.clone(), prompt, !ctx.data.review_only)
-                        }
-                    } else if ctx.data.last_report.is_some() {
-                        // No open issues; a report is pending review.
-                        let report = ctx.data.last_report.clone().unwrap_or_default();
-                        let prompt = if ctx.data.review_only {
-                            build_review_of_analysis_prompt(&task, &report)
-                        } else {
-                            build_task_reviewer_prompt(&task, &report, ctx.data.tdd)
-                        };
-                        (judge_agent_name.clone(), prompt, false)
+                let (role_agent, role_prompt, is_implementer_turn) = if ctx
+                    .data
+                    .review_issues
+                    .is_some()
+                {
+                    if ctx.data.last_report.is_some() {
+                        // A fix has already been submitted for the current
+                        // issues — re-review it.
+                        let findings = ctx.data.review_issues.clone().unwrap_or_default();
+                        let fix_report = ctx.data.last_report.clone().unwrap_or_default();
+                        (
+                            judge_agent_name.clone(),
+                            build_re_reviewer_prompt(&task, &findings, &fix_report),
+                            false,
+                        )
                     } else {
-                        // Fresh task, nothing dispatched yet.
+                        // Issues open, no fix attempt yet — dispatch the
+                        // implementer to fix them (or, for a review-only
+                        // task, the analyst to revise their findings).
+                        let fix_context = ctx.data.review_issues.as_deref();
                         let prompt = if ctx.data.review_only {
-                            build_review_analyst_prompt(&task, None, ctx.data.design_spec)
+                            build_review_analyst_prompt(&task, fix_context, ctx.data.design_spec)
                         } else {
-                            build_implementer_prompt(&task, None, ctx.data.tdd)
+                            build_implementer_prompt(&task, fix_context, ctx.data.tdd)
                         };
                         (agent_name.clone(), prompt, !ctx.data.review_only)
+                    }
+                } else if ctx.data.last_report.is_some() {
+                    // No open issues; a report is pending review.
+                    let report = ctx.data.last_report.clone().unwrap_or_default();
+                    let prompt = if ctx.data.review_only {
+                        build_review_of_analysis_prompt(&task, &report)
+                    } else {
+                        build_task_reviewer_prompt(&task, &report, ctx.data.tdd)
                     };
+                    (judge_agent_name.clone(), prompt, false)
+                } else {
+                    // Fresh task, nothing dispatched yet.
+                    let prompt = if ctx.data.review_only {
+                        build_review_analyst_prompt(&task, None, ctx.data.design_spec)
+                    } else {
+                        build_implementer_prompt(&task, None, ctx.data.tdd)
+                    };
+                    (agent_name.clone(), prompt, !ctx.data.review_only)
+                };
 
                 let cwd = (!ctx.data.worktree_path.is_empty())
                     .then(|| std::path::PathBuf::from(&ctx.data.worktree_path));

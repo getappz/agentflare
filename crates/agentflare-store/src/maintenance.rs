@@ -229,7 +229,10 @@ impl Store {
                     "DELETE FROM store_chunk_vec WHERE chunk_id IN (SELECT id FROM store_doc_chunks WHERE doc_id = ?1)",
                     params![id],
                 )?;
-                tx.execute("DELETE FROM store_doc_chunks WHERE doc_id = ?1", params![id])?;
+                tx.execute(
+                    "DELETE FROM store_doc_chunks WHERE doc_id = ?1",
+                    params![id],
+                )?;
                 // Dropping the row out of store_docs_fts is the AFTER DELETE
                 // trigger's job — see migrations::EXTERNAL_CONTENT_FTS_MIGRATION.
                 // store_chunks_fts is similarly handled by its own triggers on store_doc_chunks.

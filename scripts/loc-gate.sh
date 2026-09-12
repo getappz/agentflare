@@ -49,6 +49,12 @@ ALLOWLIST=(
   # item_tests_relations.rs) -- pre-existing debt this fix didn't create.
   # Frozen at <= FROZEN_LIMIT; a real split is separate work.
   src/mcp_server/tests/item_tests.rs
+  # Already 1540 lines on master before an unrelated `cargo fmt` pass (PR
+  # #663, landing a design-spec mode_note fix plus CI hygiene) pushed it to
+  # 1541 -- same situation as every other entry above: pre-existing debt a
+  # formatting/CI fix shouldn't have to carry. Frozen at <= FROZEN_LIMIT;
+  # a real split is separate work.
+  src/mcp_server/handoff.rs
 )
 
 cd "$(dirname "$0")/.."

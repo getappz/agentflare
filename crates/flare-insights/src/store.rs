@@ -456,7 +456,10 @@ impl InsightsStore {
 
     // ---- ingest file cursors (skip-unchanged-file cache for `sync`) ----
 
-    pub fn load_file_cursors(&self, source: &str) -> Result<HashMap<PathBuf, (i64, u64)>, StoreError> {
+    pub fn load_file_cursors(
+        &self,
+        source: &str,
+    ) -> Result<HashMap<PathBuf, (i64, u64)>, StoreError> {
         let mut stmt = self
             .conn
             .prepare("SELECT path, mtime_ms, size FROM ingest_file_cursors WHERE source=?1")?;

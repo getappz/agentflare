@@ -65,12 +65,16 @@ fn remove_relation_symmetric_type_removes_regardless_of_argument_order() {
     add_relation(&conn, &a.id, &b.id, "relates_to").unwrap();
     remove_relation(&conn, &b.id, &a.id, "relates_to").unwrap();
 
-    assert!(list_relations_by_type(&conn, &a.id, "relates_to")
-        .unwrap()
-        .is_empty());
-    assert!(list_relations_by_type(&conn, &b.id, "relates_to")
-        .unwrap()
-        .is_empty());
+    assert!(
+        list_relations_by_type(&conn, &a.id, "relates_to")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        list_relations_by_type(&conn, &b.id, "relates_to")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
