@@ -309,7 +309,7 @@ fn build_failure_decision(message: &str, severity: &str) -> serde_json::Value {
 /// simplification, not a downgrade), gates on nudge_pace so a repeat of
 /// the same topic within DEFAULT_COOLDOWN doesn't re-nudge, and only then
 /// emits a context nudge pointing at mcp__flare__vent.
-pub fn post_tool_failure(_agent: &str) {
+pub fn post_tool_failure(agent: &str) {
     let Some(input) = read_stdin_or_skip("PostToolUseFailure") else {
         return;
     };
@@ -336,7 +336,10 @@ pub fn post_tool_failure(_agent: &str) {
         return;
     }
 
-    let pace_key = format!("vent-nudge:{topic_key}");
+    // Scoped by agent (item #220) so two agents/hosts sharing a topic don't
+    // share a cooldown -- one agent's nudge must not silently suppress the
+    // other's.
+    let pace_key = format!("vent-nudge:{agent}:{topic_key}");
     if !crate::nudge_pace::should_fire(&pace_key, crate::nudge_pace::DEFAULT_COOLDOWN) {
         return;
     }
@@ -384,7 +387,7 @@ fn resolve_item_task_type(
         .map(String::from)
 }
 
-pub fn pre_tool_use(_agent: &str) {
+pub fn pre_tool_use(agent: &str) {
     let Some(input) = read_stdin_or_skip("PreToolUse") else {
         return;
     };
@@ -421,9 +424,14 @@ pub fn pre_tool_use(_agent: &str) {
         .unwrap_or(0);
     crate::optimize::prune_stale_sessions(&mut runtime, now);
 
+    // Scoped by agent identity (item #220): a bare session_id can be shared
+    // across agents/hosts (shared tmux, multi-agent machine), which would
+    // otherwise let one agent's verification/review/diagnosis evidence
+    // satisfy another's completion gate.
+    let session_key = crate::optimize::scoped_session_key(agent, &parsed.session_id);
     let record = runtime
         .sessions
-        .entry(parsed.session_id.clone())
+        .entry(session_key.clone())
         .or_insert_with(|| crate::optimize::SessionRecord {
             start_ts: now,
             turn_count: 0,
@@ -473,7 +481,7 @@ pub fn pre_tool_use(_agent: &str) {
     if crate::hook_redirect::MUTATING_TOOLS.contains(&parsed.tool_name.as_str())
         && runtime
             .staleness_checked_sessions
-            .insert(parsed.session_id.clone())
+            .insert(session_key.clone())
         && let crate::hook_redirect::TargetRepo::Found(repo) =
             crate::hook_redirect::resolve_mutating_target_repo(parsed.tool_input.as_ref())
         && let Some((default_branch, commits_behind)) =
@@ -674,10 +682,14 @@ pub fn prompt_submit(agent: &str) {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         crate::optimize::prune_stale_sessions(&mut runtime, now);
+        // Same agent-scoped key as pre_tool_use/post_tool_use (item #220) --
+        // must resolve to the same record for the completion gate to see
+        // this session's turn/tool-call history.
+        let session_key = crate::optimize::scoped_session_key(agent, sid);
         let record =
             runtime
                 .sessions
-                .entry(sid.clone())
+                .entry(session_key)
                 .or_insert_with(|| crate::optimize::SessionRecord {
                     start_ts: now,
                     turn_count: 0,
