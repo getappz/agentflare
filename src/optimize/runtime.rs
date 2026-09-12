@@ -304,6 +304,17 @@ pub fn invalidate_review(state: &mut RuntimeState, session_id: &str) {
     }
 }
 
+/// Combines agent identity with the raw hook `session_id` so two agents (or
+/// hosts) sharing a bare session id — a shared tmux pane, a multi-agent
+/// machine — don't collide on the same `RuntimeState::sessions` record (item
+/// #220). `agent` should already be normalized (`cli::hook::resolve_agent`'s
+/// output), so this is transparent for the common single-agent case: an
+/// empty/`"unknown"` agent still produces a stable, distinct key per agent
+/// value rather than silently degrading back to the bare session id.
+pub fn scoped_session_key(agent: &str, session_id: &str) -> String {
+    format!("{agent}:{session_id}")
+}
+
 pub fn runtime_state_path() -> PathBuf {
     crate::state::state_dir().join("runtime-state.json")
 }
@@ -527,6 +538,14 @@ pub fn schedule_wakeup_nudge(delay_seconds: u64) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::paths::test_support::with_temp_home;
+
+    #[test]
+    fn scoped_session_key_differs_by_agent_for_same_session_id() {
+        assert_ne!(
+            scoped_session_key("claude", "shared-sid"),
+            scoped_session_key("opencode", "shared-sid")
+        );
+    }
 
     #[test]
     fn load_defaults_to_empty_when_no_file() {
