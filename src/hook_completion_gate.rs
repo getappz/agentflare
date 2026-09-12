@@ -225,7 +225,7 @@ fn shows_finishing_branch_menu(tool_name: &str, action: &str, item_success: Opti
 /// patch/ctx_patch/...) runs, so evidence from before this edit can't cover
 /// a since-changed tree -- diagnosis evidence is deliberately NOT cleared
 /// here, see `SessionRecord::last_diagnosis`'s doc comment.
-pub fn post_tool_use(_agent: &str) {
+pub fn post_tool_use(agent: &str) {
     let Some(input) = read_stdin_or_skip("PostToolUse") else {
         return;
     };
@@ -246,10 +246,16 @@ pub fn post_tool_use(_agent: &str) {
         return;
     }
 
+    // Scoped by agent identity (item #220) -- must match the key
+    // pre_tool_use/prompt_submit use for the same session, or this session's
+    // own evidence would land in a different record than the one the
+    // completion gate reads.
+    let session_key = crate::optimize::scoped_session_key(agent, &parsed.session_id);
+
     if crate::hook_redirect::MUTATING_TOOLS.contains(&parsed.tool_name.as_str()) {
         let mut runtime = crate::optimize::load_runtime();
-        crate::optimize::invalidate_verification(&mut runtime, &parsed.session_id);
-        crate::optimize::invalidate_review(&mut runtime, &parsed.session_id);
+        crate::optimize::invalidate_verification(&mut runtime, &session_key);
+        crate::optimize::invalidate_review(&mut runtime, &session_key);
         crate::optimize::save_runtime(&runtime);
         return;
     }
@@ -264,7 +270,7 @@ pub fn post_tool_use(_agent: &str) {
         crate::optimize::prune_stale_sessions(&mut runtime, now);
         let record = runtime
             .sessions
-            .entry(parsed.session_id.clone())
+            .entry(session_key.clone())
             .or_insert_with(|| crate::optimize::SessionRecord {
                 start_ts: now,
                 turn_count: 0,
@@ -296,7 +302,7 @@ pub fn post_tool_use(_agent: &str) {
     crate::optimize::prune_stale_sessions(&mut runtime, now);
     let record = runtime
         .sessions
-        .entry(parsed.session_id.clone())
+        .entry(session_key)
         .or_insert_with(|| crate::optimize::SessionRecord {
             start_ts: now,
             turn_count: 0,
