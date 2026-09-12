@@ -305,9 +305,8 @@ pub fn compile_workflow(
 /// ` OR ` or ` AND ` (lower precedence than either, so `A AND B OR C` reads
 /// as `(A AND B) OR C`); this is not a full expression language, so a
 /// quoted literal must not itself contain the substring `" OR "`/`" AND "`.
-fn compile_run_if(
-    expr: &str,
-) -> Box<dyn Fn(&WorkflowContext<PipelineData>) -> bool + Send + Sync + 'static> {
+type RunIfPredicate = Box<dyn Fn(&WorkflowContext<PipelineData>) -> bool + Send + Sync + 'static>;
+fn compile_run_if(expr: &str) -> RunIfPredicate {
     if let Some((lhs, rhs)) = expr.split_once(" OR ") {
         let (l, r) = (compile_run_if(lhs), compile_run_if(rhs));
         return Box::new(move |ctx| l(ctx) || r(ctx));

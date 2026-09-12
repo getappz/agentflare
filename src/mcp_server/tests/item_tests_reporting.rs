@@ -155,12 +155,11 @@ fn item_groom_computes_overdue_from_due_date_and_state_group() {
         })
         .collect();
 
-    assert_eq!(overdue_by_id[past_due["id"].as_str().unwrap()], true);
-    assert_eq!(overdue_by_id[future_due["id"].as_str().unwrap()], false);
-    assert_eq!(overdue_by_id[no_due["id"].as_str().unwrap()], false);
-    assert_eq!(
-        overdue_by_id[completed_but_overdue["id"].as_str().unwrap()],
-        false,
+    assert!(overdue_by_id[past_due["id"].as_str().unwrap()]);
+    assert!(!overdue_by_id[future_due["id"].as_str().unwrap()]);
+    assert!(!overdue_by_id[no_due["id"].as_str().unwrap()]);
+    assert!(
+        !overdue_by_id[completed_but_overdue["id"].as_str().unwrap()],
         "a completed item past its due date is not overdue"
     );
 }

@@ -55,6 +55,12 @@ ALLOWLIST=(
   # formatting/CI fix shouldn't have to carry. Frozen at <= FROZEN_LIMIT;
   # a real split is separate work.
   src/mcp_server/handoff.rs
+  # Already 1986 lines on master before the same PR #663 fmt/clippy pass
+  # reformatted several already-misformatted blocks (pushing it to 2066) and
+  # collapsed a nested if into a let-chain for clippy -- pre-existing debt,
+  # same rationale as every other entry above. Frozen at <= FROZEN_LIMIT;
+  # a real split is separate work.
+  crates/agentflare-store/src/documents.rs
 )
 
 cd "$(dirname "$0")/.."

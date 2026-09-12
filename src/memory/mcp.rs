@@ -144,8 +144,7 @@ impl RecallCache {
     }
 
     fn insert(&mut self, key: String, project: String, response: String) {
-        self.entries
-            .retain(|_, e| e.inserted.elapsed() < self.ttl);
+        self.entries.retain(|_, e| e.inserted.elapsed() < self.ttl);
         if self.entries.len() >= self.cap
             && let Some(oldest) = self
                 .entries
@@ -221,16 +220,17 @@ fn recall_with_conn(conn: &rusqlite::Connection, input: RecallInput) -> Result<S
 /// `recall_with_conn` with the underlying search injected, so tests can
 /// count invocations and prove repeated identical recalls do one search.
 /// Production passes `search::search_hybrid` (+ the real embedder).
+type RecallFetch<'a> = &'a dyn Fn(
+    &rusqlite::Connection,
+    &str,
+    Option<&str>,
+    Option<&str>,
+    usize,
+) -> Result<Vec<Observation>, rusqlite::Error>;
 fn recall_with_fetch(
     conn: &rusqlite::Connection,
     input: RecallInput,
-    fetch: &dyn Fn(
-        &rusqlite::Connection,
-        &str,
-        Option<&str>,
-        Option<&str>,
-        usize,
-    ) -> Result<Vec<Observation>, rusqlite::Error>,
+    fetch: RecallFetch<'_>,
 ) -> Result<String, String> {
     if let Some(id) = input.id {
         let obs = observations::get(conn, id).map_err(|e| format!("lookup failed: {e}"))?;
@@ -746,11 +746,7 @@ mod tests {
         let first = recall_with_fetch(&conn, mk_input(), &fetch).unwrap();
         let second = recall_with_fetch(&conn, mk_input(), &fetch).unwrap();
         assert_eq!(first, second);
-        assert_eq!(
-            calls.get(),
-            1,
-            "second identical recall must hit the cache"
-        );
+        assert_eq!(calls.get(), 1, "second identical recall must hit the cache");
         let v: serde_json::Value = serde_json::from_str(&first).unwrap();
         assert!(!v.as_array().unwrap().is_empty());
     }
@@ -796,12 +792,20 @@ mod tests {
             project: Some(project.to_string()),
             limit: Some(limit),
         };
-        recall_with_fetch(&conn, mk("proj-kb-a", None, 10, "key coverage marker beta"), &fetch)
-            .unwrap();
+        recall_with_fetch(
+            &conn,
+            mk("proj-kb-a", None, 10, "key coverage marker beta"),
+            &fetch,
+        )
+        .unwrap();
         assert_eq!(calls.get(), 1);
         // Identical again: hit.
-        recall_with_fetch(&conn, mk("proj-kb-a", None, 10, "key coverage marker beta"), &fetch)
-            .unwrap();
+        recall_with_fetch(
+            &conn,
+            mk("proj-kb-a", None, 10, "key coverage marker beta"),
+            &fetch,
+        )
+        .unwrap();
         assert_eq!(calls.get(), 1);
         // Case + whitespace noise: same normalized key, still a hit.
         recall_with_fetch(
@@ -812,8 +816,12 @@ mod tests {
         .unwrap();
         assert_eq!(calls.get(), 1);
         // Different project / type / limit: each misses exactly once.
-        recall_with_fetch(&conn, mk("proj-kb-b", None, 10, "key coverage marker beta"), &fetch)
-            .unwrap();
+        recall_with_fetch(
+            &conn,
+            mk("proj-kb-b", None, 10, "key coverage marker beta"),
+            &fetch,
+        )
+        .unwrap();
         assert_eq!(calls.get(), 2);
         recall_with_fetch(
             &conn,
@@ -822,8 +830,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(calls.get(), 3);
-        recall_with_fetch(&conn, mk("proj-kb-a", None, 5, "key coverage marker beta"), &fetch)
-            .unwrap();
+        recall_with_fetch(
+            &conn,
+            mk("proj-kb-a", None, 5, "key coverage marker beta"),
+            &fetch,
+        )
+        .unwrap();
         assert_eq!(calls.get(), 4);
     }
 

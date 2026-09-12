@@ -54,8 +54,8 @@ impl AgentflareMcp {
         }
         let limit = req.limit.unwrap_or(20);
         // Local query rewriting (AI Search § query rewriting, local rule-based + sparse)
-        let effective_q = agentflare_store::fastembed::try_rewrite_query(q)
-            .unwrap_or_else(|| q.to_string());
+        let effective_q =
+            agentflare_store::fastembed::try_rewrite_query(q).unwrap_or_else(|| q.to_string());
         let fts_q_raw = effective_q.as_str();
 
         let ws_id = match self.with_backend_db(Self::resolve_workspace_id) {
@@ -74,25 +74,25 @@ impl AgentflareMcp {
             let store_start = std::time::Instant::now();
             // Similarity cache (AI Search § similarity cache) — 5 min TTL via store_kv; bypass when filters present
             let use_cache = req.meta.is_none() && req.path_glob.is_none() && req.min_score.is_none();
-            if use_cache {
-                if let Some(cached) = store.search_cache_get(q, &ws_id) {
-                    let mut grouped: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
-                        std::collections::BTreeMap::new();
-                    for m in cached.iter().take(limit) {
-                        if let Some(doc) = store.doc_get(&m.id).ok().flatten() {
-                            let entry = serde_json::json!({
-                                "id": doc.id, "path": doc.path, "title": doc.title,
-                                "doc_type": doc.doc_type, "snippet": m.snippet, "score": m.score,
-                                "source": doc.source, "mime": doc.mime, "size": doc.size,
-                                "created_at": doc.created_at, "updated_at": doc.updated_at,
-                            });
-                            grouped.entry(if doc.doc_type.is_empty() { "unknown".into() } else { doc.doc_type.clone() }).or_default().push(entry);
-                        }
+            if use_cache
+                && let Some(cached) = store.search_cache_get(q, &ws_id)
+            {
+                let mut grouped: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+                    std::collections::BTreeMap::new();
+                for m in cached.iter().take(limit) {
+                    if let Some(doc) = store.doc_get(&m.id).ok().flatten() {
+                        let entry = serde_json::json!({
+                            "id": doc.id, "path": doc.path, "title": doc.title,
+                            "doc_type": doc.doc_type, "snippet": m.snippet, "score": m.score,
+                            "source": doc.source, "mime": doc.mime, "size": doc.size,
+                            "created_at": doc.created_at, "updated_at": doc.updated_at,
+                        });
+                        grouped.entry(if doc.doc_type.is_empty() { "unknown".into() } else { doc.doc_type.clone() }).or_default().push(entry);
                     }
-                    if !grouped.is_empty() {
-                        let result = serde_json::json!({ "query": q, "source": "store", "total": grouped.values().map(|v| v.len()).sum::<usize>(), "groups": grouped, "cached": true });
-                        return Ok(serde_json::to_string_pretty(&result).unwrap_or_default());
-                    }
+                }
+                if !grouped.is_empty() {
+                    let result = serde_json::json!({ "query": q, "source": "store", "total": grouped.values().map(|v| v.len()).sum::<usize>(), "groups": grouped, "cached": true });
+                    return Ok(serde_json::to_string_pretty(&result).unwrap_or_default());
                 }
             }
             // ponytail: no valid FTS5 tokens (e.g. query is only quote chars) -- return
