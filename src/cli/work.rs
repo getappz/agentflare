@@ -11,10 +11,15 @@ use std::time::Duration;
 /// named so the two can't silently drift apart.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 21_600;
 /// `agentflare work --idle-timeout`'s default; see [`DEFAULT_TIMEOUT_SECS`].
-/// Equal to it, not shorter: headless CLI agents (print mode) emit no
-/// incremental stdout, so "no output for N secs" can't tell a hung process
-/// from one still computing — it just killed real turns (items #143/#150/#151).
-pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = DEFAULT_TIMEOUT_SECS;
+/// NOT equal to it (was, until item #222): a headless CLI agent in `json`
+/// print mode emits no incremental stdout at all, and even `stream-json`
+/// mode can go quiet for several minutes mid-turn (a single slow tool call),
+/// so a short idle-timeout previously killed real turns as false positives
+/// (items #143/#150/#151, at a 300s default). 30 minutes is short enough to
+/// catch a genuinely wedged job (item #222: 79+ min of zero output, a daemon
+/// worker slot squatted indefinitely) while staying well above any
+/// legitimate single-tool-call silence observed so far.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Claim a work item, run an agent on it in an isolated worktree, and
 /// report the result (comment + PR, or error) back onto the item.
@@ -28,14 +33,15 @@ pub struct WorkArgs {
     #[arg(long)]
     pub agent: Option<String>,
     /// Absolute hard-cap timeout in seconds, regardless of activity
-    /// (default 21600 = 6h). The backstop against a runaway process — see
-    /// --idle-timeout for why it defaults to the same value, not a shorter one.
+    /// (default 21600 = 6h). The backstop against a runaway process --
+    /// see --idle-timeout for the shorter, activity-based kill that
+    /// usually fires first.
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
     pub timeout: u64,
     /// Kill the agent if it produces no new stdout/stderr output for this
-    /// many seconds (default: same as --timeout — headless print-mode CLIs
-    /// emit no incremental output, so a shorter default just kills real long
-    /// turns). Pass a smaller value only for an agent/mode you know streams.
+    /// many seconds (default 1800 = 30m -- see DEFAULT_IDLE_TIMEOUT_SECS's
+    /// doc comment for why not shorter). Pass a larger value for an
+    /// agent/mode known to go quiet for longer during a single real turn.
     #[arg(long, default_value_t = DEFAULT_IDLE_TIMEOUT_SECS)]
     pub idle_timeout: u64,
     /// Max agent turns before forced stop (Claude Code only).

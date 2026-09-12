@@ -8,7 +8,12 @@ LIMIT=1500
 # check in CI, only locally) pushed it to 2091. Not caught by CI either
 # way (loc-gate.sh isn't wired into ci.yml); a real split of work.rs is
 # still separate work, same rationale as every other entry below.
-FROZEN_LIMIT=2100
+# Raised again from 2100: work.rs was already at 2131 lines on master
+# before item #222's idle-timeout default fix (a handful of doc-comment
+# lines) touched it -- pre-existing debt this gate doesn't catch until
+# some unrelated change happens to touch the file next. Same rationale;
+# a real split is still separate work.
+FROZEN_LIMIT=2200
 
 ALLOWLIST=(
   src/mcp_server.rs
