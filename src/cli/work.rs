@@ -1745,6 +1745,24 @@ rotate = true
 
     include!("work_auth_expiry_tests.rs");
 
+    /// The workflow engine's failure message is the generic placeholder
+    /// folded with the failing step's real `last_error` (see
+    /// `flare_workflow::engine::WorkflowEngine::execute_workflow`), e.g.
+    /// `"One or more steps failed: AI_APICallError: Rate limit exceeded..."`.
+    /// `classify_and_cooldown` must still match on that real error text —
+    /// this is the regression this fix closes: before it, `execute_work_impl`
+    /// only ever saw the generic half.
+    #[test]
+    fn classify_and_cooldown_matches_rate_limit_text_folded_into_the_generic_workflow_message() {
+        crate::paths::test_support::with_temp_home(|| {
+            let msg = "One or more steps failed: AI_APICallError: Rate limit exceeded, please try again later";
+            let retry = classify_and_cooldown("opencode", msg);
+            assert_eq!(retry, Some(RATE_LIMIT_COOLDOWN_MINUTES as u64 * 60));
+            let conn = crate::auth_db::open_or_rebuild();
+            assert!(crate::auth_db::is_cooling_down(&conn, "opencode"));
+        });
+    }
+
     include!("work_model_routing_tests.rs");
 
     fn seeded_item(
