@@ -1044,28 +1044,37 @@ pub(crate) fn apply_fresh_overrides(
 /// Re-read the item at execution time and apply `apply_fresh_overrides`.
 /// Best-effort fail-open: any DB/resolve failure returns the payload pair
 /// unchanged (today's behavior), so a missing backend can never block a run.
+/// Also surfaces the item's *current* state group, so `execute` can refuse a
+/// stale queued job against an item since cancelled/completed (item #226) --
+/// `claim()` itself doesn't guard against that, since a human re-claiming via
+/// `redispatch` is legitimate. `None` (lookup failure) fails open, like above.
 fn fresh_dispatch_pair(
     item_id: &str,
     payload_agent: &str,
     payload_model: Option<String>,
-) -> (String, Option<String>) {
+) -> (String, Option<String>, Option<String>) {
     let mcp = crate::mcp_server::AgentflareMcp::default();
-    let item = mcp
+    let fetched = mcp
         .with_backend_db(|conn| {
             let resolved = agentflare_backend::item::resolve_id(conn, None, item_id).ok()?;
-            agentflare_backend::item::get(conn, &resolved).ok()
+            let item = agentflare_backend::item::get(conn, &resolved).ok()?;
+            let state_group = agentflare_backend::state::get(conn, &item.state_id)
+                .ok()
+                .map(|s| s.group_name);
+            Some((item, state_group))
         })
         .ok()
         .flatten();
-    let Some(item) = item else {
-        return (payload_agent.to_string(), payload_model);
+    let Some((item, state_group)) = fetched else {
+        return (payload_agent.to_string(), payload_model, None);
     };
-    apply_fresh_overrides(
+    let (agent, model) = apply_fresh_overrides(
         payload_agent,
         payload_model,
         item.assignee_agent.as_deref(),
         &item.metadata,
-    )
+    );
+    (agent, model, state_group)
 }
 
 /// Runs dispatched work items in-process.
@@ -1089,7 +1098,17 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
         // run long after the payload was frozen, and the operator may have
         // reassigned the item or re-pinned its model since. Fail-open —
         // any lookup miss keeps the payload pair.
-        let (agent, model) = fresh_dispatch_pair(item_id, agent, args.get(3).cloned());
+        let (agent, model, state_group) = fresh_dispatch_pair(item_id, agent, args.get(3).cloned());
+        // Stale queued job against a now-cancelled/completed item (item
+        // #226); `fatal` since that cause can't change on its own.
+        if matches!(state_group.as_deref(), Some("completed" | "cancelled")) {
+            let group = state_group.unwrap();
+            return Err(agentflare_jobs::JobFailure {
+                message: format!("item {item_id} already {group}; skipping stale queued job"),
+                retry_after_secs: None,
+                fatal: true,
+            });
+        }
         let work_args = WorkArgs {
             target: item_id.clone(),
             agent: Some(agent.clone()),
@@ -1153,6 +1172,8 @@ mod tests {
         assert!(!failure.fatal);
         assert_eq!(failure.retry_after_secs, Some(1800));
     }
+
+    include!("work_item_state_gate_tests.rs");
 
     fn test_item() -> agentflare_backend::item::Item {
         agentflare_backend::item::Item {
