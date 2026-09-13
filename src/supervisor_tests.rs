@@ -32,6 +32,103 @@ fn resolve_confirmed_agent_rejects_unknown_agent_string() {
     assert_eq!(resolve_confirmed_agent("not-a-real-agent"), None);
 }
 
+#[test]
+fn route_unassigned_with_returns_none_when_no_rule_matches() {
+    let item = agentflare_backend::item::Item {
+        metadata: "{}".into(),
+        ..test_item_stub()
+    };
+    let config = agent_registry::RouterConfig::default();
+    let installed = [agent_registry::Agent::Opencode];
+    let mut rotation = std::collections::HashMap::new();
+    assert_eq!(
+        route_unassigned_with(&item, &config, &installed, &mut rotation),
+        None
+    );
+}
+
+#[test]
+fn route_unassigned_with_picks_the_implementer_role_rule() {
+    // Item #19 regression: an item with no assignee_agent (as
+    // `discover_untracked_prs` always creates) must still resolve to an
+    // agent when a `[[router.rule]] when = { role = "implementer" }` rule
+    // covers it, the same rule `agentflare work` itself would use.
+    let item = agentflare_backend::item::Item {
+        metadata: "{}".into(),
+        ..test_item_stub()
+    };
+    let config = agent_registry::RouterConfig {
+        default: None,
+        rules: vec![agent_registry::RouterRule {
+            when: agent_registry::RuleMatch {
+                role: Some("implementer".into()),
+                ..Default::default()
+            },
+            use_agents: vec![agent_registry::Agent::Opencode],
+            rotate: false,
+            model: None,
+        }],
+    };
+    let installed = [agent_registry::Agent::Opencode];
+    let mut rotation = std::collections::HashMap::new();
+    assert_eq!(
+        route_unassigned_with(&item, &config, &installed, &mut rotation),
+        Some(agent_registry::Agent::Opencode)
+    );
+}
+
+#[test]
+fn route_unassigned_with_ignores_a_matching_rule_whose_agent_is_not_installed() {
+    let item = agentflare_backend::item::Item {
+        metadata: "{}".into(),
+        ..test_item_stub()
+    };
+    let config = agent_registry::RouterConfig {
+        default: None,
+        rules: vec![agent_registry::RouterRule {
+            when: agent_registry::RuleMatch {
+                role: Some("implementer".into()),
+                ..Default::default()
+            },
+            use_agents: vec![agent_registry::Agent::Opencode],
+            rotate: false,
+            model: None,
+        }],
+    };
+    let installed: [agent_registry::Agent; 0] = [];
+    let mut rotation = std::collections::HashMap::new();
+    assert_eq!(
+        route_unassigned_with(&item, &config, &installed, &mut rotation),
+        None
+    );
+}
+
+fn test_item_stub() -> agentflare_backend::item::Item {
+    agentflare_backend::item::Item {
+        id: "test-id".into(),
+        project_id: "proj".into(),
+        state_id: "state".into(),
+        name: "test".into(),
+        description: String::new(),
+        priority: "none".into(),
+        parent_id: None,
+        assignee_agent: None,
+        sequence_id: 1,
+        sort_order: 0.0,
+        started_at: None,
+        completed_at: None,
+        archived_at: None,
+        external_source: None,
+        external_id: None,
+        metadata: "{}".into(),
+        created_at: 0,
+        updated_at: 0,
+        deleted_at: None,
+        start_date: None,
+        due_date: None,
+    }
+}
+
 fn test_mcp() -> AgentflareMcp {
     AgentflareMcp::for_test_memory()
 }
@@ -1346,6 +1443,41 @@ fn self_repair_or_gate_stays_quiet_once_already_gated() {
 
     assert!(matches!(outcome, SelfRepairOutcome::Skipped));
     assert!(queue.list(None).unwrap().is_empty());
+}
+
+#[test]
+fn self_repair_or_gate_still_skips_gracefully_when_unassigned_and_no_router_rule_matches() {
+    // The router fallback (item #19 regression) must degrade the same way
+    // the pre-existing "no assignee" path always did when there's genuinely
+    // nothing to route to (no `~/.agentflare/config.toml`, the common case)
+    // -- Skipped, not a panic, not a double-dispatch.
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        // Backdated past the claim TTL, same as the dispatch-success test --
+        // otherwise item #114's claim-liveness check (Deferred) would return
+        // first and this would never reach the assignee-resolution branch.
+        let item_id = seed_in_review_item_with_claim_age(&mcp, None, 1_900);
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap();
+        let label_id_by_name = seed_gate_label(&mcp);
+        let auth_conn = test_auth_conn();
+
+        let outcome = self_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            &["clippy".to_string()],
+            &label_id_by_name,
+            "/repo",
+        );
+
+        assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+        assert!(queue.list(None).unwrap().is_empty());
+    });
 }
 
 #[test]
