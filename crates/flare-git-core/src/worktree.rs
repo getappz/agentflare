@@ -273,10 +273,30 @@ pub fn task_branch_name(item: &Item) -> String {
     }
 }
 
+/// The branch `item.metadata.pr.branch` already names -- set by
+/// `discover_untracked_prs` for a PR opened by hand (outside the item-done
+/// flow) and by `persist_pr_identity` for one opened through it, both in the
+/// same `{"pr":{"number":N,"branch":"..."}}` shape. When present, this is
+/// the actual branch the item's PR lives on and must win over
+/// `task_branch_name`'s sequence-id-derived guess -- for a hand-opened PR
+/// that guess names a branch that has nothing to do with the PR at all,
+/// which is exactly how dispatching self-repair on a `discover_untracked_prs`
+/// item created a brand-new orphan branch and a duplicate PR instead of
+/// continuing the existing one (confirmed live against image-qc item #19 /
+/// PR #311: self-repair pushed `task/19-...` and opened duplicate PR #314).
+fn tracked_pr_branch(item: &Item) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&item.metadata)
+        .ok()?
+        .get("pr")?
+        .get("branch")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// The branch `item`'s worktree is (or should be) on: whatever a worktree
 /// already sitting at `worktree_path` is *actually* checked out to, falling
-/// back to the freshly-derived `task_branch_name` only when no worktree
-/// exists there yet.
+/// back to `tracked_pr_branch` (the item's own known PR branch) or, absent
+/// that, the freshly-derived `task_branch_name`.
 ///
 /// `task_branch_name` recomputes its slug from `item.name` every call, so it
 /// silently changes if the item gets renamed between claims -- and a
@@ -286,17 +306,23 @@ pub fn task_branch_name(item: &Item) -> String {
 /// re-claim detection miss the existing worktree, so `git worktree add`
 /// collides with the already-occupied path instead of reusing it (item
 /// #459's dispatch-blocking loop on item #447, which predates the slugged
-/// scheme).
+/// scheme). The on-disk check also accepts `tracked_pr_branch`'s value as a
+/// valid current checkout, not just the `task/<seq>[-slug]` shapes -- without
+/// that, a second dispatch onto an item already correctly sitting on its
+/// tracked PR branch would fail this match and re-derive `task_branch_name`
+/// all over again, undoing the fix on every dispatch after the first.
 fn resolve_worktree_branch(item: &Item, worktree_path: &Path) -> String {
+    let expected = tracked_pr_branch(item).unwrap_or_else(|| task_branch_name(item));
     if worktree_path.is_dir()
         && let Ok(current) = run_git_in(worktree_path, &["branch", "--show-current"])
         && !current.is_empty()
-        && (current == format!("task/{}", item.sequence_id)
+        && (current == expected
+            || current == format!("task/{}", item.sequence_id)
             || current.starts_with(&format!("task/{}-", item.sequence_id)))
     {
         return current;
     }
-    task_branch_name(item)
+    expected
 }
 
 /// The branch `item`'s worktree is (or should be) on — whatever is

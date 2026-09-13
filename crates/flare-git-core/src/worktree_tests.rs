@@ -149,6 +149,13 @@ fn test_item_named(sequence_id: i64, name: &str) -> Item {
     }
 }
 
+fn test_item_with_pr_branch(sequence_id: i64, branch: &str) -> Item {
+    Item {
+        metadata: format!(r#"{{"pr":{{"number":1,"branch":"{branch}"}}}}"#),
+        ..test_item(sequence_id)
+    }
+}
+
 #[test]
 fn task_branch_name_slugs_a_normal_title() {
     let item = test_item_named(33, "Agentflare code review");
@@ -1014,6 +1021,55 @@ fn resolve_item_task_branch_reads_the_worktrees_checked_out_ref() {
         task_branch_name(&renamed),
         "task/42",
         "recomputed slug must differ from the bare branch the worktree is on"
+    );
+}
+
+#[test]
+fn resolve_item_task_branch_prefers_the_items_tracked_pr_branch_over_the_derived_task_name() {
+    // Item #19/PR #311 regression: an item created by `discover_untracked_prs`
+    // for a hand-opened PR carries `metadata.pr.branch` naming that PR's real
+    // branch, which has no relationship to `task/<sequence_id>` at all. With
+    // no worktree on disk yet (a fresh dispatch), resolution must prefer that
+    // tracked branch, not invent a `task/...` name that would push to -- and
+    // open a PR against -- a completely disconnected branch.
+    let repo = init_repo();
+    let item = test_item_with_pr_branch(19, "feat/hand-opened");
+    assert_eq!(
+        resolve_item_task_branch(&item, &repo.path),
+        "feat/hand-opened"
+    );
+}
+
+#[test]
+fn create_worktree_checks_out_the_tracked_pr_branch_instead_of_a_fresh_task_branch() {
+    // Same regression, exercised end-to-end through `create_worktree`: an
+    // item tracking an already-existing PR branch must have its worktree
+    // checked out on THAT branch so a self-repair dispatch pushes onto the
+    // existing PR instead of opening a duplicate one.
+    let repo = init_repo();
+    let target = resolve_default_branch(&repo.path);
+    run_git_in(&repo.path, &["checkout", "-b", "feat/hand-opened"]).unwrap();
+    run_git_in(
+        &repo.path,
+        &["commit", "--allow-empty", "-m", "hand-opened work"],
+    )
+    .unwrap();
+    run_git_in(&repo.path, &["checkout", &target]).unwrap();
+
+    let item = test_item_with_pr_branch(19, "feat/hand-opened");
+    let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+
+    assert_eq!(
+        run_git_in(&worktree_path, &["branch", "--show-current"]).unwrap(),
+        "feat/hand-opened",
+        "must check out the item's tracked PR branch, not a fresh task/<seq> branch"
+    );
+    assert!(
+        !run_git_in_ok(
+            &repo.path,
+            &["rev-parse", "--verify", "--quiet", &task_branch_name(&item)],
+        ),
+        "must not have created a fresh task/<seq> branch at all"
     );
 }
 
