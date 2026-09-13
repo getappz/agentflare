@@ -311,7 +311,7 @@ fn resolve_dispatch_model(
 /// those print a warning rather than staying silent; either way
 /// `agentflare work` degrades to requiring `--agent` instead of crashing
 /// over a bad file.
-fn load_router_config() -> agent_registry::RouterConfig {
+pub(crate) fn load_router_config() -> agent_registry::RouterConfig {
     let path = crate::paths::home().join(".agentflare").join("config.toml");
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,

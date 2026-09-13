@@ -84,6 +84,65 @@ pub(crate) fn resolve_confirmed_agent(assignee: &str) -> Option<agent_registry::
     agent_registry::autonomous_args(agent).map(|_| agent)
 }
 
+/// Falls back to `~/.agentflare/config.toml`'s `[router]` rules for an item
+/// with no usable `assignee_agent` -- the same rules `agentflare work`
+/// already consults when a human runs it against an unassigned item
+/// (`cli::work::resolve_agent`), reused here rather than duplicated so the
+/// two paths can't drift. Without this, `self_repair_or_gate` used to just
+/// skip an unassigned item's failing PR forever, with no comment, no label,
+/// no cap counting -- an item `discover_untracked_prs` creates for a
+/// hand-opened PR always has `assignee_agent: None`, so its self-repair
+/// silently never fired even with a `[router]` rule configured to auto-pick
+/// an implementer (confirmed live on image-qc item #19 -- stuck for hours
+/// with a red PR and no dispatch attempt of any kind).
+///
+/// `run_discovery_tick`'s own tier-5 eligibility check
+/// (`quota::decide::decide`) has the identical gap for a plain
+/// `ready-for-work` item with no assignee, deliberately NOT fixed here: that
+/// check runs on every item on every tick and is documented side-effect-free,
+/// while this call's `detect_all_with` shells out to probe installed agent
+/// CLIs and `state::save` persists a rotation counter -- both fine for
+/// self-repair's much rarer per-failing-PR cadence, not for a per-tick,
+/// per-item hot path. Fixing that one needs its own design pass (cache
+/// detection results, or move routing before/outside the pure decide()).
+fn route_unassigned(item: &agentflare_backend::item::Item) -> Option<agent_registry::Agent> {
+    let mut state = crate::state::load();
+    let installed: Vec<agent_registry::Agent> = agent_registry::detect_all_with(
+        agent_registry::REGISTRY,
+        &mut state.version_cache,
+        &agent_registry::RealVersionRunner,
+    )
+    .iter()
+    .filter_map(|d| agent_registry::agent_by_name(d.id))
+    .collect();
+    let config = crate::cli::work::load_router_config();
+    let agent = route_unassigned_with(item, &config, &installed, &mut state.router_rotation);
+    crate::state::save(&state);
+    agent
+}
+
+/// The pure decision core of `route_unassigned`, split out so a test can
+/// drive it with a synthetic `config`/`installed`/`rotation` instead of this
+/// machine's real installed-agent detection and `~/.agentflare/config.toml`.
+fn route_unassigned_with(
+    item: &agentflare_backend::item::Item,
+    config: &agent_registry::RouterConfig,
+    installed: &[agent_registry::Agent],
+    rotation: &mut std::collections::HashMap<String, u64>,
+) -> Option<agent_registry::Agent> {
+    let task = agent_registry::TaskContext {
+        labels: Vec::new(),
+        kind: crate::mcp_server::item::parsed_kind(&item.metadata),
+        size: crate::mcp_server::item::parsed_size(&item.metadata),
+        repo: None,
+        assigned_agent: None,
+        role: Some("implementer".to_string()),
+    };
+    agent_registry::route(&task, config, installed, rotation)
+        .map(|d| d.agent)
+        .filter(|agent| agent_registry::autonomous_args(*agent).is_some())
+}
+
 pub(crate) struct DiscoveryTickResult {
     pub dispatched: usize,
     pub skipped: usize,
@@ -1086,6 +1145,7 @@ fn self_repair_or_gate(
         .assignee_agent
         .as_deref()
         .and_then(resolve_confirmed_agent)
+        .or_else(|| route_unassigned(item))
     else {
         return SelfRepairOutcome::Skipped;
     };
