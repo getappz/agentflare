@@ -230,7 +230,13 @@ pub fn relabel_pr_completed(item: &agentflare_backend::item::Item, repo_root: &P
 #[derive(Debug)]
 pub enum PrCiStatus {
     Merged,
-    Failing(Vec<String>),
+    /// CI has a failed check. Carries the PR number so `run_review_sweep`
+    /// can post a GitHub-visible stage label/comment for the self-repair
+    /// dispatch without a second API round-trip to look the number back up.
+    Failing {
+        number: u64,
+        checks: Vec<String>,
+    },
     Pending,
     /// CI is green. Carries the PR number and its GitHub label names so
     /// `run_review_sweep` can decide whether to auto-merge without a second
@@ -360,7 +366,10 @@ fn decide_from_checks(
     if failed.is_empty() {
         PrCiStatus::Passing { number, labels }
     } else {
-        PrCiStatus::Failing(failed)
+        PrCiStatus::Failing {
+            number,
+            checks: failed,
+        }
     }
 }
 
@@ -1148,7 +1157,10 @@ mod tests {
             vec![],
         );
         match pr_ci_status_from_batch(101, &data) {
-            PrCiStatus::Failing(names) => assert_eq!(names, vec!["clippy".to_string()]),
+            PrCiStatus::Failing { number, checks } => {
+                assert_eq!(number, 101);
+                assert_eq!(checks, vec!["clippy".to_string()]);
+            }
             other => panic!("expected Failing, got {other:?}"),
         }
     }
