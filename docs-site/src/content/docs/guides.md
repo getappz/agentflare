@@ -177,6 +177,13 @@ gated on `needs-decision`, asks a question it can't answer itself, or gives up
 self-repairing a PR after hitting the retry cap. Leave the secret unset to keep this
 path silent; nothing else changes.
 
+One of these pings is richer than the rest: once a PR goes CI-green and is only
+waiting on the `status:pr:approved` label, the message is a Telegram card — repo,
+item, and a PR excerpt — with an inline **✅ Approve** button. Tapping it adds the
+label directly (no need to open GitHub), and the supervisor's own review sweep picks
+that label up and merges on its next tick. The button only works from the chat id
+stored above.
+
 ### Slack and Discord
 
 Same `channel send` command, different platform and secret name
