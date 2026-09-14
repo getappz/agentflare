@@ -1470,6 +1470,7 @@ fn self_repair_or_gate_still_skips_gracefully_when_unassigned_and_no_router_rule
             &auth_conn,
             agentflare_resource_gate::Policy::Normal,
             &item,
+            1,
             &["clippy".to_string()],
             &label_id_by_name,
             "/repo",
