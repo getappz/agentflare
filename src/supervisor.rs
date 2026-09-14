@@ -45,6 +45,45 @@ const NEEDS_DECISION_LABEL: &str = "needs-decision";
 /// rename.
 const PR_APPROVAL_LABEL: &str = "status:pr:approved";
 
+/// Stage labels the review sweep swaps on the PR itself as it moves through
+/// self-repair, mirroring the `agentflare:in-review` -> `agentflare:completed`
+/// convention `worktree::push_and_open_pr`/`relabel_pr_completed` already use
+/// for the outer create/merge stages -- these extend the same vocabulary for
+/// what happens in between, so a human watching the PR on GitHub (rather
+/// than the item's internal comment thread) can see it's being repaired
+/// automatically instead of just silently sitting on red CI.
+const IN_REVIEW_PR_LABEL: &str = "agentflare:in-review";
+const SELF_REPAIR_PR_LABEL: &str = "agentflare:self-repair";
+const NEEDS_HUMAN_PR_LABEL: &str = "agentflare:needs-human";
+
+/// Best-effort GitHub-visible stage transition for a PR: removes `from` (if
+/// any -- tolerates it already being absent, same as every other caller of
+/// `remove_label`), adds `to`, and posts `comment`. Never returns an error:
+/// a lost status update must never block or undo the sweep's own DB
+/// mutation, which has already happened by the time this runs -- same
+/// fail-open contract `relabel_pr_completed` and `merge_approved_pr` use for
+/// their own GitHub calls.
+fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str, comment: &str) {
+    let Some(repo) = crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
+    else {
+        return;
+    };
+    let Ok(client) = crate::github::Client::new() else {
+        return;
+    };
+    if let Err(e) = crate::github::issues::add_labels(&client, &repo, number, &[to.to_string()]) {
+        eprintln!("agentflare-supervisor: could not add {to} to PR #{number}: {e}");
+    }
+    if let Some(from) = from
+        && let Err(e) = crate::github::issues::remove_label(&client, &repo, number, from)
+    {
+        eprintln!("agentflare-supervisor: could not remove {from} from PR #{number}: {e}");
+    }
+    if let Err(e) = crate::github::issues::comment(&client, &repo, number, comment) {
+        eprintln!("agentflare-supervisor: could not comment on PR #{number}: {e}");
+    }
+}
+
 /// `vault` secret holding the Telegram chat id human-gate pings go to.
 /// Reuses the same `channels`/`vault` path as `agentflare channel send`
 /// rather than inventing a separate config store for one setting -- set it
@@ -145,9 +184,12 @@ fn route_unassigned_with(
         assigned_agent: None,
         role: Some("implementer".to_string()),
     };
-    agent_registry::route(&task, config, installed, rotation)
-        .map(|d| d.agent)
+    let autonomous: Vec<agent_registry::Agent> = installed
+        .iter()
+        .copied()
         .filter(|agent| agent_registry::autonomous_args(*agent).is_some())
+        .collect();
+    agent_registry::route(&task, config, &autonomous, rotation).map(|d| d.agent)
 }
 
 pub(crate) struct DiscoveryTickResult {
@@ -798,14 +840,15 @@ fn handle_pr_status(
                 result.skipped += 1;
             }
         }
-        crate::worktree::PrCiStatus::Failing(failed_checks) => {
+        crate::worktree::PrCiStatus::Failing { number, checks } => {
             match self_repair_or_gate(
                 mcp,
                 queue,
                 auth_conn,
                 host_policy,
                 item,
-                &failed_checks,
+                number,
+                &checks,
                 label_id_by_name,
                 folder_path,
             ) {
@@ -815,6 +858,24 @@ fn handle_pr_status(
             }
         }
         crate::worktree::PrCiStatus::Passing { number, labels } => {
+            // CI just went green -- if the PR was still carrying a
+            // self-repair/needs-human stage label from before, swap it back
+            // to plain in-review rather than leaving a stale "under repair"
+            // label on a now-passing PR. `labels` is already in hand from
+            // the batched/single fetch above, so this only touches GitHub
+            // when there's actually something to revert.
+            if let Some(stale) = [SELF_REPAIR_PR_LABEL, NEEDS_HUMAN_PR_LABEL]
+                .into_iter()
+                .find(|l| labels.iter().any(|have| have == l))
+            {
+                update_pr_stage(
+                    folder_path,
+                    number,
+                    Some(stale),
+                    IN_REVIEW_PR_LABEL,
+                    "## supervisor — CI green\n\nChecks are passing again.",
+                );
+            }
             if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) && first_time_gated(&item.id) {
                 notify_pr_approval_gate(item, folder_path, number);
             }
@@ -1209,6 +1270,7 @@ fn self_repair_or_gate(
     auth_conn: &rusqlite::Connection,
     host_policy: agentflare_resource_gate::Policy,
     item: &agentflare_backend::item::Item,
+    pr_number: u64,
     failed_checks: &[String],
     label_id_by_name: &std::collections::HashMap<String, String>,
     folder_path: &str,
@@ -1238,15 +1300,16 @@ fn self_repair_or_gate(
         .unwrap_or(0);
 
     if prior_attempts >= crate::quota::decide::SELF_REPAIR_CAP {
+        let cap_message = format!(
+            "## supervisor — CI self-repair cap reached\n\nFailing checks: {}. \
+             {} automatic repair attempt(s) already made with no green build — needs a human look.",
+            failed_checks.join(", "),
+            crate::quota::decide::SELF_REPAIR_CAP,
+        );
         let _ = mcp.comment_impl(CommentRequest {
             action: "create".into(),
             item_id: Some(item.id.clone()),
-            body: Some(format!(
-                "## supervisor — CI self-repair cap reached\n\nFailing checks: {}. \
-                 {} automatic repair attempt(s) already made with no green build — needs a human look.",
-                failed_checks.join(", "),
-                crate::quota::decide::SELF_REPAIR_CAP,
-            )),
+            body: Some(cap_message.clone()),
             ..Default::default()
         });
         if let Some(gate_id) = label_id_by_name.get(NEEDS_HUMAN_GATE_LABEL) {
@@ -1257,6 +1320,13 @@ fn self_repair_or_gate(
                 ..Default::default()
             });
         }
+        update_pr_stage(
+            folder_path,
+            pr_number,
+            Some(SELF_REPAIR_PR_LABEL),
+            NEEDS_HUMAN_PR_LABEL,
+            &cap_message,
+        );
         notify_human_gate(
             item,
             &format!(
@@ -1315,17 +1385,25 @@ fn self_repair_or_gate(
     let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), Some(&reason)) else {
         return SelfRepairOutcome::Skipped;
     };
+    let dispatch_message = format!(
+        "{CI_SELF_REPAIR_MARKER}\n\nCI is failing on this PR: {}.\n\n\
+         Please investigate and push a fix.\n\njob: {}",
+        failed_checks.join(", "),
+        info.id,
+    );
     let _ = mcp.comment_impl(CommentRequest {
         action: "create".into(),
         item_id: Some(item.id.clone()),
-        body: Some(format!(
-            "{CI_SELF_REPAIR_MARKER}\n\nCI is failing on this PR: {}.\n\n\
-             Please investigate and push a fix.\n\njob: {}",
-            failed_checks.join(", "),
-            info.id,
-        )),
+        body: Some(dispatch_message.clone()),
         ..Default::default()
     });
+    update_pr_stage(
+        folder_path,
+        pr_number,
+        Some(IN_REVIEW_PR_LABEL),
+        SELF_REPAIR_PR_LABEL,
+        &dispatch_message,
+    );
     SelfRepairOutcome::Dispatched
 }
 

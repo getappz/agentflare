@@ -37,7 +37,7 @@ fn find_duplicate_pr(
     if pr.merged_at.is_none() {
         let ci_failing = matches!(
             crate::worktree::pr_ci_status(item, repo_root),
-            crate::worktree::PrCiStatus::Failing(_)
+            crate::worktree::PrCiStatus::Failing { .. }
         );
         if is_stale_ci_red(&pr, ci_failing, chrono::Utc::now()) {
             return None;
