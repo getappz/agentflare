@@ -13,6 +13,7 @@ mod handoff;
 pub(crate) mod item;
 mod item_doctor;
 mod memory_tool;
+mod pm;
 mod project_resolution;
 mod review;
 pub(crate) mod search;
@@ -1552,6 +1553,13 @@ impl AgentflareMcp {
     )]
     fn project(&self, Parameters(req): Parameters<ProjectRequest>) -> Result<String, ErrorData> {
         self.project_inner(req)
+    }
+
+    #[tool(
+        description = "Product management workflows -- read-only reports plus a PM-mode toggle, usable from any MCP client (not only Claude Code's `pm` skill + prompt hook). Single consolidated tool with `action` field (standup|groom|plan|health|portfolio|mode_on|mode_off|mode_status). standup/groom/health mirror `item`'s own actions of the same name and take the same params (cutoff_hours, staleness_days, limit, window_weeks, project override) -- `groom` additionally fixes `state_group=\"backlog,unstarted\"` so callers don't have to repeat it. `plan` is `groom` with a `capacity` Now-bucket forced on (default 5), matching the pm skill's Now/Next/Later split. `portfolio` loops every project in the workspace (`project action=list`) and rolls up `health` (default) or `standup` (`report` param) per project into one response. `mode_on`/`mode_off`/`mode_status` flip or read the same PM-mode flag the literal `/pm`, `/pm mode on`, and `/pm mode off` prompts toggle via agentflare's UserPromptSubmit hook -- unlike that hook, these work from any MCP client. Prioritization/scoring (RICE, WSJF, ICE, ...) for groom/plan stays the caller's job -- see the `pm` skill's reference/rubric.md; this tool only returns the precomputed shortlist/buckets."
+    )]
+    fn pm(&self, Parameters(req): Parameters<PmRequest>) -> Result<String, ErrorData> {
+        self.pm_inner(req)
     }
 
     #[tool(
