@@ -1069,9 +1069,11 @@ fn notify_pr_approval_gate(item: &agentflare_backend::item::Item, folder_path: &
         html_escape(&excerpt),
     );
     let callback_data = format!("approve:{repo}#{number}");
-    if let Err(e) =
-        crate::channels::send_telegram_card(&chat_id, &text, &[("\u{2705} Approve", &callback_data)])
-    {
+    if let Err(e) = crate::channels::send_telegram_card(
+        &chat_id,
+        &text,
+        &[("\u{2705} Approve", &callback_data)],
+    ) {
         eprintln!(
             "agentflare-supervisor: telegram card notify failed for item #{}: {e}",
             item.sequence_id
@@ -1121,10 +1123,8 @@ pub(crate) fn poll_telegram_approvals() {
         handle_telegram_callback(update, &chat_id);
     }
     if next_offset != offset
-        && let Err(e) = crate::vault::set_secret(
-            TELEGRAM_UPDATE_OFFSET_SECRET,
-            &next_offset.to_string(),
-        )
+        && let Err(e) =
+            crate::vault::set_secret(TELEGRAM_UPDATE_OFFSET_SECRET, &next_offset.to_string())
     {
         eprintln!("agentflare-supervisor: failed to persist telegram update offset: {e}");
     }
@@ -1159,8 +1159,13 @@ fn handle_telegram_callback(update: &serde_json::Value, expected_chat_id: &str) 
     let ack_text = match crate::github::Client::new()
         .map_err(|e| e.to_string())
         .and_then(|client| {
-            crate::github::issues::add_labels(&client, &repo, number, &[PR_APPROVAL_LABEL.to_string()])
-                .map_err(|e| e.to_string())
+            crate::github::issues::add_labels(
+                &client,
+                &repo,
+                number,
+                &[PR_APPROVAL_LABEL.to_string()],
+            )
+            .map_err(|e| e.to_string())
         }) {
         Ok(()) => "\u{2705} Approved".to_string(),
         Err(e) => {

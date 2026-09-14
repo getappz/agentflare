@@ -293,7 +293,10 @@ pub fn answer_telegram_callback(callback_query_id: &str, text: &str) -> Result<(
 pub fn clear_telegram_reply_markup(chat_id: &str, message_id: i64) -> Result<(), String> {
     let token = telegram_token()?;
     let req = OutboundRequest {
-        url: format!("https://api.telegram.org/bot{}/editMessageReplyMarkup", *token),
+        url: format!(
+            "https://api.telegram.org/bot{}/editMessageReplyMarkup",
+            *token
+        ),
         auth: None,
         body: json!({
             "chat_id": chat_id,
