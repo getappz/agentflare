@@ -109,7 +109,10 @@ impl AgentflareMcp {
             };
             let mut parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
                 ErrorData::internal_error(
-                    format!("failed to parse {report} report for project {}: {e}", project.name),
+                    format!(
+                        "failed to parse {report} report for project {}: {e}",
+                        project.name
+                    ),
                     None,
                 )
             })?;
@@ -122,8 +125,10 @@ impl AgentflareMcp {
             rows.push(parsed);
         }
         Ok(
-            serde_json::to_string_pretty(&serde_json::json!({ "report": report, "projects": rows }))
-                .unwrap_or_default(),
+            serde_json::to_string_pretty(
+                &serde_json::json!({ "report": report, "projects": rows }),
+            )
+            .unwrap_or_default(),
         )
     }
 }

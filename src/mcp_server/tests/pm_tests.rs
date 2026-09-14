@@ -17,8 +17,7 @@ fn pm_unknown_action_is_invalid_params() {
 fn pm_standup_matches_item_standup_for_the_same_params() {
     let (_tmp, s) = harness();
     let _created: serde_json::Value =
-        serde_json::from_str(&s.item(Parameters(empty_item_create("Some work"))).unwrap())
-            .unwrap();
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Some work"))).unwrap()).unwrap();
 
     let via_pm = s
         .pm(Parameters(PmRequest {
@@ -40,9 +39,11 @@ fn pm_standup_matches_item_standup_for_the_same_params() {
 #[test]
 fn pm_groom_defaults_state_group_to_backlog_and_unstarted() {
     let (_tmp, s) = harness();
-    let created: serde_json::Value =
-        serde_json::from_str(&s.item(Parameters(empty_item_create("Backlog item"))).unwrap())
-            .unwrap();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(empty_item_create("Backlog item")))
+            .unwrap(),
+    )
+    .unwrap();
 
     let groomed: serde_json::Value = serde_json::from_str(
         &s.pm(Parameters(PmRequest {
@@ -54,9 +55,7 @@ fn pm_groom_defaults_state_group_to_backlog_and_unstarted() {
     .unwrap();
     let shortlist = groomed["items"].as_array().unwrap();
     assert!(
-        shortlist
-            .iter()
-            .any(|it| it["id"] == created["id"]),
+        shortlist.iter().any(|it| it["id"] == created["id"]),
         "expected the fresh backlog item in pm groom's shortlist: {groomed}"
     );
 }
@@ -110,9 +109,11 @@ fn pm_health_matches_item_health_for_the_same_params() {
 #[test]
 fn pm_portfolio_rolls_up_every_project_with_a_project_label() {
     let (_tmp, s) = harness();
-    let _created: serde_json::Value =
-        serde_json::from_str(&s.item(Parameters(empty_item_create("Portfolio item"))).unwrap())
-            .unwrap();
+    let _created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(empty_item_create("Portfolio item")))
+            .unwrap(),
+    )
+    .unwrap();
 
     let out: serde_json::Value = serde_json::from_str(
         &s.pm(Parameters(PmRequest {
