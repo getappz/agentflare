@@ -24,6 +24,22 @@ Never treat a reporting workflow's inputs as license to mutate, and never
 slip into PM mode's mutating behavior without one of the explicit triggers
 above.
 
+## The `pm` MCP tool
+
+Every workflow in Part 1, plus `mode_on`/`mode_off`/`mode_status`, is also
+reachable as one first-class tool call — `pm` (action=
+standup|groom|plan|health|portfolio|mode_on|mode_off|mode_status) — instead
+of composing `item`/`project` calls by hand. It's a thin wrapper (same
+underlying `item action=groom|standup|health` / `project action=list` calls
+this skill already teaches, just pre-shaped: `groom`/`plan` fix
+`state_group="backlog,unstarted"`, `plan` forces a `capacity` bucket,
+`portfolio` does the per-project loop itself). Use whichever is more
+convenient — a client with no skill support (not Claude Code, or PM mode's
+`mode_on`/`off` without the literal `/pm mode on`/`off` prompt) has no other
+way to reach this. Scoring frameworks (RICE/WSJF/...) still live in this
+skill's `reference/rubric.md`, not in the tool — it never becomes the
+caller's judgment call.
+
 ## Scope
 
 Default: one project — whichever project the current repo resolves to.

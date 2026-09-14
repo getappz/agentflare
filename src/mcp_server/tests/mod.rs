@@ -433,6 +433,7 @@ mod item_tests;
 mod item_tests_cross_project;
 mod item_tests_relations;
 mod item_tests_reporting;
+mod pm_tests;
 mod project_resolution_tests;
 mod search_tests;
 mod state_tests;
