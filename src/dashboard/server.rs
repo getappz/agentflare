@@ -149,6 +149,11 @@ const SUPERVISOR_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::
 /// merged), against the same token `SUPERVISOR_DISCOVERY_INTERVAL`'s ticks
 /// never touch GitHub at all.
 const SUPERVISOR_REVIEW_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Cadence for `spawn_supervisor_telegram_approvals` -- a single `getUpdates`
+/// short-poll plus, at most, one GitHub label call per tapped "Approve"
+/// button, so this can run noticeably tighter than the GitHub-heavy review
+/// sweep above without meaningful cost.
+const SUPERVISOR_TELEGRAM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 /// Cadence for `spawn_binary_staleness_watchdog` -- a `stat()` call, so this
 /// can run far more often than the GitHub-touching sweeps above without
 /// meaningful cost. Bounds how long a rebuilt/updated binary can keep
@@ -250,6 +255,27 @@ fn spawn_supervisor_review_sweep(
                 }
                 Ok(_) => {}
                 Err(e) => eprintln!("agentflare-supervisor: review sweep task panicked: {e}"),
+            }
+        }
+    });
+}
+
+/// Runs for the lifetime of the process: wakes on
+/// `SUPERVISOR_TELEGRAM_POLL_INTERVAL` and checks for a tapped "Approve"
+/// button on a PR-approval card (see `supervisor::notify_pr_approval_gate`),
+/// adding `status:pr:approved` to the PR it names. Needs neither the job
+/// queue nor an `AgentflareMcp` handle -- it only talks to the vault and
+/// GitHub -- so it's a plain interval loop rather than mirroring the other
+/// two spawns' shape.
+fn spawn_supervisor_telegram_approvals(interval: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            if let Err(e) =
+                tokio::task::spawn_blocking(crate::supervisor::poll_telegram_approvals).await
+            {
+                eprintln!("agentflare-supervisor: telegram poll task panicked: {e}");
             }
         }
     });
@@ -817,6 +843,7 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
                     std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
                     SUPERVISOR_REVIEW_SWEEP_INTERVAL,
                 );
+                spawn_supervisor_telegram_approvals(SUPERVISOR_TELEGRAM_POLL_INTERVAL);
             }
         }
         Err(e) => {
