@@ -71,13 +71,13 @@ fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str,
     let Ok(client) = crate::github::Client::new() else {
         return;
     };
+    if let Err(e) = crate::github::issues::add_labels(&client, &repo, number, &[to.to_string()]) {
+        eprintln!("agentflare-supervisor: could not add {to} to PR #{number}: {e}");
+    }
     if let Some(from) = from
         && let Err(e) = crate::github::issues::remove_label(&client, &repo, number, from)
     {
         eprintln!("agentflare-supervisor: could not remove {from} from PR #{number}: {e}");
-    }
-    if let Err(e) = crate::github::issues::add_labels(&client, &repo, number, &[to.to_string()]) {
-        eprintln!("agentflare-supervisor: could not add {to} to PR #{number}: {e}");
     }
     if let Err(e) = crate::github::issues::comment(&client, &repo, number, comment) {
         eprintln!("agentflare-supervisor: could not comment on PR #{number}: {e}");
@@ -184,9 +184,12 @@ fn route_unassigned_with(
         assigned_agent: None,
         role: Some("implementer".to_string()),
     };
-    agent_registry::route(&task, config, installed, rotation)
-        .map(|d| d.agent)
+    let autonomous: Vec<agent_registry::Agent> = installed
+        .iter()
+        .copied()
         .filter(|agent| agent_registry::autonomous_args(*agent).is_some())
+        .collect();
+    agent_registry::route(&task, config, &autonomous, rotation).map(|d| d.agent)
 }
 
 pub(crate) struct DiscoveryTickResult {
