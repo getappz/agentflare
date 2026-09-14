@@ -88,7 +88,7 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "pm",
-        "Product management reporting: /pm:standup, /pm:groom, /pm:plan, /pm:health, /pm:portfolio — read-only item analytics across projects. Embedded in the agentflare binary.",
+        "Product management workflows: read-only reports (standup|groom|plan|health|portfolio) plus mode_on|mode_off|mode_status. Single consolidated tool with `action` field.",
     ),
     (
         "item",

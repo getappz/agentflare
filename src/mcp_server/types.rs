@@ -1107,6 +1107,47 @@ pub(crate) struct ProjectRequest {
     pub(crate) action: String,
 }
 
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct PmRequest {
+    #[schemars(
+        description = "Action: standup|groom|plan|health|portfolio|mode_on|mode_off|mode_status"
+    )]
+    pub(crate) action: String,
+    #[schemars(
+        description = "Project override (name or UUID from `project action=list`) for standup/groom/plan/health. Ignored by portfolio, which always covers every project in the workspace."
+    )]
+    #[serde(default)]
+    pub(crate) project: Option<String>,
+    #[schemars(
+        description = "Hours back a completed item counts as \"done\" (standup, portfolio with report=standup); default 24"
+    )]
+    #[serde(default)]
+    pub(crate) cutoff_hours: Option<i64>,
+    #[schemars(
+        description = "Days since updated_at before an item counts as stale (groom/plan: default 14; standup/health/portfolio: default 7)"
+    )]
+    #[serde(default)]
+    pub(crate) staleness_days: Option<i64>,
+    #[schemars(description = "Max backlog items to shortlist (groom/plan; default 15)")]
+    #[serde(default)]
+    pub(crate) limit: Option<i64>,
+    #[schemars(
+        description = "Now-bucket size for plan's Now/Next/Later split (plan only; default 5)"
+    )]
+    #[serde(default)]
+    pub(crate) capacity: Option<i64>,
+    #[schemars(
+        description = "Trailing weekly windows for velocity (health, portfolio with report=health); default 4, max 52"
+    )]
+    #[serde(default)]
+    pub(crate) window_weeks: Option<i64>,
+    #[schemars(
+        description = "portfolio only: which per-project report to roll up — health (default) or standup"
+    )]
+    #[serde(default)]
+    pub(crate) report: Option<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct AssetRequest {
     #[schemars(description = "Action: attach|get|list|delete")]
