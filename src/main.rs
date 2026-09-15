@@ -12,6 +12,7 @@ mod auth_db;
 mod auth_runner;
 mod banner;
 mod bashenv;
+mod browser_install;
 mod build_time;
 mod channels;
 mod chat_channel;

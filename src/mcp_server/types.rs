@@ -1259,3 +1259,39 @@ pub(crate) struct WorkflowRequest {
     #[serde(default)]
     pub(crate) since: Option<String>,
 }
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct BrowserRequest {
+    #[schemars(
+        description = "Action: open|snapshot|observe|extract|click|fill|type|press|hover|select|check|uncheck|back|forward|reload|get|read|screenshot|pdf|eval|wait|cookies|storage|network|tabs|dialog|console|errors|batch|state|close|doctor|status. Subcommands allowed: \"get text\", \"tab new\", \"cookies set\", \"network requests\", \"dialog accept\", \"state save\". observe filters the snapshot to matching lines; extract runs JS via eval."
+    )]
+    pub(crate) action: String,
+    #[schemars(
+        description = "Browser session id (default: $AGENTFLARE_BROWSER_SESSION, else af-<cwd hash> — concurrent worktrees isolate automatically)"
+    )]
+    #[serde(default)]
+    pub(crate) session: Option<String>,
+    #[schemars(
+        description = "Element target: @e ref from snapshot or CSS selector (click, fill, type, hover, get, ...)"
+    )]
+    #[serde(default)]
+    pub(crate) target: Option<String>,
+    #[schemars(
+        description = "Text payload: fill/type text, observe query, eval/extract JS, wait condition, batch extras vary by action"
+    )]
+    #[serde(default)]
+    pub(crate) text: Option<String>,
+    #[schemars(description = "URL payload: open/read navigation target")]
+    #[serde(default)]
+    pub(crate) url: Option<String>,
+    #[schemars(
+        description = "Extra raw args appended verbatim (escape hatch for full sidecar parity, e.g. [\"--full\"] or [\"set\",\"k\",\"v\"])"
+    )]
+    #[serde(default)]
+    pub(crate) args: Option<Vec<String>>,
+    #[schemars(
+        description = "Secret values to scrub from the output before it reaches the model (convenience, not a security boundary)"
+    )]
+    #[serde(default)]
+    pub(crate) redact: Option<Vec<String>>,
+}

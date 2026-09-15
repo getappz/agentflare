@@ -576,6 +576,29 @@ also runs automatically once per turn), `file [--title] [--body]` (list, or with
 flags, file pending agentflare-core vents as one batched GitHub issue on
 getappz/agentflare), `list [--actionable]`.
 
+### `agentflare browser <command>`
+
+Agent-first browser automation: ref-based snapshots, deterministic verbs, batch
+mode, and per-worktree session isolation (`af-<hash>` default, `--session` to
+override). First use auto-installs the pure-Rust `agent-browser` sidecar from the
+git repo via mise (`mise install github:vercel-labs/agent-browser@latest`, prebuilt
+binary — usually under a minute) plus its Chrome-for-Testing fetch — `--no-auto-install`
+(or `AGENTFLARE_BROWSER_NO_AUTO_INSTALL=1`) disables this and fails fast instead.
+
+```bash
+agentflare browser status
+agentflare browser open https://example.com
+agentflare browser snapshot
+agentflare browser observe checkout
+agentflare browser click @e2
+agentflare browser batch "open https://example.com" "snapshot"
+```
+
+Commands: `open`, `snapshot`, `observe`, `click`, `fill`, `type`, `press`,
+`hover`, `select`, `check`, `uncheck`, `back`, `forward`, `reload`, `get`,
+`read`, `screenshot`, `pdf`, `eval`, `extract`, `wait`, `cookies`, `storage`,
+`network`, `tabs`, `dialog`, `state`, `batch`, `close`, `doctor`, `status`.
+
 ## Utility
 
 ### `agentflare mcp`
