@@ -1100,18 +1100,6 @@ pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &
     }
 }
 
-/// Best-effort Telegram ping for an item whose plan just moved to
-/// `plan_status: "pending"` (via `item(action="submit_plan")`) and is now
-/// waiting on a human approver. Thin wrapper over [`notify_human_gate`] --
-/// same fail-open contract: no-ops without a configured chat id, and a send
-/// failure only logs.
-pub(crate) fn notify_plan_approval_gate(item: &agentflare_backend::item::Item, plan_asset_id: &str) {
-    notify_human_gate(
-        item,
-        &format!("plan awaiting approval (asset: {plan_asset_id})"),
-    );
-}
-
 /// Escape the characters Telegram's HTML `parse_mode` treats specially, so
 /// an arbitrary item title/description can't break card formatting (or be
 /// interpreted as an unintended tag).
@@ -1119,6 +1107,23 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Shared card-send half of [`notify_pr_approval_gate`] and
+/// [`notify_plan_approval_gate`]: look up the configured notify chat and
+/// send a one-button Telegram card. Same fail-open contract as
+/// `notify_human_gate`: no-ops without a configured chat id, and a send
+/// failure only logs -- a notification failure must never block the gate
+/// itself.
+fn request_channel_approval(card_text: &str, approve_label: &str, callback_data: &str) {
+    let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
+        return;
+    };
+    if let Err(e) =
+        crate::channels::send_telegram_card(&chat_id, card_text, &[(approve_label, callback_data)])
+    {
+        eprintln!("agentflare-supervisor: telegram card notify failed: {e}");
+    }
 }
 
 /// Telegram-only rich variant of [`notify_human_gate`] for the one gate a
@@ -1131,9 +1136,6 @@ fn html_escape(s: &str) -> String {
 /// without a configured chat id or a resolvable repo, and a send failure
 /// only logs.
 fn notify_pr_approval_gate(item: &agentflare_backend::item::Item, folder_path: &str, number: u64) {
-    let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
-        return;
-    };
     let Some(repo) = crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
     else {
         return;
@@ -1150,17 +1152,29 @@ fn notify_pr_approval_gate(item: &agentflare_backend::item::Item, folder_path: &
         html_escape(&item.name),
         html_escape(&excerpt),
     );
-    let callback_data = format!("approve:{repo}#{number}");
-    if let Err(e) = crate::channels::send_telegram_card(
-        &chat_id,
+    request_channel_approval(&text, "\u{2705} Approve", &format!("approve:{repo}#{number}"));
+}
+
+/// Human-approval card for a submitted plan -- the plan-gate sibling of
+/// `notify_pr_approval_gate`. `plan_asset_id` is included in the card text
+/// (not the callback data, which stays a plain item reference) purely so
+/// a human reading the notification knows which asset to open. Same
+/// fail-open contract as `notify_human_gate`: no-ops without a configured
+/// chat id, and a send failure only logs.
+pub(crate) fn notify_plan_approval_gate(item: &agentflare_backend::item::Item, plan_asset_id: &str) {
+    let text = format!(
+        "\u{1F4CB} <b>agentflare</b> plan needs review\n\
+         <b>Item:</b> #{} \u{2014} {}\n\
+         Plan asset: <code>{}</code>",
+        item.sequence_id,
+        html_escape(&item.name),
+        html_escape(plan_asset_id),
+    );
+    request_channel_approval(
         &text,
-        &[("\u{2705} Approve", &callback_data)],
-    ) {
-        eprintln!(
-            "agentflare-supervisor: telegram card notify failed for item #{}: {e}",
-            item.sequence_id
-        );
-    }
+        "\u{2705} Approve",
+        &format!("approve_plan:{}", item.id),
+    );
 }
 
 /// Parse an "Approve" button's `callback_data` (`approve:{owner}/{repo}#{number}`)
@@ -1173,6 +1187,12 @@ fn parse_approve_callback(data: &str) -> Option<(crate::github::RepoId, u64)> {
     Some((repo, number))
 }
 
+/// Parse an "Approve" button's `callback_data` (`approve_plan:{item_id}`)
+/// built by [`notify_plan_approval_gate`].
+fn parse_plan_approve_callback(data: &str) -> Option<String> {
+    data.strip_prefix("approve_plan:").map(str::to_string)
+}
+
 /// Poll for Telegram button clicks and act on any "Approve" tap by adding
 /// `PR_APPROVAL_LABEL` to the PR it names -- the inbound half of
 /// `notify_pr_approval_gate`'s card. Runs from its own fixed-interval
@@ -1181,7 +1201,7 @@ fn parse_approve_callback(data: &str) -> Option<(crate::github::RepoId, u64)> {
 /// long-poll thread. No-ops without a configured chat id (opt-in, same as
 /// every other Telegram path here); a single bad update is logged and
 /// skipped rather than wedging the whole poll loop.
-pub(crate) fn poll_telegram_approvals() {
+pub(crate) fn poll_telegram_approvals(mcp: &crate::mcp_server::AgentflareMcp) {
     let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
         return;
     };
@@ -1202,7 +1222,7 @@ pub(crate) fn poll_telegram_approvals() {
         if let Some(id) = update.get("update_id").and_then(serde_json::Value::as_i64) {
             next_offset = next_offset.max(id + 1);
         }
-        handle_telegram_callback(update, &chat_id);
+        handle_telegram_callback(update, &chat_id, mcp);
     }
     if next_offset != offset
         && let Err(e) =
@@ -1217,7 +1237,11 @@ pub(crate) fn poll_telegram_approvals() {
 /// defense in depth against, e.g., the bot later being added to a group),
 /// parse its `approve:` callback data, add the label, then ack + strip the
 /// button so a repeat tap is a no-op rather than a duplicate GitHub call.
-fn handle_telegram_callback(update: &serde_json::Value, expected_chat_id: &str) {
+fn handle_telegram_callback(
+    update: &serde_json::Value,
+    expected_chat_id: &str,
+    mcp: &crate::mcp_server::AgentflareMcp,
+) {
     let Some(callback) = update.get("callback_query") else {
         return;
     };
@@ -1233,6 +1257,27 @@ fn handle_telegram_callback(update: &serde_json::Value, expected_chat_id: &str) 
         .and_then(|c| c.get("id"))
         .map(std::string::ToString::to_string);
     if chat_id.as_deref() != Some(expected_chat_id) {
+        return;
+    }
+    if let Some(item_id) = parse_plan_approve_callback(data) {
+        let ack_text = match mcp.item_approve_plan(crate::mcp_server::types::ItemRequest {
+            action: "approve_plan".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }) {
+            Ok(_) => "\u{2705} Approved".to_string(),
+            Err(e) => {
+                eprintln!("agentflare-supervisor: telegram plan-approve for {item_id} failed: {e}");
+                format!("failed: {e}")
+            }
+        };
+        let _ = crate::channels::answer_telegram_callback(callback_id, &ack_text);
+        if let Some(message_id) = message
+            .and_then(|m| m.get("message_id"))
+            .and_then(serde_json::Value::as_i64)
+        {
+            let _ = crate::channels::clear_telegram_reply_markup(expected_chat_id, message_id);
+        }
         return;
     }
     let Some((repo, number)) = parse_approve_callback(data) else {
