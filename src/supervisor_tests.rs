@@ -1919,26 +1919,86 @@ fn handle_chat_message_ignores_message_from_wrong_chat() {
     let mcp = std::sync::Arc::new(test_mcp());
     // expected_chat_id is "999", message is from chat 111 -- must return
     // without dispatching anything (no panic, no network/db touch).
-    handle_chat_message(&message, "999", &mcp);
+    handle_chat_message(&message, "999", &mcp, 1);
 }
 
 #[test]
 fn handle_chat_message_ignores_message_with_no_text() {
     let message = serde_json::json!({ "chat": { "id": 999 } });
     let mcp = std::sync::Arc::new(test_mcp());
-    handle_chat_message(&message, "999", &mcp);
+    handle_chat_message(&message, "999", &mcp, 2);
 }
 
 #[test]
 fn handle_chat_message_ignores_whitespace_only_text() {
     let message = serde_json::json!({ "chat": { "id": 999 }, "text": "   " });
     let mcp = std::sync::Arc::new(test_mcp());
-    handle_chat_message(&message, "999", &mcp);
+    handle_chat_message(&message, "999", &mcp, 3);
 }
 
 #[test]
 fn handle_chat_message_ignores_message_with_no_chat() {
     let message = serde_json::json!({ "text": "hi" });
     let mcp = std::sync::Arc::new(test_mcp());
-    handle_chat_message(&message, "999", &mcp);
+    handle_chat_message(&message, "999", &mcp, 4);
+}
+
+// -- Offset watermark: safe_offset_to_persist / mark_in_flight / settle
+// (see poll_telegram_approvals). These back the fix for the exact gap
+// CodeRabbit's review flagged on this PR -- a free-text turn's offset must
+// not be confirmed before the turn itself finishes, and a later
+// synchronously-settled update must not drag the offset past an earlier
+// one that's still in flight.
+
+#[test]
+fn safe_offset_to_persist_is_ceiling_when_nothing_in_flight() {
+    let in_flight = std::collections::BTreeSet::new();
+    assert_eq!(safe_offset_to_persist(50, &in_flight), 50);
+}
+
+#[test]
+fn safe_offset_to_persist_caps_below_earliest_in_flight_update() {
+    let in_flight = std::collections::BTreeSet::from([30, 45]);
+    assert_eq!(safe_offset_to_persist(50, &in_flight), 30);
+}
+
+#[test]
+fn safe_offset_to_persist_withholds_a_later_offset_while_an_earlier_one_is_still_in_flight() {
+    // The scenario the review flagged: update N (free text, still running)
+    // must not be silently confirmed just because update N+1 (e.g. a slash
+    // command) already finished synchronously and isn't itself in the set.
+    let in_flight = std::collections::BTreeSet::from([10]);
+    assert_eq!(safe_offset_to_persist(12, &in_flight), 10);
+}
+
+#[test]
+fn safe_offset_to_persist_never_exceeds_ceiling() {
+    // Shouldn't happen in practice (an in-flight offset can't exceed the
+    // ceiling, which tracks every offset ever seen) but the result must
+    // stay bounded even if it somehow did.
+    let in_flight = std::collections::BTreeSet::from([999]);
+    assert_eq!(safe_offset_to_persist(50, &in_flight), 50);
+}
+
+#[test]
+fn mark_in_flight_then_settle_round_trips_through_the_shared_set() {
+    // High sentinel value: IN_FLIGHT_UPDATE_OFFSETS is a real process-wide
+    // static shared with other tests under cargo test's parallel execution.
+    const SENTINEL: i64 = 900_001;
+    mark_in_flight(SENTINEL);
+    assert!(
+        IN_FLIGHT_UPDATE_OFFSETS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&SENTINEL),
+        "mark_in_flight must record the offset as in flight"
+    );
+    settle(SENTINEL);
+    assert!(
+        !IN_FLIGHT_UPDATE_OFFSETS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&SENTINEL),
+        "settle must remove it once handling is done"
+    );
 }

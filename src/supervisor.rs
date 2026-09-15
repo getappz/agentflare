@@ -6,6 +6,14 @@
 use crate::mcp_server::AgentflareMcp;
 use crate::mcp_server::types::{CommentRequest, ItemRequest};
 
+mod telegram;
+pub(crate) use telegram::poll_telegram_approvals;
+#[cfg(test)]
+use telegram::{
+    IN_FLIGHT_UPDATE_OFFSETS, handle_chat_message, handle_telegram_callback, mark_in_flight,
+    parse_approve_callback, safe_offset_to_persist, settle,
+};
+
 /// Also read by `mcp_server::handoff` — a freshly handed-off item is labeled
 /// with this so the discovery loop below notices it without a human having
 /// to add the label by hand. Single source of truth so the two can't drift.
@@ -92,13 +100,6 @@ fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str,
 /// `crate::chat_channel` to authorize which chat's free-text/slash-command
 /// messages it acts on -- the same chat a PR-approval card would be sent to.
 pub(crate) const TELEGRAM_NOTIFY_CHAT_ID_SECRET: &str = "telegram_notify_chat_id";
-
-/// `vault` secret persisting the last-consumed Telegram `update_id` across
-/// restarts -- offset semantics per Telegram's own `getUpdates` docs (pass
-/// `last_update_id + 1` to avoid redelivery). Reuses the vault store as a
-/// convenient single-value KV, same precedent as
-/// `TELEGRAM_NOTIFY_CHAT_ID_SECRET` -- neither value is actually secret.
-const TELEGRAM_UPDATE_OFFSET_SECRET: &str = "telegram_update_offset";
 
 /// Since item #19, work items run in-process via `WorkItemExecutor` rather
 /// than as a spawned `agentflare work` subprocess, so this is no longer an
@@ -1141,184 +1142,6 @@ fn notify_pr_approval_gate(item: &agentflare_backend::item::Item, folder_path: &
             "agentflare-supervisor: telegram card notify failed for item #{}: {e}",
             item.sequence_id
         );
-    }
-}
-
-/// Parse an "Approve" button's `callback_data` (`approve:{owner}/{repo}#{number}`)
-/// built by [`notify_pr_approval_gate`].
-fn parse_approve_callback(data: &str) -> Option<(crate::github::RepoId, u64)> {
-    let rest = data.strip_prefix("approve:")?;
-    let (repo_part, number_part) = rest.rsplit_once('#')?;
-    let repo = crate::github::RepoId::parse(repo_part)?;
-    let number: u64 = number_part.parse().ok()?;
-    Some((repo, number))
-}
-
-/// Poll for Telegram button clicks and act on any "Approve" tap by adding
-/// `PR_APPROVAL_LABEL` to the PR it names -- the inbound half of
-/// `notify_pr_approval_gate`'s card. Runs from its own fixed-interval
-/// supervisor tick (`spawn_supervisor_telegram_approvals`), the same shape
-/// as `run_discovery_tick`/`run_review_sweep`, rather than a dedicated
-/// long-poll thread. No-ops without a configured chat id (opt-in, same as
-/// every other Telegram path here); a single bad update is logged and
-/// skipped rather than wedging the whole poll loop.
-///
-/// Fetches both `callback_query` (the `approve:` card flow, handled by
-/// [`handle_telegram_callback`] below unchanged) and `message` updates (the
-/// chat channel's commands/free-text prompts, handled by
-/// [`handle_chat_message`]) in the SAME call, sharing this one offset.
-/// Telegram allows exactly one `getUpdates` poller per bot token, and
-/// advancing the offset confirms (and permanently drops) every update below
-/// it regardless of which `allowed_updates` filter fetched them — so two
-/// independently-offset pollers on one token can silently steal updates
-/// from each other. Keeping this as the single poller is required, not
-/// just tidier.
-pub(crate) fn poll_telegram_approvals(mcp: std::sync::Arc<crate::mcp_server::AgentflareMcp>) {
-    let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
-        return;
-    };
-    let offset: i64 = crate::vault::get_secret(TELEGRAM_UPDATE_OFFSET_SECRET)
-        .ok()
-        .flatten()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let updates = match crate::channels::get_telegram_updates_filtered(
-        offset,
-        &["callback_query", "message"],
-    ) {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("agentflare-supervisor: telegram getUpdates failed: {e}");
-            return;
-        }
-    };
-    let mut last_persisted_offset = offset;
-    for update in &updates {
-        if update.get("callback_query").is_some() {
-            handle_telegram_callback(update, &chat_id);
-        } else if let Some(message) = update.get("message") {
-            handle_chat_message(message, &chat_id, &mcp);
-        }
-        // Persisted per update rather than once for the whole batch: a
-        // crash between two updates then only risks replaying the one that
-        // was in flight, not everything else this tick already handled
-        // (`/new` isn't idempotent -- unlike the approve-callback flow's
-        // `add_labels`, a replayed create makes a duplicate item).
-        let Some(next) = update
-            .get("update_id")
-            .and_then(serde_json::Value::as_i64)
-            .map(|id| id + 1)
-        else {
-            continue;
-        };
-        if next <= last_persisted_offset {
-            continue;
-        }
-        if let Err(e) = crate::vault::set_secret(TELEGRAM_UPDATE_OFFSET_SECRET, &next.to_string()) {
-            eprintln!("agentflare-supervisor: failed to persist telegram update offset: {e}");
-        } else {
-            last_persisted_offset = next;
-        }
-    }
-}
-
-/// Handle one `message` update: verify it came from the configured notify
-/// chat (same authorization `handle_telegram_callback` applies below), then
-/// hand the text off to `chat_channel::dispatch_message`. A message with no
-/// `chat`/`text` field, or from any other chat, is silently skipped.
-///
-/// Known gap: for free text, `dispatch_message` spawns the actual agent
-/// turn on a background thread and returns immediately, but
-/// `poll_telegram_approvals`'s caller still persists this update's offset
-/// right after this call returns -- i.e. once the turn is *dispatched*, not
-/// once it *completes* (up to `CHAT_TURN_TIMEOUT` later). A crash during
-/// that window loses the turn silently (no retry, since the offset already
-/// moved past it) rather than duplicating it. Closing this fully needs the
-/// offset write to wait for the turn's own completion, which either means
-/// blocking this poll tick on a slow agent run (defeating the reason
-/// dispatch is async in the first place) or a real per-update durable
-/// ledger -- out of scope for this pass. Slash commands (`chat_new` et al.)
-/// are unaffected: `dispatch_message` runs those synchronously before
-/// returning, so their offset is persisted only once they're truly done.
-fn handle_chat_message(
-    message: &serde_json::Value,
-    expected_chat_id: &str,
-    mcp: &std::sync::Arc<crate::mcp_server::AgentflareMcp>,
-) {
-    let Some(chat_id) = message
-        .get("chat")
-        .and_then(|c| c.get("id"))
-        .map(std::string::ToString::to_string)
-    else {
-        return;
-    };
-    if chat_id != expected_chat_id {
-        return;
-    }
-    let Some(text) = message.get("text").and_then(serde_json::Value::as_str) else {
-        return; // non-text message (photo, sticker, ...) -- not handled yet
-    };
-    let text = text.trim();
-    if text.is_empty() {
-        return;
-    }
-    crate::chat_channel::dispatch_message(
-        crate::chat_channel::telegram_channel(),
-        chat_id,
-        text.to_string(),
-        mcp,
-    );
-}
-
-/// Handle one `callback_query` update: verify it came from the configured
-/// notify chat (the only chat a card was ever sent to, but checked anyway --
-/// defense in depth against, e.g., the bot later being added to a group),
-/// parse its `approve:` callback data, add the label, then ack + strip the
-/// button so a repeat tap is a no-op rather than a duplicate GitHub call.
-fn handle_telegram_callback(update: &serde_json::Value, expected_chat_id: &str) {
-    let Some(callback) = update.get("callback_query") else {
-        return;
-    };
-    let Some(data) = callback.get("data").and_then(serde_json::Value::as_str) else {
-        return;
-    };
-    let Some(callback_id) = callback.get("id").and_then(serde_json::Value::as_str) else {
-        return;
-    };
-    let message = callback.get("message");
-    let chat_id = message
-        .and_then(|m| m.get("chat"))
-        .and_then(|c| c.get("id"))
-        .map(std::string::ToString::to_string);
-    if chat_id.as_deref() != Some(expected_chat_id) {
-        return;
-    }
-    let Some((repo, number)) = parse_approve_callback(data) else {
-        return;
-    };
-    let ack_text = match crate::github::Client::new()
-        .map_err(|e| e.to_string())
-        .and_then(|client| {
-            crate::github::issues::add_labels(
-                &client,
-                &repo,
-                number,
-                &[PR_APPROVAL_LABEL.to_string()],
-            )
-            .map_err(|e| e.to_string())
-        }) {
-        Ok(()) => "\u{2705} Approved".to_string(),
-        Err(e) => {
-            eprintln!("agentflare-supervisor: telegram approve for {repo}#{number} failed: {e}");
-            format!("failed: {e}")
-        }
-    };
-    let _ = crate::channels::answer_telegram_callback(callback_id, &ack_text);
-    if let Some(message_id) = message
-        .and_then(|m| m.get("message_id"))
-        .and_then(serde_json::Value::as_i64)
-    {
-        let _ = crate::channels::clear_telegram_reply_markup(expected_chat_id, message_id);
     }
 }
 

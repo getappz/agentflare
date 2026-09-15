@@ -68,29 +68,34 @@ fn load_sessions() -> std::collections::HashMap<String, String> {
 /// Held only for the brief load+insert+write, never across an agent run.
 static SESSIONS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn save_session(chat_id: &str, session_id: &str) {
+/// Shared lock→load→mutate→serialize→write sequence behind `save_session`
+/// and `remove_session`. `mutate` returns whether it actually changed the
+/// map, so a `remove` of an already-absent chat id skips the write.
+fn with_sessions_locked(
+    mutate: impl FnOnce(&mut std::collections::HashMap<String, String>) -> bool,
+) {
     let _guard = SESSIONS_WRITE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut sessions = load_sessions();
-    sessions.insert(chat_id.to_string(), session_id.to_string());
-    if let Ok(encoded) = serde_json::to_string(&sessions) {
+    if mutate(&mut sessions)
+        && let Ok(encoded) = serde_json::to_string(&sessions)
+    {
         let _ = crate::vault::set_secret(TELEGRAM_CHAT_SESSIONS_SECRET, &encoded);
     }
+}
+
+fn save_session(chat_id: &str, session_id: &str) {
+    with_sessions_locked(|sessions| {
+        sessions.insert(chat_id.to_string(), session_id.to_string());
+        true
+    });
 }
 
 /// Drop a chat's session mapping (e.g. once it's confirmed stale) so the
 /// next turn starts fresh instead of repeating a doomed `--resume`.
 fn remove_session(chat_id: &str) {
-    let _guard = SESSIONS_WRITE_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut sessions = load_sessions();
-    if sessions.remove(chat_id).is_some()
-        && let Ok(encoded) = serde_json::to_string(&sessions)
-    {
-        let _ = crate::vault::set_secret(TELEGRAM_CHAT_SESSIONS_SECRET, &encoded);
-    }
+    with_sessions_locked(|sessions| sessions.remove(chat_id).is_some());
 }
 
 /// Per-chat turn lock, keyed by chat id -- `run_chat_turn` holds this for its
@@ -265,11 +270,18 @@ fn try_reserve_chat_turn_slot() -> Option<ChatTurnSlot> {
 /// this (see `supervisor::poll_telegram_approvals`, which also owns
 /// authorizing `chat_id` against the configured notify chat before this is
 /// ever called). Refuses to spawn past `MAX_CONCURRENT_CHAT_TURNS`.
+///
+/// `on_settled` fires exactly once, on every path, once this message's
+/// handling is truly finished -- immediately for a command reply or a busy
+/// refusal, or (for free text) only after the spawned turn itself completes.
+/// The caller (`supervisor::handle_chat_message`) uses this to know when the
+/// Telegram update this came from is safe to confirm.
 pub(crate) fn dispatch_message(
     channel: &'static (dyn ChatChannel + Sync),
     chat_id: String,
     text: String,
     mcp: &AgentflareMcp,
+    on_settled: impl FnOnce() + Send + 'static,
 ) {
     match parse_command(&text) {
         Some((command, args)) => {
@@ -277,12 +289,14 @@ pub(crate) fn dispatch_message(
             if let Err(e) = channel.send_reply(&chat_id, &reply) {
                 eprintln!("agentflare-supervisor: chat command reply to {chat_id} failed: {e}");
             }
+            on_settled();
         }
         None => match try_reserve_chat_turn_slot() {
             Some(slot) => {
                 std::thread::spawn(move || {
                     let _slot = slot;
                     run_chat_turn(channel, chat_id, text);
+                    on_settled();
                 });
             }
             None => {
@@ -292,6 +306,7 @@ pub(crate) fn dispatch_message(
                 ) {
                     eprintln!("agentflare-supervisor: chat busy reply to {chat_id} failed: {e}");
                 }
+                on_settled();
             }
         },
     }
