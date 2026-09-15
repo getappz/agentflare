@@ -25,6 +25,31 @@ static LEGACY_MIGRATION_DONE: std::sync::atomic::AtomicBool =
 /// every vault writer is covered, not just that one call site.
 static VAULT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Cross-process complement to `VAULT_WRITE_LOCK` above: an advisory file
+/// lock on a sentinel file next to the vault, held for the whole
+/// read-modify-write cycle. `flare_vault`'s own file locking only wraps
+/// each individual read/write call, not the cycle between them (see its
+/// `crates/flare-vault/src/vault/file.rs` doc comment, which explicitly
+/// accepted that gap for "a local single-user CLI vault") -- the daemon and
+/// a concurrent `agentflare vault set` CLI invocation are two separate OS
+/// processes, so `VAULT_WRITE_LOCK`'s in-process mutex can't cover them;
+/// this can. Both `set_secret` and `remove_secret` funnel every caller in
+/// this codebase (CLI and daemon alike) through here, so locking only in
+/// this wrapper -- not touching the shared `flare_vault` crate itself --
+/// is sufficient.
+fn lock_vault_file_cross_process() -> Result<std::fs::File, String> {
+    let path = vault_path().with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // sentinel lock file -- content is never read, don't touch it
+        .open(&path)
+        .map_err(|e| format!("open vault lock file {}: {e}", path.display()))?;
+    fs2::FileExt::lock_exclusive(&file)
+        .map_err(|e| format!("lock vault lock file {}: {e}", path.display()))?;
+    Ok(file)
+}
+
 // Deliberately independent of `auth_crypt::get_passphrase()` (used by the
 // legacy `gateway_secrets` store): that one also falls back to an
 // interactive prompt, this one doesn't -- unattended callers (MCP server,
@@ -92,6 +117,14 @@ fn migrate_legacy_secrets(path: &Path, dek: &VaultDek, passphrase: &str) {
     if LEGACY_MIGRATION_DONE.swap(true, Ordering::SeqCst) {
         return;
     }
+    // Deliberately NOT under VAULT_WRITE_LOCK/lock_vault_file_cross_process:
+    // this runs from inside unseal_vault_with_dek(), which set_secret and
+    // remove_secret call while already holding both locks -- taking either
+    // again here (neither is reentrant) would deadlock the thread against
+    // itself. Acceptable to leave unlocked: one-time, best-effort,
+    // already fail-open (see doc comment above) -- a lost race here just
+    // means a legacy secret waits for a future process's attempt, not data
+    // loss or corruption of anything already in the vault.
 
     let Ok(conn) = crate::db::open() else { return };
     let Ok(names) = crate::gateway_secrets::list_secrets(&conn) else {
@@ -184,6 +217,7 @@ pub fn get_secret(name: &str) -> Result<Option<Zeroizing<String>>, String> {
 
 pub fn set_secret(name: &str, value: &str) -> Result<(), String> {
     let _guard = VAULT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _file_lock = lock_vault_file_cross_process()?;
     let dek = unseal_vault_with_dek()?;
     let path = vault_path();
     let mut body = read_vault_body(&path).map_err(|e| e.to_string())?;
@@ -202,6 +236,7 @@ pub fn list_secrets() -> Result<Vec<String>, String> {
 
 pub fn remove_secret(name: &str) -> Result<bool, String> {
     let _guard = VAULT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _file_lock = lock_vault_file_cross_process()?;
     let _dek = unseal_vault_with_dek()?;
     let path = vault_path();
     let mut body = read_vault_body(&path).map_err(|e| e.to_string())?;

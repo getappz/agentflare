@@ -1226,6 +1226,20 @@ pub(crate) fn poll_telegram_approvals(mcp: std::sync::Arc<crate::mcp_server::Age
 /// chat (same authorization `handle_telegram_callback` applies below), then
 /// hand the text off to `chat_channel::dispatch_message`. A message with no
 /// `chat`/`text` field, or from any other chat, is silently skipped.
+///
+/// Known gap: for free text, `dispatch_message` spawns the actual agent
+/// turn on a background thread and returns immediately, but
+/// `poll_telegram_approvals`'s caller still persists this update's offset
+/// right after this call returns -- i.e. once the turn is *dispatched*, not
+/// once it *completes* (up to `CHAT_TURN_TIMEOUT` later). A crash during
+/// that window loses the turn silently (no retry, since the offset already
+/// moved past it) rather than duplicating it. Closing this fully needs the
+/// offset write to wait for the turn's own completion, which either means
+/// blocking this poll tick on a slow agent run (defeating the reason
+/// dispatch is async in the first place) or a real per-update durable
+/// ledger -- out of scope for this pass. Slash commands (`chat_new` et al.)
+/// are unaffected: `dispatch_message` runs those synchronously before
+/// returning, so their offset is persisted only once they're truly done.
 fn handle_chat_message(
     message: &serde_json::Value,
     expected_chat_id: &str,
