@@ -55,7 +55,7 @@ pub const ACTIONS: &[ActionDef] = &[
     ActionDef { name: "open", description: "Launch browser and navigate to a URL (also: goto, navigate)", read_only: false },
     ActionDef { name: "snapshot", description: "Accessibility tree with @e refs — the primary page read (compact, token-efficient)", read_only: true },
     ActionDef { name: "observe", description: "Snapshot filtered to lines matching a query (deterministic Stagehand-style observe; no model call)", read_only: true },
-    ActionDef { name: "extract", description: "Run JS via eval and return raw output; the caller model structures it (deterministic Stagehand-style extract)", read_only: true },
+    ActionDef { name: "extract", description: "Run JS via eval and return raw output; the caller model structures it (deterministic Stagehand-style extract)", read_only: false },
     ActionDef { name: "click", description: "Click a ref or selector (fails early when covered — dismiss coverer, re-snapshot, retry)", read_only: false },
     ActionDef { name: "fill", description: "Clear and fill a field: fill <target> <text>", read_only: false },
     ActionDef { name: "type", description: "Type into an element without clearing", read_only: false },
@@ -407,6 +407,10 @@ mod tests {
         assert!(is_read_only("read"));
         assert!(!is_read_only("click"));
         assert!(!is_read_only("bogus-action"));
+        // "extract" canonicalizes to and executes as "eval" (unrestricted JS,
+        // read_only: false) -- it must never report itself read-only, or a
+        // client/gate trusting this flag would auto-approve a mutating call.
+        assert!(!is_read_only("extract"));
     }
 
     #[test]
