@@ -708,6 +708,18 @@ impl AgentflareMcp {
                 })
                 .to_string()
             }
+            agentflare_backend::item::ClaimOutcome::BlockedByPlan { status } => {
+                serde_json::json!({
+                    "status": "blocked_by_plan",
+                    "item_id": item_id,
+                    "plan_status": status,
+                    "reason": format!(
+                        "item requires plan approval (status: {status}) — call \
+                         item(action=\"submit_plan\", plan_asset_id=...) first"
+                    ),
+                })
+                .to_string()
+            }
         })
     }
 

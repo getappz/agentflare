@@ -373,6 +373,60 @@ fn item_update_assignee_to_different_instance_does_not_release_claim() {
 }
 
 #[test]
+fn item_claim_blocked_by_plan() {
+    let (s, tmp, _repo_tmp) = claim_harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("gated item".into()),
+            metadata: Some(serde_json::json!({"plan_required": true})),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let blocked: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(blocked["status"], "blocked_by_plan");
+    assert_eq!(blocked["plan_status"], "none");
+
+    // Approve the plan via a direct backend update (bypassing the MCP
+    // layer, which has no `submit_plan`/approval action yet — that's a
+    // later task in this plan).
+    let conn = backend_conn(&tmp);
+    agentflare_backend::item::update(
+        &conn,
+        &item_id,
+        agentflare_backend::item::UpdateItem {
+            metadata: Some(r#"{"plan_required":true,"plan_status":"approved"}"#.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let acquired: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(acquired["status"], "acquired");
+}
+
+#[test]
 fn item_list_rejects_negative_limit_and_offset() {
     let (_tmp, s) = harness();
     let err = s

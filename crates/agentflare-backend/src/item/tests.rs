@@ -1602,6 +1602,68 @@ fn heartbeat_release_done_are_owner_scoped() {
 }
 
 #[test]
+fn claim_blocked_by_plan_when_gated_and_unapproved() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "_planblock");
+    let item = create(
+        &conn,
+        CreateItem {
+            project_id: pid,
+            state_id: sid,
+            name: "gated item".into(),
+            description: None,
+            priority: None,
+            parent_id: None,
+            assignee_agent: None,
+            sort_order: None,
+            external_source: None,
+            external_id: None,
+            metadata: Some(r#"{"plan_required":true}"#.into()),
+            label_ids: vec![],
+            assignee_ids: vec![],
+            dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
+        },
+    )
+    .unwrap();
+
+    let outcome = claim(&conn, &item.id, "claude-code:1", crate::item::now(), 3600).unwrap();
+    assert_eq!(outcome, ClaimOutcome::BlockedByPlan { status: "none".into() });
+}
+
+#[test]
+fn claim_succeeds_once_plan_approved() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "_planok");
+    let item = create(
+        &conn,
+        CreateItem {
+            project_id: pid,
+            state_id: sid,
+            name: "gated item".into(),
+            description: None,
+            priority: None,
+            parent_id: None,
+            assignee_agent: None,
+            sort_order: None,
+            external_source: None,
+            external_id: None,
+            metadata: Some(r#"{"plan_required":true,"plan_status":"approved"}"#.into()),
+            label_ids: vec![],
+            assignee_ids: vec![],
+            dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
+        },
+    )
+    .unwrap();
+
+    let outcome = claim(&conn, &item.id, "claude-code:1", crate::item::now(), 3600).unwrap();
+    assert_eq!(outcome, ClaimOutcome::Acquired);
+}
+
+#[test]
 fn resolve_id_passes_through_uuid_unchanged() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
