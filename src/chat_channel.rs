@@ -79,6 +79,20 @@ fn save_session(chat_id: &str, session_id: &str) {
     }
 }
 
+/// Drop a chat's session mapping (e.g. once it's confirmed stale) so the
+/// next turn starts fresh instead of repeating a doomed `--resume`.
+fn remove_session(chat_id: &str) {
+    let _guard = SESSIONS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut sessions = load_sessions();
+    if sessions.remove(chat_id).is_some()
+        && let Ok(encoded) = serde_json::to_string(&sessions)
+    {
+        let _ = crate::vault::set_secret(TELEGRAM_CHAT_SESSIONS_SECRET, &encoded);
+    }
+}
+
 /// Per-chat turn lock, keyed by chat id -- `run_chat_turn` holds this for its
 /// whole body so a second free-text message for the same chat (routine: the
 /// 20s `SUPERVISOR_TELEGRAM_POLL_INTERVAL` poll is well under
@@ -158,6 +172,11 @@ fn run_chat_turn(channel: &dyn ChatChannel, chat_id: String, prompt: String) {
         && let crate::agent_launch::HeadlessOutcome::Failed(ref msg) = outcome
         && crate::work_item_pipeline::is_stale_session_error(msg)
     {
+        // Drop the dead session before retrying fresh, not just on a
+        // subsequent success (below) -- otherwise a fresh retry that also
+        // fails leaves the stale id on file, so every later message in this
+        // chat repeats this same doomed resume attempt first.
+        remove_session(&chat_id);
         outcome = crate::agent_launch::run_headless(
             agent_registry::REGISTRY,
             &agent_name,
@@ -203,13 +222,49 @@ fn parse_command(text: &str) -> Option<(&str, &str)> {
     Some((command, args.trim()))
 }
 
+/// Hard cap on concurrent free-text chat turns across all chats. Each one
+/// is a raw `std::thread::spawn` (see `dispatch_message`) with nothing else
+/// bounding how many can pile up if messages arrive faster than
+/// `CHAT_TURN_TIMEOUT` turns finish -- `std::thread::spawn` panics once the
+/// OS can't create another thread, so an unbounded burst (Telegram can
+/// return up to 100 updates per poll) is a real resource-exhaustion path,
+/// not just a theoretical one. Comfortably above anything the single
+/// authorized chat (`TELEGRAM_NOTIFY_CHAT_ID_SECRET`) produces in normal
+/// use, while still capping the worst case.
+const MAX_CONCURRENT_CHAT_TURNS: usize = 8;
+static IN_FLIGHT_CHAT_TURNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Releases its `IN_FLIGHT_CHAT_TURNS` reservation on every exit path
+/// (normal return or panic) once a turn finishes.
+struct ChatTurnSlot;
+
+impl Drop for ChatTurnSlot {
+    fn drop(&mut self) {
+        IN_FLIGHT_CHAT_TURNS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Reserve a chat-turn slot if under `MAX_CONCURRENT_CHAT_TURNS`, else
+/// `None` -- the caller replies with a busy message instead of spawning.
+fn try_reserve_chat_turn_slot() -> Option<ChatTurnSlot> {
+    IN_FLIGHT_CHAT_TURNS
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |n| (n < MAX_CONCURRENT_CHAT_TURNS).then_some(n + 1),
+        )
+        .ok()
+        .map(|_| ChatTurnSlot)
+}
+
 /// Dispatch one already-authorized inbound message: a `/command` is handled
 /// inline (fast, in-process MCP-shaped calls) and replied to immediately;
 /// free text is handed off to a background thread running the headless
 /// agent turn, so a slow agent reply never delays the poll tick that called
 /// this (see `supervisor::poll_telegram_approvals`, which also owns
 /// authorizing `chat_id` against the configured notify chat before this is
-/// ever called).
+/// ever called). Refuses to spawn past `MAX_CONCURRENT_CHAT_TURNS`.
 pub(crate) fn dispatch_message(
     channel: &'static (dyn ChatChannel + Sync),
     chat_id: String,
@@ -223,13 +278,26 @@ pub(crate) fn dispatch_message(
                 eprintln!("agentflare-supervisor: chat command reply to {chat_id} failed: {e}");
             }
         }
-        None => {
-            std::thread::spawn(move || run_chat_turn(channel, chat_id, text));
-        }
+        None => match try_reserve_chat_turn_slot() {
+            Some(slot) => {
+                std::thread::spawn(move || {
+                    let _slot = slot;
+                    run_chat_turn(channel, chat_id, text);
+                });
+            }
+            None => {
+                if let Err(e) = channel.send_reply(
+                    &chat_id,
+                    "still processing other requests -- try again in a moment",
+                ) {
+                    eprintln!("agentflare-supervisor: chat busy reply to {chat_id} failed: {e}");
+                }
+            }
+        },
     }
 }
 
-/// The chat channel this daemon polls -- `'static` so `poll_and_dispatch`
+/// The chat channel this daemon polls -- `'static` so `dispatch_message`
 /// can hand it to a spawned background thread for free-text turns without
 /// any lifetime/ownership machinery; `TelegramChannel` is a stateless unit
 /// struct, so a single shared reference is all any caller ever needs.
@@ -263,6 +331,26 @@ mod tests {
     #[test]
     fn parse_command_is_none_for_free_text() {
         assert_eq!(parse_command("what's the status of item 42?"), None);
+    }
+
+    #[test]
+    fn chat_turn_slot_bounds_concurrency_and_releases_on_drop() {
+        // Only this test touches IN_FLIGHT_CHAT_TURNS, so a clean starting
+        // count is safe to assume even under cargo test's default
+        // cross-test parallelism.
+        let mut slots = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CHAT_TURNS {
+            slots.push(try_reserve_chat_turn_slot().expect("should be under the cap"));
+        }
+        assert!(
+            try_reserve_chat_turn_slot().is_none(),
+            "must refuse once MAX_CONCURRENT_CHAT_TURNS are already held"
+        );
+        drop(slots);
+        assert!(
+            try_reserve_chat_turn_slot().is_some(),
+            "dropping a slot must release its reservation"
+        );
     }
 
     #[test]

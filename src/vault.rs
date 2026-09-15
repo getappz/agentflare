@@ -15,6 +15,15 @@ const APP_NAME: &str = "agentflare";
 static PASSPHRASE_CACHE: Mutex<Option<Zeroizing<String>>> = Mutex::new(None);
 static LEGACY_MIGRATION_DONE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// Serializes `set_secret`/`remove_secret`'s read-modify-write of the whole
+/// vault body -- each writes every key back, not just its own, so two
+/// concurrent calls (even for different secret names) can otherwise race:
+/// both read the same starting body, then whichever writes second silently
+/// discards the first's change. `chat_channel`'s per-chat session saves
+/// running on a background thread alongside the Telegram poller's own
+/// offset writes is what surfaces this in practice; the fix belongs here so
+/// every vault writer is covered, not just that one call site.
+static VAULT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 // Deliberately independent of `auth_crypt::get_passphrase()` (used by the
 // legacy `gateway_secrets` store): that one also falls back to an
@@ -174,6 +183,7 @@ pub fn get_secret(name: &str) -> Result<Option<Zeroizing<String>>, String> {
 }
 
 pub fn set_secret(name: &str, value: &str) -> Result<(), String> {
+    let _guard = VAULT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dek = unseal_vault_with_dek()?;
     let path = vault_path();
     let mut body = read_vault_body(&path).map_err(|e| e.to_string())?;
@@ -191,6 +201,7 @@ pub fn list_secrets() -> Result<Vec<String>, String> {
 }
 
 pub fn remove_secret(name: &str) -> Result<bool, String> {
+    let _guard = VAULT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _dek = unseal_vault_with_dek()?;
     let path = vault_path();
     let mut body = read_vault_body(&path).map_err(|e| e.to_string())?;
@@ -260,6 +271,45 @@ mod tests {
                 "expected a passphrase-related error, got: {err}"
             );
 
+            clear_passphrase();
+        });
+    }
+
+    /// Regression test: `set_secret` reads and rewrites the *whole* vault
+    /// body, so two concurrent calls for different keys could otherwise
+    /// race -- both read the same starting body, then whichever writes
+    /// second silently discards the first's key. `VAULT_WRITE_LOCK` must
+    /// serialize them so both keys survive regardless of interleaving.
+    #[test]
+    fn concurrent_set_secret_calls_for_different_keys_do_not_lose_either_write() {
+        with_temp_home(|| {
+            set_passphrase("test-pass");
+            unlock("test-pass").unwrap();
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let b1 = barrier.clone();
+            let t1 = std::thread::spawn(move || {
+                b1.wait();
+                for _ in 0..20 {
+                    set_secret("KEY_A", "value-a").unwrap();
+                }
+            });
+            let b2 = barrier.clone();
+            let t2 = std::thread::spawn(move || {
+                b2.wait();
+                for _ in 0..20 {
+                    set_secret("KEY_B", "value-b").unwrap();
+                }
+            });
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            let a = get_secret("KEY_A").unwrap();
+            let b = get_secret("KEY_B").unwrap();
+            assert_eq!(a.as_ref().map(|s| s.as_str()), Some("value-a"));
+            assert_eq!(b.as_ref().map(|s| s.as_str()), Some("value-b"));
+
+            lock().unwrap();
             clear_passphrase();
         });
     }

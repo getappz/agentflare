@@ -1192,22 +1192,33 @@ pub(crate) fn poll_telegram_approvals(mcp: std::sync::Arc<crate::mcp_server::Age
             return;
         }
     };
-    let mut next_offset = offset;
+    let mut last_persisted_offset = offset;
     for update in &updates {
-        if let Some(id) = update.get("update_id").and_then(serde_json::Value::as_i64) {
-            next_offset = next_offset.max(id + 1);
-        }
         if update.get("callback_query").is_some() {
             handle_telegram_callback(update, &chat_id);
         } else if let Some(message) = update.get("message") {
             handle_chat_message(message, &chat_id, &mcp);
         }
-    }
-    if next_offset != offset
-        && let Err(e) =
-            crate::vault::set_secret(TELEGRAM_UPDATE_OFFSET_SECRET, &next_offset.to_string())
-    {
-        eprintln!("agentflare-supervisor: failed to persist telegram update offset: {e}");
+        // Persisted per update rather than once for the whole batch: a
+        // crash between two updates then only risks replaying the one that
+        // was in flight, not everything else this tick already handled
+        // (`/new` isn't idempotent -- unlike the approve-callback flow's
+        // `add_labels`, a replayed create makes a duplicate item).
+        let Some(next) = update
+            .get("update_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id + 1)
+        else {
+            continue;
+        };
+        if next <= last_persisted_offset {
+            continue;
+        }
+        if let Err(e) = crate::vault::set_secret(TELEGRAM_UPDATE_OFFSET_SECRET, &next.to_string()) {
+            eprintln!("agentflare-supervisor: failed to persist telegram update offset: {e}");
+        } else {
+            last_persisted_offset = next;
+        }
     }
 }
 
