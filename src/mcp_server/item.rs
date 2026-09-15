@@ -77,6 +77,31 @@ fn metadata_to_json_string(value: serde_json::Value) -> String {
     }
 }
 
+/// Applies Task 1's default plan-gate policy
+/// (`agentflare_backend::item::plan_default_policy`) to `metadata_str` for an
+/// item at `priority`. Returns `Some(patched_metadata)` only when the policy
+/// actually gates the item AND the caller hasn't already set `plan_required`
+/// explicitly — checked via `Value::as_object().map(|o|
+/// o.contains_key("plan_required"))` rather than `PlanGateMeta`'s
+/// `#[serde(default)]` reads, since those can't distinguish "explicitly
+/// false" from "absent" (item #573). Returns `None` when no write is
+/// needed, which callers use to mean "leave metadata untouched".
+fn default_plan_gate_patch(priority: &str, metadata_str: &str) -> Option<String> {
+    let explicit = serde_json::from_str::<serde_json::Value>(metadata_str)
+        .ok()
+        .and_then(|v| v.as_object().map(|o| o.contains_key("plan_required")))
+        .unwrap_or(false);
+    if explicit {
+        return None;
+    }
+    let (required, approver) =
+        agentflare_backend::item::plan_default_policy(priority, metadata_str)?;
+    Some(agentflare_backend::item::plan_gate::merge_metadata_patch(
+        metadata_str,
+        serde_json::json!({"plan_required": required, "plan_approver": approver}),
+    ))
+}
+
 /// `size` lives in the free-form `metadata` JSON blob (`{"size": "S"|"M"|"L"}`)
 /// rather than a regex over description prose — sets via `item(update)`.
 ///
@@ -376,6 +401,19 @@ impl AgentflareMcp {
                 Some(p) if p.trim().is_empty() => None,
                 Some(p) => Some(self.resolve_item_id(conn, p)?),
             };
+            // `crud::create` itself defaults an absent priority to "none"
+            // (see `crud::create`) -- mirror that here so the default
+            // plan-gate policy sees the same effective priority the row
+            // will actually get, not a bare `None`.
+            let effective_priority = req.priority.clone().unwrap_or_else(|| "none".to_string());
+            let metadata_str = req.metadata.map(metadata_to_json_string);
+            let metadata = match default_plan_gate_patch(
+                &effective_priority,
+                metadata_str.as_deref().unwrap_or("{}"),
+            ) {
+                Some(patched) => Some(patched),
+                None => metadata_str,
+            };
             let input = agentflare_backend::item::CreateItem {
                 project_id: project.id,
                 state_id,
@@ -387,7 +425,7 @@ impl AgentflareMcp {
                 sort_order: None,
                 external_source: None,
                 external_id: None,
-                metadata: req.metadata.map(metadata_to_json_string),
+                metadata,
                 label_ids: req.label_ids.unwrap_or_default(),
                 assignee_ids: vec![],
                 dependency_ids: req.dependency_ids.unwrap_or_default(),
@@ -520,6 +558,32 @@ impl AgentflareMcp {
                 Some(p) if p.trim().is_empty() => Some(None),
                 Some(p) => Some(Some(self.resolve_item_id(conn, p)?)),
             };
+            let metadata_str = req.metadata.map(metadata_to_json_string);
+            // Only recompute the default plan-gate policy when priority is
+            // actually changing in this call -- an update that leaves
+            // priority untouched shouldn't re-derive gating from it.
+            let metadata = match req.priority.as_deref() {
+                Some(priority) => {
+                    // `UpdateItem::metadata` replaces the column wholesale
+                    // (never merges -- see `merge_metadata_patch`'s doc
+                    // comment), so when the caller didn't also send
+                    // `metadata` here, the explicit-key check and any patch
+                    // must be computed against the item's *current* stored
+                    // metadata, not an empty object, or this would wipe out
+                    // every other metadata key the item already has.
+                    let base = match &metadata_str {
+                        Some(m) => m.clone(),
+                        None => agentflare_backend::item::get(conn, &id)
+                            .map(|i| i.metadata)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    };
+                    match default_plan_gate_patch(priority, &base) {
+                        Some(patched) => Some(patched),
+                        None => metadata_str,
+                    }
+                }
+                None => metadata_str,
+            };
             let input = agentflare_backend::item::UpdateItem {
                 name: req.name,
                 description: req.description,
@@ -527,7 +591,7 @@ impl AgentflareMcp {
                 state_id: None,
                 assignee_agent: req.assignee_agent.clone(),
                 sort_order: None,
-                metadata: req.metadata.map(metadata_to_json_string),
+                metadata,
                 parent_id,
                 start_date: req.start_date,
                 due_date: req.due_date,

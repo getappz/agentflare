@@ -529,6 +529,169 @@ fn reject_plan_sets_rejected_and_records_reason() {
 }
 
 #[test]
+fn create_with_urgent_priority_auto_gates_plan_required() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("urgent item".into()),
+            priority: Some("urgent".into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(created["metadata"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["plan_required"], true);
+    assert_eq!(metadata["plan_approver"], "human");
+}
+
+#[test]
+fn create_with_explicit_plan_required_false_is_not_overridden() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("urgent item, opted out".into()),
+            priority: Some("urgent".into()),
+            metadata: Some(serde_json::json!({"plan_required": false})),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(created["metadata"].as_str().unwrap()).unwrap();
+    // Explicit override wins over the default urgent/high auto-gate rule.
+    assert_eq!(metadata["plan_required"], false);
+}
+
+#[test]
+fn update_priority_to_urgent_auto_gates_plan_required() {
+    let (tmp, s) = harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("ordinary item".into()),
+            metadata: Some(serde_json::json!({"size": "M"})),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    s.item(Parameters(ItemRequest {
+        action: "update".into(),
+        id: Some(item_id.clone()),
+        priority: Some("urgent".into()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let conn = backend_conn(&tmp);
+    let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+    assert_eq!(metadata["plan_required"], true);
+    assert_eq!(metadata["plan_approver"], "human");
+    // The pre-existing, unrelated metadata key must survive the merge --
+    // `UpdateItem::metadata` replaces the column wholesale, so this proves
+    // the default-gate patch was merged onto the item's current metadata
+    // rather than clobbering it.
+    assert_eq!(metadata["size"], "M");
+}
+
+/// Full feature end-to-end: an item auto-gated at creation cannot be
+/// claimed until a submitted plan is approved.
+#[test]
+fn end_to_end_plan_gate_blocks_then_unblocks_claim() {
+    let (s, _tmp, _repo_tmp) = claim_harness();
+
+    // 1. Create with priority="urgent" -> auto-gated plan_required=true.
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("urgent gated item".into()),
+            priority: Some("urgent".into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    let metadata: serde_json::Value =
+        serde_json::from_str(created["metadata"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["plan_required"], true);
+
+    // 2. claim -> blocked_by_plan, plan_status "none" (never submitted).
+    let blocked: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(blocked["status"], "blocked_by_plan");
+    assert_eq!(blocked["plan_status"], "none");
+
+    // 3. submit_plan with plan_approver="agent" (skip the Telegram/human
+    //    path for this test) -> plan_status "pending".
+    let submitted: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "submit_plan".into(),
+            id: Some(item_id.clone()),
+            plan_asset_id: Some("asset-e2e".into()),
+            plan_approver: Some("agent".into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(submitted["status"], "pending");
+    assert_eq!(submitted["plan_approver"], "agent");
+
+    // 4. claim again -> still blocked, plan_status "pending".
+    let still_blocked: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(still_blocked["status"], "blocked_by_plan");
+    assert_eq!(still_blocked["plan_status"], "pending");
+
+    // 5. approve_plan -> plan_status "approved".
+    let approved: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "approve_plan".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(approved["status"], "approved");
+
+    // 6. claim -> acquired.
+    let acquired: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(acquired["status"], "acquired");
+}
+
+#[test]
 fn item_list_rejects_negative_limit_and_offset() {
     let (_tmp, s) = harness();
     let err = s
