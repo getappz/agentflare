@@ -201,6 +201,73 @@ fn telegram_token() -> Result<zeroize::Zeroizing<String>, String> {
         })
 }
 
+/// Call a no-argument (or query-string-only) Telegram Bot API GET method
+/// and return its parsed body. Shared by [`telegram_bot_identity`] and
+/// [`telegram_chat_identity`] so both get the same token-safe error
+/// handling `get_telegram_updates_filtered` established (never let
+/// `ureq::Error`'s own `Display` leak the token-bearing URL).
+fn telegram_get(method: &str, query: &str) -> Result<Value, String> {
+    let token = telegram_token()?;
+    let url = format!("https://api.telegram.org/bot{}/{method}{query}", *token);
+    let resp = match http_agent().get(&url).call() {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, resp)) => {
+            return Err(format!(
+                "telegram {method} HTTP {code}: {}",
+                resp.into_string().unwrap_or_default()
+            ));
+        }
+        Err(e) => return Err(describe_send_error(Platform::Telegram, &e)),
+    };
+    resp.into_json()
+        .map_err(|e| format!("telegram {method} response was not JSON: {e}"))
+}
+
+/// The bot identity the configured `telegram_bot_token` actually resolves
+/// to (`getMe`), for `doctor`'s channel-health check. Exists because the
+/// chat channel can go permanently silent -- no error anywhere, `getUpdates`
+/// just keeps returning an empty backlog -- when the vault's token is stale
+/// or belongs to a different bot than whichever one a user is actually
+/// messaging in Telegram; printing `@bot_username` lets that be caught by
+/// eyeballing it against the real conversation instead of a long manual
+/// trace. Read-only, no message is sent.
+pub fn telegram_bot_identity() -> Result<String, String> {
+    let parsed = telegram_get("getMe", "")?;
+    let username = parsed
+        .get("result")
+        .and_then(|r| r.get("username"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "telegram getMe: missing result.username".to_string())?;
+    Ok(format!("@{username}"))
+}
+
+/// The person/chat Telegram associates with `chat_id` (`getChat`) --
+/// pairs with [`telegram_bot_identity`] so `doctor` can show BOTH ends of
+/// the configured conversation. `telegram_notify_chat_id` can point at the
+/// wrong person (stale, copy-pasted from an example, a former teammate's
+/// id) just as easily as `telegram_bot_token` can point at the wrong bot,
+/// with the identical silent-forever failure mode -- outbound sends still
+/// succeed (to whoever that id actually is), so nothing errors, and the
+/// person who's actually messaging the right bot just never gets replies.
+/// Prefers `username` (stable, and what a user recognizes at a glance);
+/// falls back to `first_name`/`last_name` for chats without one.
+pub fn telegram_chat_identity(chat_id: &str) -> Result<String, String> {
+    let parsed = telegram_get("getChat", &format!("?chat_id={chat_id}"))?;
+    let result = parsed
+        .get("result")
+        .ok_or_else(|| "telegram getChat: missing result".to_string())?;
+    if let Some(username) = result.get("username").and_then(Value::as_str) {
+        return Ok(format!("@{username}"));
+    }
+    let first = result.get("first_name").and_then(Value::as_str);
+    let last = result.get("last_name").and_then(Value::as_str);
+    match (first, last) {
+        (Some(f), Some(l)) => Ok(format!("{f} {l}")),
+        (Some(f), None) => Ok(f.to_string()),
+        _ => Err("telegram getChat: no username or name on this chat".to_string()),
+    }
+}
+
 /// Build the `sendMessage` request for a Telegram message carrying inline
 /// keyboard buttons (a "card") -- the richer sibling of [`build_request`]'s
 /// plain-text Telegram case. `parse_mode` is `HTML` rather than Markdown so
