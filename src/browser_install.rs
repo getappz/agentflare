@@ -175,8 +175,21 @@ fn tail(text: &str) -> String {
 fn install_lock() -> Result<std::fs::File, String> {
     use fs2::FileExt;
     let path = std::env::temp_dir().join("agentflare-browser-install.lock");
-    let file =
-        std::fs::File::create(&path).map_err(|e| format!("lock file {}: {e}", path.display()))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW: `temp_dir()` is a shared, world-writable directory on
+        // Unix -- another local user could pre-plant a symlink at this path
+        // pointing at a file only this process can write to. Refuse to
+        // follow it rather than silently truncating/locking whatever it
+        // points at.
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts
+        .open(&path)
+        .map_err(|e| format!("lock file {}: {e}", path.display()))?;
     file.lock_exclusive()
         .map_err(|e| format!("install lock {}: {e}", path.display()))?;
     Ok(file)

@@ -34,59 +34,66 @@ impl AgentflareMcp {
             return Ok(serde_json::to_string_pretty(&result).unwrap_or_default());
         }
 
-        // Positional assembly mirrors the CLI: target, then text, then url —
-        // matches sidecar order for fill <sel> <text>, open <url>, eval <js>.
-        let mut positionals = Vec::new();
-        if let Some(t) = req.target.filter(|s| !s.trim().is_empty()) {
-            positionals.push(t);
-        }
-        if let Some(t) = req.text.filter(|s| !s.trim().is_empty()) {
-            positionals.push(t);
-        }
-        if let Some(u) = req.url.filter(|s| !s.trim().is_empty()) {
-            positionals.push(u);
-        }
-        let extra = req.args.unwrap_or_default();
-
-        // `observe` composes locally: snapshot, then filter (no model call).
-        // The query is consumed here, not forwarded as a sidecar positional —
-        // `snapshot` takes no arguments.
-        let (backend_action, observe_query) = if action == "observe" {
-            let q = if positionals.is_empty() {
-                String::new()
-            } else {
-                positionals.remove(0)
-            };
+        // `observe` uses `text` directly as the local filter query and never
+        // forwards positionals to the backend -- `snapshot` takes none, and
+        // `target`/`url` must never silently substitute for a missing query.
+        // Every other action assembles positionals mirroring the CLI:
+        // target, then text, then url (fill <sel> <text>, open <url>, eval
+        // <js>).
+        let (backend_action, observe_query, positionals) = if action == "observe" {
+            let q = req.text.unwrap_or_default();
             if q.trim().is_empty() {
                 return Err(ErrorData::invalid_params(
                     "observe requires a query in `text`",
                     None,
                 ));
             }
-            ("snapshot".to_string(), Some(q))
+            ("snapshot".to_string(), Some(q), Vec::new())
         } else {
-            (action.clone(), None)
+            let mut positionals = Vec::new();
+            if let Some(t) = req.target.filter(|s| !s.trim().is_empty()) {
+                positionals.push(t);
+            }
+            if let Some(t) = req.text.filter(|s| !s.trim().is_empty()) {
+                positionals.push(t);
+            }
+            if let Some(u) = req.url.filter(|s| !s.trim().is_empty()) {
+                positionals.push(u);
+            }
+            (action.clone(), None, positionals)
         };
+        let extra = req.args.unwrap_or_default();
+
+        // Validate before touching install/spawn: an unknown action should
+        // fail as invalid_params, not trigger a sidecar install or surface
+        // as an opaque backend error.
+        let argv = flare_browser::build_argv(&session, &backend_action, &positionals, &extra)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
 
         let output = tokio::task::spawn_blocking({
-            let session = session.clone();
+            let secrets = secrets.clone();
             let auto_install = flare_browser::auto_install_enabled();
             move || -> Result<String, String> {
                 let backend = crate::browser_install::ensure_agent_browser(auto_install)?;
-                let argv =
-                    flare_browser::build_argv(&session, &backend_action, &positionals, &extra)?;
-                flare_browser::run_blocking(&backend, &argv)
+                flare_browser::run_blocking(&backend, &argv, &secrets)
             }
         })
         .await
         .map_err(|e| ErrorData::internal_error(format!("browser task join: {e}"), None))?
-        .map_err(|e: String| ErrorData::internal_error(e, None))?;
+        .map_err(|e: String| {
+            ErrorData::internal_error(flare_browser::redact(&e, &secrets), None)
+        })?;
 
-        let mut output = flare_browser::compact_output(&output, flare_browser::MAX_OUTPUT_CHARS);
-        if let Some(q) = observe_query {
-            output = flare_browser::observe_filter(&output, &q, 40);
-        }
+        // Filter before redacting (so a query matching a since-redacted
+        // value still works) and redact before truncating (so a secret
+        // never leaves a partial, unredacted prefix in a capped response).
+        let mut output = if let Some(q) = observe_query {
+            flare_browser::observe_filter(&output, &q, 40)
+        } else {
+            output
+        };
         output = flare_browser::redact(&output, &secrets);
+        output = flare_browser::compact_output(&output, flare_browser::MAX_OUTPUT_CHARS);
         let result = serde_json::json!({
             "action": action,
             "session": session,

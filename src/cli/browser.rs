@@ -13,7 +13,7 @@ pub struct BrowserArgs {
     /// each get an isolated browser session with zero config.
     #[arg(long)]
     pub session: Option<String>,
-    /// Skip first-use auto-install (`cargo install agent-browser`) and fail
+    /// Skip first-use auto-install (`mise install github:vercel-labs/agent-browser@latest`) and fail
     /// fast when the sidecar is missing. Env equivalent:
     /// `AGENTFLARE_BROWSER_NO_AUTO_INSTALL=1`.
     #[arg(long)]
@@ -174,10 +174,13 @@ impl BrowserArgs {
         let auto_install =
             !self.no_auto_install && flare_browser::auto_install_enabled();
         if let BrowserCommands::Observe { query, limit } = &self.command {
-            return match exec(&session, action, &positionals, &extra, auto_install) {
+            return match exec_raw(&session, action, &positionals, &extra, auto_install) {
                 Ok(snapshot) => println!(
                     "{}",
-                    flare_browser::observe_filter(&snapshot, query, *limit)
+                    flare_browser::compact_output(
+                        &flare_browser::observe_filter(&snapshot, query, *limit),
+                        flare_browser::MAX_OUTPUT_CHARS,
+                    )
                 ),
                 Err(e) => crate::ui::error(&e),
             };
@@ -202,6 +205,23 @@ fn exec(
     extra: &[String],
     auto_install: bool,
 ) -> Result<String, String> {
+    Ok(flare_browser::compact_output(
+        &exec_raw(session, action, positionals, extra, auto_install)?,
+        flare_browser::MAX_OUTPUT_CHARS,
+    ))
+}
+
+/// Like [`exec`] but returns the sidecar's raw, untruncated output.
+/// `observe` filters against the full snapshot before any truncation --
+/// capping first (as `exec` does for direct display) can push a matching
+/// line past the cut and silently miss it.
+fn exec_raw(
+    session: &str,
+    action: &str,
+    positionals: &[String],
+    extra: &[String],
+    auto_install: bool,
+) -> Result<String, String> {
     if auto_install && flare_browser::find_backend().is_err() {
         println!(
             "agent-browser not found — installing via mise (prebuilt binary, one-time, usually under a minute)…"
@@ -209,11 +229,7 @@ fn exec(
     }
     let backend = crate::browser_install::ensure_agent_browser(auto_install)?;
     let argv = flare_browser::build_argv(session, action, positionals, extra)?;
-    let out = flare_browser::run_blocking(&backend, &argv)?;
-    Ok(flare_browser::compact_output(
-        &out,
-        flare_browser::MAX_OUTPUT_CHARS,
-    ))
+    flare_browser::run_blocking(&backend, &argv, &[])
 }
 
 fn print_status(session: &str) {

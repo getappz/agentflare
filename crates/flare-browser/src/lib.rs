@@ -19,7 +19,9 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 /// Sidecar binary v1 shells out to. Pure Rust (same stack as agentflare) —
 /// installed via mise (`mise use -g agent-browser`, aqua prebuilt binaries),
@@ -32,6 +34,11 @@ pub const NO_AUTO_INSTALL_ENV: &str = "AGENTFLARE_BROWSER_NO_AUTO_INSTALL";
 pub const SESSION_ENV: &str = "AGENTFLARE_BROWSER_SESSION";
 /// Default output cap — snapshots stay well under typical MCP response limits.
 pub const MAX_OUTPUT_CHARS: usize = 12_000;
+/// Per-stream cap on raw bytes captured from the sidecar child process
+/// before the rest is drained and discarded -- generous headroom over
+/// `MAX_OUTPUT_CHARS` so a normal snapshot is never itself truncated here;
+/// only a runaway/page-controlled stream (e.g. `console`) hits it.
+const STREAM_READ_CAP_BYTES: u64 = 1024 * 1024;
 
 /// One consolidated browser verb.
 pub struct ActionDef {
@@ -230,27 +237,62 @@ pub fn build_argv(
 
 /// Run the sidecar synchronously; on success returns trimmed stdout, on
 /// failure a one-line summary plus a bounded stderr excerpt (snapshots can
-/// be large — never dump them raw into an error path).
-pub fn run_blocking(program: &Path, args: &[String]) -> Result<String, String> {
+/// be large — never dump them raw into an error path). `secrets` is
+/// redacted from the stderr excerpt before truncation, matching the
+/// success-path caller's own redact-before-compact order.
+pub fn run_blocking(
+    program: &Path,
+    args: &[String],
+    secrets: &[String],
+) -> Result<String, String> {
     // flare_process::command (not std::process::Command::new) so a daemon or
     // IDE-launched MCP server with no inherited console never flashes one
     // over the user's desktop when it spawns the sidecar (Windows).
-    let out = flare_process::command(program)
+    let mut child = flare_process::command(program)
         .args(args)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("failed to spawn {}: {e}", program.display()))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if out.status.success() {
+    let mut stdout_pipe = child.stdout.take().expect("stdout piped above");
+    let mut stderr_pipe = child.stderr.take().expect("stderr piped above");
+    // Drain both pipes concurrently and capped: `Command::output()` buffers
+    // an unbounded amount before we ever see it, which a runaway or
+    // page-controlled stream (e.g. `console`) can use to exhaust memory.
+    // Reading the two pipes one at a time instead of concurrently risks
+    // deadlock — the child blocks writing to whichever pipe fills its OS
+    // buffer first while we're still draining the other.
+    let (stdout_buf, stderr_buf) = std::thread::scope(|scope| {
+        let stdout_job = scope.spawn(|| read_capped(&mut stdout_pipe, STREAM_READ_CAP_BYTES));
+        let stderr_buf = read_capped(&mut stderr_pipe, STREAM_READ_CAP_BYTES);
+        (stdout_job.join().unwrap_or_default(), stderr_buf)
+    });
+    let status = child
+        .wait()
+        .map_err(|e| format!("failed to wait on {}: {e}", program.display()))?;
+    let stdout = String::from_utf8_lossy(&stdout_buf).trim().to_string();
+    if status.success() {
         return Ok(stdout);
     }
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    let excerpt = compact_output(&stderr, 2000);
-    let code = out.status.code().map_or("signal".to_string(), |c| c.to_string());
+    let stderr = String::from_utf8_lossy(&stderr_buf).trim().to_string();
+    let excerpt = compact_output(&redact(&stderr, secrets), 2000);
+    let code = status.code().map_or("signal".to_string(), |c| c.to_string());
     Err(if excerpt.is_empty() {
         format!("{BACKEND_BIN} exited with status {code} (no stderr)")
     } else {
         format!("{BACKEND_BIN} exited with status {code}: {excerpt}")
     })
+}
+
+/// Reads up to `cap` bytes from `pipe`, then drains (and discards) any
+/// remainder without buffering it — keeps memory bounded on a runaway
+/// stream while still letting the child finish writing instead of
+/// blocking forever on a full OS pipe buffer.
+fn read_capped(pipe: &mut impl Read, cap: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let _ = std::io::copy(&mut pipe.by_ref().take(cap), &mut buf);
+    let _ = std::io::copy(pipe, &mut std::io::sink());
+    buf
 }
 
 /// Hard-cap output length with an explicit truncation marker (keeps MCP
