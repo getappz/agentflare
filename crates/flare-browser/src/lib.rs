@@ -5,9 +5,8 @@
 //!   snapshots (`@e1`), sessions, batch mode, auth state, network/HAR,
 //!   tabs/frames/dialogs, trace/record, skills. This crate's argv shapes
 //!   mirror its CLI 1:1.
-//! - `microsoft/playwright-mcp` (Apache-2.0): isolation model (persistent
-//!   vs ephemeral profiles), allowed/blocked origins, secrets redaction,
-//!   read-only tool annotations — adopted as config + catalog metadata.
+//! - `microsoft/playwright-mcp` (Apache-2.0): secrets redaction and
+//!   read-only tool annotations — adopted as catalog metadata.
 //! - `browserbase/stagehand` (MIT): `observe`/`extract` self-healing
 //!   primitives — adopted as deterministic local helpers over snapshots
 //!   (text filter + JS eval); the LLM reasoning step stays with the caller.
