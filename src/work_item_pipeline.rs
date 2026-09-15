@@ -243,8 +243,10 @@ fn resume_args_for(
 /// mid-run (item #159) — rather than a transient failure worth retrying
 /// as-is. Matches Claude Code's `claude --resume <dead-id>` stderr; other
 /// `resume_arg` agents (Cursor) are expected to fail the same recognizable
-/// way, but none has been observed yet to confirm the exact text.
-fn is_stale_session_error(message: &str) -> bool {
+/// way, but none has been observed yet to confirm the exact text. Also
+/// reused by `crate::chat_channel` to retry a chat turn fresh (no
+/// `--resume`) when the per-chat session it had on file has gone stale.
+pub(crate) fn is_stale_session_error(message: &str) -> bool {
     message.to_lowercase().contains("no conversation found")
 }
 

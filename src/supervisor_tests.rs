@@ -1846,3 +1846,99 @@ fn cascade_unblock_dependents_unaffected_by_coexisting_duplicate_relation() {
         "a coexisting duplicate relation must not suppress the real blocks-edge cascade"
     );
 }
+
+// -- Telegram inbound routing: characterization tests written before
+// merging the chat channel's polling into this same tick (see
+// `poll_telegram_approvals`/`handle_telegram_callback`) -- these pin down
+// the existing approval-callback behavior so the merge can't silently
+// change it. No tests previously covered this path.
+
+#[test]
+fn parse_approve_callback_extracts_repo_and_number() {
+    let parsed = parse_approve_callback("approve:owner/repo#42");
+    assert!(parsed.is_some());
+    let (repo, number) = parsed.unwrap();
+    assert_eq!(repo.to_string(), "owner/repo");
+    assert_eq!(number, 42);
+}
+
+#[test]
+fn parse_approve_callback_rejects_non_approve_prefix() {
+    assert_eq!(parse_approve_callback("deny:owner/repo#42"), None);
+}
+
+#[test]
+fn parse_approve_callback_rejects_missing_number() {
+    assert_eq!(parse_approve_callback("approve:owner/repo"), None);
+}
+
+#[test]
+fn handle_telegram_callback_ignores_update_with_no_callback_query() {
+    // A plain message update -- must not panic and must not attempt any
+    // GitHub call (no network in this test process, so a GitHub attempt
+    // would hang/fail rather than silently succeed).
+    let update = serde_json::json!({
+        "update_id": 1,
+        "message": { "chat": { "id": 999 }, "text": "hello" }
+    });
+    handle_telegram_callback(&update, "999");
+}
+
+#[test]
+fn handle_telegram_callback_ignores_callback_from_wrong_chat() {
+    let update = serde_json::json!({
+        "update_id": 2,
+        "callback_query": {
+            "id": "cb1",
+            "data": "approve:owner/repo#1",
+            "message": { "message_id": 5, "chat": { "id": 111 } }
+        }
+    });
+    // expected_chat_id is "999", update is from chat 111 -- must return
+    // early (before any GitHub call) rather than panic.
+    handle_telegram_callback(&update, "999");
+}
+
+#[test]
+fn handle_telegram_callback_ignores_malformed_callback_query() {
+    let update = serde_json::json!({
+        "update_id": 3,
+        "callback_query": { "id": "cb1" } // missing "data"
+    });
+    handle_telegram_callback(&update, "999");
+}
+
+// -- `handle_chat_message`: the merged poll's other branch (see
+// `poll_telegram_approvals`). Only exercises the authorization/shape gate
+// here -- once past it, dispatch_message hands off to chat_channel, which
+// has its own test coverage for command parsing.
+
+#[test]
+fn handle_chat_message_ignores_message_from_wrong_chat() {
+    let message = serde_json::json!({ "chat": { "id": 111 }, "text": "hi" });
+    let mcp = std::sync::Arc::new(test_mcp());
+    // expected_chat_id is "999", message is from chat 111 -- must return
+    // without dispatching anything (no panic, no network/db touch).
+    handle_chat_message(&message, "999", &mcp);
+}
+
+#[test]
+fn handle_chat_message_ignores_message_with_no_text() {
+    let message = serde_json::json!({ "chat": { "id": 999 } });
+    let mcp = std::sync::Arc::new(test_mcp());
+    handle_chat_message(&message, "999", &mcp);
+}
+
+#[test]
+fn handle_chat_message_ignores_whitespace_only_text() {
+    let message = serde_json::json!({ "chat": { "id": 999 }, "text": "   " });
+    let mcp = std::sync::Arc::new(test_mcp());
+    handle_chat_message(&message, "999", &mcp);
+}
+
+#[test]
+fn handle_chat_message_ignores_message_with_no_chat() {
+    let message = serde_json::json!({ "text": "hi" });
+    let mcp = std::sync::Arc::new(test_mcp());
+    handle_chat_message(&message, "999", &mcp);
+}

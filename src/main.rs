@@ -14,6 +14,7 @@ mod banner;
 mod bashenv;
 mod build_time;
 mod channels;
+mod chat_channel;
 mod claims;
 mod claude_usage;
 mod cli;

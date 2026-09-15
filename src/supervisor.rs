@@ -88,8 +88,10 @@ fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str,
 /// Reuses the same `channels`/`vault` path as `agentflare channel send`
 /// rather than inventing a separate config store for one setting -- set it
 /// with `agentflare vault set telegram_notify_chat_id <chat_id>` alongside
-/// `telegram_bot_token` (see `channels::Platform::secret_name`).
-const TELEGRAM_NOTIFY_CHAT_ID_SECRET: &str = "telegram_notify_chat_id";
+/// `telegram_bot_token` (see `channels::Platform::secret_name`). Also read by
+/// `crate::chat_channel` to authorize which chat's free-text/slash-command
+/// messages it acts on -- the same chat a PR-approval card would be sent to.
+pub(crate) const TELEGRAM_NOTIFY_CHAT_ID_SECRET: &str = "telegram_notify_chat_id";
 
 /// `vault` secret persisting the last-consumed Telegram `update_id` across
 /// restarts -- offset semantics per Telegram's own `getUpdates` docs (pass
@@ -1160,7 +1162,18 @@ fn parse_approve_callback(data: &str) -> Option<(crate::github::RepoId, u64)> {
 /// long-poll thread. No-ops without a configured chat id (opt-in, same as
 /// every other Telegram path here); a single bad update is logged and
 /// skipped rather than wedging the whole poll loop.
-pub(crate) fn poll_telegram_approvals() {
+///
+/// Fetches both `callback_query` (the `approve:` card flow, handled by
+/// [`handle_telegram_callback`] below unchanged) and `message` updates (the
+/// chat channel's commands/free-text prompts, handled by
+/// [`handle_chat_message`]) in the SAME call, sharing this one offset.
+/// Telegram allows exactly one `getUpdates` poller per bot token, and
+/// advancing the offset confirms (and permanently drops) every update below
+/// it regardless of which `allowed_updates` filter fetched them — so two
+/// independently-offset pollers on one token can silently steal updates
+/// from each other. Keeping this as the single poller is required, not
+/// just tidier.
+pub(crate) fn poll_telegram_approvals(mcp: std::sync::Arc<crate::mcp_server::AgentflareMcp>) {
     let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
         return;
     };
@@ -1169,19 +1182,25 @@ pub(crate) fn poll_telegram_approvals() {
         .flatten()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let updates = match crate::channels::get_telegram_updates(offset) {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("agentflare-supervisor: telegram getUpdates failed: {e}");
-            return;
-        }
-    };
+    let updates =
+        match crate::channels::get_telegram_updates_filtered(offset, &["callback_query", "message"])
+        {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("agentflare-supervisor: telegram getUpdates failed: {e}");
+                return;
+            }
+        };
     let mut next_offset = offset;
     for update in &updates {
         if let Some(id) = update.get("update_id").and_then(serde_json::Value::as_i64) {
             next_offset = next_offset.max(id + 1);
         }
-        handle_telegram_callback(update, &chat_id);
+        if update.get("callback_query").is_some() {
+            handle_telegram_callback(update, &chat_id);
+        } else if let Some(message) = update.get("message") {
+            handle_chat_message(message, &chat_id, &mcp);
+        }
     }
     if next_offset != offset
         && let Err(e) =
@@ -1189,6 +1208,40 @@ pub(crate) fn poll_telegram_approvals() {
     {
         eprintln!("agentflare-supervisor: failed to persist telegram update offset: {e}");
     }
+}
+
+/// Handle one `message` update: verify it came from the configured notify
+/// chat (same authorization `handle_telegram_callback` applies below), then
+/// hand the text off to `chat_channel::dispatch_message`. A message with no
+/// `chat`/`text` field, or from any other chat, is silently skipped.
+fn handle_chat_message(
+    message: &serde_json::Value,
+    expected_chat_id: &str,
+    mcp: &std::sync::Arc<crate::mcp_server::AgentflareMcp>,
+) {
+    let Some(chat_id) = message
+        .get("chat")
+        .and_then(|c| c.get("id"))
+        .map(std::string::ToString::to_string)
+    else {
+        return;
+    };
+    if chat_id != expected_chat_id {
+        return;
+    }
+    let Some(text) = message.get("text").and_then(serde_json::Value::as_str) else {
+        return; // non-text message (photo, sticker, ...) -- not handled yet
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    crate::chat_channel::dispatch_message(
+        crate::chat_channel::telegram_channel(),
+        chat_id,
+        text.to_string(),
+        mcp,
+    );
 }
 
 /// Handle one `callback_query` update: verify it came from the configured

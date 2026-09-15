@@ -5,6 +5,7 @@
 mod artifact;
 mod asset;
 mod builtin_tools;
+mod chat;
 mod claim;
 mod comment;
 mod flare_docs;
