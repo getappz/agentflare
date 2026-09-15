@@ -1271,19 +1271,27 @@ pub(crate) struct BrowserRequest {
     )]
     #[serde(default)]
     pub(crate) session: Option<String>,
-    #[schemars(description = "Element target: @e ref from snapshot or CSS selector (click, fill, type, hover, get, ...)")]
+    #[schemars(
+        description = "Element target: @e ref from snapshot or CSS selector (click, fill, type, hover, get, ...)"
+    )]
     #[serde(default)]
     pub(crate) target: Option<String>,
-    #[schemars(description = "Text payload: fill/type text, observe query, eval/extract JS, wait condition, batch extras vary by action")]
+    #[schemars(
+        description = "Text payload: fill/type text, observe query, eval/extract JS, wait condition, batch extras vary by action"
+    )]
     #[serde(default)]
     pub(crate) text: Option<String>,
     #[schemars(description = "URL payload: open/read navigation target")]
     #[serde(default)]
     pub(crate) url: Option<String>,
-    #[schemars(description = "Extra raw args appended verbatim (escape hatch for full sidecar parity, e.g. [\"--full\"] or [\"set\",\"k\",\"v\"])")]
+    #[schemars(
+        description = "Extra raw args appended verbatim (escape hatch for full sidecar parity, e.g. [\"--full\"] or [\"set\",\"k\",\"v\"])"
+    )]
     #[serde(default)]
     pub(crate) args: Option<Vec<String>>,
-    #[schemars(description = "Secret values to scrub from the output before it reaches the model (convenience, not a security boundary)")]
+    #[schemars(
+        description = "Secret values to scrub from the output before it reaches the model (convenience, not a security boundary)"
+    )]
     #[serde(default)]
     pub(crate) redact: Option<Vec<String>>,
 }

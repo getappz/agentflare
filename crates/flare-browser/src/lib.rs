@@ -52,39 +52,171 @@ pub struct ActionDef {
 /// Consolidated catalog — vercel/agent-browser core + observe/extract
 /// (Stagehand-inspired, deterministic) + status/doctor (local-only).
 pub const ACTIONS: &[ActionDef] = &[
-    ActionDef { name: "open", description: "Launch browser and navigate to a URL (also: goto, navigate)", read_only: false },
-    ActionDef { name: "snapshot", description: "Accessibility tree with @e refs — the primary page read (compact, token-efficient)", read_only: true },
-    ActionDef { name: "observe", description: "Snapshot filtered to lines matching a query (deterministic Stagehand-style observe; no model call)", read_only: true },
-    ActionDef { name: "extract", description: "Run JS via eval and return raw output; the caller model structures it (deterministic Stagehand-style extract)", read_only: false },
-    ActionDef { name: "click", description: "Click a ref or selector (fails early when covered — dismiss coverer, re-snapshot, retry)", read_only: false },
-    ActionDef { name: "fill", description: "Clear and fill a field: fill <target> <text>", read_only: false },
-    ActionDef { name: "type", description: "Type into an element without clearing", read_only: false },
-    ActionDef { name: "press", description: "Press a key (Enter, Tab, Control+a)", read_only: false },
-    ActionDef { name: "hover", description: "Hover over an element", read_only: false },
-    ActionDef { name: "select", description: "Select dropdown option by value or label", read_only: false },
-    ActionDef { name: "check", description: "Check a checkbox", read_only: false },
-    ActionDef { name: "uncheck", description: "Uncheck a checkbox", read_only: false },
-    ActionDef { name: "back", description: "History back", read_only: false },
-    ActionDef { name: "forward", description: "History forward", read_only: false },
-    ActionDef { name: "reload", description: "Reload the page", read_only: false },
-    ActionDef { name: "get", description: "Read state: get <text|html|value|title|url|...> <target?>", read_only: true },
-    ActionDef { name: "read", description: "Agent-readable markdown for a URL, or the rendered active tab when omitted", read_only: true },
-    ActionDef { name: "screenshot", description: "Screenshot to a path (or temp dir when omitted)", read_only: true },
-    ActionDef { name: "pdf", description: "Save page as PDF", read_only: true },
-    ActionDef { name: "eval", description: "Run JavaScript in the page", read_only: false },
-    ActionDef { name: "wait", description: "Wait for selector, text, URL, JS condition, or milliseconds", read_only: true },
-    ActionDef { name: "cookies", description: "Cookie ops: cookies [set <name> <val> | clear]", read_only: false },
-    ActionDef { name: "storage", description: "localStorage/sessionStorage ops", read_only: false },
-    ActionDef { name: "network", description: "Route/mock/block requests, inspect tracked requests, HAR record", read_only: false },
-    ActionDef { name: "tabs", description: "List/switch/open/close tabs (stable t1,t2 ids + labels)", read_only: false },
-    ActionDef { name: "dialog", description: "Accept/dismiss blocking JS dialogs", read_only: false },
-    ActionDef { name: "console", description: "Page console messages", read_only: true },
-    ActionDef { name: "errors", description: "Uncaught page JS exceptions", read_only: true },
-    ActionDef { name: "batch", description: "Multiple quoted commands in one invocation (one turn, one daemon round-trip)", read_only: false },
-    ActionDef { name: "state", description: "Auth-state save/load/list (tokens live here — gitignore state files)", read_only: false },
-    ActionDef { name: "close", description: "Close the browser/session", read_only: false },
-    ActionDef { name: "doctor", description: "Diagnose the install (delegates to the sidecar's own doctor)", read_only: true },
-    ActionDef { name: "status", description: "Local-only: backend presence + resolved session, no browser launch", read_only: true },
+    ActionDef {
+        name: "open",
+        description: "Launch browser and navigate to a URL (also: goto, navigate)",
+        read_only: false,
+    },
+    ActionDef {
+        name: "snapshot",
+        description: "Accessibility tree with @e refs — the primary page read (compact, token-efficient)",
+        read_only: true,
+    },
+    ActionDef {
+        name: "observe",
+        description: "Snapshot filtered to lines matching a query (deterministic Stagehand-style observe; no model call)",
+        read_only: true,
+    },
+    ActionDef {
+        name: "extract",
+        description: "Run JS via eval and return raw output; the caller model structures it (deterministic Stagehand-style extract)",
+        read_only: false,
+    },
+    ActionDef {
+        name: "click",
+        description: "Click a ref or selector (fails early when covered — dismiss coverer, re-snapshot, retry)",
+        read_only: false,
+    },
+    ActionDef {
+        name: "fill",
+        description: "Clear and fill a field: fill <target> <text>",
+        read_only: false,
+    },
+    ActionDef {
+        name: "type",
+        description: "Type into an element without clearing",
+        read_only: false,
+    },
+    ActionDef {
+        name: "press",
+        description: "Press a key (Enter, Tab, Control+a)",
+        read_only: false,
+    },
+    ActionDef {
+        name: "hover",
+        description: "Hover over an element",
+        read_only: false,
+    },
+    ActionDef {
+        name: "select",
+        description: "Select dropdown option by value or label",
+        read_only: false,
+    },
+    ActionDef {
+        name: "check",
+        description: "Check a checkbox",
+        read_only: false,
+    },
+    ActionDef {
+        name: "uncheck",
+        description: "Uncheck a checkbox",
+        read_only: false,
+    },
+    ActionDef {
+        name: "back",
+        description: "History back",
+        read_only: false,
+    },
+    ActionDef {
+        name: "forward",
+        description: "History forward",
+        read_only: false,
+    },
+    ActionDef {
+        name: "reload",
+        description: "Reload the page",
+        read_only: false,
+    },
+    ActionDef {
+        name: "get",
+        description: "Read state: get <text|html|value|title|url|...> <target?>",
+        read_only: true,
+    },
+    ActionDef {
+        name: "read",
+        description: "Agent-readable markdown for a URL, or the rendered active tab when omitted",
+        read_only: true,
+    },
+    ActionDef {
+        name: "screenshot",
+        description: "Screenshot to a path (or temp dir when omitted)",
+        read_only: true,
+    },
+    ActionDef {
+        name: "pdf",
+        description: "Save page as PDF",
+        read_only: true,
+    },
+    ActionDef {
+        name: "eval",
+        description: "Run JavaScript in the page",
+        read_only: false,
+    },
+    ActionDef {
+        name: "wait",
+        description: "Wait for selector, text, URL, JS condition, or milliseconds",
+        read_only: true,
+    },
+    ActionDef {
+        name: "cookies",
+        description: "Cookie ops: cookies [set <name> <val> | clear]",
+        read_only: false,
+    },
+    ActionDef {
+        name: "storage",
+        description: "localStorage/sessionStorage ops",
+        read_only: false,
+    },
+    ActionDef {
+        name: "network",
+        description: "Route/mock/block requests, inspect tracked requests, HAR record",
+        read_only: false,
+    },
+    ActionDef {
+        name: "tabs",
+        description: "List/switch/open/close tabs (stable t1,t2 ids + labels)",
+        read_only: false,
+    },
+    ActionDef {
+        name: "dialog",
+        description: "Accept/dismiss blocking JS dialogs",
+        read_only: false,
+    },
+    ActionDef {
+        name: "console",
+        description: "Page console messages",
+        read_only: true,
+    },
+    ActionDef {
+        name: "errors",
+        description: "Uncaught page JS exceptions",
+        read_only: true,
+    },
+    ActionDef {
+        name: "batch",
+        description: "Multiple quoted commands in one invocation (one turn, one daemon round-trip)",
+        read_only: false,
+    },
+    ActionDef {
+        name: "state",
+        description: "Auth-state save/load/list (tokens live here — gitignore state files)",
+        read_only: false,
+    },
+    ActionDef {
+        name: "close",
+        description: "Close the browser/session",
+        read_only: false,
+    },
+    ActionDef {
+        name: "doctor",
+        description: "Diagnose the install (delegates to the sidecar's own doctor)",
+        read_only: true,
+    },
+    ActionDef {
+        name: "status",
+        description: "Local-only: backend presence + resolved session, no browser launch",
+        read_only: true,
+    },
 ];
 
 /// CLI spelling aliases mapped to real sidecar heads.
@@ -240,11 +372,7 @@ pub fn build_argv(
 /// be large — never dump them raw into an error path). `secrets` is
 /// redacted from the stderr excerpt before truncation, matching the
 /// success-path caller's own redact-before-compact order.
-pub fn run_blocking(
-    program: &Path,
-    args: &[String],
-    secrets: &[String],
-) -> Result<String, String> {
+pub fn run_blocking(program: &Path, args: &[String], secrets: &[String]) -> Result<String, String> {
     // flare_process::command (not std::process::Command::new) so a daemon or
     // IDE-launched MCP server with no inherited console never flashes one
     // over the user's desktop when it spawns the sidecar (Windows).
@@ -276,7 +404,9 @@ pub fn run_blocking(
     }
     let stderr = String::from_utf8_lossy(&stderr_buf).trim().to_string();
     let excerpt = compact_output(&redact(&stderr, secrets), 2000);
-    let code = status.code().map_or("signal".to_string(), |c| c.to_string());
+    let code = status
+        .code()
+        .map_or("signal".to_string(), |c| c.to_string());
     Err(if excerpt.is_empty() {
         format!("{BACKEND_BIN} exited with status {code} (no stderr)")
     } else {
@@ -335,7 +465,11 @@ pub fn observe_filter(snapshot: &str, query: &str, limit: usize) -> String {
     if hits.is_empty() {
         return format!("observe: no snapshot lines match {query:?}");
     }
-    format!("observe: {} match(es) for {query:?}\n{}", hits.len(), hits.join("\n"))
+    format!(
+        "observe: {} match(es) for {query:?}\n{}",
+        hits.len(),
+        hits.join("\n")
+    )
 }
 
 #[cfg(test)]
@@ -369,13 +503,7 @@ mod tests {
         let argv = build_argv("s", "snapshot", &[], &[]).unwrap();
         assert_eq!(argv, vec!["--session", "s", "snapshot"]);
         // Subcommand passthrough + alias mapping.
-        let argv = build_argv(
-            "s",
-            "get text",
-            &[String::from("@e1")],
-            &[],
-        )
-        .unwrap();
+        let argv = build_argv("s", "get text", &[String::from("@e1")], &[]).unwrap();
         assert_eq!(argv, vec!["--session", "s", "get", "text", "@e1"]);
         let argv = build_argv("s", "tabs", &[], &[]).unwrap();
         assert_eq!(argv, vec!["--session", "s", "tab"]);
@@ -437,7 +565,10 @@ mod tests {
     #[test]
     fn install_hint_is_mise_only() {
         let hint = missing_hint();
-        assert!(hint.contains("mise install github:vercel-labs/agent-browser"), "{hint}");
+        assert!(
+            hint.contains("mise install github:vercel-labs/agent-browser"),
+            "{hint}"
+        );
         assert!(!hint.contains("npm"), "{hint}");
         assert!(!hint.contains("npx"), "{hint}");
         assert!(!hint.contains("cargo install"), "{hint}");

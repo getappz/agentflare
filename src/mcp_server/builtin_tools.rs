@@ -224,8 +224,7 @@ mod tests {
 
     #[test]
     fn finds_browser_tool_by_bare_name() {
-        let hits =
-            search_builtin_tools("browser automation", 5, gateway_registry::MatchMode::Any);
+        let hits = search_builtin_tools("browser automation", 5, gateway_registry::MatchMode::Any);
         assert!(hits.iter().any(|h| h.tool == "mcp__flare__browser"));
     }
 

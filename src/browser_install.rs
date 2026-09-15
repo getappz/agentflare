@@ -8,7 +8,7 @@
 // `mise where` and invoked by absolute path, so shims never need activation.
 // mise itself is bootstrapped through `mise_install` (curl|sh on unix,
 // winget/scoop on windows) when absent.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 /// Git backend spec (floating version) + bare backend path for resolution.
@@ -109,7 +109,7 @@ fn cached_bin_path() -> Option<PathBuf> {
 /// Best-effort: a failed cache write just means the next call redoes the
 /// mise resolution, never a hard error for the caller who already has the
 /// binary path in hand.
-fn write_bin_path_cache(bin: &PathBuf) {
+fn write_bin_path_cache(bin: &Path) {
     let _ = std::fs::write(bin_path_cache_file(), bin.to_string_lossy().as_bytes());
 }
 
@@ -229,13 +229,20 @@ mod tests {
         assert!(cached_bin_path().is_none());
 
         std::fs::write(&cache, "/definitely/does/not/exist/agent-browser").unwrap();
-        assert!(cached_bin_path().is_none(), "stale entries must not be trusted");
+        assert!(
+            cached_bin_path().is_none(),
+            "stale entries must not be trusted"
+        );
 
         let dir = std::env::temp_dir().join("agentflare-browser-cache-test");
         std::fs::create_dir_all(&dir).unwrap();
         let real_bin = dir.join(flare_browser::BACKEND_BIN);
-        std::fs::write(&real_bin, "#!/bin/sh
-").unwrap();
+        std::fs::write(
+            &real_bin,
+            "#!/bin/sh
+",
+        )
+        .unwrap();
         write_bin_path_cache(&real_bin);
         assert_eq!(cached_bin_path(), Some(real_bin));
         std::fs::remove_dir_all(&dir).ok();
@@ -276,7 +283,10 @@ mod tests {
             std::env::set_var("HOME", &empty);
         }
         let err = ensure_agent_browser(false).unwrap_err();
-        assert!(err.contains("mise install github:vercel-labs/agent-browser"), "{err}");
+        assert!(
+            err.contains("mise install github:vercel-labs/agent-browser"),
+            "{err}"
+        );
         unsafe {
             if let Some(v) = saved_path {
                 std::env::set_var("PATH", v);

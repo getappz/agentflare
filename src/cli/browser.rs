@@ -57,7 +57,10 @@ pub enum BrowserCommands {
     /// Reload the page.
     Reload,
     /// Read page state: get <text|html|value|title|url|...> [target].
-    Get { kind: String, target: Option<String> },
+    Get {
+        kind: String,
+        target: Option<String>,
+    },
     /// Agent-readable markdown for a URL, or the active tab when omitted.
     Read { url: Option<String> },
     /// Screenshot to a path (temp dir when omitted).
@@ -150,9 +153,7 @@ impl BrowserArgs {
                 }
                 ("get", p, vec![])
             }
-            BrowserCommands::Read { url } => {
-                ("read", url.clone().into_iter().collect(), vec![])
-            }
+            BrowserCommands::Read { url } => ("read", url.clone().into_iter().collect(), vec![]),
             BrowserCommands::Screenshot { path } => {
                 ("screenshot", path.clone().into_iter().collect(), vec![])
             }
@@ -171,8 +172,7 @@ impl BrowserArgs {
             BrowserCommands::Doctor => ("doctor", vec!["--quick".to_string()], vec![]),
         };
         // Observe composes on snapshot output locally (no extra model call).
-        let auto_install =
-            !self.no_auto_install && flare_browser::auto_install_enabled();
+        let auto_install = !self.no_auto_install && flare_browser::auto_install_enabled();
         if let BrowserCommands::Observe { query, limit } = &self.command {
             return match exec_raw(&session, action, &positionals, &extra, auto_install) {
                 Ok(snapshot) => println!(
@@ -236,7 +236,11 @@ fn print_status(session: &str) {
     println!("session: {session}");
     match flare_browser::find_backend() {
         Ok(path) => {
-            println!("backend: {} ({})", flare_browser::BACKEND_BIN, path.display());
+            println!(
+                "backend: {} ({})",
+                flare_browser::BACKEND_BIN,
+                path.display()
+            );
             let verbs: Vec<&str> = flare_browser::ACTIONS.iter().map(|a| a.name).collect();
             println!("actions: {}", verbs.join(", "));
             println!(
