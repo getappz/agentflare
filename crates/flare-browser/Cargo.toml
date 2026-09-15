@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
+flare-process = { path = "../flare-process" }
 
 [dev-dependencies]
 tempfile = "3"

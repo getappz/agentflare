@@ -20,7 +20,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Sidecar binary v1 shells out to. Pure Rust (same stack as agentflare) —
 /// installed via mise (`mise use -g agent-browser`, aqua prebuilt binaries),
@@ -211,7 +210,10 @@ pub fn build_argv(
         return Err("browser action is required".to_string());
     }
     let head = canonical_head(words[0]);
-    if !is_local_only(head) && find_action(words[0]).is_none() {
+    // Validate both spellings: a literal catalog name (e.g. "tabs", which
+    // itself maps to the sidecar head "tab") and a pure alias (e.g. "goto",
+    // which isn't in ACTIONS at all but canonicalizes to "open").
+    if !is_local_only(head) && find_action(head).is_none() && find_action(words[0]).is_none() {
         let valid: Vec<&str> = ACTIONS.iter().map(|a| a.name).collect();
         return Err(format!(
             "unknown browser action: {action} (valid: {})",
@@ -230,7 +232,10 @@ pub fn build_argv(
 /// failure a one-line summary plus a bounded stderr excerpt (snapshots can
 /// be large — never dump them raw into an error path).
 pub fn run_blocking(program: &Path, args: &[String]) -> Result<String, String> {
-    let out = Command::new(program)
+    // flare_process::command (not std::process::Command::new) so a daemon or
+    // IDE-launched MCP server with no inherited console never flashes one
+    // over the user's desktop when it spawns the sidecar (Windows).
+    let out = flare_process::command(program)
         .args(args)
         .output()
         .map_err(|e| format!("failed to spawn {}: {e}", program.display()))?;
@@ -336,6 +341,21 @@ mod tests {
         assert_eq!(argv, vec!["--session", "s", "eval", "1+1"]);
         assert!(build_argv("s", "bogus", &[], &[]).is_err());
         assert!(build_argv("s", "   ", &[], &[]).is_err());
+    }
+
+    #[test]
+    fn build_argv_accepts_pure_aliases_not_in_the_catalog() {
+        // "goto"/"navigate"/"quit"/"exit" are canonical_head-only aliases —
+        // they never appear in ACTIONS, so validation must key off the
+        // canonicalized head, not the raw input word.
+        let argv = build_argv("s", "goto", &[String::from("https://x")], &[]).unwrap();
+        assert_eq!(argv, vec!["--session", "s", "open", "https://x"]);
+        let argv = build_argv("s", "navigate", &[String::from("https://x")], &[]).unwrap();
+        assert_eq!(argv, vec!["--session", "s", "open", "https://x"]);
+        let argv = build_argv("s", "quit", &[], &[]).unwrap();
+        assert_eq!(argv, vec!["--session", "s", "close"]);
+        let argv = build_argv("s", "exit", &[], &[]).unwrap();
+        assert_eq!(argv, vec!["--session", "s", "close"]);
     }
 
     #[test]

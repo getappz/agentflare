@@ -49,8 +49,14 @@ impl AgentflareMcp {
         let extra = req.args.unwrap_or_default();
 
         // `observe` composes locally: snapshot, then filter (no model call).
+        // The query is consumed here, not forwarded as a sidecar positional —
+        // `snapshot` takes no arguments.
         let (backend_action, observe_query) = if action == "observe" {
-            let q = positionals.first().cloned().unwrap_or_default();
+            let q = if positionals.is_empty() {
+                String::new()
+            } else {
+                positionals.remove(0)
+            };
             if q.trim().is_empty() {
                 return Err(ErrorData::invalid_params(
                     "observe requires a query in `text`",

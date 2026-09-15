@@ -1511,6 +1511,7 @@ name = "flare-browser"
 version = "0.1.0"
 dependencies = [
  "agentflare-workspace-hack",
+ "flare-process",
  "tempfile",
 ]
 
