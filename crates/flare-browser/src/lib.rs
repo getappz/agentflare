@@ -144,12 +144,12 @@ pub fn find_backend() -> Result<PathBuf, String> {
     Err(missing_hint())
 }
 
-/// Install hint — mise only (prebuilt binary, no toolchain). The actual
-/// install runs from `browser_install::ensure_agent_browser`, which also
-/// bootstraps mise itself when absent.
+/// Install hint — mise's git backend only (prebuilt binary, no toolchain).
+/// The actual install runs from `browser_install::ensure_agent_browser`,
+/// which also bootstraps mise itself when absent.
 pub fn missing_hint() -> String {
     format!(
-        "{BACKEND_BIN} not found — install it via mise (prebuilt binary, no toolchain): `mise use -g agent-browser@latest && agent-browser install` (fetches Chrome for Testing on first `install`). First use auto-installs this for you unless {NO_AUTO_INSTALL_ENV} is set."
+        "{BACKEND_BIN} not found — install it from the git repo via mise (prebuilt binary, no toolchain): `mise install github:vercel-labs/agent-browser@latest && agent-browser install` (fetches Chrome for Testing on first `install`). First use auto-installs this for you unless {NO_AUTO_INSTALL_ENV} is set."
     )
 }
 
@@ -371,10 +371,11 @@ mod tests {
     #[test]
     fn install_hint_is_mise_only() {
         let hint = missing_hint();
-        assert!(hint.contains("mise use -g agent-browser"), "{hint}");
+        assert!(hint.contains("mise install github:vercel-labs/agent-browser"), "{hint}");
         assert!(!hint.contains("npm"), "{hint}");
         assert!(!hint.contains("npx"), "{hint}");
         assert!(!hint.contains("cargo install"), "{hint}");
+        assert!(!hint.contains("mise use -g"), "{hint}");
     }
 
     #[test]

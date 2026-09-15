@@ -1,26 +1,30 @@
-// First-use installer for the agent-browser sidecar via mise.
+// First-use installer for the agent-browser sidecar via mise's git backend.
 //
-// Source: the mise registry shorthand `agent-browser`, which resolves to the
-// aqua backend — prebuilt binaries pulled from the vercel-labs/agent-browser
-// GitHub releases (linux/macOS/Windows, no toolchain, no compile, no npm).
+// `github:vercel-labs/agent-browser` is mise's UnifiedGitBackend: it installs
+// prebuilt binaries straight from the git repo's GitHub releases
+// (linux/macOS/Windows, no toolchain, no compile, no npm). Deliberately
+// `mise install`, never `mise use -g`: install records nothing in the user's
+// mise config (no global side effects) — the binary is resolved via
+// `mise where` and invoked by absolute path, so shims never need activation.
 // mise itself is bootstrapped through `mise_install` (curl|sh on unix,
-// winget/scoop on windows) when absent, so this chain has no cargo, node,
-// or brew prerequisite anywhere.
+// winget/scoop on windows) when absent.
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-/// Registry shorthand + floating version: aqua prebuilt binary, latest release.
-const MISE_SPEC: &str = "agent-browser@latest";
+/// Git backend spec (floating version) + bare backend path for resolution.
+const MISE_SPEC: &str = "github:vercel-labs/agent-browser@latest";
+const MISE_BACKEND: &str = "github:vercel-labs/agent-browser";
 /// Bound for stderr tails quoted in install errors (full logs stay on the
 /// caller side; MCP responses must stay compact).
 const ERR_TAIL_CHARS: usize = 2000;
 
 /// Ensure the sidecar exists, auto-installing on first use when enabled.
-/// Resolution order: `PATH`/cargo-bin hit (free) → `mise use -g` (one-time
-/// download) → `agent-browser install` (Chrome for Testing fetch).
-/// Concurrent first-use callers serialize on a temp-dir lock; losers
-/// re-check and reuse the winner's install. Returns the binary path —
-/// always absolute (via `mise which`), so mise shims never need activation.
+/// Resolution order: `PATH`/cargo-bin hit (free) → `mise install` from the
+/// git backend (one-time download) → `agent-browser install` (Chrome for
+/// Testing fetch). Concurrent first-use callers serialize on a temp-dir
+/// lock; losers re-check and reuse the winner's install. Returns the binary
+/// path — always absolute, so it works from bare subprocess spawns in CLI
+/// and MCP alike.
 pub fn ensure_agent_browser(auto_install: bool) -> Result<PathBuf, String> {
     if let Ok(p) = flare_browser::find_backend() {
         return Ok(p);
@@ -40,21 +44,19 @@ pub fn ensure_agent_browser(auto_install: bool) -> Result<PathBuf, String> {
     if let Ok(p) = flare_browser::find_backend() {
         return Ok(p);
     }
-    let use_out = Command::new(&mise)
-        .args(["use", "-g", MISE_SPEC])
+    let install_out = Command::new(&mise)
+        .args(["install", MISE_SPEC])
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("failed to spawn `{mise} use`: {e}"))?;
-    if !use_out.status.success() {
+        .map_err(|e| format!("failed to spawn `{mise} install`: {e}"))?;
+    if !install_out.status.success() {
         return Err(format!(
-            "`mise use -g {MISE_SPEC}` failed (exit {:?}): {}",
-            use_out.status.code(),
-            tail(&String::from_utf8_lossy(&use_out.stderr)),
+            "`mise install {MISE_SPEC}` failed (exit {:?}): {}",
+            install_out.status.code(),
+            tail(&String::from_utf8_lossy(&install_out.stderr)),
         ));
     }
-    // Absolute path out (shims require shell activation; this must work from
-    // bare subprocess spawns in CLI and MCP alike).
-    let bin = resolve_via_mise_which(&mise)?;
+    let bin = resolve_via_mise_where(&mise)?;
     let chrome_out = Command::new(&bin)
         .arg("install")
         .stdin(Stdio::null())
@@ -72,39 +74,49 @@ pub fn ensure_agent_browser(auto_install: bool) -> Result<PathBuf, String> {
     Ok(bin)
 }
 
-fn resolve_via_mise_which(mise: &str) -> Result<PathBuf, String> {
+fn resolve_via_mise_where(mise: &str) -> Result<PathBuf, String> {
     let out = Command::new(mise)
-        .args(["which", "agent-browser"])
+        .args(["where", MISE_BACKEND])
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("failed to spawn `{mise} which`: {e}"))?;
+        .map_err(|e| format!("failed to spawn `{mise} where`: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "`mise which agent-browser` failed after a successful install (exit {:?}): {} — retry manually: `mise use -g {MISE_SPEC}`",
+            "`mise where {MISE_BACKEND}` failed after a successful install (exit {:?}): {} — retry manually: `mise install {MISE_SPEC}`",
             out.status.code(),
             tail(&String::from_utf8_lossy(&out.stderr)),
         ));
     }
-    parse_which_output(&String::from_utf8_lossy(&out.stdout))
+    parse_where_output(&String::from_utf8_lossy(&out.stdout))
 }
 
-fn parse_which_output(stdout: &str) -> Result<PathBuf, String> {
+/// `mise where` prints the install dir; the binary lives in `bin/` beneath
+/// it (`agent-browser[.exe]`).
+fn parse_where_output(stdout: &str) -> Result<PathBuf, String> {
     let line = stdout
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .ok_or_else(|| {
-            "`mise which agent-browser` printed no path — retry manually: `mise use -g agent-browser@latest`"
-                .to_string()
+            format!("`mise where {MISE_BACKEND}` printed no path — retry manually: `mise install {MISE_SPEC}`")
         })?;
-    let path = PathBuf::from(line);
-    if path.is_file() {
-        Ok(path)
-    } else {
-        Err(format!(
-            "`mise which agent-browser` resolved to {line}, which is not a file — retry manually: `mise use -g agent-browser@latest`"
-        ))
+    let dir = PathBuf::from(line);
+    let cand = dir.join("bin").join(flare_browser::BACKEND_BIN);
+    if cand.is_file() {
+        return Ok(cand);
     }
+    #[cfg(windows)]
+    {
+        let exe = dir
+            .join("bin")
+            .join(format!("{}.exe", flare_browser::BACKEND_BIN));
+        if exe.is_file() {
+            return Ok(exe);
+        }
+    }
+    Err(format!(
+        "mise install dir {line} has no bin/agent-browser — retry manually: `mise install {MISE_SPEC}`"
+    ))
 }
 
 fn tail(text: &str) -> String {
@@ -136,20 +148,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_which_accepts_first_nonblank_line_pointing_at_a_file() {
-        let dir = std::env::temp_dir();
-        let file = dir.join("agentflare-browser-which-test-bin");
-        std::fs::write(&file, "#!/bin/sh\n").unwrap();
-        let out = format!("\n  \n{}\n", file.display());
-        assert_eq!(parse_which_output(&out).unwrap(), file);
-        std::fs::remove_file(&file).ok();
+    fn parse_where_resolves_bin_under_install_dir() {
+        let dir = std::env::temp_dir().join("agentflare-browser-where-test");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join(flare_browser::BACKEND_BIN);
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let out = format!("\n  \n{}\n", dir.display());
+        assert_eq!(parse_where_output(&out).unwrap(), bin);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn parse_which_rejects_empty_and_missing_paths() {
-        assert!(parse_which_output("   \n").is_err());
-        let missing = std::env::temp_dir().join("agentflare-browser-which-test-missing-xyz");
-        assert!(parse_which_output(&missing.to_string_lossy()).is_err());
+    fn parse_where_rejects_empty_and_binless_dirs() {
+        assert!(parse_where_output("   \n").is_err());
+        let dir = std::env::temp_dir().join("agentflare-browser-where-test-empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(parse_where_output(&dir.to_string_lossy()).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -177,7 +193,7 @@ mod tests {
             std::env::set_var("HOME", &empty);
         }
         let err = ensure_agent_browser(false).unwrap_err();
-        assert!(err.contains("mise use -g agent-browser"), "{err}");
+        assert!(err.contains("mise install github:vercel-labs/agent-browser"), "{err}");
         unsafe {
             if let Some(v) = saved_path {
                 std::env::set_var("PATH", v);

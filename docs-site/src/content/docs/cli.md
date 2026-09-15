@@ -580,10 +580,10 @@ getappz/agentflare), `list [--actionable]`.
 
 Agent-first browser automation: ref-based snapshots, deterministic verbs, batch
 mode, and per-worktree session isolation (`af-<hash>` default, `--session` to
-override). First use auto-installs the pure-Rust `agent-browser` sidecar via
-mise (`mise use -g agent-browser@latest`, prebuilt binary — usually under a minute)
-plus its Chrome-for-Testing fetch — `--no-auto-install` (or
-`AGENTFLARE_BROWSER_NO_AUTO_INSTALL=1`) disables this and fails fast instead.
+override). First use auto-installs the pure-Rust `agent-browser` sidecar from the
+git repo via mise (`mise install github:vercel-labs/agent-browser@latest`, prebuilt
+binary — usually under a minute) plus its Chrome-for-Testing fetch — `--no-auto-install`
+(or `AGENTFLARE_BROWSER_NO_AUTO_INSTALL=1`) disables this and fails fast instead.
 
 ```bash
 agentflare browser status

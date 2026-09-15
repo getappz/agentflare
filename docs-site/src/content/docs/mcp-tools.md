@@ -202,10 +202,10 @@ mcp__flare__browser(action="observe", text="checkout")
 mcp__flare__browser(action="click", target="@e2")
 ```
 
-Requires the pure-Rust `agent-browser` sidecar — first use auto-installs it via
-mise (`mise use -g agent-browser@latest`, prebuilt binary) plus its Chrome fetch,
-unless `AGENTFLARE_BROWSER_NO_AUTO_INSTALL` is set; `action="status"` reports backend
-presence without launching a browser.
+Requires the pure-Rust `agent-browser` sidecar — first use auto-installs it from
+the git repo via mise (`mise install github:vercel-labs/agent-browser@latest`,
+prebuilt binary) plus its Chrome fetch, unless `AGENTFLARE_BROWSER_NO_AUTO_INSTALL`
+is set; `action="status"` reports backend presence without launching a browser.
 
 ## Optimization
 
