@@ -1088,6 +1088,114 @@ fn second_tick_does_not_reenqueue_while_job_still_queued() {
 }
 
 #[test]
+fn plan_gated_item_does_not_dispatch_when_blocked() {
+    // Task #573: gated items (plan_required=true) with unapproved plan status
+    // must not be dispatched by the supervisor, same contract as job_in_flight
+    // skip behavior: return false and leave the queue empty.
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let auth_conn = test_auth_conn();
+
+    mcp.with_backend_db(|conn| {
+        let project = mcp.resolve_project(conn).unwrap();
+        // Create necessary labels
+        for name in ["ready-for-work", "dispatched", "needs-manual-dispatch"] {
+            agentflare_backend::label::create(
+                conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(project.id.clone()),
+                    workspace_id: project.workspace_id.clone(),
+                    name: name.into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap();
+        }
+        let states = agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+        let state_id = states.iter().find(|s| s.is_default).unwrap().id.clone();
+
+        // Create a blocked gated item (plan_required=true, plan_status not approved)
+        let blocked_item = agentflare_backend::item::create(
+            conn,
+            agentflare_backend::item::CreateItem {
+                project_id: project.id.clone(),
+                state_id: state_id.clone(),
+                name: "Blocked by plan gate".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: Some("claude-code".into()),
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: Some(r#"{"plan_required":true,"plan_status":"pending"}"#.into()),
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
+            },
+        )
+        .unwrap();
+
+        // Create an approved gated item (plan_required=true, plan_status="approved")
+        let approved_item = agentflare_backend::item::create(
+            conn,
+            agentflare_backend::item::CreateItem {
+                project_id: project.id.clone(),
+                state_id: state_id.clone(),
+                name: "Approved by plan gate".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: Some("claude-code".into()),
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: Some(r#"{"plan_required":true,"plan_status":"approved"}"#.into()),
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
+            },
+        )
+        .unwrap();
+
+        let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+        let ready_id = &labels
+            .iter()
+            .find(|l| l.name == "ready-for-work")
+            .unwrap()
+            .id;
+        agentflare_backend::item::add_label(conn, &blocked_item.id, ready_id).unwrap();
+        agentflare_backend::item::add_label(conn, &approved_item.id, ready_id).unwrap();
+        Some(())
+    })
+    .unwrap();
+
+    let result = run_discovery_tick(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+
+    // Only the approved item should dispatch
+    assert_eq!(
+        result.dispatched, 1,
+        "only the approved gated item should be dispatched"
+    );
+    // The queue should have exactly 1 job (for the approved item, not the blocked one)
+    let jobs = queue.list(None).unwrap();
+    assert_eq!(jobs.len(), 1, "only the approved item should be enqueued");
+}
+
+#[test]
 fn run_review_sweep_ignores_items_not_in_review() {
     let mcp = test_mcp();
     let queue = test_queue();

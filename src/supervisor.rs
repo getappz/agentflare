@@ -522,6 +522,15 @@ fn dispatch_item(
         );
         return false;
     }
+    if let agentflare_backend::item::PlanGateStatus::Blocked(status) =
+        agentflare_backend::item::plan_gate::plan_gate_status(&item.metadata)
+    {
+        eprintln!(
+            "agentflare-supervisor: item #{} ({}) blocked by plan gate (status: {status}) — skipping",
+            item.sequence_id, item.id
+        );
+        return false;
+    }
     let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), None) else {
         return false;
     };
