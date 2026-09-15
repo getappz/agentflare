@@ -3,6 +3,7 @@ mod alias;
 mod apps;
 mod artifacts;
 mod auth;
+mod browser;
 mod channel;
 mod claim;
 mod coaching;
@@ -113,6 +114,8 @@ pub enum Commands {
     Vault(vault::VaultArgs),
     /// Manage authentication credentials for connected services.
     Auth(auth::AuthArgs),
+    /// Agent-first browser automation (open, snapshot, click, fill, read, ...).
+    Browser(browser::BrowserArgs),
     /// Serve live-shareable artifact pages from AI agent sessions.
     Artifacts(artifacts::ArtifactsArgs),
     /// Hand a work product to another agent's inbox.
@@ -180,6 +183,7 @@ impl Commands {
             Self::Uninstall(cmd) => cmd.run(),
             Self::Vault(cmd) => cmd.run(),
             Self::Auth(cmd) => cmd.run(),
+            Self::Browser(cmd) => cmd.run(),
             Self::Artifacts(cmd) => cmd.run(),
             Self::Handoff(cmd) => cmd.run(),
             Self::GithubBridge(cmd) => cmd.run(),
