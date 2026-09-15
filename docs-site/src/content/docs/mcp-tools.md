@@ -1,6 +1,6 @@
 ---
 title: MCP tools reference
-description: The full first-party mcp__flare__* tool surface — 24 tools plus MCP Prompts.
+description: The full first-party mcp__flare__* tool surface — 25 tools plus MCP Prompts.
 ---
 
 Everything below is a first-party tool your agent gets once it's connected to
@@ -180,6 +180,32 @@ proactive skill suggestions.
 ```text
 mcp__flare__skill_detect(prompt="my disk is full, need to clean up")
 ```
+
+### `browser`
+
+Agent-first browser automation (open, snapshot with `@e` refs, click, fill, read,
+eval, tabs, network, auth-state). Sessions isolate per worktree automatically
+(`af-<hash>` default, overridable via `session`). Subcommands allowed
+(`"get text"`, `"tab new"`, `"cookies set"`); `observe` filters the snapshot to
+matching lines and `extract` runs JS for the caller model to structure.
+
+`action`: `open`, `snapshot`, `observe`, `extract`, `click`, `fill`, `type`,
+`press`, `hover`, `select`, `check`, `uncheck`, `back`, `forward`, `reload`,
+`get`, `read`, `screenshot`, `pdf`, `eval`, `wait`, `cookies`, `storage`,
+`network`, `tabs`, `dialog`, `console`, `errors`, `batch`, `state`, `close`,
+`doctor`, `status`.
+
+```text
+mcp__flare__browser(action="open", url="https://example.com")
+mcp__flare__browser(action="snapshot")
+mcp__flare__browser(action="observe", text="checkout")
+mcp__flare__browser(action="click", target="@e2")
+```
+
+Requires the pure-Rust `agent-browser` sidecar — first use auto-installs it via
+mise (`mise use -g agent-browser@latest`, prebuilt binary) plus its Chrome fetch,
+unless `AGENTFLARE_BROWSER_NO_AUTO_INSTALL` is set; `action="status"` reports backend
+presence without launching a browser.
 
 ## Optimization
 
