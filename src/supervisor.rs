@@ -1182,15 +1182,16 @@ pub(crate) fn poll_telegram_approvals(mcp: std::sync::Arc<crate::mcp_server::Age
         .flatten()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let updates =
-        match crate::channels::get_telegram_updates_filtered(offset, &["callback_query", "message"])
-        {
-            Ok(u) => u,
-            Err(e) => {
-                eprintln!("agentflare-supervisor: telegram getUpdates failed: {e}");
-                return;
-            }
-        };
+    let updates = match crate::channels::get_telegram_updates_filtered(
+        offset,
+        &["callback_query", "message"],
+    ) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("agentflare-supervisor: telegram getUpdates failed: {e}");
+            return;
+        }
+    };
     let mut next_offset = offset;
     for update in &updates {
         if let Some(id) = update.get("update_id").and_then(serde_json::Value::as_i64) {
