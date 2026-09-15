@@ -248,13 +248,19 @@ pub fn send_telegram_card(
 /// convention as the Bot API's own `getUpdates`). Short-polls (`timeout: 0`)
 /// since this is called from a fixed-interval supervisor tick rather than a
 /// dedicated long-poll thread -- there's nothing to gain from Telegram
-/// holding the connection open, only a busy tick thread. Filters
-/// server-side to `callback_query`, the only update type agentflare's
-/// inbound side understands.
-pub fn get_telegram_updates(offset: i64) -> Result<Vec<Value>, String> {
+/// holding the connection open, only a busy tick thread. `allowed_updates`
+/// filters server-side; `supervisor::poll_telegram_approvals` passes both
+/// `callback_query` (the PR-approval-card flow) and `message` (the chat
+/// channel) in one call, since Telegram allows only one `getUpdates` poller
+/// per bot token and advancing the offset confirms every update below it
+/// regardless of which filter fetched them.
+pub fn get_telegram_updates_filtered(
+    offset: i64,
+    allowed_updates: &[&str],
+) -> Result<Vec<Value>, String> {
     let token = telegram_token()?;
     let url = format!("https://api.telegram.org/bot{}/getUpdates", *token);
-    let body = json!({ "offset": offset, "timeout": 0, "allowed_updates": ["callback_query"] });
+    let body = json!({ "offset": offset, "timeout": 0, "allowed_updates": allowed_updates });
     let resp = match http_agent().post(&url).send_json(&body) {
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, resp)) => {
