@@ -890,6 +890,21 @@ pub(crate) struct ItemRequest {
     )]
     #[serde(default)]
     pub(crate) repo_wide: Option<bool>,
+    #[schemars(
+        description = "Asset id containing the plan content (submit_plan; required) — upload via the existing asset/handoff attachment path first, then pass its id here"
+    )]
+    #[serde(default)]
+    pub(crate) plan_asset_id: Option<String>,
+    #[schemars(
+        description = "Who approves this item's plan: \"human\" (fires a channel approve-card) or \"agent\" (any agent may call approve_plan directly) (create, update, submit_plan default lookup)"
+    )]
+    #[serde(default)]
+    pub(crate) plan_approver: Option<String>,
+    #[schemars(
+        description = "Reason text (reject_plan)"
+    )]
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
 }
 
 /// Lean per-item projection for `item(list)` — the raw 19-field `Item` (full
