@@ -1100,6 +1100,18 @@ pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &
     }
 }
 
+/// Best-effort Telegram ping for an item whose plan just moved to
+/// `plan_status: "pending"` (via `item(action="submit_plan")`) and is now
+/// waiting on a human approver. Thin wrapper over [`notify_human_gate`] --
+/// same fail-open contract: no-ops without a configured chat id, and a send
+/// failure only logs.
+pub(crate) fn notify_plan_approval_gate(item: &agentflare_backend::item::Item, plan_asset_id: &str) {
+    notify_human_gate(
+        item,
+        &format!("plan awaiting approval (asset: {plan_asset_id})"),
+    );
+}
+
 /// Escape the characters Telegram's HTML `parse_mode` treats specially, so
 /// an arbitrary item title/description can't break card formatting (or be
 /// interpreted as an unintended tag).

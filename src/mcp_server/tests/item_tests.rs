@@ -427,6 +427,108 @@ fn item_claim_blocked_by_plan() {
 }
 
 #[test]
+fn submit_plan_sets_pending_and_clears_prior_rejection() {
+    let (tmp, s) = harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("gated item".into()),
+            metadata: Some(serde_json::json!({
+                "plan_required": true,
+                "plan_rejection_reason": "stale reason from a prior round",
+            })),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let submitted: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "submit_plan".into(),
+            id: Some(item_id.clone()),
+            plan_asset_id: Some("asset-1".into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(submitted["status"], "pending");
+    assert_eq!(submitted["plan_asset_id"], "asset-1");
+    // No plan_approver was passed and none was already on the item's
+    // metadata, so submit_plan must fall back to "human".
+    assert_eq!(submitted["plan_approver"], "human");
+
+    let conn = backend_conn(&tmp);
+    let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+    assert_eq!(metadata["plan_status"], "pending");
+    assert_eq!(metadata["plan_asset_id"], "asset-1");
+    assert!(
+        metadata["plan_rejection_reason"].is_null(),
+        "submit_plan must clear a stale rejection reason: {metadata}"
+    );
+}
+
+#[test]
+fn approve_plan_requires_pending_status() {
+    let (_tmp, s) = harness();
+    // Never submitted -- no plan_status at all on the item's metadata.
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(empty_item_create("ungated item"))).unwrap(),
+    )
+    .unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let err = s
+        .item(Parameters(ItemRequest {
+            action: "approve_plan".into(),
+            id: Some(item_id),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[test]
+fn reject_plan_sets_rejected_and_records_reason() {
+    let (tmp, s) = harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("pending-plan item".into()),
+            metadata: Some(serde_json::json!({
+                "plan_required": true,
+                "plan_status": "pending",
+            })),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let rejected: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "reject_plan".into(),
+            id: Some(item_id.clone()),
+            reason: Some("needs more detail on rollback".into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(rejected["status"], "rejected");
+
+    let conn = backend_conn(&tmp);
+    let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+    assert_eq!(metadata["plan_status"], "rejected");
+    assert_eq!(metadata["plan_rejection_reason"], "needs more detail on rollback");
+}
+
+#[test]
 fn item_list_rejects_negative_limit_and_offset() {
     let (_tmp, s) = harness();
     let err = s

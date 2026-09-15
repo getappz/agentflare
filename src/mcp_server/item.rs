@@ -723,6 +723,110 @@ impl AgentflareMcp {
         })
     }
 
+    pub(crate) fn item_submit_plan(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let id = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for submit_plan", None))?;
+        let plan_asset_id = req.plan_asset_id.ok_or_else(|| {
+            ErrorData::invalid_params("plan_asset_id is required for submit_plan", None)
+        })?;
+        self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &id)?;
+            let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
+            let approver = req
+                .plan_approver
+                .or_else(|| {
+                    agentflare_backend::item::plan_gate::read_plan_gate(&item.metadata).plan_approver
+                })
+                .unwrap_or_else(|| "human".to_string());
+            let patch = serde_json::json!({
+                "plan_asset_id": plan_asset_id,
+                "plan_status": "pending",
+                "plan_approver": approver,
+                "plan_rejection_reason": serde_json::Value::Null,
+            });
+            let metadata =
+                agentflare_backend::item::plan_gate::merge_metadata_patch(&item.metadata, patch);
+            agentflare_backend::item::update(
+                conn,
+                &item_id,
+                agentflare_backend::item::UpdateItem {
+                    metadata: Some(metadata),
+                    ..Default::default()
+                },
+            )
+            .map_err(map_backend_err)?;
+            if approver == "human" {
+                crate::supervisor::notify_plan_approval_gate(&item, &plan_asset_id);
+            }
+            Ok(serde_json::json!({
+                "status": "pending",
+                "item_id": item_id,
+                "plan_asset_id": plan_asset_id,
+                "plan_approver": approver,
+            })
+            .to_string())
+        })?
+    }
+
+    pub(crate) fn item_approve_plan(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        self.set_plan_status(req, "approved", None)
+    }
+
+    pub(crate) fn item_reject_plan(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let reason = req.reason.clone();
+        self.set_plan_status(req, "rejected", reason)
+    }
+
+    /// Shared body for approve_plan/reject_plan: both require the item to be
+    /// in plan_status == "pending" (a state-mismatch error otherwise, per this
+    /// plan's error-handling requirement), and both go through the same
+    /// merge_metadata_patch write path.
+    fn set_plan_status(
+        &self,
+        req: ItemRequest,
+        new_status: &str,
+        reason: Option<String>,
+    ) -> Result<String, ErrorData> {
+        let id = req.id.ok_or_else(|| {
+            ErrorData::invalid_params(format!("id is required for {new_status} transition"), None)
+        })?;
+        self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &id)?;
+            let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
+            let gate = agentflare_backend::item::plan_gate::read_plan_gate(&item.metadata);
+            if gate.plan_status.as_deref() != Some("pending") {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "cannot {new_status} — item's plan_status is {:?}, expected \"pending\"",
+                        gate.plan_status
+                    ),
+                    None,
+                ));
+            }
+            let mut patch = serde_json::json!({ "plan_status": new_status });
+            if new_status == "approved" {
+                patch["plan_approved_by"] = serde_json::json!(self.agent.clone());
+                patch["plan_approved_at"] = serde_json::json!(crate::claims::now());
+            }
+            if let Some(reason) = &reason {
+                patch["plan_rejection_reason"] = serde_json::json!(reason);
+            }
+            let metadata =
+                agentflare_backend::item::plan_gate::merge_metadata_patch(&item.metadata, patch);
+            agentflare_backend::item::update(
+                conn,
+                &item_id,
+                agentflare_backend::item::UpdateItem {
+                    metadata: Some(metadata),
+                    ..Default::default()
+                },
+            )
+            .map_err(map_backend_err)?;
+            Ok(serde_json::json!({ "status": new_status, "item_id": item_id }).to_string())
+        })?
+    }
+
     pub(crate) fn item_heartbeat(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
             .id
