@@ -1096,7 +1096,7 @@ fn plan_gated_item_does_not_dispatch_when_blocked() {
     let queue = test_queue();
     let auth_conn = test_auth_conn();
 
-    mcp.with_backend_db(|conn| {
+    let (blocked_item_id, approved_item_id) = mcp.with_backend_db(|conn| {
         let project = mcp.resolve_project(conn).unwrap();
         // Create necessary labels
         for name in ["ready-for-work", "dispatched", "needs-manual-dispatch"] {
@@ -1174,7 +1174,7 @@ fn plan_gated_item_does_not_dispatch_when_blocked() {
             .id;
         agentflare_backend::item::add_label(conn, &blocked_item.id, ready_id).unwrap();
         agentflare_backend::item::add_label(conn, &approved_item.id, ready_id).unwrap();
-        Some(())
+        (blocked_item.id, approved_item.id)
     })
     .unwrap();
 
@@ -1193,6 +1193,14 @@ fn plan_gated_item_does_not_dispatch_when_blocked() {
     // The queue should have exactly 1 job (for the approved item, not the blocked one)
     let jobs = queue.list(None).unwrap();
     assert_eq!(jobs.len(), 1, "only the approved item should be enqueued");
+    assert!(
+        jobs[0].args.contains(&approved_item_id),
+        "the queued job must be for the approved item"
+    );
+    assert!(
+        !jobs[0].args.contains(&blocked_item_id),
+        "the blocked item must not appear in the queue"
+    );
 }
 
 #[test]
