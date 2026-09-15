@@ -560,8 +560,13 @@ fn dispatch_item(
         // their notification at submit/reject time, so only `"none"` pings.
         // `first_time_gated` is the same once-per-item-per-process idiom
         // `run_discovery_tick` already uses for `NEEDS_DECISION_LABEL`, so
-        // this fires once per gate rather than once per tick.
-        if status == "none" && first_time_gated(&item.id) {
+        // this fires once per gate rather than once per tick. Namespaced
+        // ("plan:<id>", not the bare item id) because the underlying set is
+        // keyed globally across every gate type in this file -- an
+        // unnamespaced key here would consume the same token the PR-approval
+        // card (`notify_pr_approval_gate`) checks for the same item later in
+        // its life, silently suppressing that card for every auto-gated item.
+        if status == "none" && first_time_gated(&format!("plan:{}", item.id)) {
             notify_human_gate(
                 item,
                 "auto-gated: needs a plan — call item(action=\"submit_plan\", plan_asset_id=...) \
@@ -1114,7 +1119,6 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
     .flatten()
     .any(|job| job.args.contains(&item_id.to_string()))
 }
-
 
 /// Telegram notifications and the inbound channel-approval poll. Split out
 /// when item #573's plan-gate work pushed this file past the LOC gate; glob
