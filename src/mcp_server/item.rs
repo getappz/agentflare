@@ -80,16 +80,33 @@ fn metadata_to_json_string(value: serde_json::Value) -> String {
 /// Applies Task 1's default plan-gate policy
 /// (`agentflare_backend::item::plan_default_policy`) to `metadata_str` for an
 /// item at `priority`. Returns `Some(patched_metadata)` only when the policy
-/// actually gates the item AND the caller hasn't already set `plan_required`
-/// explicitly — checked via `Value::as_object().map(|o|
-/// o.contains_key("plan_required"))` rather than `PlanGateMeta`'s
-/// `#[serde(default)]` reads, since those can't distinguish "explicitly
-/// false" from "absent" (item #573). Returns `None` when no write is
+/// actually gates the item AND the caller hasn't already set EITHER
+/// `plan_required` or `plan_approver` explicitly — checked via
+/// `Value::as_object().map(|o| o.contains_key(..))` rather than
+/// `PlanGateMeta`'s `#[serde(default)]` reads, since those can't distinguish
+/// "explicitly false"/"explicitly agent" from "absent" (item #573). Both keys
+/// count, not just `plan_required`: a caller creating an urgent item with
+/// `metadata: {"plan_approver": "agent"}` is explicitly choosing "gate this,
+/// but let an agent sign off", and the old `plan_required`-only check
+/// silently clobbered that back to `"human"`. Returns `None` when no write is
 /// needed, which callers use to mean "leave metadata untouched".
+///
+/// SCOPE: this default-gating policy applies ONLY to items created or
+/// updated through the MCP `item` tool (`item_create`/`item_update` below).
+/// Items created via the GitHub bridge import (`src/github/bridge/tick.rs`,
+/// which calls `agentflare_backend::item::create` directly) or via the
+/// `agentflare item create` CLI (`src/cli/item.rs`, same) bypass this
+/// function entirely and are NEVER auto-gated, regardless of their priority
+/// or size. Those paths can still be gated explicitly by passing
+/// `plan_required` in their metadata; extending the automatic policy to them
+/// was deliberately left out of item #573.
 fn default_plan_gate_patch(priority: &str, metadata_str: &str) -> Option<String> {
     let explicit = serde_json::from_str::<serde_json::Value>(metadata_str)
         .ok()
-        .and_then(|v| v.as_object().map(|o| o.contains_key("plan_required")))
+        .and_then(|v| {
+            v.as_object()
+                .map(|o| o.contains_key("plan_required") || o.contains_key("plan_approver"))
+        })
         .unwrap_or(false);
     if explicit {
         return None;
@@ -100,6 +117,22 @@ fn default_plan_gate_patch(priority: &str, metadata_str: &str) -> Option<String>
         metadata_str,
         serde_json::json!({"plan_required": required, "plan_approver": approver}),
     ))
+}
+
+/// Which route reached `set_plan_status`, and therefore whether the
+/// human-approver check applies (item #573 final review).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlanStatusRoute {
+    /// The public `item(action="approve_plan")` MCP surface. Any agent can
+    /// call it, so an item whose `plan_approver` is `"human"` must be refused
+    /// here — otherwise self-approval defeats the gate.
+    PublicApprove,
+    /// A human's tap on the Telegram approve card, routed in-process by
+    /// `supervisor::handle_telegram_callback`. This IS the human, so the
+    /// human-approver check is skipped.
+    ChannelApprove,
+    /// `reject_plan`. Never restricted: rejection only re-blocks the item.
+    Reject,
 }
 
 /// `size` lives in the free-form `metadata` JSON blob (`{"size": "S"|"M"|"L"}`)
@@ -794,13 +827,22 @@ impl AgentflareMcp {
         let plan_asset_id = req.plan_asset_id.ok_or_else(|| {
             ErrorData::invalid_params("plan_asset_id is required for submit_plan", None)
         })?;
-        self.with_backend_db(|conn| {
+        // `notify_plan_approval_gate` does a vault lookup (KDF unseal) plus a
+        // network POST with a timeout. `with_backend_db` holds the process-wide
+        // `Mutex<Option<Connection>>` for its ENTIRE closure body, so firing the
+        // notify from inside it stalls every other DB operation in the process
+        // for a full network round-trip — which in HTTP-server mode means every
+        // concurrent agent session (item #573 final review). Return what the
+        // notify needs out of the closure and send it once the lock is released.
+        let (response, notify) = self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &id)?;
             let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
             let approver = req
                 .plan_approver
+                .clone()
                 .or_else(|| {
-                    agentflare_backend::item::plan_gate::read_plan_gate(&item.metadata).plan_approver
+                    agentflare_backend::item::plan_gate::read_plan_gate(&item.metadata)
+                        .plan_approver
                 })
                 .unwrap_or_else(|| "human".to_string());
             let patch = serde_json::json!({
@@ -820,37 +862,66 @@ impl AgentflareMcp {
                 },
             )
             .map_err(map_backend_err)?;
-            if approver == "human" {
-                crate::supervisor::notify_plan_approval_gate(&item, &plan_asset_id);
-            }
-            Ok(serde_json::json!({
+            let response = serde_json::json!({
                 "status": "pending",
                 "item_id": item_id,
                 "plan_asset_id": plan_asset_id,
                 "plan_approver": approver,
             })
-            .to_string())
-        })?
+            .to_string();
+            let notify = (approver == "human").then_some((item, plan_asset_id));
+            Ok::<_, ErrorData>((response, notify))
+        })??;
+        if let Some((item, plan_asset_id)) = notify {
+            crate::supervisor::notify_plan_approval_gate(&item, &plan_asset_id);
+        }
+        Ok(response)
     }
 
+    /// Public, agent-callable approval (`item(action="approve_plan")`).
+    /// REFUSES an item whose `plan_approver` is `"human"`: otherwise any agent
+    /// that hit `"blocked_by_plan"` could `submit_plan` then `approve_plan` on
+    /// itself and walk straight through the gate, which defeats the entire
+    /// point of a human approver (item #573 final review). The legitimate route
+    /// for those items is [`Self::item_approve_plan_via_channel`].
     pub(crate) fn item_approve_plan(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        self.set_plan_status(req, "approved", None)
+        self.set_plan_status(req, "approved", None, PlanStatusRoute::PublicApprove)
     }
 
+    /// Channel-route approval: a real human tapped "Approve" on the Telegram
+    /// card built by `supervisor::notify_plan_approval_gate`, so the
+    /// human-approver check in `set_plan_status` is skipped. Deliberately NOT
+    /// wired into `item_inner`'s `action` dispatch — the only caller is
+    /// `supervisor::handle_telegram_callback`, which reaches it in-process
+    /// after verifying the callback came from the configured notify chat, so
+    /// no agent can invoke this through the MCP `item` tool.
+    pub(crate) fn item_approve_plan_via_channel(
+        &self,
+        req: ItemRequest,
+    ) -> Result<String, ErrorData> {
+        self.set_plan_status(req, "approved", None, PlanStatusRoute::ChannelApprove)
+    }
+
+    /// Rejecting a plan is safe self-service regardless of `plan_approver`:
+    /// it only resets the gate back to a blocked state, it never unblocks
+    /// anything, so an agent rejecting its own submission can't bypass a
+    /// human. No route restriction here by design.
     pub(crate) fn item_reject_plan(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let reason = req.reason.clone();
-        self.set_plan_status(req, "rejected", reason)
+        self.set_plan_status(req, "rejected", reason, PlanStatusRoute::Reject)
     }
 
     /// Shared body for approve_plan/reject_plan: both require the item to be
     /// in plan_status == "pending" (a state-mismatch error otherwise, per this
     /// plan's error-handling requirement), and both go through the same
-    /// merge_metadata_patch write path.
+    /// merge_metadata_patch write path. `route` decides whether the
+    /// human-approver check applies — see [`PlanStatusRoute`].
     fn set_plan_status(
         &self,
         req: ItemRequest,
         new_status: &str,
         reason: Option<String>,
+        route: PlanStatusRoute,
     ) -> Result<String, ErrorData> {
         let id = req.id.ok_or_else(|| {
             ErrorData::invalid_params(format!("id is required for {new_status} transition"), None)
@@ -865,6 +936,21 @@ impl AgentflareMcp {
                         "cannot {new_status} — item's plan_status is {:?}, expected \"pending\"",
                         gate.plan_status
                     ),
+                    None,
+                ));
+            }
+            // Checked AFTER the pending check so a stale/never-submitted item
+            // still reports the more specific state-mismatch error first.
+            // Absent `plan_approver` is treated as `"human"`, matching
+            // `item_submit_plan`'s own fallback — fail closed rather than
+            // letting hand-written metadata open the gate.
+            if route == PlanStatusRoute::PublicApprove
+                && gate.plan_approver.as_deref().unwrap_or("human") == "human"
+            {
+                return Err(ErrorData::invalid_params(
+                    "this item's plan requires human approval — tap Approve on the Telegram \
+                     card; agents cannot self-approve"
+                        .to_string(),
                     None,
                 ));
             }

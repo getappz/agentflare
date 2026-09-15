@@ -748,11 +748,11 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ItemRequest {
     #[schemars(
-        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|groom|standup|health|doctor|clear_start_date|clear_due_date"
+        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|submit_plan|approve_plan|reject_plan|groom|standup|health|doctor|clear_start_date|clear_due_date"
     )]
     pub(crate) action: String,
     #[schemars(
-        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, add_relation, remove_relation, list_relations, redispatch, clear_start_date, clear_due_date"
+        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, add_relation, remove_relation, list_relations, redispatch, submit_plan, approve_plan, reject_plan, clear_start_date, clear_due_date"
     )]
     #[serde(default)]
     pub(crate) id: Option<String>,
@@ -900,9 +900,7 @@ pub(crate) struct ItemRequest {
     )]
     #[serde(default)]
     pub(crate) plan_approver: Option<String>,
-    #[schemars(
-        description = "Reason text (reject_plan)"
-    )]
+    #[schemars(description = "Reason text (reject_plan)")]
     #[serde(default)]
     pub(crate) reason: Option<String>,
 }

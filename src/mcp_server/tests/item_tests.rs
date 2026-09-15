@@ -428,46 +428,168 @@ fn item_claim_blocked_by_plan() {
 
 #[test]
 fn submit_plan_sets_pending_and_clears_prior_rejection() {
-    let (tmp, s) = harness();
+    // This test deliberately exercises the `plan_approver` == "human" default,
+    // which makes `item_submit_plan` call `notify_plan_approval_gate`. That
+    // reads the vault -- under the REAL $HOME without this wrapper -- and can
+    // fire a REAL Telegram approve card on a developer's machine whose vault is
+    // unlocked and notify chat configured. `with_temp_home` points the vault at
+    // a throwaway directory, same as the Task 6 supervisor tests
+    // (`handle_telegram_callback_approves_a_pending_plan`). Preferred over
+    // passing `plan_approver: Some("agent")`, which would stop testing the
+    // "human" default this test exists to assert (item #573 final review).
+    crate::paths::test_support::with_temp_home(|| {
+        let (tmp, s) = harness();
+        let created: serde_json::Value = serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                action: "create".into(),
+                name: Some("gated item".into()),
+                metadata: Some(serde_json::json!({
+                    "plan_required": true,
+                    "plan_rejection_reason": "stale reason from a prior round",
+                })),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let item_id = created["id"].as_str().unwrap().to_string();
+
+        let submitted: serde_json::Value = serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                action: "submit_plan".into(),
+                id: Some(item_id.clone()),
+                plan_asset_id: Some("asset-1".into()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(submitted["status"], "pending");
+        assert_eq!(submitted["plan_asset_id"], "asset-1");
+        // No plan_approver was passed and none was already on the item's
+        // metadata, so submit_plan must fall back to "human".
+        assert_eq!(submitted["plan_approver"], "human");
+
+        let conn = backend_conn(&tmp);
+        let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+        assert_eq!(metadata["plan_status"], "pending");
+        assert_eq!(metadata["plan_asset_id"], "asset-1");
+        assert!(
+            metadata["plan_rejection_reason"].is_null(),
+            "submit_plan must clear a stale rejection reason: {metadata}"
+        );
+    });
+}
+
+/// Creates a `plan_required` item already sitting at `plan_status = "pending"`
+/// with the given `plan_approver`, and returns its id -- the exact state both
+/// self-approval tests below need.
+fn pending_plan_item(s: &AgentflareMcp, approver: &str) -> String {
     let created: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
             action: "create".into(),
-            name: Some("gated item".into()),
+            name: Some("human-gated plan".into()),
             metadata: Some(serde_json::json!({
                 "plan_required": true,
-                "plan_rejection_reason": "stale reason from a prior round",
+                "plan_status": "pending",
+                "plan_approver": approver,
+                "plan_asset_id": "asset-1",
             })),
             ..Default::default()
         }))
         .unwrap(),
     )
     .unwrap();
-    let item_id = created["id"].as_str().unwrap().to_string();
+    created["id"].as_str().unwrap().to_string()
+}
 
-    let submitted: serde_json::Value = serde_json::from_str(
-        &s.item(Parameters(ItemRequest {
-            action: "submit_plan".into(),
+/// Item #573 final review, Fix 1: the public, agent-callable `approve_plan`
+/// must REFUSE a `plan_approver == "human"` item. Without this an agent that
+/// hit `blocked_by_plan` could submit_plan + approve_plan itself and walk
+/// straight through the gate.
+#[test]
+fn public_approve_plan_refuses_a_human_approver_item() {
+    let (tmp, s) = harness();
+    let item_id = pending_plan_item(&s, "human");
+
+    let err = s
+        .item(Parameters(ItemRequest {
+            action: "approve_plan".into(),
             id: Some(item_id.clone()),
-            plan_asset_id: Some("asset-1".into()),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        err.message.contains("human approval"),
+        "error must say why an agent can't approve: {}",
+        err.message
+    );
+
+    let conn = backend_conn(&tmp);
+    let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+    assert_eq!(
+        metadata["plan_status"], "pending",
+        "a refused approval must not move the gate: {metadata}"
+    );
+}
+
+/// The other half of Fix 1: the channel-only route (a human's Telegram tap,
+/// routed by `supervisor::handle_telegram_callback`) is the ONE way the same
+/// item does get approved.
+#[test]
+fn channel_approve_plan_succeeds_for_a_human_approver_item() {
+    let (tmp, s) = harness();
+    let item_id = pending_plan_item(&s, "human");
+
+    let approved: serde_json::Value = serde_json::from_str(
+        &s.item_approve_plan_via_channel(ItemRequest {
+            action: "approve_plan".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(approved["status"], "approved");
+
+    let conn = backend_conn(&tmp);
+    let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+    assert_eq!(metadata["plan_status"], "approved");
+}
+
+/// Item #573 final review, Fix 5: an explicit `plan_approver` override is an
+/// explicit gate choice ("gate this, but let an agent sign off") and must
+/// survive the urgent/high default policy, which previously only looked for
+/// `plan_required`.
+#[test]
+fn create_with_explicit_plan_approver_is_not_overridden() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("urgent item, agent-approved".into()),
+            priority: Some("urgent".into()),
+            metadata: Some(serde_json::json!({"plan_approver": "agent"})),
             ..Default::default()
         }))
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(submitted["status"], "pending");
-    assert_eq!(submitted["plan_asset_id"], "asset-1");
-    // No plan_approver was passed and none was already on the item's
-    // metadata, so submit_plan must fall back to "human".
-    assert_eq!(submitted["plan_approver"], "human");
-
-    let conn = backend_conn(&tmp);
-    let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
-    let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
-    assert_eq!(metadata["plan_status"], "pending");
-    assert_eq!(metadata["plan_asset_id"], "asset-1");
+    let metadata: serde_json::Value =
+        serde_json::from_str(created["metadata"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        metadata["plan_approver"], "agent",
+        "an explicit plan_approver must not be clobbered to \"human\": {metadata}"
+    );
+    // The policy is skipped wholesale when either key is explicit, so
+    // plan_required is left exactly as the caller left it (absent here).
     assert!(
-        metadata["plan_rejection_reason"].is_null(),
-        "submit_plan must clear a stale rejection reason: {metadata}"
+        metadata.get("plan_required").is_none(),
+        "the default-gate patch must not touch plan_required either: {metadata}"
     );
 }
 
@@ -476,7 +598,8 @@ fn approve_plan_requires_pending_status() {
     let (_tmp, s) = harness();
     // Never submitted -- no plan_status at all on the item's metadata.
     let created: serde_json::Value = serde_json::from_str(
-        &s.item(Parameters(empty_item_create("ungated item"))).unwrap(),
+        &s.item(Parameters(empty_item_create("ungated item")))
+            .unwrap(),
     )
     .unwrap();
     let item_id = created["id"].as_str().unwrap().to_string();
@@ -525,7 +648,10 @@ fn reject_plan_sets_rejected_and_records_reason() {
     let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
     let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
     assert_eq!(metadata["plan_status"], "rejected");
-    assert_eq!(metadata["plan_rejection_reason"], "needs more detail on rollback");
+    assert_eq!(
+        metadata["plan_rejection_reason"],
+        "needs more detail on rollback"
+    );
 }
 
 #[test]

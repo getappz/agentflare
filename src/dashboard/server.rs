@@ -276,9 +276,10 @@ fn spawn_supervisor_telegram_approvals(
         loop {
             ticker.tick().await;
             let mcp = mcp.clone();
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || crate::supervisor::poll_telegram_approvals(&mcp))
-                    .await
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                crate::supervisor::poll_telegram_approvals(&mcp)
+            })
+            .await
             {
                 eprintln!("agentflare-supervisor: telegram poll task panicked: {e}");
             }

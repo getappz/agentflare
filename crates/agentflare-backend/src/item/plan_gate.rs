@@ -36,9 +36,7 @@ pub fn merge_metadata_patch(existing: &str, patch: serde_json::Value) -> String 
         .ok()
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
-    if let (Some(base_obj), serde_json::Value::Object(patch_obj)) =
-        (base.as_object_mut(), patch)
-    {
+    if let (Some(base_obj), serde_json::Value::Object(patch_obj)) = (base.as_object_mut(), patch) {
         for (k, v) in patch_obj {
             base_obj.insert(k, v);
         }
@@ -163,7 +161,10 @@ mod tests {
 
     #[test]
     fn default_policy_gates_large_size() {
-        assert_eq!(default_policy("medium", r#"{"size":"L"}"#), Some((true, "human")));
+        assert_eq!(
+            default_policy("medium", r#"{"size":"L"}"#),
+            Some((true, "human"))
+        );
     }
 
     #[test]

@@ -1090,93 +1090,96 @@ fn second_tick_does_not_reenqueue_while_job_still_queued() {
 #[test]
 fn plan_gated_item_does_not_dispatch_when_blocked() {
     // Task #573: gated items (plan_required=true) with unapproved plan status
-    // must not be dispatched by the supervisor, same contract as job_in_flight
-    // skip behavior: return false and leave the queue empty.
+    // must not be dispatched by the supervisor -- nothing enqueued for them.
+    // Unlike the `job_in_flight` skip, though, a plan gate is retryable, so it
+    // must also land in `DiscoveryTickResult::waiting` rather than in no
+    // counter at all (item #573 final review, Fix 2).
     let mcp = test_mcp();
     let queue = test_queue();
     let auth_conn = test_auth_conn();
 
-    let (blocked_item_id, approved_item_id) = mcp.with_backend_db(|conn| {
-        let project = mcp.resolve_project(conn).unwrap();
-        // Create necessary labels
-        for name in ["ready-for-work", "dispatched", "needs-manual-dispatch"] {
-            agentflare_backend::label::create(
+    let (blocked_item_id, approved_item_id) = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            // Create necessary labels
+            for name in ["ready-for-work", "dispatched", "needs-manual-dispatch"] {
+                agentflare_backend::label::create(
+                    conn,
+                    agentflare_backend::label::CreateLabel {
+                        project_id: Some(project.id.clone()),
+                        workspace_id: project.workspace_id.clone(),
+                        name: name.into(),
+                        color: None,
+                        parent_id: None,
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                    },
+                )
+                .unwrap();
+            }
+            let states = agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+            let state_id = states.iter().find(|s| s.is_default).unwrap().id.clone();
+
+            // Create a blocked gated item (plan_required=true, plan_status not approved)
+            let blocked_item = agentflare_backend::item::create(
                 conn,
-                agentflare_backend::label::CreateLabel {
-                    project_id: Some(project.id.clone()),
-                    workspace_id: project.workspace_id.clone(),
-                    name: name.into(),
-                    color: None,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id.clone(),
+                    state_id: state_id.clone(),
+                    name: "Blocked by plan gate".into(),
+                    description: None,
+                    priority: None,
                     parent_id: None,
+                    assignee_agent: Some("claude-code".into()),
                     sort_order: None,
                     external_source: None,
                     external_id: None,
+                    metadata: Some(r#"{"plan_required":true,"plan_status":"pending"}"#.into()),
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                    start_date: None,
+                    due_date: None,
                 },
             )
             .unwrap();
-        }
-        let states = agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
-        let state_id = states.iter().find(|s| s.is_default).unwrap().id.clone();
 
-        // Create a blocked gated item (plan_required=true, plan_status not approved)
-        let blocked_item = agentflare_backend::item::create(
-            conn,
-            agentflare_backend::item::CreateItem {
-                project_id: project.id.clone(),
-                state_id: state_id.clone(),
-                name: "Blocked by plan gate".into(),
-                description: None,
-                priority: None,
-                parent_id: None,
-                assignee_agent: Some("claude-code".into()),
-                sort_order: None,
-                external_source: None,
-                external_id: None,
-                metadata: Some(r#"{"plan_required":true,"plan_status":"pending"}"#.into()),
-                label_ids: vec![],
-                assignee_ids: vec![],
-                dependency_ids: vec![],
-                start_date: None,
-                due_date: None,
-            },
-        )
+            // Create an approved gated item (plan_required=true, plan_status="approved")
+            let approved_item = agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id.clone(),
+                    state_id: state_id.clone(),
+                    name: "Approved by plan gate".into(),
+                    description: None,
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: Some("claude-code".into()),
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: Some(r#"{"plan_required":true,"plan_status":"approved"}"#.into()),
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                    start_date: None,
+                    due_date: None,
+                },
+            )
+            .unwrap();
+
+            let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+            let ready_id = &labels
+                .iter()
+                .find(|l| l.name == "ready-for-work")
+                .unwrap()
+                .id;
+            agentflare_backend::item::add_label(conn, &blocked_item.id, ready_id).unwrap();
+            agentflare_backend::item::add_label(conn, &approved_item.id, ready_id).unwrap();
+            (blocked_item.id, approved_item.id)
+        })
         .unwrap();
-
-        // Create an approved gated item (plan_required=true, plan_status="approved")
-        let approved_item = agentflare_backend::item::create(
-            conn,
-            agentflare_backend::item::CreateItem {
-                project_id: project.id.clone(),
-                state_id: state_id.clone(),
-                name: "Approved by plan gate".into(),
-                description: None,
-                priority: None,
-                parent_id: None,
-                assignee_agent: Some("claude-code".into()),
-                sort_order: None,
-                external_source: None,
-                external_id: None,
-                metadata: Some(r#"{"plan_required":true,"plan_status":"approved"}"#.into()),
-                label_ids: vec![],
-                assignee_ids: vec![],
-                dependency_ids: vec![],
-                start_date: None,
-                due_date: None,
-            },
-        )
-        .unwrap();
-
-        let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
-        let ready_id = &labels
-            .iter()
-            .find(|l| l.name == "ready-for-work")
-            .unwrap()
-            .id;
-        agentflare_backend::item::add_label(conn, &blocked_item.id, ready_id).unwrap();
-        agentflare_backend::item::add_label(conn, &approved_item.id, ready_id).unwrap();
-        (blocked_item.id, approved_item.id)
-    })
-    .unwrap();
 
     let result = run_discovery_tick(
         &mcp,
@@ -1201,6 +1204,71 @@ fn plan_gated_item_does_not_dispatch_when_blocked() {
         !jobs[0].args.contains(&blocked_item_id),
         "the blocked item must not appear in the queue"
     );
+    // Item #573 final review, Fix 2: the blocked item must be visible to an
+    // operator in the tick summary. Before the fix `dispatch_item` returned a
+    // bare `false` here and no counter moved at all, so an auto-gated item
+    // could stall the supervisor silently and indefinitely.
+    assert_eq!(
+        result.waiting, 1,
+        "a plan-gated item is retryable, so it must be counted as waiting"
+    );
+    assert_eq!(
+        result.skipped, 0,
+        "waiting is not skipped -- skipped reads as a decision that won't be revisited"
+    );
+}
+
+/// Item #573 final review, Fix 2: an item gated with NO plan submitted yet
+/// (`plan_status` absent -> `"none"`) is the stall case Task 7's default
+/// policy makes common, and nothing else in the system would ever ping a
+/// human about it (`item_submit_plan` sends the approve card, and it was never
+/// called). It must count as `waiting` AND fire the one-time human notify.
+#[test]
+fn plan_gated_item_with_no_plan_submitted_counts_as_waiting() {
+    // `notify_human_gate` reads the vault -- isolate $HOME so this can never
+    // touch a developer's real vault or fire a real Telegram message, same
+    // reasoning as the Telegram-callback tests.
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let auth_conn = test_auth_conn();
+
+        let item_id = seed_ready_item(&mcp, Some("claude-code"));
+        mcp.with_backend_db(|conn| {
+            agentflare_backend::item::update(
+                conn,
+                &item_id,
+                agentflare_backend::item::UpdateItem {
+                    // plan_required with no plan_status at all -> Blocked("none").
+                    metadata: Some(r#"{"plan_required":true}"#.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        })
+        .unwrap();
+
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
+
+        assert_eq!(
+            result.dispatched, 0,
+            "an unsubmitted plan must not dispatch"
+        );
+        assert_eq!(
+            result.waiting, 1,
+            "a never-submitted plan gate must be counted as waiting, not silently dropped"
+        );
+        assert_eq!(result.skipped, 0);
+        assert!(
+            queue.list(None).unwrap().is_empty(),
+            "nothing may be enqueued for a plan-gated item"
+        );
+    });
 }
 
 #[test]

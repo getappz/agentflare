@@ -1629,7 +1629,12 @@ fn claim_blocked_by_plan_when_gated_and_unapproved() {
     .unwrap();
 
     let outcome = claim(&conn, &item.id, "claude-code:1", crate::item::now(), 3600).unwrap();
-    assert_eq!(outcome, ClaimOutcome::BlockedByPlan { status: "none".into() });
+    assert_eq!(
+        outcome,
+        ClaimOutcome::BlockedByPlan {
+            status: "none".into()
+        }
+    );
 }
 
 #[test]
