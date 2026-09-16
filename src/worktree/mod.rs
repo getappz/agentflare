@@ -333,10 +333,12 @@ fn pr_ci_status_impl(
             return PrCiStatus::Unknown;
         }
     };
+    let mergeable_state = pr.mergeable_state.clone();
     decide_from_checks(
         pr.number,
         &checks,
         pr.labels.into_iter().map(|l| l.name).collect(),
+        mergeable_state.as_deref(),
     )
 }
 
@@ -349,6 +351,7 @@ fn decide_from_checks(
     number: u64,
     checks: &[crate::github::models::CheckRun],
     labels: Vec<String>,
+    mergeable_state: Option<&str>,
 ) -> PrCiStatus {
     let summary = crate::github::mcp::checks_wait_summary(checks, 0);
     let total = summary["total_checks"].as_u64().unwrap_or(0);
@@ -363,14 +366,24 @@ fn decide_from_checks(
                 .collect()
         })
         .unwrap_or_default();
-    if failed.is_empty() {
-        PrCiStatus::Passing { number, labels }
-    } else {
-        PrCiStatus::Failing {
+    if !failed.is_empty() {
+        return PrCiStatus::Failing {
             number,
             checks: failed,
-        }
+        };
     }
+    // The check-run list above only reflects what GitHub has created so far --
+    // gated jobs (e.g. a `build` matrix behind a `changes` job) may not exist
+    // yet even though every check-run seen so far is green, which would
+    // otherwise read as "0 pending, 0 failed" and report Passing well before
+    // the PR is actually mergeable. GitHub's own `mergeable_state` already
+    // accounts for the full required-checks list, so "blocked" here means
+    // more is still outstanding -- treat it as still-pending rather than
+    // trusting the incomplete snapshot.
+    if mergeable_state == Some("blocked") {
+        return PrCiStatus::Pending;
+    }
+    PrCiStatus::Passing { number, labels }
 }
 
 /// `pr_ci_status_impl`'s decision tree applied to data already fetched in
@@ -391,7 +404,12 @@ pub(crate) fn pr_ci_status_from_batch(
     if data.mergeable == Some(true) && data.mergeable_state.as_deref() == Some("behind") {
         return PrCiStatus::Behind { number };
     }
-    decide_from_checks(number, &data.checks, data.labels.clone())
+    decide_from_checks(
+        number,
+        &data.checks,
+        data.labels.clone(),
+        data.mergeable_state.as_deref(),
+    )
 }
 
 /// Brings a cleanly-behind PR's branch up to date with the base branch via
@@ -1172,6 +1190,27 @@ mod tests {
             Some(true),
             Some("clean"),
             vec![check("build", "in_progress", None)],
+            vec![],
+        );
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Pending
+        ));
+    }
+
+    // Regression for item #687: gated jobs (e.g. a `build` matrix behind a
+    // `changes` job) may not exist as check-runs yet even though every
+    // check-run fetched so far is green, so "0 pending, 0 failed" over an
+    // incomplete snapshot is not enough to call it Passing. GitHub's own
+    // mergeable_state already accounts for the full required-checks list --
+    // "blocked" here means the sweep's snapshot is incomplete.
+    #[test]
+    fn pr_ci_status_from_batch_reports_pending_when_blocked_despite_green_checks() {
+        let data = batch_data(
+            false,
+            Some(true),
+            Some("blocked"),
+            vec![check("cla", "completed", Some("success"))],
             vec![],
         );
         assert!(matches!(
