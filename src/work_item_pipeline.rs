@@ -1099,32 +1099,53 @@ pub(crate) fn run_or_resume_with_sender(
             worktree_path: worktree_path.clone(),
             ..Default::default()
         };
-        let run_id = match existing_run_id {
-            Some(run_id) => {
-                let state = eng.get_status(run_id).await.map_err(|e| e.to_string())?;
-                if matches!(
+        // Whether `existing_run_id` is still a legitimate handle to resume:
+        // `None` here covers a stale/evicted run (`WorkflowError::NotFound` —
+        // e.g. past `MAX_RETAINED_RUNS`) as well as terminal statuses, both
+        // of which fall through to starting a fresh run below.
+        //
+        // The `state.context.data.item_id == item.id` check guards a
+        // different failure mode (item #253): `existing_run_id` comes from
+        // this item's own persisted `metadata.workflow_run_id`, but nothing
+        // upstream guarantees that field actually still belongs to *this*
+        // item — a stale copy (e.g. templated from another item) or a race
+        // in `persist_run_id` could leave it pointing at a run that's
+        // genuinely alive, just for a *different* item. Blindly awaiting
+        // that run would silently sit on someone else's dispatch (wrong
+        // worktree/cwd) instead of ever doing this item's own work — treat a
+        // mismatch exactly like a stale run and start over.
+        let resumable_state = match existing_run_id {
+            Some(run_id) => match eng.get_status(run_id).await {
+                Ok(state) if state.context.data.item_id != item.id => {
+                    eprintln!(
+                        "work_item_pipeline: item {}'s stored workflow_run_id {run_id} \
+                         actually belongs to item {} -- discarding it and starting a fresh \
+                         run instead of resuming someone else's dispatch",
+                        item.id, state.context.data.item_id
+                    );
+                    None
+                }
+                Ok(state) => Some((run_id, state)),
+                Err(WorkflowError::NotFound(_)) => None,
+                Err(e) => return Err(e.to_string()),
+            },
+            None => None,
+        };
+        let run_id = match resumable_state {
+            Some((run_id, state))
+                if !matches!(
                     state.status,
                     WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
-                ) {
-                    // Terminal — this is a genuine re-dispatch (e.g. a
-                    // fresh self-repair pass), not a crash resume. Start
-                    // over with a new run.
-                    let new_run_id = eng
-                        .start_workflow(WorkflowId::new(WORKFLOW_ID), fresh_data(), String::new())
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    persist_run_id(&mcp, &item.id, &existing_metadata, new_run_id)?;
-                    new_run_id
-                } else {
-                    // Non-terminal: either already resumed by the
-                    // boot-time `recover()` sweep (Task 8) or genuinely
-                    // still running in this same live process. Either
-                    // way, do NOT start a second run against it — just
-                    // await this one.
-                    run_id
-                }
+                ) =>
+            {
+                // Non-terminal, and confirmed above to be this item's own
+                // run: either already resumed by the boot-time `recover()`
+                // sweep (Task 8) or genuinely still running in this same
+                // live process. Either way, do NOT start a second run
+                // against it — just await this one.
+                run_id
             }
-            None => {
+            _ => {
                 let new_run_id = eng
                     .start_workflow(WorkflowId::new(WORKFLOW_ID), fresh_data(), String::new())
                     .await

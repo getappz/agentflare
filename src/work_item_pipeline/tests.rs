@@ -796,6 +796,174 @@ fn sdd_loop_step_invocations_carry_the_run_s_owner_identity() {
     }
 }
 
+// Item #253: a vented session was dispatched with the task prompt for one
+// item but a cwd pointing at a sibling item's worktree. Root cause traced to
+// `run_or_resume_with_sender` trusting `metadata.workflow_run_id` blindly --
+// if item A's metadata ever carries a `workflow_run_id` that actually
+// belongs to item B (stale copy, or a race), the old code would find B's run
+// still `Running` and just await it forever instead of ever dispatching A's
+// own work. Reproduces that exact shape: two sibling items, B's run left
+// genuinely non-terminal (a `SendMessage` that never resolves), A's metadata
+// poisoned with B's run id.
+#[test]
+fn run_or_resume_with_sender_discards_a_workflow_run_id_that_belongs_to_a_different_item() {
+    let (mcp, _backend_tmp, _repo_tmp, item_a_id, _project_id, worktree_a) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Cross-item run guard test item A");
+    std::fs::write(worktree_a.join("real_work.txt"), "real work").unwrap();
+
+    let item_b_id = mcp
+        .with_backend_db(|conn| {
+            let states = agentflare_backend::state::list_by_project(conn, &_project_id).ok()?;
+            let state_id = states.iter().find(|s| s.is_default)?.id.clone();
+            agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: _project_id.clone(),
+                    state_id,
+                    name: "Cross-item run guard test item B".to_string(),
+                    description: None,
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: None,
+                    label_ids: Vec::new(),
+                    assignee_ids: Vec::new(),
+                    dependency_ids: Vec::new(),
+                    start_date: None,
+                    due_date: None,
+                },
+            )
+            .ok()
+        })
+        .unwrap()
+        .unwrap()
+        .id;
+    let claimed_b: serde_json::Value = serde_json::from_str(
+        &mcp.item_claim(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_b_id.clone()),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let worktree_b = std::path::PathBuf::from(claimed_b["worktree_path"].as_str().unwrap());
+    assert_ne!(
+        worktree_a, worktree_b,
+        "test setup: items need distinct worktrees"
+    );
+
+    let mcp = Arc::new(mcp);
+    let item_a = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_a_id).ok())
+        .unwrap()
+        .unwrap();
+    let item_b = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_b_id).ok())
+        .unwrap()
+        .unwrap();
+
+    // Item B's own run, left non-terminal on purpose: a `SendMessage` that
+    // never resolves keeps its status `Running` for the rest of the test, so
+    // the lookup below is deterministic instead of racing real completion.
+    let hang_send: flare_workflow::json::SendMessage =
+        Arc::new(|_inv: flare_workflow::json::StepInvocation| {
+            Box::pin(std::future::pending::<Result<(String, u64, u64), String>>())
+        });
+    let eng = engine();
+    let foreign_run_id = crate::paths::test_support::with_temp_home(|| {
+        eng.register_workflow(build_work_item_pipeline_with_sender(mcp.clone(), hang_send))
+            .unwrap();
+        crate::workflow::blocking_runtime()
+            .block_on(eng.start_workflow(
+                WorkflowId::new(WORKFLOW_ID),
+                WorkItemData {
+                    item_id: item_b.id.clone(),
+                    agent_name: agent_registry::Agent::ClaudeCode.as_str().to_string(),
+                    judge_agent_name: agent_registry::Agent::ClaudeCode.as_str().to_string(),
+                    owner: crate::claims::owner_id(),
+                    worktree_path: worktree_b.display().to_string(),
+                    ..Default::default()
+                },
+                String::new(),
+            ))
+            .unwrap()
+    });
+
+    // Simulate the bug: item A's metadata carries item B's run id (a stale
+    // copy, or a race in `persist_run_id` -- either way, not item A's own).
+    persist_run_id(
+        &mcp,
+        &item_a.id,
+        &serde_json::Value::Object(Default::default()),
+        foreign_run_id,
+    )
+    .unwrap();
+
+    let seen_cwds: Arc<std::sync::Mutex<Vec<Option<std::path::PathBuf>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_cwds_for_send = seen_cwds.clone();
+    let send: flare_workflow::json::SendMessage = Arc::new(move |inv| {
+        seen_cwds_for_send.lock().unwrap().push(inv.cwd.clone());
+        let prompt = inv.prompt;
+        Box::pin(async move {
+            if prompt.contains("You are the judge") {
+                Ok((
+                    r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#
+                        .to_string(),
+                    1u64,
+                    0u64,
+                ))
+            } else {
+                Ok(("DONE: did the work".to_string(), 1u64, 0u64))
+            }
+        })
+    });
+
+    let _ = crate::paths::test_support::with_temp_home(|| {
+        run_or_resume_with_sender(
+            mcp.clone(),
+            &item_a,
+            &worktree_a,
+            agent_registry::Agent::ClaudeCode,
+            agent_registry::Agent::ClaudeCode,
+            "implement it".to_string(),
+            None,
+            None,
+            send,
+        )
+    });
+
+    let seen_cwds = seen_cwds.lock().unwrap();
+    assert!(
+        !seen_cwds.is_empty(),
+        "item A's dispatch never ran -- it must not just sit awaiting item B's run forever"
+    );
+    let expected = Some(worktree_a.clone());
+    for cwd in seen_cwds.iter() {
+        assert_eq!(
+            cwd, &expected,
+            "item A must dispatch into its own worktree, not item B's, even though \
+             item A's metadata pointed at item B's still-running workflow_run_id"
+        );
+    }
+
+    let updated_a = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_a_id).ok())
+        .unwrap()
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&updated_a.metadata).unwrap();
+    let persisted_run_id = metadata["workflow_run_id"].as_str().unwrap();
+    assert_ne!(
+        persisted_run_id,
+        foreign_run_id.to_string(),
+        "item A must not end up \"resuming\" and re-persisting item B's run id"
+    );
+}
+
 // Item #512: bare `task/<N>` checkout + renamed slug hid divergence from
 // `item_done`; finalize must surface workflow failure (not silent success).
 #[tokio::test]

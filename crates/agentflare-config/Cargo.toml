@@ -1,0 +1,22 @@
+[package]
+name = "agentflare-config"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Centralized home/config-directory resolution for agentflare"
+license = "Apache-2.0"
+repository = "https://github.com/getappz/agentflare"
+publish = false
+
+[dependencies]
+dirs = "6"
+tempfile = "3"
+agent-registry = { package = "agentflare-agent-registry", path = "../agent-registry" }
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
