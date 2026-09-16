@@ -267,10 +267,15 @@ pub fn resolve_session(explicit: Option<&str>, cwd: &Path) -> String {
 
 /// Locate the sidecar: `PATH` first, then the cargo bin dir (`$CARGO_HOME`
 /// or `~/.cargo/bin`, plus `%USERPROFILE%\.cargo\bin` on Windows) so a
-/// `cargo install` that didn't touch `PATH` still resolves.
+/// `cargo install` that didn't touch `PATH` still resolves. Skips mise's
+/// shims dir (see [`is_mise_shims_dir`]) so a dead shim there never shadows
+/// the absolute path `mise where` resolves in `browser_install`.
 pub fn find_backend() -> Result<PathBuf, String> {
     let paths = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&paths) {
+        if is_mise_shims_dir(&dir) {
+            continue;
+        }
         if let Some(p) = check_bin_dir(&dir) {
             return Ok(p);
         }
@@ -279,6 +284,31 @@ pub fn find_backend() -> Result<PathBuf, String> {
         return Ok(p);
     }
     Err(missing_hint())
+}
+
+/// `~/.local/share/mise/shims` (mirrors the same hardcoded path
+/// `daemon_autostart::daemon_path_env` appends for mise-managed agent
+/// CLIs). mise generates a shim for every tool it has ever installed,
+/// regardless of activation — but the git backend here is deliberately
+/// `mise install`ed only, never `mise use`d (see `browser_install`'s module
+/// doc: "shims never need activation"), so its shim has no active version
+/// to resolve and errors when invoked directly. A naive PATH scan would
+/// still find that dead shim file and return it as if it were the real
+/// binary, so it must be skipped explicitly.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn is_mise_shims_dir(dir: &Path) -> bool {
+    std::env::var_os("HOME").is_some_and(|home| {
+        dir == PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("mise")
+            .join("shims")
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn is_mise_shims_dir(_dir: &Path) -> bool {
+    false
 }
 
 /// Install hint — mise's git backend only (prebuilt binary, no toolchain).
@@ -585,6 +615,68 @@ mod tests {
         unsafe { std::env::remove_var(NO_AUTO_INSTALL_ENV) };
         if let Some(v) = saved {
             unsafe { std::env::set_var(NO_AUTO_INSTALL_ENV, v) };
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn is_mise_shims_dir_matches_only_the_real_shims_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // SAFETY: single-threaded env fiddling, restored before return.
+        let saved_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+
+        assert!(is_mise_shims_dir(
+            &home.join(".local").join("share").join("mise").join("shims")
+        ));
+        assert!(!is_mise_shims_dir(&home.join(".cargo").join("bin")));
+        assert!(!is_mise_shims_dir(
+            &home.join(".local").join("share").join("mise")
+        ));
+
+        match saved_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn find_backend_skips_a_dead_mise_shim_on_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let shims = home.join(".local").join("share").join("mise").join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        std::fs::write(shims.join(BACKEND_BIN), "#!/bin/sh\nexit 1\n").unwrap();
+
+        // SAFETY: single-threaded env fiddling (nextest isolates each test
+        // in its own process), restored before return.
+        let saved_home = std::env::var_os("HOME");
+        let saved_path = std::env::var_os("PATH");
+        let saved_cargo = std::env::var_os("CARGO_HOME");
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::set_var("PATH", &shims);
+            std::env::remove_var("CARGO_HOME");
+        }
+
+        let err = find_backend().unwrap_err();
+        assert!(err.contains(BACKEND_BIN), "{err}");
+
+        unsafe {
+            match saved_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match saved_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            match saved_cargo {
+                Some(v) => std::env::set_var("CARGO_HOME", v),
+                None => std::env::remove_var("CARGO_HOME"),
+            }
         }
     }
 }
