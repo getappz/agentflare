@@ -19,11 +19,41 @@ pub struct PlanGateMeta {
 }
 
 /// Reads only the plan-gate fields out of an item's `metadata` JSON blob.
-/// Unknown/unrelated keys are ignored (serde's default struct behavior),
-/// so this is safe to call on metadata carrying arbitrary other fields
-/// (`size`, `model`, ...).
+/// Unknown/unrelated keys are ignored, so this is safe to call on metadata
+/// carrying arbitrary other fields (`size`, `model`, ...).
+///
+/// Extracts each field independently rather than deserializing straight into
+/// `PlanGateMeta` -- a single whole-struct `serde_json::from_str` fails (and
+/// falls back to `PlanGateMeta::default()`, `plan_required: false`) the
+/// moment ANY recognized field has the wrong JSON type, which would silently
+/// open the gate on an otherwise-valid `plan_required: true` just because an
+/// unrelated field (e.g. `plan_approved_at`) was malformed (CodeRabbit
+/// finding on item #573's PR). Field-by-field extraction means a malformed
+/// field simply reads as absent for itself, without corrupting the rest.
 pub fn read_plan_gate(metadata: &str) -> PlanGateMeta {
-    serde_json::from_str(metadata).unwrap_or_default()
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(metadata) else {
+        return PlanGateMeta::default();
+    };
+    let obj = value.as_object();
+    let str_field = |key: &str| {
+        obj.and_then(|o| o.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    PlanGateMeta {
+        plan_required: obj
+            .and_then(|o| o.get("plan_required"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        plan_approver: str_field("plan_approver"),
+        plan_asset_id: str_field("plan_asset_id"),
+        plan_status: str_field("plan_status"),
+        plan_approved_by: str_field("plan_approved_by"),
+        plan_approved_at: obj
+            .and_then(|o| o.get("plan_approved_at"))
+            .and_then(serde_json::Value::as_i64),
+        plan_rejection_reason: str_field("plan_rejection_reason"),
+    }
 }
 
 /// Read-parse-patch-reserialize: the ONLY safe way to write into an item's
@@ -122,6 +152,25 @@ mod tests {
         assert!(gate.plan_required);
         assert_eq!(gate.plan_approver.as_deref(), Some("human"));
         assert_eq!(gate.plan_status.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn read_plan_gate_ignores_a_malformed_unrelated_field_instead_of_defaulting_everything() {
+        // A wrong-typed `plan_approved_at` (a string instead of i64) must not
+        // wipe out a valid, present `plan_required: true` -- that would
+        // silently open the gate (CodeRabbit finding on item #573's PR).
+        let gate = read_plan_gate(r#"{"plan_required":true,"plan_approved_at":"invalid"}"#);
+        assert!(
+            gate.plan_required,
+            "a malformed plan_approved_at must not clear plan_required"
+        );
+        assert_eq!(gate.plan_approved_at, None);
+    }
+
+    #[test]
+    fn plan_gate_status_blocked_when_required_and_plan_approved_at_is_malformed() {
+        let status = plan_gate_status(r#"{"plan_required":true,"plan_approved_at":"invalid"}"#);
+        assert!(matches!(status, PlanGateStatus::Blocked(ref s) if s == "none"));
     }
 
     #[test]

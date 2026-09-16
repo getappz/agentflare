@@ -77,6 +77,35 @@ fn metadata_to_json_string(value: serde_json::Value) -> String {
     }
 }
 
+/// Strips the plan-gate transition fields (`plan_status`, `plan_approved_by`,
+/// `plan_approved_at`, `plan_rejection_reason`) out of caller-supplied
+/// `create`/`update` metadata before it's persisted. Those fields are
+/// server-authoritative: only `item_submit_plan`/`set_plan_status` (approve/
+/// reject) may set them, since they write through `agentflare_backend::item`
+/// directly rather than this MCP entry point. Without this, a caller could
+/// `item(action="create", metadata={"plan_required":true,"plan_approver":
+/// "human","plan_status":"approved"})` and start an item already
+/// "approved", walking straight past the gate it claims to have
+/// (CodeRabbit finding on item #573's PR). `plan_required`/`plan_approver`
+/// themselves are left untouched -- those are the caller's explicit gating
+/// choice, handled separately by `default_plan_gate_patch`.
+fn strip_plan_transition_fields(metadata_str: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(metadata_str) else {
+        return metadata_str.to_string();
+    };
+    if let Some(obj) = value.as_object_mut() {
+        for key in [
+            "plan_status",
+            "plan_approved_by",
+            "plan_approved_at",
+            "plan_rejection_reason",
+        ] {
+            obj.remove(key);
+        }
+    }
+    value.to_string()
+}
+
 /// Applies Task 1's default plan-gate policy
 /// (`agentflare_backend::item::plan_default_policy`) to `metadata_str` for an
 /// item at `priority`. Returns `Some(patched_metadata)` only when the policy
@@ -439,7 +468,10 @@ impl AgentflareMcp {
             // plan-gate policy sees the same effective priority the row
             // will actually get, not a bare `None`.
             let effective_priority = req.priority.clone().unwrap_or_else(|| "none".to_string());
-            let metadata_str = req.metadata.map(metadata_to_json_string);
+            let metadata_str = req
+                .metadata
+                .map(metadata_to_json_string)
+                .map(|m| strip_plan_transition_fields(&m));
             let metadata = match default_plan_gate_patch(
                 &effective_priority,
                 metadata_str.as_deref().unwrap_or("{}"),
@@ -591,7 +623,10 @@ impl AgentflareMcp {
                 Some(p) if p.trim().is_empty() => Some(None),
                 Some(p) => Some(Some(self.resolve_item_id(conn, p)?)),
             };
-            let metadata_str = req.metadata.map(metadata_to_json_string);
+            let metadata_str = req
+                .metadata
+                .map(metadata_to_json_string)
+                .map(|m| strip_plan_transition_fields(&m));
             // Only recompute the default plan-gate policy when priority is
             // actually changing in this call -- an update that leaves
             // priority untouched shouldn't re-derive gating from it.
@@ -837,14 +872,23 @@ impl AgentflareMcp {
         let (response, notify) = self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &id)?;
             let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
-            let approver = req
-                .plan_approver
-                .clone()
-                .or_else(|| {
-                    agentflare_backend::item::plan_gate::read_plan_gate(&item.metadata)
-                        .plan_approver
-                })
-                .unwrap_or_else(|| "human".to_string());
+            // A stored `"human"` approver is a gate decision already made at
+            // create/update time -- the agent submitting the plan must not be
+            // able to weaken it to `"agent"` and then self-approve via the
+            // public `approve_plan` (CodeRabbit finding on item #573's PR;
+            // `end_to_end_plan_gate_blocks_then_unblocks_claim` used to prove
+            // exactly this bypass). `req.plan_approver` only applies when no
+            // stored value exists yet, or the stored value isn't "human".
+            let stored_approver =
+                agentflare_backend::item::plan_gate::read_plan_gate(&item.metadata).plan_approver;
+            let approver = match stored_approver.as_deref() {
+                Some("human") => "human".to_string(),
+                _ => req
+                    .plan_approver
+                    .clone()
+                    .or(stored_approver)
+                    .unwrap_or_else(|| "human".to_string()),
+            };
             let patch = serde_json::json!({
                 "plan_asset_id": plan_asset_id,
                 "plan_status": "pending",

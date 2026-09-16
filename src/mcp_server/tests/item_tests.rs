@@ -484,7 +484,11 @@ fn submit_plan_sets_pending_and_clears_prior_rejection() {
 
 /// Creates a `plan_required` item already sitting at `plan_status = "pending"`
 /// with the given `plan_approver`, and returns its id -- the exact state both
-/// self-approval tests below need.
+/// self-approval tests below need. Reaches "pending" via a real `submit_plan`
+/// call rather than seeding `plan_status` straight into `create`'s metadata --
+/// `create`/`update` strip that (and every other plan-transition field) from
+/// caller metadata now, since only `submit_plan`/`approve_plan`/`reject_plan`
+/// may set it (CodeRabbit finding on item #573's PR).
 fn pending_plan_item(s: &AgentflareMcp, approver: &str) -> String {
     let created: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
@@ -492,16 +496,22 @@ fn pending_plan_item(s: &AgentflareMcp, approver: &str) -> String {
             name: Some("human-gated plan".into()),
             metadata: Some(serde_json::json!({
                 "plan_required": true,
-                "plan_status": "pending",
                 "plan_approver": approver,
-                "plan_asset_id": "asset-1",
             })),
             ..Default::default()
         }))
         .unwrap(),
     )
     .unwrap();
-    created["id"].as_str().unwrap().to_string()
+    let item_id = created["id"].as_str().unwrap().to_string();
+    s.item(Parameters(ItemRequest {
+        action: "submit_plan".into(),
+        id: Some(item_id.clone()),
+        plan_asset_id: Some("asset-1".into()),
+        ..Default::default()
+    }))
+    .unwrap();
+    item_id
 }
 
 /// Item #573 final review, Fix 1: the public, agent-callable `approve_plan`
@@ -533,6 +543,64 @@ fn public_approve_plan_refuses_a_human_approver_item() {
     assert_eq!(
         metadata["plan_status"], "pending",
         "a refused approval must not move the gate: {metadata}"
+    );
+}
+
+/// CodeRabbit finding on item #573's PR: `submit_plan` must not let a caller
+/// downgrade a stored `plan_approver == "human"` to `"agent"` and then
+/// self-approve through the public route -- that would defeat Fix 1 above
+/// entirely. Item starts at `plan_status = "none"` (not yet submitted) so
+/// this exercises the real attack shape: hit `blocked_by_plan`, then try to
+/// submit_plan with an overriding `plan_approver` before approve_plan.
+#[test]
+fn submit_plan_cannot_downgrade_a_stored_human_approver() {
+    let (tmp, s) = harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("human-gated, not yet submitted".into()),
+            metadata: Some(serde_json::json!({
+                "plan_required": true,
+                "plan_approver": "human",
+            })),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let submitted: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "submit_plan".into(),
+            id: Some(item_id.clone()),
+            plan_asset_id: Some("asset-downgrade-attempt".into()),
+            plan_approver: Some("agent".into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        submitted["plan_approver"], "human",
+        "a stored human approver must survive submit_plan regardless of the caller's override"
+    );
+
+    let err = s
+        .item(Parameters(ItemRequest {
+            action: "approve_plan".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+    let conn = backend_conn(&tmp);
+    let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+    assert_eq!(
+        metadata["plan_status"], "pending",
+        "the downgrade-then-self-approve attempt must not unblock the gate: {metadata}"
     );
 }
 
@@ -593,6 +661,81 @@ fn create_with_explicit_plan_approver_is_not_overridden() {
     );
 }
 
+/// CodeRabbit finding on item #573's PR: `create`/`update` must not accept
+/// the plan-gate TRANSITION fields (`plan_status`, `plan_approved_by`,
+/// `plan_approved_at`, `plan_rejection_reason`) straight out of caller
+/// metadata -- only `submit_plan`/`approve_plan`/`reject_plan` may set them.
+/// Without stripping, a caller could create an item already sitting at
+/// `plan_status: "approved"`, skipping the gate lifecycle entirely.
+/// `plan_required`/`plan_approver` (the caller's actual gating choice) must
+/// still pass through untouched.
+#[test]
+fn create_strips_plan_transition_fields_from_caller_metadata() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("smuggled approval attempt".into()),
+            metadata: Some(serde_json::json!({
+                "plan_required": true,
+                "plan_approver": "human",
+                "plan_status": "approved",
+                "plan_approved_by": "attacker",
+                "plan_approved_at": 1_700_000_000,
+            })),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(created["metadata"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["plan_required"], true);
+    assert_eq!(metadata["plan_approver"], "human");
+    assert!(
+        metadata.get("plan_status").is_none(),
+        "create must not accept a caller-supplied plan_status: {metadata}"
+    );
+    assert!(
+        metadata.get("plan_approved_by").is_none(),
+        "create must not accept a caller-supplied plan_approved_by: {metadata}"
+    );
+    assert!(
+        metadata.get("plan_approved_at").is_none(),
+        "create must not accept a caller-supplied plan_approved_at: {metadata}"
+    );
+}
+
+/// Same protection as the `create` test above, but for `update` -- an agent
+/// updating an already-gated item's unrelated metadata (e.g. `size`) must
+/// not be able to smuggle `plan_status: "approved"` into the same call.
+#[test]
+fn update_strips_plan_transition_fields_from_caller_metadata() {
+    let (_tmp, s) = harness();
+    let item_id = pending_plan_item(&s, "human");
+
+    let updated: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "update".into(),
+            id: Some(item_id),
+            metadata: Some(serde_json::json!({
+                "plan_required": true,
+                "plan_approver": "human",
+                "plan_status": "approved",
+            })),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(updated["metadata"].as_str().unwrap()).unwrap();
+    assert!(
+        metadata.get("plan_status").is_none(),
+        "update must not accept a caller-supplied plan_status: {metadata}"
+    );
+}
+
 #[test]
 fn approve_plan_requires_pending_status() {
     let (_tmp, s) = harness();
@@ -623,7 +766,6 @@ fn reject_plan_sets_rejected_and_records_reason() {
             name: Some("pending-plan item".into()),
             metadata: Some(serde_json::json!({
                 "plan_required": true,
-                "plan_status": "pending",
             })),
             ..Default::default()
         }))
@@ -631,6 +773,16 @@ fn reject_plan_sets_rejected_and_records_reason() {
     )
     .unwrap();
     let item_id = created["id"].as_str().unwrap().to_string();
+    // Reach plan_status = "pending" via a real submit_plan call --
+    // create/update strip a caller-supplied plan_status now (CodeRabbit
+    // finding on item #573's PR).
+    s.item(Parameters(ItemRequest {
+        action: "submit_plan".into(),
+        id: Some(item_id.clone()),
+        plan_asset_id: Some("asset-1".into()),
+        ..Default::default()
+    }))
+    .unwrap();
 
     let rejected: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
@@ -734,12 +886,22 @@ fn update_priority_to_urgent_auto_gates_plan_required() {
 fn end_to_end_plan_gate_blocks_then_unblocks_claim() {
     let (s, _tmp, _repo_tmp) = claim_harness();
 
-    // 1. Create with priority="urgent" -> auto-gated plan_required=true.
+    // 1. Create with priority="urgent" plus an explicit plan_approver="agent"
+    //    -> auto-gated plan_required=true, but approvable through the public
+    //    API surface this test exercises. Priority="urgent" alone would
+    //    auto-gate to plan_approver="human" (see default_policy), which can
+    //    only be unblocked via the Telegram channel route -- not reachable
+    //    through item()'s public dispatch, and deliberately so: submit_plan
+    //    can no longer downgrade a stored "human" approver to "agent" (that
+    //    was a self-approval bypass this test used to exercise unknowingly;
+    //    see approve_plan_refuses_self_approval_on_human_gated_item for the
+    //    coverage of that refusal).
     let created: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
             action: "create".into(),
             name: Some("urgent gated item".into()),
             priority: Some("urgent".into()),
+            metadata: Some(serde_json::json!({"plan_required": true, "plan_approver": "agent"})),
             ..Default::default()
         }))
         .unwrap(),
@@ -763,14 +925,15 @@ fn end_to_end_plan_gate_blocks_then_unblocks_claim() {
     assert_eq!(blocked["status"], "blocked_by_plan");
     assert_eq!(blocked["plan_status"], "none");
 
-    // 3. submit_plan with plan_approver="agent" (skip the Telegram/human
-    //    path for this test) -> plan_status "pending".
+    // 3. submit_plan -> plan_status "pending", plan_approver stays "agent"
+    //    (the stored value from creation; submit_plan no longer accepts a
+    //    caller override that would weaken a "human" gate, but "agent" was
+    //    never "human" here so there's nothing to weaken).
     let submitted: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
             action: "submit_plan".into(),
             id: Some(item_id.clone()),
             plan_asset_id: Some("asset-e2e".into()),
-            plan_approver: Some("agent".into()),
             ..Default::default()
         }))
         .unwrap(),

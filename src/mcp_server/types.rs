@@ -896,7 +896,7 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) plan_asset_id: Option<String>,
     #[schemars(
-        description = "Who approves this item's plan: \"human\" (fires a channel approve-card) or \"agent\" (any agent may call approve_plan directly) (create, update, submit_plan default lookup)"
+        description = "Who approves this item's plan: \"human\" (fires a channel approve-card) or \"agent\" (any agent may call approve_plan directly). Read directly by submit_plan; on create/update, set it inside `metadata` as {\"plan_approver\": \"...\"} instead"
     )]
     #[serde(default)]
     pub(crate) plan_approver: Option<String>,
