@@ -94,3 +94,25 @@ ambient `CARGO_TARGET_DIR`. If `sccache` is on `PATH`, the isolated config also 
 
 Never add "Generated with Claude Code" or "Co-Authored-By: Claude" signatures.
 Commit messages are the message only.
+
+### SSH push / `gh` cache failures in a sandboxed dispatch (item #241)
+
+A sandboxed job (`agentflare-jobs`'s bwrap wrapper, `--unshare-user`) can make
+`git push` over an SSH remote (e.g. `git@github-appzdev:...`) fail with `Bad
+owner or permissions on /etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf` —
+root-owned files outside the sandbox's single mapped uid render with an
+unexpected owner, which trips OpenSSH's strict check on `Include`d config
+files. Workaround: push over HTTPS using `gh`'s stored credentials instead of
+the SSH remote:
+
+```bash
+git -c credential.helper='!gh auth git-credential' push https://github.com/<org>/<repo>.git <branch>
+```
+
+The same read-only-root cause breaks `gh run view --log` / `gh pr checks`
+(`read-only file system` writing to `~/.cache/gh`) — redirect the cache dir
+first:
+
+```bash
+export XDG_CACHE_HOME=/tmp/gh-cache && mkdir -p "$XDG_CACHE_HOME"
+```
