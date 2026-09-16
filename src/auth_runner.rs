@@ -14,6 +14,13 @@ const RATE_LIMIT_PATTERNS: &[&str] = &[
     "usage limit",
     "billing limit",
     "try again",
+    // cursor-agent's own account-exhaustion wording (item #240, confirmed
+    // live: `ActionRequiredError: You've hit your usage limit ... Switch to
+    // a different model or set a Spend Limit to continue`) -- "usage limit"
+    // above already matches that exact message, but cursor-agent's own
+    // suggested remedy ("set a Spend Limit") is also its own distinct phrase
+    // seen standalone in other account-exhaustion variants.
+    "spend limit",
 ];
 /// Conservative starter list (item #173's incident postmortem): none of these
 /// were sampled from real expired-auth CLI output per agent (claude-code,
@@ -280,5 +287,18 @@ mod tests {
         assert!(is_rate_limited("HTTP 429 Too Many Requests"));
         assert!(is_rate_limited("quota exceeded for today"));
         assert!(!is_rate_limited("something went wrong"));
+    }
+
+    #[test]
+    fn is_rate_limited_matches_cursor_agent_usage_limit_wording() {
+        // Item #240, confirmed live via a real sandboxed cursor-agent
+        // dispatch: this exact message on stderr, with zero assistant
+        // output, right after cursor-agent's own `system`/`init` message.
+        assert!(is_rate_limited(
+            "ActionRequiredError: You've hit your usage limit You've saved $51 on API model usage this month with Start. Switch to a different model or set a Spend Limit to continue with this model."
+        ));
+        // Cursor-agent's own suggested remedy, in case a future variant of
+        // this error omits the literal "usage limit" phrase.
+        assert!(is_rate_limited("Please set a Spend Limit to continue."));
     }
 }
