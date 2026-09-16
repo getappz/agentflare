@@ -55,11 +55,12 @@ pub struct AgentProfile {
 /// plus any `$HOME`-relative directories that must stay writable no matter
 /// which agent is running -- unlike agent state mounts, writes here persist
 /// to the host (e.g. a caller's own on-disk state a dispatched job reports
-/// completion through).
-#[derive(Debug, Clone, Copy, Default)]
+/// completion through). `writable_home_dirs` is owned (not `&'static`) so a
+/// caller can extend it at runtime, e.g. from an env-var override.
+#[derive(Debug, Clone, Default)]
 pub struct SandboxConfig {
     pub agent_profiles: &'static [AgentProfile],
-    pub writable_home_dirs: &'static [&'static str],
+    pub writable_home_dirs: Vec<String>,
 }
 
 /// Returns the command/args that should actually be spawned for a job:
