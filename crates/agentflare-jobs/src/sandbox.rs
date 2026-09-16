@@ -287,7 +287,7 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS", v) },
             None => unsafe { std::env::remove_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS") },
         }
-        assert_eq!(dirs, vec![".agentflare", ".foo", ".bar"]);
+        assert_eq!(dirs, vec![".agentflare", LEAN_CTX_STATE, ".foo", ".bar"]);
     }
 
     #[test]
@@ -298,7 +298,7 @@ mod tests {
         if let Some(v) = saved {
             unsafe { std::env::set_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS", v) };
         }
-        assert_eq!(dirs, vec![".agentflare"]);
+        assert_eq!(dirs, vec![".agentflare", LEAN_CTX_STATE]);
     }
 
     #[test]
