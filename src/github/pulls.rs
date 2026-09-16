@@ -79,6 +79,25 @@ pub fn marks_item(body: Option<&str>, sequence_id: i64) -> bool {
     body.is_some_and(|b| b.contains(&item_marker(sequence_id)))
 }
 
+/// True if `body` carries agentflare's own `for item #<N> via agentflare.`
+/// stamp `pr_footer` puts on every PR it opens -- for *any* item, unlike
+/// `marks_item` which checks one specific `sequence_id`. `discover_untracked_prs`
+/// uses this: each workstation keeps its own local, unsynced item database
+/// (see that function's doc comment), so a PR another workstation's
+/// `push_and_open_pr` just opened for its own item is invisible to this
+/// workstation's `known_pr_numbers` -- but the PR's body already carries this
+/// stamp the instant it's created, regardless of which workstation opened it
+/// or which local database (if any) is tracking it here. Without this check,
+/// `discover_untracked_prs` raced a fresh `push_and_open_pr` creation on
+/// another workstation and adopted the same PR into a second, duplicate local
+/// item, stacking a second `beacon:` label on top of the opener's own (item
+/// #261: PR #688 ended up with both `beacon:flared:51bb8de6c33b`, from the
+/// PR's actual opener, and `beacon:flared:c997d745ae66`, from a second
+/// workstation's discovery sweep 23 seconds later).
+pub fn opened_by_agentflare(body: Option<&str>) -> bool {
+    body.is_some_and(|b| b.contains("for item #") && b.contains(" via agentflare."))
+}
+
 /// Finds every PR (open, merged, or closed) whose body carries the
 /// `for item #<sequence_id>` marker `pr_footer` stamps onto every PR
 /// agentflare opens (see `push_and_open_pr`) -- the pre-dispatch
@@ -385,6 +404,23 @@ mod tests {
             Some("---\n_Opened by `claude-code` on **box** for item #6 via agentflare._"),
             63
         ));
+    }
+
+    #[test]
+    fn opened_by_agentflare_true_for_any_items_marker() {
+        assert!(opened_by_agentflare(Some(
+            "---\n_Opened by `claude-code` on **flared:51bb8de6c33b** for item #259 via agentflare._"
+        )));
+    }
+
+    #[test]
+    fn opened_by_agentflare_false_when_body_is_none() {
+        assert!(!opened_by_agentflare(None));
+    }
+
+    #[test]
+    fn opened_by_agentflare_false_for_a_hand_opened_pr() {
+        assert!(!opened_by_agentflare(Some("just a regular PR description")));
     }
 
     #[test]

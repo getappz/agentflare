@@ -1501,6 +1501,117 @@ fn run_review_sweep_never_merges_when_the_approval_label_only_exists_on_the_proj
     assert_eq!(result.skipped, 1);
 }
 
+// --- cross-machine self-repair claim arbitration (item #261) ---
+
+/// Wraps a marker comment body the way `MockResponse::json`'s callers need
+/// it -- serialized as a single JSON array entry with `id`/`user`/`body`,
+/// matching `github::models::Comment`'s shape.
+fn comment_json(id: u64, body: &str) -> String {
+    serde_json::json!([{"id": id, "user": {"login": "claude-code"}, "body": body}]).to_string()
+}
+
+fn claim_marker(owner: &str, ts: i64) -> String {
+    crate::github::bridge::marker::Marker {
+        action: crate::github::bridge::marker::Action::Claim,
+        owner: owner.to_string(),
+        item: "i1".to_string(),
+        ts,
+        hash: String::new(),
+    }
+    .render()
+}
+
+#[test]
+fn claim_self_repair_wins_and_posts_a_marker_when_the_pr_has_no_live_claim() {
+    // `machine_label()` reads/creates a real `~/.agentflare/bridge-instance-id`
+    // -- not mockable -- so the post-claim read must echo back THIS
+    // process's own real owner value, not a fixed placeholder.
+    let me = crate::github::bridge::config::machine_label();
+    let server = crate::github::test_support::MockServer::start(vec![
+        // Pre-claim read: no marker comments at all yet.
+        crate::github::test_support::MockResponse::json(200, r#"[]"#),
+        crate::github::test_support::MockResponse::json(201, r#"{"id":42}"#),
+        // Post-claim read: only our own marker is present now.
+        crate::github::test_support::MockResponse::json(
+            200,
+            &comment_json(42, &claim_marker(&me, 1_000)),
+        ),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = crate::github::RepoId {
+        owner: "o".into(),
+        repo: "r".into(),
+    };
+
+    assert!(claim_self_repair(&client, &repo, 688, "i1", 1_000));
+
+    let reqs = server.requests();
+    assert_eq!(reqs.len(), 3);
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(reqs[1].method, "POST");
+    assert!(
+        reqs[1].body.contains("action=claim") && reqs[1].body.contains(&me),
+        "must post a claim marker under our own owner id, got {:?}",
+        reqs[1].body
+    );
+    assert_eq!(reqs[2].method, "GET");
+}
+
+#[test]
+fn claim_self_repair_defers_when_another_workstation_already_holds_a_live_claim() {
+    // Regression for item #261's live incident: PR #688 got self-repaired
+    // (and beacon-labeled) independently by two workstations. This simulates
+    // the second workstation's check -- a live claim from a different
+    // `owner` must make it back off instead of dispatching its own repair.
+    let server = crate::github::test_support::MockServer::start(vec![
+        crate::github::test_support::MockResponse::json(
+            200,
+            &comment_json(1, &claim_marker("flared:c997d745ae66", 1_000)),
+        ),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = crate::github::RepoId {
+        owner: "o".into(),
+        repo: "r".into(),
+    };
+
+    assert!(!claim_self_repair(&client, &repo, 688, "i1", 1_050));
+
+    // Must back off WITHOUT posting a second claim marker -- only the initial
+    // read is expected; a second mock response is deliberately not queued,
+    // so the test would panic (out-of-responses) if it tried to claim anyway.
+    let reqs = server.requests();
+    assert_eq!(reqs.len(), 1);
+}
+
+#[test]
+fn claim_self_repair_proceeds_when_the_only_existing_claim_has_gone_stale() {
+    // The TTL side of the same arbitration: a claim recorded far enough in
+    // the past (past `self_repair_claim_ttl_secs()`) must not block a fresh
+    // attempt -- e.g. the original claimant's workstation died mid-repair.
+    let ttl = self_repair_claim_ttl_secs();
+    let me = crate::github::bridge::config::machine_label();
+    let server = crate::github::test_support::MockServer::start(vec![
+        crate::github::test_support::MockResponse::json(
+            200,
+            &comment_json(1, &claim_marker("flared:dead", 10_000 - ttl - 1)),
+        ),
+        crate::github::test_support::MockResponse::json(201, r#"{"id":2}"#),
+        crate::github::test_support::MockResponse::json(
+            200,
+            &comment_json(2, &claim_marker(&me, 10_000)),
+        ),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = crate::github::RepoId {
+        owner: "o".into(),
+        repo: "r".into(),
+    };
+
+    assert!(claim_self_repair(&client, &repo, 688, "i1", 10_000));
+    assert_eq!(server.requests().len(), 3);
+}
+
 #[test]
 fn self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment() {
     let mcp = test_mcp();

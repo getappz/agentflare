@@ -600,6 +600,41 @@ fn persist_pr_identity(item: &agentflare_backend::item::Item, number: u64, branc
     }
 }
 
+/// True if `existing` should be trusted as *this item's own* PR on its
+/// branch rather than an unrelated closed/merged PR that happens to reuse
+/// the same branch name -- shared by `push_and_open_pr`'s pre-create lookup
+/// and its post-create-failure recheck. Branch names get reused across items
+/// over time, and `find_existing` matches on branch name alone, so an
+/// unrelated, already-merged PR from a past item can share this branch's
+/// name (item #63). An open match is always trusted regardless of body,
+/// since GitHub itself would reject creating a genuine duplicate against it
+/// anyway.
+fn is_own_pr(
+    existing: &crate::github::models::PullRequest,
+    item: &agentflare_backend::item::Item,
+) -> bool {
+    existing.state == "open"
+        || crate::github::pulls::marks_item(existing.body.as_deref(), item.sequence_id)
+}
+
+/// Rechecks `find_existing` once after `pulls::create` fails on `branch` --
+/// see `push_and_open_pr`'s `create` `Err` arm for why this matters (item
+/// #261). Split out purely so this specific retry-and-trust behavior is
+/// exercisable against a mock GitHub server: `push_and_open_pr` itself isn't
+/// unit-testable end to end since it also needs a real git remote and
+/// `Client::new()`'s live credentials.
+fn recover_pr_after_failed_create(
+    client: &crate::github::Client,
+    repo: &RepoId,
+    branch: &str,
+    item: &agentflare_backend::item::Item,
+) -> Option<crate::github::models::PullRequest> {
+    match crate::github::pulls::find_existing(client, repo, branch) {
+        Ok(Some(existing)) if is_own_pr(&existing, item) => Some(existing),
+        _ => None,
+    }
+}
+
 /// Pushes `item`'s isolated worktree branch and opens a PR against
 /// `target_branch` — the `done`-side counterpart to `create_worktree`.
 /// Deliberately never merges: unreviewed code should never land on the
@@ -671,10 +706,7 @@ pub fn push_and_open_pr(
     // An open match is always trusted regardless of its body, since GitHub
     // itself would reject creating a genuine duplicate against it anyway.
     match crate::github::pulls::find_existing(&client, &repo, &branch) {
-        Ok(Some(existing))
-            if existing.state == "open"
-                || crate::github::pulls::marks_item(existing.body.as_deref(), item.sequence_id) =>
-        {
+        Ok(Some(existing)) if is_own_pr(&existing, item) => {
             persist_pr_identity(item, existing.number, &branch);
             if let Some(p) = progress {
                 p.send(1.0, Some(1.0), Some("PR already exists".into()));
@@ -725,8 +757,33 @@ pub fn push_and_open_pr(
             Some(pr.html_url)
         }
         Err(e) => {
-            eprintln!("worktree: PR creation failed for item {}: {e}", item.id);
-            None
+            // `create` fails this way when two workstations independently
+            // dispatched the same item raced: both `find_existing` checks
+            // above ran before either had created a PR yet, both saw
+            // nothing, both called `create`, and GitHub accepted only one
+            // (rejecting the loser with a duplicate-branch error). Without
+            // this recheck the loser used to just log and give up here,
+            // leaving the item without a linked PR even though the winner's
+            // PR -- the one the item actually needs to track -- already
+            // exists. This is the failure mode `push_and_open_pr`'s own
+            // success branch left unguarded (item #261: PR #688 ended up
+            // carrying two different workstations' `beacon:` labels because
+            // both reached the `Ok(pr)` branch above instead of one of them
+            // landing here and linking up with the other's PR instead).
+            eprintln!(
+                "worktree: PR creation failed for item {}: {e} -- rechecking for a racing PR",
+                item.id
+            );
+            match recover_pr_after_failed_create(&client, &repo, &branch, item) {
+                Some(existing) => {
+                    persist_pr_identity(item, existing.number, &branch);
+                    if let Some(p) = progress {
+                        p.send(1.0, Some(1.0), Some("PR already exists".into()));
+                    }
+                    Some(existing.html_url)
+                }
+                None => None,
+            }
         }
     }
 }
@@ -1278,5 +1335,93 @@ mod tests {
         assert_eq!(metadata["size"], "S");
         assert_eq!(metadata["pr"]["number"], 619);
         assert_eq!(metadata["pr"]["branch"], "task/191-slug");
+    }
+
+    fn repo() -> RepoId {
+        RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        }
+    }
+
+    #[test]
+    fn is_own_pr_true_for_an_open_pr_regardless_of_body() {
+        let item = item_with_metadata(259, "{}");
+        let pr: crate::github::models::PullRequest =
+            serde_json::from_str(r#"{"number":688,"html_url":"u","state":"open","title":"t"}"#)
+                .unwrap();
+        assert!(is_own_pr(&pr, &item));
+    }
+
+    #[test]
+    fn is_own_pr_true_for_a_closed_pr_marked_with_this_items_id() {
+        let item = item_with_metadata(259, "{}");
+        let pr: crate::github::models::PullRequest = serde_json::from_str(
+            r#"{"number":688,"html_url":"u","state":"closed","title":"t",
+               "body":"_Opened by claude-code on box for item #259 via agentflare._"}"#,
+        )
+        .unwrap();
+        assert!(is_own_pr(&pr, &item));
+    }
+
+    #[test]
+    fn is_own_pr_false_for_a_closed_pr_without_this_items_marker() {
+        let item = item_with_metadata(259, "{}");
+        let pr: crate::github::models::PullRequest =
+            serde_json::from_str(r#"{"number":42,"html_url":"u","state":"closed","title":"t"}"#)
+                .unwrap();
+        assert!(!is_own_pr(&pr, &item));
+    }
+
+    // Regression for item #261: two workstations independently dispatched to
+    // item #259 both saw no PR on the branch and both called `create`.
+    // GitHub accepted only one; the loser's `create` failed with a
+    // duplicate-branch error. Before this fix, that loser just logged and
+    // gave up, so it never recorded a PR at all. It must now recheck
+    // `find_existing`, find the winner's PR, and link up with it instead --
+    // never a second `create`, never a second label add.
+    #[test]
+    fn recover_pr_after_failed_create_finds_the_racing_winners_pr() {
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"[{"number":688,"html_url":"https://gh/o/r/pull/688","state":"open",
+                    "title":"t","head":{"ref":"task/259","sha":"abc"}}]"#,
+            ),
+        ]);
+        let client = server.client(None);
+        let item = item_with_metadata(259, "{}");
+
+        let recovered =
+            recover_pr_after_failed_create(&client, &repo(), "task/259", &item).unwrap();
+
+        assert_eq!(recovered.number, 688);
+        assert_eq!(recovered.html_url, "https://gh/o/r/pull/688");
+    }
+
+    #[test]
+    fn recover_pr_after_failed_create_gives_up_when_no_pr_exists_yet() {
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(200, "[]"),
+        ]);
+        let client = server.client(None);
+        let item = item_with_metadata(259, "{}");
+
+        assert!(recover_pr_after_failed_create(&client, &repo(), "task/259", &item).is_none());
+    }
+
+    #[test]
+    fn recover_pr_after_failed_create_ignores_an_unrelated_closed_pr_on_the_same_branch() {
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"[{"number":42,"html_url":"u","state":"closed","title":"t",
+                    "head":{"ref":"task/259","sha":"abc"}}]"#,
+            ),
+        ]);
+        let client = server.client(None);
+        let item = item_with_metadata(259, "{}");
+
+        assert!(recover_pr_after_failed_create(&client, &repo(), "task/259", &item).is_none());
     }
 }

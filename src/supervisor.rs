@@ -1343,6 +1343,27 @@ fn self_repair_or_gate(
         return SelfRepairOutcome::Deferred;
     }
 
+    // Item #261: `claim_still_live` above only ever sees claims recorded in
+    // THIS workstation's own local backend db -- per-workstation dbs are
+    // never synced (see `worktree::discovery`'s doc comment) -- so it cannot
+    // detect that a DIFFERENT workstation's `run_review_sweep` tick already
+    // dispatched self-repair for this same PR. GitHub is the one medium
+    // every workstation can see, so cross-machine coordination is arbitrated
+    // there instead, via a claim marker comment on the PR and the same
+    // TTL+heartbeat resolution `github::bridge::claim` already uses for
+    // issue claiming (see `claim_self_repair`). Live incident: two
+    // workstations independently self-repaired the same PR with no way to
+    // see each other, each opened/labeled it as if it were the first,
+    // leaving PR #688 with two different `beacon:` labels.
+    let repo_and_client =
+        crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
+            .zip(crate::github::Client::new().ok());
+    if let Some((repo, client)) = repo_and_client
+        && !claim_self_repair(&client, &repo, pr_number, &item.id, crate::claims::now())
+    {
+        return SelfRepairOutcome::Deferred;
+    }
+
     let Some(agent) = item
         .assignee_agent
         .as_deref()
@@ -1383,6 +1404,75 @@ fn self_repair_or_gate(
         &dispatch_message,
     );
     SelfRepairOutcome::Dispatched
+}
+
+/// TTL a self-repair PR claim marker stays live for. Reuses the same
+/// duration as the backend item-claim TTL (`claim_still_live` above) rather
+/// than a bespoke constant, since both bound how long a single self-repair
+/// attempt is expected to run before it's fair game for another workstation
+/// to retry.
+fn self_repair_claim_ttl_secs() -> i64 {
+    crate::mcp_server::types::backend_claim_ttl_secs()
+}
+
+/// Cross-machine arbitration for self-repair dispatch (item #261). Reuses
+/// `github::bridge::claim`'s TTL+heartbeat marker resolution -- the same
+/// optimistic two-step `github::bridge::tick::try_claim` already uses for
+/// issue claiming (post our marker, re-read, confirm we're still the
+/// earliest live claimant) -- against a comment on the PR itself, since a PR
+/// is also an issue on GitHub's comments endpoint. Returns `false` only when
+/// another workstation is DEFINITELY already holding a live claim; any
+/// GitHub error along the way soft-fails toward `true` (proceed) rather than
+/// blocking every repair attempt on a transient API hiccup -- a rare missed
+/// race producing one duplicate self-repair dispatch is a far smaller harm
+/// than self-repair silently never running again, the same trade-off
+/// `discover_untracked_prs`'s own `find_existing` soft-fail already makes.
+fn claim_self_repair(
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    pr_number: u64,
+    item_id: &str,
+    now: i64,
+) -> bool {
+    use crate::github::bridge::claim as claim_rules;
+    use crate::github::bridge::marker::{Action, Marker};
+
+    let ttl = self_repair_claim_ttl_secs();
+    let me = crate::github::bridge::config::machine_label();
+
+    let Ok(before) = crate::github::issues::list_comments(client, repo, pr_number, None) else {
+        return true;
+    };
+    let before: Vec<(u64, String)> = before.into_iter().map(|c| (c.id, c.body)).collect();
+    match claim_rules::resolve_holder(&before, now, ttl) {
+        Some(h) if h.marker.owner == me => return true,
+        Some(_) => return false,
+        None => {}
+    }
+
+    let marker = Marker {
+        action: Action::Claim,
+        owner: me.clone(),
+        item: item_id.to_string(),
+        ts: now,
+        hash: String::new(),
+    };
+    if crate::github::issues::comment(
+        client,
+        repo,
+        pr_number,
+        &format!("Claiming self-repair for `{me}`.\n\n{}", marker.render()),
+    )
+    .is_err()
+    {
+        return true;
+    }
+
+    let Ok(after) = crate::github::issues::list_comments(client, repo, pr_number, None) else {
+        return true;
+    };
+    let after: Vec<(u64, String)> = after.into_iter().map(|c| (c.id, c.body)).collect();
+    claim_rules::i_hold(&after, &me, now, ttl)
 }
 
 #[cfg(test)]
