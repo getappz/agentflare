@@ -155,7 +155,17 @@ const AGENT_PROFILES: &[AgentProfile] = &[
 /// discard.
 const LEAN_CTX_STATE: &str = ".local/share/lean-ctx";
 
-const WRITABLE_HOME_DIRS: &[&str] = &[".agentflare", LEAN_CTX_STATE];
+/// `gh` CLI's own cache dir, relative to `$HOME` -- holds the response cache
+/// `gh run view --log` and `gh pr checks` write through on every invocation.
+/// Left off the sandbox entirely, it falls through to the read-only root and
+/// both commands fail with EROFS writing to `~/.cache/gh` (item #241,
+/// confirmed live), same read-only-root class as `.agentflare`/
+/// `LEAN_CTX_STATE` -- needs a real writable bind rather than
+/// `OverlayEphemeral` so the cache persists across the many `gh` calls a
+/// single job makes rather than being silently discarded each time.
+const GH_CACHE_STATE: &str = ".cache/gh";
+
+const WRITABLE_HOME_DIRS: &[&str] = &[".agentflare", LEAN_CTX_STATE, GH_CACHE_STATE];
 
 /// `AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS`, comma-separated, parsed into a
 /// dir list -- e.g. `".foo,.bar"`. Empty/unset -> no extra dirs. Read fresh
@@ -287,7 +297,16 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS", v) },
             None => unsafe { std::env::remove_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS") },
         }
-        assert_eq!(dirs, vec![".agentflare", LEAN_CTX_STATE, ".foo", ".bar"]);
+        assert_eq!(
+            dirs,
+            vec![
+                ".agentflare",
+                LEAN_CTX_STATE,
+                GH_CACHE_STATE,
+                ".foo",
+                ".bar"
+            ]
+        );
     }
 
     #[test]
@@ -298,7 +317,7 @@ mod tests {
         if let Some(v) = saved {
             unsafe { std::env::set_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS", v) };
         }
-        assert_eq!(dirs, vec![".agentflare", LEAN_CTX_STATE]);
+        assert_eq!(dirs, vec![".agentflare", LEAN_CTX_STATE, GH_CACHE_STATE]);
     }
 
     #[test]
