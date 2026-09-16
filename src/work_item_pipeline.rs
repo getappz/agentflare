@@ -425,6 +425,7 @@ pub(crate) fn build_sdd_loop_step(
                 let role_invocation = flare_workflow::json::StepInvocation {
                     args: resume_args_for(&role_agent, &ctx.data.agent_sessions),
                     cwd: cwd.clone(),
+                    owner: Some(ctx.data.owner.clone()),
                     ..flare_workflow::json::StepInvocation::simple(role_agent.clone(), role_prompt)
                 };
                 let (raw_role_reply, in_tok, out_tok) = match send(role_invocation).await {
@@ -501,6 +502,7 @@ pub(crate) fn build_sdd_loop_step(
                 let judge_invocation = flare_workflow::json::StepInvocation {
                     args: resume_args_for(&judge_agent_name, &ctx.data.agent_sessions),
                     cwd,
+                    owner: Some(ctx.data.owner.clone()),
                     ..flare_workflow::json::StepInvocation::simple(
                         judge_agent_name.clone(),
                         judge_prompt,
@@ -881,7 +883,11 @@ fn real_agent_send_hook(
         let mut all_args = extra_args.clone();
         all_args.extend(inv.args.clone());
         let flare_workflow::json::StepInvocation {
-            agent, prompt, cwd, ..
+            agent,
+            prompt,
+            cwd,
+            owner,
+            ..
         } = inv;
         Box::pin(async move {
             let agent_for_reply = agent.clone();
@@ -891,7 +897,8 @@ fn real_agent_send_hook(
                 // process cwd — required for a run resumed by
                 // `engine().recover()`, which never re-enters
                 // `execute_work`'s `run_in_worktree` chdir (item #191).
-                Some(cwd) => crate::agent_launch::run_headless_in(
+                Some(cwd) => crate::agent_launch::run_headless_in_with_owner(
+                    owner.as_deref(),
                     cwd,
                     agent_registry::REGISTRY,
                     &agent,
@@ -901,7 +908,8 @@ fn real_agent_send_hook(
                     &all_args,
                     true,
                 ),
-                None => crate::agent_launch::run_headless(
+                None => crate::agent_launch::run_headless_with_owner(
+                    owner.as_deref(),
                     agent_registry::REGISTRY,
                     &agent,
                     &prompt,

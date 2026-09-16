@@ -297,8 +297,23 @@ pub fn has_owner_override() -> bool {
 /// `AGENTFLARE_SESSION` must be set to keep ownership continuous across
 /// separate `agentflare claim` invocations (acquire in one, release in
 /// another); otherwise each command is a distinct owner.
+///
+/// `AGENTFLARE_CLAIM_OWNER`, when set, is read verbatim ahead of the
+/// agent/instance reconstruction below — the cross-process counterpart to
+/// `OWNER_OVERRIDE` for a dispatched subprocess (`agent_launch::run_headless_
+/// with_owner`) whose own execution agent (`AGENTFLARE_AGENT`, needed intact
+/// for `flare-git-shim`'s bypass classification) can differ from the claim
+/// owner that dispatched it (item #538) — splicing the owner's agent into
+/// `AGENTFLARE_AGENT` instead would let that bypass check target the wrong
+/// agent.
 pub fn owner_id() -> String {
     if let Some(owner) = OWNER_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return owner;
+    }
+    if let Some(owner) = std::env::var("AGENTFLARE_CLAIM_OWNER")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         return owner;
     }
     let agent = std::env::var("AGENTFLARE_AGENT")
