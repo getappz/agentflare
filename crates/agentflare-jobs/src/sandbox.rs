@@ -140,12 +140,58 @@ const AGENT_PROFILES: &[AgentProfile] = &[
 /// means the agent finishes real work with no way to report it (item #120 --
 /// confirmed live via `EROFS` on `touch ~/.agentflare/probe` and two
 /// dispatched jobs stuck showing not-done despite merge-ready PRs).
-const WRITABLE_HOME_DIRS: &[&str] = &[".agentflare"];
+/// lean-ctx's own state dir, relative to `$HOME` -- holds `agents/
+/// registry.lock` (its agent-bus registration lock) plus the sqlite DBs
+/// every `ctx_*` tool call reads/writes through. Left off the sandbox
+/// entirely, it falls through to the read-only root and every `ctx_*` tool
+/// (read/shell/search/tree/expand) fails identically at the registration
+/// gate with `EROFS` on `registry.lock`, before reaching any real read/shell
+/// logic -- and `flare_tool`/`comment` calls that touch the same DBs fail
+/// alongside it with "attempt to write a readonly database" (item #236,
+/// confirmed live across 7+ independent dispatched sessions). Needs a real
+/// writable bind rather than `OverlayEphemeral`, like `.agentflare`: the
+/// agent-bus registry is shared coordination state across concurrently
+/// dispatched agents, not per-job scratch state an overlay could safely
+/// discard.
+const LEAN_CTX_STATE: &str = ".local/share/lean-ctx";
 
-const CONFIG: SandboxConfig = SandboxConfig {
-    agent_profiles: AGENT_PROFILES,
-    writable_home_dirs: WRITABLE_HOME_DIRS,
-};
+const WRITABLE_HOME_DIRS: &[&str] = &[".agentflare", LEAN_CTX_STATE];
+
+/// `AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS`, comma-separated, parsed into a
+/// dir list -- e.g. `".foo,.bar"`. Empty/unset -> no extra dirs. Read fresh
+/// on every `config()` call rather than cached behind a `'static` constant,
+/// so a test can set/unset the env var around a call and see it take
+/// effect immediately. Mirrors
+/// `flare_git_core::branch::extra_protected_branches_from_env`.
+#[must_use]
+fn extra_writable_home_dirs_from_env() -> Vec<String> {
+    std::env::var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `WRITABLE_HOME_DIRS` plus `extra_writable_home_dirs_from_env()` -- a
+/// runtime override so a new tool that hits the bwrap read-only-root
+/// `EROFS` pattern (#127, #106, #130, #120, #236) can get a writable
+/// `$HOME` dir without a code change + rebuild + redeploy.
+fn config() -> SandboxConfig {
+    let mut writable_home_dirs: Vec<String> = WRITABLE_HOME_DIRS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    writable_home_dirs.extend(extra_writable_home_dirs_from_env());
+    SandboxConfig {
+        agent_profiles: AGENT_PROFILES,
+        writable_home_dirs,
+    }
+}
 
 /// `.agentflare`-relative directory a sandboxed run's diagnostic-log tail
 /// (see `OPENCODE_STATE`'s `diagnostic_log`) gets written to -- nested under
@@ -195,7 +241,7 @@ pub fn wrap(
     git_writable: bool,
     diagnostic_out: Option<&Path>,
 ) -> (String, Vec<String>) {
-    flare_sandbox::wrap(command, args, cwd, git_writable, &CONFIG, diagnostic_out)
+    flare_sandbox::wrap(command, args, cwd, git_writable, &config(), diagnostic_out)
 }
 
 #[cfg(test)]
@@ -224,6 +270,35 @@ mod tests {
                 profile.binary_name
             );
         }
+    }
+
+    #[test]
+    fn config_appends_env_var_dirs_to_writable_home_dirs() {
+        // Unique to this test -- no other test in the binary touches this
+        // var, so no cross-test race despite the missing global lock other
+        // env-var tests in this codebase rely on (e.g. asset_tests.rs's
+        // GLOBAL_STATE_LOCK).
+        let saved = std::env::var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS").ok();
+        unsafe {
+            std::env::set_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS", " .foo, .bar ,,");
+        }
+        let dirs = config().writable_home_dirs;
+        match saved {
+            Some(v) => unsafe { std::env::set_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS", v) },
+            None => unsafe { std::env::remove_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS") },
+        }
+        assert_eq!(dirs, vec![".agentflare", LEAN_CTX_STATE, ".foo", ".bar"]);
+    }
+
+    #[test]
+    fn config_has_no_extra_dirs_when_env_var_unset() {
+        let saved = std::env::var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS").ok();
+        unsafe { std::env::remove_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS") };
+        let dirs = config().writable_home_dirs;
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS", v) };
+        }
+        assert_eq!(dirs, vec![".agentflare", LEAN_CTX_STATE]);
     }
 
     #[test]
