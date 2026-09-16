@@ -625,6 +625,14 @@ struct ReviewBatch {
     known_pr_numbers: std::collections::HashSet<u64>,
     items: Vec<agentflare_backend::item::Item>,
     label_id_by_name: std::collections::HashMap<String, String>,
+    /// Items #234's self-heal: items that regressed out of "in_review" (e.g.
+    /// an orphaned self-repair job's claim getting reconciled) while still
+    /// carrying a tracked, untouched `metadata.pr.number`, with no live
+    /// claim and no lifecycle gate (`NEEDS_MANUAL_LABEL`/
+    /// `NEEDS_DECISION_LABEL`) holding them back deliberately. Not yet
+    /// restored to "in_review" here -- see `stray_pr_is_still_relevant`'s
+    /// doc comment for why that has to wait until a live GitHub PR check.
+    stray_candidates: Vec<(agentflare_backend::item::Item, u64)>,
 }
 
 /// One pass: across every project registered in `project_dirs` (mirrors
@@ -681,17 +689,72 @@ pub(crate) fn run_review_sweep(
                 continue;
             };
             let in_review: Vec<_> = items
-                .into_iter()
+                .iter()
                 .filter(|i| {
                     state_by_id
                         .get(i.state_id.as_str())
                         .is_some_and(|s| s.group_name == "in_review")
                 })
+                .cloned()
                 .collect();
             let labels = agentflare_backend::label::list_by_project(conn, &dir.project_id).ok()?;
             let mut label_id_by_name = std::collections::HashMap::new();
             for l in &labels {
                 label_id_by_name.insert(l.name.clone(), l.id.clone());
+            }
+            // Self-heal items #234: an item can regress out of the
+            // "in_review" group (e.g. a self-repair job's claim getting
+            // reconciled as orphaned/failed) while its PR is still open and
+            // tracked -- once that happens, this sweep's query above can
+            // never see it again, even after the PR merges on GitHub (item
+            // #233 sat stuck in "Backlog" for hours after its PR merged).
+            // Collect candidates for recovery here; whether each one
+            // actually gets restored to "in_review" is decided once a repo
+            // and GitHub client are available below (`stray_pr_is_still_relevant`),
+            // never on metadata presence alone -- a first attempt at this
+            // fix restored on metadata + claim-liveness only, which also
+            // silently overrode `NEEDS_MANUAL_LABEL`'s dispatch-failure cap
+            // and `NEEDS_DECISION_LABEL`'s go/no-go gate (review finding on
+            // item #234's first attempt), so both are excluded here too.
+            let now = crate::claims::now();
+            let requested_ttl = crate::mcp_server::types::backend_claim_ttl_secs();
+            let mut stray_candidates = Vec::new();
+            for item in &items {
+                if state_by_id.get(item.state_id.as_str()).is_some_and(|s| {
+                    matches!(
+                        s.group_name.as_str(),
+                        "in_review" | "completed" | "cancelled"
+                    )
+                }) {
+                    continue;
+                }
+                let Some(number) = crate::worktree::pr_number_from_metadata(item) else {
+                    continue;
+                };
+                let item_label_ids = agentflare_backend::item::list_labels(conn, &item.id)
+                    .ok()
+                    .unwrap_or_default();
+                let gated = [NEEDS_MANUAL_LABEL, NEEDS_DECISION_LABEL]
+                    .iter()
+                    .any(|name| {
+                        label_id_by_name
+                            .get(*name)
+                            .is_some_and(|id| item_label_ids.contains(id))
+                    });
+                if gated {
+                    continue;
+                }
+                let ttl =
+                    agentflare_backend::claim::effective_ttl_secs(conn, &item.id, requested_ttl);
+                let has_live_claim =
+                    agentflare_backend::claim::live_claim_on_item(conn, &item.id, now, ttl)
+                        .ok()
+                        .flatten()
+                        .is_some();
+                if has_live_claim {
+                    continue;
+                }
+                stray_candidates.push((item.clone(), number));
             }
             batches.push(ReviewBatch {
                 folder_path: dir.folder_path,
@@ -700,6 +763,7 @@ pub(crate) fn run_review_sweep(
                 known_pr_numbers,
                 items: in_review,
                 label_id_by_name,
+                stray_candidates,
             });
         }
         Some(batches)
@@ -714,8 +778,9 @@ pub(crate) fn run_review_sweep(
             project_id,
             in_review_state_id,
             known_pr_numbers,
-            items,
+            mut items,
             label_id_by_name,
+            stray_candidates,
         } = batch;
         let repo_root = std::path::PathBuf::from(&folder_path);
         // Resolved once per project and reused for discovery, the batched
@@ -727,6 +792,27 @@ pub(crate) fn run_review_sweep(
             crate::github::RepoId::resolve_from_remote(&repo_root),
             crate::github::Client::new(),
         );
+        // Item #234 self-heal, continued: only now, with a resolved repo and
+        // an authenticated client in hand, do stray candidates actually get
+        // restored -- and only the ones whose PR a live GitHub call confirms
+        // is still open or already merged. No remote/no credentials means no
+        // way to tell "orphaned mid-repair" apart from "PR was closed
+        // without merging", so this soft-fails exactly like every other
+        // GitHub-touching branch in this sweep: skip this tick, the item
+        // stays where it is, and it's retried on the next one.
+        if let (Some(repo), Ok(client)) = &resolved {
+            for (item, number) in &stray_candidates {
+                if !stray_pr_is_still_relevant(client, repo, *number) {
+                    continue;
+                }
+                let restored = mcp.with_backend_db(|conn| {
+                    agentflare_backend::item::update_state(conn, &item.id, &in_review_state_id)
+                });
+                if let Ok(Ok(restored)) = restored {
+                    items.push(restored);
+                }
+            }
+        }
         if let (Some(repo), Ok(client)) = &resolved {
             let discovered = mcp
                 .with_backend_db(|conn| {
@@ -898,6 +984,27 @@ fn handle_pr_status(
         crate::worktree::PrCiStatus::Pending | crate::worktree::PrCiStatus::Unknown => {
             result.skipped += 1;
         }
+    }
+}
+
+/// Item #234's self-heal (`run_review_sweep`'s `stray_candidates` handling):
+/// confirms a stray item's tracked PR hasn't simply been closed without
+/// merging before restoring the item to "in_review" -- an abandoned PR is
+/// the one case metadata presence and claim liveness alone can't rule out.
+/// Split out from the sweep's loop, mirroring `merge_approved_pr`'s own
+/// test seam, so tests can drive it against a mock server instead of
+/// `Client::new()`'s real credentials/host -- `run_review_sweep`'s own
+/// integration tests never touch the network at all (see
+/// `throwaway_repo`'s doc comment), so this is the only way to pin the
+/// actual open/merged/closed decision.
+fn stray_pr_is_still_relevant(
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    number: u64,
+) -> bool {
+    match crate::github::pulls::get(client, repo, number) {
+        Ok(pr) => pr.state != "closed" || pr.merged_at.is_some(),
+        Err(_) => false,
     }
 }
 

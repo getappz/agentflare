@@ -1168,6 +1168,9 @@ fn run_review_sweep_skips_a_numbered_item_the_same_way_when_no_remote_resolves()
     assert!(queue.list(None).unwrap().is_empty());
 }
 
+#[path = "supervisor/tests/stray_pr_tests.rs"]
+mod stray_pr_tests;
+
 #[test]
 fn run_review_sweep_scans_in_review_items_from_every_registered_project_not_just_one() {
     // Item #124: review sweep used to resolve a single project via

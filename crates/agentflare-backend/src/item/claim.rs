@@ -36,13 +36,18 @@ pub fn agent_part(owner: &str) -> String {
     agent_registry::canonicalize(owner.split(':').next().unwrap_or(owner))
 }
 
-/// Strips a `model` key out of an item's `metadata` JSON, returning the
-/// re-serialized object only when a `model` key was actually present (so
-/// callers can skip a pointless update when there's nothing to clear).
-fn without_model_metadata(metadata: &str) -> Option<String> {
+/// Strips the given top-level keys out of an item's `metadata` JSON,
+/// returning the re-serialized object only when at least one was actually
+/// present (so callers can skip a pointless update when there's nothing to
+/// clear).
+fn without_metadata_keys(metadata: &str, keys: &[&str]) -> Option<String> {
     let mut value: serde_json::Value = serde_json::from_str(metadata).ok()?;
-    let removed = value.as_object_mut()?.remove("model").is_some();
-    removed.then(|| value.to_string())
+    let obj = value.as_object_mut()?;
+    let mut removed_any = false;
+    for key in keys {
+        removed_any |= obj.remove(*key).is_some();
+    }
+    removed_any.then(|| value.to_string())
 }
 
 /// Claims an item so other agents don't duplicate the work: on a fresh
@@ -317,11 +322,20 @@ pub fn redispatch(
     // redispatch is about to hand the item to someone else.
     let agent_changed =
         item.assignee_agent.as_deref().map(agent_part).as_deref() != Some(agent.as_str());
-    let metadata = if agent_changed {
-        without_model_metadata(&item.metadata)
+    // `metadata.pr` (set by `push_and_open_pr`/`discover_untracked_prs` at
+    // PR-creation/discovery time) is always cleared here, regardless of
+    // `agent_changed` -- redispatch resets state to "backlog" specifically
+    // for a *fresh* attempt, so a PR tracked from whatever attempt is being
+    // abandoned is stale by construction. Leaving it in place used to mean
+    // `run_review_sweep`'s stray-PR self-heal (item #234) would see the old
+    // `metadata.pr.number` on a backlog item and drag it straight back into
+    // "in_review" on the very next tick, undoing the redispatch.
+    let cleared_keys: &[&str] = if agent_changed {
+        &["model", "pr"]
     } else {
-        None
+        &["pr"]
     };
+    let metadata = without_metadata_keys(&item.metadata, cleared_keys);
 
     let backlog_state = crate::state::first_in_group(&tx, &item.project_id, "backlog")?;
     update_state(&tx, item_id, &backlog_state.id)?;
