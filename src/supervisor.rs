@@ -6,6 +6,14 @@
 use crate::mcp_server::AgentflareMcp;
 use crate::mcp_server::types::{CommentRequest, ItemRequest};
 
+mod telegram;
+pub(crate) use telegram::poll_telegram_approvals;
+#[cfg(test)]
+use telegram::{
+    IN_FLIGHT_UPDATE_OFFSETS, handle_chat_message, handle_telegram_callback, mark_in_flight,
+    parse_approve_callback, safe_offset_to_persist, settle,
+};
+
 /// Also read by `mcp_server::handoff` — a freshly handed-off item is labeled
 /// with this so the discovery loop below notices it without a human having
 /// to add the label by hand. Single source of truth so the two can't drift.
@@ -45,12 +53,53 @@ const NEEDS_DECISION_LABEL: &str = "needs-decision";
 /// rename.
 const PR_APPROVAL_LABEL: &str = "status:pr:approved";
 
+/// Stage labels the review sweep swaps on the PR itself as it moves through
+/// self-repair, mirroring the `agentflare:in-review` -> `agentflare:completed`
+/// convention `worktree::push_and_open_pr`/`relabel_pr_completed` already use
+/// for the outer create/merge stages -- these extend the same vocabulary for
+/// what happens in between, so a human watching the PR on GitHub (rather
+/// than the item's internal comment thread) can see it's being repaired
+/// automatically instead of just silently sitting on red CI.
+const IN_REVIEW_PR_LABEL: &str = "agentflare:in-review";
+const SELF_REPAIR_PR_LABEL: &str = "agentflare:self-repair";
+const NEEDS_HUMAN_PR_LABEL: &str = "agentflare:needs-human";
+
+/// Best-effort GitHub-visible stage transition for a PR: removes `from` (if
+/// any -- tolerates it already being absent, same as every other caller of
+/// `remove_label`), adds `to`, and posts `comment`. Never returns an error:
+/// a lost status update must never block or undo the sweep's own DB
+/// mutation, which has already happened by the time this runs -- same
+/// fail-open contract `relabel_pr_completed` and `merge_approved_pr` use for
+/// their own GitHub calls.
+fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str, comment: &str) {
+    let Some(repo) = crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
+    else {
+        return;
+    };
+    let Ok(client) = crate::github::Client::new() else {
+        return;
+    };
+    if let Err(e) = crate::github::issues::add_labels(&client, &repo, number, &[to.to_string()]) {
+        eprintln!("agentflare-supervisor: could not add {to} to PR #{number}: {e}");
+    }
+    if let Some(from) = from
+        && let Err(e) = crate::github::issues::remove_label(&client, &repo, number, from)
+    {
+        eprintln!("agentflare-supervisor: could not remove {from} from PR #{number}: {e}");
+    }
+    if let Err(e) = crate::github::issues::comment(&client, &repo, number, comment) {
+        eprintln!("agentflare-supervisor: could not comment on PR #{number}: {e}");
+    }
+}
+
 /// `vault` secret holding the Telegram chat id human-gate pings go to.
 /// Reuses the same `channels`/`vault` path as `agentflare channel send`
 /// rather than inventing a separate config store for one setting -- set it
 /// with `agentflare vault set telegram_notify_chat_id <chat_id>` alongside
-/// `telegram_bot_token` (see `channels::Platform::secret_name`).
-const TELEGRAM_NOTIFY_CHAT_ID_SECRET: &str = "telegram_notify_chat_id";
+/// `telegram_bot_token` (see `channels::Platform::secret_name`). Also read by
+/// `crate::chat_channel` to authorize which chat's free-text/slash-command
+/// messages it acts on -- the same chat a PR-approval card would be sent to.
+pub(crate) const TELEGRAM_NOTIFY_CHAT_ID_SECRET: &str = "telegram_notify_chat_id";
 
 /// Since item #19, work items run in-process via `WorkItemExecutor` rather
 /// than as a spawned `agentflare work` subprocess, so this is no longer an
@@ -82,6 +131,68 @@ pub(crate) fn resolve_confirmed_agent(assignee: &str) -> Option<agent_registry::
         .find(|s| s.id.as_str() == canonical)
         .map(|s| s.id)?;
     agent_registry::autonomous_args(agent).map(|_| agent)
+}
+
+/// Falls back to `~/.agentflare/config.toml`'s `[router]` rules for an item
+/// with no usable `assignee_agent` -- the same rules `agentflare work`
+/// already consults when a human runs it against an unassigned item
+/// (`cli::work::resolve_agent`), reused here rather than duplicated so the
+/// two paths can't drift. Without this, `self_repair_or_gate` used to just
+/// skip an unassigned item's failing PR forever, with no comment, no label,
+/// no cap counting -- an item `discover_untracked_prs` creates for a
+/// hand-opened PR always has `assignee_agent: None`, so its self-repair
+/// silently never fired even with a `[router]` rule configured to auto-pick
+/// an implementer (confirmed live on image-qc item #19 -- stuck for hours
+/// with a red PR and no dispatch attempt of any kind).
+///
+/// `run_discovery_tick`'s own tier-5 eligibility check
+/// (`quota::decide::decide`) has the identical gap for a plain
+/// `ready-for-work` item with no assignee, deliberately NOT fixed here: that
+/// check runs on every item on every tick and is documented side-effect-free,
+/// while this call's `detect_all_with` shells out to probe installed agent
+/// CLIs and `state::save` persists a rotation counter -- both fine for
+/// self-repair's much rarer per-failing-PR cadence, not for a per-tick,
+/// per-item hot path. Fixing that one needs its own design pass (cache
+/// detection results, or move routing before/outside the pure decide()).
+fn route_unassigned(item: &agentflare_backend::item::Item) -> Option<agent_registry::Agent> {
+    let mut state = crate::state::load();
+    let installed: Vec<agent_registry::Agent> = agent_registry::detect_all_with(
+        agent_registry::REGISTRY,
+        &mut state.version_cache,
+        &agent_registry::RealVersionRunner,
+    )
+    .iter()
+    .filter_map(|d| agent_registry::agent_by_name(d.id))
+    .collect();
+    let config = crate::cli::work::load_router_config();
+    let agent = route_unassigned_with(item, &config, &installed, &mut state.router_rotation);
+    crate::state::save(&state);
+    agent
+}
+
+/// The pure decision core of `route_unassigned`, split out so a test can
+/// drive it with a synthetic `config`/`installed`/`rotation` instead of this
+/// machine's real installed-agent detection and `~/.agentflare/config.toml`.
+fn route_unassigned_with(
+    item: &agentflare_backend::item::Item,
+    config: &agent_registry::RouterConfig,
+    installed: &[agent_registry::Agent],
+    rotation: &mut std::collections::HashMap<String, u64>,
+) -> Option<agent_registry::Agent> {
+    let task = agent_registry::TaskContext {
+        labels: Vec::new(),
+        kind: crate::mcp_server::item::parsed_kind(&item.metadata),
+        size: crate::mcp_server::item::parsed_size(&item.metadata),
+        repo: None,
+        assigned_agent: None,
+        role: Some("implementer".to_string()),
+    };
+    let autonomous: Vec<agent_registry::Agent> = installed
+        .iter()
+        .copied()
+        .filter(|agent| agent_registry::autonomous_args(*agent).is_some())
+        .collect();
+    agent_registry::route(&task, config, &autonomous, rotation).map(|d| d.agent)
 }
 
 pub(crate) struct DiscoveryTickResult {
@@ -355,7 +466,7 @@ fn ask_item(
 /// passed straight through to `--model <name>` (see `build_extra_args` in
 /// `cli/work.rs`) — model catalogs change too often to hardcode, and the
 /// underlying agent CLI already errors on an unknown name.
-fn item_model_override(metadata: &str) -> Option<String> {
+pub(crate) fn item_model_override(metadata: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(metadata)
         .ok()?
         .get("model")?
@@ -402,23 +513,48 @@ fn dispatch_item(
     label_id_by_name: &std::collections::HashMap<String, String>,
     ready_id: &str,
 ) -> bool {
+    // Single-flight guard (item #221): a row already queued/running for this
+    // item means a prior tick dispatched it — its ready→dispatched swap may
+    // have failed, or reconcile re-armed it for auto-retry — and enqueueing
+    // again just floods agent_jobs while workers never catch up. Skip; the
+    // existing row will run.
+    if job_in_flight(queue, &item.id) {
+        eprintln!(
+            "agentflare-supervisor: item #{} ({}) already has a queued/running job — skipping duplicate dispatch",
+            item.sequence_id, item.id
+        );
+        return false;
+    }
     let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), None) else {
         return false;
     };
 
-    let _ = mcp.item_remove_label(ItemRequest {
+    // Label-swap failures are logged, not swallowed: a failed swap leaves
+    // the item visible to the next tick's discovery query, silently
+    // re-arming the loop above (item #221).
+    if let Err(e) = mcp.item_remove_label(ItemRequest {
         action: "remove_label".into(),
         id: Some(item.id.clone()),
         label_id: Some(ready_id.to_string()),
         ..Default::default()
-    });
-    if let Some(dispatched_id) = label_id_by_name.get(DISPATCHED_LABEL) {
-        let _ = mcp.item_add_label(ItemRequest {
+    }) {
+        eprintln!(
+            "agentflare-supervisor: failed to remove {READY_LABEL} from item #{} ({}): {e}",
+            item.sequence_id, item.id
+        );
+    }
+    if let Some(dispatched_id) = label_id_by_name.get(DISPATCHED_LABEL)
+        && let Err(e) = mcp.item_add_label(ItemRequest {
             action: "add_label".into(),
             id: Some(item.id.clone()),
             label_id: Some(dispatched_id.clone()),
             ..Default::default()
-        });
+        })
+    {
+        eprintln!(
+            "agentflare-supervisor: failed to add {DISPATCHED_LABEL} to item #{} ({}): {e}",
+            item.sequence_id, item.id
+        );
     }
     let _ = mcp.comment_impl(CommentRequest {
         action: "create".into(),
@@ -582,16 +718,22 @@ pub(crate) fn run_review_sweep(
             label_id_by_name,
         } = batch;
         let repo_root = std::path::PathBuf::from(&folder_path);
-        if let (Some(repo), Ok(client)) = (
+        // Resolved once per project and reused for discovery, the batched
+        // GraphQL fetch below, and (implicitly, inside `pr_ci_status`) the
+        // per-item REST fallback -- rather than every one of those re-doing
+        // the same remote/credential resolution, as the old one-call-per-item
+        // loop used to via its own internal `pr_ci_status` call.
+        let resolved = (
             crate::github::RepoId::resolve_from_remote(&repo_root),
             crate::github::Client::new(),
-        ) {
+        );
+        if let (Some(repo), Ok(client)) = &resolved {
             let discovered = mcp
                 .with_backend_db(|conn| {
                     crate::worktree::discover_untracked_prs(
                         conn,
-                        &client,
-                        &repo,
+                        client,
+                        repo,
                         &project_id,
                         &in_review_state_id,
                         &known_pr_numbers,
@@ -601,61 +743,162 @@ pub(crate) fn run_review_sweep(
                 .unwrap_or(0);
             result.discovered += discovered;
         }
+
+        // Items carrying `metadata.pr.number` (set by `push_and_open_pr` at
+        // PR-creation time) are batched into a handful of GraphQL queries
+        // instead of one REST call each -- see `github::graphql`'s doc
+        // comment for the rate-limit math this avoids. Only items that
+        // predate that field fall back to the old one-REST-call-per-item
+        // path below, which also carries the branch-name-heuristic lookup
+        // those items still need.
+        let mut numbered: Vec<(&agentflare_backend::item::Item, u64)> = Vec::new();
+        let mut unnumbered: Vec<&agentflare_backend::item::Item> = Vec::new();
         for item in &items {
-            match crate::worktree::pr_ci_status(item, &repo_root) {
-                crate::worktree::PrCiStatus::Merged => {
-                    if promote_merged_item(mcp, item) {
-                        result.promoted += 1;
-                    } else {
-                        result.skipped += 1;
-                    }
-                }
-                crate::worktree::PrCiStatus::Failing(failed_checks) => {
-                    match self_repair_or_gate(
-                        mcp,
-                        queue,
-                        auth_conn,
-                        host_policy,
-                        item,
-                        &failed_checks,
-                        &label_id_by_name,
-                        &folder_path,
-                    ) {
-                        SelfRepairOutcome::Dispatched => result.self_repaired += 1,
-                        SelfRepairOutcome::Deferred => result.waiting += 1,
-                        SelfRepairOutcome::Skipped => result.skipped += 1,
-                    }
-                }
-                crate::worktree::PrCiStatus::Passing { number, labels } => {
-                    if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) && first_time_gated(&item.id)
-                    {
-                        notify_human_gate(
-                            item,
-                            &format!(
-                                "PR #{number} is CI-green and mergeable, awaiting `{PR_APPROVAL_LABEL}`"
-                            ),
-                        );
-                    }
-                    if merge_if_approved(mcp, item, &repo_root, number, &labels) {
-                        result.promoted += 1;
-                    } else {
-                        result.skipped += 1;
-                    }
-                }
-                crate::worktree::PrCiStatus::Behind { number } => {
-                    if crate::worktree::update_stale_branch(&repo_root, number) {
-                        result.updated += 1;
-                    } else {
-                        result.skipped += 1;
-                    }
-                }
-                crate::worktree::PrCiStatus::Pending | crate::worktree::PrCiStatus::Unknown => {
-                    result.skipped += 1;
-                }
+            match crate::worktree::pr_number_from_metadata(item) {
+                Some(number) => numbered.push((item, number)),
+                None => unnumbered.push(item),
             }
+        }
+
+        let batch_data = if let (Some(repo), Ok(client)) = &resolved {
+            let numbers: Vec<u64> = numbered.iter().map(|(_, n)| *n).collect();
+            crate::github::graphql::batch_pr_status_chunked(client, repo, &numbers)
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        for (item, number) in numbered {
+            // A PR number missing from `batch_data` (query failed for its
+            // chunk, or GitHub couldn't resolve that PR) is treated exactly
+            // like any other soft-fail: `Unknown`, polled again next tick --
+            // never an error for the whole sweep.
+            let status = match batch_data.get(&number) {
+                Some(data) => crate::worktree::pr_ci_status_from_batch(number, data),
+                None => crate::worktree::PrCiStatus::Unknown,
+            };
+            handle_pr_status(
+                mcp,
+                queue,
+                auth_conn,
+                host_policy,
+                item,
+                status,
+                &label_id_by_name,
+                &folder_path,
+                &repo_root,
+                &mut result,
+            );
+        }
+        for item in unnumbered {
+            let status = crate::worktree::pr_ci_status(item, &repo_root);
+            handle_pr_status(
+                mcp,
+                queue,
+                auth_conn,
+                host_policy,
+                item,
+                status,
+                &label_id_by_name,
+                &folder_path,
+                &repo_root,
+                &mut result,
+            );
         }
     }
     result
+}
+
+/// Acts on one item's already-fetched `PrCiStatus`, however it was fetched --
+/// batched via GraphQL or singly via REST. Split out of `run_review_sweep`'s
+/// loop so both fetch paths (`numbered`/`unnumbered` above) drive the exact
+/// same decision-and-mutate logic instead of two copies that could drift.
+///
+/// Every mutating branch here (`promote_merged_item`, `merge_if_approved`,
+/// `update_stale_branch`) makes its own live GitHub call as the actual
+/// authority, regardless of how stale `status` (a point-in-time snapshot,
+/// batched or not) might be by the time this runs -- a rejection from that
+/// live call (already merged, already up to date, no longer mergeable) falls
+/// through to `skipped` rather than erroring, so acting on a stale snapshot
+/// is always safe. `self_repair_or_gate` additionally re-checks claim
+/// liveness before dispatching, guarding the one branch here that starts new
+/// work rather than just re-attempting an idempotent GitHub operation.
+#[allow(clippy::too_many_arguments)]
+fn handle_pr_status(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    auth_conn: &rusqlite::Connection,
+    host_policy: agentflare_resource_gate::Policy,
+    item: &agentflare_backend::item::Item,
+    status: crate::worktree::PrCiStatus,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+    folder_path: &str,
+    repo_root: &std::path::Path,
+    result: &mut ReviewSweepResult,
+) {
+    match status {
+        crate::worktree::PrCiStatus::Merged => {
+            if promote_merged_item(mcp, item) {
+                result.promoted += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
+        crate::worktree::PrCiStatus::Failing { number, checks } => {
+            match self_repair_or_gate(
+                mcp,
+                queue,
+                auth_conn,
+                host_policy,
+                item,
+                number,
+                &checks,
+                label_id_by_name,
+                folder_path,
+            ) {
+                SelfRepairOutcome::Dispatched => result.self_repaired += 1,
+                SelfRepairOutcome::Deferred => result.waiting += 1,
+                SelfRepairOutcome::Skipped => result.skipped += 1,
+            }
+        }
+        crate::worktree::PrCiStatus::Passing { number, labels } => {
+            // CI just went green -- if the PR was still carrying a
+            // self-repair/needs-human stage label from before, swap it back
+            // to plain in-review rather than leaving a stale "under repair"
+            // label on a now-passing PR. `labels` is already in hand from
+            // the batched/single fetch above, so this only touches GitHub
+            // when there's actually something to revert.
+            if let Some(stale) = [SELF_REPAIR_PR_LABEL, NEEDS_HUMAN_PR_LABEL]
+                .into_iter()
+                .find(|l| labels.iter().any(|have| have == l))
+            {
+                update_pr_stage(
+                    folder_path,
+                    number,
+                    Some(stale),
+                    IN_REVIEW_PR_LABEL,
+                    "## supervisor — CI green\n\nChecks are passing again.",
+                );
+            }
+            if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) && first_time_gated(&item.id) {
+                notify_pr_approval_gate(item, folder_path, number);
+            }
+            if merge_if_approved(mcp, item, repo_root, number, &labels) {
+                result.promoted += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
+        crate::worktree::PrCiStatus::Behind { number } => {
+            if crate::worktree::update_stale_branch(repo_root, number) {
+                result.updated += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
+        crate::worktree::PrCiStatus::Pending | crate::worktree::PrCiStatus::Unknown => {
+            result.skipped += 1;
+        }
+    }
 }
 
 fn promote_merged_item(mcp: &AgentflareMcp, item: &agentflare_backend::item::Item) -> bool {
@@ -851,6 +1094,57 @@ pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &
     }
 }
 
+/// Escape the characters Telegram's HTML `parse_mode` treats specially, so
+/// an arbitrary item title/description can't break card formatting (or be
+/// interpreted as an unintended tag).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Telegram-only rich variant of [`notify_human_gate`] for the one gate a
+/// human can resolve with a single tap: CI is green and the only thing
+/// missing is `PR_APPROVAL_LABEL`. Unlike the plain-text pings, this carries
+/// an inline "Approve" button whose `callback_data` embeds the repo and PR
+/// number directly (`approve:{owner}/{repo}#{number}`) -- self-contained,
+/// so [`poll_telegram_approvals`] never needs to re-resolve a worktree path
+/// to act on a click. Same fail-open contract as `notify_human_gate`: no-ops
+/// without a configured chat id or a resolvable repo, and a send failure
+/// only logs.
+fn notify_pr_approval_gate(item: &agentflare_backend::item::Item, folder_path: &str, number: u64) {
+    let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
+        return;
+    };
+    let Some(repo) = crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
+    else {
+        return;
+    };
+    let excerpt: String = item.description.chars().take(200).collect();
+    let text = format!(
+        "\u{1F514} <b>agentflare</b> needs a human\n\
+         <b>Repo:</b> {repo}\n\
+         <b>Item:</b> #{} \u{2014} {}\n\
+         {}\n\n\
+         PR <a href=\"https://github.com/{repo}/pull/{number}\">#{number}</a> is CI-green and \
+         mergeable, awaiting <code>{PR_APPROVAL_LABEL}</code>.",
+        item.sequence_id,
+        html_escape(&item.name),
+        html_escape(&excerpt),
+    );
+    let callback_data = format!("approve:{repo}#{number}");
+    if let Err(e) = crate::channels::send_telegram_card(
+        &chat_id,
+        &text,
+        &[("\u{2705} Approve", &callback_data)],
+    ) {
+        eprintln!(
+            "agentflare-supervisor: telegram card notify failed for item #{}: {e}",
+            item.sequence_id
+        );
+    }
+}
+
 /// True the first time a given item id is seen gated since this process
 /// started, false on every later call for the same id -- `run_discovery_tick`
 /// re-visits an already-gated item on every tick (it stays in the
@@ -878,6 +1172,7 @@ fn self_repair_or_gate(
     auth_conn: &rusqlite::Connection,
     host_policy: agentflare_resource_gate::Policy,
     item: &agentflare_backend::item::Item,
+    pr_number: u64,
     failed_checks: &[String],
     label_id_by_name: &std::collections::HashMap<String, String>,
     folder_path: &str,
@@ -907,15 +1202,16 @@ fn self_repair_or_gate(
         .unwrap_or(0);
 
     if prior_attempts >= crate::quota::decide::SELF_REPAIR_CAP {
+        let cap_message = format!(
+            "## supervisor — CI self-repair cap reached\n\nFailing checks: {}. \
+             {} automatic repair attempt(s) already made with no green build — needs a human look.",
+            failed_checks.join(", "),
+            crate::quota::decide::SELF_REPAIR_CAP,
+        );
         let _ = mcp.comment_impl(CommentRequest {
             action: "create".into(),
             item_id: Some(item.id.clone()),
-            body: Some(format!(
-                "## supervisor — CI self-repair cap reached\n\nFailing checks: {}. \
-                 {} automatic repair attempt(s) already made with no green build — needs a human look.",
-                failed_checks.join(", "),
-                crate::quota::decide::SELF_REPAIR_CAP,
-            )),
+            body: Some(cap_message.clone()),
             ..Default::default()
         });
         if let Some(gate_id) = label_id_by_name.get(NEEDS_HUMAN_GATE_LABEL) {
@@ -926,6 +1222,13 @@ fn self_repair_or_gate(
                 ..Default::default()
             });
         }
+        update_pr_stage(
+            folder_path,
+            pr_number,
+            Some(SELF_REPAIR_PR_LABEL),
+            NEEDS_HUMAN_PR_LABEL,
+            &cap_message,
+        );
         notify_human_gate(
             item,
             &format!(
@@ -968,6 +1271,7 @@ fn self_repair_or_gate(
         .assignee_agent
         .as_deref()
         .and_then(resolve_confirmed_agent)
+        .or_else(|| route_unassigned(item))
     else {
         return SelfRepairOutcome::Skipped;
     };
@@ -983,17 +1287,25 @@ fn self_repair_or_gate(
     let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), Some(&reason)) else {
         return SelfRepairOutcome::Skipped;
     };
+    let dispatch_message = format!(
+        "{CI_SELF_REPAIR_MARKER}\n\nCI is failing on this PR: {}.\n\n\
+         Please investigate and push a fix.\n\njob: {}",
+        failed_checks.join(", "),
+        info.id,
+    );
     let _ = mcp.comment_impl(CommentRequest {
         action: "create".into(),
         item_id: Some(item.id.clone()),
-        body: Some(format!(
-            "{CI_SELF_REPAIR_MARKER}\n\nCI is failing on this PR: {}.\n\n\
-             Please investigate and push a fix.\n\njob: {}",
-            failed_checks.join(", "),
-            info.id,
-        )),
+        body: Some(dispatch_message.clone()),
         ..Default::default()
     });
+    update_pr_stage(
+        folder_path,
+        pr_number,
+        Some(IN_REVIEW_PR_LABEL),
+        SELF_REPAIR_PR_LABEL,
+        &dispatch_message,
+    );
     SelfRepairOutcome::Dispatched
 }
 

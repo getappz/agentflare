@@ -36,6 +36,8 @@ pub struct Item {
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
+    pub start_date: Option<i64>,
+    pub due_date: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +56,8 @@ pub struct CreateItem {
     pub label_ids: Vec<String>,
     pub assignee_ids: Vec<String>,
     pub dependency_ids: Vec<String>,
+    pub start_date: Option<i64>,
+    pub due_date: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -70,6 +74,8 @@ pub struct UpdateItem {
     /// `Some(None)` detaches the item from its parent — otherwise a parent
     /// set by mistake could never be removed again.
     pub parent_id: Option<Option<String>>,
+    pub start_date: Option<i64>,
+    pub due_date: Option<i64>,
 }
 
 fn now() -> i64 {
@@ -100,6 +106,8 @@ fn row_to_item(row: &rusqlite::Row) -> rusqlite::Result<Item> {
         created_at: row.get(16)?,
         updated_at: row.get(17)?,
         deleted_at: row.get(18)?,
+        start_date: row.get(19)?,
+        due_date: row.get(20)?,
     })
 }
 

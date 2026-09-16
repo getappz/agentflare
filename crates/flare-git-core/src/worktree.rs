@@ -273,10 +273,30 @@ pub fn task_branch_name(item: &Item) -> String {
     }
 }
 
+/// The branch `item.metadata.pr.branch` already names -- set by
+/// `discover_untracked_prs` for a PR opened by hand (outside the item-done
+/// flow) and by `persist_pr_identity` for one opened through it, both in the
+/// same `{"pr":{"number":N,"branch":"..."}}` shape. When present, this is
+/// the actual branch the item's PR lives on and must win over
+/// `task_branch_name`'s sequence-id-derived guess -- for a hand-opened PR
+/// that guess names a branch that has nothing to do with the PR at all,
+/// which is exactly how dispatching self-repair on a `discover_untracked_prs`
+/// item created a brand-new orphan branch and a duplicate PR instead of
+/// continuing the existing one (confirmed live against image-qc item #19 /
+/// PR #311: self-repair pushed `task/19-...` and opened duplicate PR #314).
+fn tracked_pr_branch(item: &Item) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&item.metadata)
+        .ok()?
+        .get("pr")?
+        .get("branch")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// The branch `item`'s worktree is (or should be) on: whatever a worktree
 /// already sitting at `worktree_path` is *actually* checked out to, falling
-/// back to the freshly-derived `task_branch_name` only when no worktree
-/// exists there yet.
+/// back to `tracked_pr_branch` (the item's own known PR branch) or, absent
+/// that, the freshly-derived `task_branch_name`.
 ///
 /// `task_branch_name` recomputes its slug from `item.name` every call, so it
 /// silently changes if the item gets renamed between claims -- and a
@@ -286,17 +306,23 @@ pub fn task_branch_name(item: &Item) -> String {
 /// re-claim detection miss the existing worktree, so `git worktree add`
 /// collides with the already-occupied path instead of reusing it (item
 /// #459's dispatch-blocking loop on item #447, which predates the slugged
-/// scheme).
+/// scheme). The on-disk check also accepts `tracked_pr_branch`'s value as a
+/// valid current checkout, not just the `task/<seq>[-slug]` shapes -- without
+/// that, a second dispatch onto an item already correctly sitting on its
+/// tracked PR branch would fail this match and re-derive `task_branch_name`
+/// all over again, undoing the fix on every dispatch after the first.
 fn resolve_worktree_branch(item: &Item, worktree_path: &Path) -> String {
+    let expected = tracked_pr_branch(item).unwrap_or_else(|| task_branch_name(item));
     if worktree_path.is_dir()
         && let Ok(current) = run_git_in(worktree_path, &["branch", "--show-current"])
         && !current.is_empty()
-        && (current == format!("task/{}", item.sequence_id)
+        && (current == expected
+            || current == format!("task/{}", item.sequence_id)
             || current.starts_with(&format!("task/{}-", item.sequence_id)))
     {
         return current;
     }
-    task_branch_name(item)
+    expected
 }
 
 /// The branch `item`'s worktree is (or should be) on — whatever is
@@ -409,9 +435,18 @@ pub fn create_worktree(
         // unconditionally refuses to check out a branch git still considers
         // checked out elsewhere ("already checked out" / prunable registration
         // -- confirmed live on item #331, regenerating on every dispatch
-        // attempt without this). Prune first so a stale registration for this
-        // branch never survives to block reuse.
-        crate::shell::prune_worktree_metadata_if(repo_root, true);
+        // attempt without this). Clear that registration first so it never
+        // survives to block reuse.
+        //
+        // Deliberately NOT `git worktree prune`: prune is repo-wide, and it
+        // drops the admin entry of ANY worktree whose `gitdir` file points
+        // somewhere non-existent -- even one whose directory is fully intact
+        // and holds uncommitted work. That turned one item's failed-dispatch
+        // retry into another item's data loss: the victim's `.git` pointer
+        // became dangling, `audit_orphans` then classified it as a broken-
+        // gitdir orphan, and `gc_orphans` deleted it. Scope the cleanup to
+        // this branch's own stale registration instead.
+        remove_stale_registration_for(repo_root, &branch);
         // Check it out as-is, no `-b` -- git auto-creates the local tracking
         // branch when only the remote-tracking ref exists, same as `git
         // checkout <branch>`.
@@ -501,6 +536,60 @@ pub fn create_worktree(
             Err(msg)
         }
     }
+}
+
+/// Removes the stale `.git/worktrees/<name>` admin entry that claims
+/// `branch`, if there is one. Returns whether anything was removed.
+///
+/// This is the narrow, per-branch equivalent of `git worktree prune`, and
+/// exists because prune's blast radius is the whole repo. Prune deletes the
+/// admin entry of *every* registration whose `gitdir` file points at a
+/// missing path — including a worktree that is still fully present on disk
+/// with uncommitted work in it, whose admin entry merely went stale (a
+/// moved checkout, an interrupted operation, or a Windows path/locking
+/// hiccup). The victim is left with a dangling `.git` pointer, which
+/// `audit_orphans` reads as "broken gitdir" and `gc_orphans` then deletes.
+///
+/// Two guards keep this scoped: only registrations whose `HEAD` names
+/// `branch` are considered, and only ones whose checkout directory is
+/// actually gone. A registration pointing at a live directory is never
+/// touched, so another item's worktree can never be collateral damage.
+fn remove_stale_registration_for(repo_root: &Path, branch: &str) -> bool {
+    let Ok(common_dir) = run_git_in(repo_root, &["rev-parse", "--git-common-dir"]) else {
+        return false;
+    };
+    let admin_root = repo_root.join(common_dir.trim()).join("worktrees");
+    let Ok(entries) = std::fs::read_dir(&admin_root) else {
+        return false;
+    };
+    let wanted_head = format!("ref: refs/heads/{branch}");
+    let mut removed = false;
+    for entry in entries.flatten() {
+        let admin = entry.path();
+        if !admin.is_dir() {
+            continue;
+        }
+        // Does this registration claim our branch?
+        let head = std::fs::read_to_string(admin.join("HEAD")).unwrap_or_default();
+        if head.trim() != wanted_head {
+            continue;
+        }
+        // `gitdir` holds "<checkout>/.git" -- its parent is the checkout.
+        // Preserve the registration if that directory still exists (or if
+        // the file is unreadable): fail closed, since removing a live
+        // worktree's registration is the exact harm this function avoids.
+        let gitdir = std::fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
+        let still_live = std::path::Path::new(gitdir.trim())
+            .parent()
+            .is_none_or(std::path::Path::exists);
+        if still_live {
+            continue;
+        }
+        if std::fs::remove_dir_all(&admin).is_ok() {
+            removed = true;
+        }
+    }
+    removed
 }
 
 /// Kills `child` and its whole process tree — not just the direct child —
@@ -981,7 +1070,9 @@ pub fn gc_orphans(repo_root: &Path, names: &[String]) -> Vec<String> {
         // point a destructive delete has; deleting anyway would defeat the
         // whole point of snapshotting first.
         let reason = format!("gc orphan worktree {}", name);
-        if let Err(e) = crate::snapshot::snapshot_before(repo_root, &reason) {
+        if let Err(e) =
+            crate::snapshot::snapshot_worktree_before(repo_root, &worktree_path, &reason)
+        {
             eprintln!(
                 "worktree: skipping orphan '{}', snapshot failed: {}",
                 name, e

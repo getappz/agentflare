@@ -4,7 +4,9 @@
 
 mod artifact;
 mod asset;
+mod browser;
 mod builtin_tools;
+mod chat;
 mod claim;
 mod comment;
 mod flare_docs;
@@ -13,9 +15,11 @@ mod handoff;
 pub(crate) mod item;
 mod item_doctor;
 mod memory_tool;
+mod pm;
 mod project_resolution;
 mod review;
 pub(crate) mod search;
+mod secret_scan;
 mod skill;
 pub(crate) mod types;
 mod workflow;
@@ -364,6 +368,16 @@ impl AgentflareMcp {
     )]
     async fn skill(&self, Parameters(req): Parameters<SkillRequest>) -> Result<String, ErrorData> {
         self.skill_impl(req).await
+    }
+
+    #[tool(
+        description = "Browser automation for AI agents — open, snapshot (@e refs), click, fill, read, eval, tabs, network, auth-state. Single consolidated tool with `action` field (open|snapshot|observe|extract|click|fill|type|press|hover|select|check|uncheck|back|forward|reload|get|read|screenshot|pdf|eval|wait|cookies|storage|network|tabs|dialog|console|errors|batch|state|close|doctor|status). Sessions isolate per worktree automatically; subcommands allowed (\"get text\", \"tab new\", \"cookies set\"). First use auto-installs the pure-Rust agent-browser sidecar via mise (prebuilt binary) unless AGENTFLARE_BROWSER_NO_AUTO_INSTALL is set."
+    )]
+    async fn browser(
+        &self,
+        Parameters(req): Parameters<BrowserRequest>,
+    ) -> Result<String, ErrorData> {
+        self.browser_impl(req).await
     }
 
     #[tool(
@@ -1335,14 +1349,19 @@ impl AgentflareMcp {
             "search" => self.item_search(req),
             "add_label" => self.item_add_label(req),
             "remove_label" => self.item_remove_label(req),
+            "add_relation" => self.item_add_relation(req),
+            "remove_relation" => self.item_remove_relation(req),
+            "list_relations" => self.item_list_relations(req),
             "redispatch" => self.item_redispatch(req),
             "groom" => self.item_groom(req),
             "standup" => self.item_standup(req),
             "health" => self.item_health(req),
             "doctor" => self.item_doctor(req),
+            "clear_start_date" => self.item_clear_start_date(req),
+            "clear_due_date" => self.item_clear_due_date(req),
             other => Err(ErrorData::invalid_params(
                 format!(
-                    "unknown item action: '{other}' — expected create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|redispatch|groom|standup|health|doctor"
+                    "unknown item action: '{other}' — expected create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|groom|standup|health|doctor|clear_start_date|clear_due_date"
                 ),
                 None,
             )),
@@ -1350,7 +1369,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|redispatch|groom|standup|health|doctor). `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck/bottlenecks scorecard (`bottlenecks` = items handed between agents ≥2× in the window; history starts at the assignment-log migration). The read-only reporting actions groom|standup|health accept a `project` override (name or UUID from `project action=list`) for portfolio roll-ups. `done` moves an item to \"in_review\" (not \"completed\") when it results in an open PR, and leaves the worktree in place for follow-up commits; call `check_merge` once the PR is confirmed merged to promote it to \"completed\" and clean up the worktree. Pass `summary` on `done` with what you changed and why — it becomes the PR body; omitting it leaves the PR with a generic placeholder description. `redispatch` is the AI-agent-safe way to re-arm a stuck or failed item for the daemon's own supervisor to pick back up -- `agentflare work <id>` refuses to run under an AI agent on purpose. It atomically resets state to backlog, clears stale `dispatched`/`needs-manual-dispatch` labels, re-attaches `ready-for-work`, and normalizes `assignee_agent` (pass one explicitly to override, or it reuses the item's existing one); errors on a completed/cancelled item, and returns an error asking for `assignee_agent` if the item has none. `doctor` is the MCP equivalent of `agentflare git doctor`: scans every worktree in this repo for dirty/stale/orphaned/duplicate-branch/missing-upstream health flags (respects `staleness_days`, default 14) and, with `reclaim=true`, deletes the clean stale/orphaned ones (never the main worktree; add `force=true` to also delete dirty ones) — this is the tool to reach for a `git worktree remove/prune` shim denial, not a specific item's `check_merge`/`release`. To fix ONE broken worktree, always pass `worktree=\"<lane name or path>\"` alongside `reclaim=true`/`force=true`. An unscoped `force=true` (no `worktree`) is now refused — pass `repo_wide=true` to explicitly confirm a repo-wide force-reclaim, since omitting it otherwise silently deletes every dirty lane, including other items' uncommitted work (2026-08-16 incident: an unscoped force reclaim meant to fix one lane deleted two others' uncommitted work)."
+        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|groom|standup|health|doctor). `add_relation`/`remove_relation` record a typed relation (`relation_type`: blocks|duplicate|relates_to) between this item (`id`) and another (`related_item_id`); `blocks` is directional and drives dependency/cascade behavior, `duplicate`/`relates_to` are symmetric and purely informational. `list_relations` returns all three types for an item, or just one if `relation_type` is passed. `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck/bottlenecks scorecard (`bottlenecks` = items handed between agents ≥2× in the window; history starts at the assignment-log migration). The read-only reporting actions groom|standup|health accept a `project` override (name or UUID from `project action=list`) for portfolio roll-ups. `done` moves an item to \"in_review\" (not \"completed\") when it results in an open PR, and leaves the worktree in place for follow-up commits; call `check_merge` once the PR is confirmed merged to promote it to \"completed\" and clean up the worktree. Pass `summary` on `done` with what you changed and why — it becomes the PR body; omitting it leaves the PR with a generic placeholder description. `redispatch` is the AI-agent-safe way to re-arm a stuck or failed item for the daemon's own supervisor to pick back up -- `agentflare work <id>` refuses to run under an AI agent on purpose. It atomically resets state to backlog, clears stale `dispatched`/`needs-manual-dispatch` labels, re-attaches `ready-for-work`, and normalizes `assignee_agent` (pass one explicitly to override, or it reuses the item's existing one); errors on a completed/cancelled item, and returns an error asking for `assignee_agent` if the item has none. `doctor` is the MCP equivalent of `agentflare git doctor`: scans every worktree in this repo for dirty/stale/orphaned/duplicate-branch/missing-upstream health flags (respects `staleness_days`, default 14) and, with `reclaim=true`, deletes the clean stale/orphaned ones (never the main worktree; add `force=true` to also delete dirty ones) — this is the tool to reach for a `git worktree remove/prune` shim denial, not a specific item's `check_merge`/`release`. To fix ONE broken worktree, always pass `worktree=\"<lane name or path>\"` alongside `reclaim=true`/`force=true`. An unscoped `force=true` (no `worktree`) is now refused — pass `repo_wide=true` to explicitly confirm a repo-wide force-reclaim, since omitting it otherwise silently deletes every dirty lane, including other items' uncommitted work (2026-08-16 incident: an unscoped force reclaim meant to fix one lane deleted two others' uncommitted work)."
     )]
     fn item(&self, Parameters(req): Parameters<ItemRequest>) -> Result<String, ErrorData> {
         self.item_inner(req)
@@ -1546,6 +1565,13 @@ impl AgentflareMcp {
     )]
     fn project(&self, Parameters(req): Parameters<ProjectRequest>) -> Result<String, ErrorData> {
         self.project_inner(req)
+    }
+
+    #[tool(
+        description = "Product management workflows -- read-only reports plus a PM-mode toggle, usable from any MCP client (not only Claude Code's `pm` skill + prompt hook). Single consolidated tool with `action` field (standup|groom|plan|health|portfolio|mode_on|mode_off|mode_status). standup/groom/health mirror `item`'s own actions of the same name and take the same params (cutoff_hours, staleness_days, limit, window_weeks, project override) -- `groom` additionally fixes `state_group=\"backlog,unstarted\"` so callers don't have to repeat it. `plan` is `groom` with a `capacity` Now-bucket forced on (default 5), matching the pm skill's Now/Next/Later split. `portfolio` loops every project in the workspace (`project action=list`) and rolls up `health` (default) or `standup` (`report` param) per project into one response. `mode_on`/`mode_off`/`mode_status` flip or read the same PM-mode flag the literal `/pm`, `/pm mode on`, and `/pm mode off` prompts toggle via agentflare's UserPromptSubmit hook -- unlike that hook, these work from any MCP client. Prioritization/scoring (RICE, WSJF, ICE, ...) for groom/plan stays the caller's job -- see the `pm` skill's reference/rubric.md; this tool only returns the precomputed shortlist/buckets."
+    )]
+    fn pm(&self, Parameters(req): Parameters<PmRequest>) -> Result<String, ErrorData> {
+        self.pm_inner(req)
     }
 
     #[tool(
@@ -1795,6 +1821,41 @@ impl AgentflareMcp {
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let service = AgentflareMcp::from_env().serve(stdio()).await?;
     service.waiting().await?;
+    Ok(())
+}
+
+/// Serve the MCP server over Streamable HTTP/SSE so one persistent agentflare
+/// process backs many concurrent agent sessions, instead of one cold-started
+/// OS process per connecting agent (the stdio default).
+pub async fn run_http(
+    host: &str,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+
+    // One server instance shared across every session: the point of HTTP mode
+    // is that a single process (and its lazily-opened skills/gateway registries
+    // and backend/store DB connections) backs many concurrent agent sessions,
+    // instead of cold-starting one per connection. The factory clones the Arc,
+    // so each rmcp session routes into the same `AgentflareMcp`.
+    let shared = std::sync::Arc::new(AgentflareMcp::from_env());
+
+    let service: StreamableHttpService<std::sync::Arc<AgentflareMcp>, LocalSessionManager> =
+        StreamableHttpService::new(
+            {
+                let shared = shared.clone();
+                move || Ok(shared.clone())
+            },
+            std::sync::Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+    let app = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind((host, port)).await?;
+    let addr = listener.local_addr()?;
+    eprintln!("agentflare MCP listening on http://{addr}/mcp (streamable HTTP)");
+    axum::serve(listener, app).await?;
     Ok(())
 }
 

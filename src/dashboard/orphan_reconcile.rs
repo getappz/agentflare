@@ -226,7 +226,17 @@ fn restore_ready_for_work(
                 conn,
                 item_id,
                 agentflare_backend::item::UpdateItem {
-                    assignee_agent: Some(agent.to_string()),
+                    // Prefer the item's own current assignee over this dead
+                    // job's frozen payload agent (item #230): a manual
+                    // reassignment made after this job was enqueued must
+                    // survive reconciliation, not get silently reverted back
+                    // to whoever the stale job was originally dispatched to.
+                    // Same precedence `item::claim::redispatch` already uses.
+                    assignee_agent: Some(
+                        item.assignee_agent
+                            .clone()
+                            .unwrap_or_else(|| agent.to_string()),
+                    ),
                     ..Default::default()
                 },
             )?;
@@ -365,7 +375,12 @@ pub(super) fn handle_terminal_job_failure(job: &agentflare_jobs::AgentJob) {
                 conn,
                 item_id,
                 agentflare_backend::item::UpdateItem {
-                    assignee_agent: Some(agent.clone()),
+                    // Prefer the item's own current assignee over this dead
+                    // job's frozen payload agent (item #230) -- see the
+                    // matching comment in `restore_ready_for_work` above.
+                    assignee_agent: Some(
+                        item.assignee_agent.clone().unwrap_or_else(|| agent.clone()),
+                    ),
                     ..Default::default()
                 },
             )
@@ -389,7 +404,12 @@ pub(super) fn handle_terminal_job_failure(job: &agentflare_jobs::AgentJob) {
                 conn,
                 item_id,
                 agentflare_backend::item::UpdateItem {
-                    assignee_agent: Some(agent.clone()),
+                    // Prefer the item's own current assignee over this dead
+                    // job's frozen payload agent (item #230) -- see the
+                    // matching comment in `restore_ready_for_work` above.
+                    assignee_agent: Some(
+                        item.assignee_agent.clone().unwrap_or_else(|| agent.clone()),
+                    ),
                     ..Default::default()
                 },
             )
@@ -458,4 +478,5 @@ pub(super) fn handle_terminal_job_failure(job: &agentflare_jobs::AgentJob) {
 #[cfg(test)]
 mod tests {
     include!("orphan_reconcile_tests.rs");
+    include!("orphan_reconcile_assignee_tests.rs");
 }

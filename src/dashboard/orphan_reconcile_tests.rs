@@ -68,6 +68,8 @@
                             label_ids: vec![],
                             assignee_ids: vec![],
                             dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
                         },
                     )
                     .unwrap()
@@ -185,6 +187,8 @@
                             label_ids: vec![],
                             assignee_ids: vec![],
                             dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
                         },
                     )
                     .unwrap()
@@ -269,6 +273,8 @@
                             label_ids: vec![],
                             assignee_ids: vec![],
                             dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
                         },
                     )
                     .unwrap()
@@ -398,6 +404,8 @@
                             label_ids: vec![],
                             assignee_ids: vec![],
                             dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
                         },
                     )
                     .unwrap();
@@ -528,6 +536,8 @@
                             label_ids: vec![],
                             assignee_ids: vec![],
                             dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
                         },
                     )
                     .unwrap();
@@ -664,6 +674,8 @@
                             label_ids: vec![],
                             assignee_ids: vec![],
                             dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
                         },
                     )
                     .unwrap();
@@ -779,6 +791,8 @@
                     label_ids: vec![],
                     assignee_ids: vec![],
                     dependency_ids: vec![],
+                    start_date: None,
+                    due_date: None,
                 },
             )
             .unwrap();
@@ -1291,6 +1305,8 @@
                             label_ids: vec![],
                             assignee_ids: vec![],
                             dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
                         },
                     )
                     .unwrap();
@@ -1325,6 +1341,15 @@
                     None,
                 );
             });
+
+            // The real `WorkerPool` marks a job's queue row terminally
+            // failed before invoking `terminal_failure_hook` (see the
+            // `..._after_default_intra_job_retries_still_auto_redispatches`
+            // test above, which goes through the real pool). Calling the
+            // hook directly like this test does must replicate that, or
+            // `dispatch_item`'s `job_in_flight` single-flight guard (item
+            // #221) sees this job still `queued` and refuses to redispatch.
+            queue.fail(&info.id, "transient network blip", None, true).unwrap();
 
             handle_terminal_job_failure(&job);
 

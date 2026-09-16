@@ -229,8 +229,14 @@ struct PreToolUseInput {
 fn parse_pre_tool_use(input: &str) -> Option<PreToolUseInput> {
     let v: serde_json::Value = serde_json::from_str(input).ok()?;
     let session_id = v.get("session_id")?.as_str()?.to_string();
-    let tool_name = v.get("tool_name")?.as_str()?.to_string();
-    let tool_input = v.get("tool_input").cloned();
+    let raw_tool_name = v.get("tool_name")?.as_str()?.to_string();
+    let raw_tool_input = v.get("tool_input").cloned();
+    // Unwrap flare-gateway `action="execute"` calls to the real tool they
+    // forward -- every classifier downstream (branch guard, completion
+    // gate) needs to see the actual tool/args, not the gateway envelope
+    // (item #559).
+    let (tool_name, tool_input) =
+        crate::hook_redirect::unwrap_gateway_call(&raw_tool_name, raw_tool_input.as_ref());
     let delay_seconds = tool_input
         .as_ref()
         .and_then(|ti| ti.get("delaySeconds"))
@@ -303,7 +309,7 @@ fn build_failure_decision(message: &str, severity: &str) -> serde_json::Value {
 /// simplification, not a downgrade), gates on nudge_pace so a repeat of
 /// the same topic within DEFAULT_COOLDOWN doesn't re-nudge, and only then
 /// emits a context nudge pointing at mcp__flare__vent.
-pub fn post_tool_failure(_agent: &str) {
+pub fn post_tool_failure(agent: &str) {
     let Some(input) = read_stdin_or_skip("PostToolUseFailure") else {
         return;
     };
@@ -330,7 +336,10 @@ pub fn post_tool_failure(_agent: &str) {
         return;
     }
 
-    let pace_key = format!("vent-nudge:{topic_key}");
+    // Scoped by agent (item #220) so two agents/hosts sharing a topic don't
+    // share a cooldown -- one agent's nudge must not silently suppress the
+    // other's.
+    let pace_key = format!("vent-nudge:{agent}:{topic_key}");
     if !crate::nudge_pace::should_fire(&pace_key, crate::nudge_pace::DEFAULT_COOLDOWN) {
         return;
     }
@@ -343,7 +352,42 @@ pub fn post_tool_failure(_agent: &str) {
 // #169) -- split out to stay under this file's LOC gate.
 pub use crate::hook_completion_gate::post_tool_use;
 
-pub fn pre_tool_use(_agent: &str) {
+/// Resolves an `item done`/`check_merge` call's target item to its
+/// `metadata.task_type`, for the systematic-debugging completion gate (item
+/// #203) -- `None` for any other tool call, action, or lookup failure (bad
+/// id, missing DB, item not found, unparseable metadata). Same "unknown, not
+/// failed" fail-open convention used throughout this file: a lookup failure
+/// must never add a diagnosis requirement that wasn't already there. This is
+/// a synchronous local SQLite read, precedented by `session_start_message`'s
+/// own unconditional `agentflare_backend::db::open_db` call above -- no
+/// timeout wrapper needed.
+fn resolve_item_task_type(
+    tool_name: &str,
+    tool_input: Option<&serde_json::Value>,
+) -> Option<String> {
+    if tool_name != crate::hook_redirect::ITEM_TOOL_NAME && tool_name != "item" {
+        return None;
+    }
+    let action = tool_input?.get("action")?.as_str()?;
+    if !crate::hook_redirect::GATED_ITEM_ACTIONS.contains(&action) {
+        return None;
+    }
+    let id_or_seq = tool_input?.get("id")?.as_str()?;
+    let db_path = crate::paths::home().join(".agentflare").join("backend.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = agentflare_backend::db::open_db(&db_path).ok()?;
+    let item_id = agentflare_backend::item::resolve_id(&conn, None, id_or_seq).ok()?;
+    let item = agentflare_backend::item::get(&conn, &item_id).ok()?;
+    let metadata: serde_json::Value = serde_json::from_str(&item.metadata).ok()?;
+    metadata
+        .get("task_type")
+        .and_then(serde_json::Value::as_str)
+        .map(String::from)
+}
+
+pub fn pre_tool_use(agent: &str) {
     let Some(input) = read_stdin_or_skip("PreToolUse") else {
         return;
     };
@@ -380,23 +424,36 @@ pub fn pre_tool_use(_agent: &str) {
         .unwrap_or(0);
     crate::optimize::prune_stale_sessions(&mut runtime, now);
 
+    // Scoped by agent identity (item #220): a bare session_id can be shared
+    // across agents/hosts (shared tmux, multi-agent machine), which would
+    // otherwise let one agent's verification/review/diagnosis evidence
+    // satisfy another's completion gate.
+    let session_key = crate::optimize::scoped_session_key(agent, &parsed.session_id);
     let record = runtime
         .sessions
-        .entry(parsed.session_id.clone())
+        .entry(session_key.clone())
         .or_insert_with(|| crate::optimize::SessionRecord {
             start_ts: now,
             turn_count: 0,
             recent_tool_calls: vec![],
             last_verification: None,
+            last_review: None,
+            last_diagnosis: None,
         });
 
-    // Completion gate (item #169): `item done`/`check_merge` requires fresh,
-    // passing verification evidence for this session -- see
+    // Completion gate (item #169, extended by item #182, extended by item
+    // #203): `item done`/`check_merge` requires fresh, passing verification
+    // evidence AND fresh review evidence for this session, AND (for a
+    // task_type=bugfix item) diagnosis evidence -- see
     // hook_redirect::completion_gate_reason's doc comment.
+    let task_type = resolve_item_task_type(&parsed.tool_name, parsed.tool_input.as_ref());
     if let Some(reason) = crate::hook_redirect::completion_gate_reason(
         &parsed.tool_name,
         parsed.tool_input.as_ref(),
         crate::optimize::has_fresh_passing_verification(record, now),
+        crate::optimize::has_fresh_review(record, now),
+        crate::optimize::has_fresh_diagnosis_evidence(record),
+        task_type.as_deref(),
     ) {
         let decision = json!({
             "hookSpecificOutput": {
@@ -424,7 +481,7 @@ pub fn pre_tool_use(_agent: &str) {
     if crate::hook_redirect::MUTATING_TOOLS.contains(&parsed.tool_name.as_str())
         && runtime
             .staleness_checked_sessions
-            .insert(parsed.session_id.clone())
+            .insert(session_key.clone())
         && let crate::hook_redirect::TargetRepo::Found(repo) =
             crate::hook_redirect::resolve_mutating_target_repo(parsed.tool_input.as_ref())
         && let Some((default_branch, commits_behind)) =
@@ -625,15 +682,21 @@ pub fn prompt_submit(agent: &str) {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         crate::optimize::prune_stale_sessions(&mut runtime, now);
+        // Same agent-scoped key as pre_tool_use/post_tool_use (item #220) --
+        // must resolve to the same record for the completion gate to see
+        // this session's turn/tool-call history.
+        let session_key = crate::optimize::scoped_session_key(agent, sid);
         let record =
             runtime
                 .sessions
-                .entry(sid.clone())
+                .entry(session_key)
                 .or_insert_with(|| crate::optimize::SessionRecord {
                     start_ts: now,
                     turn_count: 0,
                     recent_tool_calls: vec![],
                     last_verification: None,
+                    last_review: None,
+                    last_diagnosis: None,
                 });
         first_turn = record.turn_count == 0;
         record.turn_count += 1;
@@ -1078,6 +1141,8 @@ second line
                     label_ids: vec![],
                     assignee_ids: vec![],
                     dependency_ids: vec![],
+                    start_date: None,
+                    due_date: None,
                 },
             )
             .unwrap();
@@ -1100,6 +1165,8 @@ second line
                     label_ids: vec![],
                     assignee_ids: vec![],
                     dependency_ids: vec![],
+                    start_date: None,
+                    due_date: None,
                 },
             )
             .unwrap();
@@ -1157,6 +1224,8 @@ second line
                     label_ids: vec![],
                     assignee_ids: vec![],
                     dependency_ids: vec![],
+                    start_date: None,
+                    due_date: None,
                 },
             )
             .unwrap();

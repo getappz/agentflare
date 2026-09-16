@@ -107,6 +107,14 @@ export const BranchGuard = async (ctx) => {
 }
 "#;
 
+/// agentflare Cline plugin — a thin `AgentExtension` shim over the
+/// `agentflare hook` entry points, mirroring what Claude Code's settings.json
+/// hooks and the opencode branch-guard plugin already do. Cline discovers any
+/// .js/.ts dropped into `~/.cline/plugins/`, so the `cline-plugin` component
+/// (components.rs) writes this exact file there on `agentflare init`.
+/// Source of truth: cline-plugin/agentflare.js.
+pub const CLINE_PLUGIN_JS: &str = include_str!("../cline-plugin/agentflare.js");
+
 /// Known-old wording for a rule file, keyed by its filename — empty for rules
 /// that have never changed. Used to tell "this file still has text we shipped
 /// before" (safe to offer a refresh) apart from "the user edited this" (leave

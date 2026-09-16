@@ -165,6 +165,36 @@ fn near_duplicates(
     duplicates
 }
 
+/// Which of `item_ids` have at least one confirmed `duplicate` relation on
+/// file (from either column, since `duplicate` is a symmetric type) — feeds
+/// `GroomItem.confirmed_duplicate`, distinct from `near_duplicates`'s
+/// unconfirmed name-similarity heuristic.
+fn confirmed_duplicate_ids(
+    conn: &Connection,
+    item_ids: &[String],
+) -> Result<std::collections::HashSet<String>, ErrorData> {
+    if item_ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT item_id FROM item_dependencies WHERE relation_type = 'duplicate' AND item_id IN ({placeholders})
+         UNION
+         SELECT depends_on_item_id FROM item_dependencies WHERE relation_type = 'duplicate' AND depends_on_item_id IN ({placeholders})"
+    );
+    let params: Vec<&String> = item_ids.iter().chain(item_ids.iter()).collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+    rows.collect::<std::result::Result<_, _>>()
+        .map_err(|e: rusqlite::Error| ErrorData::internal_error(e.to_string(), None))
+}
+
 fn to_standup_item(i: &agentflare_backend::item::Item) -> StandupItem {
     StandupItem {
         id: i.id.clone(),
@@ -202,34 +232,30 @@ fn capacity_buckets(
 }
 
 impl AgentflareMcp {
-    /// Resolve a user-supplied id to an item UUID.
-    /// Accepts a UUID (pass-through) or a numeric `sequence_id`.
+    /// Resolve a user-supplied id (UUID or numeric `sequence_id`) to an item
+    /// UUID, and prove it both exists and belongs to the session's linked
+    /// project. `resolve_id`'s UUID branch passes any raw id straight
+    /// through unchecked, so without the follow-up lookup here, a caller on
+    /// one project's connection could read or mutate another project's item
+    /// just by knowing its UUID — every project in this workspace shares the
+    /// same database. An unknown or cross-project id gets the same generic
+    /// "no item matches" error either way, so a caller can't distinguish
+    /// "doesn't exist" from "exists in a different project" — otherwise this
+    /// would leak cross-project existence. This also means the id is proven
+    /// to exist before it's ever written as a foreign key, avoiding a raw
+    /// "FOREIGN KEY constraint failed" (#375) that names nothing.
     pub(crate) fn resolve_item_id(
         &self,
         conn: &Connection,
         id_or_seq: &str,
     ) -> Result<String, ErrorData> {
         let project = self.resolve_project(conn)?;
-        agentflare_backend::item::resolve_id(conn, Some(&project.id), id_or_seq)
-            .map_err(map_backend_err)
-    }
-
-    /// [`Self::resolve_item_id`] plus proof that the item actually exists.
-    /// `resolve_id` passes a non-numeric id straight through, so an unknown
-    /// UUID otherwise reaches the write and surfaces as a raw
-    /// "FOREIGN KEY constraint failed" (#375) that names nothing. Use this
-    /// wherever an id is about to be written as a foreign key rather than
-    /// read back through a call that would 404 on its own.
-    pub(crate) fn resolve_existing_item_id(
-        &self,
-        conn: &Connection,
-        raw: &str,
-    ) -> Result<String, ErrorData> {
-        let id = self.resolve_item_id(conn, raw)?;
+        let id = agentflare_backend::item::resolve_id(conn, Some(&project.id), id_or_seq)
+            .map_err(map_backend_err)?;
         match agentflare_backend::item::get(conn, &id) {
-            Ok(_) => Ok(id),
-            Err(agentflare_backend::Error::NotFound(_)) => Err(ErrorData::invalid_params(
-                format!("no item matches id '{raw}'"),
+            Ok(item) if item.project_id == project.id => Ok(id),
+            Ok(_) | Err(agentflare_backend::Error::NotFound(_)) => Err(ErrorData::invalid_params(
+                format!("no item matches id '{id_or_seq}'"),
                 None,
             )),
             Err(e) => Err(map_backend_err(e)),
@@ -348,7 +374,7 @@ impl AgentflareMcp {
             let parent_id = match req.parent_id.as_deref() {
                 None => None,
                 Some(p) if p.trim().is_empty() => None,
-                Some(p) => Some(self.resolve_existing_item_id(conn, p)?),
+                Some(p) => Some(self.resolve_item_id(conn, p)?),
             };
             let input = agentflare_backend::item::CreateItem {
                 project_id: project.id,
@@ -365,6 +391,8 @@ impl AgentflareMcp {
                 label_ids: req.label_ids.unwrap_or_default(),
                 assignee_ids: vec![],
                 dependency_ids: req.dependency_ids.unwrap_or_default(),
+                start_date: req.start_date,
+                due_date: req.due_date,
             };
             let item = agentflare_backend::item::create(conn, input).map_err(map_backend_err)?;
             Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
@@ -490,7 +518,7 @@ impl AgentflareMcp {
             let parent_id = match req.parent_id.as_deref() {
                 None => None,
                 Some(p) if p.trim().is_empty() => Some(None),
-                Some(p) => Some(Some(self.resolve_existing_item_id(conn, p)?)),
+                Some(p) => Some(Some(self.resolve_item_id(conn, p)?)),
             };
             let input = agentflare_backend::item::UpdateItem {
                 name: req.name,
@@ -501,6 +529,8 @@ impl AgentflareMcp {
                 sort_order: None,
                 metadata: req.metadata.map(metadata_to_json_string),
                 parent_id,
+                start_date: req.start_date,
+                due_date: req.due_date,
             };
             let item =
                 agentflare_backend::item::update(conn, &id, input).map_err(map_backend_err)?;
@@ -1105,6 +1135,22 @@ impl AgentflareMcp {
             // claim_done release). No-ops if someone else holds it
             // or nobody does — `release` is owner-scoped.
             let _ = agentflare_backend::claim::release(conn, &item_id, &owner);
+            // Best-effort: strip dispatch-lifecycle labels, mirroring what
+            // `redispatch` already does in reverse (item #225) — without
+            // this a cancel shortly after handoff, before any orphan/failure
+            // cycle would've swapped the label off, leaves the item labeled
+            // `ready-for-work` and the daemon keeps re-dispatching it.
+            if let Ok(labels) = agentflare_backend::label::list_by_project(conn, &project.id) {
+                for name in [
+                    crate::supervisor::READY_LABEL,
+                    crate::supervisor::DISPATCHED_LABEL,
+                    crate::supervisor::NEEDS_MANUAL_LABEL,
+                ] {
+                    if let Some(label) = labels.iter().find(|l| l.name == name) {
+                        let _ = agentflare_backend::item::remove_label(conn, &item_id, &label.id);
+                    }
+                }
+            }
             Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
         })?
     }
@@ -1174,6 +1220,137 @@ impl AgentflareMcp {
                 serde_json::json!({"removed": true, "item_id": item_id, "label_id": label_id})
                     .to_string(),
             )
+        })?
+    }
+
+    fn validate_relation_type(relation_type: &str) -> Result<(), ErrorData> {
+        if agentflare_backend::item::RELATION_TYPES.contains(&relation_type) {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_params(
+                format!(
+                    "relation_type must be one of blocks|duplicate|relates_to, got '{relation_type}'"
+                ),
+                None,
+            ))
+        }
+    }
+
+    pub(crate) fn item_add_relation(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for add_relation", None))?;
+        let related_raw = req.related_item_id.ok_or_else(|| {
+            ErrorData::invalid_params("related_item_id is required for add_relation", None)
+        })?;
+        let relation_type = req.relation_type.ok_or_else(|| {
+            ErrorData::invalid_params("relation_type is required for add_relation", None)
+        })?;
+        Self::validate_relation_type(&relation_type)?;
+        self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
+            let related_id = self.resolve_item_id(conn, &related_raw)?;
+            agentflare_backend::item::add_relation(conn, &item_id, &related_id, &relation_type)
+                .map_err(map_backend_err)?;
+            Ok(serde_json::json!({
+                "added": true,
+                "item_id": item_id,
+                "related_item_id": related_id,
+                "relation_type": relation_type,
+            })
+            .to_string())
+        })?
+    }
+
+    pub(crate) fn item_remove_relation(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for remove_relation", None))?;
+        let related_raw = req.related_item_id.ok_or_else(|| {
+            ErrorData::invalid_params("related_item_id is required for remove_relation", None)
+        })?;
+        let relation_type = req.relation_type.ok_or_else(|| {
+            ErrorData::invalid_params("relation_type is required for remove_relation", None)
+        })?;
+        Self::validate_relation_type(&relation_type)?;
+        self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
+            let related_id = self.resolve_item_id(conn, &related_raw)?;
+            agentflare_backend::item::remove_relation(conn, &item_id, &related_id, &relation_type)
+                .map_err(map_backend_err)?;
+            Ok(serde_json::json!({
+                "removed": true,
+                "item_id": item_id,
+                "related_item_id": related_id,
+                "relation_type": relation_type,
+            })
+            .to_string())
+        })?
+    }
+
+    /// Returns `list_all_relations`'s shape (all three types at once) unless
+    /// `relation_type` is passed, in which case only that type is returned.
+    pub(crate) fn item_list_relations(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for list_relations", None))?;
+        if let Some(relation_type) = req.relation_type.as_deref() {
+            Self::validate_relation_type(relation_type)?;
+        }
+        self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
+            let relations: Vec<(String, String)> = match req.relation_type.as_deref() {
+                Some(relation_type) => {
+                    agentflare_backend::item::list_relations_by_type(conn, &item_id, relation_type)
+                        .map_err(map_backend_err)?
+                        .into_iter()
+                        .map(|other_id| (relation_type.to_string(), other_id))
+                        .collect()
+                }
+                None => agentflare_backend::item::list_all_relations(conn, &item_id)
+                    .map_err(map_backend_err)?,
+            };
+            let relations: Vec<_> = relations
+                .into_iter()
+                .map(|(relation_type, other_id)| {
+                    serde_json::json!({"relation_type": relation_type, "item_id": other_id})
+                })
+                .collect();
+            Ok(serde_json::json!({"item_id": item_id, "relations": relations}).to_string())
+        })?
+    }
+
+    /// Direct SQL clear — `UpdateItem.start_date` is a plain `Option<i64>`
+    /// where `None` means "leave untouched", so `update` alone can't express
+    /// clearing the column back to NULL.
+    pub(crate) fn item_clear_start_date(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req.id.ok_or_else(|| {
+            ErrorData::invalid_params("id is required for clear_start_date", None)
+        })?;
+        if raw.trim().is_empty() {
+            return Err(ErrorData::invalid_params("id is required", None));
+        }
+        self.with_backend_db(|conn| {
+            let id = self.resolve_item_id(conn, &raw)?;
+            let item = agentflare_backend::item::clear_item_start_date(conn, &id)
+                .map_err(map_backend_err)?;
+            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
+        })?
+    }
+
+    /// Same shape as `item_clear_start_date`, for `due_date`.
+    pub(crate) fn item_clear_due_date(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for clear_due_date", None))?;
+        if raw.trim().is_empty() {
+            return Err(ErrorData::invalid_params("id is required", None));
+        }
+        self.with_backend_db(|conn| {
+            let id = self.resolve_item_id(conn, &raw)?;
+            let item = agentflare_backend::item::clear_item_due_date(conn, &id)
+                .map_err(map_backend_err)?;
+            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
         })?
     }
 
@@ -1300,6 +1477,7 @@ impl AgentflareMcp {
             let fanin = agentflare_backend::item::dependency_fanin_for_items(conn, &ids)
                 .map_err(map_backend_err)?;
             let duplicates = near_duplicates(&shortlist);
+            let confirmed_duplicates = confirmed_duplicate_ids(conn, &ids)?;
 
             let groom_items: Vec<GroomItem> = shortlist
                 .into_iter()
@@ -1309,16 +1487,20 @@ impl AgentflareMcp {
                     let unassigned = i.assignee_agent.is_none();
                     let size = parsed_size(&i.metadata);
                     let unestimated = size.is_none();
+                    let state_group = state.map(|s| s.group_name.clone()).unwrap_or_default();
+                    let overdue = i.due_date.is_some_and(|d| d < now)
+                        && !matches!(state_group.as_str(), "completed" | "cancelled");
                     GroomItem {
                         blocked_by: blocked_by.get(&i.id).cloned().unwrap_or_default(),
                         depended_on_by_count: *fanin.get(&i.id).unwrap_or(&0),
                         possible_duplicates: duplicates.get(&i.id).cloned().unwrap_or_default(),
+                        confirmed_duplicate: confirmed_duplicates.contains(&i.id),
                         id: i.id,
                         sequence_id: i.sequence_id,
                         name: i.name,
                         description: i.description,
                         state: state.map(|s| s.name.clone()).unwrap_or_default(),
-                        state_group: state.map(|s| s.group_name.clone()).unwrap_or_default(),
+                        state_group,
                         priority: i.priority,
                         assignee_agent: i.assignee_agent,
                         updated_at: i.updated_at,
@@ -1326,6 +1508,8 @@ impl AgentflareMcp {
                         unassigned,
                         size,
                         unestimated,
+                        due_date: i.due_date,
+                        overdue,
                     }
                 })
                 .collect();

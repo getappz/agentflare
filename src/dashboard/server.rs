@@ -149,6 +149,11 @@ const SUPERVISOR_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::
 /// merged), against the same token `SUPERVISOR_DISCOVERY_INTERVAL`'s ticks
 /// never touch GitHub at all.
 const SUPERVISOR_REVIEW_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Cadence for `spawn_supervisor_telegram_approvals` -- a single `getUpdates`
+/// short-poll plus, at most, one GitHub label call per tapped "Approve"
+/// button, so this can run noticeably tighter than the GitHub-heavy review
+/// sweep above without meaningful cost.
+const SUPERVISOR_TELEGRAM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 /// Cadence for `spawn_binary_staleness_watchdog` -- a `stat()` call, so this
 /// can run far more often than the GitHub-touching sweeps above without
 /// meaningful cost. Bounds how long a rebuilt/updated binary can keep
@@ -250,6 +255,35 @@ fn spawn_supervisor_review_sweep(
                 }
                 Ok(_) => {}
                 Err(e) => eprintln!("agentflare-supervisor: review sweep task panicked: {e}"),
+            }
+        }
+    });
+}
+
+/// Runs for the lifetime of the process: wakes on
+/// `SUPERVISOR_TELEGRAM_POLL_INTERVAL` and handles whatever Telegram sent
+/// since the last tick -- a tapped "Approve" button on a PR-approval card
+/// (see `supervisor::notify_pr_approval_gate`) or a chat message (a slash
+/// command or a free-text agent prompt, see `chat_channel`). Needs the
+/// shared `AgentflareMcp` handle now (chat commands call `pm`/`item`/
+/// `project` in-process), same shape as `spawn_supervisor_discovery`/
+/// `spawn_supervisor_review_sweep` above. Both flows share this single tick
+/// deliberately -- see `supervisor::poll_telegram_approvals`'s doc comment
+/// for why a second independent poller isn't safe on one bot token.
+fn spawn_supervisor_telegram_approvals(
+    mcp: std::sync::Arc<crate::mcp_server::AgentflareMcp>,
+    interval: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            let mcp = mcp.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || crate::supervisor::poll_telegram_approvals(mcp))
+                    .await
+            {
+                eprintln!("agentflare-supervisor: telegram poll task panicked: {e}");
             }
         }
     });
@@ -816,6 +850,10 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
                     queue.clone(),
                     std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
                     SUPERVISOR_REVIEW_SWEEP_INTERVAL,
+                );
+                spawn_supervisor_telegram_approvals(
+                    std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
+                    SUPERVISOR_TELEGRAM_POLL_INTERVAL,
                 );
             }
         }

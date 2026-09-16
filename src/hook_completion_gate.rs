@@ -72,8 +72,17 @@ fn item_action_succeeded(action: &str, response: Option<&Value>) -> Option<bool>
 fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
     let v: serde_json::Value = serde_json::from_str(input).ok()?;
     let session_id = v.get("session_id")?.as_str()?.to_string();
-    let tool_name = v.get("tool_name")?.as_str()?.to_string();
-    let tool_input = v.get("tool_input");
+    let raw_tool_name = v.get("tool_name")?.as_str()?.to_string();
+    let raw_tool_input = v.get("tool_input").cloned();
+    // Unwrap flare-gateway `action="execute"` calls (item #559) -- a
+    // verification command run via `mcp__flare__tool(action="execute",
+    // server="leanctx", tool="ctx_shell", args={"command": ...})` must be
+    // recorded exactly like a direct Bash call, or the completion gate
+    // never sees it as evidence and rejects `item done`/`check_merge` even
+    // right after a passing run.
+    let (tool_name, tool_input) =
+        crate::hook_redirect::unwrap_gateway_call(&raw_tool_name, raw_tool_input.as_ref());
+    let tool_input = tool_input.as_ref();
     let command = tool_input
         .and_then(|ti| {
             ti.get("command")
@@ -99,11 +108,26 @@ fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
         .map(|r| {
             let stdout = r.get("stdout").and_then(Value::as_str).unwrap_or("");
             let stderr = r.get("stderr").and_then(Value::as_str).unwrap_or("");
-            if stdout.is_empty() && stderr.is_empty() {
-                r.as_str().unwrap_or_default().to_string()
-            } else {
-                format!("{stdout}\n{stderr}")
+            if !stdout.is_empty() || !stderr.is_empty() {
+                return format!("{stdout}\n{stderr}");
             }
+            if let Some(s) = r.as_str() {
+                return s.to_string();
+            }
+            // A gateway-forwarded response (item #559) comes back as the
+            // MCP content-block envelope (`{"content":[{"type":"text",
+            // "text":"..."}]}`), same shape `response_as_json` unwraps for
+            // item actions -- without this, exit_code and output_text are
+            // both blank for every gateway-routed verification command, so
+            // a genuine failure would default to "passed" via
+            // `verification_passed`'s permissive fallback below.
+            r.get("content")
+                .and_then(Value::as_array)
+                .and_then(|blocks| blocks.first())
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
         })
         .unwrap_or_default();
     let item_success = item_action
@@ -183,17 +207,25 @@ fn shows_finishing_branch_menu(tool_name: &str, action: &str, item_success: Opti
         && item_success != Some(false)
 }
 
-/// PostToolUse (success) command hook. Three independent jobs, all closing
-/// gaps from item #169's completion gate: (1) records verification evidence
-/// for the session when a Bash-family call's command matches
-/// `optimize::is_verification_command` -- this is the ONLY place that
-/// evidence is ever recorded, so `hook_redirect::completion_gate_reason`
-/// has something to check; (2) surfaces the finishing-a-development-branch
-/// decision menu once `item done`/`check_merge` actually succeeds; (3)
-/// invalidates any recorded verification evidence when a mutating tool
-/// (Write/Edit/MultiEdit/patch/ctx_patch/...) runs, so a test run that
-/// passed before this edit can't cover a since-changed tree.
-pub fn post_tool_use(_agent: &str) {
+/// PostToolUse (success) command hook. Five independent jobs, all closing
+/// gaps from item #169's completion gate (extended to cover review evidence
+/// by item #182, and diagnosis evidence by item #203): (1) records
+/// verification evidence for the session when a Bash-family call's command
+/// matches `optimize::is_verification_command`; (2) records diagnosis
+/// evidence the same way when it matches `optimize::is_diagnosis_command`
+/// (both checks run off the same parsed command -- not mutually exclusive);
+/// (3) records review evidence when the `ReportFindings` tool call succeeds
+/// (`optimize::is_review_completion` -- see its doc comment for why this,
+/// specifically, is the trigger rather than a `Skill`/`Task`/`Agent`
+/// dispatch) -- these are the ONLY places their respective evidence is ever
+/// recorded, so `hook_redirect::completion_gate_reason` has something to
+/// check; (4) surfaces the finishing-a-development-branch decision menu once
+/// `item done`/`check_merge` actually succeeds; (5) invalidates recorded
+/// verification/review evidence when a mutating tool (Write/Edit/MultiEdit/
+/// patch/ctx_patch/...) runs, so evidence from before this edit can't cover
+/// a since-changed tree -- diagnosis evidence is deliberately NOT cleared
+/// here, see `SessionRecord::last_diagnosis`'s doc comment.
+pub fn post_tool_use(agent: &str) {
     let Some(input) = read_stdin_or_skip("PostToolUse") else {
         return;
     };
@@ -214,17 +246,17 @@ pub fn post_tool_use(_agent: &str) {
         return;
     }
 
+    // Scoped by agent identity (item #220) -- must match the key
+    // pre_tool_use/prompt_submit use for the same session, or this session's
+    // own evidence would land in a different record than the one the
+    // completion gate reads.
+    let session_key = crate::optimize::scoped_session_key(agent, &parsed.session_id);
+
     if crate::hook_redirect::MUTATING_TOOLS.contains(&parsed.tool_name.as_str()) {
         let mut runtime = crate::optimize::load_runtime();
-        crate::optimize::invalidate_verification(&mut runtime, &parsed.session_id);
+        crate::optimize::invalidate_verification(&mut runtime, &session_key);
+        crate::optimize::invalidate_review(&mut runtime, &session_key);
         crate::optimize::save_runtime(&runtime);
-        return;
-    }
-
-    let Some(command) = &parsed.command else {
-        return;
-    };
-    if !crate::optimize::is_verification_command(command) {
         return;
     }
 
@@ -232,25 +264,68 @@ pub fn post_tool_use(_agent: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+
+    if crate::optimize::is_review_completion(&parsed.tool_name) {
+        let mut runtime = crate::optimize::load_runtime();
+        crate::optimize::prune_stale_sessions(&mut runtime, now);
+        let record = runtime
+            .sessions
+            .entry(session_key.clone())
+            .or_insert_with(|| crate::optimize::SessionRecord {
+                start_ts: now,
+                turn_count: 0,
+                recent_tool_calls: vec![],
+                last_verification: None,
+                last_review: None,
+                last_diagnosis: None,
+            });
+        record.last_review = Some(crate::optimize::ReviewEvidence {
+            source: parsed.tool_name.clone(),
+            ts: now,
+        });
+        crate::optimize::save_runtime(&runtime);
+        return;
+    }
+
+    let Some(command) = &parsed.command else {
+        return;
+    };
+    let is_verification = crate::optimize::is_verification_command(command);
+    let is_diagnosis = crate::optimize::is_diagnosis_command(command);
+    if !is_verification && !is_diagnosis {
+        return;
+    }
+
     let passed = verification_passed(parsed.exit_code, &parsed.output_text);
 
     let mut runtime = crate::optimize::load_runtime();
     crate::optimize::prune_stale_sessions(&mut runtime, now);
-    let record = runtime
-        .sessions
-        .entry(parsed.session_id.clone())
-        .or_insert_with(|| crate::optimize::SessionRecord {
-            start_ts: now,
-            turn_count: 0,
-            recent_tool_calls: vec![],
-            last_verification: None,
+    let record =
+        runtime
+            .sessions
+            .entry(session_key)
+            .or_insert_with(|| crate::optimize::SessionRecord {
+                start_ts: now,
+                turn_count: 0,
+                recent_tool_calls: vec![],
+                last_verification: None,
+                last_review: None,
+                last_diagnosis: None,
+            });
+    if crate::optimize::is_verification_command(command) {
+        record.last_verification = Some(crate::optimize::VerificationEvidence {
+            command: command.clone(),
+            exit_code: parsed.exit_code,
+            passed,
+            ts: now,
         });
-    record.last_verification = Some(crate::optimize::VerificationEvidence {
-        command: command.clone(),
-        exit_code: parsed.exit_code,
-        passed,
-        ts: now,
-    });
+    }
+    if crate::optimize::is_diagnosis_command(command) {
+        record.last_diagnosis = Some(crate::optimize::DiagnosisEvidence {
+            command: command.clone(),
+            ts: now,
+        });
+    }
     crate::optimize::save_runtime(&runtime);
 }
 
@@ -274,6 +349,13 @@ mod tests {
         let parsed = parse_post_tool_use(input).unwrap();
         assert_eq!(parsed.item_action.as_deref(), Some("done"));
         assert!(parsed.command.is_none());
+    }
+
+    #[test]
+    fn parse_post_tool_use_reads_report_findings_tool_name() {
+        let input = r#"{"session_id":"s1","tool_name":"ReportFindings","tool_input":{"findings":[]},"tool_response":{}}"#;
+        let parsed = parse_post_tool_use(input).unwrap();
+        assert_eq!(parsed.tool_name, "ReportFindings");
     }
 
     #[test]
@@ -349,6 +431,35 @@ mod tests {
     #[test]
     fn parse_post_tool_use_returns_none_on_invalid_json() {
         assert!(parse_post_tool_use("not json").is_none());
+    }
+
+    #[test]
+    fn parse_post_tool_use_unwraps_gateway_routed_verification_command() {
+        // Regression for item #559: a verification command run through the
+        // flare gateway (`mcp__flare__tool(action="execute", server=
+        // "leanctx", tool="ctx_shell", args={"command": ...})`) must be
+        // recognized exactly like a direct Bash call.
+        let input = r#"{"session_id":"s1","tool_name":"mcp__flare__tool","tool_input":{"action":"execute","server":"leanctx","tool":"ctx_shell","args":{"command":"cargo test"}},"tool_response":{"content":[{"type":"text","text":"test result: ok"}]}}"#;
+        let parsed = parse_post_tool_use(input).unwrap();
+        assert_eq!(parsed.tool_name, "mcp__lean-ctx__ctx_shell");
+        assert_eq!(parsed.command.as_deref(), Some("cargo test"));
+        assert_eq!(parsed.output_text, "test result: ok");
+    }
+
+    #[test]
+    fn parse_post_tool_use_gateway_search_action_has_no_command() {
+        let input = r#"{"session_id":"s1","tool_name":"mcp__flare__tool","tool_input":{"action":"search","query":"ctx_shell"},"tool_response":{}}"#;
+        let parsed = parse_post_tool_use(input).unwrap();
+        assert_eq!(parsed.tool_name, "mcp__flare__tool");
+        assert!(parsed.command.is_none());
+    }
+
+    #[test]
+    fn output_text_falls_back_to_mcp_content_block_envelope() {
+        let input = r#"{"session_id":"s1","tool_name":"Bash","tool_input":{"command":"cargo test"},"tool_response":{"content":[{"type":"text","text":"3 failures:\n  test_foo"}]}}"#;
+        let parsed = parse_post_tool_use(input).unwrap();
+        assert_eq!(parsed.output_text, "3 failures:\n  test_foo");
+        assert!(!verification_passed(parsed.exit_code, &parsed.output_text));
     }
 
     #[test]

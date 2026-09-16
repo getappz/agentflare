@@ -32,7 +32,8 @@ pub fn search(
                 items.priority, items.parent_id, items.assignee_agent, items.sequence_id,
                 items.sort_order, items.started_at, items.completed_at, items.archived_at,
                 items.external_source, items.external_id, items.metadata,
-                items.created_at, items.updated_at, items.deleted_at
+                items.created_at, items.updated_at, items.deleted_at,
+                items.start_date, items.due_date
          FROM items_fts
          JOIN items ON items.rowid = items_fts.rowid
          WHERE items.project_id = ?1
@@ -62,7 +63,8 @@ pub fn search(
                 items.priority, items.parent_id, items.assignee_agent, items.sequence_id,
                 items.sort_order, items.started_at, items.completed_at, items.archived_at,
                 items.external_source, items.external_id, items.metadata,
-                items.created_at, items.updated_at, items.deleted_at
+                items.created_at, items.updated_at, items.deleted_at,
+                items.start_date, items.due_date
          FROM items
          WHERE items.project_id = ?1
            AND items.deleted_at IS NULL

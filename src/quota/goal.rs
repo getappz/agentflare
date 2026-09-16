@@ -150,6 +150,8 @@ mod tests {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap()

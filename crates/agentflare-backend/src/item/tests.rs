@@ -55,6 +55,8 @@ fn create_and_get() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -85,6 +87,8 @@ fn sequence_increments() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -105,6 +109,8 @@ fn sequence_increments() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -134,11 +140,65 @@ fn list_by_project_scopes() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
     assert_eq!(list_by_project(&conn, &pid1).unwrap().len(), 1);
     assert_eq!(list_by_project(&conn, &pid2).unwrap().len(), 0);
+}
+
+#[test]
+fn list_by_project_paginated_pages_and_counts() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    for n in 0..5 {
+        create(
+            &conn,
+            CreateItem {
+                project_id: pid.clone(),
+                state_id: sid.clone(),
+                name: format!("Item {n}"),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: Some(n as f64),
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
+            },
+        )
+        .unwrap();
+    }
+
+    let (page, total) = list_by_project_paginated(&conn, &pid, 2, 0).unwrap();
+    assert_eq!(total, 5);
+    assert_eq!(
+        page.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+        vec!["Item 0", "Item 1"]
+    );
+
+    let (page, total) = list_by_project_paginated(&conn, &pid, 2, 2).unwrap();
+    assert_eq!(total, 5);
+    assert_eq!(
+        page.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+        vec!["Item 2", "Item 3"]
+    );
+
+    // A page past the end still reports the true total, not zero.
+    let (page, total) = list_by_project_paginated(&conn, &pid, 2, 10).unwrap();
+    assert!(page.is_empty());
+    assert_eq!(total, 5);
+
+    assert!(list_by_project_paginated(&conn, &pid, -1, 0).is_err());
+    assert!(list_by_project_paginated(&conn, &pid, 0, -1).is_err());
 }
 
 #[test]
@@ -162,6 +222,8 @@ fn add_and_remove_labels() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -223,6 +285,8 @@ fn add_label_rejects_label_from_another_project() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -266,6 +330,8 @@ fn add_label_accepts_workspace_level_label_in_same_workspace() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -310,6 +376,8 @@ fn add_label_rejects_workspace_level_label_from_another_workspace() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -354,6 +422,8 @@ fn add_and_remove_assignees() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -386,6 +456,8 @@ fn add_and_remove_dependencies() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -406,6 +478,8 @@ fn add_and_remove_dependencies() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -460,6 +534,8 @@ fn create_wires_up_label_assignee_and_dependency_ids() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -480,6 +556,8 @@ fn create_wires_up_label_assignee_and_dependency_ids() {
             label_ids: vec![label.id.clone()],
             assignee_ids: vec!["agent:1".into()],
             dependency_ids: vec![blocker.id.clone()],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -515,6 +593,8 @@ fn dependents_of_finds_reverse_edges() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -535,6 +615,8 @@ fn dependents_of_finds_reverse_edges() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![blocker.id.clone()],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -567,6 +649,8 @@ fn all_dependencies_completed_requires_every_dependency_done() {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: deps,
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap()
@@ -608,6 +692,8 @@ fn all_dependencies_completed_false_for_item_with_no_dependencies() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -644,6 +730,8 @@ fn update_state_sets_started_at_when_moving_into_started_group() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -675,6 +763,8 @@ fn update_state_sets_completed_at_when_moving_into_completed_group() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -704,6 +794,8 @@ fn update_state_leaves_timestamps_none_when_moving_into_backlog() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -736,6 +828,8 @@ fn create_rejects_state_from_a_different_project() {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         ),
         Err(crate::error::Error::InvalidTransition(_))
@@ -764,6 +858,8 @@ fn update_state_rejects_state_from_a_different_project() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -794,6 +890,8 @@ fn make_item(conn: &Connection, pid: &str, sid: &str) -> Item {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap()
@@ -878,6 +976,123 @@ fn release_with_nothing_to_release_leaves_assignee_agent_untouched() {
         get(&conn, &item.id).unwrap().assignee_agent.as_deref(),
         Some("opencode")
     );
+}
+
+#[test]
+fn create_rejects_due_date_before_start_date() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let err = create(
+        &conn,
+        CreateItem {
+            project_id: pid,
+            state_id: sid,
+            name: "Test".into(),
+            description: None,
+            priority: None,
+            parent_id: None,
+            assignee_agent: None,
+            sort_order: None,
+            external_source: None,
+            external_id: None,
+            metadata: None,
+            label_ids: vec![],
+            assignee_ids: vec![],
+            dependency_ids: vec![],
+            start_date: Some(2000),
+            due_date: Some(1000),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, crate::error::Error::Validation(_)), "{err}");
+}
+
+#[test]
+fn update_rejects_due_date_before_the_items_existing_start_date() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            start_date: Some(2000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let err = update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            due_date: Some(1000),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, crate::error::Error::Validation(_)), "{err}");
+}
+
+#[test]
+fn update_sets_start_date_and_due_date() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    let updated = update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            start_date: Some(1000),
+            due_date: Some(2000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(updated.start_date, Some(1000));
+    assert_eq!(updated.due_date, Some(2000));
+}
+
+#[test]
+fn clear_item_start_date_nulls_only_start_date() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            start_date: Some(1000),
+            due_date: Some(2000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let cleared = clear_item_start_date(&conn, &item.id).unwrap();
+    assert_eq!(cleared.start_date, None);
+    assert_eq!(cleared.due_date, Some(2000));
+}
+
+#[test]
+fn clear_item_due_date_nulls_only_due_date() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            start_date: Some(1000),
+            due_date: Some(2000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let cleared = clear_item_due_date(&conn, &item.id).unwrap();
+    assert_eq!(cleared.due_date, None);
+    assert_eq!(cleared.start_date, Some(1000));
 }
 
 #[test]
@@ -1148,6 +1363,8 @@ fn search_ranks_by_relevance() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -1168,6 +1385,8 @@ fn search_ranks_by_relevance() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -1188,6 +1407,8 @@ fn search_ranks_by_relevance() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -1229,6 +1450,8 @@ fn search_empty_query_returns_nothing() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -1258,6 +1481,8 @@ fn search_scoped_to_project() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -1278,6 +1503,8 @@ fn search_scoped_to_project() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -1306,6 +1533,8 @@ fn search_falls_back_to_like_for_suffix_of_compound_token() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -1339,6 +1568,8 @@ fn search_like_fallback_matches_literal_backslash_in_query() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -1444,6 +1675,8 @@ fn create_and_update_canonicalize_known_assignee_aliases() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -1498,6 +1731,8 @@ fn list_by_label_returns_only_items_carrying_that_label() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -1518,6 +1753,8 @@ fn list_by_label_returns_only_items_carrying_that_label() {
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         },
     )
     .unwrap();
@@ -1812,3 +2049,8 @@ fn redispatch_rejects_a_completed_item() {
         "{err:?}"
     );
 }
+
+#[path = "tests_labels.rs"]
+mod tests_labels;
+#[path = "tests_relations.rs"]
+mod tests_relations;

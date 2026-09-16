@@ -170,9 +170,33 @@ pub(crate) fn discover_untracked_prs(
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         };
         match agentflare_backend::item::create(conn, input) {
-            Ok(_) => created += 1,
+            Ok(_) => {
+                created += 1;
+                // Same starting stage label `push_and_open_pr` gives a PR
+                // opened through the item-done flow -- without this, a
+                // hand-opened PR discovery only ever tracks would carry no
+                // agentflare lifecycle label at all, leaving a human with no
+                // GitHub-visible signal that it's under the sweep's watch.
+                let machine = crate::github::bridge::config::machine_label();
+                if let Err(e) = crate::github::issues::add_labels(
+                    client,
+                    repo,
+                    pr.number,
+                    &[
+                        "agentflare:in-review".to_string(),
+                        format!("beacon:{machine}"),
+                    ],
+                ) {
+                    eprintln!(
+                        "worktree: could not label discovered PR #{}: {e}",
+                        pr.number
+                    );
+                }
+            }
             Err(e) => eprintln!("worktree: could not create item for PR #{}: {e}", pr.number),
         }
     }
@@ -204,6 +228,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             deleted_at: None,
+            start_date: None,
+            due_date: None,
         }
     }
 

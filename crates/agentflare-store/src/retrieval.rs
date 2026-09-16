@@ -40,6 +40,26 @@ pub fn merge_ranked<I: Eq + Hash + Clone>(
         .collect()
 }
 
+/// Reciprocal Rank Fusion (RRF) — score-agnostic, no tuning.
+/// `k`=60 per SIGIR 2009 / Elasticsearch / Pinecone; frankensearch-fusion
+/// uses same default via `FRANKENSEARCH_RRF_K`. Copy of the 10-LOC math
+/// rather than a crate dep — avoids pulling 69K SLoC of `frankensearch`.
+///
+/// Inputs are ranked lists in best-first order; output is fused list
+/// sorted best-first. Score = Σ 1/(k + rank + 1) per source that contains id.
+pub fn rrf_fuse<I: Eq + Hash + Clone>(bm25_ids: &[I], vec_ids: &[I], k: f64) -> Vec<(I, f64)> {
+    let mut scores: HashMap<I, f64> = HashMap::new();
+    for (rank, id) in bm25_ids.iter().enumerate() {
+        *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (k + rank as f64 + 1.0);
+    }
+    for (rank, id) in vec_ids.iter().enumerate() {
+        *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (k + rank as f64 + 1.0);
+    }
+    let mut out: Vec<(I, f64)> = scores.into_iter().collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
 /// Exponential decay: 1.0 at age 0, 0.5 at one half-life.
 pub fn decay_factor(age_days: f64, half_life_days: f64) -> f64 {
     (-(2.0f64.ln() / half_life_days) * age_days).exp()
@@ -168,5 +188,26 @@ mod tests {
         assert_eq!(jaccard_overlap("alpha beta", "beta alpha"), 1.0);
         // words with len <= 2 are ignored
         assert_eq!(jaccard_overlap("of at alpha", "alpha in on"), 1.0);
+    }
+
+    #[test]
+    fn rrf_combines_two_rankings() {
+        // bm25: [a,b,c], vec: [b,d] → K=60 → b (both) outranks a,c,d
+        let bm25 = vec!["a", "b", "c"];
+        let vec = vec!["b", "d"];
+        let fused = rrf_fuse(&bm25, &vec, 60.0);
+        assert_eq!(fused[0].0, "b");
+        assert!(fused[0].1 > fused[1].1);
+        let get = |id: &str| fused.iter().find(|(i, _)| *i == id).unwrap().1;
+        // b = 1/62 + 1/61 ≈ 0.0325, a = 1/61 ≈ 0.016, d = 1/62 ≈ 0.016
+        assert!((get("a") - 1.0 / 61.0).abs() < 1e-9);
+        assert!((get("d") - 1.0 / 62.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rrf_k60_single_source() {
+        let fused = rrf_fuse(&["x", "y"], &[] as &[&str], 60.0);
+        assert_eq!(fused[0].0, "x");
+        assert!(fused[0].1 > fused[1].1);
     }
 }

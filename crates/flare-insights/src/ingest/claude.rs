@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use walkdir::WalkDir;
@@ -7,9 +7,10 @@ use crate::config::InsightsConfig;
 use crate::config::PricingTable;
 use crate::ingest::{
     common::{
-        extract_file_path, extract_tokens, file_kind_for_tool, parse_timestamp, title_from_text,
+        extract_file_path, extract_tokens, file_cursor, file_kind_for_tool, parse_timestamp,
+        title_from_text,
     },
-    Adapter, IngestBundle, IngestError,
+    Adapter, FileCursors, IngestBundle, IngestError,
 };
 use crate::model::{
     FileEvent, Session, SessionSource, SessionStatus, Subagent, TokenUsage, ToolCall, Turn,
@@ -22,29 +23,43 @@ impl Adapter for ClaudeAdapter {
         "claude_code"
     }
 
-    fn scan(&self, config: &InsightsConfig) -> Result<IngestBundle, IngestError> {
+    fn scan(
+        &self,
+        config: &InsightsConfig,
+        cursors: &FileCursors,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<IngestBundle, IngestError> {
         let Some(dir) = config.sources.get("claude_code") else {
             return Ok(IngestBundle::default());
         };
         if !dir.exists() {
             return Ok(IngestBundle::default());
         }
-        let mut bundle = IngestBundle::default();
-        for entry in WalkDir::new(dir)
+        let files: Vec<PathBuf> = WalkDir::new(dir)
             .max_depth(5)
             .into_iter()
             .filter_map(|e| e.ok())
-        {
-            if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .map(|e| e.path().to_path_buf())
+            .collect();
+        let total = files.len();
+        let mut bundle = IngestBundle::default();
+        for (i, path) in files.iter().enumerate() {
+            on_progress(i + 1, total);
+            let Some(cursor) = file_cursor(path) else {
                 continue;
+            };
+            if cursors.get(path) == Some(&cursor) {
+                continue; // unchanged since last sync
             }
-            if let Some(b) = parse_claude_jsonl(entry.path()) {
+            if let Some(b) = parse_claude_jsonl(path) {
                 bundle.sessions.extend(b.sessions);
                 bundle.turns.extend(b.turns);
                 bundle.tool_calls.extend(b.tool_calls);
                 bundle.file_events.extend(b.file_events);
                 bundle.subagents.extend(b.subagents);
             }
+            bundle.file_cursors.push((path.clone(), cursor.0, cursor.1));
         }
         Ok(bundle)
     }
@@ -269,6 +284,7 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
         tool_calls,
         file_events,
         subagents,
+        file_cursors: vec![],
     })
 }
 
@@ -306,6 +322,11 @@ mod tests {
             ..Default::default()
         };
         let a = ClaudeAdapter;
-        assert!(a.scan(&cfg).unwrap().sessions.is_empty());
+        let cursors = crate::ingest::FileCursors::default();
+        assert!(a
+            .scan(&cfg, &cursors, &mut |_, _| {})
+            .unwrap()
+            .sessions
+            .is_empty());
     }
 }

@@ -3,8 +3,22 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use std::path::Path;
 
 use crate::model::{Cost, TokenUsage};
+
+/// `(mtime_ms, size)` cursor for a session file, used to skip re-parsing
+/// files that haven't changed since the last sync.
+pub fn file_cursor(path: &Path) -> Option<(i64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime_ms = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some((mtime_ms, meta.len()))
+}
 
 /// Try multiple timestamp formats: RFC3339, epoch ms, epoch sec.
 pub fn parse_timestamp(v: &Value) -> Option<DateTime<Utc>> {

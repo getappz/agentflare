@@ -444,6 +444,8 @@ fn record_claim(
                     label_ids: ready_label_id.into_iter().collect(),
                     assignee_ids: vec![],
                     dependency_ids: vec![],
+                    start_date: None,
+                    due_date: None,
                 },
             )
             .map_err(|e| GitHubError::Parse(e.to_string()))?
@@ -1212,6 +1214,8 @@ mod tests {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -1250,6 +1254,8 @@ mod tests {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -1295,6 +1301,8 @@ mod tests {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap()
@@ -1599,6 +1607,8 @@ mod tests {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -1737,6 +1747,8 @@ mod tests {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();

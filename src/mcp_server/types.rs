@@ -288,6 +288,11 @@ pub(crate) struct HandoffRequest {
     #[schemars(description = "Known blockers, if any.")]
     #[serde(default)]
     pub(crate) blockers: Option<Vec<String>>,
+    #[schemars(
+        description = "Escape hatch for an intentional credential handoff: skips the pre-handoff secret scan (content/description/summary/completed/remaining/facts/findings/decisions/files_touched/evidence/blockers) that otherwise rejects the call before any item/asset is written. Default false -- deny by default."
+    )]
+    #[serde(default)]
+    pub(crate) allow_secrets: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -743,11 +748,11 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ItemRequest {
     #[schemars(
-        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|redispatch|groom|standup|health|doctor"
+        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|groom|standup|health|doctor|clear_start_date|clear_due_date"
     )]
     pub(crate) action: String,
     #[schemars(
-        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, redispatch"
+        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, add_relation, remove_relation, list_relations, redispatch, clear_start_date, clear_due_date"
     )]
     #[serde(default)]
     pub(crate) id: Option<String>,
@@ -785,6 +790,16 @@ pub(crate) struct ItemRequest {
     )]
     #[serde(default)]
     pub(crate) metadata: Option<serde_json::Value>,
+    #[schemars(
+        description = "Start date as a Unix timestamp in seconds (create, update). Validated against due_date (start_date <= due_date) whenever both are set on the item."
+    )]
+    #[serde(default)]
+    pub(crate) start_date: Option<i64>,
+    #[schemars(
+        description = "Due date as a Unix timestamp in seconds (create, update). Validated against start_date (start_date <= due_date) whenever both are set on the item. `groom` also derives `overdue` from this."
+    )]
+    #[serde(default)]
+    pub(crate) due_date: Option<i64>,
     #[schemars(description = "Label IDs to attach on creation (create)")]
     #[serde(default)]
     pub(crate) label_ids: Option<Vec<String>>,
@@ -794,6 +809,16 @@ pub(crate) struct ItemRequest {
     #[schemars(description = "Label ID (add_label, remove_label)")]
     #[serde(default)]
     pub(crate) label_id: Option<String>,
+    #[schemars(
+        description = "Relation type: blocks|duplicate|relates_to (add_relation, remove_relation; list_relations optional filter — omit to return all three types)"
+    )]
+    #[serde(default)]
+    pub(crate) relation_type: Option<String>,
+    #[schemars(
+        description = "The other item ID this item relates to (UUID or numeric sequence_id) (add_relation, remove_relation; required for both)"
+    )]
+    #[serde(default)]
+    pub(crate) related_item_id: Option<String>,
     #[schemars(
         description = "Filter by state group (list): one of backlog|unstarted|started|in_review|completed|cancelled|triage, or a comma-separated list (e.g. \"backlog,unstarted,started\") to match any. Also usable as a target for update_state (single group only) — an alternative to state_id/state_name; errors if zero or more than one state in the project shares that group. Mutually exclusive with state_id and state_name for update_state"
     )]
@@ -915,6 +940,10 @@ pub(crate) struct GroomItem {
     pub(crate) updated_at: i64,
     pub(crate) stale: bool,
     pub(crate) unassigned: bool,
+    pub(crate) due_date: Option<i64>,
+    /// True when `due_date` is in the past and the item's state group isn't
+    /// completed/cancelled — a done-but-late item isn't "overdue" anymore.
+    pub(crate) overdue: bool,
     /// Parsed from `metadata.size` ("S"|"M"|"L"); `None` when absent — see `unestimated`.
     pub(crate) size: Option<String>,
     /// True when `metadata.size` is missing — add a size label to enable real RICE scoring.
@@ -925,6 +954,10 @@ pub(crate) struct GroomItem {
     pub(crate) depended_on_by_count: i64,
     /// Other shortlisted items with a near-identical name (token-Jaccard ≥ 0.5).
     pub(crate) possible_duplicates: Vec<String>,
+    /// True when this item has a confirmed `duplicate` relation on file
+    /// (persisted via `add_relation`), distinct from the unconfirmed
+    /// name-similarity heuristic in `possible_duplicates`.
+    pub(crate) confirmed_duplicate: bool,
 }
 
 /// One-call groom result: priority+staleness-ranked shortlist with all the
@@ -1074,6 +1107,47 @@ pub(crate) struct ProjectRequest {
     pub(crate) action: String,
 }
 
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct PmRequest {
+    #[schemars(
+        description = "Action: standup|groom|plan|health|portfolio|mode_on|mode_off|mode_status"
+    )]
+    pub(crate) action: String,
+    #[schemars(
+        description = "Project override (name or UUID from `project action=list`) for standup/groom/plan/health. Ignored by portfolio, which always covers every project in the workspace."
+    )]
+    #[serde(default)]
+    pub(crate) project: Option<String>,
+    #[schemars(
+        description = "Hours back a completed item counts as \"done\" (standup, portfolio with report=standup); default 24"
+    )]
+    #[serde(default)]
+    pub(crate) cutoff_hours: Option<i64>,
+    #[schemars(
+        description = "Days since updated_at before an item counts as stale (groom/plan: default 14; standup/health/portfolio: default 7)"
+    )]
+    #[serde(default)]
+    pub(crate) staleness_days: Option<i64>,
+    #[schemars(description = "Max backlog items to shortlist (groom/plan; default 15)")]
+    #[serde(default)]
+    pub(crate) limit: Option<i64>,
+    #[schemars(
+        description = "Now-bucket size for plan's Now/Next/Later split (plan only; default 5)"
+    )]
+    #[serde(default)]
+    pub(crate) capacity: Option<i64>,
+    #[schemars(
+        description = "Trailing weekly windows for velocity (health, portfolio with report=health); default 4, max 52"
+    )]
+    #[serde(default)]
+    pub(crate) window_weeks: Option<i64>,
+    #[schemars(
+        description = "portfolio only: which per-project report to roll up — health (default) or standup"
+    )]
+    #[serde(default)]
+    pub(crate) report: Option<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct AssetRequest {
     #[schemars(description = "Action: attach|get|list|delete")]
@@ -1111,6 +1185,26 @@ pub(crate) struct SearchRequest {
     )]
     #[serde(default)]
     pub(crate) limit: Option<usize>,
+    #[schemars(
+        description = "Filter store docs by custom metadata key=value (≤5 fields, 64B prefix) — local-first only, requires doc_set_meta"
+    )]
+    #[serde(default)]
+    pub(crate) meta: Option<std::collections::HashMap<String, String>>,
+    #[schemars(
+        description = "Filter store docs by path glob (e.g. docs/*.md, src/**/*.rs) — SQLite GLOB"
+    )]
+    #[serde(default)]
+    pub(crate) path_glob: Option<String>,
+    #[schemars(
+        description = "Minimum score threshold (BM25 negated rank or cosine) — filters low-relevance hits"
+    )]
+    #[serde(default)]
+    pub(crate) min_score: Option<f64>,
+    #[schemars(
+        description = "Enable cross-encoder rerank (BGERerankerBase via fastembed, requires embeddings feature + cached model). Default true when model available."
+    )]
+    #[serde(default)]
+    pub(crate) rerank: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -1164,4 +1258,40 @@ pub(crate) struct WorkflowRequest {
     )]
     #[serde(default)]
     pub(crate) since: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct BrowserRequest {
+    #[schemars(
+        description = "Action: open|snapshot|observe|extract|click|fill|type|press|hover|select|check|uncheck|back|forward|reload|get|read|screenshot|pdf|eval|wait|cookies|storage|network|tabs|dialog|console|errors|batch|state|close|doctor|status. Subcommands allowed: \"get text\", \"tab new\", \"cookies set\", \"network requests\", \"dialog accept\", \"state save\". observe filters the snapshot to matching lines; extract runs JS via eval."
+    )]
+    pub(crate) action: String,
+    #[schemars(
+        description = "Browser session id (default: $AGENTFLARE_BROWSER_SESSION, else af-<cwd hash> — concurrent worktrees isolate automatically)"
+    )]
+    #[serde(default)]
+    pub(crate) session: Option<String>,
+    #[schemars(
+        description = "Element target: @e ref from snapshot or CSS selector (click, fill, type, hover, get, ...)"
+    )]
+    #[serde(default)]
+    pub(crate) target: Option<String>,
+    #[schemars(
+        description = "Text payload: fill/type text, observe query, eval/extract JS, wait condition, batch extras vary by action"
+    )]
+    #[serde(default)]
+    pub(crate) text: Option<String>,
+    #[schemars(description = "URL payload: open/read navigation target")]
+    #[serde(default)]
+    pub(crate) url: Option<String>,
+    #[schemars(
+        description = "Extra raw args appended verbatim (escape hatch for full sidecar parity, e.g. [\"--full\"] or [\"set\",\"k\",\"v\"])"
+    )]
+    #[serde(default)]
+    pub(crate) args: Option<Vec<String>>,
+    #[schemars(
+        description = "Secret values to scrub from the output before it reaches the model (convenience, not a security boundary)"
+    )]
+    #[serde(default)]
+    pub(crate) redact: Option<Vec<String>>,
 }

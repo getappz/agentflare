@@ -312,14 +312,17 @@ fn find_duplicate(
     .optional()
 }
 
+/// Lowercase + whitespace-collapsed normalization, shared by content
+/// hashing and the recall dedup-cache key so both agree on equivalence.
+pub fn normalize_text(s: &str) -> String {
+    s.split_whitespace()
+        .map(|w| w.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn hash_normalized(title: &str, content: &str) -> String {
-    let normal = |s: &str| -> String {
-        s.split_whitespace()
-            .map(|w| w.to_lowercase())
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let combined = format!("{} | {}", normal(title), normal(content));
+    let combined = format!("{} | {}", normalize_text(title), normalize_text(content));
     hex::encode(Sha256::digest(combined.as_bytes()))
 }
 

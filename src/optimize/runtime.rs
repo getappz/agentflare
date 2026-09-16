@@ -28,6 +28,23 @@ pub struct SessionRecord {
     /// [`VERIFICATION_FRESHNESS_SECS`] or a newer command superseded it.
     #[serde(default)]
     pub last_verification: Option<VerificationEvidence>,
+    /// Most recent code review this session actually requested, used by the
+    /// same completion gate to require fresh review evidence -- see
+    /// [`ReviewEvidence`]. Same staleness rule as `last_verification`: falls
+    /// out of [`VERIFICATION_FRESHNESS_SECS`], or a newer edit invalidates it
+    /// (a review of a since-changed tree doesn't cover the current diff).
+    #[serde(default)]
+    pub last_review: Option<ReviewEvidence>,
+    /// Most recent root-cause-investigation command this session actually
+    /// ran, used by the completion gate (item #203) to require evidence of
+    /// diagnosis before `item done`/`check_merge` on a `task_type=bugfix`
+    /// item -- see [`DiagnosisEvidence`]. Unlike `last_verification`/
+    /// `last_review`, this is NOT cleared by a later mutating tool call: a
+    /// test run stops proving anything once the tree changes underneath it,
+    /// but "did you look at recent history/a working analog before fixing"
+    /// isn't undone by the edit that follows it.
+    #[serde(default)]
+    pub last_diagnosis: Option<DiagnosisEvidence>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -44,6 +61,31 @@ pub struct VerificationEvidence {
     pub command: String,
     pub exit_code: Option<i32>,
     pub passed: bool,
+    pub ts: u64,
+}
+
+/// Evidence that a code review actually *completed* in this session,
+/// captured by the `PostToolUse` success hook (`hook_completion_gate::post_tool_use`)
+/// when the `ReportFindings` tool is called -- see [`is_review_completion`]
+/// for why that tool call, specifically, is the trigger. Unlike
+/// [`VerificationEvidence`] there's no pass/fail: review either ran or it
+/// didn't, and its findings are for the agent to act on, not this gate to
+/// judge.
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct ReviewEvidence {
+    pub source: String,
+    pub ts: u64,
+}
+
+/// Evidence that a root-cause-investigation command was actually run in this
+/// session, captured by the `PostToolUse` success hook
+/// (`hook_completion_gate::post_tool_use`) when a Bash-family call's command
+/// matches [`is_diagnosis_command`]. Mirrors [`VerificationEvidence`], minus
+/// the pass/fail signal -- a diagnosis command has no exit-code notion of
+/// "succeeded," it either ran or it didn't.
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct DiagnosisEvidence {
+    pub command: String,
     pub ts: u64,
 }
 
@@ -130,13 +172,13 @@ fn strip_quoted_substrings(s: &str) -> String {
     out
 }
 
-/// True when `command` looks like a test/build/lint invocation -- see
-/// [`VERIFICATION_COMMAND_MARKERS`]. Splits on shell statement separators
-/// and checks each statement independently (same convention as
-/// `hook_redirect::destructive_data_file_reason`) so a marker string only
-/// counts when some statement actually looks like it invokes that program,
-/// not merely mentions it as a quoted argument to `grep`/`echo`/etc.
-pub fn is_verification_command(command: &str) -> bool {
+/// Splits `command` on shell statement separators and checks each statement
+/// independently (same convention as `hook_redirect::destructive_data_file_reason`)
+/// against `markers`, so a marker string only counts when some statement
+/// actually looks like it invokes that program, not merely mentions it as a
+/// quoted argument to `grep`/`echo`/etc. Shared by [`is_verification_command`]
+/// and [`is_diagnosis_command`] -- same detection style, different marker set.
+fn command_matches_any_marker(command: &str, markers: &[&str]) -> bool {
     for statement in command
         .split(['\n', ';'])
         .flat_map(|s| s.split("&&"))
@@ -152,14 +194,17 @@ pub fn is_verification_command(command: &str) -> bool {
         if NON_EXECUTING_FIRST_WORDS.contains(&first_word) {
             continue;
         }
-        if VERIFICATION_COMMAND_MARKERS
-            .iter()
-            .any(|marker| trimmed.contains(marker))
-        {
+        if markers.iter().any(|marker| trimmed.contains(marker)) {
             return true;
         }
     }
     false
+}
+
+/// True when `command` looks like a test/build/lint invocation -- see
+/// [`VERIFICATION_COMMAND_MARKERS`].
+pub fn is_verification_command(command: &str) -> bool {
+    command_matches_any_marker(command, VERIFICATION_COMMAND_MARKERS)
 }
 
 /// Whether `record` carries verification evidence recent and passing enough
@@ -169,6 +214,71 @@ pub fn has_fresh_passing_verification(record: &SessionRecord, now: u64) -> bool 
         .last_verification
         .as_ref()
         .is_some_and(|v| v.passed && now.saturating_sub(v.ts) < VERIFICATION_FRESHNESS_SECS)
+}
+
+/// Substrings (lowercased) that mark a shell command as a root-cause-
+/// investigation step worth recording as diagnosis evidence for the
+/// systematic-debugging completion gate (item #203) -- "check recent
+/// changes," the mechanical footprint of `systematic-debugging`'s Phase 1
+/// step 3 / Phase 2 step 1. Same false-positive-tolerant philosophy as
+/// [`VERIFICATION_COMMAND_MARKERS`]: an accidental match only makes the gate
+/// slightly more permissive, never less safe.
+const DIAGNOSIS_COMMAND_MARKERS: &[&str] =
+    &["git log", "git blame", "git diff", "git show", "git bisect"];
+
+/// True when `command` looks like a diagnosis/investigation step -- see
+/// [`DIAGNOSIS_COMMAND_MARKERS`].
+pub fn is_diagnosis_command(command: &str) -> bool {
+    command_matches_any_marker(command, DIAGNOSIS_COMMAND_MARKERS)
+}
+
+/// Whether `record` carries diagnosis evidence recorded this session at all.
+/// Unlike [`has_fresh_passing_verification`], there's no pass/fail and --
+/// per [`SessionRecord::last_diagnosis`]'s doc comment -- no invalidation on
+/// a later edit, so recency here is just "exists," not a freshness window.
+pub fn has_fresh_diagnosis_evidence(record: &SessionRecord) -> bool {
+    record.last_diagnosis.is_some()
+}
+
+/// True when `tool_name` is the structural signal that a code review just
+/// *finished* being synthesized, not merely requested. Earlier revisions of
+/// this gate matched `Skill`/`Task`/`Agent` calls by scanning their prompt/
+/// skill-name text for review-shaped substrings -- rejected on review
+/// (item #182): a `Skill` call only means the skill's instructions were
+/// loaded into context, not that any review work happened yet, and `Task`/
+/// `Agent` dispatch in this harness is background-by-default, returning a
+/// task handle before the dispatched reviewer produces anything -- so both
+/// credited evidence at the wrong moment (dispatch, not completion), and the
+/// free-text scan on `Task`/`Agent` prompts/descriptions could be satisfied
+/// by a prompt that merely *mentions* review in passing.
+///
+/// `ReportFindings` is the one structural, harness-provided signal that
+/// doesn't have either problem: it's the tool this session's code-review
+/// flow calls once (and only once) it has actually examined the diff and
+/// ranked its findings -- calling it, even with an empty findings list,
+/// requires the review work to have already happened. This narrows
+/// automatic detection to review flows that report through this tool (this
+/// session's `/code-review` skill does); a subagent dispatched per
+/// superpowers' `requesting-code-review` pattern that only returns prose
+/// won't be picked up automatically -- there is no tool call visible to this
+/// hook that reliably marks "the dispatching agent read and acted on that
+/// subagent's findings" for a backgrounded dispatch. That's a real coverage
+/// gap, not a nice-to-have: acknowledged rather than papered over with a
+/// heuristic that reintroduces the same failure mode this rejects.
+pub fn is_review_completion(tool_name: &str) -> bool {
+    tool_name == "ReportFindings"
+}
+
+/// Whether `record` carries review evidence recent enough to satisfy the
+/// completion gate right now -- same freshness window as verification
+/// evidence ([`VERIFICATION_FRESHNESS_SECS`]), no separate window since both
+/// answer the same question: "does this evidence still cover the current
+/// tree".
+pub fn has_fresh_review(record: &SessionRecord, now: u64) -> bool {
+    record
+        .last_review
+        .as_ref()
+        .is_some_and(|r| now.saturating_sub(r.ts) < VERIFICATION_FRESHNESS_SECS)
 }
 
 /// Clears a session's recorded verification evidence -- called by the
@@ -182,6 +292,27 @@ pub fn invalidate_verification(state: &mut RuntimeState, session_id: &str) {
     if let Some(record) = state.sessions.get_mut(session_id) {
         record.last_verification = None;
     }
+}
+
+/// Clears a session's recorded review evidence -- called alongside
+/// [`invalidate_verification`] whenever a mutating tool runs, for the same
+/// reason: a review of the tree *before* this edit doesn't cover the tree
+/// *after* it.
+pub fn invalidate_review(state: &mut RuntimeState, session_id: &str) {
+    if let Some(record) = state.sessions.get_mut(session_id) {
+        record.last_review = None;
+    }
+}
+
+/// Combines agent identity with the raw hook `session_id` so two agents (or
+/// hosts) sharing a bare session id — a shared tmux pane, a multi-agent
+/// machine — don't collide on the same `RuntimeState::sessions` record (item
+/// #220). `agent` should already be normalized (`cli::hook::resolve_agent`'s
+/// output), so this is transparent for the common single-agent case: an
+/// empty/`"unknown"` agent still produces a stable, distinct key per agent
+/// value rather than silently degrading back to the bare session id.
+pub fn scoped_session_key(agent: &str, session_id: &str) -> String {
+    format!("{agent}:{session_id}")
 }
 
 pub fn runtime_state_path() -> PathBuf {
@@ -409,6 +540,14 @@ mod tests {
     use crate::paths::test_support::with_temp_home;
 
     #[test]
+    fn scoped_session_key_differs_by_agent_for_same_session_id() {
+        assert_ne!(
+            scoped_session_key("claude", "shared-sid"),
+            scoped_session_key("opencode", "shared-sid")
+        );
+    }
+
+    #[test]
     fn load_defaults_to_empty_when_no_file() {
         with_temp_home(|| {
             assert!(load_runtime().sessions.is_empty());
@@ -426,6 +565,8 @@ mod tests {
                     turn_count: 3,
                     recent_tool_calls: vec![],
                     last_verification: None,
+                    last_review: None,
+                    last_diagnosis: None,
                 },
             );
             save_runtime(&state);
@@ -454,6 +595,8 @@ mod tests {
                 turn_count: 1,
                 recent_tool_calls: vec![],
                 last_verification: None,
+                last_review: None,
+                last_diagnosis: None,
             },
         );
         state.sessions.insert(
@@ -463,6 +606,8 @@ mod tests {
                 turn_count: 1,
                 recent_tool_calls: vec![],
                 last_verification: None,
+                last_review: None,
+                last_diagnosis: None,
             },
         );
         let now = 100_100; // 100s after "recent", ~27.7h after "old"
@@ -478,6 +623,8 @@ mod tests {
             turn_count: 5,
             recent_tool_calls: vec![],
             last_verification: None,
+            last_review: None,
+            last_diagnosis: None,
         };
         assert!(session_hygiene_nudge(&record, 100).is_none());
     }
@@ -489,6 +636,8 @@ mod tests {
             turn_count: 81,
             recent_tool_calls: vec![],
             last_verification: None,
+            last_review: None,
+            last_diagnosis: None,
         };
         assert!(session_hygiene_nudge(&record, 100).is_some());
     }
@@ -500,6 +649,8 @@ mod tests {
             turn_count: 1,
             recent_tool_calls: vec![],
             last_verification: None,
+            last_review: None,
+            last_diagnosis: None,
         };
         assert!(session_hygiene_nudge(&record, 2 * 60 * 60 + 1).is_some());
     }
@@ -585,6 +736,89 @@ mod tests {
     }
 
     #[test]
+    fn is_diagnosis_command_matches_investigation_commands() {
+        assert!(is_diagnosis_command("git log --oneline -- src/foo.rs"));
+        assert!(is_diagnosis_command("git blame src/foo.rs"));
+        assert!(is_diagnosis_command("git diff HEAD~3 -- src/foo.rs"));
+        assert!(is_diagnosis_command("git show abc123"));
+        assert!(is_diagnosis_command("git bisect start"));
+    }
+
+    #[test]
+    fn is_diagnosis_command_ignores_unrelated_commands() {
+        assert!(!is_diagnosis_command("ls -la"));
+        assert!(!is_diagnosis_command("cargo test"));
+        assert!(!is_diagnosis_command("git status"));
+    }
+
+    #[test]
+    fn is_diagnosis_command_ignores_marker_mentioned_in_quoted_grep_pattern() {
+        assert!(!is_diagnosis_command("grep -rn \"git log\" src/"));
+        assert!(!is_diagnosis_command("echo \"remember to run git blame\""));
+    }
+
+    #[test]
+    fn is_diagnosis_command_still_matches_real_invocation_after_pipe_or_chain() {
+        assert!(is_diagnosis_command(
+            "grep -rn \"git log\" src/ ; git log --oneline"
+        ));
+        assert!(is_diagnosis_command("cd foo && git diff | less"));
+    }
+
+    #[test]
+    fn has_fresh_diagnosis_evidence_true_when_recorded() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: None,
+            last_review: None,
+            last_diagnosis: Some(DiagnosisEvidence {
+                command: "git log".into(),
+                ts: 1000,
+            }),
+        };
+        assert!(has_fresh_diagnosis_evidence(&record));
+    }
+
+    #[test]
+    fn has_fresh_diagnosis_evidence_false_when_absent() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: None,
+            last_review: None,
+            last_diagnosis: None,
+        };
+        assert!(!has_fresh_diagnosis_evidence(&record));
+    }
+
+    #[test]
+    fn invalidate_verification_does_not_clear_diagnosis_evidence() {
+        // The one behavioral difference from last_verification/last_review:
+        // a mutating tool call must NOT undo diagnosis evidence -- see
+        // SessionRecord::last_diagnosis's doc comment for why.
+        let mut state = RuntimeState::default();
+        state.sessions.insert(
+            "s1".to_string(),
+            SessionRecord {
+                start_ts: 0,
+                turn_count: 0,
+                recent_tool_calls: vec![],
+                last_verification: None,
+                last_review: None,
+                last_diagnosis: Some(DiagnosisEvidence {
+                    command: "git log".into(),
+                    ts: 1000,
+                }),
+            },
+        );
+        invalidate_verification(&mut state, "s1");
+        assert!(state.sessions["s1"].last_diagnosis.is_some());
+    }
+
+    #[test]
     fn invalidate_verification_clears_existing_evidence() {
         let mut state = RuntimeState::default();
         state.sessions.insert(
@@ -599,6 +833,8 @@ mod tests {
                     passed: true,
                     ts: 1000,
                 }),
+                last_review: None,
+                last_diagnosis: None,
             },
         );
         invalidate_verification(&mut state, "s1");
@@ -613,6 +849,97 @@ mod tests {
     }
 
     #[test]
+    fn is_review_completion_matches_report_findings_tool() {
+        assert!(is_review_completion("ReportFindings"));
+    }
+
+    #[test]
+    fn is_review_completion_ignores_dispatch_and_unrelated_tools() {
+        // Regression: PR #182 review -- Skill/Task/Agent dispatch must NOT
+        // count as review completion, only the ReportFindings call itself.
+        assert!(!is_review_completion("Skill"));
+        assert!(!is_review_completion("Task"));
+        assert!(!is_review_completion("Agent"));
+        assert!(!is_review_completion("Bash"));
+    }
+
+    #[test]
+    fn invalidate_review_clears_existing_evidence() {
+        let mut state = RuntimeState::default();
+        state.sessions.insert(
+            "s1".to_string(),
+            SessionRecord {
+                start_ts: 0,
+                turn_count: 0,
+                recent_tool_calls: vec![],
+                last_verification: None,
+                last_review: Some(ReviewEvidence {
+                    source: "code-review".into(),
+                    ts: 1000,
+                }),
+                last_diagnosis: None,
+            },
+        );
+        invalidate_review(&mut state, "s1");
+        assert!(state.sessions["s1"].last_review.is_none());
+    }
+
+    #[test]
+    fn invalidate_review_is_a_noop_for_unknown_session() {
+        let mut state = RuntimeState::default();
+        invalidate_review(&mut state, "does-not-exist");
+        assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn has_fresh_review_true_for_recent_review() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: None,
+            last_review: Some(ReviewEvidence {
+                source: "code-review".into(),
+                ts: 1000,
+            }),
+            last_diagnosis: None,
+        };
+        assert!(has_fresh_review(&record, 1000 + 60));
+    }
+
+    #[test]
+    fn has_fresh_review_false_when_stale() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: None,
+            last_review: Some(ReviewEvidence {
+                source: "code-review".into(),
+                ts: 1000,
+            }),
+            last_diagnosis: None,
+        };
+        assert!(!has_fresh_review(
+            &record,
+            1000 + VERIFICATION_FRESHNESS_SECS + 1
+        ));
+    }
+
+    #[test]
+    fn has_fresh_review_false_when_absent() {
+        let record = SessionRecord {
+            start_ts: 0,
+            turn_count: 0,
+            recent_tool_calls: vec![],
+            last_verification: None,
+            last_review: None,
+            last_diagnosis: None,
+        };
+        assert!(!has_fresh_review(&record, 1000));
+    }
+
+    #[test]
     fn has_fresh_passing_verification_true_for_recent_pass() {
         let record = SessionRecord {
             start_ts: 0,
@@ -624,6 +951,8 @@ mod tests {
                 passed: true,
                 ts: 1000,
             }),
+            last_review: None,
+            last_diagnosis: None,
         };
         assert!(has_fresh_passing_verification(&record, 1000 + 60));
     }
@@ -640,6 +969,8 @@ mod tests {
                 passed: true,
                 ts: 1000,
             }),
+            last_review: None,
+            last_diagnosis: None,
         };
         assert!(!has_fresh_passing_verification(
             &record,
@@ -659,6 +990,8 @@ mod tests {
                 passed: false,
                 ts: 1000,
             }),
+            last_review: None,
+            last_diagnosis: None,
         };
         assert!(!has_fresh_passing_verification(&record, 1000));
     }
@@ -670,6 +1003,8 @@ mod tests {
             turn_count: 0,
             recent_tool_calls: vec![],
             last_verification: None,
+            last_review: None,
+            last_diagnosis: None,
         };
         assert!(!has_fresh_passing_verification(&record, 1000));
     }

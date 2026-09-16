@@ -32,6 +32,103 @@ fn resolve_confirmed_agent_rejects_unknown_agent_string() {
     assert_eq!(resolve_confirmed_agent("not-a-real-agent"), None);
 }
 
+#[test]
+fn route_unassigned_with_returns_none_when_no_rule_matches() {
+    let item = agentflare_backend::item::Item {
+        metadata: "{}".into(),
+        ..test_item_stub()
+    };
+    let config = agent_registry::RouterConfig::default();
+    let installed = [agent_registry::Agent::Opencode];
+    let mut rotation = std::collections::HashMap::new();
+    assert_eq!(
+        route_unassigned_with(&item, &config, &installed, &mut rotation),
+        None
+    );
+}
+
+#[test]
+fn route_unassigned_with_picks_the_implementer_role_rule() {
+    // Item #19 regression: an item with no assignee_agent (as
+    // `discover_untracked_prs` always creates) must still resolve to an
+    // agent when a `[[router.rule]] when = { role = "implementer" }` rule
+    // covers it, the same rule `agentflare work` itself would use.
+    let item = agentflare_backend::item::Item {
+        metadata: "{}".into(),
+        ..test_item_stub()
+    };
+    let config = agent_registry::RouterConfig {
+        default: None,
+        rules: vec![agent_registry::RouterRule {
+            when: agent_registry::RuleMatch {
+                role: Some("implementer".into()),
+                ..Default::default()
+            },
+            use_agents: vec![agent_registry::Agent::Opencode],
+            rotate: false,
+            model: None,
+        }],
+    };
+    let installed = [agent_registry::Agent::Opencode];
+    let mut rotation = std::collections::HashMap::new();
+    assert_eq!(
+        route_unassigned_with(&item, &config, &installed, &mut rotation),
+        Some(agent_registry::Agent::Opencode)
+    );
+}
+
+#[test]
+fn route_unassigned_with_ignores_a_matching_rule_whose_agent_is_not_installed() {
+    let item = agentflare_backend::item::Item {
+        metadata: "{}".into(),
+        ..test_item_stub()
+    };
+    let config = agent_registry::RouterConfig {
+        default: None,
+        rules: vec![agent_registry::RouterRule {
+            when: agent_registry::RuleMatch {
+                role: Some("implementer".into()),
+                ..Default::default()
+            },
+            use_agents: vec![agent_registry::Agent::Opencode],
+            rotate: false,
+            model: None,
+        }],
+    };
+    let installed: [agent_registry::Agent; 0] = [];
+    let mut rotation = std::collections::HashMap::new();
+    assert_eq!(
+        route_unassigned_with(&item, &config, &installed, &mut rotation),
+        None
+    );
+}
+
+fn test_item_stub() -> agentflare_backend::item::Item {
+    agentflare_backend::item::Item {
+        id: "test-id".into(),
+        project_id: "proj".into(),
+        state_id: "state".into(),
+        name: "test".into(),
+        description: String::new(),
+        priority: "none".into(),
+        parent_id: None,
+        assignee_agent: None,
+        sequence_id: 1,
+        sort_order: 0.0,
+        started_at: None,
+        completed_at: None,
+        archived_at: None,
+        external_source: None,
+        external_id: None,
+        metadata: "{}".into(),
+        created_at: 0,
+        updated_at: 0,
+        deleted_at: None,
+        start_date: None,
+        due_date: None,
+    }
+}
+
 fn test_mcp() -> AgentflareMcp {
     AgentflareMcp::for_test_memory()
 }
@@ -85,6 +182,8 @@ fn seed_ready_item(mcp: &AgentflareMcp, assignee: Option<&str>) -> String {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -346,6 +445,8 @@ fn seed_ready_item_under_gated_goal(mcp: &AgentflareMcp) -> String {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -366,6 +467,8 @@ fn seed_ready_item_under_gated_goal(mcp: &AgentflareMcp) -> String {
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -463,6 +566,8 @@ fn seed_ready_item_under_active_goal_with_repairs(
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -498,6 +603,8 @@ fn seed_ready_item_under_active_goal_with_repairs(
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -679,6 +786,8 @@ fn seed_ready_item_in_project(mcp: &AgentflareMcp, name: &str, folder_path: &str
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -759,6 +868,8 @@ fn seed_in_review_item_with_claim_age(
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -829,6 +940,8 @@ fn seed_in_review_item_in_project(mcp: &AgentflareMcp, name: &str, folder_path: 
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap();
@@ -928,6 +1041,53 @@ fn job_in_flight_detects_a_queued_job_for_the_item() {
 }
 
 #[test]
+fn second_tick_does_not_reenqueue_while_job_still_queued() {
+    // Item #221: every discovery tick enqueued a fresh row per ready item
+    // (96+ dupes observed live) because dispatch_item never checked for an
+    // existing queued/running row. Re-arm the ready label the way a failed
+    // swap or a reconcile-restore would, tick again: still exactly one row.
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_ready_item(&mcp, Some("claude-code"));
+
+    let auth_conn = test_auth_conn();
+    let first = run_discovery_tick(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+    assert_eq!(first.dispatched, 1);
+    assert_eq!(queue.list(None).unwrap().len(), 1);
+
+    mcp.with_backend_db(|conn| {
+        let project = mcp.resolve_project(conn).unwrap();
+        let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+        let ready_id = labels
+            .iter()
+            .find(|l| l.name == "ready-for-work")
+            .unwrap()
+            .id
+            .clone();
+        agentflare_backend::item::add_label(conn, &item_id, &ready_id).unwrap();
+    })
+    .unwrap();
+
+    let second = run_discovery_tick(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+    assert_eq!(second.dispatched, 0);
+    assert_eq!(
+        queue.list(None).unwrap().len(),
+        1,
+        "re-armed ready label must not produce a second queued row"
+    );
+}
+
+#[test]
 fn run_review_sweep_ignores_items_not_in_review() {
     let mcp = test_mcp();
     let queue = test_queue();
@@ -952,6 +1112,47 @@ fn run_review_sweep_skips_an_item_whose_pr_status_cannot_be_determined() {
     let mcp = test_mcp_with_repo(repo.path().to_path_buf());
     let queue = test_queue();
     let _item_id = seed_in_review_item(&mcp, Some("claude-code"));
+
+    let auth_conn = test_auth_conn();
+    let result = run_review_sweep(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+
+    assert_eq!(result.promoted, 0);
+    assert_eq!(result.self_repaired, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(queue.list(None).unwrap().is_empty());
+}
+
+// Task #198: an item carrying `metadata.pr.number` takes the batched-GraphQL
+// fetch path instead of the old one-REST-call-per-item path. `throwaway_repo`
+// has no GitHub remote at all, so `RepoId::resolve_from_remote` fails before
+// any network call would even be attempted either way -- what this pins is
+// that the *new* numbered/batch code path degrades the same way the
+// pre-existing unnumbered path already does (`Unknown` -> `skipped`, no
+// panic), for an item shape (`metadata.pr.number` set) none of the other
+// `run_review_sweep` tests above exercise.
+#[test]
+fn run_review_sweep_skips_a_numbered_item_the_same_way_when_no_remote_resolves() {
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let queue = test_queue();
+    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    mcp.with_backend_db(|conn| {
+        agentflare_backend::item::update(
+            conn,
+            &item_id,
+            agentflare_backend::item::UpdateItem {
+                metadata: Some(r#"{"pr":{"number":501,"branch":"task/501"}}"#.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    })
+    .unwrap();
 
     let auth_conn = test_auth_conn();
     let result = run_review_sweep(
@@ -1130,6 +1331,7 @@ fn self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment() {
         &auth_conn,
         agentflare_resource_gate::Policy::Normal,
         &item,
+        1,
         &["clippy".to_string()],
         &label_id_by_name,
         "/repo",
@@ -1194,6 +1396,7 @@ fn self_repair_or_gate_gates_instead_of_dispatching_once_the_cap_is_reached() {
             &auth_conn,
             agentflare_resource_gate::Policy::Normal,
             &item,
+            1,
             &["clippy".to_string()],
             &label_id_by_name,
             "/repo",
@@ -1232,6 +1435,7 @@ fn self_repair_or_gate_stays_quiet_once_already_gated() {
         &auth_conn,
         agentflare_resource_gate::Policy::Normal,
         &item,
+        1,
         &["clippy".to_string()],
         &label_id_by_name,
         "/repo",
@@ -1239,6 +1443,42 @@ fn self_repair_or_gate_stays_quiet_once_already_gated() {
 
     assert!(matches!(outcome, SelfRepairOutcome::Skipped));
     assert!(queue.list(None).unwrap().is_empty());
+}
+
+#[test]
+fn self_repair_or_gate_still_skips_gracefully_when_unassigned_and_no_router_rule_matches() {
+    // The router fallback (item #19 regression) must degrade the same way
+    // the pre-existing "no assignee" path always did when there's genuinely
+    // nothing to route to (no `~/.agentflare/config.toml`, the common case)
+    // -- Skipped, not a panic, not a double-dispatch.
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        // Backdated past the claim TTL, same as the dispatch-success test --
+        // otherwise item #114's claim-liveness check (Deferred) would return
+        // first and this would never reach the assignee-resolution branch.
+        let item_id = seed_in_review_item_with_claim_age(&mcp, None, 1_900);
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap();
+        let label_id_by_name = seed_gate_label(&mcp);
+        let auth_conn = test_auth_conn();
+
+        let outcome = self_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            1,
+            &["clippy".to_string()],
+            &label_id_by_name,
+            "/repo",
+        );
+
+        assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+        assert!(queue.list(None).unwrap().is_empty());
+    });
 }
 
 #[test]
@@ -1262,6 +1502,7 @@ fn self_repair_or_gate_does_not_double_dispatch_while_a_job_is_already_in_flight
         &auth_conn,
         agentflare_resource_gate::Policy::Normal,
         &item,
+        1,
         &["clippy".to_string()],
         &label_id_by_name,
         "/repo",
@@ -1297,6 +1538,7 @@ fn self_repair_or_gate_defers_instead_of_dispatching_into_a_still_live_claim() {
         &auth_conn,
         agentflare_resource_gate::Policy::Normal,
         &item,
+        1,
         &["clippy".to_string()],
         &label_id_by_name,
         "/repo",
@@ -1396,6 +1638,8 @@ fn seed_item_with_deps(
                 label_ids: vec![],
                 assignee_ids: vec![],
                 dependency_ids,
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap()
@@ -1547,5 +1791,214 @@ fn cascade_unblock_dependents_is_idempotent_across_repeated_calls() {
     assert_eq!(
         ready_count, 1,
         "add_label's INSERT OR IGNORE must keep repeated cascade calls idempotent"
+    );
+}
+
+/// Regression test for the typed-relations migration (0012): a `duplicate`
+/// relation with no `blocks` edge must never be treated as a blocking
+/// dependency by `cascade_unblock_dependents` -- `dependents_of` only reads
+/// `relation_type = 'blocks'` rows.
+#[test]
+fn cascade_unblock_dependents_ignores_a_pure_duplicate_relation() {
+    let mcp = test_mcp();
+    let a = seed_item_with_deps(&mcp, "A", None, vec![]);
+    let b = seed_item_with_deps(&mcp, "B", Some("claude-code"), vec![]);
+    mcp.with_backend_db(|conn| {
+        agentflare_backend::item::add_relation(conn, &b, &a, "duplicate").unwrap()
+    })
+    .unwrap();
+    complete_item(&mcp, &a);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &a))
+        .unwrap();
+
+    assert!(
+        !item_has_ready_label(&mcp, &b),
+        "a duplicate-only relation must not be read as a blocking dependency"
+    );
+}
+
+/// A `duplicate` relation coexisting alongside a real `blocks` edge between
+/// the same pair must not change `cascade_unblock_dependents`'s behavior
+/// for the `blocks` edge -- the load-bearing constraint from item #3's spec
+/// §3.
+#[test]
+fn cascade_unblock_dependents_unaffected_by_coexisting_duplicate_relation() {
+    let mcp = test_mcp();
+    let blocker = seed_item_with_deps(&mcp, "Blocker", None, vec![]);
+    let dependent = seed_item_with_deps(
+        &mcp,
+        "Dependent",
+        Some("claude-code"),
+        vec![blocker.clone()],
+    );
+    mcp.with_backend_db(|conn| {
+        agentflare_backend::item::add_relation(conn, &dependent, &blocker, "duplicate").unwrap()
+    })
+    .unwrap();
+    complete_item(&mcp, &blocker);
+
+    mcp.with_backend_db(|conn| cascade_unblock_dependents(conn, &blocker))
+        .unwrap();
+
+    assert!(
+        item_has_ready_label(&mcp, &dependent),
+        "a coexisting duplicate relation must not suppress the real blocks-edge cascade"
+    );
+}
+
+// -- Telegram inbound routing: characterization tests written before
+// merging the chat channel's polling into this same tick (see
+// `poll_telegram_approvals`/`handle_telegram_callback`) -- these pin down
+// the existing approval-callback behavior so the merge can't silently
+// change it. No tests previously covered this path.
+
+#[test]
+fn parse_approve_callback_extracts_repo_and_number() {
+    let parsed = parse_approve_callback("approve:owner/repo#42");
+    assert!(parsed.is_some());
+    let (repo, number) = parsed.unwrap();
+    assert_eq!(repo.to_string(), "owner/repo");
+    assert_eq!(number, 42);
+}
+
+#[test]
+fn parse_approve_callback_rejects_non_approve_prefix() {
+    assert_eq!(parse_approve_callback("deny:owner/repo#42"), None);
+}
+
+#[test]
+fn parse_approve_callback_rejects_missing_number() {
+    assert_eq!(parse_approve_callback("approve:owner/repo"), None);
+}
+
+#[test]
+fn handle_telegram_callback_ignores_update_with_no_callback_query() {
+    // A plain message update -- must not panic and must not attempt any
+    // GitHub call (no network in this test process, so a GitHub attempt
+    // would hang/fail rather than silently succeed).
+    let update = serde_json::json!({
+        "update_id": 1,
+        "message": { "chat": { "id": 999 }, "text": "hello" }
+    });
+    handle_telegram_callback(&update, "999");
+}
+
+#[test]
+fn handle_telegram_callback_ignores_callback_from_wrong_chat() {
+    let update = serde_json::json!({
+        "update_id": 2,
+        "callback_query": {
+            "id": "cb1",
+            "data": "approve:owner/repo#1",
+            "message": { "message_id": 5, "chat": { "id": 111 } }
+        }
+    });
+    // expected_chat_id is "999", update is from chat 111 -- must return
+    // early (before any GitHub call) rather than panic.
+    handle_telegram_callback(&update, "999");
+}
+
+#[test]
+fn handle_telegram_callback_ignores_malformed_callback_query() {
+    let update = serde_json::json!({
+        "update_id": 3,
+        "callback_query": { "id": "cb1" } // missing "data"
+    });
+    handle_telegram_callback(&update, "999");
+}
+
+// -- `handle_chat_message`: the merged poll's other branch (see
+// `poll_telegram_approvals`). Only exercises the authorization/shape gate
+// here -- once past it, dispatch_message hands off to chat_channel, which
+// has its own test coverage for command parsing.
+
+#[test]
+fn handle_chat_message_ignores_message_from_wrong_chat() {
+    let message = serde_json::json!({ "chat": { "id": 111 }, "text": "hi" });
+    let mcp = std::sync::Arc::new(test_mcp());
+    // expected_chat_id is "999", message is from chat 111 -- must return
+    // without dispatching anything (no panic, no network/db touch).
+    handle_chat_message(&message, "999", &mcp, 1);
+}
+
+#[test]
+fn handle_chat_message_ignores_message_with_no_text() {
+    let message = serde_json::json!({ "chat": { "id": 999 } });
+    let mcp = std::sync::Arc::new(test_mcp());
+    handle_chat_message(&message, "999", &mcp, 2);
+}
+
+#[test]
+fn handle_chat_message_ignores_whitespace_only_text() {
+    let message = serde_json::json!({ "chat": { "id": 999 }, "text": "   " });
+    let mcp = std::sync::Arc::new(test_mcp());
+    handle_chat_message(&message, "999", &mcp, 3);
+}
+
+#[test]
+fn handle_chat_message_ignores_message_with_no_chat() {
+    let message = serde_json::json!({ "text": "hi" });
+    let mcp = std::sync::Arc::new(test_mcp());
+    handle_chat_message(&message, "999", &mcp, 4);
+}
+
+// -- Offset watermark: safe_offset_to_persist / mark_in_flight / settle
+// (see poll_telegram_approvals). These back the fix for the exact gap
+// CodeRabbit's review flagged on this PR -- a free-text turn's offset must
+// not be confirmed before the turn itself finishes, and a later
+// synchronously-settled update must not drag the offset past an earlier
+// one that's still in flight.
+
+#[test]
+fn safe_offset_to_persist_is_ceiling_when_nothing_in_flight() {
+    let in_flight = std::collections::BTreeSet::new();
+    assert_eq!(safe_offset_to_persist(50, &in_flight), 50);
+}
+
+#[test]
+fn safe_offset_to_persist_caps_below_earliest_in_flight_update() {
+    let in_flight = std::collections::BTreeSet::from([30, 45]);
+    assert_eq!(safe_offset_to_persist(50, &in_flight), 30);
+}
+
+#[test]
+fn safe_offset_to_persist_withholds_a_later_offset_while_an_earlier_one_is_still_in_flight() {
+    // The scenario the review flagged: update N (free text, still running)
+    // must not be silently confirmed just because update N+1 (e.g. a slash
+    // command) already finished synchronously and isn't itself in the set.
+    let in_flight = std::collections::BTreeSet::from([10]);
+    assert_eq!(safe_offset_to_persist(12, &in_flight), 10);
+}
+
+#[test]
+fn safe_offset_to_persist_never_exceeds_ceiling() {
+    // Shouldn't happen in practice (an in-flight offset can't exceed the
+    // ceiling, which tracks every offset ever seen) but the result must
+    // stay bounded even if it somehow did.
+    let in_flight = std::collections::BTreeSet::from([999]);
+    assert_eq!(safe_offset_to_persist(50, &in_flight), 50);
+}
+
+#[test]
+fn mark_in_flight_then_settle_round_trips_through_the_shared_set() {
+    // High sentinel value: IN_FLIGHT_UPDATE_OFFSETS is a real process-wide
+    // static shared with other tests under cargo test's parallel execution.
+    const SENTINEL: i64 = 900_001;
+    mark_in_flight(SENTINEL);
+    assert!(
+        IN_FLIGHT_UPDATE_OFFSETS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&SENTINEL),
+        "mark_in_flight must record the offset as in flight"
+    );
+    settle(SENTINEL);
+    assert!(
+        !IN_FLIGHT_UPDATE_OFFSETS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&SENTINEL),
+        "settle must remove it once handling is done"
     );
 }

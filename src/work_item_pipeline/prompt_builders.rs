@@ -1,3 +1,13 @@
+/// Shared across every role prompt dispatched through the resume-capable
+/// one-shot mechanism (`resume_args_for` / `send`): a fix round may resume
+/// the conversation later, but each round is a separate process, so a
+/// verification command backgrounded in one round is unrecoverable in the
+/// next. Applied to every role that might run its own build/test/lint
+/// commands (implementer, review analyst, task reviewer, analysis reviewer,
+/// re-reviewer). The judge is excluded: its job is to emit one JSON decision
+/// from already-completed role replies, not to run verification itself.
+const RESUME_VERIFICATION_NOTE: &str = "A later fix round may resume this conversation, but each round runs as a separate process: anything you background dies with it, and the resumed round has no way to check on it. Never run build, test, or lint commands as a background task planning to report back later -- run all verification synchronously in the foreground and wait for it to complete before ending your turn.";
+
 /// Builds the prompt for the implementer role: given a task, it must implement
 /// it. If `fix_context` is provided (a prior reviewer's findings), the prompt
 /// instructs them to address those issues. When `tdd` is set (item #179),
@@ -21,6 +31,7 @@ pub(crate) fn build_implementer_prompt(
             "\nFollow test-driven development for this task: write a failing test first, confirm it fails, then write the minimal code to pass it, then refactor. Do not write implementation code before its test.\n"
         );
     }
+    prompt.push_str(&format!("\n{RESUME_VERIFICATION_NOTE}\n"));
     prompt.push_str("\nReply with a short status: what you did, tests run, and any concerns.\n");
     prompt
 }
@@ -28,19 +39,39 @@ pub(crate) fn build_implementer_prompt(
 /// Review-only counterpart of `build_implementer_prompt` (item #507): same
 /// fix-round re-dispatch shape, but the role is constrained to analysis —
 /// it must never write, edit, or commit code, or open a pull request.
-pub(crate) fn build_review_analyst_prompt(task: &SddTask, fix_context: Option<&str>) -> String {
-    let mut prompt = format!(
-        "You are reviewing one task from a larger plan — analysis only. Do not write, edit, or commit any code, and do not open a pull request.\n\nTask: {}\n\n{}\n",
-        task.title, task.body
-    );
+///
+/// `design_spec` (item #216) narrows that framing for the design-spec flavor
+/// of review-only task: unlike a plain review, whose deliverable is zero
+/// artifacts (just findings), a design-spec task's deliverable *is* a written
+/// document. Without this distinction the role only ever heard "don't write
+/// code", read that as "don't produce anything", and declined to author the
+/// spec it was asked for.
+pub(crate) fn build_review_analyst_prompt(
+    task: &SddTask,
+    fix_context: Option<&str>,
+    design_spec: bool,
+) -> String {
+    let opening = if design_spec {
+        "You are working a design-spec task from a larger plan — write no application code. Your deliverable is a written design/analysis document (e.g. a spec file under docs/superpowers/specs/); produce it, don't just report that nothing exists yet. Do not open a pull request."
+    } else {
+        "You are reviewing one task from a larger plan — analysis only. Do not write, edit, or commit any code, and do not open a pull request."
+    };
+    let mut prompt = format!("{opening}\n\nTask: {}\n\n{}\n", task.title, task.body);
     if let Some(ctx) = fix_context {
         prompt.push_str(&format!(
             "\nA second reviewer flagged gaps in your prior analysis:\n{ctx}\n\nAddress them and reply with your updated findings.\n"
         ));
     }
-    prompt.push_str(
-        "\nReply with your findings: what you reviewed and any issues found (or none).\n",
-    );
+    prompt.push_str(&format!("\n{RESUME_VERIFICATION_NOTE}\n"));
+    if design_spec {
+        prompt.push_str(
+            "\nReply with what you wrote: the spec file's path and a summary of its contents.\n",
+        );
+    } else {
+        prompt.push_str(
+            "\nReply with your findings: what you reviewed and any issues found (or none).\n",
+        );
+    }
     prompt
 }
 
@@ -59,7 +90,7 @@ pub(crate) fn build_task_reviewer_prompt(
         ""
     };
     format!(
-        "Review this task's implementation for spec compliance and code quality.{tdd_note}\n\nTask: {}\n{}\n\nImplementer's report:\n{implementer_report}\n\nReply REVIEW_APPROVED if both spec and quality pass, or REVIEW_ISSUES: followed by a bulleted list of findings.\n",
+        "Review this task's implementation for spec compliance and code quality.{tdd_note}\n\nTask: {}\n{}\n\nImplementer's report:\n{implementer_report}\n\n{RESUME_VERIFICATION_NOTE}\n\nReply REVIEW_APPROVED if both spec and quality pass, or REVIEW_ISSUES: followed by a bulleted list of findings.\n",
         task.title, task.body
     )
 }
@@ -70,7 +101,7 @@ pub(crate) fn build_task_reviewer_prompt(
 /// check, only the first pass's own analysis.
 pub(crate) fn build_review_of_analysis_prompt(task: &SddTask, analyst_report: &str) -> String {
     format!(
-        "Review this analysis for completeness and accuracy — is anything missing or wrong?\n\nTask: {}\n{}\n\nAnalyst's report:\n{analyst_report}\n\nReply REVIEW_APPROVED if the analysis is thorough and accurate, or REVIEW_ISSUES: followed by a bulleted list of gaps.\n",
+        "Review this analysis for completeness and accuracy — is anything missing or wrong?\n\nTask: {}\n{}\n\nAnalyst's report:\n{analyst_report}\n\n{RESUME_VERIFICATION_NOTE}\n\nReply REVIEW_APPROVED if the analysis is thorough and accurate, or REVIEW_ISSUES: followed by a bulleted list of gaps.\n",
         task.title, task.body
     )
 }
@@ -79,7 +110,7 @@ pub(crate) fn build_review_of_analysis_prompt(task: &SddTask, analyst_report: &s
 /// findings, and a fix report, re-review only those specific findings.
 pub(crate) fn build_re_reviewer_prompt(task: &SddTask, findings: &str, fix_report: &str) -> String {
     format!(
-        "Re-review a fix for this task's findings only — do not look for new issues.\n\nTask: {}\n\nOriginal findings:\n{findings}\n\nFix report:\n{fix_report}\n\nReply REVIEW_APPROVED if every finding is addressed, or REVIEW_ISSUES: followed by what remains.\n",
+        "Re-review a fix for this task's findings only — do not look for new issues.\n\nTask: {}\n\nOriginal findings:\n{findings}\n\nFix report:\n{fix_report}\n\n{RESUME_VERIFICATION_NOTE}\n\nReply REVIEW_APPROVED if every finding is addressed, or REVIEW_ISSUES: followed by what remains.\n",
         task.title
     )
 }
@@ -92,6 +123,7 @@ pub(crate) fn build_judge_prompt(
     ledger: &[String],
     role_reply: &str,
     review_only: bool,
+    design_spec: bool,
 ) -> String {
     let task_list: String = tasks
         .iter()
@@ -110,7 +142,9 @@ pub(crate) fn build_judge_prompt(
         })
         .collect();
     let ledger_text: String = ledger.join("\n");
-    let mode_note = if review_only {
+    let mode_note = if design_spec {
+        "This is a design-spec task: no application code should be written, but the role's deliverable is a written spec/design document (e.g. under docs/superpowers/specs/) — completion requires that document to exist, not just a reply saying there's nothing to build.\n\n"
+    } else if review_only {
         "This is a review-only task: no code should be written; the role's job is to analyze and report findings, not implement fixes.\n\n"
     } else {
         ""

@@ -216,6 +216,54 @@ fn branch_guard_reason_for(branch: Option<&str>, default: Option<&str>) -> Optio
     })
 }
 
+/// MCP tool name Claude Code sends for the flare gateway's own `tool` MCP
+/// tool. `apply_gateway_permissions` (components.rs) steers agents toward
+/// calling lean-ctx exclusively through this gateway (`action="execute"`)
+/// and actively strips their direct `mcp__lean-ctx__*` permissions -- so
+/// once that's applied, every `ctx_shell`/`ctx_patch`/`ctx_edit` call this
+/// module or `hook_completion_gate` needs to classify arrives wrapped in
+/// this envelope instead of at the top level.
+const GATEWAY_TOOL_NAME: &str = "mcp__flare__tool";
+
+/// Unwraps a flare-gateway `action="execute"` call (`mcp__flare__tool(
+/// action="execute", server="leanctx", tool="ctx_shell", args={"command":
+/// "..."})`) to the real tool name and arguments it forwards, so
+/// `is_verification_command`, `MUTATING_TOOLS`, and
+/// `destructive_data_file_reason` all see the actual command/tool instead of
+/// the gateway envelope one level up. Every other call (non-gateway, or
+/// gateway `action="search"`, or `server` other than `"leanctx"`) passes
+/// through with `tool_name`/`tool_input` unchanged.
+///
+/// Root cause of item #559: without this, a verification command (or a
+/// `ctx_patch`/`ctx_edit` edit) run through the gateway was invisible to
+/// every classifier in this module -- `is_verification_command` never saw
+/// the real command, so the completion gate (`completion_gate_reason`)
+/// rejected `item done`/`check_merge` even seconds after a passing test run,
+/// on every single retry, once gateway routing was in effect.
+pub(crate) fn unwrap_gateway_call(
+    tool_name: &str,
+    tool_input: Option<&Value>,
+) -> (String, Option<Value>) {
+    let passthrough = || (tool_name.to_string(), tool_input.cloned());
+    if tool_name != GATEWAY_TOOL_NAME {
+        return passthrough();
+    }
+    let Some(input) = tool_input else {
+        return passthrough();
+    };
+    if input.get("action").and_then(Value::as_str) != Some("execute") {
+        return passthrough();
+    }
+    if input.get("server").and_then(Value::as_str) != Some("leanctx") {
+        return passthrough();
+    }
+    let Some(real_tool) = input.get("tool").and_then(Value::as_str) else {
+        return passthrough();
+    };
+    let args = input.get("args").cloned().unwrap_or_else(|| json!({}));
+    (format!("mcp__lean-ctx__{real_tool}"), Some(args))
+}
+
 /// MCP tool name Claude Code sends for the `flare` server's `item` tool
 /// (`mcp__<server>__<tool>`). opencode's MCP bridge is expected to use the
 /// same convention -- if a harness turns out to send a bare `item` instead,
@@ -226,20 +274,49 @@ pub(crate) const ITEM_TOOL_NAME: &str = "mcp__flare__item";
 /// updates a PR and moves the item to in_review; `check_merge` promotes
 /// in_review -> completed once that PR is confirmed merged. Both are the
 /// completion-claim moment the verification gate protects (item #169).
-const GATED_ITEM_ACTIONS: &[&str] = &["done", "check_merge"];
+pub(crate) const GATED_ITEM_ACTIONS: &[&str] = &["done", "check_merge"];
 
 /// Blocks `item done` / `item check_merge` until this session has a fresh,
 /// passing verification-evidence record (`crate::optimize::VerificationEvidence`,
 /// captured by the `PostToolUse` success hook when a test/build/lint command
-/// runs). Closes the `verification-before-completion` gap from item #168's
-/// gap analysis: nothing previously stopped an agent from claiming
-/// "done"/opening a PR without having actually run tests *now* -- "tests
-/// passed earlier this session" doesn't count once the evidence goes stale
-/// (see `VERIFICATION_FRESHNESS_SECS`).
+/// runs) AND a fresh review-evidence record (`crate::optimize::ReviewEvidence`,
+/// captured the same way when the `ReportFindings` tool call succeeds --
+/// see `optimize::is_review_completion`'s doc comment for why review
+/// *completion*, not a `/code-review` skill or reviewer-subagent *dispatch*,
+/// is the trigger). Closes both the `verification-before-completion` gap
+/// from item #168's gap analysis and the review-before-completion gap from
+/// item #182: nothing previously stopped an agent from claiming "done"/
+/// opening a PR without having actually run tests, or had a review actually
+/// complete, *now* -- evidence from earlier this session doesn't count once
+/// it goes stale (see `VERIFICATION_FRESHNESS_SECS`, reused as the
+/// review-freshness window too).
+///
+/// Applies to every caller of `item done`/`check_merge`, human or dispatched
+/// agent alike -- same as the pre-existing verification half of this gate,
+/// which draws no such distinction. This is an explicit judgment call, made
+/// during implementation as the task instructions asked, not a conclusion
+/// drawn from examining `work_item_pipeline.rs`'s own trust model: a human
+/// calling `item done` directly already has to satisfy the verification
+/// gate, so carving out an exemption here for the review half only would be
+/// a new, unrequested trust distinction. If that turns out wrong for how
+/// humans actually use this tool, narrowing this to SDD-dispatched calls
+/// only is a small, contained change (one more parameter here) -- flagged
+/// for the user to weigh in on rather than treated as settled.
+///
+/// Also requires a diagnosis-evidence record (`crate::optimize::DiagnosisEvidence`,
+/// item #203) when `task_type` resolves to `"bugfix"` -- see
+/// `optimize::is_diagnosis_command`'s doc comment. `task_type` and
+/// `has_fresh_diagnosis` are resolved in `hook.rs::pre_tool_use` (a backend
+/// DB lookup, fail-open to `None` on any failure) and passed in already-
+/// resolved, same as `has_fresh_verification`/`has_fresh_review`, so this
+/// function stays a pure decision core with no IO of its own.
 pub(crate) fn completion_gate_reason(
     tool_name: &str,
     tool_input: Option<&Value>,
     has_fresh_verification: bool,
+    has_fresh_review: bool,
+    has_fresh_diagnosis: bool,
+    task_type: Option<&str>,
 ) -> Option<String> {
     if tool_name != ITEM_TOOL_NAME && tool_name != "item" {
         return None;
@@ -248,13 +325,24 @@ pub(crate) fn completion_gate_reason(
     if !GATED_ITEM_ACTIONS.contains(&action) {
         return None;
     }
-    if has_fresh_verification {
-        return None;
+    if !has_fresh_verification {
+        return Some(format!(
+            "no fresh, passing verification evidence for this session -- run this project's test/build/lint command (e.g. `cargo test`, `npm test`, `pytest`) via Bash before calling `item` action={action}; a run more than {}m ago, or one that failed, doesn't count.",
+            crate::optimize::VERIFICATION_FRESHNESS_SECS / 60
+        ));
     }
-    Some(format!(
-        "no fresh, passing verification evidence for this session -- run this project's test/build/lint command (e.g. `cargo test`, `npm test`, `pytest`) via Bash before calling `item` action={action}; a run more than {}m ago, or one that failed, doesn't count.",
-        crate::optimize::VERIFICATION_FRESHNESS_SECS / 60
-    ))
+    if !has_fresh_review {
+        return Some(format!(
+            "no fresh code review evidence for this session -- run a review that reports through the `ReportFindings` tool (this session's `/code-review` skill does) before calling `item` action={action}; a review more than {}m ago doesn't count, and dispatching a reviewer subagent isn't enough on its own -- its findings have to actually come back and get reported.",
+            crate::optimize::VERIFICATION_FRESHNESS_SECS / 60
+        ));
+    }
+    if task_type == Some("bugfix") && !has_fresh_diagnosis {
+        return Some(format!(
+            "no root-cause-investigation evidence for this session -- this is a bugfix item, so run a diagnosis command (e.g. `git log`, `git diff`, `git blame` on the affected paths) via Bash before calling `item` action={action}; systematic-debugging's Iron Law is NO FIX WITHOUT ROOT-CAUSE INVESTIGATION FIRST."
+        ));
+    }
+    None
 }
 
 /// Classify one PreToolUse payload into a redirect reason, if any. Returns
@@ -290,7 +378,12 @@ fn classify(
                 )
             })
         }
-        "Bash" | "bash" | "PowerShell" | "powershell" | "shell" => {
+        "Bash" | "bash" | "PowerShell" | "powershell" | "shell" | "mcp__lean-ctx__ctx_shell" => {
+            // Includes ctx_shell (direct or gateway-unwrapped, see
+            // `unwrap_gateway_call`) -- item #559: a destructive `rm
+            // ~/.agentflare/*.db` run via ctx_shell must be caught exactly
+            // like the same command run via Bash.
+            //
             // "command" is Claude Code's and (by convention) opencode's bash
             // tool field; "cmd"/"script" are cheap insurance against a
             // harness using a different name rather than a hard dependency
@@ -410,6 +503,15 @@ mod tests {
     fn classify_blocks_recursive_delete_of_whole_agentflare_dir() {
         let input = json!({ "command": "rm -rf ~/.agentflare" });
         assert!(classify("Bash", Some(&input), NOT_A_REPO).is_some());
+    }
+
+    #[test]
+    fn classify_blocks_rm_of_agentflare_db_via_ctx_shell() {
+        // item #559: ctx_shell (direct tool name, matching what
+        // unwrap_gateway_call produces for a gateway-routed call) must be
+        // covered by the same destructive-command guard as Bash.
+        let input = json!({ "command": "rm ~/.agentflare/store.db" });
+        assert!(classify("mcp__lean-ctx__ctx_shell", Some(&input), NOT_A_REPO).is_some());
     }
 
     #[test]
@@ -683,9 +785,67 @@ mod tests {
     }
 
     #[test]
+    fn unwrap_gateway_call_unwraps_leanctx_execute() {
+        let input = json!({
+            "action": "execute",
+            "server": "leanctx",
+            "tool": "ctx_shell",
+            "args": {"command": "cargo test"},
+        });
+        let (name, unwrapped) = unwrap_gateway_call(GATEWAY_TOOL_NAME, Some(&input));
+        assert_eq!(name, "mcp__lean-ctx__ctx_shell");
+        assert_eq!(unwrapped, Some(json!({"command": "cargo test"})));
+    }
+
+    #[test]
+    fn unwrap_gateway_call_unwraps_ctx_patch_for_mutating_tool_classification() {
+        let input = json!({
+            "action": "execute",
+            "server": "leanctx",
+            "tool": "ctx_patch",
+            "args": {"path": "src/main.rs"},
+        });
+        let (name, _) = unwrap_gateway_call(GATEWAY_TOOL_NAME, Some(&input));
+        assert!(MUTATING_TOOLS.contains(&name.as_str()), "{name}");
+    }
+
+    #[test]
+    fn unwrap_gateway_call_passes_through_non_gateway_tool() {
+        let input = json!({"command": "cargo test"});
+        let (name, unwrapped) = unwrap_gateway_call("Bash", Some(&input));
+        assert_eq!(name, "Bash");
+        assert_eq!(unwrapped, Some(input));
+    }
+
+    #[test]
+    fn unwrap_gateway_call_passes_through_gateway_search_action() {
+        let input = json!({"action": "search", "query": "ctx_shell"});
+        let (name, unwrapped) = unwrap_gateway_call(GATEWAY_TOOL_NAME, Some(&input));
+        assert_eq!(name, GATEWAY_TOOL_NAME);
+        assert_eq!(unwrapped, Some(input));
+    }
+
+    #[test]
+    fn unwrap_gateway_call_passes_through_non_leanctx_server() {
+        let input = json!({"action": "execute", "server": "other", "tool": "foo", "args": {}});
+        let (name, _) = unwrap_gateway_call(GATEWAY_TOOL_NAME, Some(&input));
+        assert_eq!(name, GATEWAY_TOOL_NAME);
+    }
+
+    #[test]
+    fn unwrap_gateway_call_handles_missing_args() {
+        let input = json!({"action": "execute", "server": "leanctx", "tool": "ctx_shell"});
+        let (name, unwrapped) = unwrap_gateway_call(GATEWAY_TOOL_NAME, Some(&input));
+        assert_eq!(name, "mcp__lean-ctx__ctx_shell");
+        assert_eq!(unwrapped, Some(json!({})));
+    }
+
+    #[test]
     fn completion_gate_blocks_item_done_without_verification() {
         let input = json!({ "id": "abc", "action": "done" });
-        let reason = completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false).unwrap();
+        let reason =
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false, false, None)
+                .unwrap();
         assert!(reason.contains("verification"), "{reason}");
         assert!(reason.contains("action=done"), "{reason}");
     }
@@ -693,40 +853,130 @@ mod tests {
     #[test]
     fn completion_gate_blocks_check_merge_without_verification() {
         let input = json!({ "id": "abc", "action": "check_merge" });
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false).is_some());
+        assert!(
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false, false, None)
+                .is_some()
+        );
     }
 
     #[test]
-    fn completion_gate_allows_item_done_with_fresh_verification() {
+    fn completion_gate_blocks_item_done_with_verification_but_no_review() {
         let input = json!({ "id": "abc", "action": "done" });
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), true).is_none());
+        let reason =
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), true, false, false, None).unwrap();
+        assert!(reason.contains("review"), "{reason}");
+        assert!(reason.contains("action=done"), "{reason}");
+        assert!(!reason.contains("verification evidence"), "{reason}");
+    }
+
+    #[test]
+    fn completion_gate_allows_item_done_with_fresh_verification_and_review() {
+        let input = json!({ "id": "abc", "action": "done" });
+        assert!(
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), true, true, false, None).is_none()
+        );
     }
 
     #[test]
     fn completion_gate_ignores_other_item_actions() {
         let input = json!({ "id": "abc", "action": "claim" });
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false).is_none());
+        assert!(
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false, false, None)
+                .is_none()
+        );
         let input = json!({ "id": "abc", "action": "update" });
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false).is_none());
+        assert!(
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), false, false, false, None)
+                .is_none()
+        );
     }
 
     #[test]
     fn completion_gate_ignores_unrelated_tools() {
         let input = json!({ "action": "done" });
-        assert!(completion_gate_reason("Bash", Some(&input), false).is_none());
-        assert!(completion_gate_reason("mcp__flare__comment", Some(&input), false).is_none());
+        assert!(completion_gate_reason("Bash", Some(&input), false, false, false, None).is_none());
+        assert!(
+            completion_gate_reason(
+                "mcp__flare__comment",
+                Some(&input),
+                false,
+                false,
+                false,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn completion_gate_ignores_missing_input_or_action() {
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, None, false).is_none());
-        assert!(completion_gate_reason(ITEM_TOOL_NAME, Some(&json!({})), false).is_none());
+        assert!(completion_gate_reason(ITEM_TOOL_NAME, None, false, false, false, None).is_none());
+        assert!(
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&json!({})), false, false, false, None)
+                .is_none()
+        );
     }
 
     #[test]
     fn completion_gate_matches_bare_item_tool_name() {
         let input = json!({ "id": "abc", "action": "done" });
-        assert!(completion_gate_reason("item", Some(&input), false).is_some());
+        assert!(completion_gate_reason("item", Some(&input), false, false, false, None).is_some());
+    }
+
+    #[test]
+    fn completion_gate_blocks_bugfix_item_done_with_verification_and_review_but_no_diagnosis() {
+        let input = json!({ "id": "abc", "action": "done" });
+        let reason = completion_gate_reason(
+            ITEM_TOOL_NAME,
+            Some(&input),
+            true,
+            true,
+            false,
+            Some("bugfix"),
+        )
+        .unwrap();
+        assert!(reason.contains("root-cause"), "{reason}");
+        assert!(reason.contains("action=done"), "{reason}");
+    }
+
+    #[test]
+    fn completion_gate_allows_bugfix_item_done_once_diagnosis_is_fresh_too() {
+        let input = json!({ "id": "abc", "action": "done" });
+        assert!(
+            completion_gate_reason(
+                ITEM_TOOL_NAME,
+                Some(&input),
+                true,
+                true,
+                true,
+                Some("bugfix"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn completion_gate_ignores_diagnosis_requirement_for_non_bugfix_item() {
+        let input = json!({ "id": "abc", "action": "done" });
+        assert!(
+            completion_gate_reason(
+                ITEM_TOOL_NAME,
+                Some(&input),
+                true,
+                true,
+                false,
+                Some("research"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn completion_gate_ignores_diagnosis_requirement_for_untagged_item() {
+        let input = json!({ "id": "abc", "action": "done" });
+        assert!(
+            completion_gate_reason(ITEM_TOOL_NAME, Some(&input), true, true, false, None).is_none()
+        );
     }
 
     #[test]

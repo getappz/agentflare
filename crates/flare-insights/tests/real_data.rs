@@ -19,7 +19,17 @@ fn ingest_real_claude_and_opencode_if_present() {
     }
 
     let mgr = IngestManager::new();
-    let bundle = mgr.scan_all_flat(&config);
+    let cursor_store = InsightsStore::open_in_memory().unwrap();
+    let mut bundle = flare_insights::ingest::IngestBundle::default();
+    for (_, res) in mgr.scan_all(&config, &cursor_store, |_, _, _| {}) {
+        if let Ok(b) = res {
+            bundle.sessions.extend(b.sessions);
+            bundle.turns.extend(b.turns);
+            bundle.tool_calls.extend(b.tool_calls);
+            bundle.file_events.extend(b.file_events);
+            bundle.subagents.extend(b.subagents);
+        }
+    }
 
     // DRY: at least one session should exist on this dev machine
     // If not, don't fail - just check that scan didn't error

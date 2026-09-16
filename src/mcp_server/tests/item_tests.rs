@@ -140,6 +140,60 @@ fn item_cancel_releases_the_callers_own_claim() {
 }
 
 #[test]
+fn item_cancel_clears_dispatch_lifecycle_labels() {
+    // item #225: `run_discovery_tick` picks dispatch candidates by label
+    // alone with no state check, so a cancelled item that still carries
+    // `ready-for-work` (or a stale `dispatched`/`needs-manual-dispatch`
+    // from a prior attempt) kept getting redispatched forever.
+    let (tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    let project_id = created["project_id"].as_str().unwrap().to_string();
+
+    let (ready_id, dispatched_id) = {
+        let conn = backend_conn(&tmp);
+        let workspace_id = agentflare_backend::project::get(&conn, &project_id)
+            .unwrap()
+            .workspace_id;
+        let mk = |name: &str| {
+            agentflare_backend::label::create(
+                &conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(project_id.clone()),
+                    workspace_id: workspace_id.clone(),
+                    name: name.into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap()
+            .id
+        };
+        let ready_id = mk("ready-for-work");
+        let dispatched_id = mk("dispatched");
+        agentflare_backend::item::add_label(&conn, &item_id, &ready_id).unwrap();
+        agentflare_backend::item::add_label(&conn, &item_id, &dispatched_id).unwrap();
+        (ready_id, dispatched_id)
+    };
+
+    s.item(Parameters(ItemRequest {
+        action: "cancel".into(),
+        id: Some(item_id.clone()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let conn = backend_conn(&tmp);
+    let labels = agentflare_backend::item::list_labels(&conn, &item_id).unwrap();
+    assert!(!labels.contains(&ready_id));
+    assert!(!labels.contains(&dispatched_id));
+}
+
+#[test]
 fn item_release_clears_assignee_agent_via_mcp() {
     // item #93: `item_release` used to call `agentflare_backend::claim::release`
     // directly, which only drops the lease row and leaves `assignee_agent`

@@ -146,6 +146,8 @@ fn open_store(db: PathBuf) -> flare_insights::store::InsightsStore {
 }
 
 fn run_sync(db: PathBuf, args: SyncArgs) {
+    use std::io::Write;
+
     let store = open_store(db.clone());
     let config = flare_insights::config::InsightsConfig::default();
     let mgr = flare_insights::ingest::IngestManager::new();
@@ -154,7 +156,16 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
     let mut total_tools = 0;
     let mut total_files = 0;
     let mut total_subs = 0;
-    for (source, res) in mgr.scan_all(&config) {
+    let mut printed_progress = false;
+    let results = mgr.scan_all(&config, &store, |source, done, total| {
+        printed_progress = true;
+        eprint!("\r  {source}: {done}/{total} files scanned\x1b[K");
+        let _ = std::io::stderr().flush();
+    });
+    if printed_progress {
+        eprintln!();
+    }
+    for (source, res) in results {
         match res {
             Ok(bundle) => {
                 println!(
@@ -164,9 +175,7 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
                     bundle.tool_calls.len()
                 );
                 // DRY: transactional bundle via store helpers
-                for s in &bundle.sessions {
-                    let _ = store.upsert_session(s);
-                }
+                let _ = store.upsert_sessions_batch(&bundle.sessions);
                 if !bundle.turns.is_empty() {
                     let _ = store.upsert_turns_batch(&bundle.turns);
                 }
@@ -178,6 +187,9 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
                 }
                 if !bundle.subagents.is_empty() {
                     let _ = store.upsert_subagents_batch(&bundle.subagents);
+                }
+                if !bundle.file_cursors.is_empty() {
+                    let _ = store.upsert_file_cursors_batch(&source, &bundle.file_cursors);
                 }
                 total_sessions += bundle.sessions.len();
                 total_turns += bundle.turns.len();

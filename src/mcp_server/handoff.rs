@@ -18,6 +18,30 @@ fn ready_label_id(conn: &rusqlite::Connection, project_id: &str) -> Option<Strin
 /// non-object existing value, e.g. a double-encoded string, must not panic
 /// `IndexMut` — it's just dropped in favor of a fresh object). Returns the
 /// merged string ready for `UpdateItem`/`CreateItem`'s `metadata` field.
+/// Maximum handoff hops on one item/thread before the recursion guard
+/// refuses (item #219). Metadata-only, no schema migration.
+pub(crate) const MAX_HANDOFF_DEPTH: u64 = 10;
+const HANDOFF_DEPTH_KEY: &str = "handoff_depth";
+
+/// Reads `handoff_depth` from an item metadata JSON string (default 0).
+fn handoff_depth(existing: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(existing)
+        .ok()
+        .and_then(|v| v.get(HANDOFF_DEPTH_KEY)?.as_u64())
+        .unwrap_or(0)
+}
+
+/// Merges `handoff_depth` into existing metadata JSON, preserving other keys.
+fn merge_handoff_depth(existing: &str, depth: u64) -> String {
+    let mut merged = serde_json::from_str::<serde_json::Value>(existing)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .map(serde_json::Value::Object)
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    merged[HANDOFF_DEPTH_KEY] = serde_json::Value::from(depth);
+    merged.to_string()
+}
+
 fn merge_task_type(existing: &str, task_type: &str) -> String {
     let mut merged = serde_json::from_str::<serde_json::Value>(existing)
         .ok()
@@ -51,6 +75,7 @@ impl AgentflareMcp {
             completed,
             remaining,
             blockers,
+            allow_secrets,
         }: HandoffRequest,
     ) -> Result<String, ErrorData> {
         if recipient.trim().is_empty() {
@@ -71,6 +96,64 @@ impl AgentflareMcp {
                 None,
             ));
         }
+
+        // Fail-closed pre-handoff secret scan — before either persistence
+        // path below (local item/asset, or the bridge queue's GitHub issue
+        // body) so a pasted credential never becomes a stored artifact, and
+        // before any DB mutation so a match can't orphan an item.
+        // `redact_error_for_llm` doesn't cover this: it only ever runs on
+        // error strings, not on a payload a caller supplies on purpose.
+        if !allow_secrets.unwrap_or(false) {
+            let mut owned: Vec<(&str, String)> = Vec::new();
+            if let Some(s) = &description {
+                owned.push(("description", s.clone()));
+            }
+            if let Some(s) = &summary {
+                owned.push(("summary", s.clone()));
+            }
+            if let Some(facts) = &facts {
+                for fact in facts {
+                    if let Some(body) = fact.get("content").and_then(|v| v.as_str()) {
+                        owned.push(("facts[].content", body.to_string()));
+                    }
+                }
+            }
+            if let Some(findings) = &findings {
+                for f in findings {
+                    owned.push(("findings[]", f.to_string()));
+                }
+            }
+            if let Some(decisions) = &decisions {
+                for d in decisions {
+                    owned.push(("decisions[]", d.to_string()));
+                }
+            }
+            if let Some(files_touched) = &files_touched {
+                for f in files_touched {
+                    owned.push(("files_touched[]", f.to_string()));
+                }
+            }
+            if let Some(evidence) = &evidence {
+                for e in evidence {
+                    owned.push(("evidence[]", e.to_string()));
+                }
+            }
+            if let Some(blockers) = &blockers {
+                for b in blockers {
+                    owned.push(("blockers[]", b.clone()));
+                }
+            }
+            secret_scan::check_fields(
+                [
+                    ("content", content.as_str()),
+                    ("completed", completed.as_str()),
+                    ("remaining", remaining.as_str()),
+                ]
+                .into_iter()
+                .chain(owned.iter().map(|(field, text)| (*field, text.as_str()))),
+            )?;
+        }
+
         let recipient = recipient.trim().to_string();
         let name = name.trim().to_string();
 
@@ -148,15 +231,31 @@ impl AgentflareMcp {
 
             let item = match &item_id {
                 Some(id) => {
-                    let metadata = match &task_type {
-                        Some(t) => Some(merge_task_type(
-                            &agentflare_backend::item::get(conn, id)
-                                .map_err(map_backend_err)?
-                                .metadata,
-                            t,
-                        )),
-                        None => None,
-                    };
+                    // Recursion guard (item #219): each handoff hop bumps
+                    // `handoff_depth` in item metadata; past the cap the hop
+                    // is rejected before any asset/label is created.
+                    let incumbent =
+                        agentflare_backend::item::get(conn, id).map_err(map_backend_err)?;
+                    let next_depth = handoff_depth(&incumbent.metadata) + 1;
+                    if next_depth > MAX_HANDOFF_DEPTH {
+                        return Err(ErrorData::invalid_params(
+                            format!(
+                                "handoff recursion guard: depth {next_depth} exceeds max {MAX} \
+                                 (thread_id={}, item_id={}, reply_to={}) — possible A→B→A \
+                                 ping-pong; needs a human to break the loop",
+                                thread_id.as_deref().unwrap_or("none"),
+                                id,
+                                reply_to.as_deref().unwrap_or("none"),
+                                MAX = MAX_HANDOFF_DEPTH,
+                            ),
+                            None,
+                        ));
+                    }
+                    let mut metadata_str = merge_handoff_depth(&incumbent.metadata, next_depth);
+                    if let Some(t) = &task_type {
+                        metadata_str = merge_task_type(&metadata_str, t);
+                    }
+                    let metadata = Some(metadata_str);
                     let input = agentflare_backend::item::UpdateItem {
                         assignee_agent: Some(recipient.clone()),
                         metadata,
@@ -264,7 +363,53 @@ impl AgentflareMcp {
                             })
                     });
                     if let Some(item) = reusable {
-                        item
+                        // Same recursion guard on the thread-reuse path:
+                        // bump depth, reject past the cap, persist merged
+                        // metadata (depth + task_type, preserving the rest).
+                        let next_depth = handoff_depth(&item.metadata) + 1;
+                        if next_depth > MAX_HANDOFF_DEPTH {
+                            return Err(ErrorData::invalid_params(
+                                format!(
+                                    "handoff recursion guard: depth {next_depth} exceeds max {MAX} \
+                                     (thread_id={}, item_id={}, reply_to={}) — possible A→B→A \
+                                     ping-pong; needs a human to break the loop",
+                                    thread_id.as_deref().unwrap_or("none"),
+                                    item.id,
+                                    reply_to.as_deref().unwrap_or("none"),
+                                    MAX = MAX_HANDOFF_DEPTH,
+                                ),
+                                None,
+                            ));
+                        }
+                        let mut metadata_str = merge_handoff_depth(&item.metadata, next_depth);
+                        if let Some(t) = &task_type {
+                            metadata_str = merge_task_type(&metadata_str, t);
+                        }
+                        if let Some(t) = &thread_id
+                            && !metadata_str.contains("\"thread\"")
+                        {
+                            metadata_str = {
+                                let mut v =
+                                    serde_json::from_str::<serde_json::Value>(&metadata_str)
+                                        .ok()
+                                        .and_then(|v| v.as_object().cloned())
+                                        .map(serde_json::Value::Object)
+                                        .unwrap_or_else(|| {
+                                            serde_json::Value::Object(Default::default())
+                                        });
+                                v["thread"] = serde_json::Value::String(t.clone());
+                                v.to_string()
+                            };
+                        }
+                        agentflare_backend::item::update(
+                            conn,
+                            &item.id,
+                            agentflare_backend::item::UpdateItem {
+                                metadata: Some(metadata_str),
+                                ..Default::default()
+                            },
+                        )
+                        .map_err(map_backend_err)?
                     } else {
                         let state_id =
                             agentflare_backend::state::list_by_project(conn, &project.id)
@@ -282,6 +427,9 @@ impl AgentflareMcp {
                             metadata =
                                 Some(merge_task_type(metadata.as_deref().unwrap_or("{}"), t));
                         }
+                        // New handoff chain starts at depth 1.
+                        metadata =
+                            Some(merge_handoff_depth(metadata.as_deref().unwrap_or("{}"), 1));
                         // A brand-new handed-off item is real, undone work —
                         // labeling it `ready-for-work` (when the project has
                         // that label at all; skipped otherwise rather than
@@ -312,6 +460,8 @@ impl AgentflareMcp {
                             label_ids: ready_label_id.into_iter().collect(),
                             assignee_ids: vec![],
                             dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
                         };
                         agentflare_backend::item::create(conn, input).map_err(map_backend_err)?
                     }
@@ -1131,5 +1281,261 @@ mod tests {
                 .contains("completed and remaining are required"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn handoff_ping_pong_past_max_depth_is_rejected() {
+        // Item #219: first 10 hops on the same thread succeed with
+        // incrementing depth; the 11th is rejected before any new asset.
+        let (_tmp, mcp) = test_mcp();
+        let thread = "thread-ping-pong".to_string();
+        let mut req = base_request();
+        req.thread_id = Some(thread.clone());
+        let first = mcp.handoff_impl(req).unwrap();
+        let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let depth_of = |mcp: &AgentflareMcp, id: &str| -> u64 {
+            let metadata = mcp
+                .with_backend_db(|conn| agentflare_backend::item::get(conn, id).unwrap().metadata)
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&metadata)
+                .ok()
+                .and_then(|v| v.get("handoff_depth")?.as_u64())
+                .unwrap_or(0)
+        };
+        assert_eq!(depth_of(&mcp, &item_id), 1);
+        // Hops 2..=10 via the explicit item_id path (alternate recipients
+        // would also work; depth is what matters).
+        for expected in 2..=MAX_HANDOFF_DEPTH {
+            let reply = HandoffRequest {
+                item_id: Some(item_id.clone()),
+                thread_id: Some(thread.clone()),
+                completed: "more".to_string(),
+                remaining: "less".to_string(),
+                ..base_request()
+            };
+            mcp.handoff_impl(reply).unwrap();
+            assert_eq!(depth_of(&mcp, &item_id), expected);
+        }
+        // 11th hop rejected, depth unchanged.
+        let over = HandoffRequest {
+            item_id: Some(item_id.clone()),
+            thread_id: Some(thread.clone()),
+            completed: "more".to_string(),
+            remaining: "less".to_string(),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(over).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("recursion guard"), "{msg}");
+        assert!(msg.contains(&thread), "{msg}");
+        assert_eq!(depth_of(&mcp, &item_id), MAX_HANDOFF_DEPTH);
+    }
+
+    #[test]
+    fn handoff_thread_reuse_path_bumps_depth_and_rejects_past_cap() {
+        // Depth must survive the thread-reuse path too (no item_id).
+        let (_tmp, mcp) = test_mcp();
+        let thread = "thread-reuse-depth".to_string();
+        let mut req = base_request();
+        req.thread_id = Some(thread.clone());
+        req.recipient = "claude-code".to_string();
+        mcp.handoff_impl(req).unwrap();
+        for expected in 2..=MAX_HANDOFF_DEPTH {
+            let reply = HandoffRequest {
+                thread_id: Some(thread.clone()),
+                completed: "more".to_string(),
+                remaining: "less".to_string(),
+                ..base_request()
+            };
+            mcp.handoff_impl(reply).unwrap();
+            let depth = mcp
+                .with_backend_db(|conn| {
+                    let project = mcp.resolve_project(conn).unwrap();
+                    let items = agentflare_backend::item::list_by_assignee_agent(
+                        conn,
+                        &project.id,
+                        "claude-code",
+                    )
+                    .unwrap();
+                    items
+                        .into_iter()
+                        .find(|i| i.name == "do the thing")
+                        .unwrap()
+                        .metadata
+                })
+                .unwrap();
+            let d = serde_json::from_str::<serde_json::Value>(&depth)
+                .ok()
+                .and_then(|v| v.get("handoff_depth")?.as_u64())
+                .unwrap_or(0);
+            assert_eq!(d, expected);
+        }
+        let over = HandoffRequest {
+            thread_id: Some(thread.clone()),
+            completed: "more".to_string(),
+            remaining: "less".to_string(),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(over).unwrap_err();
+        assert!(err.to_string().contains("recursion guard"), "{err}");
+    }
+
+    #[test]
+    fn secret_in_content_blocks_before_any_item_is_created() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            content: "here is my token: ghp_abcdefghijklmnopqrstuvwxyz012345".to_string(),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("content"), "{msg}");
+        assert!(msg.contains("GitHub token"), "{msg}");
+        assert!(
+            !msg.contains("ghp_abcdefghijklmnopqrstuvwxyz012345"),
+            "{msg}"
+        );
+
+        let items = mcp
+            .with_backend_db(|conn| {
+                let project = mcp.resolve_project(conn).unwrap();
+                agentflare_backend::item::list_by_assignee_agent(
+                    conn,
+                    &project.id,
+                    &agent_registry::canonicalize("claude-code"),
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(
+            items.is_empty(),
+            "a secret-bearing handoff must not leave an orphan item behind"
+        );
+    }
+
+    #[test]
+    fn secret_in_a_fact_content_is_blocked() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            facts: Some(vec![serde_json::json!({
+                "title": "cred",
+                "content": "AKIAABCDEFGHIJKLMNOP",
+            })]),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        assert!(err.to_string().contains("facts[].content"), "{err}");
+    }
+
+    #[test]
+    fn secret_in_a_finding_is_blocked() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            findings: Some(vec![serde_json::json!({
+                "file": "src/lib.rs",
+                "summary": "left a live key sk-live-51H8xyzABCDEFghij in a comment",
+            })]),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        assert!(err.to_string().contains("findings[]"), "{err}");
+    }
+
+    #[test]
+    fn secret_solely_in_description_is_blocked_even_with_clean_content() {
+        // `description` lands directly in `CreateItem.description` (a local
+        // item column, no blob indirection) and, on the recipient="github"
+        // path, in a public GitHub issue body -- a secret confined to this
+        // field alone, with clean content/summary/facts, must not sail
+        // through either.
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            description: Some("uses ghp_abcdefghijklmnopqrstuvwxyz012345 to auth".to_string()),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("description"), "{msg}");
+        assert!(
+            !msg.contains("ghp_abcdefghijklmnopqrstuvwxyz012345"),
+            "{msg}"
+        );
+
+        let items = mcp
+            .with_backend_db(|conn| {
+                let project = mcp.resolve_project(conn).unwrap();
+                agentflare_backend::item::list_by_assignee_agent(
+                    conn,
+                    &project.id,
+                    &agent_registry::canonicalize("claude-code"),
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(
+            items.is_empty(),
+            "a secret confined to description must not leave an orphan item behind"
+        );
+    }
+
+    #[test]
+    fn secret_in_files_touched_is_blocked() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            files_touched: Some(vec![serde_json::json!({
+                "path": "src/lib.rs",
+                "modified": "left AKIAABCDEFGHIJKLMNOP in a log line",
+            })]),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        assert!(err.to_string().contains("files_touched[]"), "{err}");
+    }
+
+    #[test]
+    fn secret_in_evidence_is_blocked() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            evidence: Some(vec![serde_json::json!({
+                "kind": "log",
+                "detail": "Authorization: Bearer abc123.def456-ghi",
+            })]),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        assert!(err.to_string().contains("evidence[]"), "{err}");
+    }
+
+    #[test]
+    fn secret_in_blockers_is_blocked() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            blockers: Some(vec![
+                "blocked on rotating xoxb-1234567890-abcdefghij".to_string(),
+            ]),
+            ..base_request()
+        };
+        let err = mcp.handoff_impl(req).unwrap_err();
+        assert!(err.to_string().contains("blockers[]"), "{err}");
+    }
+
+    #[test]
+    fn allow_secrets_bypasses_the_scan() {
+        let (_tmp, mcp) = test_mcp();
+        let req = HandoffRequest {
+            content: "ghp_abcdefghijklmnopqrstuvwxyz012345".to_string(),
+            allow_secrets: Some(true),
+            ..base_request()
+        };
+        mcp.handoff_impl(req).unwrap();
+    }
+
+    #[test]
+    fn clean_handoff_passes_unchanged() {
+        let (_tmp, mcp) = test_mcp();
+        mcp.handoff_impl(base_request()).unwrap();
     }
 }

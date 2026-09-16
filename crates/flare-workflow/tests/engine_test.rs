@@ -256,6 +256,52 @@ async fn typed_step_failure_carries_its_real_reason_not_the_generic_placeholder(
 }
 
 #[tokio::test]
+async fn workflow_level_error_preserves_the_failed_steps_real_reason() {
+    let engine = build_engine();
+    let wf = WorkflowDefinition::new("wf", "wf").add_step(StepDefinition::new(
+        "boom",
+        "boom",
+        Arc::new(FunctionStep::new(|_ctx: &mut WorkflowContext<Ctx>| {
+            Box::pin(async move {
+                Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("boom"),
+                    message: "AI_APICallError: Rate limit exceeded, please try again later"
+                        .to_string(),
+                })
+            })
+        })),
+    ));
+    engine.register_workflow(wf).unwrap();
+
+    let run = engine
+        .start_workflow(
+            WorkflowId::new("wf"),
+            Ctx {
+                count: 0,
+                log: vec![],
+            },
+            "in".into(),
+        )
+        .await
+        .unwrap();
+    let _ = engine
+        .wait_for_completion(run, "wf", Duration::from_secs(5))
+        .await;
+
+    let state = engine.get_status(run).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    let error = state
+        .error
+        .clone()
+        .expect("failed run must record a top-level error");
+    assert!(
+        error.contains("AI_APICallError: Rate limit exceeded"),
+        "workflow-level error must carry the failed step's real reason, not just the generic \
+         \"One or more steps failed\" placeholder — got: {error}"
+    );
+}
+
+#[tokio::test]
 async fn dependent_of_failed_step_gets_terminal_status() {
     let engine = build_engine();
     let wf = WorkflowDefinition::new("wf", "wf")

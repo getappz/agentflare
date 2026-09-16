@@ -1,19 +1,19 @@
-// Regression coverage for the `EXECUTE_WORK_CWD_LOCK` fix in `execute_work_impl`.
+// Regression coverage for `run_in_worktree` (`work_cwd_lock.rs`).
 // Split out of `work.rs` to keep that file under the LOC gate. Included from
 // `work::tests` via `include!`.
 
-/// Regression test for the `set_current_dir` race `EXECUTE_WORK_CWD_LOCK`
-/// fixes: the daemon dispatches multiple items' `execute_work_impl` calls
-/// concurrently by design (`work_max_concurrency`), and without the lock
-/// two of them chdir-ing around the same time can have one item's
-/// pipeline run against a *different* item's worktree -- observed live,
-/// twice, with two different item pairs. This test dispatches two
-/// separate items (separate repos/worktrees) on two threads at once; each
-/// pipeline sleeps mid-run and re-checks its cwd, so it would fail (the
-/// mid-sleep `assert_eq!` below) if the lock were removed and the other
-/// thread's chdir landed in between.
+/// Regression test for item #205: `execute_work_impl` dispatches multiple
+/// items concurrently by design (`work_max_concurrency`), and
+/// `run_in_worktree` no longer chdirs the process to serialize that --
+/// every downstream git/agent spawn takes its worktree path explicitly
+/// instead. This test dispatches two separate items (separate
+/// repos/worktrees) on two threads at once, sleeping mid-run to widen any
+/// race window, and asserts: each pipeline only ever sees its own item's
+/// worktree path (never the sibling's), and the process's own cwd never
+/// moves throughout -- the concurrency-safety property the old chdir+mutex
+/// used to provide a different, more expensive way.
 #[test]
-fn execute_work_impl_serializes_the_cwd_dependent_section_across_concurrent_dispatch() {
+fn execute_work_impl_never_mixes_up_worktrees_under_concurrent_dispatch() {
     let tmp_a = tempfile::tempdir().unwrap();
     let tmp_b = tempfile::tempdir().unwrap();
     let repo_a = tmp_a.path().join("repo");
@@ -22,6 +22,8 @@ fn execute_work_impl_serializes_the_cwd_dependent_section_across_concurrent_disp
     std::fs::create_dir_all(&repo_b).unwrap();
     init_test_repo_with_origin(&repo_a);
     init_test_repo_with_origin(&repo_b);
+
+    let cwd_before_dispatch = std::env::current_dir().unwrap();
 
     crate::paths::test_support::with_temp_home(|| {
         let mcp_a = AgentflareMcp::for_project_dir(repo_a.clone());
@@ -62,21 +64,17 @@ fn execute_work_impl_serializes_the_cwd_dependent_section_across_concurrent_disp
                   timeout,
                   idle_timeout,
                   extra_args| {
-                let cwd_before = std::env::current_dir().unwrap();
                 assert!(
-                    cwd_before.starts_with(&expected_root),
-                    "chdir landed outside this thread's own repo: {cwd_before:?} \
+                    worktree_path.starts_with(&expected_root),
+                    "pipeline received a different item's worktree path: {worktree_path:?} \
                      not under {expected_root:?}"
                 );
-                // Widen the race window: without the lock, the other
-                // thread's own chdir is free to land here.
+                // Widen the race window against the sibling thread -- with
+                // no shared process-wide state left to corrupt, this is now
+                // just a liveness check that both dispatches genuinely
+                // overlap rather than proving anything by itself.
                 std::thread::sleep(Duration::from_millis(150));
-                let cwd_after = std::env::current_dir().unwrap();
-                assert_eq!(
-                    cwd_before, cwd_after,
-                    "cwd changed under us mid-run -- another thread's dispatch raced this one"
-                );
-                std::fs::write(cwd_after.join("real_work.txt"), "real work").unwrap();
+                std::fs::write(worktree_path.join("real_work.txt"), "real work").unwrap();
                 let _ = (timeout, idle_timeout, extra_args);
                 crate::work_item_pipeline::run_or_resume_with_sender(
                     mcp,
@@ -123,18 +121,18 @@ fn execute_work_impl_serializes_the_cwd_dependent_section_across_concurrent_disp
         let handle_b =
             std::thread::spawn(move || execute_work_impl(args_b, &mut Vec::new(), pipeline_b));
 
-        let outcome_a = handle_a
-            .join()
-            .expect("thread A panicked -- see assertion above");
-        let outcome_b = handle_b
-            .join()
-            .expect("thread B panicked -- see assertion above");
-
-        // Same soft-fail-on-no-GitHub-remote outcome as the sibling
-        // dispatch test above -- what this test actually checks is that
-        // neither thread's cwd ever drifted into the other's worktree,
-        // asserted inside `make_pipeline`'s closure.
-        assert_eq!(outcome_a.exit_code, 1);
-        assert_eq!(outcome_b.exit_code, 1);
+        // What this test actually checks is that neither thread ever saw
+        // the other's worktree path, asserted inside `make_pipeline`'s
+        // closure -- the dispatch outcome itself (push/PR against a fake
+        // local "origin") is a different concern, covered by the sibling
+        // fixture tests, so it's deliberately not re-asserted here.
+        handle_a.join().expect("thread A panicked -- see assertion above");
+        handle_b.join().expect("thread B panicked -- see assertion above");
     });
+
+    assert_eq!(
+        std::env::current_dir().unwrap(),
+        cwd_before_dispatch,
+        "concurrent dispatch mutated the process's own cwd"
+    );
 }

@@ -93,9 +93,20 @@ pub struct JsonWorkflow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonStep {
     pub name: String,
-    pub agent: String,
+    /// Target agent for a prompt step. Mutually exclusive with `command` —
+    /// exactly one of the two must be set.
+    #[serde(default)]
+    pub agent: Option<String>,
     #[serde(default = "default_prompt")]
     pub prompt: String,
+    /// Run this step as a deterministic subprocess (`argv[0]` + args) instead
+    /// of dispatching a full agent turn. Each element is expanded via
+    /// `{{var}}`/`{{params.x}}` before exec; the program is run directly
+    /// (never through a shell), and its captured stdout becomes the step
+    /// output. A non-zero exit maps to `StepResult::Failed`. Mutually
+    /// exclusive with `agent`.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
     #[serde(default)]
     pub mode: JsonMode,
     #[serde(default = "default_timeout")]
@@ -207,15 +218,37 @@ pub fn compile_workflow(
         };
         let deps: Vec<&str> = deps.iter().map(String::as_str).collect();
 
-        let executor = Arc::new(PromptExecutor {
-            agent: s.agent.clone(),
-            template: s.prompt.clone(),
-            send: Arc::clone(&send),
-            model: s.model.clone(),
-            args: s.args.clone(),
-            hard_cap_secs: s.hard_cap_secs,
-            idle_timeout_secs: s.idle_timeout_secs,
-        });
+        let executor: Arc<dyn StepExecutor<PipelineData>> = match (&s.command, &s.agent) {
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "step '{}': 'command' and 'agent' are mutually exclusive",
+                    s.name
+                ));
+            }
+            (None, None) => {
+                return Err(format!(
+                    "step '{}': one of 'command' or 'agent' must be set",
+                    s.name
+                ));
+            }
+            (Some(command), None) => {
+                if command.is_empty() {
+                    return Err(format!("step '{}': 'command' must not be empty", s.name));
+                }
+                Arc::new(CommandExecutor {
+                    command: command.clone(),
+                })
+            }
+            (None, Some(agent)) => Arc::new(PromptExecutor {
+                agent: agent.clone(),
+                template: s.prompt.clone(),
+                send: Arc::clone(&send),
+                model: s.model.clone(),
+                args: s.args.clone(),
+                hard_cap_secs: s.hard_cap_secs,
+                idle_timeout_secs: s.idle_timeout_secs,
+            }),
+        };
         let mut def = StepDefinition::new(s.name.clone(), s.name.clone(), executor)
             .with_timeout(std::time::Duration::from_secs(s.timeout_secs))
             .with_mode(match &s.mode {
@@ -274,16 +307,37 @@ pub fn compile_workflow(
 /// deliberately minimal: `LHS == RHS`, `LHS != RHS` (string equality after
 /// `{{var}}`/`{{params.x}}` expansion on both sides, quotes trimmed off a
 /// literal RHS), or a bare `LHS` truthiness check when no operator is
-/// present.
-fn compile_run_if(
-    expr: &str,
-) -> impl Fn(&WorkflowContext<PipelineData>) -> bool + Send + Sync + 'static {
+/// present. Two such conditions may be combined with a single top-level
+/// ` OR ` or ` AND ` (lower precedence than either, so `A AND B OR C` reads
+/// as `(A AND B) OR C`); this is not a full expression language, so a
+/// quoted literal must not itself contain the substring `" OR "`/`" AND "`.
+type RunIfPredicate = Box<dyn Fn(&WorkflowContext<PipelineData>) -> bool + Send + Sync + 'static>;
+fn compile_run_if(expr: &str) -> RunIfPredicate {
+    if let Some((lhs, rhs)) = expr.split_once(" OR ") {
+        let (l, r) = (compile_run_if(lhs), compile_run_if(rhs));
+        return Box::new(move |ctx| l(ctx) || r(ctx));
+    }
+    if let Some((lhs, rhs)) = expr.split_once(" AND ") {
+        let (l, r) = (compile_run_if(lhs), compile_run_if(rhs));
+        return Box::new(move |ctx| l(ctx) && r(ctx));
+    }
     let expr = expr.to_string();
-    move |ctx: &WorkflowContext<PipelineData>| {
+    Box::new(move |ctx: &WorkflowContext<PipelineData>| {
         let expand = |s: &str| {
-            expand_variables(s.trim(), &ctx.input, &ctx.variables, &ctx.params)
+            let out = expand_variables(s.trim(), &ctx.input, &ctx.variables, &ctx.params)
                 .trim()
-                .to_string()
+                .to_string();
+            // A bare `{{var}}` that never resolved (its step hasn't run yet,
+            // failed, or was skipped) is left as literal template text by
+            // `expand_variables` rather than becoming empty. Treat that as
+            // unset/falsy here so a downstream `run_if` can gate on "did
+            // this variable actually get produced" instead of misreading
+            // the placeholder itself as non-empty content.
+            if out.starts_with("{{") && out.ends_with("}}") {
+                String::new()
+            } else {
+                out
+            }
         };
         if let Some((lhs, rhs)) = expr.split_once("!=") {
             expand(lhs) != expand(rhs).trim_matches(['\'', '"'])
@@ -293,7 +347,7 @@ fn compile_run_if(
             let v = expand(&expr);
             !v.is_empty() && v != "false" && v != "0"
         }
-    }
+    })
 }
 
 /// Executor that expands the prompt template and sends it to an agent.
@@ -336,6 +390,68 @@ impl StepExecutor<PipelineData> for PromptExecutor {
 
     fn is_retryable(&self, error: &WorkflowError) -> bool {
         // Agent/prompt steps retry on any step failure by default.
+        !matches!(error, WorkflowError::ShuttingDown)
+    }
+}
+
+/// Executor that expands each `command` element and runs it as a subprocess
+/// directly — never through `sh -c`/`cmd /c` — so behavior doesn't depend on
+/// a shell dialect. Captured stdout becomes the step output; a non-zero exit
+/// fails the step with stderr attached.
+struct CommandExecutor {
+    command: Vec<String>,
+}
+
+#[async_trait]
+impl StepExecutor<PipelineData> for CommandExecutor {
+    async fn execute(&self, ctx: &mut WorkflowContext<PipelineData>) -> WorkflowResult<StepResult> {
+        let expanded: Vec<String> = self
+            .command
+            .iter()
+            .map(|arg| expand_variables(arg, &ctx.input, &ctx.variables, &ctx.params))
+            .collect();
+        let program = expanded[0].clone();
+        let args = expanded[1..].to_vec();
+
+        // `flare_process::command` (not raw `Command::new`) so the child
+        // doesn't flash a console window on Windows, same as every other
+        // background spawn in this workspace. Wrapped in
+        // `tokio::process::Command` (not `std::process::Command`) so the
+        // engine's `tokio::time::timeout` around step execution actually
+        // bounds the child process: on timeout the future is dropped, and
+        // `kill_on_drop` kills the child instead of leaking it to run to
+        // completion in the background.
+        let mut std_cmd = flare_process::command(&program);
+        std_cmd.args(&args);
+        let output = tokio::process::Command::from(std_cmd)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| WorkflowError::StepFailed {
+                step_id: StepId::new(&program),
+                message: format!("failed to run `{program}`: {e}"),
+            })?;
+
+        // Not inherited from a prior step: a command step produces no LLM
+        // tokens, and `WorkflowContext` persists token counts across steps,
+        // so an unset field here would otherwise leak the previous step's
+        // counts into this step's recorded metrics.
+        ctx.input_tokens = 0;
+        ctx.output_tokens = 0;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Ok(StepResult::Failed(format!(
+                "`{program}` exited with {}: {stderr}",
+                output.status
+            )));
+        }
+        ctx.output = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(StepResult::Success)
+    }
+
+    fn is_retryable(&self, error: &WorkflowError) -> bool {
         !matches!(error, WorkflowError::ShuttingDown)
     }
 }
@@ -517,6 +633,46 @@ mod tests {
         assert_eq!(inv.idle_timeout_secs, Some(7));
     }
 
+    /// Build a bare context carrying only the given variables, for testing
+    /// `compile_run_if` predicates directly without spinning up the engine.
+    fn ctx_with_vars(vars: &[(&str, &str)]) -> WorkflowContext<PipelineData> {
+        let mut ctx = WorkflowContext::new(crate::types::WorkflowRunId::new(), PipelineData);
+        ctx.variables = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        ctx
+    }
+
+    #[test]
+    fn run_if_or_treats_unset_var_as_falsy_not_its_own_placeholder_text() {
+        // Regression for the repo-compare `record` gate: when `compare`
+        // fails/is skipped, `verdict` is never captured, so `{{verdict}}`
+        // stays as literal unexpanded text. That must read as falsy, or
+        // `{{verdict}} != ''` would spuriously be true and defeat the gate.
+        let cond = compile_run_if("{{cache_check}} != 'MISS' OR {{verdict}} != ''");
+
+        // Fresh-analysis run where `compare` never produced a verdict: skip.
+        let ctx = ctx_with_vars(&[("cache_check", "MISS")]);
+        assert!(!cond(&ctx));
+
+        // Fresh-analysis run that did produce a verdict: run.
+        let ctx = ctx_with_vars(&[("cache_check", "MISS"), ("verdict", "| a | b |")]);
+        assert!(cond(&ctx));
+
+        // Cache-hit passthrough with no verdict at all: still run.
+        let ctx = ctx_with_vars(&[("cache_check", "https://artifacts/example")]);
+        assert!(cond(&ctx));
+    }
+
+    #[test]
+    fn run_if_and_requires_both_sides() {
+        let cond = compile_run_if("{{a}} == 'yes' AND {{b}} == 'yes'");
+        assert!(!cond(&ctx_with_vars(&[("a", "yes")])));
+        assert!(!cond(&ctx_with_vars(&[("a", "yes"), ("b", "no")])));
+        assert!(cond(&ctx_with_vars(&[("a", "yes"), ("b", "yes")])));
+    }
+
     #[tokio::test]
     async fn run_if_skips_step_when_condition_false() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -626,5 +782,180 @@ mod tests {
         let state = engine.get_status(run).await.unwrap();
         assert_eq!(state.status, WorkflowStatus::Completed);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn command_step_runs_without_dispatching_an_agent() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_clone = std::sync::Arc::clone(&calls);
+        let send: SendMessage = Arc::new(move |inv: StepInvocation| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok((inv.prompt, 0, 0)) })
+        });
+
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "command-pipeline",
+                "steps": [
+                    {
+                        "name": "echo-step",
+                        "command": ["echo", "-n", "hello {{params.who}}"],
+                        "output_var": "greeting"
+                    },
+                    {
+                        "name": "agent-step",
+                        "agent": "writer",
+                        "prompt": "got: {{greeting}}"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let wf = compile_workflow(&json, send).unwrap();
+        let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
+        engine.register_workflow(wf).unwrap();
+        let run = engine
+            .start_workflow_with_params(
+                crate::types::WorkflowId::new("command-pipeline"),
+                PipelineData,
+                "go".into(),
+                serde_json::json!({"who": "world"}),
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_for_completion(run, "wf", std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let state = engine.get_status(run).await.unwrap();
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        assert_eq!(
+            state.variables.get("greeting").map(String::as_str),
+            Some("hello world")
+        );
+        // Only the agent step dispatched via `send`; the command step ran
+        // as a subprocess.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn command_step_nonzero_exit_fails_with_stderr() {
+        let send: SendMessage =
+            Arc::new(|inv: StepInvocation| Box::pin(async move { Ok((inv.prompt, 0, 0)) }));
+
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "failing-command-pipeline",
+                "steps": [
+                    {
+                        "name": "boom",
+                        "command": ["sh", "-c", "echo oops >&2; exit 3"]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let wf = compile_workflow(&json, send).unwrap();
+        let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
+        engine.register_workflow(wf).unwrap();
+        let run = engine
+            .start_workflow(
+                crate::types::WorkflowId::new("failing-command-pipeline"),
+                PipelineData,
+                "go".into(),
+            )
+            .await
+            .unwrap();
+        let out = engine
+            .wait_for_completion(run, "wf", std::time::Duration::from_secs(10))
+            .await;
+        assert!(out.is_err());
+        assert!(out.unwrap_err().contains("oops"));
+
+        let state = engine.get_status(run).await.unwrap();
+        assert_eq!(state.status, WorkflowStatus::Failed);
+        let err = state
+            .step_states
+            .get(&StepId::new("boom"))
+            .and_then(|s| s.last_error.clone())
+            .expect("step recorded an error");
+        assert!(err.contains("oops"), "error was: {err}");
+    }
+
+    #[tokio::test]
+    async fn command_step_does_not_inherit_a_prior_agent_steps_token_counts() {
+        // `WorkflowContext` token counts persist across steps within a run;
+        // a command step must zero them rather than leaving the prior
+        // agent step's nonzero counts in place.
+        let send: SendMessage =
+            Arc::new(|inv: StepInvocation| Box::pin(async move { Ok((inv.prompt, 100, 50)) }));
+
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "agent-then-command-pipeline",
+                "steps": [
+                    { "name": "agent-step", "agent": "writer", "prompt": "hi" },
+                    { "name": "echo-step", "command": ["echo", "-n", "done"] }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let wf = compile_workflow(&json, send).unwrap();
+        let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
+        engine.register_workflow(wf).unwrap();
+        let run = engine
+            .start_workflow(
+                crate::types::WorkflowId::new("agent-then-command-pipeline"),
+                PipelineData,
+                "go".into(),
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_for_completion(run, "wf", std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let state = engine.get_status(run).await.unwrap();
+        let command_step = state
+            .step_states
+            .get(&StepId::new("echo-step"))
+            .expect("command step ran");
+        assert_eq!(command_step.input_tokens, 0);
+        assert_eq!(command_step.output_tokens, 0);
+    }
+
+    #[test]
+    fn command_and_agent_are_mutually_exclusive() {
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "bad-pipeline",
+                "steps": [
+                    { "name": "bad", "agent": "writer", "command": ["echo", "hi"] }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let err = compile_workflow(&json, mock_send()).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "error was: {err}");
+    }
+
+    #[test]
+    fn missing_command_and_agent_is_rejected() {
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "bad-pipeline-2",
+                "steps": [
+                    { "name": "bad" }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let err = compile_workflow(&json, mock_send()).unwrap_err();
+        assert!(err.contains("must be set"), "error was: {err}");
     }
 }

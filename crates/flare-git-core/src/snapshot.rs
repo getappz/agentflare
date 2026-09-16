@@ -10,10 +10,25 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::shell::run_in;
 
 const SNAPSHOT_REF_PREFIX: &str = "refs/agentflare/snapshots/";
+
+/// Process-local counter mixed into temporary index filenames so two
+/// snapshot calls racing inside the same process (distinct threads, same
+/// PID) never share a `GIT_INDEX_FILE` -- `std::process::id()` alone only
+/// guarantees uniqueness across processes.
+static SNAPSHOT_CALL_ID: AtomicU64 = AtomicU64::new(0);
+
+fn unique_index_suffix() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        SNAPSHOT_CALL_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotId(pub String);
@@ -27,11 +42,14 @@ pub struct SnapshotMeta {
 
 /// `git <args>` with a temporary `GIT_INDEX_FILE`, so staging for a
 /// snapshot never touches the caller's real index.
-fn run_git_with_index(
-    repo_root: &Path,
-    index_file: &Path,
-    args: &[&str],
-) -> Result<String, String> {
+///
+/// `cwd` is the directory git runs in. It is the repo root for a plain
+/// repo-root snapshot, but `snapshot_worktree_before` points it at the
+/// worktree being captured instead — `git add -A` resolves pathspecs
+/// against the current directory, so running it from the repo root with
+/// only `--work-tree` set makes git refuse the paths as outside the
+/// repository.
+fn run_git_with_index(cwd: &Path, index_file: &Path, args: &[&str]) -> Result<String, String> {
     // A snapshot must capture exactly what's on disk right now -- `-c
     // core.autocrlf=false` stops git silently converting line endings
     // while staging, regardless of the caller's ambient/global git config
@@ -39,7 +57,7 @@ fn run_git_with_index(
     let mut cmd = Command::new(crate::shell::git_binary());
     cmd.args(["-c", "core.autocrlf=false"])
         .args(args)
-        .current_dir(repo_root)
+        .current_dir(cwd)
         .env("GIT_INDEX_FILE", index_file);
     crate::shell::apply_filtered_path(&mut cmd);
     let out = cmd
@@ -56,9 +74,10 @@ fn run_git_with_index(
 /// in a temporary index file, removed afterward regardless of outcome —
 /// the real index and working tree are never touched.
 pub fn snapshot_before(repo_root: &Path, reason: &str) -> Result<SnapshotId, String> {
-    let tmp_index = repo_root
-        .join(".git")
-        .join(format!("agentflare-snapshot-index-{}", std::process::id()));
+    let tmp_index = repo_root.join(".git").join(format!(
+        "agentflare-snapshot-index-{}",
+        unique_index_suffix()
+    ));
     let result = (|| {
         run_git_with_index(repo_root, &tmp_index, &["add", "-A"])?;
         let tree = run_git_with_index(repo_root, &tmp_index, &["write-tree"])?;
@@ -81,6 +100,72 @@ pub fn snapshot_before(repo_root: &Path, reason: &str) -> Result<SnapshotId, Str
     })();
     let _ = std::fs::remove_file(&tmp_index);
     result
+}
+
+/// Snapshots a *linked worktree's* contents into the main repo's object
+/// store, returning a recoverable commit under the private snapshot ref.
+///
+/// [`snapshot_before`] cannot do this job: it stages from `repo_root`, and
+/// `ensure_worktrees_ignored` puts `.worktrees/` in `.git/info/exclude`, so
+/// `git add -A` there captures exactly nothing of the worktree about to be
+/// deleted. Every "snapshot first, then remove" call site was therefore
+/// writing an empty safety net and destroying uncommitted work anyway.
+///
+/// Works even when the worktree's own `.git` pointer is broken (the
+/// orphan case): the object store is addressed explicitly via `--git-dir`
+/// on the main repo rather than discovered from the worktree. The
+/// worktree's own `.gitignore` still applies, so build artifacts
+/// (`target/`) and the generated `.cargo/` stay out of the snapshot.
+///
+/// The commit is deliberately parentless — the worktree's branch tip is
+/// not necessarily its content's ancestor (a broken-gitdir worktree may
+/// not have a resolvable branch at all), and recovery only needs the tree.
+pub fn snapshot_worktree_before(
+    repo_root: &Path,
+    worktree_path: &Path,
+    reason: &str,
+) -> Result<SnapshotId, String> {
+    if !worktree_path.exists() {
+        return Err(format!(
+            "worktree path does not exist: {}",
+            worktree_path.display()
+        ));
+    }
+    let common_dir = resolve_common_dir(repo_root);
+    let tmp_index = common_dir.join(format!(
+        "agentflare-worktree-snapshot-index-{}",
+        unique_index_suffix()
+    ));
+    let git_dir = common_dir.to_string_lossy().to_string();
+    let result = (|| {
+        let stage_args = ["--git-dir", &git_dir, "add", "-A", "."];
+        run_git_with_index(worktree_path, &tmp_index, &stage_args)?;
+        let tree = run_git_with_index(
+            worktree_path,
+            &tmp_index,
+            &["--git-dir", &git_dir, "write-tree"],
+        )?;
+        let sha = run_in(repo_root, &["commit-tree", &tree, "-m", reason])?;
+        let refname = format!("{SNAPSHOT_REF_PREFIX}{sha}");
+        run_in(repo_root, &["update-ref", &refname, &sha])?;
+        Ok(SnapshotId(sha))
+    })();
+    let _ = std::fs::remove_file(&tmp_index);
+    result
+}
+
+/// Absolute path to the repo's common git dir — the shared `.git` of the
+/// main checkout, which is where linked worktrees' objects and admin
+/// entries actually live. Falls back to `<repo_root>/.git` when git can't
+/// answer, matching this module's best-effort style.
+fn resolve_common_dir(repo_root: &Path) -> std::path::PathBuf {
+    match run_in(
+        repo_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p.trim()),
+        _ => repo_root.join(".git"),
+    }
 }
 
 /// Checks out `commit_ish`'s tracked files into the current working tree and
@@ -238,6 +323,68 @@ mod tests {
         let after = list(&repo.path);
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, id2);
+    }
+
+    #[test]
+    fn concurrent_worktree_snapshots_do_not_share_an_index() {
+        // Regression: snapshot_worktree_before used to key its temporary
+        // GIT_INDEX_FILE on std::process::id() alone. Two threads in the
+        // same process snapshotting two different worktrees at once would
+        // stomp on each other's staging area, so a snapshot could end up
+        // capturing the wrong worktree's contents (or a mix of both).
+        let repo = init_repo_with_branch("master");
+        let wt_a = repo.path.join("wt-a");
+        let wt_b = repo.path.join("wt-b");
+        run_in(
+            &repo.path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "wt-a",
+                wt_a.to_str().unwrap(),
+                "master",
+            ],
+        )
+        .unwrap();
+        run_in(
+            &repo.path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "wt-b",
+                wt_b.to_str().unwrap(),
+                "master",
+            ],
+        )
+        .unwrap();
+        std::fs::write(wt_a.join("sentinel-a.txt"), "only in a\n").unwrap();
+        std::fs::write(wt_b.join("sentinel-b.txt"), "only in b\n").unwrap();
+
+        let repo_root_a = repo.path.clone();
+        let wt_a_clone = wt_a.clone();
+        let handle_a = std::thread::spawn(move || {
+            snapshot_worktree_before(&repo_root_a, &wt_a_clone, "concurrent snapshot a").unwrap()
+        });
+        let repo_root_b = repo.path.clone();
+        let wt_b_clone = wt_b.clone();
+        let handle_b = std::thread::spawn(move || {
+            snapshot_worktree_before(&repo_root_b, &wt_b_clone, "concurrent snapshot b").unwrap()
+        });
+        let id_a = handle_a.join().unwrap();
+        let id_b = handle_b.join().unwrap();
+
+        let tree_a = run_in(&repo.path, &["ls-tree", "-r", "--name-only", &id_a.0]).unwrap();
+        let tree_b = run_in(&repo.path, &["ls-tree", "-r", "--name-only", &id_b.0]).unwrap();
+        assert!(
+            tree_a.contains("sentinel-a.txt") && !tree_a.contains("sentinel-b.txt"),
+            "snapshot a must capture only worktree a's contents: {tree_a}"
+        );
+        assert!(
+            tree_b.contains("sentinel-b.txt") && !tree_b.contains("sentinel-a.txt"),
+            "snapshot b must capture only worktree b's contents: {tree_b}"
+        );
     }
 
     #[test]

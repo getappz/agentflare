@@ -42,6 +42,10 @@ fn search_store_requires_non_empty_query() {
             query: "".into(),
             r#type: None,
             limit: None,
+            meta: None,
+            path_glob: None,
+            min_score: None,
+            rerank: None,
         },
     )
     .unwrap_err();
@@ -75,6 +79,10 @@ fn search_store_returns_grouped_results() {
                 query: "alpha".into(),
                 r#type: Some("store".into()),
                 limit: Some(50),
+                meta: None,
+                path_glob: None,
+                min_score: None,
+                rerank: None,
             },
         )
         .unwrap();
@@ -101,6 +109,10 @@ fn search_memory_requires_non_empty_query() {
             query: "".into(),
             r#type: Some("memory".into()),
             limit: None,
+            meta: None,
+            path_glob: None,
+            min_score: None,
+            rerank: None,
         },
     )
     .unwrap_err();
@@ -133,6 +145,10 @@ fn search_memory_returns_grouped_observations() {
                 query: "memory search".into(),
                 r#type: Some("memory".into()),
                 limit: Some(50),
+                meta: None,
+                path_glob: None,
+                min_score: None,
+                rerank: None,
             },
         )
         .unwrap();
@@ -159,6 +175,10 @@ fn search_code_requires_non_empty_query() {
             query: "".into(),
             r#type: Some("code".into()),
             limit: None,
+            meta: None,
+            path_glob: None,
+            min_score: None,
+            rerank: None,
         },
     )
     .unwrap_err();
@@ -175,6 +195,10 @@ fn search_code_returns_graceful_payload_via_gateway() {
                 query: "search_impl".into(),
                 r#type: Some("code".into()),
                 limit: Some(10),
+                meta: None,
+                path_glob: None,
+                min_score: None,
+                rerank: None,
             },
         )
         .unwrap();
@@ -199,6 +223,10 @@ fn search_rejects_unknown_type() {
             query: "x".into(),
             r#type: Some("bogus".into()),
             limit: None,
+            meta: None,
+            path_glob: None,
+            min_score: None,
+            rerank: None,
         },
     )
     .unwrap_err();
@@ -219,6 +247,10 @@ fn search_store_defaults_to_store_type() {
                 query: "findable".into(),
                 r#type: None,
                 limit: None,
+                meta: None,
+                path_glob: None,
+                min_score: None,
+                rerank: None,
             },
         )
         .unwrap();
@@ -253,6 +285,10 @@ fn search_store_includes_artifact_matches() {
                 query: "marker phrase".into(),
                 r#type: None,
                 limit: None,
+                meta: None,
+                path_glob: None,
+                min_score: None,
+                rerank: None,
             },
         )
         .unwrap();

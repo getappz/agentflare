@@ -187,6 +187,8 @@ fn consolidate_lines(
             label_ids: vec![],
             assignee_ids: vec![],
             dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
         };
         match agentflare_backend::item::create(conn, input) {
             Ok(item) => {

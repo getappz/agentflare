@@ -152,6 +152,8 @@ mod tests {
                 label_ids: Vec::new(),
                 assignee_ids: Vec::new(),
                 dependency_ids: Vec::new(),
+                start_date: None,
+                due_date: None,
             },
         )
         .unwrap()

@@ -6,7 +6,7 @@ use crate::config::InsightsConfig;
 use crate::config::PricingTable;
 use crate::ingest::{
     common::{extract_file_path, extract_tokens, file_kind_for_tool, parse_timestamp},
-    Adapter, IngestBundle, IngestError,
+    Adapter, FileCursors, IngestBundle, IngestError,
 };
 use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, ToolCall, Turn};
 
@@ -16,7 +16,15 @@ impl Adapter for OpenCodeAdapter {
     fn source_name(&self) -> &'static str {
         "opencode"
     }
-    fn scan(&self, config: &InsightsConfig) -> Result<IngestBundle, IngestError> {
+    fn scan(
+        &self,
+        config: &InsightsConfig,
+        _cursors: &FileCursors,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<IngestBundle, IngestError> {
+        // Single small SQLite DB queried directly -- no per-file walk/reparse
+        // cost here, so the file-cursor skip cache doesn't apply.
+        on_progress(1, 1);
         let Some(db_path) = config.sources.get("opencode") else {
             return Ok(IngestBundle::default());
         };

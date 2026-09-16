@@ -88,7 +88,7 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "pm",
-        "Product management reporting: /pm:standup, /pm:groom, /pm:plan, /pm:health, /pm:portfolio — read-only item analytics across projects. Embedded in the agentflare binary.",
+        "Product management workflows: read-only reports (standup|groom|plan|health|portfolio) plus mode_on|mode_off|mode_status. Single consolidated tool with `action` field.",
     ),
     (
         "item",
@@ -117,6 +117,10 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
     (
         "search",
         "Unified search across 17 sources. type='store' (FTS store docs), 'memory' (brain.db observations), 'code' (leanctx), 'web' (rivalsearch), 'social', 'news', 'github', 'academic', 'datasets', 'websites', 'weather', 'financial', 'crypto', 'fx', 'indicators', 'youtube', 'bluesky'.",
+    ),
+    (
+        "browser",
+        "Browser automation for AI agents — open, snapshot (@e refs), click, fill, read, eval, tabs, network, auth-state. Single consolidated tool with `action` field (open|snapshot|observe|extract|click|fill|type|press|hover|select|check|uncheck|back|forward|reload|get|read|screenshot|pdf|eval|wait|cookies|storage|network|tabs|dialog|console|errors|batch|state|close|doctor|status).",
     ),
 ];
 
@@ -216,6 +220,12 @@ mod tests {
     fn finds_handoff_tool_by_bare_name() {
         let hits = search_builtin_tools("handoff", 5, gateway_registry::MatchMode::Any);
         assert!(hits.iter().any(|h| h.tool == "mcp__flare__handoff"));
+    }
+
+    #[test]
+    fn finds_browser_tool_by_bare_name() {
+        let hits = search_builtin_tools("browser automation", 5, gateway_registry::MatchMode::Any);
+        assert!(hits.iter().any(|h| h.tool == "mcp__flare__browser"));
     }
 
     #[test]
