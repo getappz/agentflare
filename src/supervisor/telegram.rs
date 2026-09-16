@@ -290,24 +290,34 @@ pub(crate) fn handle_telegram_callback(
         // above), which is the one legitimate way a `plan_approver == "human"`
         // item gets approved. The public method refuses those outright so no
         // agent can self-approve (item #573 final review).
-        let ack_text =
+        let succeeded =
             match mcp.item_approve_plan_via_channel(crate::mcp_server::types::ItemRequest {
                 action: "approve_plan".into(),
                 id: Some(item_id.clone()),
                 ..Default::default()
             }) {
-                Ok(_) => "\u{2705} Approved".to_string(),
+                Ok(_) => true,
                 Err(e) => {
                     eprintln!(
                         "agentflare-supervisor: telegram plan-approve for {item_id} failed: {e}"
                     );
-                    format!("failed: {e}")
+                    false
                 }
             };
+        let ack_text = if succeeded {
+            "\u{2705} Approved".to_string()
+        } else {
+            "failed -- tap Approve again to retry".to_string()
+        };
         let _ = crate::channels::answer_telegram_callback(callback_id, &ack_text);
-        if let Some(message_id) = message
-            .and_then(|m| m.get("message_id"))
-            .and_then(serde_json::Value::as_i64)
+        // Only strip the button once approval actually landed -- a transient
+        // failure (e.g. a DB error) must leave the human a way to retry
+        // instead of stranding the item with no way to re-tap Approve
+        // (CodeRabbit finding on item #573's PR).
+        if succeeded
+            && let Some(message_id) = message
+                .and_then(|m| m.get("message_id"))
+                .and_then(serde_json::Value::as_i64)
         {
             let _ = crate::channels::clear_telegram_reply_markup(expected_chat_id, message_id);
         }
