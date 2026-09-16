@@ -1,11 +1,13 @@
 //! Inbound Telegram polling: the single `getUpdates` poller shared by the
-//! PR-approval-card flow (`handle_telegram_callback`) and the chat channel
-//! (`handle_chat_message`) -- split out of `supervisor.rs` once this grew
-//! large enough on its own to push that file over the LOC gate. Everything
-//! here is still very much part of the supervisor: `PR_APPROVAL_LABEL` and
-//! `TELEGRAM_NOTIFY_CHAT_ID_SECRET` stay defined in `super` since
-//! `notify_pr_approval_gate`/`notify_human_gate` (the outbound half of this
-//! same flow) use them too and haven't moved.
+//! PR-approval-card flow, the plan-approval-card flow (both handled by
+//! `handle_telegram_callback`, dispatched on the callback data's prefix),
+//! and the chat channel (`handle_chat_message`) -- split out of
+//! `supervisor.rs` once this grew large enough on its own to push that file
+//! over the LOC gate. Everything here is still very much part of the
+//! supervisor: `PR_APPROVAL_LABEL` and `TELEGRAM_NOTIFY_CHAT_ID_SECRET` stay
+//! defined in `super`, and the outbound card-sending half (including
+//! `parse_plan_approve_callback`'s counterpart, `notify_plan_approval_gate`)
+//! lives in the sibling `notify` module.
 
 use super::{PR_APPROVAL_LABEL, TELEGRAM_NOTIFY_CHAT_ID_SECRET};
 
@@ -188,7 +190,7 @@ pub(crate) fn poll_telegram_approvals(mcp: std::sync::Arc<crate::mcp_server::Age
         }
         mark_in_flight(next);
         if update.get("callback_query").is_some() {
-            handle_telegram_callback(update, &chat_id);
+            handle_telegram_callback(update, &chat_id, &mcp);
             settle(next);
         } else if let Some(message) = update.get("message") {
             handle_chat_message(message, &chat_id, &mcp, next);
@@ -256,9 +258,15 @@ pub(crate) fn handle_chat_message(
 /// Handle one `callback_query` update: verify it came from the configured
 /// notify chat (the only chat a card was ever sent to, but checked anyway --
 /// defense in depth against, e.g., the bot later being added to a group),
-/// parse its `approve:` callback data, add the label, then ack + strip the
-/// button so a repeat tap is a no-op rather than a duplicate GitHub call.
-pub(crate) fn handle_telegram_callback(update: &serde_json::Value, expected_chat_id: &str) {
+/// then dispatch on its callback data prefix -- `approve_plan:` (a plan
+/// approval card, see `notify::notify_plan_approval_gate`) or `approve:` (a
+/// PR-approval card) -- add the label/approve the plan, then ack + strip the
+/// button so a repeat tap is a no-op rather than a duplicate GitHub/DB call.
+pub(crate) fn handle_telegram_callback(
+    update: &serde_json::Value,
+    expected_chat_id: &str,
+    mcp: &crate::mcp_server::AgentflareMcp,
+) {
     let Some(callback) = update.get("callback_query") else {
         return;
     };
@@ -274,6 +282,45 @@ pub(crate) fn handle_telegram_callback(update: &serde_json::Value, expected_chat
         .and_then(|c| c.get("id"))
         .map(std::string::ToString::to_string);
     if chat_id.as_deref() != Some(expected_chat_id) {
+        return;
+    }
+    if let Some(item_id) = super::parse_plan_approve_callback(data) {
+        // `item_approve_plan_via_channel`, NOT the public `item_approve_plan`:
+        // this tap came from a human in the configured notify chat (verified
+        // above), which is the one legitimate way a `plan_approver == "human"`
+        // item gets approved. The public method refuses those outright so no
+        // agent can self-approve (item #573 final review).
+        let succeeded =
+            match mcp.item_approve_plan_via_channel(crate::mcp_server::types::ItemRequest {
+                action: "approve_plan".into(),
+                id: Some(item_id.clone()),
+                ..Default::default()
+            }) {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!(
+                        "agentflare-supervisor: telegram plan-approve for {item_id} failed: {e}"
+                    );
+                    false
+                }
+            };
+        let ack_text = if succeeded {
+            "\u{2705} Approved".to_string()
+        } else {
+            "failed -- tap Approve again to retry".to_string()
+        };
+        let _ = crate::channels::answer_telegram_callback(callback_id, &ack_text);
+        // Only strip the button once approval actually landed -- a transient
+        // failure (e.g. a DB error) must leave the human a way to retry
+        // instead of stranding the item with no way to re-tap Approve
+        // (CodeRabbit finding on item #573's PR).
+        if succeeded
+            && let Some(message_id) = message
+                .and_then(|m| m.get("message_id"))
+                .and_then(serde_json::Value::as_i64)
+        {
+            let _ = crate::channels::clear_telegram_reply_markup(expected_chat_id, message_id);
+        }
         return;
     }
     let Some((repo, number)) = parse_approve_callback(data) else {

@@ -336,7 +336,7 @@ pub(crate) fn run_discovery_tick(
                         result.waiting += 1;
                         continue;
                     }
-                    if dispatch_item(
+                    match dispatch_item(
                         mcp,
                         queue,
                         &item,
@@ -345,7 +345,9 @@ pub(crate) fn run_discovery_tick(
                         &label_id_by_name,
                         &ready_id,
                     ) {
-                        result.dispatched += 1;
+                        DispatchOutcome::Dispatched => result.dispatched += 1,
+                        DispatchOutcome::WaitingOnPlan => result.waiting += 1,
+                        DispatchOutcome::NotDispatched => {}
                     }
                 }
                 crate::quota::decide::EffectiveAction::Ask(question) => {
@@ -504,6 +506,27 @@ fn enqueue_work_job(
     queue.enqueue(&job).ok()
 }
 
+/// What one `dispatch_item` call did, for `run_discovery_tick`'s counters.
+/// A plain `bool` couldn't distinguish "nothing to report" from "this item is
+/// waiting on something and an operator should see it in the tick summary" --
+/// the same reason `SelfRepairOutcome` exists for the review sweep.
+enum DispatchOutcome {
+    Dispatched,
+    /// Blocked on an unapproved plan gate. Retryable by definition: the item
+    /// keeps its `ready-for-work` label and the very next tick dispatches it
+    /// once the plan is approved, so it belongs in
+    /// `DiscoveryTickResult::waiting`, not `skipped`. Before item #573's final
+    /// review this returned a bare `false` and was counted against NO counter
+    /// at all, so an auto-gated `urgent`/`high` item could sit undispatched
+    /// forever with nothing but a repeated stderr line to show for it.
+    WaitingOnPlan,
+    /// Nothing was enqueued and there is nothing for this tick to wait on: a
+    /// job is already queued/running for the item, or the enqueue itself
+    /// failed. Counted exactly as the prior `false` return was -- against no
+    /// counter -- deliberately left unchanged here.
+    NotDispatched,
+}
+
 fn dispatch_item(
     mcp: &AgentflareMcp,
     queue: &agentflare_jobs::Queue,
@@ -512,7 +535,7 @@ fn dispatch_item(
     folder_path: &str,
     label_id_by_name: &std::collections::HashMap<String, String>,
     ready_id: &str,
-) -> bool {
+) -> DispatchOutcome {
     // Single-flight guard (item #221): a row already queued/running for this
     // item means a prior tick dispatched it — its ready→dispatched swap may
     // have failed, or reconcile re-armed it for auto-retry — and enqueueing
@@ -523,10 +546,40 @@ fn dispatch_item(
             "agentflare-supervisor: item #{} ({}) already has a queued/running job — skipping duplicate dispatch",
             item.sequence_id, item.id
         );
-        return false;
+        return DispatchOutcome::NotDispatched;
+    }
+    if let agentflare_backend::item::PlanGateStatus::Blocked(status) =
+        agentflare_backend::item::plan_gate::plan_gate_status(&item.metadata)
+    {
+        eprintln!(
+            "agentflare-supervisor: item #{} ({}) blocked by plan gate (status: {status}) — skipping",
+            item.sequence_id, item.id
+        );
+        // No plan has been submitted at all, so nothing else in the system
+        // will ever ping a human about this item: `item_submit_plan` sends the
+        // approve card, and it was never called. Since Task 7 auto-gates every
+        // `urgent`/`high` item, that would otherwise leave them stalled
+        // silently and indefinitely. `"pending"`/`"rejected"` already had
+        // their notification at submit/reject time, so only `"none"` pings.
+        // `first_time_gated` is the same once-per-item-per-process idiom
+        // `run_discovery_tick` already uses for `NEEDS_DECISION_LABEL`, so
+        // this fires once per gate rather than once per tick. Namespaced
+        // ("plan:<id>", not the bare item id) because the underlying set is
+        // keyed globally across every gate type in this file -- an
+        // unnamespaced key here would consume the same token the PR-approval
+        // card (`notify_pr_approval_gate`) checks for the same item later in
+        // its life, silently suppressing that card for every auto-gated item.
+        if status == "none" && first_time_gated(&format!("plan:{}", item.id)) {
+            notify_human_gate(
+                item,
+                "auto-gated: needs a plan — call item(action=\"submit_plan\", plan_asset_id=...) \
+                 before this item can be dispatched",
+            );
+        }
+        return DispatchOutcome::WaitingOnPlan;
     }
     let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), None) else {
-        return false;
+        return DispatchOutcome::NotDispatched;
     };
 
     // Label-swap failures are logged, not swallowed: a failed swap leaves
@@ -566,7 +619,7 @@ fn dispatch_item(
         )),
         ..Default::default()
     });
-    true
+    DispatchOutcome::Dispatched
 }
 
 /// Marker prefix on a self-repair-dispatch comment (see `self_repair_item`
@@ -1177,97 +1230,13 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
     .any(|job| job.args.contains(&item_id.to_string()))
 }
 
-/// Best-effort Telegram ping for an item that just landed on a human gate
-/// (a go/no-go decision, an unanswerable question, or a CI self-repair cap).
-/// Silently does nothing when `TELEGRAM_NOTIFY_CHAT_ID_SECRET` isn't
-/// configured, since notifications are opt-in and a bare install shouldn't
-/// spam stderr every tick; a configured-but-failing send only logs -- a
-/// notification failure must never block the gate itself.
-pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &str) {
-    let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
-        return;
-    };
-    let text = format!(
-        "agentflare: item #{} ({}) needs a human -- {reason}",
-        item.sequence_id, item.id
-    );
-    if let Err(e) =
-        crate::channels::send_message(crate::channels::Platform::Telegram, &chat_id, &text)
-    {
-        eprintln!(
-            "agentflare-supervisor: telegram notify failed for item #{}: {e}",
-            item.sequence_id
-        );
-    }
-}
-
-/// Escape the characters Telegram's HTML `parse_mode` treats specially, so
-/// an arbitrary item title/description can't break card formatting (or be
-/// interpreted as an unintended tag).
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-/// Telegram-only rich variant of [`notify_human_gate`] for the one gate a
-/// human can resolve with a single tap: CI is green and the only thing
-/// missing is `PR_APPROVAL_LABEL`. Unlike the plain-text pings, this carries
-/// an inline "Approve" button whose `callback_data` embeds the repo and PR
-/// number directly (`approve:{owner}/{repo}#{number}`) -- self-contained,
-/// so [`poll_telegram_approvals`] never needs to re-resolve a worktree path
-/// to act on a click. Same fail-open contract as `notify_human_gate`: no-ops
-/// without a configured chat id or a resolvable repo, and a send failure
-/// only logs.
-fn notify_pr_approval_gate(item: &agentflare_backend::item::Item, folder_path: &str, number: u64) {
-    let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
-        return;
-    };
-    let Some(repo) = crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
-    else {
-        return;
-    };
-    let excerpt: String = item.description.chars().take(200).collect();
-    let text = format!(
-        "\u{1F514} <b>agentflare</b> needs a human\n\
-         <b>Repo:</b> {repo}\n\
-         <b>Item:</b> #{} \u{2014} {}\n\
-         {}\n\n\
-         PR <a href=\"https://github.com/{repo}/pull/{number}\">#{number}</a> is CI-green and \
-         mergeable, awaiting <code>{PR_APPROVAL_LABEL}</code>.",
-        item.sequence_id,
-        html_escape(&item.name),
-        html_escape(&excerpt),
-    );
-    let callback_data = format!("approve:{repo}#{number}");
-    if let Err(e) = crate::channels::send_telegram_card(
-        &chat_id,
-        &text,
-        &[("\u{2705} Approve", &callback_data)],
-    ) {
-        eprintln!(
-            "agentflare-supervisor: telegram card notify failed for item #{}: {e}",
-            item.sequence_id
-        );
-    }
-}
-
-/// True the first time a given item id is seen gated since this process
-/// started, false on every later call for the same id -- `run_discovery_tick`
-/// re-visits an already-gated item on every tick (it stays in the
-/// `ready-for-work` query until a human clears `NEEDS_DECISION_LABEL`), so
-/// this keeps `notify_human_gate` firing once per gate instead of once per
-/// tick. In-memory and per-process by design: a daemon restart re-notifies
-/// once, which is preferable to a persistent marker for a one-line ping.
-pub(crate) fn first_time_gated(item_id: &str) -> bool {
-    static NOTIFIED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    NOTIFIED
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(item_id.to_string())
-}
+/// Telegram notifications and the inbound channel-approval poll. Split out
+/// when item #573's plan-gate work pushed this file past the LOC gate; glob
+/// re-exported so every existing `crate::supervisor::notify_*` /
+/// `first_time_gated` path (and `supervisor_tests.rs`'s `use super::*`)
+/// keeps working unchanged.
+pub(crate) mod notify;
+pub(crate) use notify::*;
 
 /// Dispatches a self-repair job for an item whose PR has failing CI checks,
 /// or -- once `quota::decide::SELF_REPAIR_CAP` prior attempts have been made

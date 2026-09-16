@@ -18,6 +18,7 @@ pub enum ClaimOutcome {
     Acquired,
     Held { owner: String, age_secs: i64 },
     BlockedByAssignee { assignee: String },
+    BlockedByPlan { status: String },
 }
 
 /// Canonical agent identity of an owner id (`<agent>:<instance>` ->
@@ -79,6 +80,11 @@ pub fn claim(
     // busy_timeout-honoring path.
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let item = get(&tx, item_id)?;
+    if let super::plan_gate::PlanGateStatus::Blocked(status) =
+        super::plan_gate::plan_gate_status(&item.metadata)
+    {
+        return Ok(ClaimOutcome::BlockedByPlan { status });
+    }
     if let Some(assignee) = &item.assignee_agent
         && agent_part(assignee) != agent_part(owner)
         && crate::claim::current_owner(&tx, item_id).is_none()

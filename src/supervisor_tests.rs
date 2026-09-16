@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "supervisor_telegram_tests.rs"]
+mod telegram_tests;
+
 #[test]
 fn resolve_confirmed_agent_accepts_claude_code() {
     assert_eq!(
@@ -1088,6 +1091,190 @@ fn second_tick_does_not_reenqueue_while_job_still_queued() {
 }
 
 #[test]
+fn plan_gated_item_does_not_dispatch_when_blocked() {
+    // Task #573: gated items (plan_required=true) with unapproved plan status
+    // must not be dispatched by the supervisor -- nothing enqueued for them.
+    // Unlike the `job_in_flight` skip, though, a plan gate is retryable, so it
+    // must also land in `DiscoveryTickResult::waiting` rather than in no
+    // counter at all (item #573 final review, Fix 2).
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let auth_conn = test_auth_conn();
+
+    let (blocked_item_id, approved_item_id) = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            // Create necessary labels
+            for name in ["ready-for-work", "dispatched", "needs-manual-dispatch"] {
+                agentflare_backend::label::create(
+                    conn,
+                    agentflare_backend::label::CreateLabel {
+                        project_id: Some(project.id.clone()),
+                        workspace_id: project.workspace_id.clone(),
+                        name: name.into(),
+                        color: None,
+                        parent_id: None,
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                    },
+                )
+                .unwrap();
+            }
+            let states = agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+            let state_id = states.iter().find(|s| s.is_default).unwrap().id.clone();
+
+            // Create a blocked gated item (plan_required=true, plan_status not approved)
+            let blocked_item = agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id.clone(),
+                    state_id: state_id.clone(),
+                    name: "Blocked by plan gate".into(),
+                    description: None,
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: Some("claude-code".into()),
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: Some(r#"{"plan_required":true,"plan_status":"pending"}"#.into()),
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                    start_date: None,
+                    due_date: None,
+                },
+            )
+            .unwrap();
+
+            // Create an approved gated item (plan_required=true, plan_status="approved")
+            let approved_item = agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id.clone(),
+                    state_id: state_id.clone(),
+                    name: "Approved by plan gate".into(),
+                    description: None,
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: Some("claude-code".into()),
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: Some(r#"{"plan_required":true,"plan_status":"approved"}"#.into()),
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                    start_date: None,
+                    due_date: None,
+                },
+            )
+            .unwrap();
+
+            let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+            let ready_id = &labels
+                .iter()
+                .find(|l| l.name == "ready-for-work")
+                .unwrap()
+                .id;
+            agentflare_backend::item::add_label(conn, &blocked_item.id, ready_id).unwrap();
+            agentflare_backend::item::add_label(conn, &approved_item.id, ready_id).unwrap();
+            (blocked_item.id, approved_item.id)
+        })
+        .unwrap();
+
+    let result = run_discovery_tick(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+
+    // Only the approved item should dispatch
+    assert_eq!(
+        result.dispatched, 1,
+        "only the approved gated item should be dispatched"
+    );
+    // The queue should have exactly 1 job (for the approved item, not the blocked one)
+    let jobs = queue.list(None).unwrap();
+    assert_eq!(jobs.len(), 1, "only the approved item should be enqueued");
+    assert!(
+        jobs[0].args.contains(&approved_item_id),
+        "the queued job must be for the approved item"
+    );
+    assert!(
+        !jobs[0].args.contains(&blocked_item_id),
+        "the blocked item must not appear in the queue"
+    );
+    // Item #573 final review, Fix 2: the blocked item must be visible to an
+    // operator in the tick summary. Before the fix `dispatch_item` returned a
+    // bare `false` here and no counter moved at all, so an auto-gated item
+    // could stall the supervisor silently and indefinitely.
+    assert_eq!(
+        result.waiting, 1,
+        "a plan-gated item is retryable, so it must be counted as waiting"
+    );
+    assert_eq!(
+        result.skipped, 0,
+        "waiting is not skipped -- skipped reads as a decision that won't be revisited"
+    );
+}
+
+/// Item #573 final review, Fix 2: an item gated with NO plan submitted yet
+/// (`plan_status` absent -> `"none"`) is the stall case Task 7's default
+/// policy makes common, and nothing else in the system would ever ping a
+/// human about it (`item_submit_plan` sends the approve card, and it was never
+/// called). It must count as `waiting` AND fire the one-time human notify.
+#[test]
+fn plan_gated_item_with_no_plan_submitted_counts_as_waiting() {
+    // `notify_human_gate` reads the vault -- isolate $HOME so this can never
+    // touch a developer's real vault or fire a real Telegram message, same
+    // reasoning as the Telegram-callback tests.
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let auth_conn = test_auth_conn();
+
+        let item_id = seed_ready_item(&mcp, Some("claude-code"));
+        mcp.with_backend_db(|conn| {
+            agentflare_backend::item::update(
+                conn,
+                &item_id,
+                agentflare_backend::item::UpdateItem {
+                    // plan_required with no plan_status at all -> Blocked("none").
+                    metadata: Some(r#"{"plan_required":true}"#.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        })
+        .unwrap();
+
+        let result = run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        );
+
+        assert_eq!(
+            result.dispatched, 0,
+            "an unsubmitted plan must not dispatch"
+        );
+        assert_eq!(
+            result.waiting, 1,
+            "a never-submitted plan gate must be counted as waiting, not silently dropped"
+        );
+        assert_eq!(result.skipped, 0);
+        assert!(
+            queue.list(None).unwrap().is_empty(),
+            "nothing may be enqueued for a plan-gated item"
+        );
+    });
+}
+
+#[test]
 fn run_review_sweep_ignores_items_not_in_review() {
     let mcp = test_mcp();
     let queue = test_queue();
@@ -1958,161 +2145,5 @@ fn cascade_unblock_dependents_unaffected_by_coexisting_duplicate_relation() {
     assert!(
         item_has_ready_label(&mcp, &dependent),
         "a coexisting duplicate relation must not suppress the real blocks-edge cascade"
-    );
-}
-
-// -- Telegram inbound routing: characterization tests written before
-// merging the chat channel's polling into this same tick (see
-// `poll_telegram_approvals`/`handle_telegram_callback`) -- these pin down
-// the existing approval-callback behavior so the merge can't silently
-// change it. No tests previously covered this path.
-
-#[test]
-fn parse_approve_callback_extracts_repo_and_number() {
-    let parsed = parse_approve_callback("approve:owner/repo#42");
-    assert!(parsed.is_some());
-    let (repo, number) = parsed.unwrap();
-    assert_eq!(repo.to_string(), "owner/repo");
-    assert_eq!(number, 42);
-}
-
-#[test]
-fn parse_approve_callback_rejects_non_approve_prefix() {
-    assert_eq!(parse_approve_callback("deny:owner/repo#42"), None);
-}
-
-#[test]
-fn parse_approve_callback_rejects_missing_number() {
-    assert_eq!(parse_approve_callback("approve:owner/repo"), None);
-}
-
-#[test]
-fn handle_telegram_callback_ignores_update_with_no_callback_query() {
-    // A plain message update -- must not panic and must not attempt any
-    // GitHub call (no network in this test process, so a GitHub attempt
-    // would hang/fail rather than silently succeed).
-    let update = serde_json::json!({
-        "update_id": 1,
-        "message": { "chat": { "id": 999 }, "text": "hello" }
-    });
-    handle_telegram_callback(&update, "999");
-}
-
-#[test]
-fn handle_telegram_callback_ignores_callback_from_wrong_chat() {
-    let update = serde_json::json!({
-        "update_id": 2,
-        "callback_query": {
-            "id": "cb1",
-            "data": "approve:owner/repo#1",
-            "message": { "message_id": 5, "chat": { "id": 111 } }
-        }
-    });
-    // expected_chat_id is "999", update is from chat 111 -- must return
-    // early (before any GitHub call) rather than panic.
-    handle_telegram_callback(&update, "999");
-}
-
-#[test]
-fn handle_telegram_callback_ignores_malformed_callback_query() {
-    let update = serde_json::json!({
-        "update_id": 3,
-        "callback_query": { "id": "cb1" } // missing "data"
-    });
-    handle_telegram_callback(&update, "999");
-}
-
-// -- `handle_chat_message`: the merged poll's other branch (see
-// `poll_telegram_approvals`). Only exercises the authorization/shape gate
-// here -- once past it, dispatch_message hands off to chat_channel, which
-// has its own test coverage for command parsing.
-
-#[test]
-fn handle_chat_message_ignores_message_from_wrong_chat() {
-    let message = serde_json::json!({ "chat": { "id": 111 }, "text": "hi" });
-    let mcp = std::sync::Arc::new(test_mcp());
-    // expected_chat_id is "999", message is from chat 111 -- must return
-    // without dispatching anything (no panic, no network/db touch).
-    handle_chat_message(&message, "999", &mcp, 1);
-}
-
-#[test]
-fn handle_chat_message_ignores_message_with_no_text() {
-    let message = serde_json::json!({ "chat": { "id": 999 } });
-    let mcp = std::sync::Arc::new(test_mcp());
-    handle_chat_message(&message, "999", &mcp, 2);
-}
-
-#[test]
-fn handle_chat_message_ignores_whitespace_only_text() {
-    let message = serde_json::json!({ "chat": { "id": 999 }, "text": "   " });
-    let mcp = std::sync::Arc::new(test_mcp());
-    handle_chat_message(&message, "999", &mcp, 3);
-}
-
-#[test]
-fn handle_chat_message_ignores_message_with_no_chat() {
-    let message = serde_json::json!({ "text": "hi" });
-    let mcp = std::sync::Arc::new(test_mcp());
-    handle_chat_message(&message, "999", &mcp, 4);
-}
-
-// -- Offset watermark: safe_offset_to_persist / mark_in_flight / settle
-// (see poll_telegram_approvals). These back the fix for the exact gap
-// CodeRabbit's review flagged on this PR -- a free-text turn's offset must
-// not be confirmed before the turn itself finishes, and a later
-// synchronously-settled update must not drag the offset past an earlier
-// one that's still in flight.
-
-#[test]
-fn safe_offset_to_persist_is_ceiling_when_nothing_in_flight() {
-    let in_flight = std::collections::BTreeSet::new();
-    assert_eq!(safe_offset_to_persist(50, &in_flight), 50);
-}
-
-#[test]
-fn safe_offset_to_persist_caps_below_earliest_in_flight_update() {
-    let in_flight = std::collections::BTreeSet::from([30, 45]);
-    assert_eq!(safe_offset_to_persist(50, &in_flight), 30);
-}
-
-#[test]
-fn safe_offset_to_persist_withholds_a_later_offset_while_an_earlier_one_is_still_in_flight() {
-    // The scenario the review flagged: update N (free text, still running)
-    // must not be silently confirmed just because update N+1 (e.g. a slash
-    // command) already finished synchronously and isn't itself in the set.
-    let in_flight = std::collections::BTreeSet::from([10]);
-    assert_eq!(safe_offset_to_persist(12, &in_flight), 10);
-}
-
-#[test]
-fn safe_offset_to_persist_never_exceeds_ceiling() {
-    // Shouldn't happen in practice (an in-flight offset can't exceed the
-    // ceiling, which tracks every offset ever seen) but the result must
-    // stay bounded even if it somehow did.
-    let in_flight = std::collections::BTreeSet::from([999]);
-    assert_eq!(safe_offset_to_persist(50, &in_flight), 50);
-}
-
-#[test]
-fn mark_in_flight_then_settle_round_trips_through_the_shared_set() {
-    // High sentinel value: IN_FLIGHT_UPDATE_OFFSETS is a real process-wide
-    // static shared with other tests under cargo test's parallel execution.
-    const SENTINEL: i64 = 900_001;
-    mark_in_flight(SENTINEL);
-    assert!(
-        IN_FLIGHT_UPDATE_OFFSETS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&SENTINEL),
-        "mark_in_flight must record the offset as in flight"
-    );
-    settle(SENTINEL);
-    assert!(
-        !IN_FLIGHT_UPDATE_OFFSETS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&SENTINEL),
-        "settle must remove it once handling is done"
     );
 }
