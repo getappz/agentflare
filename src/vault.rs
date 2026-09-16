@@ -84,7 +84,7 @@ pub fn ensure_vault() -> Result<(), String> {
         return Ok(());
     }
     let pw = get_passphrase().ok_or_else(|| {
-        "no vault passphrase available (set AGENTFLARE_VAULT_PASSPHRASE or run interactively)"
+        "no vault passphrase available (run 'agentflare vault unlock', or set AGENTFLARE_VAULT_PASSPHRASE)"
             .to_string()
     })?;
     if let Some(parent) = path.parent() {
@@ -97,7 +97,7 @@ pub fn ensure_vault() -> Result<(), String> {
 fn open_vault_with_passphrase() -> Result<VaultDek, String> {
     let path = vault_path();
     let pw = get_passphrase().ok_or_else(|| {
-        "no vault passphrase available (set AGENTFLARE_VAULT_PASSPHRASE or run interactively)"
+        "no vault passphrase available (run 'agentflare vault unlock', or set AGENTFLARE_VAULT_PASSPHRASE)"
             .to_string()
     })?;
     let dek = open_vault(&path, &pw).map_err(|e| e.to_string())?;
