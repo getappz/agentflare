@@ -694,6 +694,11 @@ fn run_headless_impl(
     // would make its `claim`/`done`/`release` calls on the item it's already
     // claimed fail with "claimed by <agent>:<job-id>" (a *different* owner).
     cmd.env("AGENTFLARE_AGENT", spec.id.as_str());
+    // `Command` inherits this process's ambient env by default (same reason
+    // `CARGO_TARGET_DIR` is stripped above) — an ownerless dispatch must not
+    // let a stale `AGENTFLARE_CLAIM_OWNER` from the calling process's own env
+    // (e.g. a different in-process dispatch) leak into this child.
+    cmd.env_remove("AGENTFLARE_CLAIM_OWNER");
     if let Some(owner) = owner {
         cmd.env("AGENTFLARE_CLAIM_OWNER", owner);
     }
