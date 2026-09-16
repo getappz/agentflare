@@ -140,7 +140,22 @@ const AGENT_PROFILES: &[AgentProfile] = &[
 /// means the agent finishes real work with no way to report it (item #120 --
 /// confirmed live via `EROFS` on `touch ~/.agentflare/probe` and two
 /// dispatched jobs stuck showing not-done despite merge-ready PRs).
-const WRITABLE_HOME_DIRS: &[&str] = &[".agentflare"];
+/// lean-ctx's own state dir, relative to `$HOME` -- holds `agents/
+/// registry.lock` (its agent-bus registration lock) plus the sqlite DBs
+/// every `ctx_*` tool call reads/writes through. Left off the sandbox
+/// entirely, it falls through to the read-only root and every `ctx_*` tool
+/// (read/shell/search/tree/expand) fails identically at the registration
+/// gate with `EROFS` on `registry.lock`, before reaching any real read/shell
+/// logic -- and `flare_tool`/`comment` calls that touch the same DBs fail
+/// alongside it with "attempt to write a readonly database" (item #236,
+/// confirmed live across 7+ independent dispatched sessions). Needs a real
+/// writable bind rather than `OverlayEphemeral`, like `.agentflare`: the
+/// agent-bus registry is shared coordination state across concurrently
+/// dispatched agents, not per-job scratch state an overlay could safely
+/// discard.
+const LEAN_CTX_STATE: &str = ".local/share/lean-ctx";
+
+const WRITABLE_HOME_DIRS: &[&str] = &[".agentflare", LEAN_CTX_STATE];
 
 /// `AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS`, comma-separated, parsed into a
 /// dir list -- e.g. `".foo,.bar"`. Empty/unset -> no extra dirs. Read fresh
