@@ -1790,6 +1790,31 @@ rotate = true
         });
     }
 
+    /// Item #240: a cursor-agent dispatch that hits its account usage limit
+    /// (confirmed live via the real sandboxed dispatch: `cursor-agent`
+    /// prints its `system`/`init` message, then exits non-zero with
+    /// `ActionRequiredError: You've hit your usage limit ... Switch to a
+    /// different model or set a Spend Limit to continue` on stderr and zero
+    /// assistant turns) surfaces through a *different* engine wrapper than
+    /// `classify_and_cooldown_matches_rate_limit_text_folded_into_the_generic_workflow_message`
+    /// covers: when `finalize` never runs because its `sdd_loop` dependency
+    /// permanently failed, `WorkflowEngine` reports "Workflow failed due to
+    /// step dependency failure: <real error>" instead of "One or more steps
+    /// failed: <real error>" (see `engine.rs`'s two `finish_workflow_failed`
+    /// call sites). `classify_and_cooldown` must match through this wrapper
+    /// too, so the daemon cools cursor-agent down instead of respawning a
+    /// worktree for the same item every tick with no visible progress.
+    #[test]
+    fn classify_and_cooldown_matches_cursor_usage_limit_folded_into_dependency_failure_message() {
+        crate::paths::test_support::with_temp_home(|| {
+            let msg = "Workflow failed due to step dependency failure: cursor exited non-zero — last stderr before kill:\nActionRequiredError: You've hit your usage limit You've saved $51 on API model usage this month with Start. Switch to a different model or set a Spend Limit to continue with this model.";
+            let retry = classify_and_cooldown("cursor", msg);
+            assert_eq!(retry, Some(RATE_LIMIT_COOLDOWN_MINUTES as u64 * 60));
+            let conn = crate::auth_db::open_or_rebuild();
+            assert!(crate::auth_db::is_cooling_down(&conn, "cursor"));
+        });
+    }
+
     include!("work_model_routing_tests.rs");
 
     fn seeded_item(
