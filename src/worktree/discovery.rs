@@ -114,8 +114,21 @@ pub(crate) fn claim_pr_for_discovery(
 /// at all. Also gated on `claim_pr_for_discovery` (`owner` identifies this
 /// workstation): multiple workstations independently poll the same repo with
 /// no shared item DB, so without a durable marker on the PR itself, two of
-/// them could both create their own duplicate tracking item for it. The
-/// synthesized item's `metadata.pr` shape matches
+/// them could both create their own duplicate tracking item for it.
+///
+/// Also skips any PR whose body already carries agentflare's own
+/// `pulls::opened_by_agentflare` stamp, *before* the claim-comment check --
+/// `known_pr_numbers` only reflects items in *this* workstation's own local
+/// database, so a PR another workstation's `push_and_open_pr` just opened
+/// for its own item is invisible here even though it's already tracked
+/// there. The stamp lands in the PR body the instant it's created, ahead of
+/// any claim comment (`push_and_open_pr` never posts one), so relying on
+/// `claim_pr_for_discovery` alone left a race window: a sweep here could
+/// still see the PR as unclaimed and win the (uncontested) claim, adopting a
+/// second, duplicate local item and stacking a second `beacon:` label on top
+/// of the real opener's (item #261, live: PR #688 ended up carrying two
+/// different workstations' `beacon:` labels 23 seconds apart).
+/// The synthesized item's `metadata.pr` shape matches
 /// `merge_and_persist_pr_identity` exactly, so every downstream sweep step
 /// (CI check, self-repair, branch update, merge) treats it identically to a
 /// normal item. Returns the number of items created; soft-fails to 0 on any
@@ -141,6 +154,7 @@ pub(crate) fn discover_untracked_prs(
         if pr.draft
             || known_pr_numbers.contains(&pr.number)
             || !crate::github::is_trusted_author_association(&pr.author_association)
+            || crate::github::pulls::opened_by_agentflare(pr.body.as_deref())
         {
             continue;
         }
@@ -453,6 +467,59 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // Regression for item #261 (live incident): PR #688, opened by one
+    // workstation's `push_and_open_pr` for item #259, ended up carrying a
+    // SECOND workstation's `beacon:` label too -- that second workstation's
+    // own local item database had no record of item #259 or PR #688 at all
+    // (per-workstation DBs aren't synced), so its `known_pr_numbers` didn't
+    // exclude it, and it adopted the PR into a duplicate local item. The PR
+    // body already carried agentflare's own `for item #259 via agentflare.`
+    // stamp from the moment it was opened -- this test simulates exactly
+    // that: `known_pr_numbers` is empty (as it would be on the second,
+    // unaware workstation), but the PR body itself proves it's already
+    // agentflare's, so discovery must skip it before ever reaching the
+    // claim-comment step (no second mock response is queued for a comment
+    // post or re-read -- the test would fail with an out-of-responses panic
+    // if discovery tried to claim it anyway).
+    #[test]
+    fn discover_untracked_prs_skips_a_pr_already_opened_by_agentflare_elsewhere() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"[{"number":688,"html_url":"u","state":"open","title":"chore: fix","head":{"ref":"task/259","sha":"abc"},"author_association":"OWNER","body":"---\n_Opened by `claude-code` on **flared:51bb8de6c33b** for item #259 via agentflare._"}]"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        // Empty, as it would be on a workstation whose own local DB never
+        // heard of item #259 -- the body-marker check must still catch it.
+        let known = std::collections::HashSet::new();
+
+        let created = discover_untracked_prs(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &known,
+            "flared:c997d745ae66",
+        );
+
+        assert_eq!(created, 0);
+        assert!(
+            agentflare_backend::item::list_by_project(&conn, &project_id)
+                .unwrap()
+                .is_empty()
+        );
+        // Only the initial PR list call -- no claim comment, no item create.
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]
