@@ -2020,6 +2020,39 @@ fn redispatch_to_the_same_agent_keeps_the_model_override() {
     );
 }
 
+// Item #234 review: `run_review_sweep`'s stray-PR self-heal restores any
+// item carrying `metadata.pr.number` with no live claim straight back into
+// "in_review". Without this, redispatching a stuck item back to "backlog"
+// for a fresh attempt while it still carries a stale PR reference from the
+// abandoned attempt would get immediately dragged back into "in_review" by
+// the very next sweep tick, undoing the redispatch.
+#[test]
+fn redispatch_clears_a_stale_pr_reference_from_a_prior_attempt() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
+    update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            metadata: Some(r#"{"pr":{"number":501,"branch":"task/501"},"size":"M"}"#.to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    redispatch(&conn, &item.id, None).unwrap();
+
+    let updated = get(&conn, &item.id).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
+    assert!(
+        metadata.get("pr").is_none(),
+        "a PR tracked by an abandoned attempt must not survive redispatch: {metadata:?}"
+    );
+    assert_eq!(metadata.get("size").and_then(|v| v.as_str()), Some("M"));
+}
+
 #[test]
 fn redispatch_with_no_assignee_anywhere_returns_no_assignee_and_makes_no_changes() {
     let conn = db::open_in_memory().unwrap();
