@@ -71,6 +71,7 @@ dependencies = [
  "agentflare-apps",
  "agentflare-artifacts",
  "agentflare-backend",
+ "agentflare-config",
  "agentflare-db-kit",
  "agentflare-flare-code",
  "agentflare-flare-insights",
@@ -189,6 +190,16 @@ dependencies = [
  "thiserror",
  "ureq 2.12.1",
  "url",
+]
+
+[[package]]
+name = "agentflare-config"
+version = "0.1.0"
+dependencies = [
+ "agentflare-agent-registry",
+ "agentflare-workspace-hack",
+ "dirs",
+ "tempfile",
 ]
 
 [[package]]

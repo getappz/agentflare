@@ -1,5 +1,5 @@
 [workspace]
-members = ["agentflare-workspace-hack","crates/flare-insights","crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-process", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault", "crates/agentflare-resource-gate", "crates/flare-workflow", "crates/flare-sandbox", "crates/agentflare-apps", "crates/flare-browser"]
+members = ["agentflare-workspace-hack","crates/flare-insights","crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-process", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault", "crates/agentflare-resource-gate", "crates/flare-workflow", "crates/flare-sandbox", "crates/agentflare-apps", "crates/flare-browser", "crates/agentflare-config"]
 resolver = "2"
 
 [package]
@@ -99,6 +99,7 @@ machine-uid = "0.6.0"
 agentflare-workspace-hack = { version = "0.1", path = "agentflare-workspace-hack" }
 dunce = "1"
 agentflare-apps = { path = "crates/agentflare-apps" }
+agentflare-config = { path = "crates/agentflare-config" }
 tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
