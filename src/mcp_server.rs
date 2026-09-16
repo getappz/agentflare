@@ -4,7 +4,9 @@
 
 mod artifact;
 mod asset;
+mod browser;
 mod builtin_tools;
+mod chat;
 mod claim;
 mod comment;
 mod flare_docs;
@@ -366,6 +368,16 @@ impl AgentflareMcp {
     )]
     async fn skill(&self, Parameters(req): Parameters<SkillRequest>) -> Result<String, ErrorData> {
         self.skill_impl(req).await
+    }
+
+    #[tool(
+        description = "Browser automation for AI agents — open, snapshot (@e refs), click, fill, read, eval, tabs, network, auth-state. Single consolidated tool with `action` field (open|snapshot|observe|extract|click|fill|type|press|hover|select|check|uncheck|back|forward|reload|get|read|screenshot|pdf|eval|wait|cookies|storage|network|tabs|dialog|console|errors|batch|state|close|doctor|status). Sessions isolate per worktree automatically; subcommands allowed (\"get text\", \"tab new\", \"cookies set\"). First use auto-installs the pure-Rust agent-browser sidecar via mise (prebuilt binary) unless AGENTFLARE_BROWSER_NO_AUTO_INSTALL is set."
+    )]
+    async fn browser(
+        &self,
+        Parameters(req): Parameters<BrowserRequest>,
+    ) -> Result<String, ErrorData> {
+        self.browser_impl(req).await
     }
 
     #[tool(

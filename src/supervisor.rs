@@ -6,6 +6,14 @@
 use crate::mcp_server::AgentflareMcp;
 use crate::mcp_server::types::{CommentRequest, ItemRequest};
 
+mod telegram;
+pub(crate) use telegram::poll_telegram_approvals;
+#[cfg(test)]
+use telegram::{
+    IN_FLIGHT_UPDATE_OFFSETS, handle_chat_message, handle_telegram_callback, mark_in_flight,
+    parse_approve_callback, safe_offset_to_persist, settle,
+};
+
 /// Also read by `mcp_server::handoff` — a freshly handed-off item is labeled
 /// with this so the discovery loop below notices it without a human having
 /// to add the label by hand. Single source of truth so the two can't drift.
@@ -88,15 +96,10 @@ fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str,
 /// Reuses the same `channels`/`vault` path as `agentflare channel send`
 /// rather than inventing a separate config store for one setting -- set it
 /// with `agentflare vault set telegram_notify_chat_id <chat_id>` alongside
-/// `telegram_bot_token` (see `channels::Platform::secret_name`).
-const TELEGRAM_NOTIFY_CHAT_ID_SECRET: &str = "telegram_notify_chat_id";
-
-/// `vault` secret persisting the last-consumed Telegram `update_id` across
-/// restarts -- offset semantics per Telegram's own `getUpdates` docs (pass
-/// `last_update_id + 1` to avoid redelivery). Reuses the vault store as a
-/// convenient single-value KV, same precedent as
-/// `TELEGRAM_NOTIFY_CHAT_ID_SECRET` -- neither value is actually secret.
-const TELEGRAM_UPDATE_OFFSET_SECRET: &str = "telegram_update_offset";
+/// `telegram_bot_token` (see `channels::Platform::secret_name`). Also read by
+/// `crate::chat_channel` to authorize which chat's free-text/slash-command
+/// messages it acts on -- the same chat a PR-approval card would be sent to.
+pub(crate) const TELEGRAM_NOTIFY_CHAT_ID_SECRET: &str = "telegram_notify_chat_id";
 
 /// Since item #19, work items run in-process via `WorkItemExecutor` rather
 /// than as a spawned `agentflare work` subprocess, so this is no longer an

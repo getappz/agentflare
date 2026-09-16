@@ -261,12 +261,18 @@ fn spawn_supervisor_review_sweep(
 }
 
 /// Runs for the lifetime of the process: wakes on
-/// `SUPERVISOR_TELEGRAM_POLL_INTERVAL` and checks for a tapped "Approve"
-/// button on a PR-approval or plan-approval card (see
-/// `supervisor::notify_pr_approval_gate`/`notify_plan_approval_gate`).
-/// Needs an `AgentflareMcp` handle now (plan-approval calls
-/// `item_approve_plan`), so this mirrors `spawn_supervisor_discovery`'s
-/// shape rather than standing alone.
+/// `SUPERVISOR_TELEGRAM_POLL_INTERVAL` and handles whatever Telegram sent
+/// since the last tick -- a tapped "Approve" button on a PR-approval or
+/// plan-approval card (see
+/// `supervisor::notify_pr_approval_gate`/`notify_plan_approval_gate`) or a
+/// chat message (a slash command or a free-text agent prompt, see
+/// `chat_channel`). Needs the shared `AgentflareMcp` handle now (plan
+/// approval calls `item_approve_plan_via_channel`, chat commands call
+/// `pm`/`item`/`project` in-process), same shape as
+/// `spawn_supervisor_discovery`/`spawn_supervisor_review_sweep` above. Both
+/// flows share this single tick deliberately -- see
+/// `supervisor::poll_telegram_approvals`'s doc comment for why a second
+/// independent poller isn't safe on one bot token.
 fn spawn_supervisor_telegram_approvals(
     mcp: std::sync::Arc<crate::mcp_server::AgentflareMcp>,
     interval: std::time::Duration,
@@ -276,10 +282,9 @@ fn spawn_supervisor_telegram_approvals(
         loop {
             ticker.tick().await;
             let mcp = mcp.clone();
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                crate::supervisor::poll_telegram_approvals(&mcp)
-            })
-            .await
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || crate::supervisor::poll_telegram_approvals(mcp))
+                    .await
             {
                 eprintln!("agentflare-supervisor: telegram poll task panicked: {e}");
             }

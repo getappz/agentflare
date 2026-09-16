@@ -725,6 +725,77 @@ fn sdd_loop_step_invocations_carry_the_item_s_own_worktree_path_as_cwd() {
     }
 }
 
+// Item #538: the spawned coding-agent subprocess must present the same
+// claim-owner identity the job's claim was filed under, so its own
+// `claims::owner_id()` (which `comment`/`claim`/`done`/`release` use) matches
+// the identity the dispatch thread captured — otherwise the live agent's
+// done/release on its own claimed item fails with "claimed by <agent>:<job-id>"
+// (a *different* owner). `build_sdd_loop_step` threads `ctx.data.owner` into
+// every `StepInvocation` it sends, mirroring the `worktree_path` threading
+// item #191 established.
+#[test]
+fn sdd_loop_step_invocations_carry_the_run_s_owner_identity() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Owner-threading test item");
+    std::fs::write(worktree_path.join("real_work.txt"), "real work").unwrap();
+    let mcp = Arc::new(mcp);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
+        .unwrap()
+        .unwrap();
+
+    let expected_owner = "claude-code:job-538".to_string();
+    let seen_owners: Arc<std::sync::Mutex<Vec<Option<String>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_owners_for_send = seen_owners.clone();
+    let send: flare_workflow::json::SendMessage = Arc::new(move |inv| {
+        seen_owners_for_send.lock().unwrap().push(inv.owner.clone());
+        let prompt = inv.prompt;
+        Box::pin(async move {
+            if prompt.contains("You are the judge") {
+                Ok((
+                    r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#
+                        .to_string(),
+                    1u64,
+                    0u64,
+                ))
+            } else {
+                Ok(("DONE: did the work".to_string(), 1u64, 0u64))
+            }
+        })
+    });
+
+    let _ = crate::paths::test_support::with_temp_home(|| {
+        crate::claims::with_owner_override(expected_owner.clone(), || {
+            run_or_resume_with_sender(
+                mcp.clone(),
+                &item,
+                &worktree_path,
+                agent_registry::Agent::ClaudeCode,
+                agent_registry::Agent::ClaudeCode,
+                "implement it".to_string(),
+                None,
+                None,
+                send,
+            )
+        })
+    });
+
+    let seen_owners = seen_owners.lock().unwrap();
+    assert!(
+        !seen_owners.is_empty(),
+        "sdd_loop never dispatched an agent"
+    );
+    for owner in seen_owners.iter() {
+        assert_eq!(
+            owner.as_deref(),
+            Some(expected_owner.as_str()),
+            "StepInvocation.owner must be the run's claim owner, so the spawned \
+             agent's own owner_id() reconstructs the identity the claim was filed under"
+        );
+    }
+}
+
 // Item #512: bare `task/<N>` checkout + renamed slug hid divergence from
 // `item_done`; finalize must surface workflow failure (not silent success).
 #[tokio::test]

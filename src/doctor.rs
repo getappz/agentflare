@@ -34,6 +34,103 @@ pub(crate) fn check_host(host: &str) -> Vec<CheckResult> {
         .collect()
 }
 
+/// Telegram chat-channel health, folded into the same `CheckResult` shape
+/// `check_host` produces under a synthetic "telegram" host, so the existing
+/// print/JSON layout renders it with no changes. Only runs when
+/// `telegram_bot_token` is actually configured (opt-in, same as every other
+/// Telegram code path) -- so `doctor` stays local-only/instant, and never
+/// prompts for a vault passphrase, for the common case of nobody having set
+/// this up. `token`'s `describe` shows the resolved `@bot_username` so it
+/// can be eyeballed against whatever bot is actually being messaged --
+/// the chat channel goes silently, permanently unreachable with zero error
+/// anywhere when the configured token belongs to a different bot, and this
+/// is the fast way to catch that instead of a long manual trace.
+/// `send_test` (only attempted once `notify_chat` confirms a target
+/// exists) actually calls `sendMessage` to that chat -- unlike `token` and
+/// `notify_chat`, which only prove the plumbing is intact, this is the one
+/// check that proves a message really lands in Telegram.
+pub(crate) fn telegram_channel_checks() -> Vec<CheckResult> {
+    // `list_secrets` only reads stored names, no vault unlock required --
+    // unlike `get_secret` below, which needs a cached key or passphrase.
+    // Gating presence on this (not `get_secret`) is what lets a genuinely
+    // unconfigured setup skip silently while a *locked* vault that does
+    // have a token configured still surfaces as a real failing check
+    // instead of also vanishing indistinguishably.
+    let Ok(names) = crate::vault::list_secrets() else {
+        return Vec::new();
+    };
+    if !names.iter().any(|n| n == "telegram_bot_token") {
+        return Vec::new();
+    }
+    let host = "telegram".to_string();
+    let mut checks = match crate::channels::telegram_bot_identity() {
+        Ok(username) => vec![CheckResult {
+            host: host.clone(),
+            component_id: "token",
+            ok: true,
+            describe: format!("bot {username} reachable"),
+        }],
+        Err(e) => {
+            return vec![CheckResult {
+                host,
+                component_id: "token",
+                ok: false,
+                describe: e,
+            }];
+        }
+    };
+    // Fetched once (not per-check) -- the vault is already unsealed at this
+    // point (the `token` check above required it), so this can't newly
+    // fail on a lock; `chat_id` is `None` whenever it's simply unset.
+    let chat_id = crate::vault::get_secret("telegram_notify_chat_id")
+        .ok()
+        .flatten();
+
+    checks.push(CheckResult {
+        host: host.clone(),
+        component_id: "notify_chat",
+        ok: chat_id.is_some(),
+        describe: match &chat_id {
+            // Resolves who that id actually belongs to (`getChat`) --
+            // `telegram_notify_chat_id` can point at the wrong person
+            // (stale, copy-pasted from an example, a former teammate's id)
+            // exactly as silently as `telegram_bot_token` can point at the
+            // wrong bot: outbound sends still succeed either way, so
+            // nothing errors, and whoever is actually messaging the right
+            // bot just never gets a reply. Falls back to the bare id if
+            // `getChat` itself fails -- still `ok: true` since a working
+            // chat id, even one the identity lookup couldn't resolve,
+            // isn't itself the failure.
+            Some(id) => match crate::channels::telegram_chat_identity(id) {
+                Ok(who) => format!("notify chat configured ({who})"),
+                Err(_) => "notify chat configured".to_string(),
+            },
+            None => "no telegram_notify_chat_id configured — set it with 'agentflare vault set telegram_notify_chat_id'".to_string(),
+        },
+    });
+
+    // Only attempted once a chat id is actually on file -- `notify_chat`
+    // above already reports the "nothing to send to" case, so this would
+    // just be a redundant second failure otherwise.
+    if let Some(chat_id) = chat_id {
+        let send_result = crate::channels::send_message(
+            crate::channels::Platform::Telegram,
+            &chat_id,
+            "agentflare doctor: channel check -- this bot can reach you.",
+        );
+        checks.push(CheckResult {
+            host,
+            component_id: "send_test",
+            ok: send_result.is_ok(),
+            describe: match send_result {
+                Ok(()) => "test message delivered".to_string(),
+                Err(e) => e,
+            },
+        });
+    }
+    checks
+}
+
 pub(crate) fn stale_rules_for_host(host: &str) -> Vec<StaleRule> {
     rule_targets(host)
         .into_iter()
@@ -78,6 +175,18 @@ pub fn run(agent: Option<&str>, json: bool) {
         stale.extend(stale_rules_for_host(host));
     }
 
+    // Not a coding-agent host like the others in `hosts` -- appended after
+    // so the per-agent loop above (which calls `get_components`/
+    // `rule_targets`, neither of which know about "telegram") never sees
+    // it, while the print loop below picks it up the same way any other
+    // host does.
+    let mut display_hosts = hosts.clone();
+    let channel_checks = telegram_channel_checks();
+    if !channel_checks.is_empty() {
+        display_hosts.push("telegram".to_string());
+        checks.extend(channel_checks);
+    }
+
     let healthy = checks.iter().all(|r| r.ok) && stale.is_empty();
 
     if json {
@@ -101,7 +210,7 @@ pub fn run(agent: Option<&str>, json: bool) {
         let passed = checks.iter().filter(|r| r.ok).count();
 
         println!("agentflare doctor\n");
-        for host in &hosts {
+        for host in &display_hosts {
             let host_checks: Vec<&CheckResult> =
                 checks.iter().filter(|r| &r.host == host).collect();
             let host_stale: Vec<&StaleRule> = stale.iter().filter(|s| &s.host == host).collect();
