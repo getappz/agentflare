@@ -763,10 +763,22 @@ fn execute_work_impl(
         // handoff, `ClaimOutcome::BlockedByAssignee`) differ: "blocked" has
         // no `owner`/`age_secs`, so formatting it as "held" printed the
         // nonsensical "held by ? (0s)" instead of the real reason.
+        // "blocked_by_plan" (`ClaimOutcome::BlockedByPlan`, item #573) is the
+        // same shape of problem: it carries `plan_status`/`reason` and no
+        // `owner`/`age_secs`, so the `_` arm below would print the exact
+        // "held by ? (0s, ttl 0s)" nonsense described above. Its `reason` is
+        // already a complete, actionable sentence — print it verbatim.
         let msg = match status {
             "blocked" => claim["reason"]
                 .as_str()
                 .unwrap_or("item is blocked by an unaccepted handoff")
+                .to_string(),
+            "blocked_by_plan" => claim["reason"]
+                .as_str()
+                .unwrap_or(
+                    "item requires plan approval — call item(action=\"submit_plan\", \
+                     plan_asset_id=...) first",
+                )
                 .to_string(),
             _ => {
                 let owner = claim["owner"].as_str().unwrap_or("?");

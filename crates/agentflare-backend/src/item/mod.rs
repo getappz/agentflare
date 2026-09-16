@@ -5,6 +5,7 @@ use crate::error::Result;
 
 mod claim;
 mod crud;
+pub mod plan_gate;
 mod relations;
 mod search;
 #[cfg(test)]
@@ -12,6 +13,7 @@ mod tests;
 
 pub use claim::*;
 pub use crud::*;
+pub use plan_gate::{PlanGateMeta, PlanGateStatus, default_policy as plan_default_policy};
 pub use relations::*;
 pub use search::*;
 
