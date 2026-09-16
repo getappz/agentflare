@@ -167,7 +167,7 @@ fn build_bwrap_args_with_home(
             }
         }
 
-        for relative in config.writable_home_dirs {
+        for relative in &config.writable_home_dirs {
             let dir = Path::new(home).join(relative);
             if dir.exists() {
                 let dir_str = path_to_string(&dir);
@@ -444,7 +444,7 @@ mod tests {
                 binary_name,
                 state_mounts: mounts,
             }])),
-            writable_home_dirs: &[],
+            writable_home_dirs: Vec::new(),
         }
     }
 
@@ -692,7 +692,7 @@ mod tests {
         let home = std::ffi::OsString::from(dir.path());
         let config = SandboxConfig {
             agent_profiles: &[],
-            writable_home_dirs: &[".agentflare"],
+            writable_home_dirs: vec![".agentflare".to_string()],
         };
         let args = build_bwrap_args_with_home(None, "true", &[], Some(&home), false, &config);
         let path = path_to_string(&dir.path().join(".agentflare"));
@@ -709,7 +709,7 @@ mod tests {
         let home = std::ffi::OsString::from(dir.path());
         let config = SandboxConfig {
             agent_profiles: &[],
-            writable_home_dirs: &[".agentflare"],
+            writable_home_dirs: vec![".agentflare".to_string()],
         };
         let args = build_bwrap_args_with_home(None, "true", &[], Some(&home), false, &config);
         let path = path_to_string(&dir.path().join(".agentflare"));
