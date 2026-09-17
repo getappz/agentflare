@@ -269,7 +269,7 @@ pub fn resolve_session(explicit: Option<&str>, cwd: &Path) -> String {
 /// or `~/.cargo/bin`, plus `%USERPROFILE%\.cargo\bin` on Windows) so a
 /// `cargo install` that didn't touch `PATH` still resolves. Skips mise's
 /// shims dir (see [`is_mise_shims_dir`]) so a dead shim there never shadows
-/// the absolute path `mise where` resolves in `browser_install`.
+/// the absolute path `mise which` resolves in `browser_install`.
 pub fn find_backend() -> Result<PathBuf, String> {
     let paths = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&paths) {
