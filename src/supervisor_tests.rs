@@ -1634,6 +1634,7 @@ fn self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment() {
         &item,
         1,
         &["clippy".to_string()],
+        &[],
         &label_id_by_name,
         "/repo",
     );
@@ -1699,6 +1700,7 @@ fn self_repair_or_gate_gates_instead_of_dispatching_once_the_cap_is_reached() {
             &item,
             1,
             &["clippy".to_string()],
+            &[],
             &label_id_by_name,
             "/repo",
         );
@@ -1738,6 +1740,7 @@ fn self_repair_or_gate_stays_quiet_once_already_gated() {
         &item,
         1,
         &["clippy".to_string()],
+        &[],
         &label_id_by_name,
         "/repo",
     );
@@ -1773,6 +1776,7 @@ fn self_repair_or_gate_still_skips_gracefully_when_unassigned_and_no_router_rule
             &item,
             1,
             &["clippy".to_string()],
+            &[],
             &label_id_by_name,
             "/repo",
         );
@@ -1805,6 +1809,7 @@ fn self_repair_or_gate_does_not_double_dispatch_while_a_job_is_already_in_flight
         &item,
         1,
         &["clippy".to_string()],
+        &[],
         &label_id_by_name,
         "/repo",
     );
@@ -1841,6 +1846,7 @@ fn self_repair_or_gate_defers_instead_of_dispatching_into_a_still_live_claim() {
         &item,
         1,
         &["clippy".to_string()],
+        &[],
         &label_id_by_name,
         "/repo",
     );
@@ -1860,6 +1866,304 @@ fn self_repair_or_gate_defers_instead_of_dispatching_into_a_still_live_claim() {
         "a deferred attempt must not post a self-repair-dispatched marker, \
          or it would count against the cap on a later real attempt"
     );
+}
+
+// Regression for item #273's follow-up: a PR heading into CI self-repair
+// isn't always leaving plain in-review -- it might be leaving CodeRabbit's
+// own review-repair stage instead, and removing a label that isn't there is
+// a silent no-op, so the wrong `from` label left both stacked on the PR.
+#[test]
+fn stale_stage_label_picks_the_coderabbit_review_repair_label_when_present() {
+    let labels = vec![CODERABBIT_REPAIR_PR_LABEL.to_string()];
+    assert_eq!(stale_stage_label(&labels), Some(CODERABBIT_REPAIR_PR_LABEL));
+}
+
+#[test]
+fn stale_stage_label_falls_back_to_the_in_review_label() {
+    let labels = vec![IN_REVIEW_PR_LABEL.to_string()];
+    assert_eq!(stale_stage_label(&labels), Some(IN_REVIEW_PR_LABEL));
+}
+
+#[test]
+fn stale_stage_label_is_none_when_neither_stage_label_is_present() {
+    assert_eq!(stale_stage_label(&[]), None);
+}
+
+// --- coderabbit_repair_or_gate (item #273) ---
+
+fn coderabbit_finding(id: u64, login: &str) -> crate::github::models::ReviewComment {
+    crate::github::models::ReviewComment {
+        id,
+        user: crate::github::models::User {
+            login: login.to_string(),
+        },
+        path: "src/lib.rs".to_string(),
+        line: Some(42),
+        body: "this could panic on an empty slice".to_string(),
+    }
+}
+
+#[test]
+fn unresolved_coderabbit_comments_keeps_only_unresolved_coderabbit_findings() {
+    let comments = vec![
+        coderabbit_finding(1, "coderabbitai[bot]"),
+        coderabbit_finding(2, "coderabbitai[bot]"),
+        coderabbit_finding(3, "a-human-reviewer"),
+    ];
+    let mut resolved = std::collections::HashSet::new();
+    resolved.insert(2u64); // this CodeRabbit comment's thread was resolved
+
+    let unresolved = unresolved_coderabbit_comments(&comments, &resolved);
+
+    assert_eq!(
+        unresolved.iter().map(|c| c.id).collect::<Vec<_>>(),
+        vec![1],
+        "must drop the resolved CodeRabbit comment and the human reviewer's \
+         comment, keeping only the still-unresolved CodeRabbit one"
+    );
+}
+
+#[test]
+fn unresolved_coderabbit_comments_matches_the_bot_login_case_insensitively() {
+    let comments = vec![coderabbit_finding(1, "CodeRabbitAI[bot]")];
+    let unresolved = unresolved_coderabbit_comments(&comments, &std::collections::HashSet::new());
+    assert_eq!(unresolved.len(), 1);
+}
+
+#[test]
+fn coderabbit_repair_or_gate_skips_without_touching_anything_when_there_are_no_findings() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    let label_id_by_name = seed_gate_label(&mcp);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    let auth_conn = test_auth_conn();
+
+    let outcome = coderabbit_repair_or_gate(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        1,
+        &[],
+        &[],
+        &label_id_by_name,
+        "/repo",
+    );
+
+    assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+    assert!(queue.list(None).unwrap().is_empty());
+    let comments = mcp
+        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item_id).unwrap())
+        .unwrap();
+    assert!(comments.is_empty(), "a clean review must stay silent");
+}
+
+#[test]
+fn coderabbit_repair_or_gate_dispatches_a_job_and_posts_a_summary_of_the_findings() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    // Claim backdated past the in_review TTL cap, same trick
+    // `self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment` uses,
+    // so the claim-liveness gate doesn't short-circuit before dispatch.
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    let label_id_by_name = seed_gate_label(&mcp);
+    let auth_conn = test_auth_conn();
+    let findings = vec![
+        coderabbit_finding(1, "coderabbitai[bot]"),
+        coderabbit_finding(2, "coderabbitai[bot]"),
+    ];
+
+    let outcome = coderabbit_repair_or_gate(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        1,
+        &findings,
+        &[],
+        &label_id_by_name,
+        "/repo",
+    );
+
+    assert!(matches!(outcome, SelfRepairOutcome::Dispatched));
+    let jobs = queue.list(None).unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].args.contains(&item_id));
+    assert_eq!(
+        jobs[0].dispatch_reason.as_deref(),
+        Some("CodeRabbit review: 2 unresolved finding(s)")
+    );
+    let comments = mcp
+        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item_id).unwrap())
+        .unwrap();
+    let dispatch_comment = comments
+        .iter()
+        .find(|c| c.body.starts_with(CODERABBIT_REPAIR_MARKER))
+        .expect("must post a marker comment summarizing what's being addressed");
+    assert!(dispatch_comment.body.contains("src/lib.rs:42"));
+    assert!(
+        dispatch_comment
+            .body
+            .contains("this could panic on an empty slice")
+    );
+}
+
+#[test]
+fn coderabbit_repair_or_gate_gates_instead_of_dispatching_once_the_cap_is_reached() {
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+        let label_id_by_name = seed_gate_label(&mcp);
+
+        for _ in 0..crate::quota::decide::SELF_REPAIR_CAP {
+            mcp.comment_impl(CommentRequest {
+                action: "create".into(),
+                item_id: Some(item_id.clone()),
+                body: Some(format!("{CODERABBIT_REPAIR_MARKER}\n\njob: prior")),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap();
+        let auth_conn = test_auth_conn();
+        let findings = vec![coderabbit_finding(1, "coderabbitai[bot]")];
+
+        let outcome = coderabbit_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            1,
+            &findings,
+            &[],
+            &label_id_by_name,
+            "/repo",
+        );
+
+        assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+        assert!(queue.list(None).unwrap().is_empty());
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
+    });
+}
+
+#[test]
+fn coderabbit_repair_or_gate_stays_quiet_once_already_gated() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    let label_id_by_name = seed_gate_label(&mcp);
+    mcp.item_add_label(ItemRequest {
+        action: "add_label".into(),
+        id: Some(item_id.clone()),
+        label_id: Some(label_id_by_name[NEEDS_HUMAN_GATE_LABEL].clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    let auth_conn = test_auth_conn();
+    let findings = vec![coderabbit_finding(1, "coderabbitai[bot]")];
+
+    let outcome = coderabbit_repair_or_gate(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        1,
+        &findings,
+        &[],
+        &label_id_by_name,
+        "/repo",
+    );
+
+    assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+    assert!(queue.list(None).unwrap().is_empty());
+}
+
+#[test]
+fn coderabbit_repair_or_gate_does_not_double_dispatch_while_a_job_is_already_in_flight() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    let label_id_by_name = seed_gate_label(&mcp);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    let auth_conn = test_auth_conn();
+    let job = agentflare_jobs::AgentJob::new("agentflare-work")
+        .args([item_id.clone(), "claude-code".to_string()])
+        .in_process();
+    queue.enqueue(&job).unwrap();
+    let findings = vec![coderabbit_finding(1, "coderabbitai[bot]")];
+
+    let outcome = coderabbit_repair_or_gate(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        1,
+        &findings,
+        &[],
+        &label_id_by_name,
+        "/repo",
+    );
+
+    assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+    assert_eq!(
+        queue.list(None).unwrap().len(),
+        1,
+        "must not enqueue a second job"
+    );
+}
+
+#[test]
+fn coderabbit_repair_or_gate_reverts_the_stage_label_once_findings_are_resolved() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    let label_id_by_name = seed_gate_label(&mcp);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    let auth_conn = test_auth_conn();
+
+    // No findings left, but the PR is still carrying the review-repair stage
+    // label from a prior dispatch -- must skip (no job to enqueue), and the
+    // revert-label call is exercised (best-effort against "/repo", which has
+    // no resolvable remote, so it's a silent no-op here rather than a panic).
+    let outcome = coderabbit_repair_or_gate(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        1,
+        &[],
+        &[CODERABBIT_REPAIR_PR_LABEL.to_string()],
+        &label_id_by_name,
+        "/repo",
+    );
+
+    assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+    assert!(queue.list(None).unwrap().is_empty());
 }
 
 #[test]

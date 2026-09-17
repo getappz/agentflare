@@ -97,6 +97,7 @@ fn self_repair_defers_rather_than_skips_when_the_host_gate_blocks() {
             &item,
             1,
             &["clippy".to_string()],
+            &[],
             &label_id_by_name,
             "/repo",
         );
@@ -136,6 +137,7 @@ fn self_repair_defers_rather_than_skips_when_the_agent_is_cooling_down() {
         &item,
         1,
         &["clippy".to_string()],
+        &[],
         &label_id_by_name,
         "/repo",
     );
