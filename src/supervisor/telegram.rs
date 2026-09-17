@@ -71,16 +71,13 @@ pub(crate) fn settle(next: i64) {
 /// in-flight update -- confirming any further would drop an update whose
 /// handling isn't done yet. Pure and vault-free so it's directly
 /// unit-testable; `persist_offset_if_advanced` is the only caller.
+/// Delegates to `flare-channels` so the crate and the supervisor share one
+/// implementation (the crate's copy carries the unit tests).
 pub(crate) fn safe_offset_to_persist(
     ceiling: i64,
     in_flight: &std::collections::BTreeSet<i64>,
 ) -> i64 {
-    in_flight
-        .iter()
-        .next()
-        .copied()
-        .unwrap_or(ceiling)
-        .min(ceiling)
+    flare_channels::safe_offset_to_persist(ceiling, in_flight)
 }
 
 /// Persist `safe_offset_to_persist`'s result if it's an improvement on
@@ -143,6 +140,10 @@ pub(crate) fn poll_telegram_approvals(mcp: std::sync::Arc<crate::mcp_server::Age
     let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
         return;
     };
+    // One-time startup (token validation, webhook clearing, command menu).
+    // Non-fatal and self-healing: runs once per process on success, retries
+    // on later ticks otherwise. The poll below runs regardless.
+    crate::channels::ensure_telegram_ready();
     let offset: i64 = crate::vault::get_secret(TELEGRAM_UPDATE_OFFSET_SECRET)
         .ok()
         .flatten()
@@ -170,7 +171,7 @@ pub(crate) fn poll_telegram_approvals(mcp: std::sync::Arc<crate::mcp_server::Age
         let Some(next) = update
             .get("update_id")
             .and_then(serde_json::Value::as_i64)
-            .map(|id| id + 1)
+            .map(flare_channels::next_offset)
         else {
             continue;
         };
@@ -233,7 +234,14 @@ pub(crate) fn handle_chat_message(
         settle(update_offset);
         return;
     };
-    if chat_id != expected_chat_id {
+    // Single-member allowlist: only the configured notify chat may drive
+    // the agent (DmPolicy::AllowedOnly with one member). Spelled through
+    // the shared policy helper so a future multi-user allowlist changes
+    // data (the member set), not this branch.
+    if !flare_channels::dm_allows(
+        flare_channels::DmPolicy::AllowedOnly,
+        chat_id == expected_chat_id,
+    ) {
         settle(update_offset);
         return;
     }
@@ -246,12 +254,38 @@ pub(crate) fn handle_chat_message(
         settle(update_offset);
         return;
     }
+    // Realtime mirror of this authorized inbound message for the dashboard
+    // stream and future gateway consumers. `update_offset` is this update's
+    // `next` value, so the event id is `update_id`, matching the poller.
+    // `sender` prefers the Telegram user id and falls back to the chat id
+    // (equal for the authorized-DM flow this daemon serves today).
+    let update_id = update_offset - 1;
+    let sender = message
+        .get("from")
+        .and_then(|f| f.get("id"))
+        .map(std::string::ToString::to_string)
+        .unwrap_or_else(|| chat_id.clone());
+    crate::channels::chat_bus().publish(flare_channels::ChannelEvent::Inbound(
+        flare_channels::ChannelMessage::text(
+            update_id.to_string(),
+            sender,
+            chat_id.clone(),
+            text.to_string(),
+            flare_channels::TELEGRAM_CHANNEL_NAME,
+        ),
+    ));
     crate::chat_channel::dispatch_message(
         crate::chat_channel::telegram_channel(),
         chat_id,
         text.to_string(),
         mcp,
-        move || settle(update_offset),
+        move || {
+            settle(update_offset);
+            crate::channels::chat_bus().publish(flare_channels::ChannelEvent::Settled {
+                channel: flare_channels::TELEGRAM_CHANNEL_NAME.to_string(),
+                id: update_id.to_string(),
+            });
+        },
     );
 }
 
