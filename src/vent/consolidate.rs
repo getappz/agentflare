@@ -216,14 +216,18 @@ struct EscalationSweep {
 /// SLA tick regardless (item #484: 71 comments over three weeks after it was
 /// folded into #483) treats "not yet closed" as "never triaged", which isn't
 /// the same thing.
-fn has_triage_relation(conn: &rusqlite::Connection, item_id: &str) -> bool {
+fn has_triage_relation(
+    conn: &rusqlite::Connection,
+    item_id: &str,
+) -> agentflare_backend::Result<bool> {
     for relation_type in ["duplicate", "relates_to"] {
-        match agentflare_backend::item::list_relations_by_type(conn, item_id, relation_type) {
-            Ok(related) if !related.is_empty() => return true,
-            _ => {}
+        if !agentflare_backend::item::list_relations_by_type(conn, item_id, relation_type)?
+            .is_empty()
+        {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// Runs on every consolidate pass (even with zero new vent lines, since
@@ -250,13 +254,25 @@ fn sweep_escalations(conn: &rusqlite::Connection, project_id: &str, now: i64) ->
         let Ok(state) = agentflare_backend::state::get(conn, &item.state_id) else {
             continue;
         };
+        if row.escalation_state == "open"
+            && !matches!(state.group_name.as_str(), "completed" | "cancelled")
+        {
+            match has_triage_relation(conn, &row.item_id) {
+                Ok(true) => {
+                    sweep.held += 1;
+                    continue;
+                }
+                Ok(false) => {}
+                // Fail closed: a lookup error must not be read as "no relation" --
+                // that would let this row re-escalate or have its priority
+                // clobbered while its triage status is actually unknown.
+                Err(_) => continue,
+            }
+        }
         match state.group_name.as_str() {
             "completed" | "cancelled" => {
                 let _ = agentflare_backend::vent::resolve_escalation(conn, &row.id, now);
                 sweep.resolved += 1;
-            }
-            _ if row.escalation_state == "open" && has_triage_relation(conn, &row.item_id) => {
-                sweep.held += 1;
             }
             "started" | "in_review" if row.escalation_state == "open" => {
                 let _ = agentflare_backend::vent::acknowledge_escalation(conn, &row.id, now);
