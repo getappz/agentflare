@@ -171,10 +171,18 @@ pub(crate) struct WorkItemData {
     pub checkpoint_base_sha: Option<String>,
     /// Cursor into this item's comment history: every comment strictly newer
     /// than this timestamp is a candidate correction the pipeline hasn't
-    /// seen yet (item #269/#270). Seeded to the run's start time in
-    /// `fresh_data()`, advanced by the heartbeat-tick comment poll in
-    /// `run_or_resume_with_sender`'s outer loop as it drains new comments
-    /// into `pending_corrections` below.
+    /// seen yet (item #269/#270). Seeded in `fresh_data()` from the item's
+    /// own persisted `last_seen_comment_at` metadata (falling back to the
+    /// run's start time only when the item has never carried one), advanced
+    /// by the heartbeat-tick comment poll in `run_or_resume_with_sender`'s
+    /// outer loop as it drains new comments into `pending_corrections`
+    /// below. `poll_pending_corrections` mirrors every advance back onto
+    /// the item's metadata (see `persist_comment_cursor`) precisely so a
+    /// later fresh dispatch's `fresh_data()` can read it back here instead
+    /// of reseeding to "now" and re-missing a correction posted before a
+    /// failed/orphaned attempt's redispatch -- this field is a per-run
+    /// working copy of that item-level cursor, not its source of truth
+    /// (item #272).
     ///
     /// `#[serde(default)]` for the same reason as `review_only`: runs
     /// started before this field existed must still deserialize.
@@ -1098,6 +1106,49 @@ async fn poll_pending_corrections(
             }
         })
         .await;
+    // `corrections` was non-empty, so at least one comment's `created_at`
+    // exceeds `cursor` -- `latest_seen` (the max over ALL comments) is
+    // therefore also `> cursor` here, guaranteed non-`None`.
+    if let Some(latest) = latest_seen {
+        persist_comment_cursor(mcp, item_id, latest);
+    }
+}
+
+/// Mirrors an advanced comment cursor onto the item's own metadata (the
+/// same merge-then-`item_update` pattern as `persist_run_id`) so it
+/// outlives this run -- read back by a later fresh dispatch's
+/// `fresh_data()` instead of reseeding to "now" and re-missing a
+/// correction posted before a failed/orphaned attempt's redispatch (item
+/// #272). Re-fetches the item's current metadata rather than reusing any
+/// snapshot captured at dispatch time, since this can run long after that
+/// snapshot went stale. Best-effort like the rest of
+/// `poll_pending_corrections`: a failure here just means the next fresh
+/// dispatch reseeds from "now" again, same as before this fix.
+fn persist_comment_cursor(mcp: &AgentflareMcp, item_id: &str, cursor: i64) {
+    let Ok(raw) = mcp.item_get(ItemRequest {
+        action: "get".into(),
+        id: Some(item_id.to_string()),
+        ..Default::default()
+    }) else {
+        return;
+    };
+    let Ok(item) = serde_json::from_str::<agentflare_backend::item::Item>(&raw) else {
+        return;
+    };
+    let existing_metadata: serde_json::Value = serde_json::from_str(&item.metadata)
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    let mut merged = existing_metadata
+        .as_object()
+        .cloned()
+        .map(serde_json::Value::Object)
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    merged["last_seen_comment_at"] = serde_json::Value::from(cursor);
+    let _ = mcp.item_update(ItemRequest {
+        action: "update".into(),
+        id: Some(item_id.to_string()),
+        metadata: Some(merged),
+        ..Default::default()
+    });
 }
 
 /// Resumable entrypoint `execute_work` (Task 7) calls: (re-)registers the
@@ -1224,11 +1275,19 @@ pub(crate) fn run_or_resume_with_sender(
             tdd,
             worktree_path: worktree_path.clone(),
             // A resumed run (the other arm below) keeps its own persisted
-            // cursor instead of going through `fresh_data()` — only a
-            // genuinely fresh dispatch seeds it here, to the run's own start
-            // time, so the very first heartbeat poll only surfaces comments
-            // posted after dispatch, not this item's entire history.
-            last_seen_comment_at: crate::claims::now(),
+            // cursor instead of going through `fresh_data()`. A genuinely
+            // fresh dispatch reads the item-level cursor `persist_comment_
+            // cursor` mirrors onto `existing_metadata` (item #272) so a
+            // correction posted before a prior failed/orphaned attempt's
+            // redispatch is still caught here instead of falling behind
+            // "now" — only an item that has never had a cursor persisted
+            // (its very first dispatch) falls back to the run's own start
+            // time, so that first heartbeat poll doesn't surface the item's
+            // entire pre-existing comment history as "corrections".
+            last_seen_comment_at: existing_metadata
+                .get("last_seen_comment_at")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_else(crate::claims::now),
             ..Default::default()
         };
         // Whether `existing_run_id` is still a legitimate handle to resume:

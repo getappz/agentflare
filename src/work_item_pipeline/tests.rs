@@ -794,6 +794,90 @@ fn run_or_resume_with_sender_persists_run_id_on_success() {
     assert!(metadata["workflow_run_id"].as_str().is_some());
 }
 
+/// Item #272: a genuinely fresh dispatch (no resumable run) must seed its
+/// cursor from the item's own persisted `last_seen_comment_at` metadata,
+/// not reseed to "now" -- otherwise a correction posted before a
+/// failed/orphaned attempt's redispatch is missed on the new run exactly
+/// like the #266 scenario `poll_pending_corrections`'s own doc comment
+/// describes. Simulates a prior run having already advanced and persisted
+/// the cursor (`persist_comment_cursor`) before crashing, then asserts a
+/// brand new dispatch's `WorkItemData` starts from that old value instead
+/// of the run's own start time.
+#[test]
+fn run_or_resume_with_sender_seeds_fresh_dispatch_cursor_from_persisted_item_metadata() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Fresh-dispatch cursor test item");
+    std::fs::write(worktree_path.join("real_work.txt"), "real work").unwrap();
+    let mcp = Arc::new(mcp);
+
+    let persisted_cursor = crate::claims::now() - 100_000;
+    mcp.item_update(ItemRequest {
+        action: "update".into(),
+        id: Some(item_id.clone()),
+        metadata: Some(serde_json::json!({"last_seen_comment_at": persisted_cursor})),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
+        .unwrap()
+        .unwrap();
+
+    let send: flare_workflow::json::SendMessage = Arc::new(
+        move |inv: flare_workflow::json::StepInvocation| {
+            let prompt = inv.prompt;
+            Box::pin(async move {
+                if prompt.contains("You are the judge") {
+                    Ok((
+                        r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"Task 0: complete","task_model_tier":null}"#
+                            .to_string(),
+                        1u64,
+                        0u64,
+                    ))
+                } else {
+                    Ok(("DONE: did the work".to_string(), 1u64, 0u64))
+                }
+            })
+        },
+    );
+
+    let seeded_cursor = crate::paths::test_support::with_temp_home(|| {
+        let _ = run_or_resume_with_sender(
+            mcp.clone(),
+            &item,
+            &worktree_path,
+            agent_registry::Agent::ClaudeCode,
+            agent_registry::Agent::ClaudeCode,
+            "implement it".to_string(),
+            None,
+            None,
+            send,
+        );
+        let updated = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
+            .unwrap()
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
+        let run_id: flare_workflow::WorkflowRunId = metadata["workflow_run_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::workflow::blocking_runtime()
+            .block_on(engine().get_status(run_id))
+            .unwrap()
+            .context
+            .data
+            .last_seen_comment_at
+    });
+
+    assert_eq!(
+        seeded_cursor, persisted_cursor,
+        "fresh dispatch must seed the cursor from the item's persisted metadata, not reseed to \"now\""
+    );
+}
+
 // Item #191: a run resumed by `engine().recover()` after a daemon restart
 // executes `sdd_loop`'s steps on the engine's own scheduler, never
 // re-entering `execute_work`'s `run_in_worktree` chdir -- so the agent
