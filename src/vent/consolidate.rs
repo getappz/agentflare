@@ -14,6 +14,7 @@ pub struct ConsolidateReport {
     pub escalated: usize,
     pub acknowledged: usize,
     pub resolved: usize,
+    pub held: usize,
 }
 
 pub fn read_new_lines(log_path: &Path, cursor_path: &Path) -> (Vec<VentLine>, u64) {
@@ -79,6 +80,7 @@ pub fn consolidate_core(
     report.escalated = sweep.escalated;
     report.acknowledged = sweep.acknowledged;
     report.resolved = sweep.resolved;
+    report.held = sweep.held;
     Ok(report)
 }
 
@@ -205,12 +207,36 @@ struct EscalationSweep {
     escalated: usize,
     acknowledged: usize,
     resolved: usize,
+    held: usize,
+}
+
+/// An item carrying a `duplicate` or `relates_to` relation has already been
+/// looked at by a human or agent and deliberately tied to another item's
+/// fate -- that relation *is* the triage record. Re-escalating it on every
+/// SLA tick regardless (item #484: 71 comments over three weeks after it was
+/// folded into #483) treats "not yet closed" as "never triaged", which isn't
+/// the same thing.
+fn has_triage_relation(
+    conn: &rusqlite::Connection,
+    item_id: &str,
+) -> agentflare_backend::Result<bool> {
+    for relation_type in ["duplicate", "relates_to"] {
+        if !agentflare_backend::item::list_relations_by_type(conn, item_id, relation_type)?
+            .is_empty()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Runs on every consolidate pass (even with zero new vent lines, since
 /// staleness alone must be able to trigger it) over every vent still in an
 /// active escalation tier. Per row: an item that reached completed/
-/// cancelled resolves the escalation; one claimed into started/in_review
+/// cancelled resolves the escalation; one carrying a duplicate/relates_to
+/// relation is held regardless of state (checked before started/in_review,
+/// since a related item claimed into progress is still triaged, not newly
+/// claimed); one claimed into started/in_review with no triage relation
 /// acknowledges it (pausing further staleness checks); otherwise, once it's
 /// sat unclaimed past its severity's SLA, it re-escalates -- bumping the
 /// tier, re-forcing the item's priority, and leaving a comment so the
@@ -228,6 +254,21 @@ fn sweep_escalations(conn: &rusqlite::Connection, project_id: &str, now: i64) ->
         let Ok(state) = agentflare_backend::state::get(conn, &item.state_id) else {
             continue;
         };
+        if row.escalation_state == "open"
+            && !matches!(state.group_name.as_str(), "completed" | "cancelled")
+        {
+            match has_triage_relation(conn, &row.item_id) {
+                Ok(true) => {
+                    sweep.held += 1;
+                    continue;
+                }
+                Ok(false) => {}
+                // Fail closed: a lookup error must not be read as "no relation" --
+                // that would let this row re-escalate or have its priority
+                // clobbered while its triage status is actually unknown.
+                Err(_) => continue,
+            }
+        }
         match state.group_name.as_str() {
             "completed" | "cancelled" => {
                 let _ = agentflare_backend::vent::resolve_escalation(conn, &row.id, now);
@@ -618,6 +659,87 @@ mod tests {
 
         let (state, _, _, _) = escalation_row(&conn);
         assert_eq!(state, "acknowledged");
+    }
+
+    #[test]
+    fn duplicate_relation_holds_escalation_without_clobbering_priority() {
+        let conn = open_in_memory().unwrap();
+        let (p, s) = seed(&conn);
+        let dir = tempfile::tempdir().unwrap();
+        let (log, cur) = (dir.path().join("v.jsonl"), dir.path().join("v.cursor"));
+        write_lines(&log, &[("high", "worktree got wiped again")]);
+        let rep = consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+        let item_id = rep.items_created[0].clone();
+
+        conn.execute(
+            "INSERT INTO items (id,project_id,state_id,name,created_at,updated_at) VALUES ('other','p','s','x',1,1)",
+            [],
+        )
+        .unwrap();
+        agentflare_backend::item::add_relation(&conn, &item_id, "other", "duplicate").unwrap();
+
+        // A manual priority downgrade during triage must survive the sweep
+        // instead of being force-reset back to the severity-derived value.
+        agentflare_backend::item::update(
+            &conn,
+            &item_id,
+            agentflare_backend::item::UpdateItem {
+                priority: Some("low".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Backdate past the high-severity SLA so a non-held row would re-escalate.
+        conn.execute("UPDATE vents SET escalated_at = escalated_at - 1000000", [])
+            .unwrap();
+        let rep2 = consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+        assert_eq!(rep2.held, 1);
+        assert_eq!(
+            rep2.escalated, 0,
+            "the duplicate relation pauses re-escalation"
+        );
+
+        let (state, level, _, priority) = escalation_row(&conn);
+        assert_eq!(state, "open", "held, not resolved -- the item stays open");
+        assert_eq!(level, 0, "no tier bump while held");
+        assert_eq!(
+            priority, "low",
+            "held sweep must not clobber a manual priority change"
+        );
+    }
+
+    #[test]
+    fn duplicate_relation_holds_even_when_item_is_started() {
+        let conn = open_in_memory().unwrap();
+        let (p, s) = seed(&conn);
+        insert_state(&conn, "started", "started", 2.0);
+        let dir = tempfile::tempdir().unwrap();
+        let (log, cur) = (dir.path().join("v.jsonl"), dir.path().join("v.cursor"));
+        write_lines(&log, &[("high", "flaky CI runner, again")]);
+        let rep = consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+        let item_id = rep.items_created[0].clone();
+
+        conn.execute(
+            "INSERT INTO items (id,project_id,state_id,name,created_at,updated_at) VALUES ('other','p','s','x',1,1)",
+            [],
+        )
+        .unwrap();
+        agentflare_backend::item::add_relation(&conn, &item_id, "other", "duplicate").unwrap();
+        agentflare_backend::item::update_state(&conn, &item_id, "started").unwrap();
+
+        let rep2 = consolidate_core(&conn, &p, &s, &log, &cur).unwrap();
+        assert_eq!(
+            rep2.held, 1,
+            "a triage relation must hold the escalation even once the item is claimed"
+        );
+        assert_eq!(rep2.acknowledged, 0);
+
+        let (state, _, _, _) = escalation_row(&conn);
+        assert_eq!(
+            state, "open",
+            "held, not acknowledged -- a related item must stay open, not be treated as claimed"
+        );
     }
 
     #[test]
