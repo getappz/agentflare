@@ -1,5 +1,5 @@
 [workspace]
-members = ["agentflare-workspace-hack","crates/flare-insights","crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-process", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault", "crates/agentflare-resource-gate", "crates/flare-workflow", "crates/flare-sandbox", "crates/agentflare-apps", "crates/flare-browser", "crates/agentflare-config"]
+members = ["agentflare-workspace-hack","crates/flare-insights","crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-process", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault", "crates/agentflare-resource-gate", "crates/flare-workflow", "crates/flare-sandbox", "crates/agentflare-apps", "crates/flare-browser", "crates/agentflare-config", "crates/flare-channels"]
 resolver = "2"
 
 [package]
@@ -84,6 +84,7 @@ fs2 = "0.4"
 rust-embed = "8"
 tokio-stream = { version = "0.1", features = ["sync"] }
 agentflare-store = { path = "crates/agentflare-store" }
+flare-channels = { path = "crates/flare-channels" }
 flare-docs = { path = "crates/flare-docs" }
 flare-browser = { path = "crates/flare-browser" }
 flare-git-core = { path = "crates/flare-git-core" }
