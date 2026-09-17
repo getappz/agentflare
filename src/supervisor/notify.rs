@@ -11,9 +11,37 @@
 //! Everything here is fail-open by contract: each function no-ops when
 //! `TELEGRAM_NOTIFY_CHAT_ID_SECRET` isn't configured (notifications are
 //! opt-in), and a configured-but-failing send only logs. A notification
-//! failure must never block the gate it is reporting.
+//! failure must never block the gate it is reporting. That fail-open
+//! contract extends to "running under `cargo test`" too -- see
+//! `test_notify_disabled` below -- since a fake, in-memory-only test item
+//! has no business reaching a developer's real vault or Telegram chat
+//! (item #274).
 
 use super::*;
+
+/// Test-only circuit breaker for both fail-open entry points below
+/// (`notify_human_gate`, `request_channel_approval`). `cargo test --bin
+/// agentflare` compiles this whole crate with `cfg(test)` active -- not
+/// just code inside `#[cfg(test)] mod` blocks -- so without this, ANY test
+/// that reaches a human-gate or plan/PR-approval code path reads whatever
+/// vault + chat id happen to be configured on the machine running the
+/// suite and can fire a real Telegram message referencing a fake item id
+/// that exists only in that test's `:memory:` backend. Tests isolate
+/// `$HOME` via `paths::test_support::with_temp_home` when they need to
+/// exercise the vault lookup itself (e.g. asserting on the "no token
+/// configured" error path); everything else just wants this to no-op,
+/// which it now does regardless of whether a given test remembered to
+/// isolate `$HOME`. Compiled out of release builds entirely, so production
+/// behavior is unaffected.
+#[cfg(test)]
+fn test_notify_disabled() -> bool {
+    std::env::var("AGENTFLARE_TEST_ALLOW_NOTIFY").as_deref() != Ok("1")
+}
+
+#[cfg(not(test))]
+fn test_notify_disabled() -> bool {
+    false
+}
 
 /// Best-effort Telegram ping for an item that just landed on a human gate
 /// (a go/no-go decision, an unanswerable question, or a CI self-repair cap).
@@ -22,6 +50,9 @@ use super::*;
 /// spam stderr every tick; a configured-but-failing send only logs -- a
 /// notification failure must never block the gate itself.
 pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &str) {
+    if test_notify_disabled() {
+        return;
+    }
     let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
         return;
     };
@@ -55,6 +86,9 @@ fn html_escape(s: &str) -> String {
 /// failure only logs -- a notification failure must never block the gate
 /// itself.
 fn request_channel_approval(card_text: &str, approve_label: &str, callback_data: &str) {
+    if test_notify_disabled() {
+        return;
+    }
     let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
         return;
     };
