@@ -1,4 +1,5 @@
 mod artifacts;
+mod chat;
 mod data;
 mod orphan_reconcile;
 mod server;

@@ -209,8 +209,9 @@ fn run_chat_turn(channel: &dyn ChatChannel, chat_id: String, prompt: String) {
         | crate::agent_launch::HeadlessOutcome::NotFound(msg)
         | crate::agent_launch::HeadlessOutcome::Failed(msg) => format!("agent turn failed: {msg}"),
     };
-    if let Err(e) = channel.send_reply(&chat_id, &reply) {
-        eprintln!("agentflare-supervisor: chat reply to {chat_id} failed: {e}");
+    match channel.send_reply(&chat_id, &reply) {
+        Ok(()) => publish_outbound(&chat_id, &reply),
+        Err(e) => eprintln!("agentflare-supervisor: chat reply to {chat_id} failed: {e}"),
     }
 }
 
@@ -225,6 +226,25 @@ fn parse_command(text: &str) -> Option<(&str, &str)> {
     // where multiple bots share `/status`) -- strip it before matching.
     let command = command.split('@').next().unwrap_or(command);
     Some((command, args.trim()))
+}
+
+/// Publish a realtime event. Best-effort by design: the bus drops when
+/// nobody listens, so chat turns never block on observers.
+fn publish(event: flare_channels::ChannelEvent) {
+    crate::channels::chat_bus().publish(event);
+}
+
+fn publish_typing(chat_id: &str) {
+    publish(flare_channels::ChannelEvent::Typing {
+        channel: flare_channels::TELEGRAM_CHANNEL_NAME.to_string(),
+        target: chat_id.to_string(),
+    });
+}
+
+fn publish_outbound(chat_id: &str, text: &str) {
+    publish(flare_channels::ChannelEvent::Outbound(
+        flare_channels::SendMessage::new(chat_id, text),
+    ));
 }
 
 /// Hard cap on concurrent free-text chat turns across all chats. Each one
@@ -286,13 +306,17 @@ pub(crate) fn dispatch_message(
     match parse_command(&text) {
         Some((command, args)) => {
             let reply = mcp.handle_chat_command(command, args);
-            if let Err(e) = channel.send_reply(&chat_id, &reply) {
-                eprintln!("agentflare-supervisor: chat command reply to {chat_id} failed: {e}");
+            match channel.send_reply(&chat_id, &reply) {
+                Ok(()) => publish_outbound(&chat_id, &reply),
+                Err(e) => {
+                    eprintln!("agentflare-supervisor: chat command reply to {chat_id} failed: {e}");
+                }
             }
             on_settled();
         }
         None => match try_reserve_chat_turn_slot() {
             Some(slot) => {
+                publish_typing(&chat_id);
                 std::thread::spawn(move || {
                     let _slot = slot;
                     run_chat_turn(channel, chat_id, text);
