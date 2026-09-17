@@ -145,6 +145,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentflare-approval"
+version = "0.1.0"
+dependencies = [
+ "agentflare-db-kit",
+ "agentflare-store",
+ "agentflare-workspace-hack",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agentflare-apps"
 version = "0.1.0"
 dependencies = [
