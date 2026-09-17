@@ -77,6 +77,31 @@ tool has MCP support, prefer it there. Recall-only via the CLI otherwise.
 
 Use Exa for internet search when available — free-tier, no API key required.
 
+## Browser automation
+
+agentflare ships an agent-first browser automation CLI (thin frontend over a
+Playwright-based sidecar, auto-installed on first use):
+
+```bash
+agentflare browser open <url>              # launch + navigate
+agentflare browser snapshot                # accessibility tree with @e refs — primary page read
+agentflare browser click <ref-or-selector>
+agentflare browser fill <ref-or-selector> <text>
+agentflare browser get text|html|value|title|url [target]
+agentflare browser read [url]              # agent-readable markdown of the page
+agentflare browser screenshot [path]
+agentflare browser eval <js>
+agentflare browser batch "<cmd1>" "<cmd2>" # multiple ops in one round-trip
+agentflare browser close
+agentflare browser doctor                  # diagnose the install
+```
+
+Sessions are isolated per working directory by default (`af-<hash>`), or set
+explicitly with `--session <id>` / `$AGENTFLARE_BROWSER_SESSION`, so
+concurrent worktrees don't collide. Run `agentflare browser --help` for the
+full subcommand list (also: type/press/hover/select/check/uncheck/back/
+forward/reload/tabs/cookies/storage/network/dialog/state/wait/pdf/extract).
+
 ## Cargo target-dir isolation (item #133/#139)
 
 Each claimed worktree gets its own `.cargo/config.toml` (relative
