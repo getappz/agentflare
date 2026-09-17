@@ -264,6 +264,31 @@ pub fn migrations() -> Migrations<'static> {
         M::up(EXTERNAL_CONTENT_FTS_MIGRATION),
         M::up(CHUNK_TABLES_MIGRATION),
         M::up(META_TABLES_MIGRATION),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS store_pending_approvals (
+            request_id        TEXT PRIMARY KEY NOT NULL,
+            command_class     TEXT NOT NULL,
+            command_key       TEXT NOT NULL,
+            action_summary    TEXT NOT NULL,
+            command_redacted  TEXT NOT NULL,
+            origin            TEXT NOT NULL,
+            created_at        INTEGER NOT NULL,
+            expires_at        INTEGER,
+            decided_at        INTEGER,
+            decision          TEXT,
+            decided_via       TEXT,
+            executed_at       INTEGER,
+            execution_outcome TEXT,
+            execution_error   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_store_pending_approvals_pending
+            ON store_pending_approvals(decided_at);
+
+        CREATE TABLE IF NOT EXISTS store_approval_allowlist (
+            command_key TEXT PRIMARY KEY NOT NULL,
+            created_at  INTEGER NOT NULL
+        );",
+        ),
     ])
 }
 
