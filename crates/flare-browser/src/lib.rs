@@ -400,15 +400,25 @@ pub fn build_argv(
 /// failure a one-line summary plus a bounded stderr excerpt (snapshots can
 /// be large — never dump them raw into an error path). `secrets` is
 /// redacted from the stderr excerpt before truncation, matching the
-/// success-path caller's own redact-before-compact order.
-pub fn run_blocking(program: &Path, args: &[String], secrets: &[String]) -> Result<String, String> {
+/// success-path caller's own redact-before-compact order. `path_env`, when
+/// set, is the `PATH` `browser_install::ensure_agent_browser` resolved via
+/// `mise env --json` for a mise-installed backend — merged into the child's
+/// env so it sees the same `PATH` mise would activate for it.
+pub fn run_blocking(
+    program: &Path,
+    args: &[String],
+    secrets: &[String],
+    path_env: Option<&str>,
+) -> Result<String, String> {
     // flare_process::command (not std::process::Command::new) so a daemon or
     // IDE-launched MCP server with no inherited console never flashes one
     // over the user's desktop when it spawns the sidecar (Windows).
-    let mut child = flare_process::command(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut cmd = flare_process::command(program);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(path) = path_env {
+        cmd.env("PATH", path);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn {}: {e}", program.display()))?;
     let mut stdout_pipe = child.stdout.take().expect("stdout piped above");

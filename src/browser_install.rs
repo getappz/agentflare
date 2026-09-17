@@ -4,40 +4,49 @@
 // prebuilt binaries straight from the git repo's GitHub releases
 // (linux/macOS/Windows, no toolchain, no compile, no npm). Deliberately
 // `mise install`, never `mise use -g`: install records nothing in the user's
-// mise config (no global side effects) — the binary is resolved via
-// `mise which` and invoked by absolute path, so shims never need activation.
-// mise itself is bootstrapped through `mise_install` (curl|sh on unix,
-// winget/scoop on windows) when absent.
+// mise config (no global side effects) — the binary is resolved via `mise
+// env --json` and invoked by absolute path, so shims never need activation.
+// The git backend's install layout is flat (the binary sits directly in the
+// install dir, no `bin/` subdir), so `mise env --json`'s merged `PATH` is
+// scanned rather than guessed at; that same `PATH` is carried along and
+// merged into the spawned agent-browser command's env, in case a future
+// backend needs sibling tools on `PATH` at runtime. mise itself is
+// bootstrapped through `mise_install` (curl|sh on unix, winget/scoop on
+// windows) when absent.
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 /// Git backend spec (floating version), used both to install and to
-/// resolve the installed binary's absolute path via `mise which`.
+/// resolve the installed binary + its env via `mise env --json`.
 const MISE_SPEC: &str = "github:vercel-labs/agent-browser@latest";
 /// Bound for stderr tails quoted in install errors (full logs stay on the
 /// caller side; MCP responses must stay compact).
 const ERR_TAIL_CHARS: usize = 2000;
 
 /// Ensure the sidecar exists, auto-installing on first use when enabled.
-/// Resolution order: `PATH`/cargo-bin hit (free) → cached `mise which`
+/// Resolution order: `PATH`/cargo-bin hit (free) → cached `mise env --json`
 /// result from a prior install in this process/session (free) → `mise
 /// install` from the git backend (one-time download) → `agent-browser
 /// install` (Chrome for Testing fetch). Concurrent first-use callers
 /// serialize on a temp-dir lock; losers re-check and reuse the winner's
 /// install. Returns the binary path — always absolute, so it works from
-/// bare subprocess spawns in CLI and MCP alike.
+/// bare subprocess spawns in CLI and MCP alike — plus the `PATH` mise
+/// resolved for the spec, when resolution went through mise (`None` when
+/// the binary was already reachable via the caller's own `PATH`/cargo-bin,
+/// which needs no extra env to run). Callers should merge that `PATH` into
+/// the env of any command they spawn against the returned binary.
 ///
 /// The mise git backend deliberately never touches `PATH`/shims (see the
 /// module doc), so `flare_browser::find_backend()` alone can never see a
-/// mise-resolved install on a later call — without the path cache below,
+/// mise-resolved install on a later call — without the cache below,
 /// *every* invocation (not just the first) would redo `mise install` +
-/// `mise which` + the Chrome-for-Testing fetch.
-pub fn ensure_agent_browser(auto_install: bool) -> Result<PathBuf, String> {
+/// `mise env --json` + the Chrome-for-Testing fetch.
+pub fn ensure_agent_browser(auto_install: bool) -> Result<(PathBuf, Option<String>), String> {
     if let Ok(p) = flare_browser::find_backend() {
-        return Ok(p);
+        return Ok((p, None));
     }
-    if let Some(p) = cached_bin_path() {
-        return Ok(p);
+    if let Some((bin, path_env)) = cached_backend() {
+        return Ok((bin, Some(path_env)));
     }
     if !auto_install {
         return Err(flare_browser::missing_hint());
@@ -52,10 +61,10 @@ pub fn ensure_agent_browser(auto_install: bool) -> Result<PathBuf, String> {
     let _lock = install_lock()?;
     // A racing caller may have finished while we waited on the lock.
     if let Ok(p) = flare_browser::find_backend() {
-        return Ok(p);
+        return Ok((p, None));
     }
-    if let Some(p) = cached_bin_path() {
-        return Ok(p);
+    if let Some((bin, path_env)) = cached_backend() {
+        return Ok((bin, Some(path_env)));
     }
     // flare_process::command: no bare Command::new for captured spawns —
     // suppresses the console-window flash on Windows when this runs
@@ -72,9 +81,10 @@ pub fn ensure_agent_browser(auto_install: bool) -> Result<PathBuf, String> {
             tail(&String::from_utf8_lossy(&install_out.stderr)),
         ));
     }
-    let bin = resolve_via_mise_which(&mise)?;
+    let (bin, path_env) = resolve_via_mise_env(&mise)?;
     let chrome_out = flare_process::command(&bin)
         .arg("install")
+        .env("PATH", &path_env)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("failed to spawn `{} install`: {e}", bin.display()))?;
@@ -87,69 +97,101 @@ pub fn ensure_agent_browser(auto_install: bool) -> Result<PathBuf, String> {
             bin.display(),
         ));
     }
-    write_bin_path_cache(&bin);
-    Ok(bin)
+    write_backend_cache(&bin, &path_env);
+    Ok((bin, Some(path_env)))
 }
 
-/// Where the resolved absolute binary path is cached across invocations
-/// (separate processes never share the `find_backend()` PATH-scan result,
-/// and the mise git backend puts nothing on `PATH`).
-fn bin_path_cache_file() -> PathBuf {
+/// Where the resolved binary path + its mise `PATH` are cached across
+/// invocations (separate processes never share the `find_backend()`
+/// PATH-scan result, and the mise git backend puts nothing on `PATH`).
+fn cached_backend_file() -> PathBuf {
     std::env::temp_dir().join("agentflare-browser-bin-path")
 }
 
-/// Read the cached path from a prior install, if it still points at a real
-/// file (self-heals if the install was moved/removed since).
-fn cached_bin_path() -> Option<PathBuf> {
-    let text = std::fs::read_to_string(bin_path_cache_file()).ok()?;
-    let p = PathBuf::from(text.trim());
-    p.is_file().then_some(p)
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedBackend {
+    bin: PathBuf,
+    path_env: String,
+}
+
+/// Read the cached backend from a prior install, if the binary still
+/// points at a real file (self-heals if the install was moved/removed
+/// since).
+fn cached_backend() -> Option<(PathBuf, String)> {
+    let text = std::fs::read_to_string(cached_backend_file()).ok()?;
+    let cached: CachedBackend = serde_json::from_str(&text).ok()?;
+    cached
+        .bin
+        .is_file()
+        .then_some((cached.bin, cached.path_env))
 }
 
 /// Best-effort: a failed cache write just means the next call redoes the
 /// mise resolution, never a hard error for the caller who already has the
 /// binary path in hand.
-fn write_bin_path_cache(bin: &Path) {
-    let _ = std::fs::write(bin_path_cache_file(), bin.to_string_lossy().as_bytes());
+fn write_backend_cache(bin: &Path, path_env: &str) {
+    let cached = CachedBackend {
+        bin: bin.to_path_buf(),
+        path_env: path_env.to_string(),
+    };
+    if let Ok(text) = serde_json::to_string(&cached) {
+        let _ = std::fs::write(cached_backend_file(), text);
+    }
 }
 
-/// `mise which <bin> --tool <spec>` resolves the absolute binary path
-/// directly, without scanning `PATH` or guessing at the install layout.
-fn resolve_via_mise_which(mise: &str) -> Result<PathBuf, String> {
+/// `mise env --json <spec>` resolves the full env mise would export to
+/// activate the spec — no `mise where` + guessed `bin/` layout, which the
+/// git backend doesn't even have (its binary sits directly in the install
+/// dir). The returned `PATH` already has that install dir merged in ahead
+/// of the caller's own `PATH`, so it's both how the binary is located here
+/// and what gets carried along to merge into the spawned agent-browser
+/// command's env.
+fn resolve_via_mise_env(mise: &str) -> Result<(PathBuf, String), String> {
     let out = flare_process::command(mise)
-        .args(["which", flare_browser::BACKEND_BIN, "--tool", MISE_SPEC])
+        .args(["env", "--json", MISE_SPEC])
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("failed to spawn `{mise} which`: {e}"))?;
+        .map_err(|e| format!("failed to spawn `{mise} env --json {MISE_SPEC}`: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "`mise which {} --tool {MISE_SPEC}` failed after a successful install (exit {:?}): {} — retry manually: `mise install {MISE_SPEC}`",
-            flare_browser::BACKEND_BIN,
+            "`mise env --json {MISE_SPEC}` failed after a successful install (exit {:?}): {} — retry manually: `mise install {MISE_SPEC}`",
             out.status.code(),
             tail(&String::from_utf8_lossy(&out.stderr)),
         ));
     }
-    parse_which_output(&String::from_utf8_lossy(&out.stdout))
+    parse_env_output(&String::from_utf8_lossy(&out.stdout))
 }
 
-fn parse_which_output(stdout: &str) -> Result<PathBuf, String> {
-    let line = stdout
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
+fn parse_env_output(stdout: &str) -> Result<(PathBuf, String), String> {
+    let vars: std::collections::HashMap<String, String> = serde_json::from_str(stdout)
+        .map_err(|e| format!("`mise env --json {MISE_SPEC}` produced invalid JSON: {e}"))?;
+    let path = vars.get("PATH").cloned().ok_or_else(|| {
+        format!(
+            "`mise env --json {MISE_SPEC}` had no PATH — retry manually: `mise install {MISE_SPEC}`"
+        )
+    })?;
+    let bin = std::env::split_paths(&path)
+        .find_map(|dir| {
+            let cand = dir.join(flare_browser::BACKEND_BIN);
+            if cand.is_file() {
+                return Some(cand);
+            }
+            #[cfg(windows)]
+            {
+                let exe = dir.join(format!("{}.exe", flare_browser::BACKEND_BIN));
+                if exe.is_file() {
+                    return Some(exe);
+                }
+            }
+            None
+        })
         .ok_or_else(|| {
             format!(
-                "`mise which {} --tool {MISE_SPEC}` printed no path — retry manually: `mise install {MISE_SPEC}`",
+                "mise env for {MISE_SPEC} has no {} on PATH — retry manually: `mise install {MISE_SPEC}`",
                 flare_browser::BACKEND_BIN
             )
         })?;
-    let bin = PathBuf::from(line);
-    if bin.is_file() {
-        return Ok(bin);
-    }
-    Err(format!(
-        "`mise which` resolved to {line}, which is not a file — retry manually: `mise install {MISE_SPEC}`"
-    ))
+    Ok((bin, path))
 }
 
 fn tail(text: &str) -> String {
@@ -194,37 +236,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_which_resolves_an_existing_binary_path() {
-        let dir = std::env::temp_dir().join("agentflare-browser-which-test");
+    fn parse_env_finds_bin_flat_in_an_install_dir_on_path() {
+        // The git backend's install dir has no `bin/` subdir -- the binary
+        // sits directly in it -- so this must resolve without one.
+        let dir = std::env::temp_dir().join("agentflare-browser-env-test");
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join(flare_browser::BACKEND_BIN);
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
-        let out = format!("\n  \n{}\n", bin.display());
-        assert_eq!(parse_which_output(&out).unwrap(), bin);
+        // Build the fake PATH with the platform's own separator/joining
+        // rules (`:` on Unix, `;` on Windows) -- a hardcoded Unix-style
+        // literal made this test fail on Windows (`split_paths` couldn't
+        // parse it), even though the function under test is platform-correct.
+        let missing_a = std::env::temp_dir().join("agentflare-browser-env-test-missing-a");
+        let missing_b = std::env::temp_dir().join("agentflare-browser-env-test-missing-b");
+        let path = std::env::join_paths([&missing_a, &dir, &missing_b])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let json = serde_json::json!({"PATH": path}).to_string();
+        let (resolved_bin, resolved_path) = parse_env_output(&json).unwrap();
+        assert_eq!(resolved_bin, bin);
+        assert_eq!(resolved_path, path);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn parse_which_rejects_empty_output_and_missing_binary() {
-        assert!(parse_which_output("   \n").is_err());
-        let dir = std::env::temp_dir().join("agentflare-browser-which-test-missing");
+    fn parse_env_rejects_invalid_json_missing_path_and_binless_path() {
+        assert!(parse_env_output("not json").is_err());
+        assert!(parse_env_output(r#"{"OTHER":"x"}"#).is_err());
+        let dir = std::env::temp_dir().join("agentflare-browser-env-test-empty");
         std::fs::create_dir_all(&dir).unwrap();
-        let missing = dir.join(flare_browser::BACKEND_BIN);
-        assert!(parse_which_output(&missing.to_string_lossy()).is_err());
+        let json = serde_json::json!({"PATH": dir.to_string_lossy()}).to_string();
+        assert!(parse_env_output(&json).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn cached_bin_path_ignores_a_stale_or_missing_entry() {
-        let cache = bin_path_cache_file();
+    fn cached_backend_ignores_a_stale_or_missing_entry() {
+        let cache = cached_backend_file();
         let saved = std::fs::read_to_string(&cache).ok();
 
         std::fs::remove_file(&cache).ok();
-        assert!(cached_bin_path().is_none());
+        assert!(cached_backend().is_none());
 
-        std::fs::write(&cache, "/definitely/does/not/exist/agent-browser").unwrap();
+        std::fs::write(
+            &cache,
+            r#"{"bin":"/definitely/does/not/exist/agent-browser","path_env":"/x"}"#,
+        )
+        .unwrap();
         assert!(
-            cached_bin_path().is_none(),
+            cached_backend().is_none(),
             "stale entries must not be trusted"
         );
 
@@ -237,8 +298,8 @@ mod tests {
 ",
         )
         .unwrap();
-        write_bin_path_cache(&real_bin);
-        assert_eq!(cached_bin_path(), Some(real_bin));
+        write_backend_cache(&real_bin, "/some/path");
+        assert_eq!(cached_backend(), Some((real_bin, "/some/path".to_string())));
         std::fs::remove_dir_all(&dir).ok();
 
         match saved {
@@ -262,7 +323,7 @@ mod tests {
     fn ensure_respects_disabled_auto_install_when_backend_absent() {
         // Also ignore a stale path cache from a real install on this
         // machine, so this test holds regardless of prior local state.
-        std::fs::remove_file(bin_path_cache_file()).ok();
+        std::fs::remove_file(cached_backend_file()).ok();
         // Scrub lookup roots so the test holds whether or not this machine
         // has the sidecar. SAFETY: restored below; nothing else in this
         // module reads PATH/CARGO_HOME/HOME.
