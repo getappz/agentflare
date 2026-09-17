@@ -117,3 +117,100 @@ fn dispatch_bookkeeping_lands_on_items_of_projects_other_than_the_daemons_own() 
          ceiling can never trip"
     );
 }
+
+/// CodeRabbit finding on this PR: `run_discovery_tick` only requires
+/// `READY_LABEL` to exist before batching a project (see `DISPATCHED_LABEL`'s
+/// doc comment) -- a project that never got the `dispatched` label seeded
+/// could otherwise enqueue a real job, remove `ready-for-work`, and leave the
+/// item wearing neither label: invisible to the dashboard and to the next
+/// discovery query, with no way back onto `ready-for-work` short of a human
+/// relabeling it by hand. `dispatch_item` must resolve `DISPATCHED_LABEL`
+/// before enqueueing, not merely at label-swap time, and leave the item
+/// exactly as it found it when that label is missing.
+#[test]
+fn dispatch_item_declines_when_the_project_has_no_dispatched_label() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            // Deliberately only "ready-for-work" -- no "dispatched" label.
+            let ready = agentflare_backend::label::create(
+                conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(project.id.clone()),
+                    workspace_id: project.workspace_id.clone(),
+                    name: "ready-for-work".into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap();
+            let states = agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+            let state_id = states.iter().find(|s| s.is_default).unwrap().id.clone();
+            let item = agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id.clone(),
+                    state_id,
+                    name: "Do the thing".into(),
+                    description: Some("no dispatched label exists yet".into()),
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: Some("claude-code".into()),
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: None,
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                    start_date: None,
+                    due_date: None,
+                },
+            )
+            .unwrap();
+            agentflare_backend::item::add_label(conn, &item.id, &ready.id).unwrap();
+            item.id
+        })
+        .unwrap();
+
+    let auth_conn = test_auth_conn();
+    let result = run_discovery_tick(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+    assert_eq!(
+        result.dispatched, 0,
+        "must not dispatch without a dispatched label to swap to"
+    );
+    assert!(
+        queue.list(None).unwrap().is_empty(),
+        "no job should be enqueued when the label swap can never complete"
+    );
+
+    let labels = mcp
+        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+        .unwrap();
+    let ready_id = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            agentflare_backend::label::list_by_project(conn, &project.id)
+                .unwrap()
+                .into_iter()
+                .find(|l| l.name == "ready-for-work")
+                .unwrap()
+                .id
+        })
+        .unwrap();
+    assert!(
+        labels.contains(&ready_id),
+        "ready-for-work must stay on so a human fixing the missing label sees the item again \
+         on the very next tick"
+    );
+}

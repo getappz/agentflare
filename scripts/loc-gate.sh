@@ -66,6 +66,16 @@ ALLOWLIST=(
   # same rationale as every other entry above. Frozen at <= FROZEN_LIMIT;
   # a real split is separate work.
   crates/agentflare-store/src/documents.rs
+  # At 1481 lines on master (after this branch's merge with master's own
+  # Telegram/chat-channel work), PR #759's CodeRabbit-review follow-up fix
+  # (transactional bookkeeping writes + a guard against dispatching without
+  # a `dispatched` label to swap to, both in `dispatch_item`/
+  # `record_supervisor_action`) pushed it to 1508. Splitting this file's
+  # discovery/dispatch/review-sweep/self-repair logic into submodules is
+  # worth doing but is a separate, larger refactor than a review-response
+  # fix should carry. Frozen at <= FROZEN_LIMIT; a real split is separate
+  # work.
+  src/supervisor.rs
 )
 
 cd "$(dirname "$0")/.."

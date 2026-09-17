@@ -404,14 +404,22 @@ fn record_supervisor_action(
     comment: &str,
 ) {
     let author = crate::claims::owner_id();
+    // One transaction: `with_backend_db` only locks and opens the connection,
+    // it does not itself start one, so without this a failure partway through
+    // (e.g. `add_label` after `remove_label` already ran) leaves the earlier
+    // writes committed -- exactly the half-applied state ("ready-for-work
+    // gone, no dispatched label, no marker comment") that lets an item slip
+    // back into the discovery loop invisibly.
     let outcome = mcp.with_backend_db(|conn| -> agentflare_backend::error::Result<()> {
+        let tx = conn.unchecked_transaction()?;
         if let Some(id) = remove_label_id {
-            agentflare_backend::item::remove_label(conn, &item.id, id)?;
+            agentflare_backend::item::remove_label(&tx, &item.id, id)?;
         }
         if let Some(id) = add_label_id {
-            agentflare_backend::item::add_label(conn, &item.id, id)?;
+            agentflare_backend::item::add_label(&tx, &item.id, id)?;
         }
-        agentflare_backend::comment::create(conn, &item.id, &author, comment)?;
+        agentflare_backend::comment::create(&tx, &item.id, &author, comment)?;
+        tx.commit()?;
         Ok(())
     });
     let err = match outcome {
@@ -603,6 +611,20 @@ fn dispatch_item(
         }
         return DispatchOutcome::WaitingOnPlan;
     }
+    // Resolved before enqueueing, not merely at label-swap time: discovery
+    // only requires `READY_LABEL` to exist on a project (see
+    // `run_discovery_tick`), so a project that never got `DISPATCHED_LABEL`
+    // seeded would otherwise enqueue a real job, remove `ready-for-work`, and
+    // leave the item wearing neither label -- invisible to the dashboard and
+    // to the next discovery query, with no way back onto `ready-for-work`
+    // short of a human relabeling it by hand.
+    let Some(dispatched_id) = label_id_by_name.get(DISPATCHED_LABEL) else {
+        eprintln!(
+            "agentflare-supervisor: item #{} ({}) not dispatched — project has no {DISPATCHED_LABEL} label",
+            item.sequence_id, item.id
+        );
+        return DispatchOutcome::NotDispatched;
+    };
     let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), None) else {
         return DispatchOutcome::NotDispatched;
     };
@@ -618,7 +640,7 @@ fn dispatch_item(
         mcp,
         item,
         Some(ready_id),
-        label_id_by_name.get(DISPATCHED_LABEL).map(String::as_str),
+        Some(dispatched_id.as_str()),
         &format!(
             "{}\n\njob: {}",
             crate::dispatch_failure_ceiling::DISPATCH_MARKER,
