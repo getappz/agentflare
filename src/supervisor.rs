@@ -63,6 +63,9 @@ const PR_APPROVAL_LABEL: &str = "status:pr:approved";
 const IN_REVIEW_PR_LABEL: &str = "agentflare:in-review";
 const SELF_REPAIR_PR_LABEL: &str = "agentflare:self-repair";
 const NEEDS_HUMAN_PR_LABEL: &str = "agentflare:needs-human";
+/// Same stage-label convention, for a CI-green PR whose CodeRabbit review
+/// still has unresolved findings (item #273's `coderabbit_repair_or_gate`).
+const CODERABBIT_REPAIR_PR_LABEL: &str = "agentflare:review-repair";
 
 /// Best-effort GitHub-visible stage transition for a PR: removes `from` (if
 /// any -- tolerates it already being absent, same as every other caller of
@@ -628,9 +631,28 @@ fn dispatch_item(
 /// the same way an item's `metadata` isn't otherwise touched by this file.
 const CI_SELF_REPAIR_MARKER: &str = "## supervisor — CI self-repair dispatched";
 
+/// Marker prefix on a CodeRabbit-review-repair-dispatch comment (see
+/// `coderabbit_repair_or_gate` below) -- counted the same way
+/// `CI_SELF_REPAIR_MARKER` is, against the same `quota::decide::SELF_REPAIR_CAP`,
+/// so a PR CodeRabbit keeps flagging doesn't retry-dispatch forever either.
+const CODERABBIT_REPAIR_MARKER: &str = "## supervisor — CodeRabbit review repair dispatched";
+
+/// Login prefix every known CodeRabbit bot account posts review comments
+/// under (`coderabbitai[bot]` today) -- matched as a prefix rather than an
+/// exact string so a renamed/enterprise variant of the same bot isn't
+/// silently invisible to `unresolved_coderabbit_comments`.
+const CODERABBIT_LOGIN_PREFIX: &str = "coderabbit";
+
 pub(crate) struct ReviewSweepResult {
     pub promoted: usize,
     pub self_repaired: usize,
+    /// PRs whose CodeRabbit review left unresolved findings and got a
+    /// capped review-repair job dispatched for them -- mirrors
+    /// `self_repaired`, but reacting to CodeRabbit's own review threads
+    /// rather than CI (item #273: `run_review_sweep` previously only ever
+    /// looked at CI check status and `mergeable_state`, never the review
+    /// itself).
+    pub review_repaired: usize,
     pub skipped: usize,
     /// Items a later sweep should retry (agent cooling down, or the host
     /// resource gate throttling/pausing dispatch) rather than ones this
@@ -708,6 +730,7 @@ pub(crate) fn run_review_sweep(
     let mut result = ReviewSweepResult {
         promoted: 0,
         self_repaired: 0,
+        review_repaired: 0,
         skipped: 0,
         waiting: 0,
         updated: 0,
@@ -1024,7 +1047,27 @@ fn handle_pr_status(
             if merge_if_approved(mcp, item, repo_root, number, &labels) {
                 result.promoted += 1;
             } else {
-                result.skipped += 1;
+                // Not merged (no approval yet, or the merge call itself was
+                // rejected) -- CI being green doesn't mean the PR is actually
+                // done if CodeRabbit's own review still has unresolved
+                // findings sitting on it untouched (item #273).
+                let findings = fetch_unresolved_coderabbit_comments(repo_root, number);
+                match coderabbit_repair_or_gate(
+                    mcp,
+                    queue,
+                    auth_conn,
+                    host_policy,
+                    item,
+                    number,
+                    &findings,
+                    &labels,
+                    label_id_by_name,
+                    folder_path,
+                ) {
+                    SelfRepairOutcome::Dispatched => result.review_repaired += 1,
+                    SelfRepairOutcome::Deferred => result.waiting += 1,
+                    SelfRepairOutcome::Skipped => result.skipped += 1,
+                }
             }
         }
         crate::worktree::PrCiStatus::Behind { number } => {
@@ -1401,6 +1444,271 @@ fn self_repair_or_gate(
         pr_number,
         Some(IN_REVIEW_PR_LABEL),
         SELF_REPAIR_PR_LABEL,
+        &dispatch_message,
+    );
+    SelfRepairOutcome::Dispatched
+}
+
+/// CodeRabbit review comments a live GraphQL call reports as still
+/// unresolved (`resolved_ids` -- see `pulls::resolved_review_comment_ids`'s
+/// doc comment), filtered to the ones CodeRabbit itself left rather than a
+/// human reviewer's -- `run_review_sweep` only auto-dispatches a repair job
+/// for the former; a human's own unresolved review comment is left for the
+/// approval-gate flow instead. Split out from `coderabbit_repair_or_gate` as
+/// a pure function so the filter itself is unit-testable without a live
+/// GitHub client.
+fn unresolved_coderabbit_comments<'a>(
+    review_comments: &'a [crate::github::models::ReviewComment],
+    resolved_ids: &std::collections::HashSet<u64>,
+) -> Vec<&'a crate::github::models::ReviewComment> {
+    review_comments
+        .iter()
+        .filter(|c| {
+            !resolved_ids.contains(&c.id)
+                && c.user
+                    .login
+                    .to_lowercase()
+                    .starts_with(CODERABBIT_LOGIN_PREFIX)
+        })
+        .collect()
+}
+
+/// Live-fetches `pr_number`'s unresolved CodeRabbit findings -- split out
+/// from `coderabbit_repair_or_gate` so that function's own cap/claim/dispatch
+/// decision tree takes pre-fetched findings as a plain slice, exactly like
+/// `self_repair_or_gate` takes a pre-fetched `failed_checks`, and so it can
+/// be unit-tested the same soft-fail-tolerant way (no live GitHub client)
+/// `self_repair_or_gate`'s own tests already rely on. Soft-fails to an empty
+/// list on any lookup error, same as every other GitHub-touching helper in
+/// this file -- the caller's fallback is simply to skip this tick and try
+/// again next time.
+fn fetch_unresolved_coderabbit_comments(
+    repo_root: &std::path::Path,
+    pr_number: u64,
+) -> Vec<crate::github::models::ReviewComment> {
+    let Some(repo) = crate::github::RepoId::resolve_from_remote(repo_root) else {
+        return Vec::new();
+    };
+    let Ok(client) = crate::github::Client::new() else {
+        return Vec::new();
+    };
+    let Ok(review_comments) =
+        crate::github::pulls::list_review_comments(&client, &repo, pr_number, None)
+    else {
+        return Vec::new();
+    };
+    let Ok(resolved_ids) =
+        crate::github::pulls::resolved_review_comment_ids(&client, &repo, pr_number)
+    else {
+        return Vec::new();
+    };
+    unresolved_coderabbit_comments(&review_comments, &resolved_ids)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+/// Dispatches a review-repair job for a CI-green PR whose CodeRabbit review
+/// still has unresolved findings, or -- once
+/// `quota::decide::SELF_REPAIR_CAP` prior attempts have been made -- gates
+/// it for a human instead of retrying forever. Item #273: `run_review_sweep`
+/// previously only ever reacted to CI check status and `mergeable_state`; a
+/// PR could sit with CodeRabbit review threads flagged and untouched
+/// indefinitely as long as CI itself stayed green. Mirrors
+/// `self_repair_or_gate` throughout -- same cap accounting via a marker
+/// comment prefix, same claim/cooldown/host-pressure gates before
+/// dispatching, same PR-stage-label convention -- so the two dispatch paths
+/// can't quietly drift apart. `findings` is fetched once by the caller
+/// (`fetch_unresolved_coderabbit_comments`) rather than by this function
+/// itself, again mirroring how `self_repair_or_gate` receives `failed_checks`.
+#[allow(clippy::too_many_arguments)]
+fn coderabbit_repair_or_gate(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    auth_conn: &rusqlite::Connection,
+    host_policy: agentflare_resource_gate::Policy,
+    item: &agentflare_backend::item::Item,
+    pr_number: u64,
+    findings: &[crate::github::models::ReviewComment],
+    labels: &[String],
+    label_id_by_name: &std::collections::HashMap<String, String>,
+    folder_path: &str,
+) -> SelfRepairOutcome {
+    let already_gated = label_id_by_name
+        .get(NEEDS_HUMAN_GATE_LABEL)
+        .is_some_and(|gate_id| {
+            mcp.with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
+                .ok()
+                .and_then(Result::ok)
+                .is_some_and(|ids| ids.contains(gate_id))
+        });
+    if already_gated || job_in_flight(queue, &item.id) {
+        return SelfRepairOutcome::Skipped;
+    }
+
+    if findings.is_empty() {
+        // Findings from an earlier tick all got resolved since -- swap the
+        // stage label back rather than leaving a stale "review-repair" label
+        // on a PR nothing is actively repairing anymore. Only touches GitHub
+        // when the label is actually still there.
+        if labels.iter().any(|l| l == CODERABBIT_REPAIR_PR_LABEL) {
+            update_pr_stage(
+                folder_path,
+                pr_number,
+                Some(CODERABBIT_REPAIR_PR_LABEL),
+                IN_REVIEW_PR_LABEL,
+                "## supervisor — CodeRabbit review clear\n\nNo unresolved findings remain.",
+            );
+        }
+        return SelfRepairOutcome::Skipped;
+    }
+
+    let prior_attempts = mcp
+        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
+        .ok()
+        .and_then(Result::ok)
+        .map(|comments| {
+            comments
+                .iter()
+                .filter(|c| c.body.starts_with(CODERABBIT_REPAIR_MARKER))
+                .count() as u32
+        })
+        .unwrap_or(0);
+
+    if prior_attempts >= crate::quota::decide::SELF_REPAIR_CAP {
+        let cap_message = format!(
+            "## supervisor — CodeRabbit review repair cap reached\n\n{} unresolved finding(s) \
+             remain. {} automatic repair attempt(s) already made — needs a human look.",
+            findings.len(),
+            crate::quota::decide::SELF_REPAIR_CAP,
+        );
+        let _ = mcp.comment_impl(CommentRequest {
+            action: "create".into(),
+            item_id: Some(item.id.clone()),
+            body: Some(cap_message.clone()),
+            ..Default::default()
+        });
+        if let Some(gate_id) = label_id_by_name.get(NEEDS_HUMAN_GATE_LABEL) {
+            let _ = mcp.item_add_label(ItemRequest {
+                action: "add_label".into(),
+                id: Some(item.id.clone()),
+                label_id: Some(gate_id.clone()),
+                ..Default::default()
+            });
+        }
+        update_pr_stage(
+            folder_path,
+            pr_number,
+            Some(CODERABBIT_REPAIR_PR_LABEL),
+            NEEDS_HUMAN_PR_LABEL,
+            &cap_message,
+        );
+        notify_human_gate(
+            item,
+            &format!(
+                "CodeRabbit review repair cap reached ({} attempt(s), {} finding(s) still \
+                 unresolved)",
+                crate::quota::decide::SELF_REPAIR_CAP,
+                findings.len()
+            ),
+        );
+        return SelfRepairOutcome::Skipped;
+    }
+
+    // Same item #114 rationale as `self_repair_or_gate`: dispatching while
+    // the item's own claim is still live would just die instantly at
+    // `execute_work`'s claim-acquire step.
+    let claim_still_live = mcp
+        .with_backend_db(|conn| {
+            let requested_ttl = crate::mcp_server::types::backend_claim_ttl_secs();
+            let ttl = agentflare_backend::claim::effective_ttl_secs(conn, &item.id, requested_ttl);
+            agentflare_backend::claim::has_active_claim_by_other(
+                conn,
+                &item.id,
+                "",
+                crate::claims::now(),
+                ttl,
+            )
+        })
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false);
+    if claim_still_live {
+        return SelfRepairOutcome::Deferred;
+    }
+
+    // Same item #261 rationale as `self_repair_or_gate`: arbitrate across
+    // workstations via a claim marker comment on the PR itself, since a
+    // per-workstation backend db can't see another workstation's dispatch.
+    // Same soft-fail as `self_repair_or_gate`'s own resolution here: no
+    // remote/no credentials proceeds rather than blocking dispatch on it.
+    let repo_and_client =
+        crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
+            .zip(crate::github::Client::new().ok());
+    if let Some((repo, client)) = repo_and_client
+        && !claim_self_repair(&client, &repo, pr_number, &item.id, crate::claims::now())
+    {
+        return SelfRepairOutcome::Deferred;
+    }
+
+    let Some(agent) = item
+        .assignee_agent
+        .as_deref()
+        .and_then(resolve_confirmed_agent)
+        .or_else(|| route_unassigned(item))
+    else {
+        return SelfRepairOutcome::Skipped;
+    };
+    if crate::auth_db::is_cooling_down(auth_conn, agent.as_str()) {
+        return SelfRepairOutcome::Deferred;
+    }
+    if host_policy.blocks_dispatch() {
+        return SelfRepairOutcome::Deferred;
+    }
+
+    // Summarized, not dumped in full -- a long CodeRabbit finding body would
+    // otherwise blow up the dispatch comment for a PR with many of them.
+    let summary: Vec<String> = findings
+        .iter()
+        .take(10)
+        .map(|c| {
+            let line = c.line.map(|l| format!(":{l}")).unwrap_or_default();
+            let first_line = c.body.lines().next().unwrap_or("").trim();
+            format!("- `{}{line}` ({}): {first_line}", c.path, c.user.login)
+        })
+        .collect();
+    let overflow = findings.len().saturating_sub(10);
+    let overflow_line = if overflow > 0 {
+        format!("\n- …and {overflow} more")
+    } else {
+        String::new()
+    };
+
+    let reason = format!(
+        "CodeRabbit review: {} unresolved finding(s)",
+        findings.len()
+    );
+    let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), Some(&reason)) else {
+        return SelfRepairOutcome::Skipped;
+    };
+    let dispatch_message = format!(
+        "{CODERABBIT_REPAIR_MARKER}\n\nCodeRabbit left {} unresolved finding(s) on this PR:\n\n\
+         {}{overflow_line}\n\nPlease address them and push a fix.\n\njob: {}",
+        findings.len(),
+        summary.join("\n"),
+        info.id,
+    );
+    let _ = mcp.comment_impl(CommentRequest {
+        action: "create".into(),
+        item_id: Some(item.id.clone()),
+        body: Some(dispatch_message.clone()),
+        ..Default::default()
+    });
+    update_pr_stage(
+        folder_path,
+        pr_number,
+        Some(IN_REVIEW_PR_LABEL),
+        CODERABBIT_REPAIR_PR_LABEL,
         &dispatch_message,
     );
     SelfRepairOutcome::Dispatched
