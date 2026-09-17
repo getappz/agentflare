@@ -137,7 +137,7 @@ pub(crate) struct ToolRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ClaimRequest {
-    #[schemars(description = "Action: acquire|done|heartbeat|list|release")]
+    #[schemars(description = "Action: acquire|done|heartbeat|list|release|should_stop|stop")]
     pub(crate) action: String,
     #[schemars(
         description = "Target to claim, e.g. \"issue#42\", \"pr#7\", \"item#<uuid>\", or \"item#<seq_id>\""
@@ -158,6 +158,11 @@ pub(crate) struct ClaimRequest {
     )]
     #[serde(default)]
     pub(crate) scope: Vec<String>,
+    #[schemars(
+        description = "Why the owner should stop -- surfaced back to it by should_stop (stop)"
+    )]
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
