@@ -20,6 +20,26 @@ pub fn is_set(name: &str) -> bool {
 /// behavior to agentflare-managed projects only.
 pub const PROJECT_MARKER: &str = ".agentflare";
 
+/// Re-entry marker every agentflare dispatcher (this PATH shim and the
+/// `~/.bashenv` function dispatcher) stamps on the `lean-ctx -c` child it
+/// spawns, and treats as a kill switch when already set: a dispatcher that
+/// finds it in its own environment is running INSIDE a command tree some
+/// outer dispatcher already handed to lean-ctx, so it must exec the real
+/// tool and never spawn another lean-ctx.
+///
+/// agentflare owns this variable outright -- lean-ctx only ever reads and
+/// clears its own `LEAN_CTX_*` markers, and it deliberately clears
+/// `LEAN_CTX_WRAPPED`/`LEAN_CTX_ACTIVE` on its delegate-to-shell path -- so
+/// unlike those, this one survives every lean-ctx spawn path and every shell
+/// lean-ctx starts. Without it, a shell that lean-ctx spawns (which on some
+/// paths inherits `BASH_ENV` and re-sources `.bashenv`, or simply resolves
+/// the tool back through the shim dir on PATH) re-enters a dispatcher with
+/// the lean-ctx markers gone, spawns a fresh unwrapped `lean-ctx -c`, and
+/// the lap repeats without bound: observed live as ~8,000 orphaned
+/// `bash.exe`/`lean-ctx.exe` processes and system memory exhaustion
+/// (image-qc vents #274/#278, 2026-09-16).
+pub const REENTRY_MARKER: &str = "AGENTFLARE_SHIM_ACTIVE";
+
 /// Walk up from `start` looking for `.agentflare`, stopping at `home`
 /// (exclusive) -- `~/.agentflare` is agentflare's own data dir, not a
 /// project marker, and would otherwise false-positive on everything

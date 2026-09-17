@@ -377,6 +377,65 @@ pub(crate) fn run_discovery_tick(
     result
 }
 
+/// Records a supervisor decision on `item` -- the label swap plus the
+/// comment humans and `dispatch_failure_ceiling` read -- directly against
+/// the backend by the item's own canonical ids, never through the
+/// `ItemRequest`/`CommentRequest` MCP entry points.
+///
+/// Those entry points resolve every id via `resolve_item_id`, which only
+/// accepts items of the ONE project this daemon process is linked to (the
+/// cwd it was started in), while `run_discovery_tick` deliberately walks
+/// every registered `project_dirs` folder. For any other project's items
+/// the swap and the comment therefore failed -- silently, since each call
+/// was `let _ =` -- and a daemon started by the watchdog scheduled task
+/// (cwd `C:\Windows\System32`) matched no real project at all. Visible
+/// damage: not one `## supervisor — dispatched` marker was posted anywhere
+/// after 2026-08-31, so `dispatch_failure_ceiling` counted zero cycles,
+/// `handle_terminal_job_failure` put `ready-for-work` straight back, and a
+/// deterministically failing item was re-dispatched every
+/// `SUPERVISOR_DISCOVERY_INTERVAL` without bound (image-qc item #273: 1,367
+/// jobs in 31 hours, 2026-09-16/17). A skipped item likewise never lost
+/// `ready-for-work` and was re-skipped, with a fresh comment, every tick.
+///
+/// Failures are logged, not swallowed: a swap that didn't land is exactly
+/// what re-arms the loop on the next tick (item #221).
+fn record_supervisor_action(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    remove_label_id: Option<&str>,
+    add_label_id: Option<&str>,
+    comment: &str,
+) {
+    let author = crate::claims::owner_id();
+    // One transaction: `with_backend_db` only locks and opens the connection,
+    // it does not itself start one, so without this a failure partway through
+    // (e.g. `add_label` after `remove_label` already ran) leaves the earlier
+    // writes committed -- exactly the half-applied state ("ready-for-work
+    // gone, no dispatched label, no marker comment") that lets an item slip
+    // back into the discovery loop invisibly.
+    let outcome = mcp.with_backend_db(|conn| -> agentflare_backend::error::Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        if let Some(id) = remove_label_id {
+            agentflare_backend::item::remove_label(&tx, &item.id, id)?;
+        }
+        if let Some(id) = add_label_id {
+            agentflare_backend::item::add_label(&tx, &item.id, id)?;
+        }
+        agentflare_backend::comment::create(&tx, &item.id, &author, comment)?;
+        tx.commit()?;
+        Ok(())
+    });
+    let err = match outcome {
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => e.to_string(),
+        Err(e) => e.to_string(),
+    };
+    eprintln!(
+        "agentflare-supervisor: failed to record supervisor action on item #{} ({}): {err}",
+        item.sequence_id, item.id
+    );
+}
+
 fn skip_item(
     mcp: &AgentflareMcp,
     item: &agentflare_backend::item::Item,
@@ -387,28 +446,13 @@ fn skip_item(
         None => "no assignee_agent set — cannot auto-dispatch".to_string(),
         Some(a) => format!("assignee '{a}' is not a confirmed-autonomous agent"),
     };
-    let _ = mcp.comment_impl(CommentRequest {
-        action: "create".into(),
-        item_id: Some(item.id.clone()),
-        body: Some(format!(
-            "## supervisor — skipped\n\n{reason}. Run `agentflare work` manually."
-        )),
-        ..Default::default()
-    });
-    let _ = mcp.item_remove_label(ItemRequest {
-        action: "remove_label".into(),
-        id: Some(item.id.clone()),
-        label_id: Some(ready_id.to_string()),
-        ..Default::default()
-    });
-    if let Some(needs_manual_id) = label_id_by_name.get(NEEDS_MANUAL_LABEL) {
-        let _ = mcp.item_add_label(ItemRequest {
-            action: "add_label".into(),
-            id: Some(item.id.clone()),
-            label_id: Some(needs_manual_id.clone()),
-            ..Default::default()
-        });
-    }
+    record_supervisor_action(
+        mcp,
+        item,
+        Some(ready_id),
+        label_id_by_name.get(NEEDS_MANUAL_LABEL).map(String::as_str),
+        &format!("## supervisor — skipped\n\n{reason}. Run `agentflare work` manually."),
+    );
     if first_time_gated(&item.id) {
         notify_human_gate(item, &reason);
     }
@@ -421,26 +465,15 @@ fn ask_item(
     label_id_by_name: &std::collections::HashMap<String, String>,
     ready_id: &str,
 ) {
-    let _ = mcp.comment_impl(CommentRequest {
-        action: "create".into(),
-        item_id: Some(item.id.clone()),
-        body: Some(format!("## supervisor — gated\n\n{question}")),
-        ..Default::default()
-    });
-    let _ = mcp.item_remove_label(ItemRequest {
-        action: "remove_label".into(),
-        id: Some(item.id.clone()),
-        label_id: Some(ready_id.to_string()),
-        ..Default::default()
-    });
-    if let Some(gated_id) = label_id_by_name.get(NEEDS_HUMAN_GATE_LABEL) {
-        let _ = mcp.item_add_label(ItemRequest {
-            action: "add_label".into(),
-            id: Some(item.id.clone()),
-            label_id: Some(gated_id.clone()),
-            ..Default::default()
-        });
-    }
+    record_supervisor_action(
+        mcp,
+        item,
+        Some(ready_id),
+        label_id_by_name
+            .get(NEEDS_HUMAN_GATE_LABEL)
+            .map(String::as_str),
+        &format!("## supervisor — gated\n\n{question}"),
+    );
     notify_human_gate(item, question);
 }
 
@@ -581,47 +614,42 @@ fn dispatch_item(
         }
         return DispatchOutcome::WaitingOnPlan;
     }
+    // Resolved before enqueueing, not merely at label-swap time: discovery
+    // only requires `READY_LABEL` to exist on a project (see
+    // `run_discovery_tick`), so a project that never got `DISPATCHED_LABEL`
+    // seeded would otherwise enqueue a real job, remove `ready-for-work`, and
+    // leave the item wearing neither label -- invisible to the dashboard and
+    // to the next discovery query, with no way back onto `ready-for-work`
+    // short of a human relabeling it by hand.
+    let Some(dispatched_id) = label_id_by_name.get(DISPATCHED_LABEL) else {
+        eprintln!(
+            "agentflare-supervisor: item #{} ({}) not dispatched — project has no {DISPATCHED_LABEL} label",
+            item.sequence_id, item.id
+        );
+        return DispatchOutcome::NotDispatched;
+    };
     let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), None) else {
         return DispatchOutcome::NotDispatched;
     };
 
-    // Label-swap failures are logged, not swallowed: a failed swap leaves
-    // the item visible to the next tick's discovery query, silently
-    // re-arming the loop above (item #221).
-    if let Err(e) = mcp.item_remove_label(ItemRequest {
-        action: "remove_label".into(),
-        id: Some(item.id.clone()),
-        label_id: Some(ready_id.to_string()),
-        ..Default::default()
-    }) {
-        eprintln!(
-            "agentflare-supervisor: failed to remove {READY_LABEL} from item #{} ({}): {e}",
-            item.sequence_id, item.id
-        );
-    }
-    if let Some(dispatched_id) = label_id_by_name.get(DISPATCHED_LABEL)
-        && let Err(e) = mcp.item_add_label(ItemRequest {
-            action: "add_label".into(),
-            id: Some(item.id.clone()),
-            label_id: Some(dispatched_id.clone()),
-            ..Default::default()
-        })
-    {
-        eprintln!(
-            "agentflare-supervisor: failed to add {DISPATCHED_LABEL} to item #{} ({}): {e}",
-            item.sequence_id, item.id
-        );
-    }
-    let _ = mcp.comment_impl(CommentRequest {
-        action: "create".into(),
-        item_id: Some(item.id.clone()),
-        body: Some(format!(
+    // ready-for-work -> dispatched, plus the one-per-cycle dispatch marker
+    // `dispatch_failure_ceiling` counts. Done by canonical id straight
+    // against the backend (see `record_supervisor_action`): the item may
+    // belong to any registered project, not just the one this daemon's
+    // cwd is linked to, and a swap that silently doesn't land leaves the
+    // item visible to the next tick's discovery query, re-arming the loop
+    // above (item #221).
+    record_supervisor_action(
+        mcp,
+        item,
+        Some(ready_id),
+        Some(dispatched_id.as_str()),
+        &format!(
             "{}\n\njob: {}",
             crate::dispatch_failure_ceiling::DISPATCH_MARKER,
             info.id
-        )),
-        ..Default::default()
-    });
+        ),
+    );
     DispatchOutcome::Dispatched
 }
 

@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "supervisor_project_scope_tests.rs"]
+mod project_scope_tests;
 #[path = "supervisor_telegram_tests.rs"]
 mod telegram_tests;
 

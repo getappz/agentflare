@@ -71,12 +71,17 @@ ALLOWLIST=(
   # same rationale as every other entry above. Frozen at <= FROZEN_LIMIT;
   # a real split is separate work.
   crates/agentflare-store/src/documents.rs
-  # Already 1788 lines on master (over LIMIT, but never added here) before
-  # item #273's follow-up fix (the already_gated_or_in_flight dedup and the
-  # stale_stage_label fix) touched it, pushing it to 1827 -- same rationale
-  # as every other entry above: pre-existing debt a small, scoped fix
-  # shouldn't have to carry. Frozen at <= FROZEN_LIMIT; a real split is
-  # separate work.
+  # Pushed over LIMIT independently by two concurrent fixes: item #273's
+  # follow-up (the already_gated_or_in_flight dedup and stale_stage_label
+  # fix, 1788 -> 1827 lines on master) and, on this branch, PR #759's
+  # CodeRabbit-review follow-up fix (transactional bookkeeping writes + a
+  # guard against dispatching without a `dispatched` label to swap to,
+  # both in `dispatch_item`/`record_supervisor_action`, 1481 -> 1508 lines
+  # before this merge). Same rationale as every other entry above:
+  # pre-existing debt a small, scoped fix shouldn't have to carry.
+  # Splitting this file's discovery/dispatch/review-sweep/self-repair
+  # logic into submodules is worth doing but is a separate, larger
+  # refactor. Frozen at <= FROZEN_LIMIT; a real split is separate work.
   src/supervisor.rs
 )
 

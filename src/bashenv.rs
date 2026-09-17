@@ -63,13 +63,20 @@ _af_in_scoped_project() {{
 _af_dispatch() {{
   local _af_cmd=$1; shift
   if [ -n "${{LEAN_CTX_DISABLED:-}}" ] || [ -n "${{LEAN_CTX_NO_HOOK:-}}" ]; then command "$_af_cmd" "$@"; return; fi
+  # Re-entry guard (mirrors the compiled PATH shim, agentflare-shim/src/lib.rs
+  # REENTRY_MARKER): already inside a command tree an agentflare dispatcher
+  # handed to lean-ctx -- or one lean-ctx itself owns -- so run the real tool.
+  # Without this, a shell lean-ctx spawns can re-source this file with
+  # lean-ctx's own markers cleared and start the lean-ctx -> bash -> lean-ctx
+  # lap again without bound (the 2026-09-16 fork-bomb, image-qc vents #274/#278).
+  if [ -n "${{AGENTFLARE_SHIM_ACTIVE:-}}" ] || [ -n "${{LEAN_CTX_WRAPPED:-}}" ]; then command "$_af_cmd" "$@"; return; fi
   if [ -t 1 ]; then command "$_af_cmd" "$@"; return; fi
   if [ -z "${{CLAUDECODE:-}}" ] && [ -z "${{CURSOR_AGENT:-}}" ] && [ -z "${{CODEX_CLI_SESSION:-}}" ] \
      && [ -z "${{GEMINI_SESSION:-}}" ] && [ -z "${{CODEBUDDY:-}}" ] && [ -z "${{LEAN_CTX_AGENT:-}}" ]; then
     command "$_af_cmd" "$@"; return
   fi
   if ! _af_in_scoped_project; then command "$_af_cmd" "$@"; return; fi
-  lean-ctx -c "$_af_cmd" "$@"
+  AGENTFLARE_SHIM_ACTIVE=1 lean-ctx -c "$_af_cmd" "$@"
   local _af_rc=$?
   if [ "$_af_rc" -eq 126 ] || [ "$_af_rc" -eq 127 ]; then command "$_af_cmd" "$@"; return; fi
   return "$_af_rc"
@@ -308,6 +315,137 @@ mod tests {
             "# <<< x <<<",
             "new"
         ));
+    }
+
+    #[test]
+    fn shims_block_guards_against_dispatcher_re_entry() {
+        let block = shims_block();
+        assert!(
+            block.contains(
+                r#"[ -n "${AGENTFLARE_SHIM_ACTIVE:-}" ] || [ -n "${LEAN_CTX_WRAPPED:-}" ]"#
+            ),
+            "dispatcher must treat the re-entry marker (and lean-ctx's ownership marker) as a kill switch:\n{block}"
+        );
+        assert!(
+            block.contains(r#"AGENTFLARE_SHIM_ACTIVE=1 lean-ctx -c "$_af_cmd" "$@""#),
+            "dispatcher must stamp the re-entry marker on the lean-ctx child it spawns:\n{block}"
+        );
+    }
+
+    /// A GNU bash to drive the dispatcher block with. On Windows the bare
+    /// `bash` on PATH is often WSL's launcher stub, so Git for Windows'
+    /// copies are tried first; `None` when no working GNU bash exists.
+    fn find_gnu_bash() -> Option<std::path::PathBuf> {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if cfg!(windows) {
+            for pf in ["ProgramFiles", "ProgramW6432"] {
+                if let Some(base) = std::env::var_os(pf) {
+                    let git = std::path::Path::new(&base).join("Git");
+                    candidates.push(git.join("usr").join("bin").join("bash.exe"));
+                    candidates.push(git.join("bin").join("bash.exe"));
+                }
+            }
+        }
+        candidates.push(std::path::PathBuf::from("bash"));
+        candidates.into_iter().find(|bash| {
+            std::process::Command::new(bash)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| {
+                    o.status.success() && String::from_utf8_lossy(&o.stdout).contains("GNU bash")
+                })
+        })
+    }
+
+    /// Regression for the 2026-09-16 fork-bomb (image-qc vents #274/#278):
+    /// the shell lean-ctx spawns can re-source this very file with lean-ctx's
+    /// own re-entry markers cleared, so a wrapped tool name inside it hits
+    /// `_af_dispatch` again, which spawned another `lean-ctx -c`, which
+    /// spawned another shell, without bound. Simulate exactly that lap with a
+    /// fake `lean-ctx` that runs its command in a fresh bash under the same
+    /// `BASH_ENV`, and assert the dispatcher stops after one lap. The fake
+    /// gives up after five laps so a regression fails the assertion instead of
+    /// hanging the test run.
+    #[test]
+    fn dispatcher_stops_after_one_lap_when_lean_ctx_resources_the_same_bashenv() {
+        let Some(bash) = find_gnu_bash() else {
+            eprintln!("skipping: no GNU bash available");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = home.join("proj");
+        fs::create_dir_all(project.join(".agentflare")).unwrap();
+        let bashenv = tmp.path().join("bashenv");
+        fs::write(
+            &bashenv,
+            format!("{SHIMS_START}\n{}\n{SHIMS_END}\n", shims_block()),
+        )
+        .unwrap();
+
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let lap_log = tmp.path().join("laps");
+        fs::write(&lap_log, "").unwrap();
+        let fake_lean_ctx = bin.join("lean-ctx");
+        fs::write(
+            &fake_lean_ctx,
+            "#!/bin/sh\n\
+             echo lap >> \"$AF_TEST_LAP_LOG\"\n\
+             if [ \"$(wc -l < \"$AF_TEST_LAP_LOG\")\" -gt 5 ]; then exit 99; fi\n\
+             shift\n\
+             exec bash -c \"$*\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&fake_lean_ctx, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // The fake lean-ctx must win over any real one; bash's own directory
+        // comes next so the fake's `sh`/`wc`/`bash` and the wrapped `cat`
+        // resolve to that same GNU toolset (on Windows, Git's `usr/bin` is not
+        // otherwise on a non-login shell's PATH and `bash` would fall through
+        // to WSL's launcher); and the machine's own installed PATH shims
+        // (which dispatch through lean-ctx themselves) must not take part.
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let filtered = std::env::join_paths(
+            std::iter::once(bin.clone())
+                .chain(bash.parent().map(std::path::Path::to_path_buf))
+                .chain(std::env::split_paths(&path).filter(|p| !p.ends_with(".agentflare/shims"))),
+        )
+        .unwrap();
+        let posix = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
+
+        let output = std::process::Command::new(&bash)
+            .args(["-c", "cat /dev/null"])
+            .current_dir(&project)
+            .env("PATH", filtered)
+            .env("BASH_ENV", posix(&bashenv))
+            .env("HOME", posix(&home))
+            .env("CLAUDECODE", "1")
+            .env("AF_TEST_LAP_LOG", posix(&lap_log))
+            .env_remove("LEAN_CTX_DISABLED")
+            .env_remove("LEAN_CTX_NO_HOOK")
+            .env_remove("LEAN_CTX_WRAPPED")
+            .env_remove("LEAN_CTX_ACTIVE")
+            .env_remove("AGENTFLARE_SHIM_ACTIVE")
+            .output()
+            .unwrap();
+
+        let laps = fs::read_to_string(&lap_log).unwrap().lines().count();
+        assert_eq!(
+            laps,
+            1,
+            "dispatcher re-entered lean-ctx {laps} times (expected exactly one lap)\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "wrapped command must still run and succeed after the single lap\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
