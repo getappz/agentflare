@@ -168,6 +168,45 @@ impl AgentflareMcp {
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(serde_json::json!({ "done": ok, "repo": repo, "target": target }).to_string())
             }
+            "stop" => {
+                let target = req
+                    .target
+                    .ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
+                let target = self.resolve_claim_target(&target)?;
+                let (conn, repo) = Self::claim_ctx(&target, req.repo)?;
+                let requested = crate::claims::request_stop(
+                    &conn,
+                    &repo,
+                    &target,
+                    req.reason.as_deref(),
+                    crate::claims::now(),
+                )
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                Ok(serde_json::json!({
+                    "stop_requested": requested,
+                    "repo": repo,
+                    "target": target,
+                    "reason": req.reason,
+                })
+                .to_string())
+            }
+            "should_stop" => {
+                let target = req
+                    .target
+                    .ok_or_else(|| ErrorData::invalid_params("target is required", None))?;
+                let target = self.resolve_claim_target(&target)?;
+                let (conn, repo) = Self::claim_ctx(&target, req.repo)?;
+                let signal = crate::claims::should_stop(&conn, &repo, &target)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                Ok(serde_json::json!({
+                    "stop": signal.is_some(),
+                    "reason": signal.as_ref().and_then(|s| s.reason.clone()),
+                    "requested_at": signal.map(|s| s.requested_at),
+                    "repo": repo,
+                    "target": target,
+                })
+                .to_string())
+            }
             "list" => {
                 let conn = Self::claim_db()?;
                 let scope = if req.all_repos {

@@ -937,7 +937,7 @@ impl AgentflareMcp {
         Ok(serde_json::json!({ "sent": true, "platform": platform, "target": target }).to_string())
     }
     #[tool(
-        description = "Records a path-scoped write lock in the claim ledger so the git shim's scope-check can tell concurrent agents' edits apart -- it does NOT provision a worktree, a branch, or a directory of any kind. Single consolidated tool with `action` field (acquire|done|heartbeat|list|release). If you need an isolated worktree to actually do file edits in, use the `item` tool's own `claim` action instead (`item(action=\"claim\", id=<item>)`) -- that is the one that creates the worktree; this `claim` tool and that one share a name but do different things."
+        description = "Records a path-scoped write lock in the claim ledger so the git shim's scope-check can tell concurrent agents' edits apart -- it does NOT provision a worktree, a branch, or a directory of any kind. Single consolidated tool with `action` field (acquire|done|heartbeat|list|release|should_stop|stop). `stop`/`should_stop` are a cooperative human-in-the-loop signal (EPIC #131): `stop` flags a live claim asking its owner to pause, `should_stop` is a read-only poll an owner calls from inside its own work loop to check for that flag -- honor system, not an enforced interrupt. If you need an isolated worktree to actually do file edits in, use the `item` tool's own `claim` action instead (`item(action=\"claim\", id=<item>)`) -- that is the one that creates the worktree; this `claim` tool and that one share a name but do different things."
     )]
     fn claim(&self, Parameters(req): Parameters<ClaimRequest>) -> Result<String, ErrorData> {
         self.claim_impl(req)
