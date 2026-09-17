@@ -5,21 +5,21 @@
 // (linux/macOS/Windows, no toolchain, no compile, no npm). Deliberately
 // `mise install`, never `mise use -g`: install records nothing in the user's
 // mise config (no global side effects) — the binary is resolved via
-// `mise where` and invoked by absolute path, so shims never need activation.
+// `mise which` and invoked by absolute path, so shims never need activation.
 // mise itself is bootstrapped through `mise_install` (curl|sh on unix,
 // winget/scoop on windows) when absent.
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-/// Git backend spec (floating version) + bare backend path for resolution.
+/// Git backend spec (floating version), used both to install and to
+/// resolve the installed binary's absolute path via `mise which`.
 const MISE_SPEC: &str = "github:vercel-labs/agent-browser@latest";
-const MISE_BACKEND: &str = "github:vercel-labs/agent-browser";
 /// Bound for stderr tails quoted in install errors (full logs stay on the
 /// caller side; MCP responses must stay compact).
 const ERR_TAIL_CHARS: usize = 2000;
 
 /// Ensure the sidecar exists, auto-installing on first use when enabled.
-/// Resolution order: `PATH`/cargo-bin hit (free) → cached `mise where`
+/// Resolution order: `PATH`/cargo-bin hit (free) → cached `mise which`
 /// result from a prior install in this process/session (free) → `mise
 /// install` from the git backend (one-time download) → `agent-browser
 /// install` (Chrome for Testing fetch). Concurrent first-use callers
@@ -31,7 +31,7 @@ const ERR_TAIL_CHARS: usize = 2000;
 /// module doc), so `flare_browser::find_backend()` alone can never see a
 /// mise-resolved install on a later call — without the path cache below,
 /// *every* invocation (not just the first) would redo `mise install` +
-/// `mise where` + the Chrome-for-Testing fetch.
+/// `mise which` + the Chrome-for-Testing fetch.
 pub fn ensure_agent_browser(auto_install: bool) -> Result<PathBuf, String> {
     if let Ok(p) = flare_browser::find_backend() {
         return Ok(p);
@@ -72,7 +72,7 @@ pub fn ensure_agent_browser(auto_install: bool) -> Result<PathBuf, String> {
             tail(&String::from_utf8_lossy(&install_out.stderr)),
         ));
     }
-    let bin = resolve_via_mise_where(&mise)?;
+    let bin = resolve_via_mise_which(&mise)?;
     let chrome_out = flare_process::command(&bin)
         .arg("install")
         .stdin(Stdio::null())
@@ -113,48 +113,42 @@ fn write_bin_path_cache(bin: &Path) {
     let _ = std::fs::write(bin_path_cache_file(), bin.to_string_lossy().as_bytes());
 }
 
-fn resolve_via_mise_where(mise: &str) -> Result<PathBuf, String> {
+/// `mise which <bin> --tool <spec>` resolves the absolute binary path
+/// directly, without scanning `PATH` or guessing at the install layout.
+fn resolve_via_mise_which(mise: &str) -> Result<PathBuf, String> {
     let out = flare_process::command(mise)
-        .args(["where", MISE_BACKEND])
+        .args(["which", flare_browser::BACKEND_BIN, "--tool", MISE_SPEC])
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("failed to spawn `{mise} where`: {e}"))?;
+        .map_err(|e| format!("failed to spawn `{mise} which`: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "`mise where {MISE_BACKEND}` failed after a successful install (exit {:?}): {} — retry manually: `mise install {MISE_SPEC}`",
+            "`mise which {} --tool {MISE_SPEC}` failed after a successful install (exit {:?}): {} — retry manually: `mise install {MISE_SPEC}`",
+            flare_browser::BACKEND_BIN,
             out.status.code(),
             tail(&String::from_utf8_lossy(&out.stderr)),
         ));
     }
-    parse_where_output(&String::from_utf8_lossy(&out.stdout))
+    parse_which_output(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// `mise where` prints the install dir; the binary lives in `bin/` beneath
-/// it (`agent-browser[.exe]`).
-fn parse_where_output(stdout: &str) -> Result<PathBuf, String> {
+fn parse_which_output(stdout: &str) -> Result<PathBuf, String> {
     let line = stdout
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .ok_or_else(|| {
-            format!("`mise where {MISE_BACKEND}` printed no path — retry manually: `mise install {MISE_SPEC}`")
+            format!(
+                "`mise which {} --tool {MISE_SPEC}` printed no path — retry manually: `mise install {MISE_SPEC}`",
+                flare_browser::BACKEND_BIN
+            )
         })?;
-    let dir = PathBuf::from(line);
-    let cand = dir.join("bin").join(flare_browser::BACKEND_BIN);
-    if cand.is_file() {
-        return Ok(cand);
-    }
-    #[cfg(windows)]
-    {
-        let exe = dir
-            .join("bin")
-            .join(format!("{}.exe", flare_browser::BACKEND_BIN));
-        if exe.is_file() {
-            return Ok(exe);
-        }
+    let bin = PathBuf::from(line);
+    if bin.is_file() {
+        return Ok(bin);
     }
     Err(format!(
-        "mise install dir {line} has no bin/agent-browser — retry manually: `mise install {MISE_SPEC}`"
+        "`mise which` resolved to {line}, which is not a file — retry manually: `mise install {MISE_SPEC}`"
     ))
 }
 
@@ -200,23 +194,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_where_resolves_bin_under_install_dir() {
-        let dir = std::env::temp_dir().join("agentflare-browser-where-test");
-        let bin_dir = dir.join("bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        let bin = bin_dir.join(flare_browser::BACKEND_BIN);
+    fn parse_which_resolves_an_existing_binary_path() {
+        let dir = std::env::temp_dir().join("agentflare-browser-which-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join(flare_browser::BACKEND_BIN);
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
-        let out = format!("\n  \n{}\n", dir.display());
-        assert_eq!(parse_where_output(&out).unwrap(), bin);
+        let out = format!("\n  \n{}\n", bin.display());
+        assert_eq!(parse_which_output(&out).unwrap(), bin);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn parse_where_rejects_empty_and_binless_dirs() {
-        assert!(parse_where_output("   \n").is_err());
-        let dir = std::env::temp_dir().join("agentflare-browser-where-test-empty");
+    fn parse_which_rejects_empty_output_and_missing_binary() {
+        assert!(parse_which_output("   \n").is_err());
+        let dir = std::env::temp_dir().join("agentflare-browser-which-test-missing");
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(parse_where_output(&dir.to_string_lossy()).is_err());
+        let missing = dir.join(flare_browser::BACKEND_BIN);
+        assert!(parse_which_output(&missing.to_string_lossy()).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
