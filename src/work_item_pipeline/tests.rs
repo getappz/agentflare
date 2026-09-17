@@ -408,6 +408,142 @@ async fn finalize_step_releases_claim_when_human_review_gate_is_hit() {
 }
 
 #[tokio::test]
+async fn finalize_step_holds_instead_of_item_done_when_a_correction_is_still_pending() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, _worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Pending-correction finalize test item");
+    let mcp = Arc::new(mcp);
+    let owner = crate::claims::owner_id();
+
+    let data = WorkItemData {
+        item_id: item_id.clone(),
+        owner: owner.clone(),
+        reply_text: "DONE: implemented the task".to_string(),
+        pending_corrections: vec!["Use mise env --json, not mise which -t.".to_string()],
+        ..Default::default()
+    };
+    let step = build_finalize_step(mcp.clone());
+    let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
+    let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
+    engine.register_workflow(wf).unwrap();
+    let run_id = engine
+        .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+        .await
+        .unwrap();
+
+    for _ in 0..50 {
+        let state = engine.get_status(run_id).await.unwrap();
+        if state.status == flare_workflow::WorkflowStatus::Completed {
+            assert!(
+                state.context.data.pr_url.is_none(),
+                "a pending correction must gate finalize before item_done/PR-open ever runs"
+            );
+            let still_claimed = mcp
+                .with_backend_db(|conn| {
+                    agentflare_backend::claim::is_owner(conn, &item_id, &owner)
+                        .map_err(|e| e.to_string())
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                !still_claimed,
+                "finalize must release the claim when gating for an unread correction"
+            );
+            let comments: serde_json::Value = serde_json::from_str(
+                &mcp.comment_impl(CommentRequest {
+                    action: "list".into(),
+                    item_id: Some(item_id.clone()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let arr = comments.as_array().unwrap();
+            assert_eq!(arr.len(), 1, "must post exactly one on-hold comment");
+            let body = arr[0]["body"].as_str().unwrap();
+            assert!(
+                body.contains("Use mise env --json, not mise which -t."),
+                "on-hold comment must quote the pending correction, got: {body}"
+            );
+            return;
+        }
+        if state.status == flare_workflow::WorkflowStatus::Failed {
+            panic!(
+                "finalize must succeed (hold, not fail) for a pending correction: {:?}",
+                state.error
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("finalize step did not complete");
+}
+
+#[tokio::test]
+async fn poll_pending_corrections_picks_up_new_comments_not_authored_by_the_run_owner() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, _worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Correction poll test item");
+    let mcp = Arc::new(mcp);
+    let owner = crate::claims::owner_id();
+
+    let noop = StepDefinition::new(
+        "noop",
+        "noop",
+        flare_workflow::noop_executor::<WorkItemData>(),
+    );
+    let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(noop);
+    let store = flare_workflow::SqliteStore::<WorkItemData>::open_memory().unwrap();
+    let eng = WorkflowEngine::<WorkItemData, flare_workflow::SqliteStore<WorkItemData>>::with_store(
+        store,
+    );
+    eng.register_workflow(wf).unwrap();
+
+    let data = WorkItemData {
+        item_id: item_id.clone(),
+        owner: owner.clone(),
+        // Backdated so both comments posted below land after it regardless
+        // of second-resolution ties between them.
+        last_seen_comment_at: crate::claims::now() - 10,
+        ..Default::default()
+    };
+    let run_id = eng
+        .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+        .await
+        .unwrap();
+
+    // This run's own comment (e.g. a prior finalize hold/success post) must
+    // never loop back in as a "correction".
+    mcp.comment_impl(CommentRequest {
+        action: "create".into(),
+        item_id: Some(item_id.clone()),
+        body: Some("own status update".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    // A correction from someone else must be picked up.
+    crate::claims::with_owner_override("human:reviewer", || {
+        mcp.comment_impl(CommentRequest {
+            action: "create".into(),
+            item_id: Some(item_id.clone()),
+            body: Some("Correction: use mise env --json, not mise which -t.".into()),
+            ..Default::default()
+        })
+    })
+    .unwrap();
+
+    poll_pending_corrections(&mcp, &eng, run_id, &item_id, &owner).await;
+
+    let state = eng.get_status(run_id).await.unwrap();
+    assert_eq!(
+        state.context.data.pending_corrections,
+        vec!["Correction: use mise env --json, not mise which -t.".to_string()],
+        "must pick up the other author's comment and skip this run's own"
+    );
+    assert!(
+        state.context.data.last_seen_comment_at > crate::claims::now() - 10,
+        "cursor must advance past the comments just polled"
+    );
+}
+
+#[tokio::test]
 async fn finalize_step_releases_claim_after_review_only_success() {
     let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, _worktree_path) =
         crate::mcp_server::tests::mcp_with_claimed_item("Review-only claim release test item");

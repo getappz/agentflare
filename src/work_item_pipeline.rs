@@ -169,6 +169,27 @@ pub(crate) struct WorkItemData {
     /// fragments. `None` until then, and for review-only runs.
     #[serde(default)]
     pub checkpoint_base_sha: Option<String>,
+    /// Cursor into this item's comment history: every comment strictly newer
+    /// than this timestamp is a candidate correction the pipeline hasn't
+    /// seen yet (item #269/#270). Seeded to the run's start time in
+    /// `fresh_data()`, advanced by the heartbeat-tick comment poll in
+    /// `run_or_resume_with_sender`'s outer loop as it drains new comments
+    /// into `pending_corrections` below.
+    ///
+    /// `#[serde(default)]` for the same reason as `review_only`: runs
+    /// started before this field existed must still deserialize.
+    #[serde(default)]
+    pub last_seen_comment_at: i64,
+    /// Item comments posted since `last_seen_comment_at`'s prior value, not
+    /// authored by this run's own `owner` identity — populated by the
+    /// heartbeat-tick poll (see `poll_pending_corrections`), consumed and
+    /// cleared by `build_sdd_loop_step` at the start of the next role-turn
+    /// prompt, and re-checked as a `finalize` gate immediately before
+    /// `item_done` so a correction that arrives too late for any task turn
+    /// still blocks the PR instead of being silently dropped (item
+    /// #269/#270).
+    #[serde(default)]
+    pub pending_corrections: Vec<String>,
 }
 
 impl flare_workflow::WorkflowData for WorkItemData {
@@ -182,8 +203,8 @@ include!("work_item_pipeline/judge_decision.rs");
 use flare_workflow::executor::FunctionStep;
 use flare_workflow::sqlite_store::SqliteStore;
 use flare_workflow::{
-    StepDefinition, StepId, StepResult, WorkflowContext, WorkflowEngine, WorkflowError, WorkflowId,
-    WorkflowStatus,
+    StateStore, StepDefinition, StepId, StepResult, WorkflowContext, WorkflowEngine, WorkflowError,
+    WorkflowId, WorkflowStatus,
 };
 use std::str::FromStr;
 
@@ -418,6 +439,20 @@ pub(crate) fn build_sdd_loop_step(
                         build_implementer_prompt(&task, None, ctx.data.tdd)
                     };
                     (agent_name.clone(), prompt, !ctx.data.review_only)
+                };
+
+                // Consume any corrections the heartbeat-tick poll picked up
+                // since the last turn (item #269/#270) — prepended once,
+                // right before this turn's dispatch, then cleared so the
+                // same correction isn't repeated on every subsequent turn.
+                let role_prompt = if ctx.data.pending_corrections.is_empty() {
+                    role_prompt
+                } else {
+                    let corrections = ctx.data.pending_corrections.join("\n\n");
+                    ctx.data.pending_corrections.clear();
+                    format!(
+                        "Note -- posted after this task started, read before continuing:\n{corrections}\n\n{role_prompt}"
+                    )
                 };
 
                 let cwd = (!ctx.data.worktree_path.is_empty())
@@ -775,6 +810,33 @@ pub(crate) fn build_finalize_step(
                         return Ok(StepResult::Success);
                     }
 
+                    // A correction landed too late for any task turn to
+                    // consume it (posted after the last `sdd_loop` iteration
+                    // ran, e.g. during the final turn itself) — gate the
+                    // same way `hold_reason` above does rather than silently
+                    // opening a PR the correction says not to (item
+                    // #269/#270's whole premise: PR #753 shipped exactly the
+                    // approach a comment said to disregard).
+                    if !ctx.data.pending_corrections.is_empty() {
+                        let corrections = ctx.data.pending_corrections.join("\n\n---\n\n");
+                        finalize_release_claim_best_effort(&mcp, &item_id, false);
+                        let body = format!(
+                            "## agentflare work — on hold\n\n\
+                             Unread correction posted after this task started -- needs a \
+                             fresh pass before this item can be marked done:\n\n{corrections}"
+                        );
+                        let _ = mcp.comment_impl(CommentRequest {
+                            action: "create".into(),
+                            item_id: Some(item_id.clone()),
+                            body: Some(body.clone()),
+                            ..Default::default()
+                        });
+                        if let Some(recipient) = notify_recipient.as_deref() {
+                            crate::cli::work::notify(recipient, &body, &item_id);
+                        }
+                        return Ok(StepResult::Success);
+                    }
+
                     // Squash checkpoint commits (item #193) into one diff
                     // before `item_done`'s own commit, so the LOC-freeze
                     // gate sees the whole run at once. `.take()`: a retry
@@ -974,6 +1036,70 @@ pub(crate) fn engine() -> &'static WorkflowEngine<WorkItemData, SqliteStore<Work
     &ENGINE
 }
 
+/// Piggybacks on `run_or_resume_with_sender`'s existing heartbeat cadence
+/// (item #269/#270) to catch corrections posted as item comments after this
+/// run claimed the item — the gap that let PR #753 ship the exact approach a
+/// mid-flight correction said to disregard (see the plan doc's reproduction).
+/// Lists the item's comments, keeps the ones newer than the persisted
+/// `last_seen_comment_at` cursor and not authored by this run's own `owner`
+/// identity (so `finalize`'s own hold/success comments never loop back in as
+/// "corrections"), and appends their bodies to `pending_corrections` via
+/// `StateStore::update` — the same load-mutate-write-under-lock primitive
+/// the engine itself uses for every other out-of-band state change, so this
+/// races safely against a concurrently-running step (worst case: a write
+/// landing mid-step gets overwritten by that step's own completion and is
+/// simply re-detected on the next heartbeat tick, since the cursor only
+/// advances once the write actually sticks).
+///
+/// Best-effort throughout: a list/parse/update failure just means this tick
+/// misses the poll, not a fatal run — the next heartbeat tries again.
+async fn poll_pending_corrections(
+    mcp: &AgentflareMcp,
+    eng: &WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>>,
+    run_id: flare_workflow::WorkflowRunId,
+    item_id: &str,
+    owner: &str,
+) {
+    let Ok(listed) = mcp.comment_impl(CommentRequest {
+        action: "list".into(),
+        item_id: Some(item_id.to_string()),
+        ..Default::default()
+    }) else {
+        return;
+    };
+    let Ok(comments) =
+        serde_json::from_str::<Vec<agentflare_backend::comment::ItemComment>>(&listed)
+    else {
+        return;
+    };
+    let Ok(state) = eng.get_status(run_id).await else {
+        return;
+    };
+    let cursor = state.context.data.last_seen_comment_at;
+    let latest_seen = comments.iter().map(|c| c.created_at).max();
+    let corrections: Vec<String> = comments
+        .into_iter()
+        .filter(|c| {
+            c.created_at > cursor
+                && crate::claims::agent_of(&c.author_agent) != crate::claims::agent_of(owner)
+        })
+        .map(|c| c.body)
+        .collect();
+    if corrections.is_empty() {
+        return;
+    }
+    let _ = eng
+        .state_store()
+        .update(run_id, move |s| {
+            s.context.data.pending_corrections.extend(corrections);
+            if let Some(latest) = latest_seen {
+                s.context.data.last_seen_comment_at =
+                    s.context.data.last_seen_comment_at.max(latest);
+            }
+        })
+        .await;
+}
+
 /// Resumable entrypoint `execute_work` (Task 7) calls: (re-)registers the
 /// per-dispatch pipeline definition, starts a fresh run or resumes an
 /// in-flight/crashed one recorded on the item's `workflow_run_id` metadata,
@@ -1097,6 +1223,12 @@ pub(crate) fn run_or_resume_with_sender(
             design_spec,
             tdd,
             worktree_path: worktree_path.clone(),
+            // A resumed run (the other arm below) keeps its own persisted
+            // cursor instead of going through `fresh_data()` — only a
+            // genuinely fresh dispatch seeds it here, to the run's own start
+            // time, so the very first heartbeat poll only surfaces comments
+            // posted after dispatch, not this item's entire history.
+            last_seen_comment_at: crate::claims::now(),
             ..Default::default()
         };
         // Whether `existing_run_id` is still a legitimate handle to resume:
@@ -1184,6 +1316,8 @@ pub(crate) fn run_or_resume_with_sender(
                                 ..Default::default()
                             })
                         });
+                        poll_pending_corrections(&mcp, eng, run_id, &item.id, &heartbeat_owner)
+                            .await;
                         last_heartbeat = std::time::Instant::now();
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
