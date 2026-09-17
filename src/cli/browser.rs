@@ -222,7 +222,7 @@ fn exec_raw(
     extra: &[String],
     auto_install: bool,
 ) -> Result<String, String> {
-    if auto_install && flare_browser::find_backend().is_err() {
+    if auto_install && crate::browser_install::needs_install() {
         println!(
             "agent-browser not found — installing via mise (prebuilt binary, one-time, usually under a minute)…"
         );
