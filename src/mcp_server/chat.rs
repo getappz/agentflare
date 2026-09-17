@@ -6,6 +6,18 @@
 
 use super::*;
 
+/// Chat slash commands: `(menu name, help usage suffix, short description)`.
+/// Single source of truth for the `/help` text below, the Telegram
+/// `setMyCommands` menu (`channels::telegram_bot_commands` reads this), and
+/// the `handle_chat_command` match arms below — add a command here and in
+/// the dispatch, never in only one place.
+pub(crate) const CHAT_COMMAND_SPECS: &[(&str, &str, &str)] = &[
+    ("status", "", "project standup (done / in progress / stuck)"),
+    ("project", "", "the project this chat is linked to"),
+    ("new", " <title>", "create a work item"),
+    ("help", "", "this message"),
+];
+
 impl AgentflareMcp {
     /// Route a parsed `/command args` to its handler and return the reply
     /// text to send back to the chat. Never errors: any failure downstream
@@ -84,13 +96,17 @@ impl AgentflareMcp {
     }
 
     fn chat_help() -> String {
-        "Commands:\n\
-         /status \u{2014} project standup (done / in progress / stuck)\n\
-         /project \u{2014} the project this chat is linked to\n\
-         /new <title> \u{2014} create a work item\n\
-         /help \u{2014} this message\n\
-         Anything else continues your agent session."
-            .to_string()
+        // Built from CHAT_COMMAND_SPECS so the menu, the help text, and the
+        // dispatch can never drift apart.
+        let mut out = String::from("Commands:\n");
+        for (i, (name, usage, desc)) in CHAT_COMMAND_SPECS.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&format!("/{name}{usage} \u{2014} {desc}"));
+        }
+        out.push_str("\nAnything else continues your agent session.");
+        out
     }
 }
 
@@ -156,6 +172,29 @@ mod tests {
         let text = mcp.handle_chat_command("help", "");
         for cmd in ["/status", "/project", "/new", "/help"] {
             assert!(text.contains(cmd), "help text missing {cmd}");
+        }
+    }
+
+    #[test]
+    fn chat_command_specs_render_in_help_and_dispatch() {
+        // Every spec must render in /help and route somewhere other than the
+        // unknown-command fallback. Dispatch runs against the memory backend
+        // (never the real workspace) — even the side-effecting `new` arm
+        // only creates a throwaway in-memory item.
+        let help = AgentflareMcp::chat_help();
+        for (name, usage, _) in CHAT_COMMAND_SPECS {
+            assert!(
+                help.contains(&format!("/{name}{usage}")),
+                "help text missing /{name}{usage}"
+            );
+        }
+        let mem = AgentflareMcp::for_test_memory();
+        for (name, _, _) in CHAT_COMMAND_SPECS {
+            let reply = mem.handle_chat_command(name, "probe-title");
+            assert!(
+                !reply.starts_with("Unknown command"),
+                "/{name} must dispatch, got: {reply}"
+            );
         }
     }
 

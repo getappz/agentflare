@@ -1,0 +1,24 @@
+[package]
+name = "flare-channels"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+description = "Modular channel abstraction for the agentflare platform — Channel trait, message types, registry, and realtime event bus. Transport-agnostic; Telegram/Slack/Discord impls plug in without touching callers."
+repository = "https://github.com/getappz/agentflare"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+ureq = { version = "2", features = ["json"] }
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "sync", "rt"] }
+
+[lints.rust]
+unsafe_code = "warn"
