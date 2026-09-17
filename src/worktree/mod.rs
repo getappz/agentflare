@@ -233,9 +233,16 @@ pub enum PrCiStatus {
     /// CI has a failed check. Carries the PR number so `run_review_sweep`
     /// can post a GitHub-visible stage label/comment for the self-repair
     /// dispatch without a second API round-trip to look the number back up.
+    /// Also carries the PR's current GitHub labels (already in hand from the
+    /// same fetch as `checks`), so a self-repair dispatch can tell whether
+    /// it's replacing a plain in-review label or a stale
+    /// `agentflare:review-repair` one left over from item #273's CodeRabbit
+    /// repair path -- without it, self-repair only ever cleared the
+    /// in-review label, leaving the review-repair label stacked on top.
     Failing {
         number: u64,
         checks: Vec<String>,
+        labels: Vec<String>,
     },
     Pending,
     /// CI is green. Carries the PR number and its GitHub label names so
@@ -370,6 +377,7 @@ fn decide_from_checks(
         return PrCiStatus::Failing {
             number,
             checks: failed,
+            labels,
         };
     }
     // The check-run list above only reflects what GitHub has created so far --
@@ -1232,9 +1240,14 @@ mod tests {
             vec![],
         );
         match pr_ci_status_from_batch(101, &data) {
-            PrCiStatus::Failing { number, checks } => {
+            PrCiStatus::Failing {
+                number,
+                checks,
+                labels,
+            } => {
                 assert_eq!(number, 101);
                 assert_eq!(checks, vec!["clippy".to_string()]);
+                assert!(labels.is_empty());
             }
             other => panic!("expected Failing, got {other:?}"),
         }
