@@ -222,12 +222,15 @@ fn exec_raw(
     extra: &[String],
     auto_install: bool,
 ) -> Result<String, String> {
-    if auto_install && flare_browser::find_backend().is_err() {
-        println!(
-            "agent-browser not found — installing via mise (prebuilt binary, one-time, usually under a minute)…"
-        );
-    }
-    let (backend, path_env) = crate::browser_install::ensure_agent_browser(auto_install)?;
+    let (backend, path_env) = if auto_install && flare_browser::find_backend().is_err() {
+        crate::ui::with_spinner(
+            "agent-browser not found — installing via mise (prebuilt binary, one-time, usually under a minute)…",
+            "agent-browser install finished",
+            || crate::browser_install::ensure_agent_browser(auto_install),
+        )?
+    } else {
+        crate::browser_install::ensure_agent_browser(auto_install)?
+    };
     let argv = flare_browser::build_argv(session, action, positionals, extra)?;
     flare_browser::run_blocking(&backend, &argv, &[], path_env.as_deref())
 }
