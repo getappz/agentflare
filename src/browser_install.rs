@@ -101,6 +101,16 @@ pub fn ensure_agent_browser(auto_install: bool) -> Result<(PathBuf, Option<Strin
     Ok((bin, Some(path_env)))
 }
 
+/// True when [`ensure_agent_browser`] would actually run `mise install`
+/// (neither `find_backend()`'s `PATH` scan nor the cached prior-install file
+/// resolves). Callers use this to gate a "not found, installing…" progress
+/// message so it only fires on the real first-use path -- checking
+/// `find_backend()` alone fires on every call, since the mise git backend
+/// deliberately never touches `PATH` (see the module doc).
+pub fn needs_install() -> bool {
+    flare_browser::find_backend().is_err() && cached_backend().is_none()
+}
+
 /// Where the resolved binary path + its mise `PATH` are cached across
 /// invocations (separate processes never share the `find_backend()`
 /// PATH-scan result, and the mise git backend puts nothing on `PATH`).
