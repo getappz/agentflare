@@ -706,3 +706,51 @@ async fn stale_resumed_session_is_cleared_so_the_retry_sends_a_fresh_prompt() {
         .expect("retry with a fresh prompt must succeed");
     assert!(matches!(result, StepResult::Success));
 }
+
+#[tokio::test]
+async fn pending_correction_is_prepended_to_the_role_prompt_and_cleared() {
+    let (send, calls) = mock_send(vec![
+        "DONE: added the flag",
+        r#"{"action":"advance_task","rationale":"looks done","ledger_line":"Task 0: implementer done","task_model_tier":null}"#,
+    ]);
+    let mut data = one_task_data();
+    data.pending_corrections = vec!["Use `mise env --json`, not `mise which -t`.".to_string()];
+    let step = sdd_step(send);
+    let mut ctx = WorkflowContext::new(Default::default(), data);
+    step.executor.execute(&mut ctx).await.expect("executes");
+
+    let recorded = calls.lock().unwrap();
+    assert!(
+        recorded[0]
+            .1
+            .contains("Use `mise env --json`, not `mise which -t`."),
+        "correction must be prepended to the role prompt, got: {}",
+        recorded[0].1
+    );
+    assert!(
+        recorded[0].1.starts_with("Note --"),
+        "correction note must lead the prompt, got: {}",
+        recorded[0].1
+    );
+    assert!(
+        ctx.data.pending_corrections.is_empty(),
+        "correction must be cleared once consumed, so it isn't repeated next turn"
+    );
+}
+
+#[tokio::test]
+async fn no_pending_corrections_leaves_the_role_prompt_unchanged() {
+    let (send, calls) = mock_send(vec![
+        "DONE: added the flag",
+        r#"{"action":"advance_task","rationale":"looks done","ledger_line":"Task 0: implementer done","task_model_tier":null}"#,
+    ]);
+    let step = sdd_step(send);
+    let mut ctx = WorkflowContext::new(Default::default(), one_task_data());
+    step.executor.execute(&mut ctx).await.expect("executes");
+
+    let recorded = calls.lock().unwrap();
+    assert!(
+        !recorded[0].1.starts_with("Note --"),
+        "no correction note should be added when pending_corrections is empty"
+    );
+}
