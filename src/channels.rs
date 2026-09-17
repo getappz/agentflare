@@ -64,9 +64,9 @@ pub fn build_request(platform: Platform, target: &str, text: &str, token: &str) 
     match platform {
         // Token goes in the URL path; no auth header.
         Platform::Telegram => OutboundRequest {
-            url: format!("https://api.telegram.org/bot{token}/sendMessage"),
+            url: flare_channels::send_message_url(flare_channels::TELEGRAM_API_BASE, token),
             auth: None,
-            body: json!({ "chat_id": target, "text": text }),
+            body: flare_channels::send_body(target, text),
         },
         Platform::Slack => OutboundRequest {
             url: "https://slack.com/api/chat.postMessage".to_string(),
@@ -281,19 +281,10 @@ pub fn build_telegram_card_request(
     buttons: &[(&str, &str)],
     token: &str,
 ) -> OutboundRequest {
-    let row: Vec<Value> = buttons
-        .iter()
-        .map(|(text, data)| json!({ "text": text, "callback_data": data }))
-        .collect();
     OutboundRequest {
-        url: format!("https://api.telegram.org/bot{token}/sendMessage"),
+        url: flare_channels::send_message_url(flare_channels::TELEGRAM_API_BASE, token),
         auth: None,
-        body: json!({
-            "chat_id": target,
-            "text": html_text,
-            "parse_mode": "HTML",
-            "reply_markup": { "inline_keyboard": [row] },
-        }),
+        body: flare_channels::card_body(target, html_text, buttons),
     }
 }
 
@@ -354,9 +345,13 @@ pub fn get_telegram_updates_filtered(
 pub fn answer_telegram_callback(callback_query_id: &str, text: &str) -> Result<(), String> {
     let token = telegram_token()?;
     let req = OutboundRequest {
-        url: format!("https://api.telegram.org/bot{}/answerCallbackQuery", *token),
+        url: flare_channels::method_url(
+            flare_channels::TELEGRAM_API_BASE,
+            &token,
+            "answerCallbackQuery",
+        ),
         auth: None,
-        body: json!({ "callback_query_id": callback_query_id, "text": text }),
+        body: flare_channels::answer_callback_body(callback_query_id, text),
     };
     send(Platform::Telegram, &req)
 }
@@ -366,18 +361,156 @@ pub fn answer_telegram_callback(callback_query_id: &str, text: &str) -> Result<(
 pub fn clear_telegram_reply_markup(chat_id: &str, message_id: i64) -> Result<(), String> {
     let token = telegram_token()?;
     let req = OutboundRequest {
-        url: format!(
-            "https://api.telegram.org/bot{}/editMessageReplyMarkup",
-            *token
+        url: flare_channels::method_url(
+            flare_channels::TELEGRAM_API_BASE,
+            &token,
+            "editMessageReplyMarkup",
         ),
         auth: None,
-        body: json!({
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "reply_markup": { "inline_keyboard": [] },
-        }),
+        body: flare_channels::clear_markup_body(chat_id, message_id),
     };
     send(Platform::Telegram, &req)
+}
+
+/// Bot commands advertised via Telegram `setMyCommands`, sourced from the
+/// same [`crate::mcp_server::chat::CHAT_COMMAND_SPECS`] the `/help` text and
+/// the command dispatch read — one list, three consumers.
+pub fn telegram_bot_commands() -> Vec<flare_channels::BotCommand> {
+    crate::mcp_server::chat::CHAT_COMMAND_SPECS
+        .iter()
+        .filter_map(|(name, _, desc)| flare_channels::BotCommand::new(name, desc))
+        .collect()
+}
+
+/// Clear a stale webhook mapping left by a previous process so `getUpdates`
+/// polling does not hit HTTP 409. Keeps the server-side backlog
+/// (`drop_pending_updates = false`): the supervisor's persisted offset
+/// replays it instead of silently losing messages.
+pub fn clear_telegram_webhook() -> Result<(), String> {
+    let token = telegram_token()?;
+    let req = OutboundRequest {
+        url: flare_channels::method_url(flare_channels::TELEGRAM_API_BASE, &token, "deleteWebhook"),
+        auth: None,
+        body: flare_channels::delete_webhook_body(false),
+    };
+    send(Platform::Telegram, &req)
+}
+
+/// Advertise the command menu. No-op when the specs table is empty.
+pub fn register_telegram_commands() -> Result<(), String> {
+    let commands = telegram_bot_commands();
+    if commands.is_empty() {
+        return Ok(());
+    }
+    let token = telegram_token()?;
+    let req = OutboundRequest {
+        url: flare_channels::method_url(flare_channels::TELEGRAM_API_BASE, &token, "setMyCommands"),
+        auth: None,
+        body: flare_channels::set_commands_body(&commands),
+    };
+    send(Platform::Telegram, &req)
+}
+
+/// One-time Telegram startup: validate the token (`getMe`, fail fast),
+/// clear a stale webhook mapping, and advertise the command menu. Called on
+/// the first supervisor tick; every step is non-fatal (a failure logs and
+/// retries on the next tick, e.g. for a token added later), and success is
+/// remembered for the life of the process.
+pub(crate) fn ensure_telegram_ready() {
+    static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if DONE.get().is_some() {
+        return;
+    }
+    if let Err(e) = telegram_bot_identity() {
+        eprintln!("agentflare-supervisor: telegram startup: token check failed: {e}");
+        return;
+    }
+    if let Err(e) = clear_telegram_webhook() {
+        eprintln!("agentflare-supervisor: telegram startup: {e}");
+        return;
+    }
+    if let Err(e) = register_telegram_commands() {
+        eprintln!("agentflare-supervisor: telegram startup: {e}");
+        return;
+    }
+    let _ = DONE.set(());
+}
+
+/// Process-wide realtime bus for [`flare_channels::ChannelEvent`]s. The
+/// Telegram poller publishes `Inbound`/`Settled`, chat turns publish
+/// `Typing`/`Outbound`, and consumers (dashboard SSE, future gateway WS)
+/// subscribe — no polling, no per-client work.
+static CHAT_BUS: std::sync::OnceLock<flare_channels::ChatBus> = std::sync::OnceLock::new();
+
+/// Clone of the shared realtime bus. Publishing never fails (no listeners
+/// is fine); subscribers lag-drop like the dashboard `/events` stream.
+pub fn chat_bus() -> flare_channels::ChatBus {
+    CHAT_BUS
+        .get_or_init(flare_channels::ChatBus::default)
+        .clone()
+}
+
+/// [`flare_channels::TokenProvider`] backed by the encrypted vault: the
+/// crate asks for a channel alias, this maps it to the matching
+/// [`Platform::secret_name`]. `telegram` and `telegram.<alias>` both resolve
+/// to `telegram_bot_token` (single-bot today, alias-ready for multi-bot);
+/// unknown platforms resolve to `None` rather than erroring.
+pub struct VaultTokens;
+
+impl flare_channels::TokenProvider for VaultTokens {
+    fn token_for(&self, channel: &str) -> Option<String> {
+        let base = channel.split('.').next().unwrap_or(channel);
+        let name = Platform::parse(base)?.secret_name();
+        crate::vault::get_secret(name)
+            .ok()
+            .flatten()
+            .map(|s| s.to_string())
+    }
+}
+
+/// Named live channel handles over `flare-channels` transports. Immutable
+/// after first build, so no lock is held across `.await` sends. Single
+/// `telegram` entry for now — the supervisor's poller and the dashboard
+/// send endpoint share it instead of each hand-rolling HTTP.
+static CHANNEL_HANDLES: std::sync::OnceLock<
+    std::collections::HashMap<String, std::sync::Arc<dyn flare_channels::Channel>>,
+> = std::sync::OnceLock::new();
+
+/// Look up a live channel by alias (`telegram`). `None` for unconfigured
+/// platforms — the caller decides the status code, not this.
+pub fn channel_handle(alias: &str) -> Option<std::sync::Arc<dyn flare_channels::Channel>> {
+    CHANNEL_HANDLES
+        .get_or_init(|| {
+            let mut map = std::collections::HashMap::new();
+            let config = flare_channels::TelegramConfig::default();
+            map.insert(
+                config.alias.clone(),
+                std::sync::Arc::new(flare_channels::TelegramChannel::new(
+                    config,
+                    std::sync::Arc::new(VaultTokens),
+                )) as std::sync::Arc<dyn flare_channels::Channel>,
+            );
+            map
+        })
+        .get(alias)
+        .cloned()
+}
+
+/// Send one message through the named live channel and mirror it on the
+/// realtime bus. New callers (dashboard send endpoint) use this; the
+/// supervisor's existing `send_message` path is untouched.
+pub async fn send_chat(alias: &str, target: &str, text: &str) -> Result<(), String> {
+    let Some(handle) = channel_handle(alias) else {
+        return Err(format!("unknown chat channel: {alias}"));
+    };
+    handle
+        .send(flare_channels::SendMessage::new(target, text))
+        .await
+        .map_err(|e| e.to_string())?;
+    chat_bus().publish(flare_channels::ChannelEvent::Outbound(
+        flare_channels::SendMessage::new(target, text),
+    ));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -512,6 +645,58 @@ mod tests {
                 err.contains("telegram_bot_token"),
                 "should name the missing secret: {err}"
             );
+        });
+    }
+
+    #[test]
+    fn vault_tokens_resolves_aliases_and_rejects_unknown() {
+        use flare_channels::TokenProvider as _;
+        crate::paths::test_support::with_temp_home(|| {
+            let tokens = VaultTokens;
+            // Empty vault: known platforms resolve to None (no panic, no
+            // error) so transports fail later with a clear message.
+            assert!(tokens.token_for("telegram").is_none());
+            assert!(tokens.token_for("telegram.home").is_none());
+            assert!(tokens.token_for("slack").is_none());
+            assert!(tokens.token_for("discord").is_none());
+            // Not a platform prefix: must not match.
+            assert!(tokens.token_for("telegram-bot").is_none());
+            assert!(tokens.token_for("nope").is_none());
+            assert!(tokens.token_for("").is_none());
+        });
+    }
+
+    #[test]
+    fn channel_registry_exposes_telegram_only() {
+        assert!(channel_handle("telegram").is_some());
+        assert!(channel_handle("slack").is_none());
+        assert!(channel_handle("telegram.home").is_none());
+    }
+
+    #[tokio::test]
+    async fn send_chat_rejects_unknown_channel_without_touching_network() {
+        let err = send_chat("nope", "123", "hi")
+            .await
+            .expect_err("unknown channel must error");
+        assert!(err.contains("nope"), "should name the channel: {err}");
+    }
+
+    #[test]
+    fn telegram_bot_commands_mirror_chat_specs() {
+        let commands = telegram_bot_commands();
+        let names: Vec<&str> = commands.iter().map(|c| c.command.as_str()).collect();
+        assert_eq!(names, vec!["status", "project", "new", "help"]);
+    }
+
+    #[test]
+    fn telegram_startup_helpers_fail_cleanly_without_a_token() {
+        // No network touched: with no vault present every step fails at the
+        // token lookup, and ensure_telegram_ready retries on later ticks
+        // (rather than latching) so a token added later still takes effect.
+        crate::paths::test_support::with_temp_home(|| {
+            assert!(clear_telegram_webhook().is_err());
+            assert!(register_telegram_commands().is_err());
+            ensure_telegram_ready();
         });
     }
 }

@@ -119,7 +119,7 @@ pub(crate) fn telegram_channel_checks() -> Vec<CheckResult> {
             "agentflare doctor: channel check -- this bot can reach you.",
         );
         checks.push(CheckResult {
-            host,
+            host: host.clone(),
             component_id: "send_test",
             ok: send_result.is_ok(),
             describe: match send_result {
@@ -128,7 +128,42 @@ pub(crate) fn telegram_channel_checks() -> Vec<CheckResult> {
             },
         });
     }
+    // Live `flare-channels` transport state: registry presence, cumulative
+    // counters, and realtime observers. Local-only, no network.
+    checks.push(CheckResult {
+        host,
+        component_id: "transport",
+        ok: true,
+        describe: transport_describe(),
+    });
     checks
+}
+
+/// Describe the `flare-channels` live transport for the `transport` doctor
+/// check. Informational (`ok: true` always): a zero-traffic transport is a
+/// healthy idle one — the supervisor's own poller predates the crate
+/// transport, so counters only move once flows migrate onto it.
+fn transport_describe() -> String {
+    let Some(handle) = crate::channels::channel_handle("telegram") else {
+        return "telegram transport not registered".to_string();
+    };
+    let status = handle.status();
+    let observers = crate::channels::chat_bus().receiver_count();
+    let mut describe = format!(
+        "transport {} (sent {}, received {}, {} live observers)",
+        if status.connected {
+            "connected"
+        } else {
+            "idle"
+        },
+        status.messages_sent,
+        status.messages_received,
+        observers,
+    );
+    if let Some(err) = status.last_error {
+        describe.push_str(&format!(" — last error: {err}"));
+    }
+    describe
 }
 
 pub(crate) fn stale_rules_for_host(host: &str) -> Vec<StaleRule> {

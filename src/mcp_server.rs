@@ -6,7 +6,7 @@ mod artifact;
 mod asset;
 mod browser;
 mod builtin_tools;
-mod chat;
+pub(crate) mod chat;
 mod claim;
 mod comment;
 mod flare_docs;
