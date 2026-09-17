@@ -243,7 +243,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join(flare_browser::BACKEND_BIN);
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
-        let path = format!("/does/not/exist:{}:/also/missing", dir.display());
+        // Build the fake PATH with the platform's own separator/joining
+        // rules (`:` on Unix, `;` on Windows) -- a hardcoded Unix-style
+        // literal made this test fail on Windows (`split_paths` couldn't
+        // parse it), even though the function under test is platform-correct.
+        let missing_a = std::env::temp_dir().join("agentflare-browser-env-test-missing-a");
+        let missing_b = std::env::temp_dir().join("agentflare-browser-env-test-missing-b");
+        let path = std::env::join_paths([&missing_a, &dir, &missing_b])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let json = serde_json::json!({"PATH": path}).to_string();
         let (resolved_bin, resolved_path) = parse_env_output(&json).unwrap();
         assert_eq!(resolved_bin, bin);
