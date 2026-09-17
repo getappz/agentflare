@@ -74,8 +74,9 @@ impl AgentflareMcp {
             let secrets = secrets.clone();
             let auto_install = flare_browser::auto_install_enabled();
             move || -> Result<String, String> {
-                let backend = crate::browser_install::ensure_agent_browser(auto_install)?;
-                flare_browser::run_blocking(&backend, &argv, &secrets)
+                let (backend, path_env) =
+                    crate::browser_install::ensure_agent_browser(auto_install)?;
+                flare_browser::run_blocking(&backend, &argv, &secrets, path_env.as_deref())
             }
         })
         .await

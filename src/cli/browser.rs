@@ -227,9 +227,9 @@ fn exec_raw(
             "agent-browser not found — installing via mise (prebuilt binary, one-time, usually under a minute)…"
         );
     }
-    let backend = crate::browser_install::ensure_agent_browser(auto_install)?;
+    let (backend, path_env) = crate::browser_install::ensure_agent_browser(auto_install)?;
     let argv = flare_browser::build_argv(session, action, positionals, extra)?;
-    flare_browser::run_blocking(&backend, &argv, &[])
+    flare_browser::run_blocking(&backend, &argv, &[], path_env.as_deref())
 }
 
 fn print_status(session: &str) {
