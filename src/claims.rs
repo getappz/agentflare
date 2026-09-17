@@ -37,7 +37,8 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY (repo, target)
         );",
     )?;
-    add_scope_column_if_missing(conn)
+    add_scope_column_if_missing(conn)?;
+    add_stop_columns_if_missing(conn)
 }
 
 /// Additive migration for installs that created `claims` before the `scope`
@@ -49,6 +50,22 @@ fn add_scope_column_if_missing(conn: &Connection) -> rusqlite::Result<()> {
         .exists([])?;
     if !has_scope {
         conn.execute("ALTER TABLE claims ADD COLUMN scope TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Additive migration for installs that created `claims` before the
+/// stop-signal columns existed (item #297's cooperative stop mechanism) —
+/// same idempotency concern as `add_scope_column_if_missing`.
+fn add_stop_columns_if_missing(conn: &Connection) -> rusqlite::Result<()> {
+    let has_stop: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('claims') WHERE name = 'stop_requested_at'")?
+        .exists([])?;
+    if !has_stop {
+        conn.execute_batch(
+            "ALTER TABLE claims ADD COLUMN stop_requested_at INTEGER;
+             ALTER TABLE claims ADD COLUMN stop_reason TEXT;",
+        )?;
     }
     Ok(())
 }
@@ -95,8 +112,12 @@ pub fn acquire(
         let scope_json = scope.map(|s| serde_json::to_string(s).unwrap_or_default());
         // Scoped to owner: if another owner steals the lease between LEDGER.acquire()
         // and this UPDATE, this must not overwrite their row's provenance with ours.
+        // Also clears any pending stop signal -- acquire() (unlike heartbeat(), the
+        // repeated-refresh call) marks the start of a claim session, so a stop
+        // requested against a prior session shouldn't carry over into a new one.
         conn.execute(
-            "UPDATE claims SET git_commit = ?3, scope = ?5 WHERE repo = ?1 AND target = ?2 AND owner = ?4",
+            "UPDATE claims SET git_commit = ?3, scope = ?5, stop_requested_at = NULL, stop_reason = NULL
+             WHERE repo = ?1 AND target = ?2 AND owner = ?4",
             params![repo, target, git_commit, owner, scope_json],
         )?;
     }
@@ -129,6 +150,59 @@ pub fn done(
     now: i64,
 ) -> rusqlite::Result<bool> {
     LEDGER.done(conn, &[repo, target], owner, now)
+}
+
+/// A pending stop request against a live claim, as read back by `should_stop`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StopSignal {
+    pub reason: Option<String>,
+    pub requested_at: i64,
+}
+
+/// Flags a live claim for cooperative stop -- the human-in-the-loop signal
+/// half of the `should_stop` poll contract (EPIC #131), modeled on
+/// AgentGit's `agt stop <id> --reason` / `agt agent should-stop`. Deliberately
+/// NOT owner-scoped, unlike `heartbeat`/`release`/`done`: like
+/// `reassignment_releases_claim`, this is a human or coordinator asking the
+/// *owner* to stop, so gating it on the caller already being that owner would
+/// defeat the purpose. It is honor-system, same as the reference tool's
+/// worktree-lock half being optional for v1 -- the owner must actually poll
+/// `should_stop` and act on it. Returns false if there is no live claim on
+/// `repo`/`target` to signal.
+pub fn request_stop(
+    conn: &Connection,
+    repo: &str,
+    target: &str,
+    reason: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "UPDATE claims SET stop_requested_at = ?3, stop_reason = ?4
+         WHERE repo = ?1 AND target = ?2 AND status = 'claimed'",
+        params![repo, target, now, reason],
+    )? > 0)
+}
+
+/// Read-only poll: is a stop currently requested for this claim? Meant to be
+/// called from inside an agent's own work loop (mirrors `agt agent
+/// should-stop --exit-code`'s 0/1/>1 exit-code contract at the CLI layer).
+pub fn should_stop(
+    conn: &Connection,
+    repo: &str,
+    target: &str,
+) -> rusqlite::Result<Option<StopSignal>> {
+    conn.query_row(
+        "SELECT stop_requested_at, stop_reason FROM claims
+         WHERE repo = ?1 AND target = ?2 AND stop_requested_at IS NOT NULL",
+        params![repo, target],
+        |r| {
+            Ok(StopSignal {
+                requested_at: r.get(0)?,
+                reason: r.get(1)?,
+            })
+        },
+    )
+    .optional()
 }
 
 /// Lists claims (optionally scoped to `repo`). With `include_stale = false`,
@@ -567,6 +641,44 @@ mod tests {
         acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap();
         let claims = list(&c, Some("o/r"), true, 1000, TTL).unwrap();
         assert!(claims[0].scope.is_empty());
+    }
+
+    #[test]
+    fn should_stop_is_none_until_requested_then_some_with_reason() {
+        let c = mem();
+        acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap();
+        assert!(should_stop(&c, "o/r", "issue#1").unwrap().is_none());
+
+        assert!(request_stop(&c, "o/r", "issue#1", Some("pausing for review"), 1500).unwrap());
+        let signal = should_stop(&c, "o/r", "issue#1").unwrap().unwrap();
+        assert_eq!(signal.reason.as_deref(), Some("pausing for review"));
+        assert_eq!(signal.requested_at, 1500);
+    }
+
+    #[test]
+    fn request_stop_returns_false_when_no_live_claim() {
+        let c = mem();
+        assert!(!request_stop(&c, "o/r", "issue#1", None, 1000).unwrap());
+
+        acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap();
+        done(&c, "o/r", "issue#1", "a:1", 1000).unwrap();
+        assert!(
+            !request_stop(&c, "o/r", "issue#1", None, 1100).unwrap(),
+            "a done claim is no longer live -- nothing to signal"
+        );
+    }
+
+    #[test]
+    fn reacquiring_clears_a_stale_stop_signal_from_a_prior_session() {
+        let c = mem();
+        acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap();
+        request_stop(&c, "o/r", "issue#1", Some("stop"), 1100).unwrap();
+        assert!(should_stop(&c, "o/r", "issue#1").unwrap().is_some());
+
+        // Same owner re-acquiring (e.g. re-running `claim acquire`) starts a
+        // fresh session -- the old stop signal shouldn't silently persist.
+        acquire(&c, "o/r", "issue#1", "a:1", None, None, 1200, TTL).unwrap();
+        assert!(should_stop(&c, "o/r", "issue#1").unwrap().is_none());
     }
 
     #[test]

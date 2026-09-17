@@ -53,15 +53,38 @@ pub enum ClaimAction {
         #[arg(long)]
         all_repos: bool,
     },
+    /// Ask a live claim's owner to stop (human-in-the-loop signal). Honor
+    /// system: the owner must poll `should-stop` and act on it -- this does
+    /// not itself interrupt or lock anything.
+    Stop {
+        target: String,
+        #[arg(long)]
+        repo: Option<String>,
+        /// Why the agent should stop -- surfaced back to it by `should-stop`.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Poll whether a stop has been requested for a target. Designed to be
+    /// called from inside an agent's own work loop. Exit code: 0 = stop
+    /// requested, 1 = continue (no stop signal), >1 = error running the check.
+    ShouldStop {
+        target: String,
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 impl ClaimArgs {
     pub fn run(self) {
+        // `should-stop` reserves exit 1 for its own "continue" outcome, so an
+        // infra failure (can't even open the ledger) must exit >1 here or a
+        // polling script would misread "ledger unreachable" as "keep going".
+        let is_should_stop = matches!(self.action, ClaimAction::ShouldStop { .. });
         let conn = match crate::db::open() {
             Ok(c) => c,
             Err(e) => {
                 crate::ui::error(&format!("claim: cannot open ledger: {e}"));
-                std::process::exit(1);
+                std::process::exit(if is_should_stop { 2 } else { 1 });
             }
         };
         let owner = crate::claims::owner_id();
@@ -129,6 +152,49 @@ impl ClaimArgs {
                         }
                     }
                     Err(e) => fail(e),
+                }
+            }
+            ClaimAction::Stop {
+                target,
+                repo,
+                reason,
+            } => {
+                let repo = require_repo(repo);
+                match crate::claims::request_stop(&conn, &repo, &target, reason.as_deref(), now) {
+                    Ok(true) => println!("stop requested for {repo} {target}"),
+                    Ok(false) => {
+                        crate::ui::error(&format!("{repo} {target}: no live claim to signal"));
+                        std::process::exit(1);
+                    }
+                    Err(e) => fail(e),
+                }
+            }
+            ClaimAction::ShouldStop { target, repo } => {
+                let repo = match crate::claims::resolve_repo(repo) {
+                    Some(r) => r,
+                    None => {
+                        crate::ui::error(
+                            "claim: could not determine repo — run inside a git repo or pass --repo owner/name",
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                match crate::claims::should_stop(&conn, &repo, &target) {
+                    Ok(Some(signal)) => {
+                        match signal.reason {
+                            Some(r) => println!("stop requested: {r}"),
+                            None => println!("stop requested"),
+                        }
+                        std::process::exit(0);
+                    }
+                    Ok(None) => {
+                        println!("continue");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        crate::ui::error(&format!("claim: ledger error: {e}"));
+                        std::process::exit(2);
+                    }
                 }
             }
         }
