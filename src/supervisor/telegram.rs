@@ -281,6 +281,14 @@ pub(crate) fn handle_chat_message(
         mcp,
         move || {
             settle(update_offset);
+            // Persist right away rather than waiting for the next tick's
+            // end-of-tick call: a free-text turn can settle in the gap
+            // between ticks, and leaving the vault stale until the
+            // following tick's `get_telegram_updates_filtered` call would
+            // let Telegram redeliver this already-handled update, which by
+            // then is no longer in `IN_FLIGHT_UPDATE_OFFSETS` -- dispatching
+            // it a second time.
+            persist_offset_if_advanced();
             crate::channels::chat_bus().publish(flare_channels::ChannelEvent::Settled {
                 channel: flare_channels::TELEGRAM_CHANNEL_NAME.to_string(),
                 id: update_id.to_string(),
