@@ -31,10 +31,23 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 
 use agentflare_shim::{
-    in_scoped_project, is_set, path_without_shim_dir, run_real, tool_name_from_exe, trace,
+    REENTRY_MARKER, in_scoped_project, is_set, path_without_shim_dir, run_real, tool_name_from_exe,
+    trace,
 };
 
-const KILL_SWITCHES: &[&str] = &["LEAN_CTX_DISABLED", "LEAN_CTX_NO_HOOK"];
+/// Any of these set means "exec the real tool, never spawn lean-ctx":
+/// lean-ctx's own user-facing opt-outs, lean-ctx's ownership marker (a parent
+/// lean-ctx already owns compression of this command tree, so a nested
+/// `lean-ctx -c` would only pass through -- one more process hop for
+/// nothing), and agentflare's own [`REENTRY_MARKER`], the one guard that
+/// survives every lean-ctx spawn path (see its doc comment for the
+/// fork-bomb this closes).
+const KILL_SWITCHES: &[&str] = &[
+    "LEAN_CTX_DISABLED",
+    "LEAN_CTX_NO_HOOK",
+    "LEAN_CTX_WRAPPED",
+    REENTRY_MARKER,
+];
 
 const AGENT_ENV_VARS: &[&str] = &[
     "LEAN_CTX_AGENT",
@@ -80,6 +93,10 @@ fn main() {
     // flashing one just to run lean-ctx.
     let mut cmd = flare_process::command("lean-ctx");
     cmd.arg("-c").arg(&tool).args(&args);
+    // Everything lean-ctx spawns for this command inherits the marker, so a
+    // nested shim hit (or a re-sourced `.bashenv` function) execs the real
+    // tool instead of starting the loop over.
+    cmd.env(REENTRY_MARKER, "1");
     if let Some(p) = &filtered_path {
         cmd.env("PATH", p);
     }
