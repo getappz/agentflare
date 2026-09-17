@@ -104,21 +104,27 @@ pub fn send_body(target: &str, text: &str) -> serde_json::Value {
     serde_json::json!({ "chat_id": target, "text": text })
 }
 
-/// Body for an HTML `sendMessage` carrying one row of inline-keyboard
-/// buttons (`(label, callback_data)` pairs). HTML needs only `&`/`<`/`>`
-/// escaped, unlike the much larger MarkdownV2 escape set.
+/// Body for an HTML `sendMessage`, optionally carrying one row of
+/// inline-keyboard buttons (`(label, callback_data)` pairs). HTML needs only
+/// `&`/`<`/`>` escaped, unlike the much larger MarkdownV2 escape set. An
+/// empty `buttons` omits `reply_markup` entirely rather than sending an
+/// empty button row -- this is the plain-card path (formatted text, no
+/// action) shared by any gate that has no follow-up a human can tap.
 #[must_use]
 pub fn card_body(target: &str, html_text: &str, buttons: &[(&str, &str)]) -> serde_json::Value {
-    let row: Vec<serde_json::Value> = buttons
-        .iter()
-        .map(|(text, data)| serde_json::json!({ "text": text, "callback_data": data }))
-        .collect();
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "chat_id": target,
         "text": html_text,
         "parse_mode": "HTML",
-        "reply_markup": { "inline_keyboard": [row] },
-    })
+    });
+    if !buttons.is_empty() {
+        let row: Vec<serde_json::Value> = buttons
+            .iter()
+            .map(|(text, data)| serde_json::json!({ "text": text, "callback_data": data }))
+            .collect();
+        body["reply_markup"] = serde_json::json!({ "inline_keyboard": [row] });
+    }
+    body
 }
 
 /// Body acknowledging a tapped button (toast on the button; required quickly
@@ -876,6 +882,13 @@ mod tests {
             body["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
             "approve:x"
         );
+    }
+
+    #[test]
+    fn card_body_omits_reply_markup_without_buttons() {
+        let body = card_body("42", "<b>hi</b>", &[]);
+        assert_eq!(body["parse_mode"], "HTML");
+        assert!(body.get("reply_markup").is_none());
     }
 
     #[test]

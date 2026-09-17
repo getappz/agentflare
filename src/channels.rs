@@ -5,10 +5,17 @@
 //! the encrypted `gateway_secrets` store; the inbound daemon (flared) reuses
 //! this same path to send its replies.
 //!
-//! Request shapes per platform:
-//! - Telegram: `POST {base}/bot{token}/sendMessage`  body `{chat_id, text}`     (token in URL)
-//! - Slack:    `POST slack.com/api/chat.postMessage`  body `{channel, text}`    (Authorization: Bearer)
-//! - Discord:  `POST discord.com/api/v10/channels/{id}/messages`  body `{content}` (Authorization: Bot)
+//! Each platform renders `text` with whatever presentation it actually
+//! supports, rather than a flat string everywhere:
+//! - Telegram: `POST {base}/bot{token}/sendMessage`  body `{chat_id, text}` (token in URL).
+//!   Card sends (approval gates) additionally set `parse_mode: HTML` and an
+//!   inline keyboard -- see [`build_telegram_card_request`].
+//! - Slack:    `POST slack.com/api/chat.postMessage`  body `{channel, text, blocks}`
+//!   (Authorization: Bearer) -- `blocks` is a single Block Kit section so the
+//!   message renders as a card; `text` stays a plain fallback (Slack's own
+//!   notification/accessibility copy for clients that don't render blocks).
+//! - Discord:  `POST discord.com/api/v10/channels/{id}/messages`  body `{embeds}`
+//!   (Authorization: Bot) -- one embed carrying `text` as its description.
 //!
 //! Each platform needs a bot token stored under [`Platform::secret_name`] via
 //! `agentflare vault set <secret_name>` (value piped over stdin) before
@@ -58,7 +65,8 @@ pub struct OutboundRequest {
     pub body: Value,
 }
 
-/// Build the platform-specific send request for a plain-text message.
+/// Build the platform-specific send request, rendered with whatever card
+/// presentation that platform supports rather than a flat string.
 #[must_use]
 pub fn build_request(platform: Platform, target: &str, text: &str, token: &str) -> OutboundRequest {
     match platform {
@@ -68,16 +76,30 @@ pub fn build_request(platform: Platform, target: &str, text: &str, token: &str) 
             auth: None,
             body: flare_channels::send_body(target, text),
         },
+        // `blocks` is one Block Kit section so Slack renders this as a card
+        // rather than a bare line; `text` stays alongside it as the
+        // required fallback Slack uses for push notifications and clients
+        // that don't render blocks. No interactive elements (buttons) yet --
+        // that needs a Slack interactivity endpoint to receive the tap,
+        // which nothing in this codebase serves today (unlike Telegram's
+        // `getUpdates` poller).
         Platform::Slack => OutboundRequest {
             url: "https://slack.com/api/chat.postMessage".to_string(),
             auth: Some(format!("Bearer {token}")),
-            body: json!({ "channel": target, "text": text }),
+            body: json!({
+                "channel": target,
+                "text": text,
+                "blocks": [
+                    { "type": "section", "text": { "type": "mrkdwn", "text": text } }
+                ],
+            }),
         },
-        // Discord uses the literal `Bot ` auth prefix (not `Bearer`).
+        // Discord uses the literal `Bot ` auth prefix (not `Bearer`), and
+        // renders an embed as a card rather than plain message content.
         Platform::Discord => OutboundRequest {
             url: format!("https://discord.com/api/v10/channels/{target}/messages"),
             auth: Some(format!("Bot {token}")),
-            body: json!({ "content": text }),
+            body: json!({ "embeds": [{ "description": text }] }),
         },
     }
 }
@@ -562,7 +584,14 @@ mod tests {
         assert_eq!(r.url, "https://slack.com/api/chat.postMessage");
         assert_eq!(r.auth.as_deref(), Some("Bearer xoxb-TOK"));
         assert_eq!(r.body["channel"], "C123");
+        // Plain-text fallback stays present (Slack notification/accessibility
+        // copy for clients that don't render blocks)...
         assert_eq!(r.body["text"], "hi");
+        // ...alongside a Block Kit section carrying the same text as mrkdwn,
+        // so it renders as a card rather than a bare line.
+        assert_eq!(r.body["blocks"][0]["type"], "section");
+        assert_eq!(r.body["blocks"][0]["text"]["type"], "mrkdwn");
+        assert_eq!(r.body["blocks"][0]["text"]["text"], "hi");
     }
 
     #[test]
@@ -570,7 +599,7 @@ mod tests {
         let r = build_request(Platform::Discord, "999", "hi", "TOK");
         assert_eq!(r.url, "https://discord.com/api/v10/channels/999/messages");
         assert_eq!(r.auth.as_deref(), Some("Bot TOK"));
-        assert_eq!(r.body["content"], "hi");
+        assert_eq!(r.body["embeds"][0]["description"], "hi");
     }
 
     #[test]
