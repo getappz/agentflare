@@ -43,6 +43,30 @@ fn test_notify_disabled() -> bool {
     false
 }
 
+/// Cap on `notify_human_gate`'s summarized reason line. Some callers (e.g.
+/// `cli::work_auth_expiry`'s `handle_auth_expired`) pass a `reason` that
+/// embeds a dispatch failure's full message, which can itself carry
+/// `agent_launch::diagnostic_suffix`'s multi-KB raw stdout/stderr/sandbox-log
+/// tail (item #269) -- fine in the item comment thread, unreadable as a
+/// phone push notification.
+const NOTIFY_REASON_MAX_CHARS: usize = 240;
+
+/// Reduces a possibly multi-line, possibly huge failure `reason` to the last
+/// non-blank line (where the actual error typically ends up, after any raw
+/// output dumped above it), capped to `NOTIFY_REASON_MAX_CHARS`.
+fn summarize_reason(reason: &str) -> String {
+    let last_line = reason
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(reason)
+        .trim();
+    match last_line.char_indices().nth(NOTIFY_REASON_MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &last_line[..cut]),
+        None => last_line.to_string(),
+    }
+}
+
 /// Best-effort Telegram ping for an item that just landed on a human gate
 /// (a go/no-go decision, an unanswerable question, or a CI self-repair cap).
 /// Silently does nothing when `TELEGRAM_NOTIFY_CHAT_ID_SECRET` isn't
@@ -56,6 +80,7 @@ pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &
     let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
         return;
     };
+    let reason = summarize_reason(reason);
     let text = format!(
         "agentflare: item #{} ({}) needs a human -- {reason}",
         item.sequence_id, item.id
@@ -185,4 +210,36 @@ pub(crate) fn first_time_gated(item_id: &str) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(item_id.to_string())
+}
+
+#[cfg(test)]
+mod summarize_reason_tests {
+    use super::*;
+
+    #[test]
+    fn passes_short_single_line_reasons_through_unchanged() {
+        assert_eq!(
+            summarize_reason("gated pending a go/no-go decision"),
+            "gated pending a go/no-go decision"
+        );
+    }
+
+    #[test]
+    fn takes_the_last_non_blank_line_of_a_multiline_reason() {
+        // Item #269-shaped: a raw stdout/JSON dump followed by the actual
+        // error on its own trailing line (`diagnostic_suffix`'s shape).
+        let reason = "{\"type\":\"assistant\",\"text\":\"...\"}\n\n\nerror: token expired";
+        assert_eq!(summarize_reason(reason), "error: token expired");
+    }
+
+    #[test]
+    fn caps_an_overlong_line_and_marks_the_cut() {
+        let long_line = "x".repeat(NOTIFY_REASON_MAX_CHARS + 50);
+        let summarized = summarize_reason(&long_line);
+        assert_eq!(
+            summarized.chars().count(),
+            NOTIFY_REASON_MAX_CHARS + 1 // + the "…" marker
+        );
+        assert!(summarized.ends_with('…'));
+    }
 }
