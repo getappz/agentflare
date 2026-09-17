@@ -1005,7 +1005,11 @@ fn handle_pr_status(
                 result.skipped += 1;
             }
         }
-        crate::worktree::PrCiStatus::Failing { number, checks } => {
+        crate::worktree::PrCiStatus::Failing {
+            number,
+            checks,
+            labels,
+        } => {
             match self_repair_or_gate(
                 mcp,
                 queue,
@@ -1014,6 +1018,7 @@ fn handle_pr_status(
                 item,
                 number,
                 &checks,
+                &labels,
                 label_id_by_name,
                 folder_path,
             ) {
@@ -1050,23 +1055,33 @@ fn handle_pr_status(
                 // Not merged (no approval yet, or the merge call itself was
                 // rejected) -- CI being green doesn't mean the PR is actually
                 // done if CodeRabbit's own review still has unresolved
-                // findings sitting on it untouched (item #273).
-                let findings = fetch_unresolved_coderabbit_comments(repo_root, number);
-                match coderabbit_repair_or_gate(
-                    mcp,
-                    queue,
-                    auth_conn,
-                    host_policy,
-                    item,
-                    number,
-                    &findings,
-                    &labels,
-                    label_id_by_name,
-                    folder_path,
-                ) {
-                    SelfRepairOutcome::Dispatched => result.review_repaired += 1,
-                    SelfRepairOutcome::Deferred => result.waiting += 1,
-                    SelfRepairOutcome::Skipped => result.skipped += 1,
+                // findings sitting on it untouched (item #273). Skip the two
+                // live GitHub calls this fetch costs entirely once the item
+                // is already gated or a repair job is already in flight --
+                // `coderabbit_repair_or_gate` would just discard the findings
+                // and return `Skipped` anyway, but not before paying for the
+                // fetch on every single tick for as long as the PR sits
+                // gated or in-flight.
+                if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
+                    result.skipped += 1;
+                } else {
+                    let findings = fetch_unresolved_coderabbit_comments(repo_root, number);
+                    match coderabbit_repair_or_gate(
+                        mcp,
+                        queue,
+                        auth_conn,
+                        host_policy,
+                        item,
+                        number,
+                        &findings,
+                        &labels,
+                        label_id_by_name,
+                        folder_path,
+                    ) {
+                        SelfRepairOutcome::Dispatched => result.review_repaired += 1,
+                        SelfRepairOutcome::Deferred => result.waiting += 1,
+                        SelfRepairOutcome::Skipped => result.skipped += 1,
+                    }
                 }
             }
         }
@@ -1281,6 +1296,45 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
 pub(crate) mod notify;
 pub(crate) use notify::*;
 
+/// Whether `item` is already gated for a human (`NEEDS_HUMAN_GATE_LABEL`) or
+/// has an `agentflare-work` job already queued/running -- the short-circuit
+/// both `self_repair_or_gate` and `coderabbit_repair_or_gate` open with, and
+/// what `handle_pr_status` checks up front before paying for a live
+/// CodeRabbit-findings fetch it would otherwise throw away immediately (item
+/// #273 follow-up: that fetch used to run unconditionally on every tick for
+/// as long as a PR sat gated or in-flight).
+fn already_gated_or_in_flight(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    item: &agentflare_backend::item::Item,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+) -> bool {
+    let already_gated = label_id_by_name
+        .get(NEEDS_HUMAN_GATE_LABEL)
+        .is_some_and(|gate_id| {
+            mcp.with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
+                .ok()
+                .and_then(Result::ok)
+                .is_some_and(|ids| ids.contains(gate_id))
+        });
+    already_gated || job_in_flight(queue, &item.id)
+}
+
+/// Which in-progress PR stage label a self-repair dispatch should remove
+/// before adding `SELF_REPAIR_PR_LABEL` -- whichever of the known stage
+/// labels the PR is currently carrying. CI self-repair and item #273's
+/// CodeRabbit review-repair run against the same PR at different times, so a
+/// PR heading into self-repair isn't always leaving plain in-review -- it
+/// might be leaving `CODERABBIT_REPAIR_PR_LABEL` instead. Without checking
+/// for that, a PR whose CI broke while under review-repair ended up with
+/// both labels stacked, since removing a label that isn't there is a
+/// silent no-op.
+fn stale_stage_label(labels: &[String]) -> Option<&'static str> {
+    [IN_REVIEW_PR_LABEL, CODERABBIT_REPAIR_PR_LABEL]
+        .into_iter()
+        .find(|l| labels.iter().any(|have| have == l))
+}
+
 /// Dispatches a self-repair job for an item whose PR has failing CI checks,
 /// or -- once `quota::decide::SELF_REPAIR_CAP` prior attempts have been made
 /// with no green build -- gates it for a human instead of retrying forever.
@@ -1293,18 +1347,11 @@ fn self_repair_or_gate(
     item: &agentflare_backend::item::Item,
     pr_number: u64,
     failed_checks: &[String],
+    labels: &[String],
     label_id_by_name: &std::collections::HashMap<String, String>,
     folder_path: &str,
 ) -> SelfRepairOutcome {
-    let already_gated = label_id_by_name
-        .get(NEEDS_HUMAN_GATE_LABEL)
-        .is_some_and(|gate_id| {
-            mcp.with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
-                .ok()
-                .and_then(Result::ok)
-                .is_some_and(|ids| ids.contains(gate_id))
-        });
-    if already_gated || job_in_flight(queue, &item.id) {
+    if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
         return SelfRepairOutcome::Skipped;
     }
 
@@ -1442,7 +1489,7 @@ fn self_repair_or_gate(
     update_pr_stage(
         folder_path,
         pr_number,
-        Some(IN_REVIEW_PR_LABEL),
+        stale_stage_label(labels),
         SELF_REPAIR_PR_LABEL,
         &dispatch_message,
     );
@@ -1534,15 +1581,7 @@ fn coderabbit_repair_or_gate(
     label_id_by_name: &std::collections::HashMap<String, String>,
     folder_path: &str,
 ) -> SelfRepairOutcome {
-    let already_gated = label_id_by_name
-        .get(NEEDS_HUMAN_GATE_LABEL)
-        .is_some_and(|gate_id| {
-            mcp.with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
-                .ok()
-                .and_then(Result::ok)
-                .is_some_and(|ids| ids.contains(gate_id))
-        });
-    if already_gated || job_in_flight(queue, &item.id) {
+    if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
         return SelfRepairOutcome::Skipped;
     }
 

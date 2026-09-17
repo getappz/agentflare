@@ -1634,6 +1634,7 @@ fn self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment() {
         &item,
         1,
         &["clippy".to_string()],
+        &[],
         &label_id_by_name,
         "/repo",
     );
@@ -1699,6 +1700,7 @@ fn self_repair_or_gate_gates_instead_of_dispatching_once_the_cap_is_reached() {
             &item,
             1,
             &["clippy".to_string()],
+            &[],
             &label_id_by_name,
             "/repo",
         );
@@ -1738,6 +1740,7 @@ fn self_repair_or_gate_stays_quiet_once_already_gated() {
         &item,
         1,
         &["clippy".to_string()],
+        &[],
         &label_id_by_name,
         "/repo",
     );
@@ -1773,6 +1776,7 @@ fn self_repair_or_gate_still_skips_gracefully_when_unassigned_and_no_router_rule
             &item,
             1,
             &["clippy".to_string()],
+            &[],
             &label_id_by_name,
             "/repo",
         );
@@ -1805,6 +1809,7 @@ fn self_repair_or_gate_does_not_double_dispatch_while_a_job_is_already_in_flight
         &item,
         1,
         &["clippy".to_string()],
+        &[],
         &label_id_by_name,
         "/repo",
     );
@@ -1841,6 +1846,7 @@ fn self_repair_or_gate_defers_instead_of_dispatching_into_a_still_live_claim() {
         &item,
         1,
         &["clippy".to_string()],
+        &[],
         &label_id_by_name,
         "/repo",
     );
@@ -1860,6 +1866,27 @@ fn self_repair_or_gate_defers_instead_of_dispatching_into_a_still_live_claim() {
         "a deferred attempt must not post a self-repair-dispatched marker, \
          or it would count against the cap on a later real attempt"
     );
+}
+
+// Regression for item #273's follow-up: a PR heading into CI self-repair
+// isn't always leaving plain in-review -- it might be leaving CodeRabbit's
+// own review-repair stage instead, and removing a label that isn't there is
+// a silent no-op, so the wrong `from` label left both stacked on the PR.
+#[test]
+fn stale_stage_label_picks_the_coderabbit_review_repair_label_when_present() {
+    let labels = vec![CODERABBIT_REPAIR_PR_LABEL.to_string()];
+    assert_eq!(stale_stage_label(&labels), Some(CODERABBIT_REPAIR_PR_LABEL));
+}
+
+#[test]
+fn stale_stage_label_falls_back_to_the_in_review_label() {
+    let labels = vec![IN_REVIEW_PR_LABEL.to_string()];
+    assert_eq!(stale_stage_label(&labels), Some(IN_REVIEW_PR_LABEL));
+}
+
+#[test]
+fn stale_stage_label_is_none_when_neither_stage_label_is_present() {
+    assert_eq!(stale_stage_label(&[]), None);
 }
 
 // --- coderabbit_repair_or_gate (item #273) ---
