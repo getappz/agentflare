@@ -1338,6 +1338,22 @@ mod tests {
     }
 
     #[test]
+    fn browser_rule_is_included_in_joined_hosts() {
+        // Hosts that concatenate rule_text::all() (cursor, codex, windsurf,
+        // vscode-copilot, cline) should pick up BROWSER automatically once
+        // it's added to all() -- no per-host wiring needed for those.
+        for host in ["cursor", "codex", "windsurf", "vscode-copilot", "cline"] {
+            let targets = rule_targets(host);
+            assert!(
+                targets
+                    .iter()
+                    .any(|(_, content)| content.contains(rule_text::BROWSER)),
+                "'{host}' joined rule content should include the browser rule text"
+            );
+        }
+    }
+
+    #[test]
     fn rule_targets_includes_coaching_sourced_rule_for_claude_code_and_opencode() {
         crate::paths::test_support::with_temp_home(|| {
             crate::coaching::apply_rule(
