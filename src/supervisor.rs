@@ -63,6 +63,11 @@ const PR_APPROVAL_LABEL: &str = "status:pr:approved";
 const IN_REVIEW_PR_LABEL: &str = "agentflare:in-review";
 const SELF_REPAIR_PR_LABEL: &str = "agentflare:self-repair";
 const NEEDS_HUMAN_PR_LABEL: &str = "agentflare:needs-human";
+/// Stage label for a PR with a genuine merge conflict (`PrCiStatus::Conflicting`,
+/// item #271) while `rebase_or_gate` has a rebase job dispatched against it --
+/// same vocabulary extension as `SELF_REPAIR_PR_LABEL`, just for the
+/// conflict-with-base-branch case rather than failing CI.
+const CONFLICT_PR_LABEL: &str = "agentflare:conflict";
 
 /// Best-effort GitHub-visible stage transition for a PR: removes `from` (if
 /// any -- tolerates it already being absent, same as every other caller of
@@ -628,6 +633,13 @@ fn dispatch_item(
 /// the same way an item's `metadata` isn't otherwise touched by this file.
 const CI_SELF_REPAIR_MARKER: &str = "## supervisor — CI self-repair dispatched";
 
+/// Marker prefix on a rebase-dispatch comment (see `rebase_or_gate` below) --
+/// mirrors `CI_SELF_REPAIR_MARKER`'s role: `run_review_sweep` counts these on
+/// an item to enforce `quota::decide::SELF_REPAIR_CAP` against merge-conflict
+/// rebase attempts the same way it does against failing-CI ones, without a
+/// separate persistent counter.
+const REBASE_CONFLICT_MARKER: &str = "## supervisor — merge-conflict rebase dispatched";
+
 pub(crate) struct ReviewSweepResult {
     pub promoted: usize,
     pub self_repaired: usize,
@@ -651,10 +663,17 @@ pub(crate) struct ReviewSweepResult {
     /// item is picked up by the *next* tick's normal per-item loop, not this
     /// one.
     pub discovered: usize,
+    /// PRs with a genuine merge conflict (`PrCiStatus::Conflicting`, item
+    /// #271) this sweep dispatched a capped rebase job for via
+    /// `rebase_or_gate` -- kept distinct from `self_repaired` since it's a
+    /// different failure mode (conflict with base branch, not failing CI)
+    /// even though the dispatch mechanics mirror it.
+    pub rebase_dispatched: usize,
 }
 
-/// Why `self_repair_or_gate` did or didn't dispatch. A plain `bool` can't
-/// distinguish "decided against this item" from "try again next sweep".
+/// Why `self_repair_or_gate`/`rebase_or_gate` did or didn't dispatch. A plain
+/// `bool` can't distinguish "decided against this item" from "try again next
+/// sweep".
 enum SelfRepairOutcome {
     Dispatched,
     /// Retryable: the blocking condition (cooldown, host pressure) is
@@ -712,6 +731,7 @@ pub(crate) fn run_review_sweep(
         waiting: 0,
         updated: 0,
         discovered: 0,
+        rebase_dispatched: 0,
     };
     // Computed once, not per-project/per-PR: identifies this workstation to
     // `claim_pr_for_discovery`'s marker comment so two workstations racing to
@@ -1001,14 +1021,18 @@ fn handle_pr_status(
         }
         crate::worktree::PrCiStatus::Passing { number, labels } => {
             // CI just went green -- if the PR was still carrying a
-            // self-repair/needs-human stage label from before, swap it back
-            // to plain in-review rather than leaving a stale "under repair"
-            // label on a now-passing PR. `labels` is already in hand from
-            // the batched/single fetch above, so this only touches GitHub
-            // when there's actually something to revert.
-            if let Some(stale) = [SELF_REPAIR_PR_LABEL, NEEDS_HUMAN_PR_LABEL]
-                .into_iter()
-                .find(|l| labels.iter().any(|have| have == l))
+            // self-repair/conflict/needs-human stage label from before, swap
+            // it back to plain in-review rather than leaving a stale "under
+            // repair" label on a now-passing PR. `labels` is already in hand
+            // from the batched/single fetch above, so this only touches
+            // GitHub when there's actually something to revert.
+            if let Some(stale) = [
+                SELF_REPAIR_PR_LABEL,
+                CONFLICT_PR_LABEL,
+                NEEDS_HUMAN_PR_LABEL,
+            ]
+            .into_iter()
+            .find(|l| labels.iter().any(|have| have == l))
             {
                 update_pr_stage(
                     folder_path,
@@ -1032,6 +1056,22 @@ fn handle_pr_status(
                 result.updated += 1;
             } else {
                 result.skipped += 1;
+            }
+        }
+        crate::worktree::PrCiStatus::Conflicting { number } => {
+            match rebase_or_gate(
+                mcp,
+                queue,
+                auth_conn,
+                host_policy,
+                item,
+                number,
+                label_id_by_name,
+                folder_path,
+            ) {
+                SelfRepairOutcome::Dispatched => result.rebase_dispatched += 1,
+                SelfRepairOutcome::Deferred => result.waiting += 1,
+                SelfRepairOutcome::Skipped => result.skipped += 1,
             }
         }
         crate::worktree::PrCiStatus::Pending | crate::worktree::PrCiStatus::Unknown => {
@@ -1359,7 +1399,14 @@ fn self_repair_or_gate(
         crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
             .zip(crate::github::Client::new().ok());
     if let Some((repo, client)) = repo_and_client
-        && !claim_self_repair(&client, &repo, pr_number, &item.id, crate::claims::now())
+        && !claim_self_repair(
+            &client,
+            &repo,
+            pr_number,
+            &item.id,
+            crate::claims::now(),
+            "self-repair",
+        )
     {
         return SelfRepairOutcome::Deferred;
     }
@@ -1406,6 +1453,172 @@ fn self_repair_or_gate(
     SelfRepairOutcome::Dispatched
 }
 
+/// Dispatches a rebase job for an item whose PR has a genuine merge conflict
+/// with its base branch (`PrCiStatus::Conflicting`, item #271), or -- once
+/// `quota::decide::SELF_REPAIR_CAP` prior attempts have been made with no
+/// clean merge -- gates it for a human instead of retrying forever. Mirrors
+/// `self_repair_or_gate` above arm for arm: same cap/claim/cooldown/host-gate
+/// sequence, since a merge conflict and failing CI are both "this PR can't
+/// land yet, and an agent needs to push a fix" -- they only differ in what
+/// the dispatched job needs to do and which stage label reflects it on
+/// GitHub. Not merged into one function since the two statuses carry
+/// different payloads (`checks` vs none) and doing so would mean threading
+/// an `Option<&[String]>` through the CI-only cap/dispatch messages just to
+/// keep them accurate.
+#[allow(clippy::too_many_arguments)]
+fn rebase_or_gate(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    auth_conn: &rusqlite::Connection,
+    host_policy: agentflare_resource_gate::Policy,
+    item: &agentflare_backend::item::Item,
+    pr_number: u64,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+    folder_path: &str,
+) -> SelfRepairOutcome {
+    let already_gated = label_id_by_name
+        .get(NEEDS_HUMAN_GATE_LABEL)
+        .is_some_and(|gate_id| {
+            mcp.with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
+                .ok()
+                .and_then(Result::ok)
+                .is_some_and(|ids| ids.contains(gate_id))
+        });
+    if already_gated || job_in_flight(queue, &item.id) {
+        return SelfRepairOutcome::Skipped;
+    }
+
+    let prior_attempts = mcp
+        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
+        .ok()
+        .and_then(Result::ok)
+        .map(|comments| {
+            comments
+                .iter()
+                .filter(|c| c.body.starts_with(REBASE_CONFLICT_MARKER))
+                .count() as u32
+        })
+        .unwrap_or(0);
+
+    if prior_attempts >= crate::quota::decide::SELF_REPAIR_CAP {
+        let cap_message = format!(
+            "## supervisor — rebase cap reached\n\nThis PR has a merge conflict with its base \
+             branch. {} automatic rebase attempt(s) already made with no clean merge — needs a \
+             human look.",
+            crate::quota::decide::SELF_REPAIR_CAP,
+        );
+        let _ = mcp.comment_impl(CommentRequest {
+            action: "create".into(),
+            item_id: Some(item.id.clone()),
+            body: Some(cap_message.clone()),
+            ..Default::default()
+        });
+        if let Some(gate_id) = label_id_by_name.get(NEEDS_HUMAN_GATE_LABEL) {
+            let _ = mcp.item_add_label(ItemRequest {
+                action: "add_label".into(),
+                id: Some(item.id.clone()),
+                label_id: Some(gate_id.clone()),
+                ..Default::default()
+            });
+        }
+        update_pr_stage(
+            folder_path,
+            pr_number,
+            Some(CONFLICT_PR_LABEL),
+            NEEDS_HUMAN_PR_LABEL,
+            &cap_message,
+        );
+        notify_human_gate(
+            item,
+            &format!(
+                "Merge-conflict rebase cap reached ({} attempt(s), still conflicting)",
+                crate::quota::decide::SELF_REPAIR_CAP,
+            ),
+        );
+        return SelfRepairOutcome::Skipped;
+    }
+
+    // Same reasoning as `self_repair_or_gate`'s identical check (item #114):
+    // dispatching while the item's own claim is still live would just die
+    // instantly at `execute_work`'s claim-acquire step.
+    let claim_still_live = mcp
+        .with_backend_db(|conn| {
+            let requested_ttl = crate::mcp_server::types::backend_claim_ttl_secs();
+            let ttl = agentflare_backend::claim::effective_ttl_secs(conn, &item.id, requested_ttl);
+            agentflare_backend::claim::has_active_claim_by_other(
+                conn,
+                &item.id,
+                "",
+                crate::claims::now(),
+                ttl,
+            )
+        })
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false);
+    if claim_still_live {
+        return SelfRepairOutcome::Deferred;
+    }
+
+    // Same cross-machine arbitration as `self_repair_or_gate` (item #261):
+    // this workstation's local claim check above can't see another
+    // workstation's own sweep already dispatching a rebase for this PR.
+    let repo_and_client =
+        crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
+            .zip(crate::github::Client::new().ok());
+    if let Some((repo, client)) = repo_and_client
+        && !claim_self_repair(
+            &client,
+            &repo,
+            pr_number,
+            &item.id,
+            crate::claims::now(),
+            "conflict rebase",
+        )
+    {
+        return SelfRepairOutcome::Deferred;
+    }
+
+    let Some(agent) = item
+        .assignee_agent
+        .as_deref()
+        .and_then(resolve_confirmed_agent)
+        .or_else(|| route_unassigned(item))
+    else {
+        return SelfRepairOutcome::Skipped;
+    };
+    if crate::auth_db::is_cooling_down(auth_conn, agent.as_str()) {
+        return SelfRepairOutcome::Deferred;
+    }
+    if host_policy.blocks_dispatch() {
+        return SelfRepairOutcome::Deferred;
+    }
+    let reason = "resolve merge conflict with base branch".to_string();
+    let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), Some(&reason)) else {
+        return SelfRepairOutcome::Skipped;
+    };
+    let dispatch_message = format!(
+        "{REBASE_CONFLICT_MARKER}\n\nThis PR has a merge conflict with its base branch.\n\n\
+         Please rebase (or merge) onto the latest base branch, resolve the conflict, and \
+         push.\n\njob: {}",
+        info.id,
+    );
+    let _ = mcp.comment_impl(CommentRequest {
+        action: "create".into(),
+        item_id: Some(item.id.clone()),
+        body: Some(dispatch_message.clone()),
+        ..Default::default()
+    });
+    update_pr_stage(
+        folder_path,
+        pr_number,
+        Some(IN_REVIEW_PR_LABEL),
+        CONFLICT_PR_LABEL,
+        &dispatch_message,
+    );
+    SelfRepairOutcome::Dispatched
+}
+
 /// TTL a self-repair PR claim marker stays live for. Reuses the same
 /// duration as the backend item-claim TTL (`claim_still_live` above) rather
 /// than a bespoke constant, since both bound how long a single self-repair
@@ -1415,7 +1628,8 @@ fn self_repair_claim_ttl_secs() -> i64 {
     crate::mcp_server::types::backend_claim_ttl_secs()
 }
 
-/// Cross-machine arbitration for self-repair dispatch (item #261). Reuses
+/// Cross-machine arbitration for self-repair/rebase dispatch (item #261,
+/// extended for conflict-rebase dispatch by item #271). Reuses
 /// `github::bridge::claim`'s TTL+heartbeat marker resolution -- the same
 /// optimistic two-step `github::bridge::tick::try_claim` already uses for
 /// issue claiming (post our marker, re-read, confirm we're still the
@@ -1424,15 +1638,19 @@ fn self_repair_claim_ttl_secs() -> i64 {
 /// another workstation is DEFINITELY already holding a live claim; any
 /// GitHub error along the way soft-fails toward `true` (proceed) rather than
 /// blocking every repair attempt on a transient API hiccup -- a rare missed
-/// race producing one duplicate self-repair dispatch is a far smaller harm
-/// than self-repair silently never running again, the same trade-off
+/// race producing one duplicate dispatch is a far smaller harm than repair
+/// silently never running again, the same trade-off
 /// `discover_untracked_prs`'s own `find_existing` soft-fail already makes.
+/// `purpose` only shapes the human-readable claim comment (e.g.
+/// "self-repair" vs "conflict rebase") -- the marker/arbitration logic
+/// itself doesn't care which caller is claiming.
 fn claim_self_repair(
     client: &crate::github::Client,
     repo: &crate::github::RepoId,
     pr_number: u64,
     item_id: &str,
     now: i64,
+    purpose: &str,
 ) -> bool {
     use crate::github::bridge::claim as claim_rules;
     use crate::github::bridge::marker::{Action, Marker};
@@ -1461,7 +1679,7 @@ fn claim_self_repair(
         client,
         repo,
         pr_number,
-        &format!("Claiming self-repair for `{me}`.\n\n{}", marker.render()),
+        &format!("Claiming {purpose} for `{me}`.\n\n{}", marker.render()),
     )
     .is_err()
     {

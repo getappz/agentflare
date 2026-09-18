@@ -222,8 +222,9 @@ pub fn relabel_pr_completed(item: &agentflare_backend::item::Item, repo_root: &P
 /// CI signal the in-review sweep (`supervisor::run_review_sweep`, item #65)
 /// polls per item: merged (promote), failing (self-repair), CI-green with a
 /// human approval label attached (auto-merge, item #194), cleanly behind the
-/// base branch with no conflict (update-branch, item #197's follow-up), or
-/// nothing actionable yet. `Unknown` covers every soft-fail case
+/// base branch with no conflict (update-branch, item #197's follow-up),
+/// genuinely conflicting with the base branch (rebase-dispatch, item #271),
+/// or nothing actionable yet. `Unknown` covers every soft-fail case
 /// `is_pr_merged` above also treats as "not merged yet" -- no credentials,
 /// no resolvable remote, no PR found, or a lookup error -- since the
 /// caller's fallback is simply to poll again next tick.
@@ -252,6 +253,17 @@ pub enum PrCiStatus {
     /// them here would be wasted work the branch update is about to
     /// invalidate anyway.
     Behind {
+        number: u64,
+    },
+    /// GitHub's own `mergeable_state == "dirty"` (REST) / `mergeStateStatus
+    /// == DIRTY` (GraphQL, lowercased by `parse_batch_pr` to the same
+    /// string) -- a genuine merge conflict with the base branch, unlike
+    /// `Behind` which GitHub can resolve server-side. No server-side fix
+    /// exists for this one, so `run_review_sweep` dispatches a capped
+    /// rebase job instead of an `update_stale_branch` call. Checked before
+    /// CI status is fetched for the same reason `Behind` is: existing check
+    /// runs are stale against a branch that's about to be rewritten anyway.
+    Conflicting {
         number: u64,
     },
     Unknown,
@@ -319,6 +331,9 @@ fn pr_ci_status_impl(
     }
     if pr.mergeable == Some(true) && pr.mergeable_state.as_deref() == Some("behind") {
         return PrCiStatus::Behind { number: pr.number };
+    }
+    if pr.mergeable_state.as_deref() == Some("dirty") {
+        return PrCiStatus::Conflicting { number: pr.number };
     }
     let Some(sha) = pr.head.as_ref().map(|h| h.sha.clone()) else {
         return PrCiStatus::Unknown;
@@ -403,6 +418,9 @@ pub(crate) fn pr_ci_status_from_batch(
     }
     if data.mergeable == Some(true) && data.mergeable_state.as_deref() == Some("behind") {
         return PrCiStatus::Behind { number };
+    }
+    if data.mergeable_state.as_deref() == Some("dirty") {
+        return PrCiStatus::Conflicting { number };
     }
     decide_from_checks(
         number,
@@ -1120,6 +1138,33 @@ mod tests {
     }
 
     #[test]
+    fn pr_ci_status_reports_conflicting_before_ever_fetching_check_runs() {
+        // GitHub's own mergeable_state == "dirty": a genuine merge conflict
+        // with the base branch, not the "behind" case above -- there's no
+        // server-side fix for this, so `run_review_sweep` must dispatch a
+        // rebase job instead. Only one request should fire, same reasoning
+        // as the "behind" case: stale check runs aren't worth fetching for a
+        // branch that's about to be rewritten anyway.
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"{"number":755,"html_url":"u","state":"open","title":"t","mergeable":false,"mergeable_state":"dirty"}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        let item = item_with_metadata(271, r#"{"pr":{"number":755,"branch":"whatever"}}"#);
+
+        let status = pr_ci_status_impl(&item, Path::new("/does/not/exist"), &client, &repo);
+
+        assert!(matches!(status, PrCiStatus::Conflicting { number: 755 }));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
     fn update_branch_pr_succeeds_on_a_clean_update() {
         let server = crate::github::test_support::MockServer::start(vec![
             crate::github::test_support::MockResponse::json(202, r#"{"message":"Updating"}"#),
@@ -1198,6 +1243,15 @@ mod tests {
         assert!(matches!(
             pr_ci_status_from_batch(101, &data),
             PrCiStatus::Behind { number: 101 }
+        ));
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_reports_conflicting_before_checks() {
+        let data = batch_data(false, Some(false), Some("dirty"), vec![], vec![]);
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Conflicting { number: 101 }
         ));
     }
 

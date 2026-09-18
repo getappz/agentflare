@@ -246,11 +246,20 @@ fn spawn_supervisor_review_sweep(
             .await;
             match result {
                 Ok(s)
-                    if s.promoted > 0 || s.self_repaired > 0 || s.waiting > 0 || s.updated > 0 =>
+                    if s.promoted > 0
+                        || s.self_repaired > 0
+                        || s.waiting > 0
+                        || s.updated > 0
+                        || s.rebase_dispatched > 0 =>
                 {
                     eprintln!(
-                        "agentflare-supervisor: review sweep promoted {}, self-repaired {}, updated {}, skipped {}, waiting {}",
-                        s.promoted, s.self_repaired, s.updated, s.skipped, s.waiting
+                        "agentflare-supervisor: review sweep promoted {}, self-repaired {}, rebase-dispatched {}, updated {}, skipped {}, waiting {}",
+                        s.promoted,
+                        s.self_repaired,
+                        s.rebase_dispatched,
+                        s.updated,
+                        s.skipped,
+                        s.waiting
                     );
                 }
                 Ok(_) => {}

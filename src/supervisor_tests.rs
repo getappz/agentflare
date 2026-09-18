@@ -1543,7 +1543,14 @@ fn claim_self_repair_wins_and_posts_a_marker_when_the_pr_has_no_live_claim() {
         repo: "r".into(),
     };
 
-    assert!(claim_self_repair(&client, &repo, 688, "i1", 1_000));
+    assert!(claim_self_repair(
+        &client,
+        &repo,
+        688,
+        "i1",
+        1_000,
+        "self-repair"
+    ));
 
     let reqs = server.requests();
     assert_eq!(reqs.len(), 3);
@@ -1575,7 +1582,14 @@ fn claim_self_repair_defers_when_another_workstation_already_holds_a_live_claim(
         repo: "r".into(),
     };
 
-    assert!(!claim_self_repair(&client, &repo, 688, "i1", 1_050));
+    assert!(!claim_self_repair(
+        &client,
+        &repo,
+        688,
+        "i1",
+        1_050,
+        "self-repair"
+    ));
 
     // Must back off WITHOUT posting a second claim marker -- only the initial
     // read is expected; a second mock response is deliberately not queued,
@@ -1608,7 +1622,14 @@ fn claim_self_repair_proceeds_when_the_only_existing_claim_has_gone_stale() {
         repo: "r".into(),
     };
 
-    assert!(claim_self_repair(&client, &repo, 688, "i1", 10_000));
+    assert!(claim_self_repair(
+        &client,
+        &repo,
+        688,
+        "i1",
+        10_000,
+        "self-repair"
+    ));
     assert_eq!(server.requests().len(), 3);
 }
 
@@ -1699,6 +1720,94 @@ fn self_repair_or_gate_gates_instead_of_dispatching_once_the_cap_is_reached() {
             &item,
             1,
             &["clippy".to_string()],
+            &label_id_by_name,
+            "/repo",
+        );
+
+        assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+        assert!(queue.list(None).unwrap().is_empty());
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(labels_contain_name(&mcp, &labels, NEEDS_HUMAN_GATE_LABEL));
+    });
+}
+
+#[test]
+fn rebase_or_gate_dispatches_a_job_and_posts_a_marker_comment() {
+    // Mirrors `self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment`
+    // for the merge-conflict path (item #271): same dispatch mechanics, a
+    // different marker/label/reason since there's nothing analogous to
+    // `failed_checks` for a conflict.
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    let label_id_by_name = seed_gate_label(&mcp);
+    let auth_conn = test_auth_conn();
+
+    let outcome = rebase_or_gate(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        1,
+        &label_id_by_name,
+        "/repo",
+    );
+
+    assert!(matches!(outcome, SelfRepairOutcome::Dispatched));
+    let jobs = queue.list(None).unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].args.contains(&item_id));
+    assert_eq!(
+        jobs[0].dispatch_reason.as_deref(),
+        Some("resolve merge conflict with base branch")
+    );
+    let comments = mcp
+        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item_id).unwrap())
+        .unwrap();
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.body.starts_with(REBASE_CONFLICT_MARKER))
+    );
+}
+
+#[test]
+fn rebase_or_gate_gates_instead_of_dispatching_once_the_cap_is_reached() {
+    // Mirrors `self_repair_or_gate_gates_instead_of_dispatching_once_the_cap_is_reached`
+    // for the merge-conflict path.
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+        let label_id_by_name = seed_gate_label(&mcp);
+        let auth_conn = test_auth_conn();
+
+        for _ in 0..crate::quota::decide::SELF_REPAIR_CAP {
+            mcp.comment_impl(CommentRequest {
+                action: "create".into(),
+                item_id: Some(item_id.clone()),
+                body: Some(format!("{REBASE_CONFLICT_MARKER}\n\njob: prior")),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap();
+
+        let outcome = rebase_or_gate(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            1,
             &label_id_by_name,
             "/repo",
         );
