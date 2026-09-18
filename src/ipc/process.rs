@@ -21,6 +21,8 @@ pub fn is_alive(pid: u32) -> bool {
     {
         let status = std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
         matches!(status, Ok(s) if s.success())
     }
@@ -92,6 +94,8 @@ pub fn terminate_gracefully(pid: u32) -> Result<(), String> {
     {
         let status = std::process::Command::new("kill")
             .args(["-TERM", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .map_err(|e| format!("kill -TERM: {e}"))?;
         if status.success() {
@@ -119,6 +123,8 @@ pub fn force_kill(pid: u32) -> Result<(), String> {
     {
         let status = std::process::Command::new("kill")
             .args(["-KILL", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .map_err(|e| format!("kill -KILL: {e}"))?;
         if status.success() {
