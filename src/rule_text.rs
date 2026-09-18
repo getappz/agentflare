@@ -52,8 +52,13 @@ pub const FLARE_DOCS_SUPERSEDED: &[&str] = &[
 @scope: every session + subagent"#,
 ];
 
+pub const BROWSER: &str = r#"@use: `agentflare browser` — agent-first browser automation CLI (Playwright-based sidecar, auto-installs on first use)
+@commands: open <url>, snapshot (accessibility tree with @e refs — primary page read), click/fill <ref-or-selector>, get text|html|value|title|url, read [url] (agent-readable markdown), screenshot, eval <js>, batch "<cmd1>" "<cmd2>", close, doctor
+@scope: sessions isolate per working directory by default (`af-<hash>`); pin explicitly with `--session <id>` / `$AGENTFLARE_BROWSER_SESSION` so concurrent worktrees don't collide
+@how: `agentflare browser --help` for the full subcommand list"#;
+
 pub fn all() -> Vec<&'static str> {
-    vec![EXA, GIT, LEANCTX, FLARE_DOCS]
+    vec![EXA, GIT, LEANCTX, FLARE_DOCS, BROWSER]
 }
 
 /// opencode's own PreToolUse-equivalent: a local plugin dropped into
