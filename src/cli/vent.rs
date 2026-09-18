@@ -68,10 +68,10 @@ pub fn run(args: VentArgs) {
             for id in r.items_created {
                 crate::ui::step(&format!("filed item {id}"));
             }
-            if r.escalated + r.acknowledged + r.resolved > 0 {
+            if r.escalated + r.acknowledged + r.resolved + r.held > 0 {
                 crate::ui::info(&format!(
-                    "escalations: {} re-escalated, {} acknowledged, {} resolved",
-                    r.escalated, r.acknowledged, r.resolved
+                    "escalations: {} re-escalated, {} acknowledged, {} resolved, {} held (triaged)",
+                    r.escalated, r.acknowledged, r.resolved, r.held
                 ));
             }
         }

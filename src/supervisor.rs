@@ -1074,7 +1074,17 @@ fn handle_pr_status(
                     "## supervisor — CI green\n\nChecks are passing again.",
                 );
             }
-            if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) && first_time_gated(&item.id) {
+            // Namespaced ("pr-approval:<id>", not the bare item id): the
+            // underlying set is keyed globally across every gate type in
+            // this file (see `dispatch_item`'s "plan:" comment) -- an
+            // unnamespaced key here silently starves this card of its
+            // once-per-gate notify if the item was already gated for an
+            // unrelated reason earlier in its life (e.g. the go/no-go
+            // decision gate below, or `skip_item`), since that gate's call
+            // already consumed the bare-id token (item #587).
+            if !labels.iter().any(|l| l == PR_APPROVAL_LABEL)
+                && first_time_gated(&format!("pr-approval:{}", item.id))
+            {
                 notify_pr_approval_gate(item, folder_path, number);
             }
             if merge_if_approved(mcp, item, repo_root, number, &labels) {

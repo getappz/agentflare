@@ -67,7 +67,7 @@ pub fn global_filed_path() -> PathBuf {
 }
 
 pub fn backend_db_path() -> PathBuf {
-    crate::paths::home().join(".agentflare").join("backend.db")
+    crate::paths::agentflare_dir().join("backend.db")
 }
 
 #[cfg(test)]

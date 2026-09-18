@@ -106,7 +106,7 @@ pub fn spawn_if_enabled() -> Option<std::thread::JoinHandle<()>> {
 /// the same file is the normal way to give a background thread its own
 /// handle.
 fn open_items_db() -> Option<rusqlite::Connection> {
-    let path = crate::paths::home().join(".agentflare").join("backend.db");
+    let path = crate::paths::agentflare_dir().join("backend.db");
     match agentflare_backend::db::open_db(&path) {
         Ok(c) => Some(c),
         Err(e) => {

@@ -9,7 +9,7 @@ pub fn serve(host: &str, port: u16, dir: Option<std::path::PathBuf>) {
             Ok(s) => Arc::new(ArtifactStore::with_store(s)),
             Err(e) => {
                 eprintln!("[artifacts] fallback to flat-file store: {e}");
-                let d = crate::paths::home().join(".agentflare").join("artifacts");
+                let d = crate::paths::agentflare_dir().join("artifacts");
                 Arc::new(ArtifactStore::new(d))
             }
         }

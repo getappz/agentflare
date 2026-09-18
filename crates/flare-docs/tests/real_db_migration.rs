@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 fn real_db() -> Option<PathBuf> {
-    let p = dirs::home_dir()?.join(".agentflare").join("flare-docs.db");
+    let p = agentflare_config::agentflare_dir().join("flare-docs.db");
     p.exists().then_some(p)
 }
 

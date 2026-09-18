@@ -117,9 +117,7 @@ fn install_opts() -> InstallOptions {
 }
 
 fn load_registries() -> Vec<String> {
-    let path = crate::paths::home()
-        .join(".agentflare")
-        .join("registries.json");
+    let path = crate::paths::agentflare_dir().join("registries.json");
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|b| serde_json::from_str(&b).ok())
@@ -127,9 +125,7 @@ fn load_registries() -> Vec<String> {
 }
 
 fn save_registries(registries: &[String]) {
-    let path = crate::paths::home()
-        .join(".agentflare")
-        .join("registries.json");
+    let path = crate::paths::agentflare_dir().join("registries.json");
     if let Some(p) = path.parent() {
         let _ = std::fs::create_dir_all(p);
     }

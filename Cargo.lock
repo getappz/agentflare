@@ -145,6 +145,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentflare-approval"
+version = "0.1.0"
+dependencies = [
+ "agentflare-db-kit",
+ "agentflare-store",
+ "agentflare-workspace-hack",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agentflare-apps"
 version = "0.1.0"
 dependencies = [
@@ -296,6 +312,7 @@ dependencies = [
 name = "agentflare-jobs"
 version = "0.1.0"
 dependencies = [
+ "agentflare-config",
  "agentflare-db-kit",
  "agentflare-workspace-hack",
  "flare-process",
@@ -422,7 +439,6 @@ dependencies = [
  "regex-syntax",
  "reqwest 0.13.4",
  "rmcp",
- "rustix 1.1.4",
  "rustls",
  "rustls-webpki",
  "serde",
@@ -1544,10 +1560,10 @@ dependencies = [
 name = "flare-docs"
 version = "0.1.0"
 dependencies = [
+ "agentflare-config",
  "agentflare-db-kit",
  "agentflare-store",
  "agentflare-workspace-hack",
- "dirs",
  "flate2",
  "rusqlite",
  "rustdoc-types",

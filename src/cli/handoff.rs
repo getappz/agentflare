@@ -98,7 +98,7 @@ impl HandoffArgs {
                 Err(e) => {
                     eprintln!("[handoff] fallback to flat-file store: {e}");
                     agentflare_artifacts::ArtifactStore::new(
-                        crate::paths::home().join(".agentflare").join("artifacts"),
+                        crate::paths::agentflare_dir().join("artifacts"),
                     )
                 }
             },

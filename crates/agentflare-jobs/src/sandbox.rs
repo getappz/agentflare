@@ -207,20 +207,18 @@ fn config() -> SandboxConfig {
 /// (see `OPENCODE_STATE`'s `diagnostic_log`) gets written to -- nested under
 /// `.agentflare` because that's already a real, host-persistent writable
 /// bind (`WRITABLE_HOME_DIRS`), so no additional bind is needed.
-const DIAGNOSTIC_SUBDIR: &str = ".agentflare/sandbox-diagnostics";
-
 /// Absolute host path a sandboxed run's diagnostic-log tail (if any) would
 /// be written to for the given unique `token`. The caller creates this
 /// path's parent directory before spawning (so the bind exists even on a
 /// box's very first sandboxed run) and reads + removes it after the child
-/// exits -- see `agent_launch::run_headless_impl`. `None` if `$HOME` can't
-/// be resolved, mirroring `wrap`'s own fallback when sandboxing is
-/// unavailable.
+/// exits -- see `agent_launch::run_headless_impl`. `None` if no home
+/// directory can be resolved at all, mirroring `wrap`'s own fallback when
+/// sandboxing is unavailable.
 pub fn diagnostic_path(token: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
     Some(
-        Path::new(&home)
-            .join(DIAGNOSTIC_SUBDIR)
+        agentflare_config::try_home()?
+            .join(".agentflare")
+            .join("sandbox-diagnostics")
             .join(format!("{token}.log")),
     )
 }

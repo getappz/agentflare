@@ -8,7 +8,7 @@ pub fn open_readonly(path: &Path) -> rusqlite::Result<Connection> {
 
 /// Open the PM backend database (`~/.agentflare/backend.db`) read-only.
 pub fn pm_db_readonly() -> rusqlite::Result<Connection> {
-    let path = crate::paths::home().join(".agentflare").join("backend.db");
+    let path = crate::paths::agentflare_dir().join("backend.db");
     open_readonly(&path)
 }
 
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn pm_db_readonly_rejects_writes() {
         crate::paths::test_support::with_temp_home(|| {
-            let agentflare_dir = crate::paths::home().join(".agentflare");
+            let agentflare_dir = crate::paths::agentflare_dir();
             std::fs::create_dir_all(&agentflare_dir).unwrap();
             let path = agentflare_dir.join("backend.db");
             {

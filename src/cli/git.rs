@@ -12,7 +12,6 @@
 //! through a Bash/shell tool slips past it. A native git hook is the
 //! shell-agnostic enforcement boundary. See item #132 follow-up.
 
-use crate::paths::home;
 use clap::{Args, Subcommand};
 use flare_git_core::shell::BoundedLinesError;
 use flare_git_core::{
@@ -242,7 +241,7 @@ pub struct ShipArgs {
 
 /// Canonical location: `~/.agentflare/githooks/`.
 fn shared_hooks_dir() -> PathBuf {
-    home().join(".agentflare").join("githooks")
+    crate::paths::agentflare_dir().join("githooks")
 }
 
 /// The hook scripts embedded as the canonical source of truth. Written into
@@ -302,7 +301,7 @@ pub fn run(args: GitArgs) {
 /// `agentflare-shim` (item #227's lean-ctx PATH shim) already uses, so
 /// there's one PATH entry to manage, not several.
 pub(crate) fn shims_dir() -> PathBuf {
-    home().join(".agentflare").join("shims")
+    crate::paths::agentflare_dir().join("shims")
 }
 
 pub(crate) fn shim_dest_name() -> &'static str {

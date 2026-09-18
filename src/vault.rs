@@ -75,7 +75,7 @@ pub fn cache_passphrase(passphrase: &str) {
 }
 
 fn vault_path() -> std::path::PathBuf {
-    crate::paths::home().join(".agentflare").join("vault.json")
+    crate::paths::agentflare_dir().join("vault.json")
 }
 
 pub fn ensure_vault() -> Result<(), String> {

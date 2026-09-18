@@ -547,7 +547,7 @@ impl AgentflareMcp {
                         }
                         Err(e) => {
                             eprintln!("[artifacts] fallback to flat-file store: {e}");
-                            let dir = crate::paths::home().join(".agentflare").join("artifacts");
+                            let dir = crate::paths::agentflare_dir().join("artifacts");
                             std::sync::Arc::new(agentflare_artifacts::ArtifactStore::new(dir))
                         }
                     };
@@ -623,7 +623,7 @@ impl AgentflareMcp {
 
     /// Directory the per-repo project link (`project.json`) lives under.
     /// Same name as this codebase's global per-user data dir
-    /// (`crate::paths::home().join(".agentflare")`, holding `agentflare.db`,
+    /// (`crate::paths::agentflare_dir()`, holding `agentflare.db`,
     /// artifacts, etc.) — that's fine ONLY because `find_root_from`'s
     /// walk-up is hard-bounded to never reach the user's home directory
     /// (see below); the global dir only ever exists at exactly that one
@@ -815,7 +815,7 @@ impl AgentflareMcp {
             let db_path = self
                 .backend_db_override
                 .clone()
-                .unwrap_or_else(|| crate::paths::home().join(".agentflare").join("backend.db"));
+                .unwrap_or_else(|| crate::paths::agentflare_dir().join("backend.db"));
             let conn = agentflare_backend::db::open_db(&db_path)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
             *guard = Some(conn);
@@ -854,7 +854,7 @@ impl AgentflareMcp {
         if let Ok(bg) = self.backend_db.try_lock()
             && let Some(ref conn) = *bg
         {
-            let base_path = crate::paths::home().join(".agentflare");
+            let base_path = crate::paths::agentflare_dir();
             if let Ok(s) = self.store.lock()
                 && let Some(ref store) = *s
             {
@@ -937,7 +937,7 @@ impl AgentflareMcp {
         Ok(serde_json::json!({ "sent": true, "platform": platform, "target": target }).to_string())
     }
     #[tool(
-        description = "Records a path-scoped write lock in the claim ledger so the git shim's scope-check can tell concurrent agents' edits apart -- it does NOT provision a worktree, a branch, or a directory of any kind. Single consolidated tool with `action` field (acquire|done|heartbeat|list|release). If you need an isolated worktree to actually do file edits in, use the `item` tool's own `claim` action instead (`item(action=\"claim\", id=<item>)`) -- that is the one that creates the worktree; this `claim` tool and that one share a name but do different things."
+        description = "Records a path-scoped write lock in the claim ledger so the git shim's scope-check can tell concurrent agents' edits apart -- it does NOT provision a worktree, a branch, or a directory of any kind. Single consolidated tool with `action` field (acquire|done|heartbeat|list|release|should_stop|stop). `stop`/`should_stop` are a cooperative human-in-the-loop signal (EPIC #131): `stop` flags a live claim asking its owner to pause, `should_stop` is a read-only poll an owner calls from inside its own work loop to check for that flag -- honor system, not an enforced interrupt. If you need an isolated worktree to actually do file edits in, use the `item` tool's own `claim` action instead (`item(action=\"claim\", id=<item>)`) -- that is the one that creates the worktree; this `claim` tool and that one share a name but do different things."
     )]
     fn claim(&self, Parameters(req): Parameters<ClaimRequest>) -> Result<String, ErrorData> {
         self.claim_impl(req)
@@ -1000,9 +1000,7 @@ impl AgentflareMcp {
         for msg in crate::gateway_integrations::auto_register_local() {
             eprintln!("agentflare: gateway {msg}");
         }
-        let path = crate::paths::home()
-            .join(".agentflare")
-            .join("gateway.toml");
+        let path = crate::gateway_integrations::gateway_toml_path();
         match std::fs::read_to_string(&path) {
             Ok(s) => match gateway_registry::parse_config(&s) {
                 Ok(config) => config,

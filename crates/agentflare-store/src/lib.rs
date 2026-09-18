@@ -1,3 +1,4 @@
+pub mod approval;
 pub mod blobs;
 pub mod chunk;
 pub mod documents;

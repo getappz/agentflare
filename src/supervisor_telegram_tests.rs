@@ -261,7 +261,7 @@ fn safe_offset_to_persist_is_ceiling_when_nothing_in_flight() {
 #[test]
 fn safe_offset_to_persist_caps_below_earliest_in_flight_update() {
     let in_flight = std::collections::BTreeSet::from([30, 45]);
-    assert_eq!(safe_offset_to_persist(50, &in_flight), 30);
+    assert_eq!(safe_offset_to_persist(50, &in_flight), 29);
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn safe_offset_to_persist_withholds_a_later_offset_while_an_earlier_one_is_still
     // must not be silently confirmed just because update N+1 (e.g. a slash
     // command) already finished synchronously and isn't itself in the set.
     let in_flight = std::collections::BTreeSet::from([10]);
-    assert_eq!(safe_offset_to_persist(12, &in_flight), 10);
+    assert_eq!(safe_offset_to_persist(12, &in_flight), 9);
 }
 
 #[test]

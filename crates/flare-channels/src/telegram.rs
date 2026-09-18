@@ -459,12 +459,16 @@ pub fn next_offset(update_id: i64) -> i64 {
 
 /// Highest offset safe to confirm: `ceiling` unless an in-flight update
 /// sits below it, in which case stop just short so a crash replays it.
+/// `in_flight` holds `next` values (`update_id + 1`), so persisting that
+/// value verbatim would confirm (and permanently drop) the in-flight update
+/// itself -- the earliest one must be reduced by one to stay at-or-below its
+/// own `update_id`.
 #[must_use]
 pub fn safe_offset_to_persist(ceiling: i64, in_flight: &BTreeSet<i64>) -> i64 {
     in_flight
         .iter()
         .next()
-        .copied()
+        .map(|next| next.saturating_sub(1))
         .unwrap_or(ceiling)
         .min(ceiling)
 }
@@ -999,7 +1003,7 @@ mod tests {
         let empty = BTreeSet::new();
         assert_eq!(safe_offset_to_persist(101, &empty), 101);
         let in_flight: BTreeSet<i64> = [102, 105].into_iter().collect();
-        assert_eq!(safe_offset_to_persist(106, &in_flight), 102);
+        assert_eq!(safe_offset_to_persist(106, &in_flight), 101);
     }
 
     #[test]

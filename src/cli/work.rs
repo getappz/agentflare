@@ -204,7 +204,7 @@ fn stage_and_attach_asset(
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let filename = format!("work-reply-{item_id}-{nanos}.txt");
-    let staging_dir = crate::paths::home().join(".agentflare").join("staging");
+    let staging_dir = crate::paths::agentflare_dir().join("staging");
     std::fs::create_dir_all(&staging_dir).map_err(|e| e.to_string())?;
     std::fs::write(staging_dir.join(&filename), content).map_err(|e| e.to_string())?;
 
@@ -312,7 +312,7 @@ fn resolve_dispatch_model(
 /// `agentflare work` degrades to requiring `--agent` instead of crashing
 /// over a bad file.
 pub(crate) fn load_router_config() -> agent_registry::RouterConfig {
-    let path = crate::paths::home().join(".agentflare").join("config.toml");
+    let path = crate::paths::agentflare_dir().join("config.toml");
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
