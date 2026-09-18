@@ -85,6 +85,15 @@ pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &
         "agentflare: item #{} ({}) needs a human -- {reason}",
         item.sequence_id, item.id
     );
+    // Same per-chat lock `chat_channel::run_chat_turn` holds for its whole
+    // body -- without it, this side-channel send races an in-flight chat
+    // reply to the same chat with no ordering between the two Telegram API
+    // calls, so an unrelated notification can land interleaved with it
+    // (item #281).
+    let turn_lock = crate::chat_channel::chat_turn_lock(&chat_id);
+    let _turn_guard = turn_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Err(e) =
         crate::channels::send_message(crate::channels::Platform::Telegram, &chat_id, &text)
     {
@@ -117,6 +126,14 @@ fn request_channel_approval(card_text: &str, approve_label: &str, callback_data:
     let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
         return;
     };
+    // See the matching lock in `notify_human_gate` above: without it, this
+    // card send races `chat_channel::run_chat_turn`'s reply to the same
+    // chat, so e.g. a plan-approval card can land interleaved with an
+    // unrelated in-flight conversational reply (item #281).
+    let turn_lock = crate::chat_channel::chat_turn_lock(&chat_id);
+    let _turn_guard = turn_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Err(e) =
         crate::channels::send_telegram_card(&chat_id, card_text, &[(approve_label, callback_data)])
     {
