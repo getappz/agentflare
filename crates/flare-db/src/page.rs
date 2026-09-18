@@ -16,4 +16,20 @@ impl Page {
             skip,
         }
     }
+
+    /// Applies this page to a sea-query `SELECT`, generated-code-side.
+    ///
+    /// Unlike Postgres, SQLite rejects a bare `OFFSET` with no preceding `LIMIT`
+    /// (`near "OFFSET": syntax error`) -- sea-query itself renders whatever `.offset()`/
+    /// `.limit()` calls it's given with no backend-specific adjustment. So an offset is
+    /// only emitted paired with a limit, substituting `i64::MAX` as "no cap" when `take`
+    /// is `None`, keeping the two backends' generated SQL behaviorally identical.
+    pub fn apply(&self, q: &mut sea_query::SelectStatement) {
+        if self.skip > 0 {
+            q.limit(self.take.map_or(i64::MAX as u64, |take| take as u64));
+            q.offset(self.skip as u64);
+        } else if let Some(take) = self.take {
+            q.limit(take as u64);
+        }
+    }
 }

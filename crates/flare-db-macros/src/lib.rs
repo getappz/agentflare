@@ -294,10 +294,7 @@ pub fn derive_crud(input: TokenStream) -> TokenStream {
                 let mut q = flare_db::sea_query::Query::select();
                 q.columns([#(#all_col_lits),*]).from(#table_lit);
                 #soft_delete_read_guard
-                q.offset(page.skip as u64);
-                if let Some(take) = page.take {
-                    q.limit(take as u64);
-                }
+                page.apply(&mut q);
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
                 flare_db::sqlx::query_as_with::<_, Self, _>(&sql, values).fetch_all(pool).await
             }
@@ -309,10 +306,7 @@ pub fn derive_crud(input: TokenStream) -> TokenStream {
                 let mut q = flare_db::sea_query::Query::select();
                 q.columns([#(#all_col_lits),*]).from(#table_lit);
                 #soft_delete_read_guard
-                q.offset(page.skip as u64);
-                if let Some(take) = page.take {
-                    q.limit(take as u64);
-                }
+                page.apply(&mut q);
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
                 let rows = flare_db::sqlx::query_as_with::<_, Self, _>(&sql, values)
                     .fetch_all(&mut *tx)
@@ -408,10 +402,7 @@ pub fn derive_crud(input: TokenStream) -> TokenStream {
                 let mut q = flare_db::sea_query::Query::select();
                 q.columns([#(#all_col_lits),*]).from(#table_lit);
                 #(q.and_where_option(filter.#all_field_idents.map(|op| flare_db::FilterOp::into_expr(op, #all_col_lits)));)*
-                q.offset(page.skip as u64);
-                if let Some(take) = page.take {
-                    q.limit(take as u64);
-                }
+                page.apply(&mut q);
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
                 flare_db::sqlx::query_as_with::<_, Self, _>(&sql, values).fetch_all(pool).await
             }
