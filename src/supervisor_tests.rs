@@ -2187,6 +2187,7 @@ fn self_repair_or_gate_dispatches_for_a_merge_conflict_trigger() {
         &item,
         1,
         RepairTrigger::MergeConflict,
+        &[],
         &label_id_by_name,
         "/repo",
     );
@@ -2241,6 +2242,7 @@ fn self_repair_or_gate_caps_conflict_and_ci_repair_attempts_independently() {
         &item,
         1,
         RepairTrigger::MergeConflict,
+        &[],
         &label_id_by_name,
         "/repo",
     );

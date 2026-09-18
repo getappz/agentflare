@@ -1510,57 +1510,6 @@ fn stale_stage_label(labels: &[String]) -> Option<&'static str> {
         .find(|l| labels.iter().any(|have| have == l))
 }
 
-/// Escape the characters Telegram's HTML `parse_mode` treats specially, so
-/// an arbitrary item title/description can't break card formatting (or be
-/// interpreted as an unintended tag).
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-/// Telegram-only rich variant of [`notify_human_gate`] for the one gate a
-/// human can resolve with a single tap: CI is green and the only thing
-/// missing is `PR_APPROVAL_LABEL`. Unlike the plain-text pings, this carries
-/// an inline "Approve" button whose `callback_data` embeds the repo and PR
-/// number directly (`approve:{owner}/{repo}#{number}`) -- self-contained,
-/// so [`poll_telegram_approvals`] never needs to re-resolve a worktree path
-/// to act on a click. Same fail-open contract as `notify_human_gate`: no-ops
-/// without a configured chat id or a resolvable repo, and a send failure
-/// only logs.
-fn notify_pr_approval_gate(item: &agentflare_backend::item::Item, folder_path: &str, number: u64) {
-    let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
-        return;
-    };
-    let Some(repo) = crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
-    else {
-        return;
-    };
-    let excerpt: String = item.description.chars().take(200).collect();
-    let text = format!(
-        "\u{1F514} <b>agentflare</b> needs a human\n\
-         <b>Repo:</b> {repo}\n\
-         <b>Item:</b> #{} \u{2014} {}\n\
-         {}\n\n\
-         PR <a href=\"https://github.com/{repo}/pull/{number}\">#{number}</a> is CI-green and \
-         mergeable, awaiting <code>{PR_APPROVAL_LABEL}</code>.",
-        item.sequence_id,
-        html_escape(&item.name),
-        html_escape(&excerpt),
-    );
-    let callback_data = format!("approve:{repo}#{number}");
-    if let Err(e) = crate::channels::send_telegram_card(
-        &chat_id,
-        &text,
-        &[("\u{2705} Approve", &callback_data)],
-    ) {
-        eprintln!(
-            "agentflare-supervisor: telegram card notify failed for item #{}: {e}",
-            item.sequence_id
-        );
-    }
-}
-
 /// One-shot per item (namespaced separately from `notify_pr_approval_gate`'s
 /// plain `item.id` key in `first_time_gated` -- the same item can hit both
 /// gates at different points in its life and each must fire once on its
@@ -1590,23 +1539,6 @@ fn notify_conflict_gate(item: &agentflare_backend::item::Item, folder_path: &str
         item,
         &format!("PR #{number} has a merge conflict with its base branch"),
     );
-}
-
-/// True the first time a given item id is seen gated since this process
-/// started, false on every later call for the same id -- `run_discovery_tick`
-/// re-visits an already-gated item on every tick (it stays in the
-/// `ready-for-work` query until a human clears `NEEDS_DECISION_LABEL`), so
-/// this keeps `notify_human_gate` firing once per gate instead of once per
-/// tick. In-memory and per-process by design: a daemon restart re-notifies
-/// once, which is preferable to a persistent marker for a one-line ping.
-pub(crate) fn first_time_gated(item_id: &str) -> bool {
-    static NOTIFIED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    NOTIFIED
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(item_id.to_string())
 }
 
 /// Dispatches a self-repair job for an item whose PR has failing CI checks,
