@@ -1,0 +1,29 @@
+# Deliberately its own single-package workspace (see root Cargo.toml's `exclude` comment): this crate's dependency tree cannot share a Cargo.lock with the main agentflare workspace's rusqlite 0.40 pin. An empty `[workspace]` table here stops cargo's ancestor search at this manifest instead of climbing to the outer repo
+[workspace]
+
+[package]
+name = "flare-db"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+description = "Async, sqlx-backed repository derive macro (list/get/create/update/delete/count, soft-delete, pagination, sea-query-based filtering) for Postgres and SQLite — not a full ORM."
+publish = false
+
+[dependencies]
+flare-db-macros = { version = "0.1", path = "../flare-db-macros" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "migrate", "macros", "time"] }
+sea-query = { version = "0.32", default-features = false, features = ["backend-postgres", "backend-sqlite", "thread-safe", "with-time"] }
+sea-query-binder = { version = "0.7", default-features = false, features = ["with-time"] }
+time = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[features]
+default = ["sqlite"]
+postgres = ["sqlx/postgres", "sea-query-binder/sqlx-postgres"]
+sqlite = ["sqlx/sqlite", "sea-query-binder/sqlx-sqlite"]
+# Gates the Postgres integration test in tests/postgres_integration.rs, which requires a live
+# DATABASE_URL and is not run by default (see design doc "Testing" section).
+integration-postgres = ["postgres"]
