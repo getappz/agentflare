@@ -1635,7 +1635,7 @@ fn self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment() {
         agentflare_resource_gate::Policy::Normal,
         &item,
         1,
-        &["clippy".to_string()],
+        RepairTrigger::FailingChecks(&["clippy".to_string()]),
         &[],
         &label_id_by_name,
         "/repo",
@@ -1701,7 +1701,7 @@ fn self_repair_or_gate_gates_instead_of_dispatching_once_the_cap_is_reached() {
             agentflare_resource_gate::Policy::Normal,
             &item,
             1,
-            &["clippy".to_string()],
+            RepairTrigger::FailingChecks(&["clippy".to_string()]),
             &[],
             &label_id_by_name,
             "/repo",
@@ -1741,7 +1741,7 @@ fn self_repair_or_gate_stays_quiet_once_already_gated() {
         agentflare_resource_gate::Policy::Normal,
         &item,
         1,
-        &["clippy".to_string()],
+        RepairTrigger::FailingChecks(&["clippy".to_string()]),
         &[],
         &label_id_by_name,
         "/repo",
@@ -1777,7 +1777,7 @@ fn self_repair_or_gate_still_skips_gracefully_when_unassigned_and_no_router_rule
             agentflare_resource_gate::Policy::Normal,
             &item,
             1,
-            &["clippy".to_string()],
+            RepairTrigger::FailingChecks(&["clippy".to_string()]),
             &[],
             &label_id_by_name,
             "/repo",
@@ -1810,7 +1810,7 @@ fn self_repair_or_gate_does_not_double_dispatch_while_a_job_is_already_in_flight
         agentflare_resource_gate::Policy::Normal,
         &item,
         1,
-        &["clippy".to_string()],
+        RepairTrigger::FailingChecks(&["clippy".to_string()]),
         &[],
         &label_id_by_name,
         "/repo",
@@ -1847,7 +1847,7 @@ fn self_repair_or_gate_defers_instead_of_dispatching_into_a_still_live_claim() {
         agentflare_resource_gate::Policy::Normal,
         &item,
         1,
-        &["clippy".to_string()],
+        RepairTrigger::FailingChecks(&["clippy".to_string()]),
         &[],
         &label_id_by_name,
         "/repo",
@@ -2169,6 +2169,172 @@ fn coderabbit_repair_or_gate_reverts_the_stage_label_once_findings_are_resolved(
 }
 
 #[test]
+fn self_repair_or_gate_dispatches_for_a_merge_conflict_trigger() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    let label_id_by_name = seed_gate_label(&mcp);
+    let auth_conn = test_auth_conn();
+
+    let outcome = self_repair_or_gate(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        1,
+        RepairTrigger::MergeConflict,
+        &label_id_by_name,
+        "/repo",
+    );
+
+    assert!(matches!(outcome, SelfRepairOutcome::Dispatched));
+    let jobs = queue.list(None).unwrap();
+    assert_eq!(
+        jobs[0].dispatch_reason.as_deref(),
+        Some("conflict-repair: merge conflict with base branch")
+    );
+    let comments = mcp
+        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item_id).unwrap())
+        .unwrap();
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.body.starts_with(CONFLICT_REPAIR_MARKER))
+    );
+}
+
+#[test]
+fn self_repair_or_gate_caps_conflict_and_ci_repair_attempts_independently() {
+    // A PR that already burned its CI-self-repair cap must still get a
+    // fresh attempt when it later (separately) conflicts -- the two triggers
+    // count against independent markers (`CI_SELF_REPAIR_MARKER` vs
+    // `CONFLICT_REPAIR_MARKER`), so one exhausted cap can't silently block
+    // the other kind of repair.
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let label_id_by_name = seed_gate_label(&mcp);
+    let auth_conn = test_auth_conn();
+
+    for _ in 0..crate::quota::decide::SELF_REPAIR_CAP {
+        mcp.comment_impl(CommentRequest {
+            action: "create".into(),
+            item_id: Some(item_id.clone()),
+            body: Some(format!("{CI_SELF_REPAIR_MARKER}\n\njob: prior")),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+
+    let outcome = self_repair_or_gate(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        1,
+        RepairTrigger::MergeConflict,
+        &label_id_by_name,
+        "/repo",
+    );
+
+    assert!(
+        matches!(outcome, SelfRepairOutcome::Dispatched),
+        "an exhausted CI-repair cap must not gate an unrelated conflict-repair attempt"
+    );
+}
+
+#[test]
+fn auto_resolve_conflicts_enabled_defaults_to_false_with_no_config() {
+    crate::paths::test_support::with_temp_home(|| {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(!auto_resolve_conflicts_enabled(repo.path()));
+    });
+}
+
+#[test]
+fn auto_resolve_conflicts_enabled_reads_the_project_config_file() {
+    crate::paths::test_support::with_temp_home(|| {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".agentflare")).unwrap();
+        std::fs::write(
+            repo.path().join(".agentflare").join("config.toml"),
+            "[review_sweep]\nauto_resolve_conflicts = true\n",
+        )
+        .unwrap();
+        assert!(auto_resolve_conflicts_enabled(repo.path()));
+    });
+}
+
+#[test]
+fn auto_resolve_conflicts_enabled_falls_back_to_the_user_home_file() {
+    crate::paths::test_support::with_temp_home(|| {
+        std::fs::create_dir_all(crate::paths::home().join(".agentflare")).unwrap();
+        std::fs::write(
+            crate::paths::home().join(".agentflare").join("config.toml"),
+            "[review_sweep]\nauto_resolve_conflicts = true\n",
+        )
+        .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            auto_resolve_conflicts_enabled(repo.path()),
+            "a project with no override should inherit the user's global default"
+        );
+    });
+}
+
+#[test]
+fn auto_resolve_conflicts_enabled_project_file_overrides_user_home() {
+    crate::paths::test_support::with_temp_home(|| {
+        std::fs::create_dir_all(crate::paths::home().join(".agentflare")).unwrap();
+        std::fs::write(
+            crate::paths::home().join(".agentflare").join("config.toml"),
+            "[review_sweep]\nauto_resolve_conflicts = true\n",
+        )
+        .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".agentflare")).unwrap();
+        std::fs::write(
+            repo.path().join(".agentflare").join("config.toml"),
+            "[review_sweep]\nauto_resolve_conflicts = false\n",
+        )
+        .unwrap();
+        assert!(
+            !auto_resolve_conflicts_enabled(repo.path()),
+            "a project must be able to opt out even when the user's global default opts in"
+        );
+    });
+}
+
+#[test]
+fn auto_resolve_conflicts_enabled_env_var_overrides_both_files() {
+    crate::paths::test_support::with_temp_home(|| {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".agentflare")).unwrap();
+        std::fs::write(
+            repo.path().join(".agentflare").join("config.toml"),
+            "[review_sweep]\nauto_resolve_conflicts = false\n",
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("AGENTFLARE_AUTO_RESOLVE_CONFLICTS", "true");
+        }
+        let result = auto_resolve_conflicts_enabled(repo.path());
+        unsafe {
+            std::env::remove_var("AGENTFLARE_AUTO_RESOLVE_CONFLICTS");
+        }
+        assert!(result, "an explicit env override must win over either file");
+    });
+}
+
+#[test]
 fn first_time_gated_is_true_once_then_false_for_the_same_id() {
     // Unique per-test id -- the backing set is a single process-wide static
     // shared by every test in this binary, so a literal like "item-1" would
@@ -2181,6 +2347,30 @@ fn first_time_gated_is_true_once_then_false_for_the_same_id() {
     assert!(
         !first_time_gated(id),
         "a later tick re-seeing the same still-gated item must not notify again"
+    );
+}
+
+#[test]
+fn first_time_gated_namespaces_conflict_gate_separately_from_plain_item_id() {
+    // `notify_pr_approval_gate` gates on the plain item id; `notify_conflict_gate`
+    // namespaces its key as `conflict:<item.id>` specifically so the same item
+    // hitting both gates (missing approval label now, a merge conflict later,
+    // or vice versa) notifies once for EACH, rather than the second gate
+    // silently finding the shared key already consumed.
+    let id = "first-time-gated-test-item-conflict-ns";
+    assert!(first_time_gated(id), "plain key fires on first sighting");
+    assert!(
+        first_time_gated(&format!("conflict:{id}")),
+        "the namespaced conflict key must still fire on its own first sighting, \
+         not be considered already-notified because the plain key was"
+    );
+    assert!(
+        !first_time_gated(id),
+        "the plain key must not re-fire after its own first sighting"
+    );
+    assert!(
+        !first_time_gated(&format!("conflict:{id}")),
+        "the namespaced key must not re-fire after its own first sighting"
     );
 }
 

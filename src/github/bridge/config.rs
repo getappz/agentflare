@@ -360,7 +360,7 @@ pub struct BridgeConfig {
     pub instance_id: String,
 }
 
-fn truthy(v: &str) -> bool {
+pub(crate) fn truthy(v: &str) -> bool {
     matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
 }
 
