@@ -16,10 +16,16 @@ pub fn run(version: Option<String>, check_only: bool, quiet: bool) {
 
     let asset = github::asset_name(&target_version);
 
-    if !quiet {
-        println!("downloading {asset}...");
-    }
-    let data = match github::download_asset(&target_version, &asset) {
+    let download_result = if quiet {
+        github::download_asset(&target_version, &asset)
+    } else {
+        crate::ui::with_spinner(
+            &format!("downloading {asset}…"),
+            "download finished",
+            || github::download_asset(&target_version, &asset),
+        )
+    };
+    let data = match download_result {
         Ok(d) => d,
         Err(e) => {
             eprintln!("error downloading: {e}");
@@ -27,10 +33,14 @@ pub fn run(version: Option<String>, check_only: bool, quiet: bool) {
         }
     };
 
-    if !quiet {
-        println!("verifying checksum...");
-    }
-    match github::expected_checksum(&target_version, &asset) {
+    let checksum_result = if quiet {
+        github::expected_checksum(&target_version, &asset)
+    } else {
+        crate::ui::with_spinner("verifying checksum…", "checksum fetched", || {
+            github::expected_checksum(&target_version, &asset)
+        })
+    };
+    match checksum_result {
         Ok(expected) => {
             if let Err(e) = github::verify_checksum(&data, &expected) {
                 eprintln!("{e}");

@@ -775,12 +775,20 @@ pub fn get_components(host: &str) -> Vec<Component> {
             needs_consent: true,
             describe: "mise (dev-tool manager) — used by `agentflare run` to launch agents with mise-managed tools on PATH; https://mise.run".to_string(),
             check: Box::new(mise_present_cached),
-            apply: Box::new(|| match crate::mise_install::ensure_mise() {
-                crate::mise_install::MiseOutcome::Present(_) => "mise already installed".to_string(),
-                crate::mise_install::MiseOutcome::Installed(p) => {
-                    format!("mise installed ({p}) — open a new shell to put it on PATH")
-                }
-                crate::mise_install::MiseOutcome::Failed(m) => format!("mise install failed — {m}"),
+            apply: Box::new(|| {
+                crate::ui::with_spinner("Installing mise…", "mise install finished", || {
+                    match crate::mise_install::ensure_mise() {
+                        crate::mise_install::MiseOutcome::Present(_) => {
+                            "mise already installed".to_string()
+                        }
+                        crate::mise_install::MiseOutcome::Installed(p) => {
+                            format!("mise installed ({p}) — open a new shell to put it on PATH")
+                        }
+                        crate::mise_install::MiseOutcome::Failed(m) => {
+                            format!("mise install failed — {m}")
+                        }
+                    }
+                })
             }),
         },
         // PATH shims (`~/.agentflare/shims/`): route bare tool-name calls
@@ -919,7 +927,11 @@ pub fn get_components(host: &str) -> Vec<Component> {
                         format!("lean-ctx install already triggered — check {}", log.display())
                     } else {
                         let _ = fs::create_dir_all(log.parent().unwrap());
-                        let outcome = crate::tool_install::install(&crate::tool_install::LEAN_CTX);
+                        let outcome = crate::ui::with_spinner(
+                            "Installing lean-ctx…",
+                            "lean-ctx install finished",
+                            || crate::tool_install::install(&crate::tool_install::LEAN_CTX),
+                        );
                         let _ = fs::write(&log, format!("{:?}", std::time::SystemTime::now()));
                         match outcome {
                             Ok(m) => m,
