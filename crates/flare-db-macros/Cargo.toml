@@ -1,0 +1,19 @@
+# Deliberately its own single-package workspace (see root Cargo.toml's `exclude` comment): this crate's dependency tree cannot share a Cargo.lock with the main agentflare workspace's rusqlite 0.40 pin. An empty `[workspace]` table here stops cargo's ancestor search at this manifest instead of climbing to the outer repo
+[workspace]
+
+[package]
+name = "flare-db-macros"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+description = "Proc-macro crate for flare-db: derives the Crud impl (list/get/create/update/delete/count) for sqlx-backed entities. Not meant to be depended on directly — use flare-db."
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["extra-traits"] }
+quote = "1"
+proc-macro2 = "1"

@@ -1,5 +1,12 @@
 [workspace]
 members = ["agentflare-workspace-hack","crates/flare-insights","crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-process", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault", "crates/agentflare-resource-gate", "crates/flare-workflow", "crates/flare-sandbox", "crates/agentflare-apps", "crates/flare-browser", "crates/agentflare-config", "crates/flare-channels", "crates/agentflare-approval"]
+# flare-db(-macros) are deliberately NOT workspace members: sqlx's `sqlite` feature pulls in
+# libsqlite3-sys ^0.28-^0.30 (checked every 0.7-0.9 sqlx-sqlite release on crates.io), which
+# can never coexist with this workspace's rusqlite 0.40 (-> libsqlite3-sys ^0.38) -- both crates
+# set `links = "sqlite3"`, and cargo hard-errors the moment both are in one resolved graph. CI's
+# `cargo clippy --workspace --all-features` would hit that unconditionally if they were members.
+# Excluding them gives each its own Cargo.lock, so `sqlite` never has to resolve against rusqlite.
+exclude = ["crates/flare-db", "crates/flare-db-macros"]
 resolver = "2"
 
 [package]
