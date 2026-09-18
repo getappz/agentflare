@@ -130,8 +130,9 @@ agents' reviews to trust more.
 
 ## Channel notifications
 
-`agentflare channel send` posts a plain-text message to Telegram, Slack, or Discord
-using a bot token stored in the local encrypted vault (see
+`agentflare channel send` posts a message to Telegram, Slack, or Discord, rendered
+as a card on each platform (a Slack Block Kit section, a Discord embed), using a
+bot token stored in the local encrypted vault (see
 [`agentflare vault`](/docs/cli/)).
 The supervisor daemon reuses the same path to ping you when an item needs a human — a
 go/no-go decision, an unanswerable question, or a CI self-repair cap.
@@ -177,12 +178,12 @@ gated on `needs-decision`, asks a question it can't answer itself, or gives up
 self-repairing a PR after hitting the retry cap. Leave the secret unset to keep this
 path silent; nothing else changes.
 
-One of these pings is richer than the rest: once a PR goes CI-green and is only
-waiting on the `status:pr:approved` label, the message is a Telegram card — repo,
-item, and a PR excerpt — with an inline **✅ Approve** button. Tapping it adds the
-label directly (no need to open GitHub), and the supervisor's own review sweep picks
-that label up and merges on its next tick. The button only works from the chat id
-stored above.
+Every one of these pings is a formatted Telegram card (item number, name, and the
+reason it's gated). One is richer still: once a PR goes CI-green and is only
+waiting on the `status:pr:approved` label, the card also carries an inline
+**✅ Approve** button. Tapping it adds the label directly (no need to open GitHub),
+and the supervisor's own review sweep picks that label up and merges on its next
+tick. The button only works from the chat id stored above.
 
 ### Slack and Discord
 

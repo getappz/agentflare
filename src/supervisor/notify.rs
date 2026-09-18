@@ -67,12 +67,25 @@ fn summarize_reason(reason: &str) -> String {
     }
 }
 
+/// Escape the characters Telegram's HTML `parse_mode` treats specially, so
+/// an arbitrary item title/description can't break card formatting (or be
+/// interpreted as an unintended tag).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Best-effort Telegram ping for an item that just landed on a human gate
 /// (a go/no-go decision, an unanswerable question, or a CI self-repair cap).
-/// Silently does nothing when `TELEGRAM_NOTIFY_CHAT_ID_SECRET` isn't
-/// configured, since notifications are opt-in and a bare install shouldn't
-/// spam stderr every tick; a configured-but-failing send only logs -- a
-/// notification failure must never block the gate itself.
+/// Same HTML-card formatting as [`notify_pr_approval_gate`] and
+/// [`notify_plan_approval_gate`], just without a button -- none of this
+/// function's callers have a single-tap follow-up action to attach one to
+/// (unlike the PR/plan gates, which do). Silently does nothing when
+/// `TELEGRAM_NOTIFY_CHAT_ID_SECRET` isn't configured, since notifications
+/// are opt-in and a bare install shouldn't spam stderr every tick; a
+/// configured-but-failing send only logs -- a notification failure must
+/// never block the gate itself.
 pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &str) {
     if test_notify_disabled() {
         return;
@@ -82,8 +95,12 @@ pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &
     };
     let reason = summarize_reason(reason);
     let text = format!(
-        "agentflare: item #{} ({}) needs a human -- {reason}",
-        item.sequence_id, item.id
+        "\u{1F514} <b>agentflare</b> needs a human\n\
+         <b>Item:</b> #{} \u{2014} {}\n\
+         {}",
+        item.sequence_id,
+        html_escape(&item.name),
+        html_escape(&reason),
     );
     // Same per-chat lock `chat_channel::run_chat_turn` holds for its whole
     // body -- without it, this side-channel send races an in-flight chat
@@ -94,23 +111,12 @@ pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &
     let _turn_guard = turn_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Err(e) =
-        crate::channels::send_message(crate::channels::Platform::Telegram, &chat_id, &text)
-    {
+    if let Err(e) = crate::channels::send_telegram_card(&chat_id, &text, &[]) {
         eprintln!(
             "agentflare-supervisor: telegram notify failed for item #{}: {e}",
             item.sequence_id
         );
     }
-}
-
-/// Escape the characters Telegram's HTML `parse_mode` treats specially, so
-/// an arbitrary item title/description can't break card formatting (or be
-/// interpreted as an unintended tag).
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// Shared card-send half of [`notify_pr_approval_gate`] and
