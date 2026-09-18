@@ -5,11 +5,12 @@
 //! depending on the model remembering it — hook.rs's UserPromptSubmit
 //! handler re-injects a reminder every turn while the flag is set.
 
-use crate::paths::home;
 use std::path::PathBuf;
 
 fn flag_path() -> PathBuf {
-    home().join(".agentflare").join("pm-mode").join("session")
+    crate::paths::agentflare_dir()
+        .join("pm-mode")
+        .join("session")
 }
 
 #[must_use]

@@ -93,7 +93,7 @@ fn resolve_asset(conn: &Connection, project_id: &str, id: &str) -> ResolvedConte
     if !asset_in_project(conn, &asset, project_id) {
         return ResolvedContent::NotFound;
     }
-    let base_path = crate::paths::home().join(".agentflare");
+    let base_path = crate::paths::agentflare_dir();
     let content = agentflare_backend::asset::read_file(&base_path, &asset.storage_path)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
@@ -262,7 +262,7 @@ mod tests {
             )
             .unwrap();
 
-            let base_path = crate::paths::home().join(".agentflare");
+            let base_path = crate::paths::agentflare_dir();
             let big_content = "x".repeat(5000);
             asset::write_file(&base_path, "assets/big.txt", big_content.as_bytes()).unwrap();
             let created = asset::create(
@@ -448,7 +448,7 @@ mod tests {
             )
             .unwrap();
 
-            let base_path = crate::paths::home().join(".agentflare");
+            let base_path = crate::paths::agentflare_dir();
             asset::write_file(&base_path, "assets/secret.txt", b"secret").unwrap();
             let created = asset::create(
                 &conn,

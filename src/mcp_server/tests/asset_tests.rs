@@ -4,8 +4,7 @@ use super::*;
 fn asset_attach_get_list_delete_round_trip() {
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();
-        let home = crate::paths::home();
-        let staging = home.join(".agentflare").join("staging");
+        let staging = crate::paths::agentflare_dir().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
 
         let item: serde_json::Value =
@@ -165,8 +164,7 @@ fn asset_get_rejects_missing_id() {
 fn asset_get_and_delete_after_delete_return_not_found() {
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();
-        let home = crate::paths::home();
-        let staging = home.join(".agentflare").join("staging");
+        let staging = crate::paths::agentflare_dir().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
 
         let item: serde_json::Value =
@@ -228,8 +226,7 @@ fn asset_get_and_delete_after_delete_return_not_found() {
 fn asset_shared_storage_delete_safety() {
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();
-        let home = crate::paths::home();
-        let staging = home.join(".agentflare").join("staging");
+        let staging = crate::paths::agentflare_dir().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
 
         let item1: serde_json::Value =
@@ -328,8 +325,7 @@ fn asset_shared_storage_delete_safety() {
 fn asset_attach_to_project() {
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();
-        let home = crate::paths::home();
-        let staging = home.join(".agentflare").join("staging");
+        let staging = crate::paths::agentflare_dir().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
 
         let project: serde_json::Value = serde_json::from_str(
@@ -394,8 +390,7 @@ fn asset_attach_rejects_neither_item_nor_project() {
 fn asset_attach_rejects_nonexistent_item() {
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();
-        let home = crate::paths::home();
-        let staging = home.join(".agentflare").join("staging");
+        let staging = crate::paths::agentflare_dir().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::write(staging.join("f.txt"), b"data").unwrap();
         let err = s
@@ -434,8 +429,7 @@ fn asset_attach_rejects_missing_staging_file() {
 fn asset_attach_rejects_oversized_file() {
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();
-        let home = crate::paths::home();
-        let staging = home.join(".agentflare").join("staging");
+        let staging = crate::paths::agentflare_dir().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         // write a file just past the default 5 MB limit
         let big = vec![0u8; 5 * 1024 * 1024 + 1];
@@ -460,7 +454,7 @@ fn asset_attach_rejects_symlink() {
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();
         let home = crate::paths::home();
-        let staging = home.join(".agentflare").join("staging");
+        let staging = crate::paths::agentflare_dir().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         let outside = home.join("outside-secret.txt");
         std::fs::write(&outside, b"not for attaching").unwrap();
@@ -485,8 +479,7 @@ fn asset_attach_rejects_non_regular_file() {
     // other special files, without the hang risk of actually opening one.
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();
-        let home = crate::paths::home();
-        let staging = home.join(".agentflare").join("staging");
+        let staging = crate::paths::agentflare_dir().join("staging");
         std::fs::create_dir_all(staging.join("dir.txt")).unwrap();
         let err = s
             .asset(Parameters(AssetRequest {
@@ -506,8 +499,7 @@ fn asset_attach_rejects_non_regular_file() {
 fn asset_get_over_max_inline_omits_content() {
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();
-        let home = crate::paths::home();
-        let staging = home.join(".agentflare").join("staging");
+        let staging = crate::paths::agentflare_dir().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
 
         let item: serde_json::Value = serde_json::from_str(
@@ -563,8 +555,7 @@ fn asset_get_over_max_inline_omits_content() {
 fn asset_get_returns_text_content_as_utf8_not_base64() {
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();
-        let home = crate::paths::home();
-        let staging = home.join(".agentflare").join("staging");
+        let staging = crate::paths::agentflare_dir().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
 
         let item: serde_json::Value = serde_json::from_str(
@@ -613,8 +604,7 @@ fn asset_get_returns_text_content_as_utf8_not_base64() {
 fn asset_get_returns_base64_for_binary_with_valid_utf8_bytes() {
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();
-        let home = crate::paths::home();
-        let staging = home.join(".agentflare").join("staging");
+        let staging = crate::paths::agentflare_dir().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
 
         let item: serde_json::Value = serde_json::from_str(

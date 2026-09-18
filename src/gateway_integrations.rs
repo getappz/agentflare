@@ -73,7 +73,7 @@ fn leanctx_post_note() -> Vec<String> {
 }
 
 pub fn gateway_toml_path() -> PathBuf {
-    home().join(".agentflare").join("gateway.toml")
+    crate::paths::agentflare_dir().join("gateway.toml")
 }
 
 /// A remote that mentions "github" — matches `github.com` in HTTPS/SSH URLs

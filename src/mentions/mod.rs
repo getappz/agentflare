@@ -21,7 +21,7 @@ pub fn expand(prompt: &str) -> Option<String> {
     if mentions.is_empty() {
         return None;
     }
-    let db_path = crate::paths::home().join(".agentflare").join("backend.db");
+    let db_path = crate::paths::agentflare_dir().join("backend.db");
     if !db_path.exists() {
         return None;
     }

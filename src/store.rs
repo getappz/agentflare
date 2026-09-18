@@ -8,7 +8,7 @@ use std::path::PathBuf;
 /// own migrations; sharing a file would let two independent migration
 /// systems fight over the same schema/version state.
 pub fn store_path() -> PathBuf {
-    crate::paths::home().join(".agentflare").join("store.db")
+    crate::paths::agentflare_dir().join("store.db")
 }
 
 /// Opens a fresh connection to the local store on every call -- deliberately

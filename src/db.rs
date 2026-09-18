@@ -8,13 +8,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub fn agentflare_db_path() -> PathBuf {
-    crate::paths::home()
-        .join(".agentflare")
-        .join("agentflare.db")
+    crate::paths::agentflare_dir().join("agentflare.db")
 }
 
 fn old_gateway_db_path() -> PathBuf {
-    crate::paths::home().join(".agentflare").join("gateway.db")
+    crate::paths::agentflare_dir().join("gateway.db")
 }
 
 /// Opens (creating if absent) `agentflare.db` and applies every table's
