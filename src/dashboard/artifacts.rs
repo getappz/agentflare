@@ -22,7 +22,7 @@ fn open_store() -> ArtifactState {
         Ok(s) => ArtifactStore::with_store(s),
         Err(e) => {
             eprintln!("[dashboard/artifacts] failed to open store: {e}");
-            ArtifactStore::new(crate::paths::home().join(".agentflare").join("artifacts"))
+            ArtifactStore::new(crate::paths::agentflare_dir().join("artifacts"))
         }
     };
     ArtifactState {

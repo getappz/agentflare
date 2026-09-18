@@ -47,9 +47,7 @@ fn parse_run_id(s: &str) -> Result<WorkflowRunId, String> {
 
 /// Default SQLite store location for workflow runs.
 pub fn default_db_path() -> PathBuf {
-    crate::paths::home()
-        .join(".agentflare")
-        .join("workflows.db")
+    crate::paths::agentflare_dir().join("workflows.db")
 }
 
 /// Default hard/idle subprocess timeouts when a step doesn't override them.

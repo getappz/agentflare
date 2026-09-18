@@ -119,7 +119,7 @@ fn session_start_message(agent: &str) -> String {
     // project happens to be oldest in backend.db", which is a single
     // shared database across every repo agentflare has ever touched on
     // this machine.
-    let db_path = crate::paths::home().join(".agentflare").join("backend.db");
+    let db_path = crate::paths::agentflare_dir().join("backend.db");
     if db_path.exists()
         && let Ok(conn) = agentflare_backend::db::open_db(&db_path)
         && let Some(pid) = crate::mcp_server::AgentflareMcp::default()
@@ -373,7 +373,7 @@ fn resolve_item_task_type(
         return None;
     }
     let id_or_seq = tool_input?.get("id")?.as_str()?;
-    let db_path = crate::paths::home().join(".agentflare").join("backend.db");
+    let db_path = crate::paths::agentflare_dir().join("backend.db");
     if !db_path.exists() {
         return None;
     }
@@ -1104,9 +1104,8 @@ second line
         use agentflare_backend::item;
 
         with_temp_home(|| {
-            let home = crate::paths::home();
-            std::fs::create_dir_all(home.join(".agentflare")).unwrap();
-            let db_path = home.join(".agentflare").join("backend.db");
+            std::fs::create_dir_all(crate::paths::agentflare_dir()).unwrap();
+            let db_path = crate::paths::agentflare_dir().join("backend.db");
             let conn = agentflare_backend::db::open_db(&db_path).unwrap();
 
             // Resolve the project through the SAME unconfigured
@@ -1195,9 +1194,8 @@ second line
         use agentflare_backend::item;
 
         with_temp_home(|| {
-            let home = crate::paths::home();
-            std::fs::create_dir_all(home.join(".agentflare")).unwrap();
-            let db_path = home.join(".agentflare").join("backend.db");
+            std::fs::create_dir_all(crate::paths::agentflare_dir()).unwrap();
+            let db_path = crate::paths::agentflare_dir().join("backend.db");
             let conn = agentflare_backend::db::open_db(&db_path).unwrap();
 
             let proj = crate::mcp_server::AgentflareMcp::default()

@@ -7,6 +7,14 @@ pub fn home() -> PathBuf {
     agentflare_config::home()
 }
 
+/// `~/.agentflare` — agentflare's own per-user data dir (holding
+/// `agentflare.db`, `store.db`, `backend.db`, artifacts, staging, shims,
+/// config.toml, ...). Single definition, mirroring `claude_dir()` below, so
+/// the 20+ existing call sites can't drift apart if this root ever moves.
+pub fn agentflare_dir() -> PathBuf {
+    home().join(".agentflare")
+}
+
 /// Absolute path to the currently-running agentflare binary, falling back to
 /// the bare name if it can't be resolved. Used wherever agentflare registers
 /// itself as a command in another tool's config (Claude Code hooks, MCP

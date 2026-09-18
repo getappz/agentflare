@@ -255,7 +255,7 @@ pub fn clear_project_bridge_settings(repo_root: &Path) -> Result<PathBuf, String
 /// is machine-scoped, not project-scoped, so it must not depend on (or vary
 /// with) which repo the caller happens to be running from.
 fn home_config_path() -> PathBuf {
-    crate::paths::home().join(".agentflare").join("config.toml")
+    crate::paths::agentflare_dir().join("config.toml")
 }
 
 /// `[bridge].machine_name` from the user-home config file, trimmed and
@@ -367,9 +367,7 @@ fn truthy(v: &str) -> bool {
 /// `~/.agentflare/bridge-instance-id` — the persisted discriminator half of
 /// this workstation's bridge owner id.
 fn instance_id_path() -> PathBuf {
-    crate::paths::home()
-        .join(".agentflare")
-        .join("bridge-instance-id")
+    crate::paths::agentflare_dir().join("bridge-instance-id")
 }
 
 /// Owner-id prefix, in place of the `<agent>` half `claims::owner_id()` uses.

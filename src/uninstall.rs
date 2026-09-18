@@ -224,7 +224,7 @@ fn clean_ponytail_caveman(dry_run: bool) {
 }
 
 fn clean_state_dir(dry_run: bool) {
-    let state = home().join(".agentflare");
+    let state = crate::paths::agentflare_dir();
     remove_dir(&state, dry_run);
 }
 

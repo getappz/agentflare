@@ -37,7 +37,7 @@ impl AgentflareMcp {
                         None,
                     ));
                 }
-                let staging_dir = crate::paths::home().join(".agentflare").join("staging");
+                let staging_dir = crate::paths::agentflare_dir().join("staging");
                 let staged = staging_dir.join(&fn_val);
 
                 // symlink_metadata (not metadata) never follows the link, so a

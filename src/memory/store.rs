@@ -2,8 +2,7 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 
 pub fn brain_db_path() -> PathBuf {
-    crate::paths::home()
-        .join(".agentflare")
+    crate::paths::agentflare_dir()
         .join("memory")
         .join("brain.db")
 }

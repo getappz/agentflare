@@ -3,7 +3,6 @@
 // `agentflare-store`'s kv table; a legacy `state.json` (the pre-store
 // on-disk format) is imported once, in place, the first time this runs
 // against a store that has neither key yet.
-use crate::paths::home;
 pub use agent_registry::VersionCacheEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -29,7 +28,7 @@ fn default_true() -> bool {
 }
 
 pub fn state_dir() -> PathBuf {
-    home().join(".agentflare")
+    crate::paths::agentflare_dir()
 }
 
 pub fn state_path() -> PathBuf {
