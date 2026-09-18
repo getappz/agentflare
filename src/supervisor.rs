@@ -95,6 +95,44 @@ fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str,
     }
 }
 
+/// Whether `run_review_sweep` should dispatch an agent to rebase/resolve a
+/// PR that GitHub reports as `Conflicting`, instead of just surfacing it to
+/// a human (see `handle_pr_status`'s `Conflicting` arm). Defaults to `false`
+/// -- unlike `Behind`'s clean fast-forward, resolving a real conflict means
+/// rewriting someone else's diff, which is a judgment call worth an explicit
+/// opt-in rather than a repo-wide default.
+///
+/// Resolution order mirrors `github::bridge::config`'s project settings:
+/// `AGENTFLARE_AUTO_RESOLVE_CONFLICTS` env var, else `.agentflare/config.toml`'s
+/// `[review_sweep].auto_resolve_conflicts` with the project-local file
+/// (repo-scoped, so a project can opt out even when the user's home config
+/// opts in globally) taking precedence over the user-home file (so one
+/// global default doesn't require setting it in every project). A malformed
+/// or unreadable config file falls back to `false` rather than failing the
+/// sweep tick over one bad setting.
+fn auto_resolve_conflicts_enabled(repo_root: &std::path::Path) -> bool {
+    if let Ok(v) = std::env::var("AGENTFLARE_AUTO_RESOLVE_CONFLICTS") {
+        return crate::github::bridge::config::truthy(&v);
+    }
+    let Ok(layers) =
+        flare_git_core::config_loader::locate_and_parse(repo_root, Some(&crate::paths::home()))
+    else {
+        return false;
+    };
+    [
+        layers.project_local.as_ref().map(|(_, v)| v),
+        layers.user_home.as_ref().map(|(_, v)| v),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|doc| {
+        doc.get("review_sweep")?
+            .get("auto_resolve_conflicts")?
+            .as_bool()
+    })
+    .unwrap_or(false)
+}
+
 /// `vault` secret holding the Telegram chat id human-gate pings go to.
 /// Reuses the same `channels`/`vault` path as `agentflare channel send`
 /// rather than inventing a separate config store for one setting -- set it
@@ -658,6 +696,73 @@ fn dispatch_item(
 /// `quota::decide::SELF_REPAIR_CAP` without a separate persistent counter,
 /// the same way an item's `metadata` isn't otherwise touched by this file.
 const CI_SELF_REPAIR_MARKER: &str = "## supervisor — CI self-repair dispatched";
+/// Same role as `CI_SELF_REPAIR_MARKER`, kept as its own prefix (rather than
+/// reusing it) so `self_repair_or_gate`'s `prior_attempts`/cap count for a
+/// CI-failure dispatch and a merge-conflict dispatch independently -- a PR
+/// that burned its CI-repair cap must still get a fresh conflict-repair
+/// attempt, and vice versa.
+const CONFLICT_REPAIR_MARKER: &str = "## supervisor — merge-conflict repair dispatched";
+
+/// What triggered `self_repair_or_gate` -- lets one dispatch/cap/claim/
+/// cooldown/host-policy/routing implementation serve both the pre-existing
+/// CI self-repair path and the new merge-conflict repair path
+/// (`handle_pr_status`'s `Conflicting` arm) without duplicating it.
+enum RepairTrigger<'a> {
+    FailingChecks(&'a [String]),
+    MergeConflict,
+}
+
+impl RepairTrigger<'_> {
+    fn marker(&self) -> &'static str {
+        match self {
+            Self::FailingChecks(_) => CI_SELF_REPAIR_MARKER,
+            Self::MergeConflict => CONFLICT_REPAIR_MARKER,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::FailingChecks(_) => "CI self-repair",
+            Self::MergeConflict => "merge-conflict repair",
+        }
+    }
+
+    /// What's actually wrong, for the comment/notify bodies.
+    fn what(&self) -> String {
+        match self {
+            Self::FailingChecks(checks) => format!("Failing checks: {}", checks.join(", ")),
+            Self::MergeConflict => {
+                "This PR conflicts with its base branch and can't be merged automatically".into()
+            }
+        }
+    }
+
+    fn instruction(&self) -> &'static str {
+        match self {
+            Self::FailingChecks(_) => "Please investigate and push a fix.",
+            Self::MergeConflict => {
+                "Please rebase onto (or merge in) the base branch and resolve the conflicts."
+            }
+        }
+    }
+
+    fn cap_outcome(&self) -> &'static str {
+        match self {
+            Self::FailingChecks(_) => "no green build",
+            Self::MergeConflict => "still conflicting",
+        }
+    }
+
+    /// Short tag for the job's `dispatch_reason` -- `self-repair: <checks>`
+    /// is an existing, tested string (`self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment`);
+    /// kept unchanged rather than routed through `what()`'s longer prose.
+    fn dispatch_reason(&self) -> String {
+        match self {
+            Self::FailingChecks(checks) => format!("self-repair: {}", checks.join(", ")),
+            Self::MergeConflict => "conflict-repair: merge conflict with base branch".into(),
+        }
+    }
+}
 
 /// Marker prefix on a CodeRabbit-review-repair-dispatch comment (see
 /// `coderabbit_repair_or_gate` below) -- counted the same way
@@ -1045,7 +1150,7 @@ fn handle_pr_status(
                 host_policy,
                 item,
                 number,
-                &checks,
+                RepairTrigger::FailingChecks(&checks),
                 &labels,
                 label_id_by_name,
                 folder_path,
@@ -1127,6 +1232,38 @@ fn handle_pr_status(
             if crate::worktree::update_stale_branch(repo_root, number) {
                 result.updated += 1;
             } else {
+                result.skipped += 1;
+            }
+        }
+        crate::worktree::PrCiStatus::Conflicting { number } => {
+            if auto_resolve_conflicts_enabled(repo_root) {
+                match self_repair_or_gate(
+                    mcp,
+                    queue,
+                    auth_conn,
+                    host_policy,
+                    item,
+                    number,
+                    RepairTrigger::MergeConflict,
+                    // No PR labels in hand here -- `Conflicting` is detected
+                    // before the label fetch that `Failing`/`Passing` carry
+                    // (same reasoning as skipping the check-run fetch). Worst
+                    // case a stale self-repair/review-repair stage label
+                    // isn't cleared before this one is added.
+                    &[],
+                    label_id_by_name,
+                    folder_path,
+                ) {
+                    SelfRepairOutcome::Dispatched => result.self_repaired += 1,
+                    SelfRepairOutcome::Deferred => result.waiting += 1,
+                    SelfRepairOutcome::Skipped => result.skipped += 1,
+                }
+            } else {
+                // Opt-out is the default (see `auto_resolve_conflicts_enabled`) --
+                // surface it once instead of letting `merge_if_approved`'s live
+                // merge call keep silently rejecting the same conflict every
+                // tick forever.
+                notify_conflict_gate(item, folder_path, number);
                 result.skipped += 1;
             }
         }
@@ -1373,6 +1510,37 @@ fn stale_stage_label(labels: &[String]) -> Option<&'static str> {
         .find(|l| labels.iter().any(|have| have == l))
 }
 
+/// One-shot per item (namespaced separately from `notify_pr_approval_gate`'s
+/// plain `item.id` key in `first_time_gated` -- the same item can hit both
+/// gates at different points in its life and each must fire once on its
+/// own): posts a GitHub-visible comment, swaps the PR's stage label to
+/// `NEEDS_HUMAN_PR_LABEL`, and pings Telegram the first time this sweep sees
+/// a real merge conflict on it while `auto_resolve_conflicts_enabled` is
+/// off. Without this, `handle_pr_status`'s `Conflicting` arm would just
+/// silently `skip` the item forever -- unlike `Passing`'s missing-approval
+/// gate, nothing else in the sweep would ever surface it.
+fn notify_conflict_gate(item: &agentflare_backend::item::Item, folder_path: &str, number: u64) {
+    if !first_time_gated(&format!("conflict:{}", item.id)) {
+        return;
+    }
+    let message = "## supervisor — merge conflict\n\n\
+         This PR now conflicts with its base branch and can't be merged automatically. \
+         Rebase or merge the base branch in and resolve the conflicts, then push.\n\n\
+         (Set `auto_resolve_conflicts = true` under `[review_sweep]` in `.agentflare/config.toml` \
+         -- project or user-home -- to have an agent attempt this automatically instead.)";
+    update_pr_stage(
+        folder_path,
+        number,
+        Some(IN_REVIEW_PR_LABEL),
+        NEEDS_HUMAN_PR_LABEL,
+        message,
+    );
+    notify_human_gate(
+        item,
+        &format!("PR #{number} has a merge conflict with its base branch"),
+    );
+}
+
 /// Dispatches a self-repair job for an item whose PR has failing CI checks,
 /// or -- once `quota::decide::SELF_REPAIR_CAP` prior attempts have been made
 /// with no green build -- gates it for a human instead of retrying forever.
@@ -1384,7 +1552,7 @@ fn self_repair_or_gate(
     host_policy: agentflare_resource_gate::Policy,
     item: &agentflare_backend::item::Item,
     pr_number: u64,
-    failed_checks: &[String],
+    trigger: RepairTrigger<'_>,
     labels: &[String],
     label_id_by_name: &std::collections::HashMap<String, String>,
     folder_path: &str,
@@ -1400,17 +1568,19 @@ fn self_repair_or_gate(
         .map(|comments| {
             comments
                 .iter()
-                .filter(|c| c.body.starts_with(CI_SELF_REPAIR_MARKER))
+                .filter(|c| c.body.starts_with(trigger.marker()))
                 .count() as u32
         })
         .unwrap_or(0);
 
     if prior_attempts >= crate::quota::decide::SELF_REPAIR_CAP {
         let cap_message = format!(
-            "## supervisor — CI self-repair cap reached\n\nFailing checks: {}. \
-             {} automatic repair attempt(s) already made with no green build — needs a human look.",
-            failed_checks.join(", "),
+            "## supervisor — {} cap reached\n\n{}. \
+             {} automatic repair attempt(s) already made, {} — needs a human look.",
+            trigger.label(),
+            trigger.what(),
             crate::quota::decide::SELF_REPAIR_CAP,
+            trigger.cap_outcome(),
         );
         let _ = mcp.comment_impl(CommentRequest {
             action: "create".into(),
@@ -1436,9 +1606,10 @@ fn self_repair_or_gate(
         notify_human_gate(
             item,
             &format!(
-                "CI self-repair cap reached ({} attempt(s), still failing: {})",
+                "{} cap reached ({} attempt(s), {})",
+                trigger.label(),
                 crate::quota::decide::SELF_REPAIR_CAP,
-                failed_checks.join(", ")
+                trigger.what(),
             ),
         );
         return SelfRepairOutcome::Skipped;
@@ -1508,14 +1679,15 @@ fn self_repair_or_gate(
     if host_policy.blocks_dispatch() {
         return SelfRepairOutcome::Deferred;
     }
-    let reason = format!("self-repair: {}", failed_checks.join(", "));
+    let reason = trigger.dispatch_reason();
     let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), Some(&reason)) else {
         return SelfRepairOutcome::Skipped;
     };
     let dispatch_message = format!(
-        "{CI_SELF_REPAIR_MARKER}\n\nCI is failing on this PR: {}.\n\n\
-         Please investigate and push a fix.\n\njob: {}",
-        failed_checks.join(", "),
+        "{}\n\n{}.\n\n{}\n\njob: {}",
+        trigger.marker(),
+        trigger.what(),
+        trigger.instruction(),
         info.id,
     );
     let _ = mcp.comment_impl(CommentRequest {

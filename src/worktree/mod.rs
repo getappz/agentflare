@@ -261,6 +261,16 @@ pub enum PrCiStatus {
     Behind {
         number: u64,
     },
+    /// GitHub's own `mergeable_state == "dirty"` -- unlike `Behind` this is a
+    /// real conflict, not a clean fast-forward, so `run_review_sweep` can't
+    /// resolve it with the same no-judgment server-side call
+    /// `update_stale_branch` uses for `Behind`. Checked in the same place as
+    /// `Behind` (before CI status is fetched) for the same reason: a
+    /// conflicted PR's existing check runs ran against a merge base that's
+    /// about to be invalidated regardless of what they say.
+    Conflicting {
+        number: u64,
+    },
     Unknown,
 }
 
@@ -326,6 +336,9 @@ fn pr_ci_status_impl(
     }
     if pr.mergeable == Some(true) && pr.mergeable_state.as_deref() == Some("behind") {
         return PrCiStatus::Behind { number: pr.number };
+    }
+    if pr.mergeable == Some(false) && pr.mergeable_state.as_deref() == Some("dirty") {
+        return PrCiStatus::Conflicting { number: pr.number };
     }
     let Some(sha) = pr.head.as_ref().map(|h| h.sha.clone()) else {
         return PrCiStatus::Unknown;
@@ -416,6 +429,9 @@ pub(crate) fn pr_ci_status_from_batch(
     }
     if data.mergeable == Some(true) && data.mergeable_state.as_deref() == Some("behind") {
         return PrCiStatus::Behind { number };
+    }
+    if data.mergeable == Some(false) && data.mergeable_state.as_deref() == Some("dirty") {
+        return PrCiStatus::Conflicting { number };
     }
     decide_from_checks(
         number,
@@ -1133,6 +1149,27 @@ mod tests {
     }
 
     #[test]
+    fn pr_ci_status_reports_conflicting_before_ever_fetching_check_runs() {
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"{"number":622,"html_url":"u","state":"open","title":"t","mergeable":false,"mergeable_state":"dirty"}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        let item = item_with_metadata(196, r#"{"pr":{"number":622,"branch":"whatever"}}"#);
+
+        let status = pr_ci_status_impl(&item, Path::new("/does/not/exist"), &client, &repo);
+
+        assert!(matches!(status, PrCiStatus::Conflicting { number: 622 }));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
     fn update_branch_pr_succeeds_on_a_clean_update() {
         let server = crate::github::test_support::MockServer::start(vec![
             crate::github::test_support::MockResponse::json(202, r#"{"message":"Updating"}"#),
@@ -1211,6 +1248,15 @@ mod tests {
         assert!(matches!(
             pr_ci_status_from_batch(101, &data),
             PrCiStatus::Behind { number: 101 }
+        ));
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_reports_conflicting_before_checks() {
+        let data = batch_data(false, Some(false), Some("dirty"), vec![], vec![]);
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Conflicting { number: 101 }
         ));
     }
 
