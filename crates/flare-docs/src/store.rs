@@ -62,10 +62,7 @@ impl DocsStore {
     }
 
     pub fn default_db_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".agentflare")
-            .join("flare-docs.db")
+        agentflare_config::agentflare_dir().join("flare-docs.db")
     }
 
     pub fn open_default() -> Result<Self, Error> {

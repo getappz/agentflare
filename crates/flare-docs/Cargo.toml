@@ -8,12 +8,12 @@ description = "On-demand third-party package/API documentation fetch, cache, and
 publish = false
 
 [dependencies]
+agentflare-config = { path = "../agentflare-config" }
 agentflare-store = { path = "../agentflare-store" }
 db_kit = { package = "agentflare-db-kit", path = "../agentflare-db-kit" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-dirs = "6"
 rusqlite = { version = "0.40", features = ["bundled"] }
 zstd = "0.13"
 ureq = "2"

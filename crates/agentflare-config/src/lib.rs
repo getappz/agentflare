@@ -5,16 +5,24 @@
 // AGENTFLARE_HOME_OVERRIDE is agentflare's own escape hatch for tests/CI.
 use std::path::PathBuf;
 
+/// Fallible twin of `home()` below, for the rare caller that needs to
+/// degrade gracefully (e.g. a sandbox wrapper that just skips a bind mount)
+/// instead of panicking when no home directory can be resolved at all.
+#[must_use]
+pub fn try_home() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("AGENTFLARE_HOME_OVERRIDE") {
+        return Some(PathBuf::from(p));
+    }
+    dirs::home_dir()
+}
+
 /// # Panics
 ///
 /// Panics if the home directory cannot be resolved (`dirs::home_dir()`
 /// returns `None`).
 #[must_use]
 pub fn home() -> PathBuf {
-    if let Ok(p) = std::env::var("AGENTFLARE_HOME_OVERRIDE") {
-        return PathBuf::from(p);
-    }
-    dirs::home_dir().expect("home directory not found")
+    try_home().expect("home directory not found")
 }
 
 /// `~/.config/agentflare/<namespace>` (or the OS config dir equivalent) —
@@ -25,6 +33,17 @@ pub fn config_dir(namespace: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("agentflare")
         .join(namespace)
+}
+
+/// `~/.agentflare` — agentflare's own per-user data dir (`agentflare.db`,
+/// `store.db`, `backend.db`, artifacts, staging, shims, config.toml, ...).
+/// The one resolver every per-user `.agentflare` consumer should share —
+/// `home()` above already honors `AGENTFLARE_HOME_OVERRIDE`, unlike
+/// `dirs::home_dir()`/`$HOME` called directly, which either ignore the
+/// override or, on Windows, may not even be set (`HOME` isn't `USERPROFILE`).
+#[must_use]
+pub fn agentflare_dir() -> PathBuf {
+    home().join(".agentflare")
 }
 
 // Shared by every dependent crate's tests: AGENTFLARE_HOME_OVERRIDE and cwd

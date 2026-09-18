@@ -8,6 +8,7 @@ description = "Persistent background job queue for AI agent CLIs. SQLite-backed,
 publish = false
 
 [dependencies]
+agentflare-config = { path = "../agentflare-config" }
 db_kit = { package = "agentflare-db-kit", path = "../agentflare-db-kit" }
 flare-sandbox = { path = "../flare-sandbox" }
 flare-process = { path = "../flare-process" }

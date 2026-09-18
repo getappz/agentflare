@@ -9,10 +9,12 @@ pub fn home() -> PathBuf {
 
 /// `~/.agentflare` — agentflare's own per-user data dir (holding
 /// `agentflare.db`, `store.db`, `backend.db`, artifacts, staging, shims,
-/// config.toml, ...). Single definition, mirroring `claude_dir()` below, so
-/// the 20+ existing call sites can't drift apart if this root ever moves.
+/// config.toml, ...). Lives in `agentflare-config` so library crates
+/// (flare-docs, agentflare-jobs, ...) can share it too, not just this binary
+/// crate's own call sites; re-exported here for the many existing
+/// `paths::agentflare_dir()` callers, same as `home()` above.
 pub fn agentflare_dir() -> PathBuf {
-    home().join(".agentflare")
+    agentflare_config::agentflare_dir()
 }
 
 /// Absolute path to the currently-running agentflare binary, falling back to
