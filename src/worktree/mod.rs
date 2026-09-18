@@ -387,8 +387,13 @@ fn decide_from_checks(
     // the PR is actually mergeable. GitHub's own `mergeable_state` already
     // accounts for the full required-checks list, so "blocked" here means
     // more is still outstanding -- treat it as still-pending rather than
-    // trusting the incomplete snapshot.
-    if mergeable_state == Some("blocked") {
+    // trusting the incomplete snapshot. Item #587: the original fix only
+    // special-cased "blocked" and the ping still fired early, because right
+    // after a push GitHub reports "unknown" (it hasn't finished computing
+    // mergeability at all yet) before it ever settles into "blocked" --
+    // that's the exact same incomplete-snapshot window, just caught one tick
+    // earlier, so it gets the same treatment.
+    if matches!(mergeable_state, Some("blocked") | Some("unknown")) {
         return PrCiStatus::Pending;
     }
     PrCiStatus::Passing { number, labels }
@@ -1280,6 +1285,26 @@ mod tests {
             false,
             Some(true),
             Some("blocked"),
+            vec![check("cla", "completed", Some("success"))],
+            vec![],
+        );
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Pending
+        ));
+    }
+
+    // Regression for item #587: the "blocked" fix above wasn't enough -- the
+    // ping still fired early because GitHub reports "unknown" (mergeability
+    // not computed yet at all) in the window right after a push, before it
+    // has settled into "blocked". Same incomplete-snapshot race, one tick
+    // earlier.
+    #[test]
+    fn pr_ci_status_from_batch_reports_pending_when_mergeable_state_unknown_despite_green_checks() {
+        let data = batch_data(
+            false,
+            None,
+            Some("unknown"),
             vec![check("cla", "completed", Some("success"))],
             vec![],
         );
