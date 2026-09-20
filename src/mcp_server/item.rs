@@ -932,13 +932,15 @@ impl AgentflareMcp {
         self.set_plan_status(req, "approved", None, PlanStatusRoute::PublicApprove)
     }
 
-    /// Channel-route approval: a real human tapped "Approve" on the Telegram
-    /// card built by `supervisor::notify_plan_approval_gate`, so the
-    /// human-approver check in `set_plan_status` is skipped. Deliberately NOT
-    /// wired into `item_inner`'s `action` dispatch — the only caller is
-    /// `supervisor::handle_telegram_callback`, which reaches it in-process
-    /// after verifying the callback came from the configured notify chat, so
-    /// no agent can invoke this through the MCP `item` tool.
+    /// Human-route approval: either a real human tapped "Approve" on the
+    /// Telegram card built by `supervisor::notify_plan_approval_gate`, or ran
+    /// `agentflare item approve-plan`. The human-approver check in
+    /// `set_plan_status` is skipped. Deliberately NOT wired into
+    /// `item_inner`'s `action` dispatch — the callers are
+    /// `supervisor::handle_telegram_callback` (in-process, after verifying the
+    /// callback came from the configured notify chat) and `cli::item`'s
+    /// `ApprovePlan` (which refuses under an AI agent), so no agent can invoke
+    /// this through the MCP `item` tool.
     pub(crate) fn item_approve_plan_via_channel(
         &self,
         req: ItemRequest,
@@ -993,7 +995,8 @@ impl AgentflareMcp {
             {
                 return Err(ErrorData::invalid_params(
                     "this item's plan requires human approval — tap Approve on the Telegram \
-                     card; agents cannot self-approve"
+                     card or have a human run `agentflare item approve-plan <id>`; agents \
+                     cannot self-approve"
                         .to_string(),
                     None,
                 ));

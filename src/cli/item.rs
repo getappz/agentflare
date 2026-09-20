@@ -42,11 +42,48 @@ pub enum ItemCommands {
         #[arg(long)]
         id: String,
     },
+    /// Approve an item's pending plan (human-only; refuses under an AI agent)
+    ApprovePlan {
+        /// Item id (#1 or UUID)
+        id: String,
+    },
+}
+
+/// `Some(message)` when the caller is an AI agent. `approve-plan` is the CLI
+/// twin of a human's Telegram tap, so it must stay out of an agent's reach —
+/// same detection `agentflare work` uses.
+fn approve_plan_denial(agent: Option<&str>) -> Option<String> {
+    agent.map(|agent| {
+        format!(
+            "`agentflare item approve-plan` is a human-only command — it stands in for a \
+             human's approval on the Telegram card, so an agent running it would defeat the \
+             plan gate (detected this process is running under the {agent} AI agent). Ask a \
+             human to run it."
+        )
+    })
 }
 
 impl ItemArgs {
     pub fn run(self) {
         match self.command {
+            ItemCommands::ApprovePlan { id } => {
+                if let Some(msg) = approve_plan_denial(agent_detector::agent_name().as_deref()) {
+                    eprintln!("error: {msg}");
+                    std::process::exit(1);
+                }
+                let mcp = crate::mcp_server::AgentflareMcp::default();
+                match mcp.item_approve_plan_via_channel(crate::mcp_server::types::ItemRequest {
+                    action: "approve_plan".into(),
+                    id: Some(id),
+                    ..Default::default()
+                }) {
+                    Ok(json) => println!("{json}"),
+                    Err(e) => {
+                        crate::ui::error(&e.to_string());
+                        std::process::exit(1);
+                    }
+                }
+            }
             ItemCommands::List {
                 json: _,
                 limit,
@@ -244,5 +281,24 @@ impl ItemArgs {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::approve_plan_denial;
+
+    #[test]
+    fn approve_plan_is_denied_under_an_ai_agent() {
+        let msg = approve_plan_denial(Some("claude-code")).expect("agent must be denied");
+        assert!(
+            msg.contains("human-only") && msg.contains("claude-code"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn approve_plan_is_allowed_for_a_human() {
+        assert_eq!(approve_plan_denial(None), None);
     }
 }
