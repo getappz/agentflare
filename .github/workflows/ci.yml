@@ -189,7 +189,11 @@ jobs:
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
         uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
-          tool: cargo-hakari
+          # Pinned: the generated workspace-hack differs between hakari
+          # versions (0.9.39 wants different output than 0.9.38), so an
+          # unpinned install fails every PR whenever upstream cuts a release.
+          # Bump together with a `cargo hakari generate` re-run.
+          tool: cargo-hakari@0.9.38
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
         run: cargo hakari generate --diff
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
