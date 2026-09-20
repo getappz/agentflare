@@ -1087,6 +1087,61 @@ fn item_redispatch_reports_dispatch_blocked_when_a_live_claim_remains() {
     assert!(resp["blocked_by_live_claim"]["age_secs"].as_i64().unwrap() >= 60);
 }
 
+fn redispatch_with(s: &AgentflareMcp, item_id: &str, assignee: &str) -> serde_json::Value {
+    serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "redispatch".into(),
+            id: Some(item_id.into()),
+            assignee_agent: Some(assignee.into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn item_redispatch_to_another_agent_releases_the_old_agents_claim() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    seed_claim(&s, &item_id, "opencode:dead-job", 60);
+
+    let resp = redispatch_with(&s, &item_id, "claude-code");
+
+    assert_eq!(resp["assignee_agent"].as_str(), Some("claude-code"));
+    assert_eq!(
+        resp["dispatchable"],
+        serde_json::Value::Bool(true),
+        "{resp:?}"
+    );
+    assert!(resp.get("blocked_by_live_claim").is_none());
+    assert_eq!(
+        s.with_backend_db(|conn| agentflare_backend::claim::current_owner(conn, &item_id))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn item_redispatch_to_the_same_agent_keeps_its_claim() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    seed_claim(&s, &item_id, "opencode:live-job", 60);
+
+    redispatch_with(&s, &item_id, "opencode");
+
+    assert_eq!(
+        s.with_backend_db(|conn| agentflare_backend::claim::current_owner(conn, &item_id))
+            .unwrap(),
+        Some("opencode:live-job".to_string()),
+        "a same-agent redispatch must not release the claim"
+    );
+}
+
 #[test]
 fn item_release_reclaims_and_releases_a_stale_claim_from_an_abandoned_owner() {
     let (_tmp, s) = harness();
