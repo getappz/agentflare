@@ -19,6 +19,19 @@ fn blob_disk_path(dir: &Path, hash: &str) -> PathBuf {
     dir.join(&hash[..2]).join(hash)
 }
 
+/// `blob_disk_path` for hashes that may not have come from `blob_store`: a
+/// hash is hex (blake3), so anything else — path separators, `..`, or a
+/// string too short to slice — is rejected instead of escaping `dir`.
+fn checked_blob_path(dir: &Path, hash: &str) -> std::io::Result<PathBuf> {
+    if hash.len() < 2 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid blob hash",
+        ));
+    }
+    Ok(blob_disk_path(dir, hash))
+}
+
 /// Reads the store's own blob directory first, then the legacy shared
 /// `<root>/blobs` where builds before per-store namespacing wrote everything.
 ///
@@ -26,7 +39,7 @@ fn blob_disk_path(dir: &Path, hash: &str) -> PathBuf {
 /// disk failures) are propagated instead of being folded into "not found".
 fn read_disk_blob(dir: &Path, legacy_dir: &Path, hash: &str) -> std::io::Result<Option<Vec<u8>>> {
     for d in [dir, legacy_dir] {
-        match std::fs::read(blob_disk_path(d, hash)) {
+        match std::fs::read(checked_blob_path(d, hash)?) {
             Ok(data) => return Ok(Some(decompress_if_gzip(data)?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
@@ -36,7 +49,7 @@ fn read_disk_blob(dir: &Path, legacy_dir: &Path, hash: &str) -> std::io::Result<
 }
 
 fn write_disk_blob(dir: &Path, hash: &str, data: &[u8]) -> Result<(), std::io::Error> {
-    let path = blob_disk_path(dir, hash);
+    let path = checked_blob_path(dir, hash)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -74,7 +87,9 @@ fn decompress_if_gzip(data: Vec<u8>) -> std::io::Result<Vec<u8>> {
 /// this store can't see that table — leaking a legacy file is recoverable,
 /// deleting one another store needs is not.
 fn delete_disk_blob(dir: &Path, hash: &str) {
-    let path = blob_disk_path(dir, hash);
+    let Ok(path) = checked_blob_path(dir, hash) else {
+        return;
+    };
     // The row is already gone (blob_unref) or was never inserted (blob_store,
     // cleaning up after a failed metadata insert) by the time this runs, so a
     // failure here can't be retried through the database — log it (unless the
@@ -298,6 +313,15 @@ mod tests {
         assert!(s.blob_unref(&h).unwrap());
         assert!(s.blob_unref(&h).unwrap());
         assert!(s.blob_get(&h).unwrap().is_none());
+    }
+
+    #[test]
+    fn non_hex_hashes_never_resolve_to_a_disk_path() {
+        let dir = std::path::Path::new("blobs");
+        for bad in ["", "a", "../x", "ab/../../x", "zz", "ab\\cd"] {
+            assert!(checked_blob_path(dir, bad).is_err(), "{bad:?}");
+        }
+        assert!(checked_blob_path(dir, "ab12").is_ok());
     }
 
     #[test]

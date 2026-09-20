@@ -22,6 +22,7 @@ const VERSIONS_DIR: &str = "versions";
 /// history list) is untouched, so what happened is still visible even after
 /// old snapshot bodies are gone. v1 is always kept as the origin anchor.
 const MAX_KEPT_VERSIONS: u32 = 50;
+const MAX_ID_LEN: usize = 64;
 
 /// Doc-store project key for artifact documents.
 const DOC_PROJECT: &str = "__artifacts__";
@@ -272,11 +273,12 @@ impl ArtifactStore {
     }
 
     fn publish_flat(&self, req: &PublishRequest) -> std::io::Result<PublishResponse> {
-        let id = req
-            .update_id
-            .clone()
-            .filter(|uid| self.artifact_dir(uid).exists())
-            .unwrap_or_else(|| nanoid::nanoid!());
+        // An invalid `update_id` is an error, not a cue to mint a fresh id; only
+        // an omitted or valid-but-missing one falls back to a new nanoid.
+        let id = match req.update_id.as_deref() {
+            Some(uid) if self.artifact_dir(uid)?.exists() => uid.to_string(),
+            _ => nanoid::nanoid!(),
+        };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -297,7 +299,7 @@ impl ArtifactStore {
             }
         }
 
-        let dir = self.artifact_dir(&id);
+        let dir = self.artifact_dir(&id)?;
         let unchanged = prev.is_some()
             && fs::read_to_string(dir.join(CONTENT_FILE))
                 .map(|current| current == req.content)
@@ -378,7 +380,7 @@ impl ArtifactStore {
                 .header(&format!("{id} v{from}"), &format!("{id} v{to}"))
                 .to_string());
         }
-        let versions_dir = self.artifact_dir(id).join(VERSIONS_DIR);
+        let versions_dir = self.artifact_dir(id)?.join(VERSIONS_DIR);
         let old = read_version_file(&versions_dir.join(from.to_string()))?;
         let new = read_version_file(&versions_dir.join(to.to_string()))?;
         let diff = similar::TextDiff::from_lines(&old, &new);
@@ -519,7 +521,7 @@ impl ArtifactStore {
         }
         let mut artifact = self.get(id)?;
         let content_path = self
-            .artifact_dir(id)
+            .artifact_dir(id)?
             .join(VERSIONS_DIR)
             .join(version.to_string());
         artifact.content = read_version_file(&content_path)?;
@@ -531,7 +533,7 @@ impl ArtifactStore {
         if let Some(ref store) = self.store {
             return self.get_store(store, id);
         }
-        let dir = self.artifact_dir(id);
+        let dir = self.artifact_dir(id)?;
         if !dir.exists() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -617,7 +619,7 @@ impl ArtifactStore {
                 None => Ok(false),
             };
         }
-        let dir = self.artifact_dir(id);
+        let dir = self.artifact_dir(id)?;
         if !dir.exists() {
             return Ok(false);
         }
@@ -641,12 +643,26 @@ impl ArtifactStore {
         }
     }
 
-    fn artifact_dir(&self, id: &str) -> PathBuf {
-        self.base_path.join(id)
+    /// Artifact ids are nanoids (`A-Za-z0-9_-`). Anything else (`..`, path
+    /// separators, an absolute path) could escape `base_path`, and `delete`
+    /// removes the resolved directory recursively, so reject it up front.
+    fn artifact_dir(&self, id: &str) -> std::io::Result<PathBuf> {
+        let valid = !id.is_empty()
+            && id.len() <= MAX_ID_LEN
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !valid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid artifact id",
+            ));
+        }
+        Ok(self.base_path.join(id))
     }
 
     fn read_meta(&self, id: &str) -> Option<ArtifactMeta> {
-        let path = self.artifact_dir(id).join(META_FILE);
+        let path = self.artifact_dir(id).ok()?.join(META_FILE);
         fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -791,7 +807,14 @@ mod tests {
         let content = "repeat me ".repeat(200);
         let id = publish(&store, None, &content);
 
-        let raw = fs::read(store.artifact_dir(&id).join(VERSIONS_DIR).join("1")).unwrap();
+        let raw = fs::read(
+            store
+                .artifact_dir(&id)
+                .unwrap()
+                .join(VERSIONS_DIR)
+                .join("1"),
+        )
+        .unwrap();
         assert!(
             raw.len() < content.len(),
             "on-disk snapshot ({} bytes) should be smaller than the source ({} bytes)",
@@ -811,7 +834,11 @@ mod tests {
         // Simulate a snapshot written by a build predating compression: no
         // gzip magic, plain UTF-8 text on disk.
         fs::write(
-            store.artifact_dir(&id).join(VERSIONS_DIR).join("1"),
+            store
+                .artifact_dir(&id)
+                .unwrap()
+                .join(VERSIONS_DIR)
+                .join("1"),
             "legacy plaintext, no gzip header",
         )
         .unwrap();
@@ -820,6 +847,48 @@ mod tests {
             store.get_version(&id, 1).unwrap().content,
             "legacy plaintext, no gzip header"
         );
+    }
+
+    #[test]
+    fn ids_that_could_escape_the_base_dir_are_rejected() {
+        let (tmp, store) = store();
+        let victim = tmp.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+
+        for bad in ["", "..", "../victim", "a/b", "a\\b", "/etc"] {
+            assert!(store.get(bad).is_err(), "get({bad:?}) must fail");
+            assert!(store.delete(bad).is_err(), "delete({bad:?}) must fail");
+            assert!(store.diff(bad, 1, 2).is_err(), "diff({bad:?}) must fail");
+        }
+        assert!(
+            victim.exists(),
+            "a traversal id must not delete outside the store"
+        );
+    }
+
+    #[test]
+    fn publish_with_an_invalid_update_id_fails_instead_of_minting_a_new_artifact() {
+        let (_tmp, store) = store();
+        let before = fs::read_dir(store.base_path()).unwrap().count();
+
+        for bad in ["../victim", "a/b", ""] {
+            let err = store
+                .publish(&PublishRequest {
+                    name: "doc".into(),
+                    artifact_type: ArtifactType::Markdown,
+                    content: "x".into(),
+                    session_id: "s1".into(),
+                    update_id: Some(bad.into()),
+                    ..Default::default()
+                })
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        assert_eq!(fs::read_dir(store.base_path()).unwrap().count(), before);
+
+        // A valid id that doesn't exist yet still gets a fresh artifact.
+        let id = publish(&store, Some("valid_but_missing".into()), "x");
+        assert_ne!(id, "valid_but_missing");
     }
 
     // ── store-backed (agentflare_store) tests ──

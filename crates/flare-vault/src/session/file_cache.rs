@@ -38,12 +38,7 @@ pub fn load_from_file_cache(app_name: &str, entry_key: &str) -> Option<[u8; 32]>
     // Simple XOR obfuscation with cache key
     let cache_key = derive_cache_key(app_name);
     let dek = xor_decrypt(&data, &cache_key);
-    if dek.len() != 32 {
-        return None;
-    }
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&dek);
-    Some(result)
+    <[u8; 32]>::try_from(dek.as_slice()).ok()
 }
 
 pub fn store_in_file_cache(app_name: &str, entry_key: &str, dek: &[u8; 32]) {
