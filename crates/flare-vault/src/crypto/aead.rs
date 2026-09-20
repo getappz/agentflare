@@ -1,6 +1,6 @@
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use rand::RngCore;
+use rand::Rng;
 pub const MAGIC: &[u8] = b"FLVT";
 pub const NONCE_SIZE: usize = 12;
 
@@ -38,8 +38,7 @@ impl EncryptedBlob {
 }
 
 pub fn encrypt_dek(plaintext: &[u8], kek: &[u8; 32]) -> Result<EncryptedBlob, String> {
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce_bytes: [u8; NONCE_SIZE] = OsRng.r#gen();
     let nonce = Nonce::from_slice(&nonce_bytes);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(kek));
     let ciphertext = cipher
@@ -64,8 +63,7 @@ pub fn decrypt_dek(blob: &EncryptedBlob, kek: &[u8; 32]) -> Result<Vec<u8>, Stri
 }
 
 pub fn encrypt_value(plaintext: &[u8], dek: &[u8; 32]) -> Result<Vec<u8>, String> {
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce_bytes: [u8; NONCE_SIZE] = OsRng.r#gen();
     let nonce = Nonce::from_slice(&nonce_bytes);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek));
     let ciphertext = cipher
@@ -95,9 +93,13 @@ pub fn decrypt_value(data: &[u8], dek: &[u8; 32]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    fn random_key() -> [u8; 32] {
+        OsRng.r#gen()
+    }
+
     #[test]
     fn dek_roundtrip() {
-        let kek = [0xABu8; 32];
+        let kek = random_key();
         let dek = b"this-is-a-256-bit-key-dummy!";
         let blob = encrypt_dek(dek, &kek).unwrap();
         let decrypted = decrypt_dek(&blob, &kek).unwrap();
@@ -106,15 +108,15 @@ mod tests {
 
     #[test]
     fn dek_wrong_kek_fails() {
-        let kek1 = [0xABu8; 32];
-        let kek2 = [0xBAu8; 32];
+        let kek1 = random_key();
+        let kek2 = random_key();
         let blob = encrypt_dek(b"my-dek-value", &kek1).unwrap();
         assert!(decrypt_dek(&blob, &kek2).is_err());
     }
 
     #[test]
     fn value_roundtrip() {
-        let dek = [0x42u8; 32];
+        let dek = random_key();
         let plaintext = b"my-secret-api-key-12345";
         let encrypted = encrypt_value(plaintext, &dek).unwrap();
         let decrypted = decrypt_value(&encrypted, &dek).unwrap();
@@ -123,7 +125,7 @@ mod tests {
 
     #[test]
     fn unique_nonces() {
-        let dek = [0x42u8; 32];
+        let dek = random_key();
         let plaintext = b"same-data";
         let c1 = encrypt_value(plaintext, &dek).unwrap();
         let c2 = encrypt_value(plaintext, &dek).unwrap();
@@ -132,8 +134,8 @@ mod tests {
 
     #[test]
     fn wrong_dek_fails() {
-        let dek1 = [0x42u8; 32];
-        let dek2 = [0x24u8; 32];
+        let dek1 = random_key();
+        let dek2 = random_key();
         let encrypted = encrypt_value(b"secret", &dek1).unwrap();
         assert!(decrypt_value(&encrypted, &dek2).is_err());
     }

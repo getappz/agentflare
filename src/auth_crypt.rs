@@ -1,7 +1,7 @@
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use pbkdf2::pbkdf2_hmac_array;
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 
 const MAGIC: &[u8] = b"AFVE";
@@ -31,12 +31,10 @@ pub fn is_encrypted(data: &[u8]) -> bool {
 }
 
 pub fn encrypt(plaintext: &[u8], passphrase: &str) -> Option<Vec<u8>> {
-    let mut salt = [0u8; SALT_SIZE];
-    OsRng.fill_bytes(&mut salt);
+    let salt: [u8; SALT_SIZE] = OsRng.r#gen();
     let key = derive_key(passphrase, &salt);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce_bytes: [u8; NONCE_SIZE] = OsRng.r#gen();
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher.encrypt(nonce, plaintext).ok()?;
     let mut result = MAGIC.to_vec();

@@ -11,12 +11,7 @@ pub fn load_from_keyring(app_name: &str, entry_key: &str) -> Option<[u8; 32]> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(secret.as_bytes())
         .ok()?;
-    if bytes.len() != 32 {
-        return None;
-    }
-    let mut dek = [0u8; 32];
-    dek.copy_from_slice(&bytes);
-    Some(dek)
+    <[u8; 32]>::try_from(bytes.as_slice()).ok()
 }
 
 pub fn store_in_keyring(app_name: &str, entry_key: &str, dek: &[u8; 32]) {
