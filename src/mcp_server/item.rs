@@ -1676,7 +1676,7 @@ impl AgentflareMcp {
         if raw.trim().is_empty() {
             return Err(ErrorData::invalid_params("id is required", None));
         }
-        let assignee_agent = req.assignee_agent.clone();
+        let req_assignee = req.assignee_agent.clone();
         let now = crate::claims::now();
         let ttl = crate::mcp_server::types::backend_claim_ttl_secs();
         self.with_backend_db(|conn| {
@@ -1684,11 +1684,24 @@ impl AgentflareMcp {
             let outcome = agentflare_backend::item::redispatch(
                 conn,
                 &item_id,
-                assignee_agent.as_deref(),
+                req_assignee.as_deref(),
             )
             .map_err(map_backend_err)?;
             match outcome {
                 agentflare_backend::item::RedispatchOutcome::Ready { assignee_agent } => {
+                    // An explicit `assignee_agent` is a hand-off, same as
+                    // `item_update`: release the previous agent's claim so the
+                    // item isn't stuck non-dispatchable until the TTL lapses.
+                    // Without one the assignee is unchanged, so a live claim
+                    // still legitimately blocks dispatch.
+                    if req_assignee.is_some() {
+                        crate::claims::reassignment_releases_claim(
+                            conn,
+                            &item_id,
+                            Some(&assignee_agent),
+                        )
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                    }
                     let effective_ttl =
                         agentflare_backend::claim::effective_ttl_secs(conn, &item_id, ttl);
                     let live = agentflare_backend::claim::live_claim_on_item(
