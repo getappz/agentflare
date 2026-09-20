@@ -5,7 +5,7 @@ use crate::session;
 use crate::vault::file::{read_vault_file, vault_file_exists, write_vault_file};
 use crate::vault::model::{SecretEntry, VaultBody, VaultFile};
 use chrono::Utc;
-use rand::RngCore;
+use rand::Rng;
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -75,8 +75,7 @@ pub fn create_vault(path: &Path, passphrase: &str) -> VaultResult<()> {
         return Err(VaultError::AlreadyInitialized(path.display().to_string()));
     }
 
-    let mut salt = vec![0u8; SALT_SIZE];
-    rand::rngs::OsRng.fill_bytes(&mut salt);
+    let salt = rand::rngs::OsRng.r#gen::<[u8; SALT_SIZE]>().to_vec();
 
     let params = KdfParams {
         salt: salt.clone(),
@@ -85,8 +84,7 @@ pub fn create_vault(path: &Path, passphrase: &str) -> VaultResult<()> {
 
     let kek = derive_kek(passphrase, &params).map_err(VaultError::Crypto)?;
 
-    let mut dek = [0u8; DEK_SIZE];
-    rand::rngs::OsRng.fill_bytes(&mut dek);
+    let dek = rand::rngs::OsRng.r#gen::<[u8; DEK_SIZE]>();
 
     let blob = encrypt_dek(&dek, &kek.key).map_err(VaultError::Crypto)?;
     let vault = VaultFile::new(blob.to_bytes(), salt);
@@ -114,9 +112,10 @@ pub fn open_vault(path: &Path, passphrase: &str) -> VaultResult<VaultDek> {
         .map_err(VaultError::Crypto)?;
 
     let mut dek_bytes = decrypt_dek(&blob, &kek.key).map_err(|_| VaultError::WrongPassphrase)?;
-    let mut dek = [0u8; DEK_SIZE];
-    dek.copy_from_slice(&dek_bytes);
+    // Zeroize before propagating so a wrong-length DEK isn't left in memory.
+    let dek = <[u8; DEK_SIZE]>::try_from(dek_bytes.as_slice());
     dek_bytes.zeroize();
+    let dek = dek.map_err(|_| VaultError::Crypto("vault DEK has an invalid length".into()))?;
 
     Ok(VaultDek { dek })
 }
