@@ -22,8 +22,11 @@ fn blob_disk_path(dir: &Path, hash: &str) -> PathBuf {
 /// `blob_disk_path` for hashes that may not have come from `blob_store`: a
 /// hash is hex (blake3), so anything else — path separators, `..`, or a
 /// string too short to slice — is rejected instead of escaping `dir`.
+///
+/// The `contains("..")` test is implied by the hex check; it stays because it
+/// is the guard form CodeQL's path-injection query recognises as a sanitizer.
 fn checked_blob_path(dir: &Path, hash: &str) -> std::io::Result<PathBuf> {
-    if hash.len() < 2 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if hash.len() < 2 || hash.contains("..") || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "invalid blob hash",

@@ -273,11 +273,12 @@ impl ArtifactStore {
     }
 
     fn publish_flat(&self, req: &PublishRequest) -> std::io::Result<PublishResponse> {
-        let id = req
-            .update_id
-            .clone()
-            .filter(|uid| self.artifact_dir(uid).is_ok_and(|d| d.exists()))
-            .unwrap_or_else(|| nanoid::nanoid!());
+        // An invalid `update_id` is an error, not a cue to mint a fresh id; only
+        // an omitted or valid-but-missing one falls back to a new nanoid.
+        let id = match req.update_id.as_deref() {
+            Some(uid) if self.artifact_dir(uid)?.exists() => uid.to_string(),
+            _ => nanoid::nanoid!(),
+        };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -863,6 +864,31 @@ mod tests {
             victim.exists(),
             "a traversal id must not delete outside the store"
         );
+    }
+
+    #[test]
+    fn publish_with_an_invalid_update_id_fails_instead_of_minting_a_new_artifact() {
+        let (_tmp, store) = store();
+        let before = fs::read_dir(store.base_path()).unwrap().count();
+
+        for bad in ["../victim", "a/b", ""] {
+            let err = store
+                .publish(&PublishRequest {
+                    name: "doc".into(),
+                    artifact_type: ArtifactType::Markdown,
+                    content: "x".into(),
+                    session_id: "s1".into(),
+                    update_id: Some(bad.into()),
+                    ..Default::default()
+                })
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        assert_eq!(fs::read_dir(store.base_path()).unwrap().count(), before);
+
+        // A valid id that doesn't exist yet still gets a fresh artifact.
+        let id = publish(&store, Some("valid_but_missing".into()), "x");
+        assert_ne!(id, "valid_but_missing");
     }
 
     // ── store-backed (agentflare_store) tests ──
