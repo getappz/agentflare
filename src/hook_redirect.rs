@@ -223,7 +223,7 @@ fn branch_guard_reason_for(branch: Option<&str>, default: Option<&str>) -> Optio
 /// once that's applied, every `ctx_shell`/`ctx_patch`/`ctx_edit` call this
 /// module or `hook_completion_gate` needs to classify arrives wrapped in
 /// this envelope instead of at the top level.
-const GATEWAY_TOOL_NAME: &str = "mcp__flare__tool";
+pub(crate) const GATEWAY_TOOL_NAME: &str = "mcp__flare__tool";
 
 /// Unwraps a flare-gateway `action="execute"` call (`mcp__flare__tool(
 /// action="execute", server="leanctx", tool="ctx_shell", args={"command":

@@ -191,6 +191,11 @@ fn confirm_gateway_integrations(agent: &str, yes: bool) {
 /// flagless commands and older installs that still carry `--agent <host>`
 /// (upgrades stay idempotent either way). It must not match optimize code's own
 /// hook commands (`"<bin>" optimize code hook X"`), so both can coexist per event.
+///
+/// When the existing entry's `matcher` differs from `matcher` it is rewritten
+/// in place (returns `true`), so a widened matcher reaches installs wired by an
+/// older version -- the hook only runs for tools its matcher names, so a stale
+/// matcher silently disables whatever the hook records for the missing tool.
 fn add_hook_entry(
     hooks_obj: &mut Map<String, Value>,
     event: &str,
@@ -204,8 +209,19 @@ fn add_hook_entry(
         .or_insert_with(|| json!([]))
         .as_array_mut()
         .unwrap();
-    if arr.iter().any(|v| v.to_string().contains(marker)) {
-        return false;
+    if let Some(existing) = arr
+        .iter_mut()
+        .find(|v| v.to_string().contains(marker))
+        .and_then(Value::as_object_mut)
+    {
+        let Some(m) = matcher else {
+            return false;
+        };
+        if existing.get("matcher").and_then(Value::as_str) == Some(m) {
+            return false;
+        }
+        existing.insert("matcher".to_string(), json!(m));
+        return true;
     }
     let mut entry =
         json!({ "hooks": [{ "type": "command", "command": command, "timeout": timeout }] });
@@ -235,6 +251,23 @@ fn remove_hook_entries_matching(
     let before = arr.len();
     arr.retain(|v| !v.to_string().contains(marker));
     arr.len() != before
+}
+
+/// `PostToolUse` matcher for `hook post-tool-use`: the union of every tool
+/// name the hook (`hook_completion_gate::post_tool_use`) branches on. Claude
+/// Code only spawns the hook for tools this names, so anything the hook
+/// depends on but this omits is silently dead -- `ReportFindings` was, which
+/// left `last_review` unset and made `item done` unsatisfiable (item #610).
+/// `wire_claude_code_post_tool_use_matcher_covers_every_tool_the_hook_handles`
+/// pins the two together.
+fn post_tool_use_matcher() -> String {
+    format!(
+        "Bash|bash|PowerShell|powershell|shell|mcp__lean-ctx__ctx_shell|{gateway}|{item}|item|{review}|{mutating}",
+        gateway = crate::hook_redirect::GATEWAY_TOOL_NAME,
+        item = crate::hook_redirect::ITEM_TOOL_NAME,
+        review = crate::optimize::REVIEW_COMPLETION_TOOL,
+        mutating = crate::hook_redirect::MUTATING_TOOLS.join("|"),
+    )
 }
 
 fn wire_claude_code() {
@@ -300,16 +333,11 @@ fn wire_claude_code() {
     // which genuinely needs every tool call for the branch guard) rather
     // than left unmatched, so this doesn't spawn a subprocess on every Read/
     // Grep/etc call too.
-    let post_tool_use_matcher = format!(
-        "Bash|bash|PowerShell|powershell|shell|{}|item|{}",
-        crate::hook_redirect::ITEM_TOOL_NAME,
-        crate::hook_redirect::MUTATING_TOOLS.join("|")
-    );
     added |= add_hook_entry(
         hooks_obj,
         "PostToolUse",
         "hook post-tool-use",
-        Some(&post_tool_use_matcher),
+        Some(&post_tool_use_matcher()),
         format!("\"{bin}\" hook post-tool-use"),
         5,
     );
@@ -855,6 +883,79 @@ mod tests {
             wire_claude_code();
             let second = fs::read_to_string(&path).unwrap();
             assert_eq!(first, second, "second run should not duplicate hooks");
+        });
+    }
+
+    /// The matcher entry Claude Code will consult for `hook post-tool-use`.
+    fn installed_post_tool_use_matcher() -> String {
+        let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+        let settings: Value = serde_json::from_str(&content).unwrap();
+        let entries = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        let matching: Vec<_> = entries
+            .iter()
+            .filter(|e| e.to_string().contains("hook post-tool-use"))
+            .collect();
+        assert_eq!(matching.len(), 1, "exactly one post-tool-use entry");
+        matching[0]["matcher"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn wire_claude_code_post_tool_use_matcher_covers_every_tool_the_hook_handles() {
+        // Every tool name `hook_completion_gate::post_tool_use` branches on --
+        // if one is missing here the hook never runs for it (item #610).
+        assert!(crate::optimize::is_review_completion("ReportFindings"));
+        let mut handled: Vec<&str> = vec![
+            // Bash family: verification/diagnosis evidence (`hook_redirect::classify`).
+            "Bash",
+            "bash",
+            "PowerShell",
+            "powershell",
+            "shell",
+            "mcp__lean-ctx__ctx_shell",
+            // `item done`/`check_merge` finishing menu.
+            crate::hook_redirect::ITEM_TOOL_NAME,
+            "item",
+            // Review evidence.
+            crate::optimize::REVIEW_COMPLETION_TOOL,
+            // Gateway-routed commands/edits are unwrapped by the hook.
+            crate::hook_redirect::GATEWAY_TOOL_NAME,
+        ];
+        handled.extend(crate::hook_redirect::MUTATING_TOOLS);
+
+        with_temp_home(|| {
+            wire_claude_code();
+            let matcher = installed_post_tool_use_matcher();
+            let names: Vec<&str> = matcher.split('|').collect();
+            for tool in &handled {
+                assert!(names.contains(tool), "matcher {matcher:?} misses {tool}");
+            }
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_refreshes_a_stale_post_tool_use_matcher() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("settings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Matcher as wired before `ReportFindings` was added to it.
+            let stale = "Bash|bash|PowerShell|powershell|shell|mcp__flare__item|item|Write";
+            let seed = json!({ "hooks": { "PostToolUse": [
+                { "matcher": "Other", "hooks": [{ "type": "command", "command": "unrelated" }] },
+                { "matcher": stale, "hooks": [
+                    { "type": "command", "command": "\"agentflare\" hook post-tool-use", "timeout": 5 }
+                ] },
+            ] } });
+            fs::write(&path, seed.to_string()).unwrap();
+
+            wire_claude_code();
+
+            assert_eq!(installed_post_tool_use_matcher(), post_tool_use_matcher());
+            let settings: Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let entries = settings["hooks"]["PostToolUse"].as_array().unwrap();
+            assert_eq!(entries.len(), 2, "refresh must not add a duplicate entry");
+            assert_eq!(entries[0]["matcher"], "Other");
+            assert_eq!(entries[1]["hooks"][0]["timeout"], 5);
         });
     }
 
