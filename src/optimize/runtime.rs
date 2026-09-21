@@ -266,8 +266,14 @@ pub fn has_fresh_diagnosis_evidence(record: &SessionRecord) -> bool {
 /// gap, not a nice-to-have: acknowledged rather than papered over with a
 /// heuristic that reintroduces the same failure mode this rejects.
 pub fn is_review_completion(tool_name: &str) -> bool {
-    tool_name == "ReportFindings"
+    tool_name == REVIEW_COMPLETION_TOOL
 }
+
+/// The tool whose successful call [`is_review_completion`] treats as review
+/// completion. Also feeds the installed `PostToolUse` matcher
+/// (`init::post_tool_use_matcher`) -- the hook only runs for tools that
+/// matcher names, so a review tool missing from it never records evidence.
+pub const REVIEW_COMPLETION_TOOL: &str = "ReportFindings";
 
 /// Whether `record` carries review evidence recent enough to satisfy the
 /// completion gate right now -- same freshness window as verification
