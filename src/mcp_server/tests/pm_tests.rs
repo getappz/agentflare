@@ -103,6 +103,24 @@ fn pm_health_matches_item_health_for_the_same_params() {
             ..Default::default()
         }))
         .unwrap();
+    // Each call reads the wall clock itself, so the velocity week bounds can
+    // differ by a second or two. Compare everything else exactly and the
+    // bounds within a tolerance.
+    let mut via_pm: serde_json::Value = serde_json::from_str(&via_pm).unwrap();
+    let mut via_item: serde_json::Value = serde_json::from_str(&via_item).unwrap();
+    let bounds = |v: &mut serde_json::Value| -> Vec<i64> {
+        v["velocity"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .flat_map(|w| ["week_start", "week_end"].map(|k| w[k].take().as_i64().unwrap()))
+            .collect()
+    };
+    let (pm_bounds, item_bounds) = (bounds(&mut via_pm), bounds(&mut via_item));
+    assert_eq!(pm_bounds.len(), item_bounds.len());
+    for (a, b) in pm_bounds.iter().zip(&item_bounds) {
+        assert!((a - b).abs() <= 5, "week bounds drifted: {a} vs {b}");
+    }
     assert_eq!(via_pm, via_item);
 }
 
