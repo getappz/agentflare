@@ -92,14 +92,26 @@ pub fn item_id_tag(item_id: &str) -> String {
     format!("{ITEM_ID_TAG_PREFIX}{item_id} -->")
 }
 
-/// False only when `body` carries an identity tag naming a *different* item
-/// than `item_id`. A body with no tag (a PR opened before `item_id_tag`
-/// existed, or by hand) still passes -- there's nothing to contradict, so
-/// callers fall back to the sequence-number marker alone.
+/// False when `body` carries *any* identity tag that is malformed (no closing
+/// ` -->`) or names a *different* item than `item_id` -- every occurrence is
+/// checked, so a matching tag can't launder a conflicting one after it. A body
+/// with no tag at all (a PR opened before `item_id_tag` existed, or by hand)
+/// still passes -- there's nothing to contradict, so callers fall back to the
+/// sequence-number marker alone.
 fn tag_allows(body: Option<&str>, item_id: &str) -> bool {
-    body.and_then(|b| b.split_once(ITEM_ID_TAG_PREFIX))
-        .and_then(|(_, rest)| rest.split_once(" -->"))
-        .is_none_or(|(tagged, _)| tagged == item_id)
+    let Some(mut rest) = body else {
+        return true;
+    };
+    while let Some((_, after_prefix)) = rest.split_once(ITEM_ID_TAG_PREFIX) {
+        let Some((tagged, after_tag)) = after_prefix.split_once(" -->") else {
+            return false;
+        };
+        if tagged != item_id {
+            return false;
+        }
+        rest = after_tag;
+    }
+    true
 }
 
 /// [`marks_item`] plus the identity-tag check: the PR must carry this
@@ -485,6 +497,20 @@ mod tests {
         let client = server.client(None);
         let prs = find_by_item_marker(&client, &repo(), 198, "gateway-item-uuid").unwrap();
         assert_eq!(prs.iter().map(|p| p.number).collect::<Vec<_>>(), vec![637]);
+    }
+
+    /// Every tag occurrence counts: a matching tag followed by a conflicting or
+    /// malformed one is an ambiguous identity, not a match.
+    #[test]
+    fn marks_this_item_rejects_a_body_with_a_second_conflicting_or_malformed_tag() {
+        let marker = "_Opened by `a` on **m** for item #198 via agentflare._";
+        let ok = item_id_tag("mine");
+        let conflicting = format!("{marker}\n{ok}\n{}", item_id_tag("other"));
+        assert!(!marks_this_item(Some(&conflicting), 198, "mine"));
+        let malformed = format!("{marker}\n{ok}\n{ITEM_ID_TAG_PREFIX}mine");
+        assert!(!marks_this_item(Some(&malformed), 198, "mine"));
+        let repeated = format!("{marker}\n{ok}\n{ok}");
+        assert!(marks_this_item(Some(&repeated), 198, "mine"));
     }
 
     #[test]

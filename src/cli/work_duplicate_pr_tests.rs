@@ -238,6 +238,48 @@
         });
     }
 
+    /// If the human-review comment can't be created, nothing persistent flags
+    /// the duplicate for a human -- the outcome must be a failure (so the job
+    /// retries), not a success. The claim is still released.
+    #[test]
+    fn handle_duplicate_pr_fails_when_the_review_comment_cannot_be_created() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+            let mcp = AgentflareMcp::for_project_dir(repo_root.clone());
+            let item = mcp.with_backend_db(|conn| seeded_item(&mcp, conn)).unwrap();
+            mcp.item_claim(ItemRequest {
+                action: "claim".into(),
+                id: Some(item.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+            let mut guard = ClaimGuard::new(&mcp, &item.id);
+            let mut log = Vec::new();
+            // An id that names no item makes the comment insert fail; the
+            // release (keyed off the same id) fails too, which is fine here --
+            // the assertion is on the outcome and the logged error.
+            let outcome = handle_duplicate_pr(
+                &mcp,
+                "no-such-item-id",
+                &item,
+                &open_duplicate_pr(7),
+                None,
+                &mut guard,
+                &mut log,
+            );
+            assert_ne!(outcome.exit_code, 0);
+            let log = String::from_utf8(log).unwrap();
+            assert!(
+                log.contains("could not record the human-review comment"),
+                "expected the comment failure in the log, got: {log}"
+            );
+        });
+    }
+
     /// The other half of item #164's MVP: an open (unmerged) duplicate skips
     /// dispatch and flags for a human instead of self-completing or opening
     /// a second PR.

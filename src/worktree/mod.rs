@@ -652,19 +652,14 @@ fn persist_pr_identity(item: &agentflare_backend::item::Item, number: u64, branc
 /// and its post-create-failure recheck. Branch names get reused across items
 /// over time, and `find_existing` matches on branch name alone, so an
 /// unrelated, already-merged PR from a past item can share this branch's
-/// name (item #63). An open match is always trusted regardless of body,
-/// since GitHub itself would reject creating a genuine duplicate against it
-/// anyway.
+/// name (item #63). An open match gets no exemption: an open PR tagged for
+/// another item must not be recorded as this item's authoritative PR identity
+/// (item #595).
 fn is_own_pr(
     existing: &crate::github::models::PullRequest,
     item: &agentflare_backend::item::Item,
 ) -> bool {
-    existing.state == "open"
-        || crate::github::pulls::marks_this_item(
-            existing.body.as_deref(),
-            item.sequence_id,
-            &item.id,
-        )
+    crate::github::pulls::marks_this_item(existing.body.as_deref(), item.sequence_id, &item.id)
 }
 
 /// Rechecks `find_existing` once after `pulls::create` fails on `branch` --

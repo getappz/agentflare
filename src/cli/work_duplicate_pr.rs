@@ -175,7 +175,7 @@ fn handle_duplicate_pr(
             pr.number, pr.html_url
         )
     };
-    let _ = mcp.comment_impl(CommentRequest {
+    let comment = mcp.comment_impl(CommentRequest {
         action: "create".into(),
         item_id: Some(item_id.into()),
         body: Some(body.clone()),
@@ -198,7 +198,19 @@ fn handle_duplicate_pr(
     if let Some(recipient) = notify_recipient {
         notify(recipient, &body, item_id);
     }
-    0.into()
+    // The comment is the persistent human-review signal: with the claim now
+    // released and nothing else recorded, reporting success on a failed
+    // comment would drop the duplicate silently. Fail so the job retries.
+    match comment {
+        Ok(_) => 0.into(),
+        Err(e) => {
+            let _ = writeln!(
+                log,
+                "duplicate work: could not record the human-review comment on {item_id}: {e}"
+            );
+            1.into()
+        }
+    }
 }
 
 /// Thin wrapper so `execute_work_impl`'s call site is a one-line short
