@@ -179,12 +179,19 @@ fn link_or_copy(src: &Path, dest: &Path) -> std::io::Result<()> {
 /// Installs every PATH shim this build has binaries for. Returns a status
 /// message for `Component::apply`'s display.
 pub fn install() -> String {
+    install_checked().0
+}
+
+/// Like [`install`], but also reports whether any shim failed to install
+/// (skipped shims, i.e. no bundled binary, are not failures).
+pub fn install_checked() -> (String, bool) {
     let dir = shims_dir();
     if let Err(e) = fs::create_dir_all(&dir) {
-        return format!("cannot create {}: {e}", dir.display());
+        return (format!("cannot create {}: {e}", dir.display()), true);
     }
 
     let mut messages = Vec::new();
+    let mut failed_any = false;
 
     match bundled_generic_shim() {
         Some(src) => {
@@ -209,6 +216,7 @@ pub fn install() -> String {
             if failed.is_empty() {
                 messages.push(format!("{installed} generic tool shims linked"));
             } else {
+                failed_any = true;
                 messages.push(format!(
                     "{installed} generic tool shims linked, {} failed: {}",
                     failed.len(),
@@ -225,7 +233,10 @@ pub fn install() -> String {
     match bundled_git_shim() {
         Some(src) => match install_git_shim_binary(&dir, &src) {
             Ok(dest) => messages.push(format!("git shim -> {}", dest.display())),
-            Err(e) => messages.push(format!("git shim install failed: {e}")),
+            Err(e) => {
+                failed_any = true;
+                messages.push(format!("git shim install failed: {e}"));
+            }
         },
         None => messages.push("no bundled git shim binary — skipped".to_string()),
     }
@@ -239,7 +250,7 @@ pub fn install() -> String {
         Err(e) => messages.push(format!("could not update PATH: {e}")),
     }
 
-    messages.join("; ")
+    (messages.join("; "), failed_any)
 }
 
 #[cfg(test)]

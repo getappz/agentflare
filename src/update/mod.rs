@@ -72,9 +72,22 @@ pub fn run(version: Option<String>, check_only: bool, quiet: bool) {
     if !quiet {
         println!("replacing {}...", current.display());
     }
-    if let Err(e) = swap::replace_binary(&new_binary, &current) {
-        eprintln!("error replacing binary: {e}");
-        std::process::exit(1);
+    match swap::replace_binary(&new_binary, &current) {
+        Ok(swap::SwapOutcome::Installed) => {}
+        #[cfg(windows)]
+        Ok(swap::SwapOutcome::Deferred { log }) => {
+            eprintln!(
+                "swap scheduled, not done: {} is locked; the update completes only when no \
+                 process holds it (result is logged to {})",
+                current.display(),
+                log.display()
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error replacing binary: {e}");
+            std::process::exit(1);
+        }
     }
 
     if !quiet {
