@@ -130,6 +130,9 @@ pub struct Captured {
     /// True iff `timed_out` was caused by the idle window elapsing with no
     /// new stdout/stderr bytes, rather than `hard_cap` being reached.
     pub idle_killed: bool,
+    /// True iff the child was killed because its job was cancelled (see
+    /// `agentflare_jobs::cancel`). Never set together with `timed_out`.
+    pub cancelled: bool,
 }
 
 /// Kill `child` and everything it spawned, not just the direct process. A
@@ -199,12 +202,16 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
 /// item #75). Writing on a dedicated thread, symmetric with the stdout/stderr
 /// readers above, avoids a deadlock if the child starts producing output
 /// before `stdin` is fully written and the OS pipe buffer fills up.
-#[allow(dead_code)]
-pub fn run_captured(
+///
+/// `cancel_job`, when `Some`, is the queue id of the in-process job this child
+/// works for; the wait loop polls `agentflare_jobs::cancel::job_cancelled` for
+/// it and kills the child once the job is cancelled (see `Captured::cancelled`).
+pub fn run_captured_for_job(
     mut cmd: Command,
     hard_cap: Duration,
     idle_timeout: Duration,
     stdin: Option<&str>,
+    cancel_job: Option<&str>,
 ) -> std::io::Result<Captured> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -284,6 +291,8 @@ pub fn run_captured(
     let mut last_activity_at = Instant::now();
     let mut timed_out = false;
     let mut idle_killed = false;
+    let mut cancelled = false;
+    let mut last_cancel_poll = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -306,18 +315,55 @@ pub fn run_captured(
             idle_killed = true;
             break status;
         }
+        // A cancelled job (item reassigned to another agent) must not keep its
+        // agent CLI running. Polled ~1/s -- it costs a DB read.
+        if let Some(job_id) = cancel_job
+            && last_cancel_poll.elapsed() >= Duration::from_secs(1)
+        {
+            last_cancel_poll = Instant::now();
+            if agentflare_jobs::cancel::job_cancelled(job_id) {
+                kill_tree(&mut child);
+                let status = child.wait()?;
+                cancelled = true;
+                break status;
+            }
+        }
         std::thread::sleep(Duration::from_millis(20));
     };
 
     let stdout = reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
     Ok(Captured {
-        success: status.success() && !timed_out,
+        success: status.success() && !timed_out && !cancelled,
         stdout,
         stderr,
         timed_out,
         idle_killed,
+        cancelled,
     })
+}
+
+/// `run_captured_for_job` for a child that belongs to no queue job.
+#[allow(dead_code)]
+pub fn run_captured(
+    cmd: Command,
+    hard_cap: Duration,
+    idle_timeout: Duration,
+    stdin: Option<&str>,
+) -> std::io::Result<Captured> {
+    run_captured_for_job(cmd, hard_cap, idle_timeout, stdin, None)
+}
+
+/// The queue job id inside an in-process work job's claim owner
+/// (`<agent>:<job-id>`, see `WorkItemExecutor`). A CLI run's `<agent>:<pid>`
+/// yields a "job id" no job is registered under, so it never reads as cancelled.
+fn job_id_of_owner(owner: &str) -> Option<&str> {
+    owner.rsplit_once(':').map(|(_, id)| id)
+}
+
+/// Whether the in-process job that `owner` belongs to has been cancelled.
+pub(crate) fn owner_job_cancelled(owner: &str) -> bool {
+    job_id_of_owner(owner).is_some_and(agentflare_jobs::cancel::job_cancelled)
 }
 
 /// Build the full argv for a headless run: `[binary, <print-mode flags…>,
@@ -702,7 +748,13 @@ fn run_headless_impl(
     if let Some(owner) = owner {
         cmd.env("AGENTFLARE_CLAIM_OWNER", owner);
     }
-    let result = run_captured(cmd, hard_cap, idle_timeout, Some(prompt));
+    let result = run_captured_for_job(
+        cmd,
+        hard_cap,
+        idle_timeout,
+        Some(prompt),
+        owner.and_then(job_id_of_owner),
+    );
     // Always taken (read + removed), win or lose, regardless of whether it
     // ends up used below -- otherwise `~/.agentflare/sandbox-diagnostics`
     // accumulates one file per headless dispatch forever.
@@ -718,6 +770,9 @@ fn run_headless_impl(
                     cost_usd: None,
                 })
             }
+        }
+        Ok(c) if c.cancelled => {
+            HeadlessOutcome::Failed(agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string())
         }
         Ok(c) if c.timed_out => {
             let reason = if c.idle_killed {

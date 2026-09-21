@@ -24,6 +24,14 @@ const MAX_WINDOW_WEEKS: i64 = 52;
 const DEFAULT_LIST_LIMIT: i64 = 50;
 const MAX_LIST_LIMIT: i64 = 500;
 
+/// Response warning for a reassignment whose job cancellation failed (item
+/// #607): the old agent's job may still be running next to the new assignee.
+fn job_cancel_warning(err: &str) -> String {
+    format!(
+        "reassigned, but the previous agent's jobs could not be cancelled ({err}); a running job may keep working until it finishes"
+    )
+}
+
 fn priority_rank(p: &str) -> u8 {
     match p {
         "urgent" => 5,
@@ -702,6 +710,12 @@ impl AgentflareMcp {
             let item =
                 agentflare_backend::item::update(conn, &id, input).map_err(map_backend_err)?;
             if req.assignee_agent.is_some() {
+                // Releases the old agent's claim only. It deliberately does NOT
+                // cancel the old agent's jobs (item #607): unlike `redispatch`,
+                // a plain update doesn't re-arm the item (`ready-for-work`
+                // label, backlog state), so cancelling here would strand it
+                // `dispatched` with no job. Reassign via `redispatch` to stop
+                // the previous agent's job.
                 crate::claims::reassignment_releases_claim(
                     conn,
                     &id,
@@ -1740,7 +1754,15 @@ impl AgentflareMcp {
                     // item isn't stuck non-dispatchable until the TTL lapses.
                     // Without one the assignee is unchanged, so a live claim
                     // still legitimately blocks dispatch.
+                    let mut cancel_result = None;
                     if req_assignee.is_some() {
+                        // Cancel first, release second: the old job's finalize
+                        // step checks for cancellation before `item_done`, and
+                        // once the claim is gone `item_done` would re-acquire
+                        // it under the old owner. Flagging the job first means
+                        // that check already sees the cancel by then.
+                        cancel_result =
+                            Some(self.cancel_jobs_for_reassignment(&item_id, &assignee_agent));
                         crate::claims::reassignment_releases_claim(
                             conn,
                             &item_id,
@@ -1765,6 +1787,11 @@ impl AgentflareMcp {
                         "dispatchable": dispatchable,
                         "assignee_agent": assignee_agent,
                     });
+                    match cancel_result {
+                        Some(Ok(n)) => resp["jobs_cancelled"] = n.into(),
+                        Some(Err(e)) => resp["warning"] = job_cancel_warning(&e).into(),
+                        None => {}
+                    }
                     if let Some(live) = blocked_by {
                         resp["blocked_by_live_claim"] = serde_json::json!({
                             "owner": live.owner,

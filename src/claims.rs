@@ -445,6 +445,22 @@ pub fn reassignment_releases_claim(
     Ok(true)
 }
 
+/// The job-queue side of a reassignment: cancels `item_id`'s queued/retrying
+/// and running in-process jobs that target a different agent than
+/// `new_assignee`, so the old agent's job can't keep working (or open a PR)
+/// alongside the new one, and its stale queue entry doesn't hold back the
+/// fresh dispatch. Same-agent reassignment (instance refresh) cancels nothing.
+pub fn reassignment_cancels_jobs(
+    queue: &agentflare_jobs::Queue,
+    item_id: &str,
+    new_assignee: &str,
+) -> Result<Vec<String>, agentflare_jobs::queue::Error> {
+    let new_agent = agentflare_backend::item::agent_part(new_assignee);
+    queue.cancel_for_item(item_id, |job_agent| {
+        agentflare_backend::item::agent_part(job_agent) == new_agent
+    })
+}
+
 pub fn now() -> i64 {
     db_kit::ids::now()
 }
@@ -722,6 +738,31 @@ mod tests {
         assert!(repo_key_from_url("https://bitbucket.org/o/r").is_none());
         assert!(repo_key_from_url("git@gitlab.com:o/r.git").is_none());
         assert!(repo_key_from_url("ssh://git@gitlab.com/o/r.git").is_none());
+    }
+
+    #[test]
+    fn reassignment_cancels_only_the_old_agents_jobs_for_that_item() {
+        let q = agentflare_jobs::Queue::open_memory(std::env::temp_dir()).unwrap();
+        let job = |item: &str, agent: &str| {
+            q.enqueue(
+                &agentflare_jobs::AgentJob::new("agentflare-work")
+                    .args([item, agent])
+                    .in_process(),
+            )
+            .unwrap()
+            .id
+        };
+        let old = job("i1", "opencode");
+        let refreshed = job("i1", "claude-code");
+        let other = job("i2", "opencode");
+
+        // `claude-code:<instance>` is the same agent as the payload's bare name.
+        let ids = reassignment_cancels_jobs(&q, "i1", "claude-code:abc").unwrap();
+
+        assert_eq!(ids, vec![old.clone()]);
+        assert!(q.is_cancelled(&old));
+        assert!(!q.is_cancelled(&refreshed));
+        assert!(!q.is_cancelled(&other));
     }
 
     #[test]

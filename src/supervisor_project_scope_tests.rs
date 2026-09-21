@@ -1,4 +1,4 @@
-//! Cross-project dispatch bookkeeping tests, split out of
+//! Dispatch bookkeeping tests (cross-project scoping, reassignment), split out of
 //! `supervisor_tests.rs` (frozen at the LOC-gate limit, `scripts/loc-gate.sh`)
 //! the same way `supervisor_telegram_tests.rs` is. `use super::*` keeps every
 //! helper (`test_mcp`, `test_queue`, `test_auth_conn`, ...) available exactly
@@ -213,4 +213,57 @@ fn dispatch_item_declines_when_the_project_has_no_dispatched_label() {
         "ready-for-work must stay on so a human fixing the missing label sees the item again \
          on the very next tick"
     );
+}
+
+#[test]
+fn reassignment_holds_the_new_dispatch_until_the_old_job_stops_then_dispatches_the_new_agent() {
+    // Item #607: redispatching an item to another agent cancels the old
+    // agent's job. A running job only gets `cancel_requested`, so the item
+    // stays in flight (no second agent next to the still-alive first) until
+    // the executor really stops; only then does the next tick enqueue a fresh
+    // job for the new assignee.
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_ready_item(&mcp, Some("claude-code"));
+    let auth_conn = test_auth_conn();
+    let tick = || {
+        run_discovery_tick(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+        )
+    };
+    assert_eq!(tick().dispatched, 1);
+    let (old_job, _) = queue.dequeue().unwrap().expect("old job is picked up");
+
+    mcp.with_backend_db(|conn| {
+        agentflare_backend::item::redispatch(conn, &item_id, Some("opencode")).unwrap();
+    })
+    .unwrap();
+    let cancelled = crate::claims::reassignment_cancels_jobs(&queue, &item_id, "opencode").unwrap();
+    assert_eq!(cancelled, vec![old_job.clone()]);
+
+    assert_eq!(tick().dispatched, 0, "old job is still alive");
+    assert_eq!(queue.list(None).unwrap().len(), 1);
+
+    // The worker's executor notices the cancel, stops, and reports it.
+    assert!(
+        !queue
+            .fail(
+                &old_job,
+                agentflare_jobs::cancel::CANCELLED_MESSAGE,
+                None,
+                true
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        tick().dispatched,
+        1,
+        "fresh dispatch once the old job is terminal"
+    );
+    let fresh: Vec<_> = queue.list(Some(agentflare_jobs::JobState::Queued)).unwrap();
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].args.get(1).map(String::as_str), Some("opencode"));
 }

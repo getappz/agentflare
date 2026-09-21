@@ -1009,6 +1009,25 @@ fn execute_work_impl(
             let _ = writeln!(log, "done: {item_id}");
             0.into()
         }
+        Err(msg) if msg.contains(agentflare_jobs::cancel::CANCELLED_MESSAGE) => {
+            // Item #607: stopped on purpose because the item was reassigned.
+            // No failure comment or notify -- the reassignment already
+            // released this claim and the new agent owns the item now.
+            // Disarm the guard: its `item_release` re-*acquires* a claim it
+            // doesn't own before releasing, which would briefly hand the item
+            // back to this cancelled job. Drop only a lease still held under
+            // this job's own owner id (owner-scoped: a no-op otherwise).
+            claim_guard.disarm();
+            let owner = crate::claims::owner_id();
+            let _ = mcp
+                .with_backend_db(|conn| agentflare_backend::claim::release(conn, item_id, &owner));
+            let _ = writeln!(log, "cancelled: {item_id}");
+            WorkOutcome {
+                exit_code: 1,
+                retry_after_secs: None,
+                fatal: true,
+            }
+        }
         Err(msg) => {
             release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
             crate::ui::error(&msg);
@@ -1111,6 +1130,15 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
             )
             .into());
         };
+        // Cancelled (item reassigned) between dequeue and here: don't claim
+        // the item back for the old agent.
+        if agentflare_jobs::cancel::job_cancelled(job_id) {
+            return Err(agentflare_jobs::JobFailure {
+                message: agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string(),
+                retry_after_secs: None,
+                fatal: true,
+            });
+        }
         let repo_root = args.get(2).map(std::path::PathBuf::from);
         // Execution-time re-resolve (not enqueue-time replay): a retry may
         // run long after the payload was frozen, and the operator may have

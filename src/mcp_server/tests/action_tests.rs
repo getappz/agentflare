@@ -1142,6 +1142,97 @@ fn item_redispatch_to_the_same_agent_keeps_its_claim() {
     );
 }
 
+/// A harness whose reassignments cancel jobs in an in-memory queue, holding a
+/// running `opencode` work job for a fresh item (claimed as `opencode:<job>`).
+/// `_registered` mirrors what `WorkerPool` does for a running in-process job.
+struct RunningOldJob {
+    _tmp: tempfile::TempDir,
+    mcp: AgentflareMcp,
+    queue: agentflare_jobs::Queue,
+    item_id: String,
+    job_id: String,
+    _registered: agentflare_jobs::cancel::Registration,
+}
+
+fn running_opencode_job() -> RunningOldJob {
+    let (tmp, mut s) = harness();
+    let queue = agentflare_jobs::Queue::open_memory(tmp.path().join("job-logs")).unwrap();
+    s.job_queue_override = Some(queue.clone());
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    queue
+        .enqueue(
+            &agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([item_id.clone(), "opencode".to_string()])
+                .in_process(),
+        )
+        .unwrap();
+    let (job_id, _) = queue.dequeue().unwrap().unwrap();
+    seed_claim(&s, &item_id, &format!("opencode:{job_id}"), 60);
+    let (check_queue, check_id) = (queue.clone(), job_id.clone());
+    let registered =
+        agentflare_jobs::cancel::register(&job_id, move || check_queue.is_cancelled(&check_id));
+    RunningOldJob {
+        _tmp: tmp,
+        mcp: s,
+        queue,
+        item_id,
+        job_id,
+        _registered: registered,
+    }
+}
+
+#[test]
+fn item_redispatch_to_another_agent_cancels_the_old_agents_running_job() {
+    // Item #607: the old agent's job used to keep running (and retrying) after
+    // the redispatch. Its wait loop / pipeline see the cancel through the
+    // claim-owner string alone, which is all that crosses their thread hops.
+    let old = running_opencode_job();
+    let owner = format!("opencode:{}", old.job_id);
+    assert!(!crate::agent_launch::owner_job_cancelled(&owner));
+
+    let resp = redispatch_with(&old.mcp, &old.item_id, "claude-code");
+
+    assert_eq!(resp["jobs_cancelled"].as_u64(), Some(1), "{resp:?}");
+    assert!(resp.get("warning").is_none());
+    assert!(crate::agent_launch::owner_job_cancelled(&owner));
+    assert_eq!(
+        old.queue.get(&old.job_id).unwrap().state,
+        agentflare_jobs::JobState::Running,
+        "stays in flight until its executor has actually stopped"
+    );
+}
+
+#[test]
+fn item_update_to_another_agent_leaves_the_old_agents_job_alone() {
+    // A plain update doesn't re-arm the item (labels/state), so cancelling the
+    // job here would strand the item with no job at all; only `redispatch`,
+    // which re-arms it, cancels.
+    let old = running_opencode_job();
+
+    old.mcp
+        .item(Parameters(ItemRequest {
+            action: "update".into(),
+            id: Some(old.item_id.clone()),
+            assignee_agent: Some("claude-code".into()),
+            ..Default::default()
+        }))
+        .unwrap();
+
+    assert!(!old.queue.is_cancelled(&old.job_id));
+}
+
+#[test]
+fn item_redispatch_to_the_same_agent_leaves_its_job_running() {
+    let old = running_opencode_job();
+
+    let resp = redispatch_with(&old.mcp, &old.item_id, "opencode");
+
+    assert_eq!(resp["jobs_cancelled"].as_u64(), Some(0), "{resp:?}");
+    assert!(!old.queue.is_cancelled(&old.job_id));
+}
+
 #[test]
 fn item_release_by_a_superseded_job_keeps_the_redispatched_assignee() {
     let (_tmp, s) = harness();
