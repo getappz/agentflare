@@ -220,12 +220,16 @@ fn run_in_process(
     let job_id = id.to_string();
     let args = job.args.clone();
     let cancel_queue = queue.clone();
+    let cancel_id = job_id.clone();
+    // Registered on this thread, before the executor thread exists, so a
+    // timed-out attempt's not-yet-scheduled thread can never register *after*
+    // a retry's and replace it. The guard moves into the thread and is held
+    // until the executor returns, so `cancel::job_cancelled(job_id)` is live
+    // exactly while this job's work is.
+    let cancel_registration =
+        crate::cancel::register(&job_id, move || cancel_queue.is_cancelled(&cancel_id));
     std::thread::spawn(move || {
-        let cancel_id = job_id.clone();
-        // Held until the executor returns, so `cancel::job_cancelled(job_id)`
-        // is live exactly while this job's work is.
-        let _cancel =
-            crate::cancel::register(&job_id, move || cancel_queue.is_cancelled(&cancel_id));
+        let _cancel = cancel_registration;
         let result = executor.execute(&job_id, &args, &mut log_file);
         let _ = tx.send(result);
     });

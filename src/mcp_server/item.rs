@@ -1756,14 +1756,19 @@ impl AgentflareMcp {
                     // still legitimately blocks dispatch.
                     let mut cancel_result = None;
                     if req_assignee.is_some() {
+                        // Cancel first, release second: the old job's finalize
+                        // step checks for cancellation before `item_done`, and
+                        // once the claim is gone `item_done` would re-acquire
+                        // it under the old owner. Flagging the job first means
+                        // that check already sees the cancel by then.
+                        cancel_result =
+                            Some(self.cancel_jobs_for_reassignment(&item_id, &assignee_agent));
                         crate::claims::reassignment_releases_claim(
                             conn,
                             &item_id,
                             Some(&assignee_agent),
                         )
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                        cancel_result =
-                            Some(self.cancel_jobs_for_reassignment(&item_id, &assignee_agent));
                     }
                     let effective_ttl =
                         agentflare_backend::claim::effective_ttl_secs(conn, &item_id, ttl);

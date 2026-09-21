@@ -261,8 +261,12 @@ impl Queue {
         fatal: bool,
     ) -> Result<bool, Error> {
         let now = db_kit::ids::now();
-        let conn = self.conn.lock();
-        let (retries, max_retries, cancel_requested): (u32, u32, bool) = conn.query_row(
+        let mut conn = self.conn.lock();
+        // IMMEDIATE: the `cancel_requested` read and the state write below must
+        // not interleave with another process's `cancel_for_item` (the MCP
+        // server), or a cancelled job could be re-queued for a retry.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (retries, max_retries, cancel_requested): (u32, u32, bool) = tx.query_row(
             "SELECT retries, max_retries, cancel_requested != 0 FROM agent_jobs WHERE id = ?1",
             params![id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -271,30 +275,32 @@ impl Queue {
         // finish the row as `killed` and neither retry it nor report a failure
         // (`false`: no terminal-failure hook).
         if cancel_requested {
-            conn.execute(
+            tx.execute(
                 "UPDATE agent_jobs SET state = 'killed', error = ?1, finished_at = ?2
                  WHERE id = ?3",
                 params![error, now, id],
             )?;
+            tx.commit()?;
             return Ok(false);
         }
         let retried = !fatal && retries < max_retries;
         if retried {
             let not_before = retry_after_secs.map(|s| now + s as i64);
-            conn.execute(
+            tx.execute(
                 "UPDATE agent_jobs
                  SET state = 'queued', retries = retries + 1, error = ?1, started_at = NULL, not_before = ?2
                  WHERE id = ?3",
                 params![error, not_before, id],
             )?;
         } else {
-            conn.execute(
+            tx.execute(
                 "UPDATE agent_jobs
                  SET state = 'failed', error = ?1, finished_at = ?2
                  WHERE id = ?3",
                 params![error, now, id],
             )?;
         }
+        tx.commit()?;
         drop(conn);
         // A retry goes back to 'queued' — wake workers so it's picked up
         // promptly instead of waiting out the fallback poll interval. Waking
@@ -470,9 +476,12 @@ impl Queue {
         keep: impl Fn(&str) -> bool,
     ) -> Result<Vec<String>, Error> {
         let now = db_kit::ids::now();
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        // IMMEDIATE: select + mark as one unit against the daemon's own
+        // `dequeue`/`fail`/`complete` (other processes, other connections).
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows: Vec<(String, String, String)> = {
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT id, state, payload FROM agent_jobs
                  WHERE state IN ('queued', 'running') AND cancel_requested = 0",
             )?;
@@ -496,7 +505,7 @@ impl Queue {
             // guarded on `state = 'queued'` and falls back to a cancel request
             // when the job has just started running.
             let killed = state == "queued"
-                && conn.execute(
+                && tx.execute(
                     "UPDATE agent_jobs SET state = 'killed', finished_at = ?1, error = ?2
                      WHERE id = ?3 AND state = 'queued'",
                     params![now, crate::cancel::CANCELLED_MESSAGE, id],
@@ -504,7 +513,7 @@ impl Queue {
             // A row that reached a terminal state after the SELECT matches
             // neither UPDATE and is not reported as cancelled.
             let flagged = !killed
-                && conn.execute(
+                && tx.execute(
                     "UPDATE agent_jobs SET cancel_requested = 1
                      WHERE id = ?1 AND state IN ('queued', 'running')",
                     params![id],
@@ -513,6 +522,7 @@ impl Queue {
                 cancelled.push(id);
             }
         }
+        tx.commit()?;
         Ok(cancelled)
     }
 
