@@ -79,6 +79,35 @@ pub fn marks_item(body: Option<&str>, sequence_id: i64) -> bool {
     body.is_some_and(|b| b.contains(&item_marker(sequence_id)))
 }
 
+const ITEM_ID_TAG_PREFIX: &str = "<!-- agentflare-item-id: ";
+
+/// Hidden identity tag `pr_footer` appends after the visible marker. The
+/// visible `for item #<sequence_id>` marker is only unique per project *and
+/// per workstation* (each keeps its own local item database), so on its own
+/// it can attribute one item's PR to a different item that happens to share
+/// the same number (item #595: PR #636, opened for a different item #198,
+/// nearly got this one's #198 auto-completed). The item's UUID is globally
+/// unique.
+pub fn item_id_tag(item_id: &str) -> String {
+    format!("{ITEM_ID_TAG_PREFIX}{item_id} -->")
+}
+
+/// False only when `body` carries an identity tag naming a *different* item
+/// than `item_id`. A body with no tag (a PR opened before `item_id_tag`
+/// existed, or by hand) still passes -- there's nothing to contradict, so
+/// callers fall back to the sequence-number marker alone.
+fn tag_allows(body: Option<&str>, item_id: &str) -> bool {
+    body.and_then(|b| b.split_once(ITEM_ID_TAG_PREFIX))
+        .and_then(|(_, rest)| rest.split_once(" -->"))
+        .is_none_or(|(tagged, _)| tagged == item_id)
+}
+
+/// [`marks_item`] plus the identity-tag check: the PR must carry this
+/// sequence number's marker *and* not be tagged for some other item.
+pub fn marks_this_item(body: Option<&str>, sequence_id: i64, item_id: &str) -> bool {
+    marks_item(body, sequence_id) && tag_allows(body, item_id)
+}
+
 /// True if `body` carries agentflare's own `for item #<N> via agentflare.`
 /// stamp `pr_footer` puts on every PR it opens -- for *any* item, unlike
 /// `marks_item` which checks one specific `sequence_id`. `discover_untracked_prs`
@@ -122,6 +151,7 @@ pub fn find_by_item_marker(
     client: &Client,
     repo: &RepoId,
     sequence_id: i64,
+    item_id: &str,
 ) -> Result<Vec<PullRequest>, GitHubError> {
     let query = format!(
         "repo:{}/{} type:pr \"{}\" in:body",
@@ -144,7 +174,10 @@ pub fn find_by_item_marker(
         .collect::<Result<_, _>>()?;
     Ok(prs
         .into_iter()
-        .filter(|pr| pr.body.as_deref().is_some_and(|b| b.contains(&marker)))
+        .filter(|pr| {
+            pr.body.as_deref().is_some_and(|b| b.contains(&marker))
+                && tag_allows(pr.body.as_deref(), item_id)
+        })
         .collect())
 }
 
@@ -406,6 +439,61 @@ mod tests {
         ));
     }
 
+    /// Item #595: two items in different databases share sequence #198; the
+    /// visible marker alone can't tell their PRs apart, the identity tag can.
+    #[test]
+    fn marks_this_item_rejects_a_pr_tagged_for_a_different_item_with_the_same_number() {
+        let body = format!(
+            "---\n_Opened by `a` on **m** for item #198 via agentflare._\n{}",
+            item_id_tag("uuid-of-the-review-sweep-item")
+        );
+        assert!(!marks_this_item(
+            Some(&body),
+            198,
+            "uuid-of-the-gateway-item"
+        ));
+        assert!(marks_this_item(
+            Some(&body),
+            198,
+            "uuid-of-the-review-sweep-item"
+        ));
+    }
+
+    /// Item #595's incident shape end to end: two PRs both stamped "for item
+    /// #198" (one from another item's database, one this item's own) --
+    /// only the one whose identity tag doesn't contradict this item survives.
+    #[test]
+    fn find_by_item_marker_drops_a_pr_tagged_for_a_different_item() {
+        let footer = |uuid: &str| {
+            format!(
+                "_Opened by `a` on **m** for item #198 via agentflare._\n{}",
+                item_id_tag(uuid)
+            )
+        };
+        let pr_json = |number: u64, body: &str| {
+            serde_json::json!({
+                "number": number, "html_url": "u", "state": "closed", "title": "t",
+                "merged_at": "2026-09-18T00:00:00Z", "body": body
+            })
+            .to_string()
+        };
+        let server = MockServer::start(vec![
+            MockResponse::json(200, r#"{"items":[{"number":636},{"number":637}]}"#),
+            MockResponse::json(200, &pr_json(636, &footer("review-sweep-item-uuid"))),
+            MockResponse::json(200, &pr_json(637, &footer("gateway-item-uuid"))),
+        ]);
+        let client = server.client(None);
+        let prs = find_by_item_marker(&client, &repo(), 198, "gateway-item-uuid").unwrap();
+        assert_eq!(prs.iter().map(|p| p.number).collect::<Vec<_>>(), vec![637]);
+    }
+
+    #[test]
+    fn marks_this_item_falls_back_to_the_number_for_an_untagged_legacy_pr() {
+        let body = "---\n_Opened by `a` on **m** for item #198 via agentflare._";
+        assert!(marks_this_item(Some(body), 198, "any-uuid"));
+        assert!(!marks_this_item(Some(body), 199, "any-uuid"));
+    }
+
     #[test]
     fn opened_by_agentflare_true_for_any_items_marker() {
         assert!(opened_by_agentflare(Some(
@@ -433,7 +521,7 @@ mod tests {
             ),
         ]);
         let client = server.client(None);
-        let found = find_by_item_marker(&client, &repo(), 164).unwrap();
+        let found = find_by_item_marker(&client, &repo(), 164, "item-uuid").unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].number, 42);
         assert!(found[0].merged_at.is_some());
@@ -451,7 +539,7 @@ mod tests {
         let server = MockServer::start(vec![MockResponse::json(200, r#"{"items":[]}"#)]);
         let client = server.client(None);
         assert!(
-            find_by_item_marker(&client, &repo(), 999)
+            find_by_item_marker(&client, &repo(), 999, "item-uuid")
                 .unwrap()
                 .is_empty()
         );
@@ -473,7 +561,7 @@ mod tests {
         ]);
         let client = server.client(None);
         assert!(
-            find_by_item_marker(&client, &repo(), 184)
+            find_by_item_marker(&client, &repo(), 184, "item-uuid")
                 .unwrap()
                 .is_empty()
         );
