@@ -132,11 +132,20 @@ pub fn claim(
 /// behind it. The guard only exempts a same-agent-type reclaim, so a
 /// released item stayed permanently blocked to every other agent type
 /// (item #93). A no-op release (nothing to release, or the caller doesn't
-/// own the lease) leaves `assignee_agent` untouched.
+/// own the lease) leaves `assignee_agent` untouched, and so does a release
+/// while the item has since been reassigned to a *different* agent type: a
+/// job still running when the operator redispatched must not erase that
+/// reassignment when it later fails, or its queue retry sees no assignee and
+/// falls back to the job's frozen agent.
 pub fn release(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
     let tx = conn.unchecked_transaction()?;
     let released = crate::claim::release(&tx, item_id, owner)?;
-    if released {
+    let reassigned = released
+        && get(&tx, item_id)
+            .ok()
+            .and_then(|item| item.assignee_agent)
+            .is_some_and(|a| agent_part(&a) != agent_part(owner));
+    if released && !reassigned {
         // Direct SQL, not `update()` -- `UpdateItem.assignee_agent` treats
         // `None` as "leave untouched" so it has no way to express an
         // explicit clear back to NULL.

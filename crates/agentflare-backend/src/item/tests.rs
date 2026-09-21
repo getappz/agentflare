@@ -979,6 +979,36 @@ fn release_with_nothing_to_release_leaves_assignee_agent_untouched() {
 }
 
 #[test]
+fn release_keeps_an_assignee_reassigned_to_a_different_agent_mid_run() {
+    // A job for opencode is in flight when the operator hands the item to
+    // claude-code. When that job later fails and releases, it must not wipe
+    // the reassignment: the queue retry would otherwise see no assignee and
+    // fall back to the job's frozen agent.
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    assert_eq!(
+        claim(&conn, &item.id, "opencode:1", 1000, TTL).unwrap(),
+        ClaimOutcome::Acquired
+    );
+    update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            assignee_agent: Some("claude-code".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(release(&conn, &item.id, "opencode:1").unwrap());
+    assert_eq!(
+        get(&conn, &item.id).unwrap().assignee_agent.as_deref(),
+        Some("claude-code")
+    );
+}
+
+#[test]
 fn create_rejects_due_date_before_start_date() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
