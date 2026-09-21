@@ -69,6 +69,13 @@ pub fn list_prompts() -> Vec<Prompt> {
                 "install-hooks|install-shim|uninstall-shim|snapshot <list|restore|prune>|audit <preview|prune>|doctor plus options (omit for usage)",
             )]),
         ),
+        Prompt::new(
+            "pm",
+            Some("Act as the project's PM: bare = PM mode + daily kickoff; or standup|groom|plan|health|portfolio|mode on|off"),
+            Some(vec![PromptArgument::new("command").with_description(
+                "standup|groom|plan|health|portfolio|mode on|mode off plus args (omit for the daily kickoff)",
+            )]),
+        ),
     ];
     prompts.extend(
         SUB_SKILLS
@@ -90,6 +97,9 @@ pub fn get_prompt(
     }
     if request.name == "git" {
         return Some(get_git_command(request));
+    }
+    if request.name == "pm" {
+        return Some(get_pm_command(request));
     }
     if request.name == "optimize" {
         return Some(get_optimize_mode(request));
@@ -307,6 +317,34 @@ fn get_git_command(request: &GetPromptRequestParams) -> GetPromptResult {
     ))
 }
 
+/// Embedded so `/pm` works in every project, not just repos that commit
+/// `.claude/commands/pm.md` — same source file, no second copy to drift.
+const PM_COMMAND: &str = include_str!("../.claude/commands/pm.md");
+
+fn get_pm_command(request: &GetPromptRequestParams) -> GetPromptResult {
+    let command = request
+        .arguments
+        .as_ref()
+        .and_then(|a| a.get("command"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    // Drop the YAML frontmatter (`---\n...\n---`).
+    let body = PM_COMMAND
+        .splitn(3, "---")
+        .nth(2)
+        .unwrap_or(PM_COMMAND)
+        .trim();
+    // The literal-`/pm` UserPromptSubmit hook that sets the PM-mode flag does
+    // not fire for MCP prompts, so the agent has to set it via the `pm` tool.
+    assistant_text(format!(
+        "The literal `/pm` hook that sets the PM-mode flag does not fire for this prompt, so \
+         set it yourself: call the `pm` tool (mcp__flare__pm) with action=mode_on for a bare \
+         call or `mode on`, action=mode_off for `mode off`. Then follow:\n\n{}",
+        body.replace("$ARGUMENTS", command)
+    ))
+}
+
 fn get_optimize_skill(skill: &str) -> GetPromptResult {
     if let Err(e) = crate::optimize::code::set_active(skill) {
         return assistant_text(format!("Failed to persist flare code mode: {e}"));
@@ -326,8 +364,8 @@ mod tests {
         assert!(names.contains(&"optimize"));
         assert!(names.contains(&"optimize-review"));
         assert!(names.contains(&"optimize-no-hallucination"));
-        // optimize + artifact + handoff + git + one per sub-skill
-        assert_eq!(names.len(), 4 + SUB_SKILLS.len());
+        // optimize + artifact + handoff + git + pm + one per sub-skill
+        assert_eq!(names.len(), 5 + SUB_SKILLS.len());
     }
 
     #[test]
@@ -499,6 +537,48 @@ mod tests {
             assert!(text.contains("isn't meant for direct"), "{text}");
             assert!(!text.contains("Run it as"), "{text}");
         }
+    }
+
+    fn pm_prompt_text(command: Option<&str>) -> String {
+        use rmcp::model::JsonObject;
+        let mut params = GetPromptRequestParams::new("pm");
+        if let Some(c) = command {
+            let mut args = JsonObject::new();
+            args.insert("command".to_string(), serde_json::json!(c));
+            params = params.with_arguments(args);
+        }
+        let result = get_prompt(&params, None).unwrap();
+        format!("{:?}", result.messages[0].content)
+    }
+
+    #[test]
+    fn lists_pm_prompt() {
+        let prompts = list_prompts();
+        assert!(prompts.iter().any(|p| p.name == "pm"));
+    }
+
+    #[test]
+    fn bare_pm_prompt_returns_kickoff_and_mode_instruction() {
+        let text = pm_prompt_text(None);
+        assert!(text.contains("daily kickoff"), "{text}");
+        assert!(text.contains("action=mode_on"), "{text}");
+        // Frontmatter must be stripped and the placeholder substituted.
+        assert!(!text.contains("argument-hint"), "{text}");
+        assert!(!text.contains("$ARGUMENTS"), "{text}");
+    }
+
+    #[test]
+    fn pm_prompt_substitutes_command_argument() {
+        let text = pm_prompt_text(Some("standup 48"));
+        assert!(text.contains("standup 48"), "{text}");
+        assert!(!text.contains("$ARGUMENTS"), "{text}");
+    }
+
+    #[test]
+    fn pm_prompt_embeds_mode_off_subcommand() {
+        let text = pm_prompt_text(Some("mode off"));
+        assert!(text.contains("leave PM mode"), "{text}");
+        assert!(text.contains("action=mode_off"), "{text}");
     }
 
     #[test]

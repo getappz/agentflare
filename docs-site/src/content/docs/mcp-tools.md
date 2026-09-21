@@ -323,6 +323,9 @@ MCP Prompts, routed through the same tools above:
 - `/handoff <command>` — `<recipient> <brief>` to send, `inbox [me]`, or `thread <id>`.
 - `/git <command>` — `install-hooks`, `install-shim`, `uninstall-shim`, `snapshot
   {list,restore,prune}`, `audit {preview,prune}`, `doctor`.
+- `/pm [command]` — bare enables PM mode and runs the daily kickoff; or `standup`,
+  `groom`, `plan`, `health`, `portfolio`, `mode on|off`. Backed by the `pm` tool, so it
+  works in any project regardless of which repo commits `.claude/commands/pm.md`.
 - `/optimize-review`, `/optimize-audit`, `/optimize-debt`, `/optimize-gain`,
   `/optimize-help`, `/optimize-playbook`, `/optimize-no-hallucination` — the flare-code
   sub-skills, one slash command each.
