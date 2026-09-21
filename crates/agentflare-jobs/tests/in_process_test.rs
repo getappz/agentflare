@@ -231,3 +231,70 @@ fn in_process_job_that_hangs_is_abandoned_at_its_timeout_instead_of_wedging_the_
         "should fail at the 1s watchdog, not wait out the 5s executor call, took {elapsed:?}"
     );
 }
+
+/// Mirrors the work-item pipeline: the job's work runs on ANOTHER thread
+/// (tokio's blocking pool in production) that only knows the job id, and the
+/// executor waits for it to see the cancel there.
+struct CancelAwareExecutor {
+    started: std::sync::mpsc::SyncSender<()>,
+    /// Held back until the test has checked the job is still `running`, so the
+    /// executor can't observe the cancel and finish before that assertion.
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl InProcessExecutor for CancelAwareExecutor {
+    fn execute(
+        &self,
+        job_id: &str,
+        _args: &[String],
+        _log: &mut dyn std::io::Write,
+    ) -> Result<(), JobFailure> {
+        self.started.send(()).unwrap();
+        self.release.lock().unwrap().recv().unwrap();
+        let id = job_id.to_string();
+        std::thread::spawn(move || {
+            while !agentflare_jobs::cancel::job_cancelled(&id) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+        .join()
+        .unwrap();
+        Err(agentflare_jobs::cancel::CANCELLED_MESSAGE.into())
+    }
+}
+
+#[test]
+fn cancelled_running_job_stays_running_until_its_executor_stops_then_ends_killed() {
+    let q = test_queue();
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut pool = WorkerPool::new(q.clone()).with_executor(Arc::new(CancelAwareExecutor {
+        started: started_tx,
+        release: std::sync::Mutex::new(release_rx),
+    }));
+    pool.start(1);
+    let info = q
+        .enqueue(
+            &AgentJob::new("agentflare-work")
+                .args(["item-1", "opencode"])
+                .in_process(),
+        )
+        .unwrap();
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+
+    q.cancel_for_item("item-1", |agent| agent == "claude-code")
+        .unwrap();
+    assert_eq!(
+        q.get(&info.id).unwrap().state,
+        JobState::Running,
+        "still in flight until the executor has actually stopped"
+    );
+    release_tx.send(()).unwrap();
+
+    let final_info = wait_for_terminal(&q, &info.id, 400);
+    pool.shutdown();
+    assert_eq!(final_info.state, JobState::Killed);
+    assert_eq!(final_info.retries, 0, "a cancelled job is never retried");
+    assert!(q.dequeue().unwrap().is_none());
+}

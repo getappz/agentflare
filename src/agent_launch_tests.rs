@@ -138,6 +138,40 @@
         assert_eq!(out.stdout, "xxxxx");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn run_captured_kills_the_child_when_its_job_is_cancelled() {
+        // Item #607: a job cancelled by a reassignment must stop its agent
+        // CLI, not leave it running to the hard cap.
+        let start = std::time::Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf 'working'; sleep 20");
+        let _registered = agentflare_jobs::cancel::register("run-captured-cancel-job", || true);
+        let out = run_captured_for_job(
+            cmd,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+            None,
+            Some("run-captured-cancel-job"),
+        )
+        .unwrap();
+        assert!(!out.success, "a cancelled run must not report success");
+        assert!(out.cancelled);
+        assert!(!out.timed_out, "a cancel is not a timeout");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "child should be killed at the next cancel poll, not run to completion"
+        );
+    }
+
+    #[test]
+    fn owner_job_cancelled_resolves_the_job_id_behind_a_claim_owner() {
+        let _registered = agentflare_jobs::cancel::register("owner-cancel-job", || true);
+        assert!(owner_job_cancelled("opencode:owner-cancel-job"));
+        assert!(!owner_job_cancelled("opencode:another-job"));
+        assert!(!owner_job_cancelled("opencode"), "no job id in the owner");
+    }
+
     // Mirrors `run_captured_keeps_output_written_before_a_timeout_kill` but
     // with a generous hard cap and a tight idle window, proving the idle
     // timeout — not the hard cap — is what catches a child that produced
@@ -594,6 +628,7 @@
             stderr: String::new(),
             timed_out: true,
             idle_killed: false,
+            cancelled: false,
         };
         assert_eq!(diagnostic_suffix(&c, None), " (no output captured)");
     }
@@ -612,6 +647,7 @@
             stderr: "authentication expired, please re-authenticate".to_string(),
             timed_out: true,
             idle_killed: false,
+            cancelled: false,
         };
         let suffix = diagnostic_suffix(&c, None);
         assert!(suffix.contains("last stdout before kill"));
@@ -629,6 +665,7 @@
             stderr: "panic: something broke".to_string(),
             timed_out: true,
             idle_killed: false,
+            cancelled: false,
         };
         let suffix = diagnostic_suffix(&c, None);
         assert!(suffix.contains("last stderr before kill"));
@@ -647,6 +684,7 @@
             stderr: String::new(),
             timed_out: true,
             idle_killed: true,
+            cancelled: false,
         };
         let suffix = diagnostic_suffix(&c, Some("level=INFO message=\"tool call\" tool=lean_ctx"));
         assert!(suffix.contains("sandbox-side agent log tail"));
@@ -661,6 +699,7 @@
             success: false,
             timed_out: false,
             idle_killed: false,
+            cancelled: false,
         };
         let msg = match Ok::<_, std::io::Error>(captured) {
             Ok(c) if c.success => unreachable!(),

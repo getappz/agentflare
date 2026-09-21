@@ -93,6 +93,9 @@ pub struct AgentflareMcp {
     backend_db: std::sync::Mutex<Option<rusqlite::Connection>>,
     /// Tests inject a temp path here so they never touch the shared backend.db.
     pub(crate) backend_db_override: Option<std::path::PathBuf>,
+    /// Tests inject a job queue here to observe reassignment cancelling the
+    /// previous agent's jobs; production opens the real `agentflare.db` queue.
+    pub(crate) job_queue_override: Option<agentflare_jobs::Queue>,
     /// Tests inject a temp file path here so project-link resolution never
     /// reads/writes this actual repo's `.agentflare/project.json`.
     backend_project_link_override: Option<std::path::PathBuf>,
@@ -821,6 +824,33 @@ impl AgentflareMcp {
             *guard = Some(conn);
         }
         Ok(f(guard.as_ref().expect("just initialized above")))
+    }
+
+    /// Hands `item_id` to `new_assignee` on the job-queue side: cancels the
+    /// previous agent's queued/retrying/running jobs (see
+    /// `claims::reassignment_cancels_jobs`) and returns how many. The
+    /// reassignment itself already succeeded, so callers surface an `Err` as a
+    /// warning rather than failing the call -- but they must surface it: a
+    /// job left running keeps working alongside the new assignee. Without a
+    /// `job_queue_override`, a `backend_db_override` (tests) skips this: the
+    /// real queue lives in `agentflare.db`, which they must not touch.
+    pub(crate) fn cancel_jobs_for_reassignment(
+        &self,
+        item_id: &str,
+        new_assignee: &str,
+    ) -> Result<usize, String> {
+        let queue = match &self.job_queue_override {
+            Some(queue) => queue.clone(),
+            None if self.backend_db_override.is_some() => return Ok(0),
+            None => agentflare_jobs::Queue::open(
+                &crate::db::agentflare_db_path(),
+                crate::state::state_dir().join("job-logs"),
+            )
+            .map_err(|e| e.to_string())?,
+        };
+        crate::claims::reassignment_cancels_jobs(&queue, item_id, new_assignee)
+            .map(|ids| ids.len())
+            .map_err(|e| e.to_string())
     }
 
     /// Open the store (create + migrate) if not yet open.

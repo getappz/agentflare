@@ -217,3 +217,52 @@ fn cleanup_removes_old_jobs_and_their_log_files() {
     assert!(!stdout_path.exists(), "stdout log should be removed");
     assert!(!stderr_path.exists(), "stderr log should be removed");
 }
+
+fn work_job(item: &str, agent: &str) -> AgentJob {
+    AgentJob::new("agentflare-work")
+        .args([item, agent])
+        .in_process()
+}
+
+#[test]
+fn cancel_for_item_cancels_queued_and_running_jobs_of_other_agents() {
+    let q = test_queue();
+    let running = q.enqueue(&work_job("item-1", "opencode")).unwrap();
+    let (running_id, _) = q.dequeue().unwrap().unwrap();
+    assert_eq!(running_id, running.id);
+    let queued_retry = q.enqueue(&work_job("item-1", "opencode")).unwrap();
+    let same_agent = q.enqueue(&work_job("item-1", "claude-code")).unwrap();
+    let other_item = q.enqueue(&work_job("item-2", "opencode")).unwrap();
+
+    let cancelled = q
+        .cancel_for_item("item-1", |agent| agent == "claude-code")
+        .unwrap();
+
+    assert_eq!(cancelled.len(), 2);
+    assert!(q.is_cancelled(&running.id));
+    assert_eq!(
+        q.get(&running.id).unwrap().state,
+        JobState::Running,
+        "a running job stays in flight until its executor actually stops"
+    );
+    assert_eq!(q.get(&queued_retry.id).unwrap().state, JobState::Killed);
+    assert!(q.is_cancelled(&queued_retry.id));
+    assert!(
+        !q.is_cancelled(&same_agent.id),
+        "new assignee's job is kept"
+    );
+    assert!(!q.is_cancelled(&other_item.id), "other items are untouched");
+}
+
+#[test]
+fn cancelled_running_job_finishes_killed_and_is_not_retried_by_the_worker() {
+    let q = test_queue();
+    q.enqueue(&work_job("item-1", "opencode")).unwrap();
+    let (id, _) = q.dequeue().unwrap().unwrap();
+    q.cancel_for_item("item-1", |_| false).unwrap();
+
+    // The worker reports the (stopped) run's outcome after the cancel.
+    assert!(!q.fail(&id, "cancelled", None, false).unwrap());
+    assert_eq!(q.get(&id).unwrap().state, JobState::Killed);
+    assert!(q.dequeue().unwrap().is_none(), "must not be re-queued");
+}

@@ -60,6 +60,9 @@ pub fn migrations() -> rusqlite_migration::Migrations<'static> {
             ALTER TABLE agent_jobs ADD COLUMN stderr_bytes INTEGER NOT NULL DEFAULT 0;",
         ),
         rusqlite_migration::M::up("ALTER TABLE agent_jobs ADD COLUMN not_before INTEGER;"),
+        rusqlite_migration::M::up(
+            "ALTER TABLE agent_jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;",
+        ),
     ])
 }
 
@@ -237,7 +240,9 @@ impl Queue {
 
     /// Returns `true` when this failure was terminal (retries exhausted, or
     /// `fatal` short-circuited them, row left `state = 'failed'`), `false`
-    /// when it went back to `queued` for another attempt — callers that need
+    /// when it went back to `queued` for another attempt, or when the job had
+    /// been cancelled (`cancel_for_item`; the row is finished as `killed`,
+    /// which is deliberately not a failure) — callers that need
     /// to react to a job's *permanent* failure (e.g.
     /// `worker::run_in_process`'s terminal-failure hook) use this instead of
     /// re-deriving it from a follow-up `get`.
@@ -257,11 +262,22 @@ impl Queue {
     ) -> Result<bool, Error> {
         let now = db_kit::ids::now();
         let conn = self.conn.lock();
-        let (retries, max_retries): (u32, u32) = conn.query_row(
-            "SELECT retries, max_retries FROM agent_jobs WHERE id = ?1",
+        let (retries, max_retries, cancel_requested): (u32, u32, bool) = conn.query_row(
+            "SELECT retries, max_retries, cancel_requested != 0 FROM agent_jobs WHERE id = ?1",
             params![id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
+        // Cancelled mid-run (`cancel_for_item`): the cancel was deliberate, so
+        // finish the row as `killed` and neither retry it nor report a failure
+        // (`false`: no terminal-failure hook).
+        if cancel_requested {
+            conn.execute(
+                "UPDATE agent_jobs SET state = 'killed', error = ?1, finished_at = ?2
+                 WHERE id = ?3",
+                params![error, now, id],
+            )?;
+            return Ok(false);
+        }
         let retried = !fatal && retries < max_retries;
         if retried {
             let not_before = retry_after_secs.map(|s| now + s as i64);
@@ -416,6 +432,88 @@ impl Queue {
             return Err(Error::NotFound(id.to_string()));
         }
         Ok(())
+    }
+
+    /// Whether the job was cancelled (`cancel`/`cancel_for_item`). A running
+    /// in-process job polls this to stop itself; a missing row reads as not
+    /// cancelled so a lookup failure can never kill live work.
+    pub fn is_cancelled(&self, id: &str) -> bool {
+        let conn = self.conn.lock();
+        match conn.query_row(
+            "SELECT state = 'killed' OR cancel_requested != 0 FROM agent_jobs WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, bool>(0),
+        ) {
+            Ok(cancelled) => cancelled,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(e) => {
+                // Not fatal (never kill live work on a lookup failure) but not
+                // silent either: a missed cancel otherwise leaves no trace.
+                eprintln!("agentflare-jobs: cancel check for {id} failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// Cancels every queued (incl. retry-pending) or running in-process job
+    /// for `item_id` whose target agent (`args[1]`) fails `keep` -- used when
+    /// an item is handed to a different agent, so the old agent's job (and
+    /// its retries) can't keep working or push alongside the new one. A queued
+    /// job is `killed` at once. A running job only gets `cancel_requested`: it
+    /// stays `running` (so the item still counts as in flight and no second
+    /// agent is dispatched next to it) until its executor sees `is_cancelled`,
+    /// stops, and `fail` finishes the row as `killed`. Returns the cancelled
+    /// job ids.
+    pub fn cancel_for_item(
+        &self,
+        item_id: &str,
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<Vec<String>, Error> {
+        let now = db_kit::ids::now();
+        let conn = self.conn.lock();
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, state, payload FROM agent_jobs
+                 WHERE state IN ('queued', 'running') AND cancel_requested = 0",
+            )?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut cancelled = Vec::new();
+        for (id, state, payload) in rows {
+            let Ok(job) = serde_json::from_str::<crate::types::AgentJob>(&payload) else {
+                continue;
+            };
+            let targets_item = job.in_process
+                && job.args.first().is_some_and(|a| a == item_id)
+                && job.args.get(1).is_some_and(|agent| !keep(agent));
+            if !targets_item {
+                continue;
+            }
+            // The in-process lock only serializes this process: the daemon's
+            // worker is a different process (own `Queue`, own connection) and
+            // may dequeue the job between the SELECT and here, so the kill is
+            // guarded on `state = 'queued'` and falls back to a cancel request
+            // when the job has just started running.
+            let killed = state == "queued"
+                && conn.execute(
+                    "UPDATE agent_jobs SET state = 'killed', finished_at = ?1, error = ?2
+                     WHERE id = ?3 AND state = 'queued'",
+                    params![now, crate::cancel::CANCELLED_MESSAGE, id],
+                )? > 0;
+            // A row that reached a terminal state after the SELECT matches
+            // neither UPDATE and is not reported as cancelled.
+            let flagged = !killed
+                && conn.execute(
+                    "UPDATE agent_jobs SET cancel_requested = 1
+                     WHERE id = ?1 AND state IN ('queued', 'running')",
+                    params![id],
+                )? > 0;
+            if killed || flagged {
+                cancelled.push(id);
+            }
+        }
+        Ok(cancelled)
     }
 
     /// Deletes finished jobs older than `older_than_secs`, including their

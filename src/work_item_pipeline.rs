@@ -486,7 +486,11 @@ pub(crate) fn build_sdd_loop_step(
                         // terminal error for `cli::work`'s
                         // `handle_auth_expired`/`classify_and_cooldown` to
                         // classify.
-                        if crate::auth_runner::is_auth_expired(&message) {
+                        // A job cancelled by a reassignment (item #607) is the
+                        // same: retrying would just be refused again.
+                        if crate::auth_runner::is_auth_expired(&message)
+                            || message == agentflare_jobs::cancel::CANCELLED_MESSAGE
+                        {
                             return Ok(StepResult::Failed(message));
                         }
                         // A dead resumed session would otherwise fail the
@@ -558,7 +562,11 @@ pub(crate) fn build_sdd_loop_step(
                         // same item #164 rationale: skip this step's
                         // `RetryPolicy` entirely for an auth-expiry failure
                         // instead of burning 3 guaranteed-useless attempts.
-                        if crate::auth_runner::is_auth_expired(&message) {
+                        // A job cancelled by a reassignment (item #607) is the
+                        // same: retrying would just be refused again.
+                        if crate::auth_runner::is_auth_expired(&message)
+                            || message == agentflare_jobs::cancel::CANCELLED_MESSAGE
+                        {
                             return Ok(StepResult::Failed(message));
                         }
                         if is_stale_session_error(&message) {
@@ -757,6 +765,19 @@ pub(crate) fn build_finalize_step(
                 if ctx.data.item_id.is_empty() {
                     return Ok(StepResult::Failed(
                         "finalize: item_id is empty, cannot reconstruct run identity".to_string(),
+                    ));
+                }
+                // A job cancelled by a reassignment (item #607) must not push
+                // or open a PR for an item that now belongs to another agent.
+                let cancel_owner = ctx.data.owner.clone();
+                let cancelled = tokio::task::spawn_blocking(move || {
+                    crate::agent_launch::owner_job_cancelled(&cancel_owner)
+                })
+                .await
+                .unwrap_or(false);
+                if cancelled {
+                    return Ok(StepResult::Failed(
+                        agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string(),
                     ));
                 }
                 let item_id = ctx.data.item_id.clone();
@@ -960,34 +981,49 @@ fn real_agent_send_hook(
             ..
         } = inv;
         Box::pin(async move {
+            // Refuse to start another agent turn for a cancelled job (item
+            // #607). A turn already running is stopped by `run_captured_for_job`,
+            // which finds the job via `owner` on its own blocking thread.
             let agent_for_reply = agent.clone();
-            let outcome = tokio::task::spawn_blocking(move || match &cwd {
-                // Explicit cwd (the item's own worktree, threaded through
-                // `WorkItemData::worktree_path`) instead of the ambient
-                // process cwd — required for a run resumed by
-                // `engine().recover()`, which never re-enters
-                // `execute_work`'s `run_in_worktree` chdir (item #191).
-                Some(cwd) => crate::agent_launch::run_headless_in_with_owner(
-                    owner.as_deref(),
-                    cwd,
-                    agent_registry::REGISTRY,
-                    &agent,
-                    &prompt,
-                    timeout,
-                    idle_timeout,
-                    &all_args,
-                    true,
-                ),
-                None => crate::agent_launch::run_headless_with_owner(
-                    owner.as_deref(),
-                    agent_registry::REGISTRY,
-                    &agent,
-                    &prompt,
-                    timeout,
-                    idle_timeout,
-                    &all_args,
-                    true,
-                ),
+            let outcome = tokio::task::spawn_blocking(move || {
+                // The check reads SQLite, so it runs here on the blocking
+                // pool, not on the shared workflow runtime's worker threads.
+                if owner
+                    .as_deref()
+                    .is_some_and(crate::agent_launch::owner_job_cancelled)
+                {
+                    return crate::agent_launch::HeadlessOutcome::Failed(
+                        agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string(),
+                    );
+                }
+                match &cwd {
+                    // Explicit cwd (the item's own worktree, threaded through
+                    // `WorkItemData::worktree_path`) instead of the ambient
+                    // process cwd — required for a run resumed by
+                    // `engine().recover()`, which never re-enters
+                    // `execute_work`'s `run_in_worktree` chdir (item #191).
+                    Some(cwd) => crate::agent_launch::run_headless_in_with_owner(
+                        owner.as_deref(),
+                        cwd,
+                        agent_registry::REGISTRY,
+                        &agent,
+                        &prompt,
+                        timeout,
+                        idle_timeout,
+                        &all_args,
+                        true,
+                    ),
+                    None => crate::agent_launch::run_headless_with_owner(
+                        owner.as_deref(),
+                        agent_registry::REGISTRY,
+                        &agent,
+                        &prompt,
+                        timeout,
+                        idle_timeout,
+                        &all_args,
+                        true,
+                    ),
+                }
             })
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
@@ -1420,6 +1456,8 @@ include!("work_item_pipeline/task_sourcing.rs");
 
 include!("work_item_pipeline/prompt_builders.rs");
 
+#[cfg(test)]
+mod cancel_tests;
 #[cfg(test)]
 mod cap_tests;
 #[cfg(test)]

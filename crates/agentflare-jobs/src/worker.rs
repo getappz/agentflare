@@ -219,7 +219,13 @@ fn run_in_process(
     let executor = executor.clone();
     let job_id = id.to_string();
     let args = job.args.clone();
+    let cancel_queue = queue.clone();
     std::thread::spawn(move || {
+        let cancel_id = job_id.clone();
+        // Held until the executor returns, so `cancel::job_cancelled(job_id)`
+        // is live exactly while this job's work is.
+        let _cancel =
+            crate::cancel::register(&job_id, move || cancel_queue.is_cancelled(&cancel_id));
         let result = executor.execute(&job_id, &args, &mut log_file);
         let _ = tx.send(result);
     });
