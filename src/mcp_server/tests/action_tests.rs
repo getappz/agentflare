@@ -1143,6 +1143,37 @@ fn item_redispatch_to_the_same_agent_keeps_its_claim() {
 }
 
 #[test]
+fn item_release_by_a_superseded_job_keeps_the_redispatched_assignee() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    seed_claim(&s, &item_id, "opencode:dead-job", 60);
+    redispatch_with(&s, &item_id, "claude-code");
+
+    // The old job was still running when the operator redispatched; it now
+    // fails and releases under its own owner id.
+    crate::claims::with_owner_override("opencode:dead-job", || {
+        s.item(Parameters(ItemRequest {
+            action: "release".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap()
+    });
+
+    assert_eq!(
+        s.with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id)
+            .unwrap()
+            .assignee_agent)
+            .unwrap()
+            .as_deref(),
+        Some("claude-code"),
+        "a failing job's release must not erase the operator's reassignment"
+    );
+}
+
+#[test]
 fn item_release_reclaims_and_releases_a_stale_claim_from_an_abandoned_owner() {
     let (_tmp, s) = harness();
     let created: serde_json::Value =
