@@ -153,11 +153,14 @@
         assert!(!is_stale_ci_red(&pr, true, chrono::Utc::now()));
     }
 
-    /// Item #164's acceptance criterion: a merged duplicate PR self-heals
-    /// the item to "completed" instead of letting a redispatch re-do
-    /// already-merged work (the near-miss from items #122/#156).
+    /// Item #595: a merged duplicate PR must NOT silently complete the item.
+    /// The marker that matched it is just text in a PR body -- PR #636 was a
+    /// different item's work stamped "for item #198", and auto-completing on
+    /// it closed #198 with zero implementation. It skips dispatch and flags a
+    /// human (like an open duplicate), leaving the item's state, worktree,
+    /// and PR labels untouched.
     #[test]
-    fn handle_duplicate_pr_auto_completes_on_a_merged_match() {
+    fn handle_duplicate_pr_flags_for_review_on_a_merged_match_without_completing() {
         crate::paths::test_support::with_temp_home(|| {
             let tmp = tempfile::tempdir().unwrap();
             let repo_root = tmp.path().join("repo");
@@ -177,13 +180,18 @@
                 "acquired"
             );
 
+            let state_id_after_claim = mcp
+                .with_backend_db(|conn| agentflare_backend::item::get(conn, &item.id))
+                .unwrap()
+                .unwrap()
+                .state_id;
+
             let mut guard = ClaimGuard::new(&mcp, &item.id);
             let mut log = Vec::new();
             let outcome = handle_duplicate_pr(
                 &mcp,
                 &item.id,
                 &item,
-                &repo_root,
                 &duplicate_pr(42, true),
                 None,
                 &mut guard,
@@ -195,11 +203,14 @@
                 .with_backend_db(|conn| agentflare_backend::item::get(conn, &item.id))
                 .unwrap()
                 .unwrap();
-            let state = mcp
-                .with_backend_db(|conn| agentflare_backend::state::get(conn, &refreshed.state_id))
-                .unwrap()
-                .unwrap();
-            assert_eq!(state.group_name, "completed");
+            assert_eq!(
+                refreshed.state_id, state_id_after_claim,
+                "a merged duplicate must not change the item's state"
+            );
+            assert!(
+                refreshed.completed_at.is_none(),
+                "a merged duplicate must not mark the item completed"
+            );
 
             let claim_after = mcp
                 .item_claim(ItemRequest {
@@ -221,8 +232,8 @@
             assert!(
                 comments
                     .iter()
-                    .any(|c| c.body.contains("duplicate work detected") && c.body.contains("#42")),
-                "expected a duplicate-work comment naming the merged PR, got: {comments:?}"
+                    .any(|c| c.body.contains("needs human review") && c.body.contains("#42")),
+                "expected a needs-human-review comment naming the merged PR, got: {comments:?}"
             );
         });
     }
@@ -266,7 +277,6 @@
                 &mcp,
                 &item.id,
                 &item,
-                &repo_root,
                 &open_duplicate_pr(7),
                 None,
                 &mut guard,

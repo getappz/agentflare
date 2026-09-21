@@ -20,15 +20,17 @@ const STALE_DUPLICATE_DAYS: i64 = 3;
 /// API error all just return `None` so dispatch proceeds normally — same
 /// fail-open contract `worktree::is_pr_merged`/`relabel_pr_completed`
 /// already use. Prefers a merged match over a still-open one (sorted first)
-/// so `handle_duplicate_pr` can self-heal instead of merely flagging for
-/// review, on the rare chance both exist.
+/// so `handle_duplicate_pr` reports the stronger evidence, on the rare
+/// chance both exist.
 fn find_duplicate_pr(
     item: &agentflare_backend::item::Item,
     repo_root: &std::path::Path,
 ) -> Option<crate::github::models::PullRequest> {
     let repo = crate::github::RepoId::resolve_from_remote(repo_root)?;
     let client = crate::github::Client::new().ok()?;
-    let prs = crate::github::pulls::find_by_item_marker(&client, &repo, item.sequence_id).ok()?;
+    let prs =
+        crate::github::pulls::find_by_item_marker(&client, &repo, item.sequence_id, &item.id)
+            .ok()?;
     let pr = pick_duplicate_pr(
         prs,
         flare_git_core::branch::current_branch(repo_root).as_deref(),
@@ -71,8 +73,8 @@ fn is_stale_ci_red(
 }
 
 /// Picks which match to act on when `find_by_item_marker` returns more than
-/// one PR for the same item — a merged one wins so `handle_duplicate_pr`
-/// self-heals instead of merely flagging for review. A closed-but-unmerged
+/// one PR for the same item — a merged one wins as the stronger evidence
+/// `handle_duplicate_pr` reports for human confirmation. A closed-but-unmerged
 /// PR (a previously abandoned attempt, e.g. an item found superseded and
 /// closed) is dropped entirely rather than treated as an open duplicate —
 /// otherwise it would permanently block a legitimate redispatch. Split out
@@ -101,9 +103,9 @@ fn is_stale_ci_red(
 /// out right now.
 ///
 /// A *merged* match still always short-circuits regardless of branch or
-/// ownership, since that's this function's other job: self-heal an item
-/// whose PR landed while its tracked state fell out of sync (items
-/// #122/#156).
+/// ownership, since that's this function's other job: surface an item whose
+/// PR landed while its tracked state fell out of sync (items #122/#156) for a
+/// human to confirm.
 fn pick_duplicate_pr(
     mut prs: Vec<crate::github::models::PullRequest>,
     current_branch: Option<&str>,
@@ -127,58 +129,39 @@ fn pick_duplicate_pr(
 /// terminal successes, not failures — matching how `work_item_pipeline`'s
 /// `finalize` step treats its own "hold"/"needs human review" diversions.
 ///
-/// - Merged: self-heal — mark the item completed, clean up its worktree,
-///   relabel the PR `agentflare:completed`, and release the claim, the same
-///   shape `item_check_merge`'s promoted path already uses. If marking
-///   completed doesn't confirm success, this returns a retryable failure
-///   instead of reporting success, leaving `claim_guard` armed so its
-///   `Drop` releases the claim for a future attempt.
-/// - Still open: skip dispatch and flag for a human instead of racing a
-///   second PR for the same item.
+/// Both branches skip dispatch and flag for a human; neither touches the
+/// item's tracker state. A merged match used to self-heal (mark completed,
+/// clean up the worktree, relabel the PR) on the strength of nothing but a
+/// text marker in the PR body -- item #595 showed that marker can name the
+/// wrong item (PR #636 was another item's work, stamped "for item #198"),
+/// which completed a never-implemented item with zero work done. Completing
+/// it (or not) is now the human's call, and nothing here is irreversible.
 ///
-/// Either way, `claim_guard` is only disarmed once `item_release` actually
-/// confirms success — a failed release leaves it armed so `Drop`'s
-/// best-effort retry is still the backstop, matching `release_and_comment`'s
-/// own contract.
-#[allow(clippy::too_many_arguments)]
+/// `claim_guard` is only disarmed once `item_release` actually confirms
+/// success — a failed release leaves it armed so `Drop`'s best-effort retry
+/// is still the backstop, matching `release_and_comment`'s own contract.
 fn handle_duplicate_pr(
     mcp: &AgentflareMcp,
     item_id: &str,
     item: &agentflare_backend::item::Item,
-    worktree_path: &std::path::Path,
     pr: &crate::github::models::PullRequest,
     notify_recipient: Option<&str>,
     claim_guard: &mut ClaimGuard,
     log: &mut dyn std::io::Write,
 ) -> WorkOutcome {
     let body = if pr.merged_at.is_some() {
-        let owner = crate::claims::owner_id();
-        let marked = mcp
-            .with_backend_db(|conn| agentflare_backend::item::mark_completed(conn, item_id, &owner))
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(false);
-        if !marked {
-            let msg = format!(
-                "duplicate work: PR #{} already merged for {item_id}, but mark_completed \
-                 didn't confirm success -- leaving claim armed for retry",
-                pr.number
-            );
-            let _ = writeln!(log, "{msg}");
-            crate::ui::error(&msg);
-            return 1.into();
-        }
-        crate::worktree::cleanup_worktree(item, worktree_path);
-        crate::worktree::relabel_pr_completed(item, worktree_path);
         let _ = writeln!(
             log,
-            "duplicate work: PR #{} already merged for {item_id} -- auto-completed",
+            "duplicate work: merged PR #{} carries {item_id}'s marker -- needs human \
+             confirmation, skipping dispatch",
             pr.number
         );
         format!(
-            "## agentflare work — duplicate work detected\n\nPR #{} ({}) already merged for \
-             this item; auto-completing instead of redispatching.",
-            pr.number, pr.html_url
+            "## agentflare work — needs human review\n\nPR #{} ({}) is already merged and \
+             carries this item's `for item #{}` marker, so dispatch was skipped. The marker \
+             alone can't prove the PR covers this item's scope; confirm it does, then complete \
+             the item by hand.",
+            pr.number, pr.html_url, item.sequence_id
         )
     } else {
         let _ = writeln!(
@@ -234,7 +217,6 @@ fn duplicate_pr_short_circuit(
         mcp,
         &item.id,
         item,
-        worktree_path,
         &pr,
         notify_recipient,
         claim_guard,
