@@ -158,7 +158,8 @@ enum PlanStatusRoute {
     PublicApprove,
     /// A human's tap on the Telegram approve card, routed in-process by
     /// `supervisor::handle_telegram_callback`. This IS the human, so the
-    /// human-approver check is skipped.
+    /// human-approver check is skipped, and the item is looked up by its own
+    /// id in any project (`resolve_item_id_any_project`).
     ChannelApprove,
     /// `reject_plan`. Never restricted: rejection only re-blocks the item.
     Reject,
@@ -342,6 +343,40 @@ impl AgentflareMcp {
         match agentflare_backend::item::get(conn, &id) {
             Ok(item) if item.project_id == project.id => Ok(id),
             Ok(_) | Err(agentflare_backend::Error::NotFound(_)) => Err(ErrorData::invalid_params(
+                format!("no item matches id '{id_or_seq}'"),
+                None,
+            )),
+            Err(e) => Err(map_backend_err(e)),
+        }
+    }
+
+    /// [`Self::resolve_item_id`] minus the linked-project comparison: proves
+    /// the item exists and returns its id, wherever it lives. ONLY for
+    /// [`PlanStatusRoute::ChannelApprove`] -- a human-authenticated tap whose
+    /// callback carries the item's own id, so the item's project (not the
+    /// daemon's session project) is the right one. The same generic "no item
+    /// matches" error is returned when it is missing.
+    ///
+    /// A bare numeric `sequence_id` (optionally `#`-prefixed) is only
+    /// meaningful within one project, so it keeps the scoped resolution rather
+    /// than guessing a project (`resolve_id(None, ..)` returns the first match
+    /// across all of them).
+    fn resolve_item_id_any_project(
+        &self,
+        conn: &Connection,
+        id_or_seq: &str,
+    ) -> Result<String, ErrorData> {
+        if id_or_seq
+            .strip_prefix('#')
+            .unwrap_or(id_or_seq)
+            .parse::<i64>()
+            .is_ok()
+        {
+            return self.resolve_item_id(conn, id_or_seq);
+        }
+        match agentflare_backend::item::get(conn, id_or_seq) {
+            Ok(_) => Ok(id_or_seq.to_string()),
+            Err(agentflare_backend::Error::NotFound(_)) => Err(ErrorData::invalid_params(
                 format!("no item matches id '{id_or_seq}'"),
                 None,
             )),
@@ -973,7 +1008,15 @@ impl AgentflareMcp {
             ErrorData::invalid_params(format!("id is required for {new_status} transition"), None)
         })?;
         self.with_backend_db(|conn| {
-            let item_id = self.resolve_item_id(conn, &id)?;
+            // Only the human channel route may reach an item outside the
+            // session's linked project (the Telegram tap names the item; the
+            // daemon's own project is irrelevant). Every agent-callable route
+            // keeps the project boundary.
+            let item_id = if route == PlanStatusRoute::ChannelApprove {
+                self.resolve_item_id_any_project(conn, &id)?
+            } else {
+                self.resolve_item_id(conn, &id)?
+            };
             let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
             let gate = agentflare_backend::item::plan_gate::read_plan_gate(&item.metadata);
             if gate.plan_status.as_deref() != Some("pending") {
