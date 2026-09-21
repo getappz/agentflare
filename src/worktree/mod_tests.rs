@@ -609,12 +609,33 @@
     }
 
     #[test]
-    fn is_own_pr_true_for_an_open_pr_regardless_of_body() {
+    fn is_own_pr_true_for_an_open_pr_tagged_for_this_item() {
         let item = item_with_metadata(259, "{}");
-        let pr: crate::github::models::PullRequest =
-            serde_json::from_str(r#"{"number":688,"html_url":"u","state":"open","title":"t"}"#)
-                .unwrap();
+        let body = format!(
+            "_Opened by claude-code on box for item #259 via agentflare._\n{}",
+            crate::github::pulls::item_id_tag(&item.id)
+        );
+        let pr: crate::github::models::PullRequest = serde_json::from_value(serde_json::json!({
+            "number": 688, "html_url": "u", "state": "open", "title": "t", "body": body
+        }))
+        .unwrap();
         assert!(is_own_pr(&pr, &item));
+    }
+
+    // Item #595: an open PR tagged for another item must not be adopted as
+    // this item's PR identity just because it is open.
+    #[test]
+    fn is_own_pr_false_for_an_open_pr_tagged_for_a_different_item() {
+        let item = item_with_metadata(259, "{}");
+        let body = format!(
+            "_Opened by claude-code on box for item #259 via agentflare._\n{}",
+            crate::github::pulls::item_id_tag("some-other-items-uuid")
+        );
+        let pr: crate::github::models::PullRequest = serde_json::from_value(serde_json::json!({
+            "number": 688, "html_url": "u", "state": "open", "title": "t", "body": body
+        }))
+        .unwrap();
+        assert!(!is_own_pr(&pr, &item));
     }
 
     #[test]
@@ -667,7 +688,8 @@
             crate::github::test_support::MockResponse::json(
                 200,
                 r#"[{"number":688,"html_url":"https://gh/o/r/pull/688","state":"open",
-                    "title":"t","head":{"ref":"task/259","sha":"abc"}}]"#,
+                    "title":"t","head":{"ref":"task/259","sha":"abc"},
+                    "body":"_Opened by claude-code on box for item #259 via agentflare._"}]"#,
             ),
         ]);
         let client = server.client(None);
