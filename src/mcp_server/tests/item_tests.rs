@@ -374,11 +374,24 @@ fn item_update_assignee_to_different_instance_does_not_release_claim() {
 
 #[test]
 fn item_claim_blocked_by_plan() {
+    // Same environment-dependent trap as
+    // end_to_end_plan_gate_blocks_then_unblocks_claim: the create call below
+    // sets assignee_agent="claude-code" so plan_required's claimability
+    // check accepts it, so the final claim() must come from that same
+    // identity or claim()'s handoff freeze (BlockedByAssignee) blocks it.
+    // Pin the owner instead of relying on ambient agent-detection.
+    crate::claims::with_owner_override("claude-code:test", || {
+        item_claim_blocked_by_plan_inner();
+    });
+}
+
+fn item_claim_blocked_by_plan_inner() {
     let (s, tmp, _repo_tmp) = claim_harness();
     let created: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
             action: "create".into(),
             name: Some("gated item".into()),
+            assignee_agent: Some("claude-code".into()),
             metadata: Some(serde_json::json!({"plan_required": true})),
             ..Default::default()
         }))
@@ -443,6 +456,7 @@ fn submit_plan_sets_pending_and_clears_prior_rejection() {
             &s.item(Parameters(ItemRequest {
                 action: "create".into(),
                 name: Some("gated item".into()),
+                assignee_agent: Some("claude-code".into()),
                 metadata: Some(serde_json::json!({
                     "plan_required": true,
                     "plan_rejection_reason": "stale reason from a prior round",
@@ -494,6 +508,7 @@ fn pending_plan_item(s: &AgentflareMcp, approver: &str) -> String {
         &s.item(Parameters(ItemRequest {
             action: "create".into(),
             name: Some("human-gated plan".into()),
+            assignee_agent: Some("claude-code".into()),
             metadata: Some(serde_json::json!({
                 "plan_required": true,
                 "plan_approver": approver,
@@ -559,6 +574,7 @@ fn submit_plan_cannot_downgrade_a_stored_human_approver() {
         &s.item(Parameters(ItemRequest {
             action: "create".into(),
             name: Some("human-gated, not yet submitted".into()),
+            assignee_agent: Some("claude-code".into()),
             metadata: Some(serde_json::json!({
                 "plan_required": true,
                 "plan_approver": "human",
@@ -641,6 +657,7 @@ fn create_with_explicit_plan_approver_is_not_overridden() {
             action: "create".into(),
             name: Some("urgent item, agent-approved".into()),
             priority: Some("urgent".into()),
+            assignee_agent: Some("claude-code".into()),
             metadata: Some(serde_json::json!({"plan_approver": "agent"})),
             ..Default::default()
         }))
@@ -676,6 +693,7 @@ fn create_strips_plan_transition_fields_from_caller_metadata() {
         &s.item(Parameters(ItemRequest {
             action: "create".into(),
             name: Some("smuggled approval attempt".into()),
+            assignee_agent: Some("claude-code".into()),
             metadata: Some(serde_json::json!({
                 "plan_required": true,
                 "plan_approver": "human",
@@ -764,6 +782,7 @@ fn reject_plan_sets_rejected_and_records_reason() {
         &s.item(Parameters(ItemRequest {
             action: "create".into(),
             name: Some("pending-plan item".into()),
+            assignee_agent: Some("claude-code".into()),
             metadata: Some(serde_json::json!({
                 "plan_required": true,
             })),
@@ -814,6 +833,7 @@ fn create_with_urgent_priority_auto_gates_plan_required() {
             action: "create".into(),
             name: Some("urgent item".into()),
             priority: Some("urgent".into()),
+            assignee_agent: Some("claude-code".into()),
             ..Default::default()
         }))
         .unwrap(),
@@ -845,6 +865,126 @@ fn create_with_explicit_plan_required_false_is_not_overridden() {
     assert_eq!(metadata["plan_required"], false);
 }
 
+/// Item #628 live incident (2026-09-22): `plan_required: true` with neither
+/// an `assignee_agent` nor an already-submitted plan is permanently
+/// unclaimable -- no agent will ever auto-dispatch it to write a plan, and
+/// there's nothing yet for a human to approve either. `create` must refuse
+/// this combination outright instead of silently accepting a dead-end item.
+#[test]
+fn create_rejects_plan_required_with_no_assignee_and_no_plan() {
+    let (_tmp, s) = harness();
+    let err = s
+        .item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("dead-end gated item".into()),
+            metadata: Some(serde_json::json!({"plan_required": true, "plan_approver": "human"})),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        err.message.contains("assignee_agent"),
+        "error must name the fix: {}",
+        err.message
+    );
+}
+
+/// The normal dispatch-then-plan flow (#595, #610): an assignee is set, so
+/// the assigned agent will be told to submit a plan on claim. Must still be
+/// allowed.
+#[test]
+fn create_accepts_plan_required_with_assignee_agent_and_no_plan() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("gated item, assigned".into()),
+            assignee_agent: Some("claude-code".into()),
+            metadata: Some(serde_json::json!({"plan_required": true, "plan_approver": "human"})),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(created["metadata"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["plan_required"], true);
+}
+
+/// A plan written up front (spec first, assignment TBD): `plan_asset_id`
+/// provided in the same `create` call also unblocks the gate, even with no
+/// `assignee_agent`.
+#[test]
+fn create_accepts_plan_required_with_plan_asset_id_and_no_assignee() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some("gated item, spec up front".into()),
+            plan_asset_id: Some("asset-spec-1".into()),
+            metadata: Some(serde_json::json!({"plan_required": true, "plan_approver": "human"})),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(created["metadata"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["plan_required"], true);
+}
+
+/// Same dead-end check as `create`'s, but reached via `update` -- gating an
+/// item that has no assignee and no submitted plan must be refused there
+/// too, not just at creation.
+#[test]
+fn update_rejects_plan_required_with_no_assignee_and_no_plan() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(empty_item_create("ungated item")))
+            .unwrap(),
+    )
+    .unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let err = s
+        .item(Parameters(ItemRequest {
+            action: "update".into(),
+            id: Some(item_id),
+            metadata: Some(serde_json::json!({"plan_required": true, "plan_approver": "human"})),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+/// `update` setting `plan_required` and `assignee_agent` together in the same
+/// call must be allowed -- same dispatch-then-plan flow as `create`'s.
+#[test]
+fn update_accepts_plan_required_with_assignee_agent_in_same_call() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(empty_item_create("ungated item")))
+            .unwrap(),
+    )
+    .unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let updated: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "update".into(),
+            id: Some(item_id),
+            assignee_agent: Some("claude-code".into()),
+            metadata: Some(serde_json::json!({"plan_required": true, "plan_approver": "human"})),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(updated["metadata"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["plan_required"], true);
+}
+
 #[test]
 fn update_priority_to_urgent_auto_gates_plan_required() {
     let (tmp, s) = harness();
@@ -852,6 +992,7 @@ fn update_priority_to_urgent_auto_gates_plan_required() {
         &s.item(Parameters(ItemRequest {
             action: "create".into(),
             name: Some("ordinary item".into()),
+            assignee_agent: Some("claude-code".into()),
             metadata: Some(serde_json::json!({"size": "M"})),
             ..Default::default()
         }))
@@ -884,6 +1025,20 @@ fn update_priority_to_urgent_auto_gates_plan_required() {
 /// claimed until a submitted plan is approved.
 #[test]
 fn end_to_end_plan_gate_blocks_then_unblocks_claim() {
+    // Step 1 sets `assignee_agent: "claude-code"` so plan_required's new
+    // claimability check accepts it; the final claim in step 6 must then
+    // come from that same agent identity or `claim()`'s handoff freeze
+    // (`BlockedByAssignee`) blocks it. Pin the owner explicitly instead of
+    // relying on ambient agent-detection (`owner_id()` falls back to
+    // `agent_detector::agent_name()`, which resolves to "claude-code" only
+    // when actually running inside Claude Code -- a bare CI runner detects
+    // nothing and falls back to "cli", which doesn't match).
+    crate::claims::with_owner_override("claude-code:test", || {
+        end_to_end_plan_gate_blocks_then_unblocks_claim_inner();
+    });
+}
+
+fn end_to_end_plan_gate_blocks_then_unblocks_claim_inner() {
     let (s, _tmp, _repo_tmp) = claim_harness();
 
     // 1. Create with priority="urgent" plus an explicit plan_approver="agent"
@@ -901,6 +1056,7 @@ fn end_to_end_plan_gate_blocks_then_unblocks_claim() {
             action: "create".into(),
             name: Some("urgent gated item".into()),
             priority: Some("urgent".into()),
+            assignee_agent: Some("claude-code".into()),
             metadata: Some(serde_json::json!({"plan_required": true, "plan_approver": "agent"})),
             ..Default::default()
         }))
@@ -1622,6 +1778,9 @@ fn item_groom_reads_size_and_flags_unestimated() {
         &s.item(Parameters(ItemRequest {
             action: "create".into(),
             name: Some("Sized".into()),
+            // Size "L" auto-gates `plan_required` (`default_policy`); an
+            // assignee is required so the gate stays claimable.
+            assignee_agent: Some("claude-code".into()),
             metadata: Some(serde_json::json!({"size": "L"})),
             ..Default::default()
         }))
