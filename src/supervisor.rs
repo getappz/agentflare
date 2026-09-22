@@ -90,7 +90,11 @@ fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str,
     {
         eprintln!("agentflare-supervisor: could not remove {from} from PR #{number}: {e}");
     }
-    if let Err(e) = crate::github::issues::comment(&client, &repo, number, comment) {
+    // Empty comment = label bookkeeping only (a silent re-dispatch whose
+    // announcement already went out) — never post a blank comment to the PR.
+    if !comment.is_empty()
+        && let Err(e) = crate::github::issues::comment(&client, &repo, number, comment)
+    {
         eprintln!("agentflare-supervisor: could not comment on PR #{number}: {e}");
     }
 }
@@ -796,6 +800,164 @@ impl RepairTrigger<'_> {
 /// so a PR CodeRabbit keeps flagging doesn't retry-dispatch forever either.
 const CODERABBIT_REPAIR_MARKER: &str = "## supervisor — CodeRabbit review repair dispatched";
 
+/// Marker prefix on the one-time repair summary posted once the findings that
+/// triggered a dispatch are all resolved (see
+/// `maybe_post_repair_complete_summary`) — the counterpart to
+/// `CODERABBIT_REPAIR_MARKER`'s dispatch announcement.
+const CODERABBIT_REPAIR_COMPLETE_MARKER: &str = "## supervisor — CodeRabbit review repair complete";
+
+/// Item-metadata keys tracking CodeRabbit review-repair announcements (item
+/// #633 follow-up): the sweep used to post a dispatch comment on EVERY
+/// dispatch, so a repair that failed and retried spammed identical posts on
+/// the item and the PR. Now the findings snapshot is fingerprinted and the
+/// dispatch post goes out once per snapshot; retries re-dispatch silently.
+const CODERABBIT_REPAIR_ANNOUNCED_KEY: &str = "coderabbit_repair_announced_for";
+/// Silent re-dispatches (same findings, no new marker comment). The cap counts
+/// marker comments + this counter, so retries still trip it exactly as before.
+const CODERABBIT_REPAIR_SILENT_KEY: &str = "coderabbit_repair_silent_attempts";
+/// Fingerprint whose completion summary was already posted — the summary goes
+/// out once, not on every later clean sweep.
+const CODERABBIT_REPAIR_COMPLETED_KEY: &str = "coderabbit_repair_completed_for";
+
+/// Stable fingerprint of a findings snapshot: sorted `path:line:login:first-line`
+/// rows, truncated. Sorted (not fetch order) so reordered fetches don't
+/// re-announce; first body lines included so genuinely changed findings do.
+fn coderabbit_findings_fingerprint(findings: &[crate::github::models::ReviewComment]) -> String {
+    let mut rows: Vec<String> = findings
+        .iter()
+        .map(|c| {
+            let line = c.line.map(|l| l.to_string()).unwrap_or_default();
+            let first = c.body.lines().next().unwrap_or("").trim();
+            format!("{}:{line}:{}:{first}", c.path, c.user.login)
+        })
+        .collect();
+    rows.sort();
+    rows.join("\n").chars().take(2000).collect()
+}
+
+/// Reads the repair-tracking keys off an item's metadata: the announced
+/// fingerprint, the silent re-dispatch count, and the completed fingerprint.
+/// Missing/corrupt metadata reads as all-empty, never an error.
+fn repair_track(item: &agentflare_backend::item::Item) -> (Option<String>, u32, Option<String>) {
+    let meta: serde_json::Value = serde_json::from_str(&item.metadata).unwrap_or_default();
+    let text = |k: &str| meta.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let count = meta
+        .get(CODERABBIT_REPAIR_SILENT_KEY)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
+    (
+        text(CODERABBIT_REPAIR_ANNOUNCED_KEY),
+        count,
+        text(CODERABBIT_REPAIR_COMPLETED_KEY),
+    )
+}
+
+/// Merges repair-tracking keys into the item's current metadata (re-fetched,
+/// not reused from any snapshot, so a concurrent metadata write isn't
+/// clobbered — same pattern as `persist_comment_cursor`). Each key is
+/// `Option`: `None` leaves it untouched.
+fn persist_repair_track(
+    mcp: &AgentflareMcp,
+    item_id: &str,
+    announced: Option<&str>,
+    silent_bump: bool,
+    completed: Option<&str>,
+) {
+    let Ok(raw) = mcp.item_get(ItemRequest {
+        action: "get".into(),
+        id: Some(item_id.to_string()),
+        ..Default::default()
+    }) else {
+        return;
+    };
+    let Ok(item) = serde_json::from_str::<agentflare_backend::item::Item>(&raw) else {
+        return;
+    };
+    let mut merged = serde_json::from_str::<serde_json::Value>(&item.metadata)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .map(serde_json::Value::Object)
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    if let Some(fp) = announced {
+        merged[CODERABBIT_REPAIR_ANNOUNCED_KEY] = serde_json::Value::String(fp.to_string());
+    }
+    if silent_bump {
+        let current = merged
+            .get(CODERABBIT_REPAIR_SILENT_KEY)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        merged[CODERABBIT_REPAIR_SILENT_KEY] = serde_json::Value::from(current + 1);
+    }
+    if let Some(fp) = completed {
+        merged[CODERABBIT_REPAIR_COMPLETED_KEY] = serde_json::Value::String(fp.to_string());
+    }
+    let _ = mcp.item_update(ItemRequest {
+        action: "update".into(),
+        id: Some(item_id.to_string()),
+        metadata: Some(merged),
+        ..Default::default()
+    });
+}
+
+/// Posts the one-time repair summary once the announced findings are clean,
+/// and returns an excerpt for the PR-side clear message when the repair run
+/// left a recorded outcome. Returns `None` when there is nothing to announce
+/// (never dispatched) or the summary already went out — callers post nothing
+/// more in either case.
+fn maybe_post_repair_complete_summary(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+) -> Option<String> {
+    let (announced_for, _, completed_for) = repair_track(item);
+    let announced = announced_for?;
+    if completed_for.as_deref() == Some(announced.as_str()) {
+        return None;
+    }
+    // Latest repair-run outcome after the last dispatch marker, if any.
+    let excerpt = mcp
+        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|comments| {
+            let last_dispatch = comments
+                .iter()
+                .rposition(|c| c.body.starts_with(CODERABBIT_REPAIR_MARKER))?;
+            comments[last_dispatch..].iter().rev().find_map(|c| {
+                c.body
+                    .strip_prefix(crate::dispatch_failure_ceiling::WORK_SUCCESS_MARKER)
+                    .map(|rest| {
+                        rest.trim()
+                            .lines()
+                            .take(20)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                            .chars()
+                            .take(1200)
+                            .collect::<String>()
+                    })
+            })
+        })
+        .filter(|text| !text.trim().is_empty());
+    let body = match &excerpt {
+        Some(text) => format!(
+            "{CODERABBIT_REPAIR_COMPLETE_MARKER}\n\nAll CodeRabbit findings are resolved. \
+             What the repair run reported:\n\n{text}"
+        ),
+        None => format!(
+            "{CODERABBIT_REPAIR_COMPLETE_MARKER}\n\nAll CodeRabbit findings are resolved \
+             (no repair-run summary on record — likely fixed by a manual push)."
+        ),
+    };
+    let _ = mcp.comment_impl(CommentRequest {
+        action: "create".into(),
+        item_id: Some(item.id.clone()),
+        body: Some(body),
+        ..Default::default()
+    });
+    persist_repair_track(mcp, &item.id, None, false, Some(&announced));
+    excerpt
+}
+
 /// Login prefix every known CodeRabbit bot account posts review comments
 /// under (`coderabbitai[bot]` today) -- matched as a prefix rather than an
 /// exact string so a renamed/enterprise variant of the same bot isn't
@@ -1386,7 +1548,8 @@ fn merge_or_repair_findings(
             folder_path,
         ));
     }
-    clear_stale_coderabbit_repair_label(folder_path, number, labels);
+    let summary = maybe_post_repair_complete_summary(mcp, item);
+    clear_stale_coderabbit_repair_label(folder_path, number, labels, summary.as_deref());
     if merge_if_approved(mcp, item, repo_root, number, labels) {
         PassingPrOutcome::Merged
     } else {
@@ -1870,14 +2033,25 @@ fn fetch_unresolved_coderabbit_comments(
 /// own empty-findings branch and `merge_or_repair_findings`'s, so a PR
 /// heading straight to `merge_if_approved` doesn't skip the same cleanup.
 /// Only touches GitHub when the label is actually still there.
-fn clear_stale_coderabbit_repair_label(folder_path: &str, pr_number: u64, labels: &[String]) {
+fn clear_stale_coderabbit_repair_label(
+    folder_path: &str,
+    pr_number: u64,
+    labels: &[String],
+    summary: Option<&str>,
+) {
     if labels.iter().any(|l| l == CODERABBIT_REPAIR_PR_LABEL) {
+        let mut message =
+            "## supervisor — CodeRabbit review clear\n\nNo unresolved findings remain.".to_string();
+        if let Some(text) = summary.filter(|s| !s.trim().is_empty()) {
+            message.push_str("\n\nRepair summary:\n");
+            message.push_str(&text.chars().take(600).collect::<String>());
+        }
         update_pr_stage(
             folder_path,
             pr_number,
             Some(CODERABBIT_REPAIR_PR_LABEL),
             IN_REVIEW_PR_LABEL,
-            "## supervisor — CodeRabbit review clear\n\nNo unresolved findings remain.",
+            &message,
         );
     }
 }
@@ -1900,11 +2074,14 @@ fn coderabbit_repair_or_gate(
     }
 
     if findings.is_empty() {
-        clear_stale_coderabbit_repair_label(folder_path, pr_number, labels);
+        let summary = maybe_post_repair_complete_summary(mcp, item);
+        clear_stale_coderabbit_repair_label(folder_path, pr_number, labels, summary.as_deref());
         return SelfRepairOutcome::Skipped;
     }
 
-    let prior_attempts = mcp
+    let (announced_for, silent_attempts, _) = repair_track(item);
+    let fingerprint = coderabbit_findings_fingerprint(findings);
+    let prior_markers = mcp
         .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
         .ok()
         .and_then(Result::ok)
@@ -1915,6 +2092,9 @@ fn coderabbit_repair_or_gate(
                 .count() as u32
         })
         .unwrap_or(0);
+    // Marker comments (announced dispatches) + the silent-dispatch counter =
+    // every dispatch so far; retries without a new post still count.
+    let prior_attempts = prior_markers + silent_attempts;
 
     if prior_attempts >= crate::quota::decide::SELF_REPAIR_CAP {
         let cap_message = format!(
@@ -2032,6 +2212,24 @@ fn coderabbit_repair_or_gate(
     let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), Some(&reason)) else {
         return SelfRepairOutcome::Skipped;
     };
+    if announced_for.as_deref() == Some(fingerprint.as_str()) {
+        // Same findings already announced — re-dispatch the retry silently
+        // instead of posting the identical announcement again.
+        persist_repair_track(mcp, &item.id, None, true, None);
+        // The PR stage label may have been reverted out-of-band; ensure it
+        // without commenting (empty comment = label bookkeeping only).
+        if !labels.iter().any(|l| l == CODERABBIT_REPAIR_PR_LABEL) {
+            update_pr_stage(
+                folder_path,
+                pr_number,
+                stale_stage_label(labels),
+                CODERABBIT_REPAIR_PR_LABEL,
+                "",
+            );
+        }
+        return SelfRepairOutcome::Dispatched;
+    }
+    persist_repair_track(mcp, &item.id, Some(&fingerprint), false, None);
     let dispatch_message = format!(
         "{CODERABBIT_REPAIR_MARKER}\n\nCodeRabbit left {} unresolved finding(s) on this PR:\n\n\
          {}{overflow_line}\n\nPlease address them and push a fix.\n\njob: {}",
@@ -2127,3 +2325,7 @@ fn claim_self_repair(
 #[cfg(test)]
 #[path = "supervisor_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "supervisor_coderabbit_tests.rs"]
+mod coderabbit_tests;
