@@ -816,11 +816,20 @@ fn execute_work_impl(
         release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
         crate::ui::error(&msg);
         let _ = writeln!(log, "{msg}");
+        // Transient registration/lock races (teardown still in flight) must
+        // NOT fail terminal: terminal failures auto-redispatch a fresh job on
+        // the next tick, which re-hits the same half-torn-down admin state
+        // every ~12s with zero progress (item #633). Retry the same job with
+        // a delay instead so teardown finishes; structural failures stay
+        // fatal (item #467).
+        let retryable = claim["worktree_error"]
+            .as_str()
+            .is_some_and(flare_git_core::worktree::is_retryable_worktree_race);
         // Structural failure (item #467): fail straight to terminal instead of retrying.
         return WorkOutcome {
             exit_code: 1,
-            retry_after_secs: None,
-            fatal: true,
+            retry_after_secs: retryable.then_some(60),
+            fatal: !retryable,
         };
     };
     let _ = writeln!(log, "worktree: {}", wpath.display());

@@ -134,16 +134,16 @@ fn test_item_stub() -> agentflare_backend::item::Item {
     }
 }
 
-fn test_mcp() -> AgentflareMcp {
+pub(crate) fn test_mcp() -> AgentflareMcp {
     AgentflareMcp::for_test_memory()
 }
 
-fn test_queue() -> agentflare_jobs::Queue {
+pub(crate) fn test_queue() -> agentflare_jobs::Queue {
     let dir = tempfile::tempdir().unwrap().keep();
     agentflare_jobs::Queue::open_memory(dir.join("logs")).unwrap()
 }
 
-fn test_auth_conn() -> rusqlite::Connection {
+pub(crate) fn test_auth_conn() -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     crate::auth_db::migrate(&conn).unwrap();
     conn
@@ -847,7 +847,7 @@ fn test_mcp_with_repo(repo_root: std::path::PathBuf) -> AgentflareMcp {
 /// already covered by `mcp_server::tests`. The claim is backdated by
 /// `claim_age_secs` so tests can seed either a fresh (still-live) claim or
 /// one already past its #108-capped in_review TTL (item #114).
-fn seed_in_review_item_with_claim_age(
+pub(crate) fn seed_in_review_item_with_claim_age(
     mcp: &AgentflareMcp,
     assignee: Option<&str>,
     claim_age_secs: i64,
@@ -1011,7 +1011,7 @@ fn run_discovery_tick_dispatches_ready_items_from_every_registered_project_not_j
     );
 }
 
-fn seed_gate_label(mcp: &AgentflareMcp) -> std::collections::HashMap<String, String> {
+pub(crate) fn seed_gate_label(mcp: &AgentflareMcp) -> std::collections::HashMap<String, String> {
     mcp.with_backend_db(|conn| {
         let project = mcp.resolve_project(conn).unwrap();
         let _ = agentflare_backend::label::create(
@@ -1947,7 +1947,7 @@ fn stale_stage_label_is_none_when_neither_stage_label_is_present() {
 
 // --- coderabbit_repair_or_gate (item #273) ---
 
-fn coderabbit_finding(id: u64, login: &str) -> crate::github::models::ReviewComment {
+pub(crate) fn coderabbit_finding(id: u64, login: &str) -> crate::github::models::ReviewComment {
     crate::github::models::ReviewComment {
         id,
         user: crate::github::models::User {

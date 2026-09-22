@@ -1437,9 +1437,23 @@ impl AgentflareMcp {
                         owner: holder,
                         age_secs,
                     } => {
+                        // Name the caller too: when holder IS the caller's own
+                        // job (same agent, different instance) this is owner
+                        // identity drift, not a cross-agent conflict — the two
+                        // look identical without both sides visible (item #633
+                        // attempt #5 tripped over its own claim).
+                        let drift_hint =
+                            if agentflare_backend::item::agent_part(&holder)
+                                == agentflare_backend::item::agent_part(&owner)
+                            {
+                                "; same agent, different instance — owner identity drift? \
+                                 check AGENTFLARE_CLAIM_OWNER/with_owner_override continuity"
+                            } else {
+                                ""
+                            };
                         return Err(ErrorData::invalid_params(
                             format!(
-                                "item {item_id} is claimed by '{holder}' (active {age_secs}s ago) -- refusing to complete someone else's live claim"
+                                "item {item_id} is claimed by '{holder}' (active {age_secs}s ago) -- refusing to complete someone else's live claim (caller '{owner}'{drift_hint})"
                             ),
                             None,
                         ));
