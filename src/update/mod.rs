@@ -89,12 +89,16 @@ pub fn run(version: Option<String>, check_only: bool, quiet: bool) {
             std::process::exit(1);
         }
         // Never claim success on the swap's say-so: compare what is on disk
-        // (item #624/#627 -- the same check `dev-install` performs).
+        // (item #624/#627 -- the same check `dev-install` performs). The swap
+        // itself already succeeded, so `current` now holds unverified bytes,
+        // not the old binary -- `describe_holders()` (a locked-file
+        // diagnostic) does not apply here.
         Err(swap::InstallError::Verify(e)) => {
             eprintln!(
-                "update FAILED, {} was not updated: {e}\n{}",
-                current.display(),
-                swap::describe_holders()
+                "update installed a binary at {} but could not verify it matches the \
+                 downloaded release: {e}\nthis binary may be corrupted; re-run `agentflare \
+                 update` or reinstall manually before trusting it",
+                current.display()
             );
             std::process::exit(1);
         }

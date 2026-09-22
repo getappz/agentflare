@@ -110,11 +110,15 @@ pub fn run(release: bool, dry_run: bool) {
             std::process::exit(1);
         }
         // Never claim success on the swap's say-so: compare what is on disk.
+        // The swap itself already succeeded, so `target` now holds unverified
+        // bytes, not the old binary -- `describe_holders()` (a locked-file
+        // diagnostic) does not apply here.
         Err(crate::update::swap::InstallError::Verify(e)) => {
             crate::ui::error(&format!(
-                "install FAILED, {} was not updated: {e}\n{}",
-                target.display(),
-                crate::update::swap::describe_holders()
+                "installed a binary at {} but could not verify it matches the build: {e}\n\
+                 this binary may be corrupted; re-run `dev-install` or reinstall manually \
+                 before trusting it",
+                target.display()
             ));
             std::process::exit(1);
         }
