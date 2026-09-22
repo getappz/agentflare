@@ -458,8 +458,7 @@ fn compute_filter_signals(
 /// explicitly set on `req` (`unassigned`/`blocked`/`has_comments`/
 /// `stale_claim`/`unestimated`, each optional and combinable via AND).
 fn matches_filter_signals(signals: &FilterSignals, req: &ItemRequest) -> bool {
-    req.unassigned
-        .is_none_or(|want| signals.unassigned == want)
+    req.unassigned.is_none_or(|want| signals.unassigned == want)
         && req.blocked.is_none_or(|want| signals.blocked == want)
         && req
             .has_comments
@@ -1808,8 +1807,14 @@ impl AgentflareMcp {
             // filtered set here is already the final returned set — safe to
             // run the full annotation pass (including near-duplicates)
             // directly on it, same as `list` does for its own final page.
-            let mut annotations_by_id =
-                compute_annotations(conn, &items, &state_by_id, now, stale_cutoff, claim_ttl_secs)?;
+            let mut annotations_by_id = compute_annotations(
+                conn,
+                &items,
+                &state_by_id,
+                now,
+                stale_cutoff,
+                claim_ttl_secs,
+            )?;
             let summaries: Vec<ItemSummary> = items
                 .into_iter()
                 .map(|i| {
