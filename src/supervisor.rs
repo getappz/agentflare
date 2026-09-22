@@ -644,11 +644,37 @@ fn dispatch_item(
         // card (`notify_pr_approval_gate`) checks for the same item later in
         // its life, silently suppressing that card for every auto-gated item.
         if status == "none" && first_time_gated(&format!("plan:{}", item.id)) {
-            notify_human_gate(
-                item,
-                "auto-gated: needs a plan — call item(action=\"submit_plan\", plan_asset_id=...) \
-                 before this item can be dispatched",
-            );
+            let reason = "auto-gated: needs a plan — call item(action=\"submit_plan\", \
+                           plan_asset_id=...) before this item can be dispatched";
+            notify_human_gate(item, reason);
+            // `notify_human_gate` above is a best-effort, opt-in Telegram ping
+            // (no-ops entirely without a configured chat id) -- unlike
+            // `skip_item`'s "no assignee_agent" case, nothing wrote *why* this
+            // item is stuck into its own comment thread, so a human who isn't
+            // watching Telegram (or wasn't configured at all) sees only a
+            // silent item and the daemon's own stderr. Deliberately does NOT
+            // touch labels the way `record_supervisor_action` does -- this
+            // item keeps `ready-for-work` by design (see `WaitingOnPlan`'s
+            // doc comment) so the very next tick re-checks it once approved.
+            let outcome = mcp.with_backend_db(|conn| {
+                agentflare_backend::comment::create(
+                    conn,
+                    &item.id,
+                    &crate::claims::owner_id(),
+                    &format!("## supervisor — waiting on plan\n\n{reason}"),
+                )
+            });
+            let comment_err = match outcome {
+                Ok(Ok(_)) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(e) => Some(e.to_string()),
+            };
+            if let Some(e) = comment_err {
+                eprintln!(
+                    "agentflare-supervisor: failed to record plan-gate comment on item #{} ({}): {e}",
+                    item.sequence_id, item.id
+                );
+            }
         }
         return DispatchOutcome::WaitingOnPlan;
     }

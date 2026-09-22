@@ -156,6 +156,58 @@ fn default_plan_gate_patch(priority: &str, metadata_str: &str) -> Option<String>
     ))
 }
 
+/// Whether `metadata_str` already carries evidence that a plan was submitted
+/// for this call: a `plan_status` (survives only when it was already present
+/// on the item before this call, since `strip_plan_transition_fields` always
+/// removes a caller-supplied one), or a `plan_asset_id` -- either inline in
+/// `metadata_str` itself (not stripped, unlike the transition fields) or
+/// passed via `plan_asset_id_field` (the request's own top-level field,
+/// mirroring what `item_submit_plan` reads).
+fn plan_already_submitted(metadata_str: &str, plan_asset_id_field: Option<&str>) -> bool {
+    if plan_asset_id_field.is_some_and(|s| !s.trim().is_empty()) {
+        return true;
+    }
+    let gate = agentflare_backend::item::plan_gate::read_plan_gate(metadata_str);
+    gate.plan_status.is_some() || gate.plan_asset_id.is_some()
+}
+
+/// Refuses to let `create`/`update` write a `metadata_str` that gates the
+/// item (`plan_required: true` or a non-empty `plan_approver`) while leaving
+/// it permanently unclaimable -- no `assignee_agent` to auto-dispatch it, and
+/// no plan for a human to review yet either (item #628 live incident,
+/// 2026-09-22: filed exactly this combination, sat inert for ~40 minutes
+/// with the daemon logging a plan-gate skip every tick and no agent ever able
+/// to pick it up). `default_plan_gate_patch`'s normal flow -- gate at
+/// creation with an assignee, no plan yet, written later by whoever claims it
+/// (#595, #610) -- is unaffected: this only rejects when BOTH the assignee
+/// and the plan are missing.
+fn validate_plan_gate_claimable(
+    metadata_str: &str,
+    assignee_agent: Option<&str>,
+    plan_asset_id_field: Option<&str>,
+) -> Result<(), ErrorData> {
+    let gate = agentflare_backend::item::plan_gate::read_plan_gate(metadata_str);
+    let gating = gate.plan_required
+        || gate
+            .plan_approver
+            .as_deref()
+            .is_some_and(|a| !a.trim().is_empty());
+    if !gating {
+        return Ok(());
+    }
+    if assignee_agent.is_some_and(|a| !a.trim().is_empty()) {
+        return Ok(());
+    }
+    if plan_already_submitted(metadata_str, plan_asset_id_field) {
+        return Ok(());
+    }
+    Err(ErrorData::invalid_params(
+        "plan_required with no assignee_agent and no plan is permanently unclaimable — set \
+         assignee_agent, or submit_plan in the same call, or drop plan_required",
+        None,
+    ))
+}
+
 /// Which route reached `set_plan_status`, and therefore whether the
 /// human-approver check applies (item #573 final review).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -522,6 +574,13 @@ impl AgentflareMcp {
                 Some(patched) => Some(patched),
                 None => metadata_str,
             };
+            if let Some(m) = &metadata {
+                validate_plan_gate_claimable(
+                    m,
+                    req.assignee_agent.as_deref(),
+                    req.plan_asset_id.as_deref(),
+                )?;
+            }
             let input = agentflare_backend::item::CreateItem {
                 project_id: project.id,
                 state_id,
@@ -695,6 +754,19 @@ impl AgentflareMcp {
                 }
                 None => metadata_str,
             };
+            if let Some(m) = &metadata {
+                let effective_assignee = match req.assignee_agent.as_deref() {
+                    Some(a) => Some(a.to_string()),
+                    None => agentflare_backend::item::get(conn, &id)
+                        .ok()
+                        .and_then(|i| i.assignee_agent),
+                };
+                validate_plan_gate_claimable(
+                    m,
+                    effective_assignee.as_deref(),
+                    req.plan_asset_id.as_deref(),
+                )?;
+            }
             let input = agentflare_backend::item::UpdateItem {
                 name: req.name,
                 description: req.description,
