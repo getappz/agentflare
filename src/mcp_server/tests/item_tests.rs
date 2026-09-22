@@ -2688,3 +2688,101 @@ fn item_groom_flags_has_comments_and_stale_claim() {
     assert_eq!(entry["has_comments"], true);
     assert_eq!(entry["stale_claim"], true);
 }
+
+/// Structural filtering must still run over the whole candidate set (not
+/// just the returned page) -- a fix-round regression guard for the
+/// filter-signals/full-annotations split: filtering is cheap and must stay
+/// pre-pagination, only the expensive display-only annotations move to
+/// post-pagination.
+#[test]
+fn item_list_filters_before_pagination_across_a_multi_page_result() {
+    let (_tmp, s) = harness();
+    // Three assigned "noise" items sort first (see below), then one
+    // unassigned target -- with limit=1 a naive "filter the first page"
+    // implementation would page past the target before the unassigned
+    // filter ever saw it.
+    for n in 1..=3 {
+        s.item(Parameters(ItemRequest {
+            action: "create".into(),
+            name: Some(format!("Noise{n}")),
+            assignee_agent: Some("agent-noise".into()),
+            ..Default::default()
+        }))
+        .unwrap();
+    }
+    let target: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Target"))).unwrap()).unwrap();
+
+    let listed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "list".into(),
+            unassigned: Some(true),
+            limit: Some(1),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let items = listed["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], target["id"]);
+    assert_eq!(listed["total"], 1);
+}
+
+/// `possible_duplicates` is a display-only annotation (it doesn't gate any
+/// structural filter) -- computing it is O(n^2) over whatever set it's
+/// given, so a fix round scoped it to just the returned page instead of the
+/// whole filtered backlog (mirroring `groom`'s existing shortlist-scoped
+/// duplicate detection). With `limit=2` and three near-identical names, the
+/// third item never reaches page-annotation computation, so it must not
+/// show up in the first two items' `possible_duplicates`.
+#[test]
+fn item_list_scopes_possible_duplicates_to_the_returned_page() {
+    let (_tmp, s) = harness();
+    let a: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(empty_item_create("Widget Alpha Duplicate")))
+            .unwrap(),
+    )
+    .unwrap();
+    let b: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(empty_item_create("Widget Beta Duplicate")))
+            .unwrap(),
+    )
+    .unwrap();
+    let c: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(empty_item_create("Widget Gamma Duplicate")))
+            .unwrap(),
+    )
+    .unwrap();
+
+    let listed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "list".into(),
+            limit: Some(2),
+            offset: Some(0),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let items = listed["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let page_ids: Vec<&str> = items.iter().map(|i| i["id"].as_str().unwrap()).collect();
+    assert!(page_ids.contains(&a["id"].as_str().unwrap()));
+    assert!(page_ids.contains(&b["id"].as_str().unwrap()));
+    assert!(!page_ids.contains(&c["id"].as_str().unwrap()));
+
+    for item in items {
+        let dups: Vec<&str> = item["possible_duplicates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            !dups.contains(&c["id"].as_str().unwrap()),
+            "off-page item {} leaked into possible_duplicates: {dups:?}",
+            c["id"]
+        );
+    }
+}

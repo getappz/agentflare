@@ -402,24 +402,74 @@ fn compute_annotations(
         .collect())
 }
 
-/// Whether `annotations` satisfies every structural filter the caller
+/// Cheap decision-support signals needed only to evaluate the structural
+/// filters (`unassigned`/`blocked`/`has_comments`/`stale_claim`/
+/// `unestimated`) -- a lean subset of `ItemAnnotations` computed once over
+/// the *whole* filtered candidate set via the same handful of batched
+/// queries `compute_annotations` uses (dependency edges, comment counts,
+/// claim staleness), but skipping its O(n^2) `near_duplicates` pass and the
+/// fan-in/confirmed-duplicate queries -- those are display-only and don't
+/// gate any filter, so `list`/`search` only pay for them on the final
+/// returned page via `compute_annotations`, not the whole backlog.
+struct FilterSignals {
+    unassigned: bool,
+    blocked: bool,
+    has_comments: bool,
+    stale_claim: bool,
+    unestimated: bool,
+}
+
+fn compute_filter_signals(
+    conn: &Connection,
+    items: &[agentflare_backend::item::Item],
+    now: i64,
+    claim_ttl_secs: i64,
+) -> Result<std::collections::HashMap<String, FilterSignals>, ErrorData> {
+    let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+    let edges = agentflare_backend::item::dependency_edges_for_items(conn, &ids)
+        .map_err(map_backend_err)?;
+    let blocked_by = blocked_by_map(&edges);
+    let comment_counts =
+        agentflare_backend::comment::count_by_items(conn, &ids).map_err(map_backend_err)?;
+    let stale_claims: std::collections::HashSet<String> =
+        agentflare_backend::claim::list_all(conn, now, claim_ttl_secs)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            .into_iter()
+            .filter(|c| c.stale && c.key.len() == 1)
+            .filter_map(|c| c.key.into_iter().next())
+            .collect();
+
+    Ok(items
+        .iter()
+        .map(|i| {
+            let signals = FilterSignals {
+                unassigned: i.assignee_agent.is_none(),
+                blocked: blocked_by.get(&i.id).is_some_and(|deps| !deps.is_empty()),
+                has_comments: comment_counts.get(&i.id).is_some_and(|&c| c > 0),
+                stale_claim: stale_claims.contains(&i.id),
+                unestimated: parsed_size(&i.metadata).is_none(),
+            };
+            (i.id.clone(), signals)
+        })
+        .collect())
+}
+
+/// Whether `signals` satisfies every structural filter the caller
 /// explicitly set on `req` (`unassigned`/`blocked`/`has_comments`/
 /// `stale_claim`/`unestimated`, each optional and combinable via AND).
-fn matches_structural_filters(annotations: &ItemAnnotations, req: &ItemRequest) -> bool {
+fn matches_filter_signals(signals: &FilterSignals, req: &ItemRequest) -> bool {
     req.unassigned
-        .is_none_or(|want| annotations.unassigned == want)
-        && req
-            .blocked
-            .is_none_or(|want| !annotations.blocked_by.is_empty() == want)
+        .is_none_or(|want| signals.unassigned == want)
+        && req.blocked.is_none_or(|want| signals.blocked == want)
         && req
             .has_comments
-            .is_none_or(|want| annotations.has_comments == want)
+            .is_none_or(|want| signals.has_comments == want)
         && req
             .stale_claim
-            .is_none_or(|want| annotations.stale_claim == want)
+            .is_none_or(|want| signals.stale_claim == want)
         && req
             .unestimated
-            .is_none_or(|want| annotations.unestimated == want)
+            .is_none_or(|want| signals.unestimated == want)
 }
 
 fn to_standup_item(i: &agentflare_backend::item::Item) -> StandupItem {
@@ -745,11 +795,13 @@ impl AgentflareMcp {
             }
 
             // Structural filters (unassigned/blocked/has_comments/stale_claim/
-            // unestimated) need the same annotations `groom` computes, so they
-            // run before pagination — filtering after paging would silently
-            // return a short page. `compute_annotations` batches its lookups
-            // over the whole (state_group/assignee-filtered) set in a handful
-            // of queries, not one per item.
+            // unestimated) need to run before pagination — filtering after
+            // paging would silently return a short page. `compute_filter_signals`
+            // batches its lookups over the whole (state_group/assignee-filtered)
+            // set in a handful of queries, not one per item, and deliberately
+            // skips the expensive display-only annotations (near-duplicates is
+            // O(n^2)) that don't gate any filter — those are computed below,
+            // only for the page actually being returned.
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -761,18 +813,11 @@ impl AgentflareMcp {
                     .max(0)
                     .saturating_mul(86_400);
             let claim_ttl_secs = backend_claim_ttl_secs();
-            let mut annotations_by_id = compute_annotations(
-                conn,
-                &items,
-                &state_by_id,
-                now,
-                stale_cutoff,
-                claim_ttl_secs,
-            )?;
+            let filter_signals = compute_filter_signals(conn, &items, now, claim_ttl_secs)?;
             items.retain(|i| {
-                annotations_by_id
+                filter_signals
                     .get(&i.id)
-                    .is_some_and(|a| matches_structural_filters(a, &req))
+                    .is_some_and(|s| matches_filter_signals(s, &req))
             });
 
             let total = items.len();
@@ -782,6 +827,12 @@ impl AgentflareMcp {
                 .unwrap_or(DEFAULT_LIST_LIMIT)
                 .clamp(0, MAX_LIST_LIMIT) as usize;
             let page: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
+
+            // Only the returned page pays for the full annotation pass
+            // (near-duplicates, fan-in, confirmed-duplicate) — bounded by
+            // `MAX_LIST_LIMIT`, not the size of the filtered backlog.
+            let mut annotations_by_id =
+                compute_annotations(conn, &page, &state_by_id, now, stale_cutoff, claim_ttl_secs)?;
 
             let summaries: Vec<ItemSummary> = page
                 .into_iter()
@@ -1745,20 +1796,20 @@ impl AgentflareMcp {
                     .max(0)
                     .saturating_mul(86_400);
             let claim_ttl_secs = backend_claim_ttl_secs();
-            let mut annotations_by_id = compute_annotations(
-                conn,
-                &items,
-                &state_by_id,
-                now,
-                stale_cutoff,
-                claim_ttl_secs,
-            )?;
-
+            let filter_signals = compute_filter_signals(conn, &items, now, claim_ttl_secs)?;
             items.retain(|i| {
-                annotations_by_id
+                filter_signals
                     .get(&i.id)
-                    .is_some_and(|a| matches_structural_filters(a, &req))
+                    .is_some_and(|s| matches_filter_signals(s, &req))
             });
+
+            // `search` has no further pagination beyond its own DB-level
+            // `limit` (already applied above `items` was fetched), so the
+            // filtered set here is already the final returned set — safe to
+            // run the full annotation pass (including near-duplicates)
+            // directly on it, same as `list` does for its own final page.
+            let mut annotations_by_id =
+                compute_annotations(conn, &items, &state_by_id, now, stale_cutoff, claim_ttl_secs)?;
             let summaries: Vec<ItemSummary> = items
                 .into_iter()
                 .map(|i| {
