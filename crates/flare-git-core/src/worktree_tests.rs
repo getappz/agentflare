@@ -1403,3 +1403,52 @@ fn push_branch_rebases_onto_the_latest_target_before_pushing() {
         "the pushed branch must be based on the target's latest commit, not the stale one it started from"
     );
 }
+
+#[test]
+fn retryable_worktree_race_matches_transient_registration_and_lock_errors() {
+    // Item #633's observed failures: attempts #3/#4 died on
+    // "missing but already registered".
+    assert!(is_retryable_worktree_race(
+        "Preparing worktree (checking out 'task/631-foo'); fatal: \
+         '.../.worktrees/task/631' is a missing but already registered worktree; \
+         use 'add -f' to override, or 'prune' or 'remove' to clear"
+    ));
+    assert!(is_retryable_worktree_race(
+        "could not lock config file .git/config: File exists"
+    ));
+    assert!(is_retryable_worktree_race(
+        "fatal: Unable to lock 'refs/heads/task/1' already locked"
+    ));
+    assert!(!is_retryable_worktree_race(
+        "fatal: a branch named 'task/1' already exists"
+    ));
+    assert!(!is_retryable_worktree_race("not a git repository"));
+    assert!(!is_retryable_worktree_race(""));
+}
+
+#[test]
+fn create_worktree_refuses_to_recreate_over_a_dirty_checkout() {
+    // Item #633 ask 4: a retry must fail loudly rather than clobber
+    // uncommitted work — #631's rescue was manual.
+    let repo = init_repo();
+    let item = test_item(1);
+    let target = resolve_default_branch(&repo.path);
+    let worktree_path = create_worktree(&item, &repo.path, &target, None).unwrap();
+    // Occupy the path with a DIFFERENT branch holding uncommitted work, so
+    // the re-claim path (not the early-return reuse path) is exercised.
+    // Must NOT match task/<id>[-slug]: resolve_worktree_branch treats such
+    // a checkout as a valid reuse and returns Ok early.
+    run_git_in(&worktree_path, &["checkout", "-b", "other-branch"]).unwrap();
+    std::fs::write(worktree_path.join("uncommitted.txt"), b"wip").unwrap();
+    let renamed = test_item_named(1, "a completely different title");
+    let err = create_worktree(&renamed, &repo.path, &target, None)
+        .expect_err("must refuse rather than clobber dirty work");
+    assert!(
+        err.contains("refusing to recreate over dirty worktree"),
+        "must name the refusal explicitly: {err}"
+    );
+    assert!(
+        worktree_path.join("uncommitted.txt").exists(),
+        "dirty work must be preserved"
+    );
+}

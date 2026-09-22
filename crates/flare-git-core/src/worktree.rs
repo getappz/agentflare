@@ -30,6 +30,24 @@ pub trait Progress {
 /// `create_worktree` below.
 static WORKTREE_ADD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// True when a `git worktree add` failure looks transient — a registration/
+/// lock race with teardown/cleanup still in flight — rather than structural.
+///
+/// Matched case-insensitively against the subprocess error text. Callers use
+/// this to retry the same job with a delay (intra-job `retry_after_secs`)
+/// instead of failing terminal and churning through rapid-fire redispatches
+/// of fresh jobs that all hit the same half-torn-down admin state (item #633).
+#[must_use]
+pub fn is_retryable_worktree_race(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("missing but already registered")
+        || e.contains("already registered")
+        || e.contains("could not lock")
+        || e.contains("unable to lock")
+        || e.contains("already locked")
+        || (e.contains("worktree add") && e.contains("already exists"))
+}
+
 pub fn resolve_target_branch(conn: &rusqlite::Connection, item: &Item, repo_root: &Path) -> String {
     if let Some(ref parent_id) = item.parent_id
         && let Ok(parent) = agentflare_backend::item::get(conn, parent_id)
@@ -378,6 +396,24 @@ pub fn create_worktree(
         isolate_worktree_target_dir(&worktree_path);
         return Ok(worktree_path);
     }
+    // Never silently proceed over an existing checkout holding uncommitted
+    // work: a retry racing a half-torn-down worktree must fail loudly rather
+    // than clobber it (item #633 ask 4 — #631's rescue was manual).
+    if worktree_path.is_dir() && !worktree_already_checked_out(&worktree_path, &branch) {
+        let dirty = run_git_in(worktree_path.as_path(), &["status", "--porcelain"])
+            .map(|out| !out.trim().is_empty())
+            .unwrap_or(false);
+        if dirty {
+            let msg = format!(
+                "worktree: refusing to recreate over dirty worktree at {} for item {} \
+                 (uncommitted changes preserved; clear or commit them before retrying)",
+                worktree_path.display(),
+                item.id
+            );
+            eprintln!("{msg}");
+            return Err(msg);
+        }
+    }
     ensure_worktrees_ignored(repo_root);
     if let Some(parent) = worktree_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -445,8 +481,11 @@ pub fn create_worktree(
         // retry into another item's data loss: the victim's `.git` pointer
         // became dangling, `audit_orphans` then classified it as a broken-
         // gitdir orphan, and `gc_orphans` deleted it. Scope the cleanup to
-        // this branch's own stale registration instead.
+        // this branch's own stale registration instead. Also clear by path:
+        // a stale entry can point at our path under an old ref even when the
+        // branch lookup above resolved differently (item #633).
         remove_stale_registration_for(repo_root, &branch);
+        remove_stale_registration_for_path(repo_root, &worktree_path);
         // Check it out as-is, no `-b` -- git auto-creates the local tracking
         // branch when only the remote-tracking ref exists, same as `git
         // checkout <branch>`.
@@ -511,31 +550,59 @@ pub fn create_worktree(
     let arg_refs: Vec<&str> = worktree_add_args.iter().map(String::as_str).collect();
     // `git worktree add` takes its own lock on `.git/config`/`.git/worktrees`
     // admin state; two calls against the same repo at the same instant race
-    // on that lock and the loser fails outright with no retry ("could not
-    // lock config file .git/config: File exists"). Serialize in-process so
-    // concurrent claims from the same daemon (e.g. two items dispatched in
-    // the same supervisor tick) queue instead of racing. Deliberately a
-    // separate lock from `with_backend_db`'s -- this is a subprocess call,
-    // not DB access, and item.rs already runs it outside that lock on
-    // purpose.
-    let git_result = {
-        let _guard = WORKTREE_ADD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        run_git_in(repo_root, &arg_refs)
-    };
-    match git_result {
-        Ok(_) => {
-            if let Some(p) = progress {
-                p.send(1.0, Some(1.0), Some("Worktree created".into()));
-            }
-            isolate_worktree_target_dir(&worktree_path);
-            Ok(worktree_path)
+    // on that lock and the loser fails outright ("could not lock config
+    // file .git/config: File exists"). Serialize in-process so concurrent
+    // claims from the same daemon (e.g. two items dispatched in the same
+    // supervisor tick) queue instead of racing. Deliberately a separate
+    // lock from `with_backend_db`'s -- this is a subprocess call, not DB
+    // access, and item.rs already runs it outside that lock on purpose.
+    //
+    // The in-process mutex cannot serialize across separate job processes, and
+    // a redispatch can fire while the previous attempt's teardown is still in
+    // flight — the registration and the directory disagree for a few seconds
+    // ("missing but already registered"). Retry retryable failures with a
+    // short backoff so teardown finishes instead of churning fresh dispatches
+    // every ~12s (item #633): same job waits, rather than terminal-failing
+    // into an immediate redispatch loop.
+    const ADD_ATTEMPTS: usize = 3;
+    const ADD_BACKOFF_SECS: [u64; 2] = [2, 5];
+    let mut last_err = String::new();
+    for attempt in 0..ADD_ATTEMPTS {
+        if attempt > 0 {
+            // Reconcile again before retrying: the first attempt's failure may
+            // have been the stale registration itself, now cleared.
+            remove_stale_registration_for(repo_root, &branch);
+            remove_stale_registration_for_path(repo_root, &worktree_path);
+            std::thread::sleep(std::time::Duration::from_secs(
+                ADD_BACKOFF_SECS[(attempt - 1).min(ADD_BACKOFF_SECS.len() - 1)],
+            ));
         }
-        Err(e) => {
-            let msg = format!("worktree: creation skipped for item {}: {}", item.id, e);
-            eprintln!("{msg}");
-            Err(msg)
+        let git_result = {
+            let _guard = WORKTREE_ADD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            run_git_in(repo_root, &arg_refs)
+        };
+        match git_result {
+            Ok(_) => {
+                if let Some(p) = progress {
+                    p.send(1.0, Some(1.0), Some("Worktree created".into()));
+                }
+                isolate_worktree_target_dir(&worktree_path);
+                return Ok(worktree_path);
+            }
+            Err(e) => {
+                last_err = e;
+                if !is_retryable_worktree_race(&last_err) {
+                    break;
+                }
+            }
         }
     }
+    let msg = format!(
+        "worktree: creation skipped for item {} after {ADD_ATTEMPTS} attempt(s): {}",
+        item.id, last_err
+    );
+    eprintln!("{msg}");
+    Err(msg)
 }
 
 /// Removes the stale `.git/worktrees/<name>` admin entry that claims
@@ -583,6 +650,56 @@ fn remove_stale_registration_for(repo_root: &Path, branch: &str) -> bool {
             .parent()
             .is_none_or(std::path::Path::exists);
         if still_live {
+            continue;
+        }
+        if std::fs::remove_dir_all(&admin).is_ok() {
+            removed = true;
+        }
+    }
+    removed
+}
+
+/// Removes the stale `.git/worktrees/<name>` admin entry pointing at
+/// `worktree_path`, if that directory is genuinely gone. Path-scoped
+/// companion to `remove_stale_registration_for` above: the branch-scoped
+/// cleaner cannot see a stale entry when the branch itself doesn't exist yet
+/// (brand-new-branch path) or still names an old ref, yet `git worktree add`
+/// still refuses with "missing but already registered" for that path.
+///
+/// Same fail-closed guards, scoped the other way: only entries whose `gitdir`
+/// parent resolves to exactly `worktree_path` are considered, and only when
+/// that directory is actually absent — verified twice with a short pause
+/// between checks so a teardown still in flight isn't mistaken for genuinely
+/// gone (item #633). Never touches a live directory.
+fn remove_stale_registration_for_path(repo_root: &Path, worktree_path: &Path) -> bool {
+    let Ok(common_dir) = run_git_in(repo_root, &["rev-parse", "--git-common-dir"]) else {
+        return false;
+    };
+    let admin_root = repo_root.join(common_dir.trim()).join("worktrees");
+    let Ok(entries) = std::fs::read_dir(&admin_root) else {
+        return false;
+    };
+    let mut removed = false;
+    for entry in entries.flatten() {
+        let admin = entry.path();
+        if !admin.is_dir() {
+            continue;
+        }
+        let gitdir = std::fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
+        let checkout = std::path::Path::new(gitdir.trim())
+            .parent()
+            .map(std::path::Path::to_path_buf);
+        let is_ours = checkout.as_deref() == Some(worktree_path);
+        if !is_ours {
+            continue;
+        }
+        // Double-check with a beat in between: teardown in flight can make a
+        // live directory look briefly absent.
+        if worktree_path.exists() {
+            continue;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if worktree_path.exists() {
             continue;
         }
         if std::fs::remove_dir_all(&admin).is_ok() {
