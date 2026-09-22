@@ -8,7 +8,6 @@
 
 mod cargo;
 
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -93,32 +92,32 @@ pub fn run(release: bool, dry_run: bool) {
         built.display(),
         target.display()
     ));
-    match crate::update::swap::replace_binary(&built, &target) {
-        Ok(crate::update::swap::SwapOutcome::Installed) => {}
+    match crate::update::swap::install_verified(&built, &target) {
+        Ok(crate::update::swap::InstallOutcome::Installed) => {}
         #[cfg(windows)]
-        Ok(crate::update::swap::SwapOutcome::Deferred { log }) => {
+        Ok(crate::update::swap::InstallOutcome::Deferred { log }) => {
             crate::ui::error(&format!(
                 "NOT installed: swap scheduled; it completes only when no process holds {}.\n\
                  result is logged to {}\n{}",
                 target.display(),
                 log.display(),
-                describe_holders()
+                crate::update::swap::describe_holders()
             ));
             std::process::exit(1);
         }
-        Err(e) => {
+        Err(crate::update::swap::InstallError::Swap(e)) => {
             crate::ui::error(&format!("error installing binary: {e}"));
             std::process::exit(1);
         }
-    }
-    // Never claim success on the swap's say-so: compare what is on disk.
-    if let Err(e) = verify_installed(&built, &target) {
-        crate::ui::error(&format!(
-            "install FAILED, {} was not updated: {e}\n{}",
-            target.display(),
-            describe_holders()
-        ));
-        std::process::exit(1);
+        // Never claim success on the swap's say-so: compare what is on disk.
+        Err(crate::update::swap::InstallError::Verify(e)) => {
+            crate::ui::error(&format!(
+                "install FAILED, {} was not updated: {e}\n{}",
+                target.display(),
+                crate::update::swap::describe_holders()
+            ));
+            std::process::exit(1);
+        }
     }
     crate::ui::success(&format!("installed to {}", target.display()));
     crate::ui::info("run `agentflare --version` to confirm");
@@ -126,52 +125,6 @@ pub fn run(release: bool, dry_run: bool) {
     if !install_shims(release, &target) {
         std::process::exit(1);
     }
-}
-
-/// Confirm `target` is byte-identical to `built` (size, then SHA-256).
-fn verify_installed(built: &Path, target: &Path) -> Result<(), String> {
-    let (built_size, built_hash) = digest(built)?;
-    let (target_size, target_hash) = digest(target)?;
-    if (built_size, &built_hash) == (target_size, &target_hash) {
-        return Ok(());
-    }
-    Err(format!(
-        "installed file is {target_size} bytes (sha256 {}), the build is {built_size} bytes \
-         (sha256 {})",
-        &target_hash[..12],
-        &built_hash[..12]
-    ))
-}
-
-/// `(size in bytes, hex SHA-256)` of the file at `path`.
-fn digest(path: &Path) -> Result<(u64, String), String> {
-    let mut file = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let size = std::io::copy(&mut file, &mut hasher)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    Ok((size, hex::encode(hasher.finalize())))
-}
-
-/// Which processes might be holding a file `dev-install` could not replace.
-fn describe_holders() -> String {
-    format_holders(&crate::update::swap::find_killable_pids())
-}
-
-fn format_holders(pids: &[u32]) -> String {
-    if pids.is_empty() {
-        return "no other agentflare process found; something else (antivirus, an indexer, \
-                a shell) may be holding the file"
-            .to_string();
-    }
-    let list = pids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "other agentflare processes still running (pid {list}); stop them (`agentflare daemon \
-         stop`) and re-run"
-    )
 }
 
 /// Build and place the PATH-shim binaries next to the freshly installed
@@ -220,7 +173,7 @@ fn install_shims(release: bool, target: &Path) -> bool {
             let _ = fs::remove_file(&staged);
             crate::ui::error(&format!(
                 "shim install FAILED: could not place {name} next to agentflare: {e}\n{}",
-                describe_holders()
+                crate::update::swap::describe_holders()
             ));
             return false;
         }
@@ -229,7 +182,7 @@ fn install_shims(release: bool, target: &Path) -> bool {
     if failed {
         crate::ui::error(&format!(
             "shim install FAILED: {summary}\n{}",
-            describe_holders()
+            crate::update::swap::describe_holders()
         ));
     } else {
         crate::ui::info(&summary);
@@ -379,32 +332,6 @@ mod tests {
         assert!(!same_file(&f, &other));
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn verify_installed_accepts_identical_and_rejects_any_difference() {
-        let dir = tempfile::tempdir().unwrap();
-        let built = dir.path().join("built");
-        let same = dir.path().join("same");
-        let shorter = dir.path().join("shorter");
-        let same_size = dir.path().join("same-size");
-        fs::write(&built, b"NEWCONTENT").unwrap();
-        fs::write(&same, b"NEWCONTENT").unwrap();
-        fs::write(&shorter, b"NEW").unwrap();
-        fs::write(&same_size, b"OLDCONTENT").unwrap();
-
-        assert!(verify_installed(&built, &same).is_ok());
-        // A stale install (the item 624 symptom) must be a failure, not a success.
-        let e = verify_installed(&built, &shorter).unwrap_err();
-        assert!(e.contains("3 bytes") && e.contains("10 bytes"), "got {e}");
-        assert!(verify_installed(&built, &same_size).is_err());
-        assert!(verify_installed(&built, &dir.path().join("missing")).is_err());
-    }
-
-    #[test]
-    fn format_holders_lists_pids_or_says_none_found() {
-        assert!(format_holders(&[7, 9]).contains("pid 7, 9"));
-        assert!(format_holders(&[]).contains("no other agentflare process"));
     }
 
     #[test]

@@ -72,10 +72,10 @@ pub fn run(version: Option<String>, check_only: bool, quiet: bool) {
     if !quiet {
         println!("replacing {}...", current.display());
     }
-    match swap::replace_binary(&new_binary, &current) {
-        Ok(swap::SwapOutcome::Installed) => {}
+    match swap::install_verified(&new_binary, &current) {
+        Ok(swap::InstallOutcome::Installed) => {}
         #[cfg(windows)]
-        Ok(swap::SwapOutcome::Deferred { log }) => {
+        Ok(swap::InstallOutcome::Deferred { log }) => {
             eprintln!(
                 "swap scheduled, not done: {} is locked; the update completes only when no \
                  process holds it (result is logged to {})",
@@ -84,8 +84,18 @@ pub fn run(version: Option<String>, check_only: bool, quiet: bool) {
             );
             std::process::exit(1);
         }
-        Err(e) => {
+        Err(swap::InstallError::Swap(e)) => {
             eprintln!("error replacing binary: {e}");
+            std::process::exit(1);
+        }
+        // Never claim success on the swap's say-so: compare what is on disk
+        // (item #624/#627 -- the same check `dev-install` performs).
+        Err(swap::InstallError::Verify(e)) => {
+            eprintln!(
+                "update FAILED, {} was not updated: {e}\n{}",
+                current.display(),
+                swap::describe_holders()
+            );
             std::process::exit(1);
         }
     }

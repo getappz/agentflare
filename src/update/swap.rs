@@ -18,6 +18,7 @@
 //! (item #127) calls it to install a freshly built binary over the installed
 //! one without disturbing a running server.
 
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// How [`replace_binary`] left `target`.
@@ -30,6 +31,45 @@ pub(crate) enum SwapOutcome {
     /// the old binary is still installed; the script appends its result to `log`.
     #[cfg(windows)]
     Deferred { log: PathBuf },
+}
+
+/// Outcome of [`install_verified`]. Same shape as [`SwapOutcome`], but
+/// `Installed` here means the swap *and* the byte-level verification both
+/// passed -- callers can report success on this alone.
+#[derive(Debug)]
+pub(crate) enum InstallOutcome {
+    Installed,
+    #[cfg(windows)]
+    Deferred {
+        log: PathBuf,
+    },
+}
+
+/// Why [`install_verified`] failed: at the swap step itself, or at the
+/// post-swap verification. Callers use this to word their error differently
+/// (a swap error and a "the install silently did nothing" error are not the
+/// same failure).
+pub(crate) enum InstallError {
+    Swap(String),
+    Verify(String),
+}
+
+/// [`replace_binary`], then confirm `target` actually ended up byte-identical
+/// to `new_binary`. Never claim success on the swap's say-so alone: compare
+/// what is on disk (item #624 -- a swap could report success, or pre-fix
+/// silently swap nothing, while the installed bytes didn't match the build).
+pub(crate) fn install_verified(
+    new_binary: &Path,
+    target: &Path,
+) -> Result<InstallOutcome, InstallError> {
+    match replace_binary(new_binary, target) {
+        Ok(SwapOutcome::Installed) => {}
+        #[cfg(windows)]
+        Ok(SwapOutcome::Deferred { log }) => return Ok(InstallOutcome::Deferred { log }),
+        Err(e) => return Err(InstallError::Swap(e)),
+    }
+    verify_installed(new_binary, target).map_err(InstallError::Verify)?;
+    Ok(InstallOutcome::Installed)
 }
 
 /// Replace the binary at `target` with `new_binary`.
@@ -46,6 +86,53 @@ pub(crate) fn replace_binary(new_binary: &Path, target: &Path) -> Result<SwapOut
     {
         unix_replace(new_binary, target)
     }
+}
+
+/// Confirm `target` is byte-identical to `built` (size, then SHA-256).
+pub(crate) fn verify_installed(built: &Path, target: &Path) -> Result<(), String> {
+    let (built_size, built_hash) = digest(built)?;
+    let (target_size, target_hash) = digest(target)?;
+    if (built_size, &built_hash) == (target_size, &target_hash) {
+        return Ok(());
+    }
+    Err(format!(
+        "installed file is {target_size} bytes (sha256 {}), the build is {built_size} bytes \
+         (sha256 {})",
+        &target_hash[..12],
+        &built_hash[..12]
+    ))
+}
+
+/// `(size in bytes, hex SHA-256)` of the file at `path`.
+fn digest(path: &Path) -> Result<(u64, String), String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let size = std::io::copy(&mut file, &mut hasher)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok((size, hex::encode(hasher.finalize())))
+}
+
+/// Which processes might be holding a file a swap could not replace.
+pub(crate) fn describe_holders() -> String {
+    format_holders(&find_killable_pids())
+}
+
+fn format_holders(pids: &[u32]) -> String {
+    if pids.is_empty() {
+        return "no other agentflare process found; something else (antivirus, an indexer, \
+                a shell) may be holding the file"
+            .to_string();
+    }
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "other agentflare processes still running (pid {list}); stop them (`agentflare daemon \
+         stop`) and re-run"
+    )
 }
 
 #[cfg(not(windows))]
@@ -396,6 +483,63 @@ mod tests {
         let name = a.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("agentflare."), "got {name}");
         assert!(name.ends_with(".old.exe"), "got {name}");
+    }
+
+    #[test]
+    fn verify_installed_accepts_identical_and_rejects_any_difference() {
+        let dir = tempfile::tempdir().unwrap();
+        let built = dir.path().join("built");
+        let same = dir.path().join("same");
+        let shorter = dir.path().join("shorter");
+        let same_size = dir.path().join("same-size");
+        std::fs::write(&built, b"NEWCONTENT").unwrap();
+        std::fs::write(&same, b"NEWCONTENT").unwrap();
+        std::fs::write(&shorter, b"NEW").unwrap();
+        std::fs::write(&same_size, b"OLDCONTENT").unwrap();
+
+        assert!(verify_installed(&built, &same).is_ok());
+        // A stale install (the item 624 symptom) must be a failure, not a success.
+        let e = verify_installed(&built, &shorter).unwrap_err();
+        assert!(e.contains("3 bytes") && e.contains("10 bytes"), "got {e}");
+        assert!(verify_installed(&built, &same_size).is_err());
+        assert!(verify_installed(&built, &dir.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn format_holders_lists_pids_or_says_none_found() {
+        assert!(format_holders(&[7, 9]).contains("pid 7, 9"));
+        assert!(format_holders(&[]).contains("no other agentflare process"));
+    }
+
+    // Regression coverage for the `update` half of item 624/627: this is the
+    // exact call `update::run` now makes on `Ok(SwapOutcome::Installed)`. The
+    // happy path lands verified bytes; a target that diverges afterward
+    // (the item-624 symptom of a swap claiming success while the installed
+    // bytes don't match) must be caught by the same check dev_install uses,
+    // not silently reported as installed.
+    #[test]
+    fn install_verified_verifies_the_swap_update_run_performs() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(if cfg!(windows) {
+            "agentflare.exe"
+        } else {
+            "agentflare"
+        });
+        let new = dir.path().join("new-binary");
+        std::fs::write(&target, b"OLD").unwrap();
+        std::fs::write(&new, b"NEWCONTENT").unwrap();
+
+        assert!(matches!(
+            install_verified(&new, &target),
+            Ok(InstallOutcome::Installed)
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"NEWCONTENT");
+
+        // A build whose installed bytes are made to differ afterward must be
+        // caught, not silently accepted as installed.
+        std::fs::write(&target, b"TAMPERED").unwrap();
+        let e = verify_installed(&new, &target).unwrap_err();
+        assert!(e.contains("8 bytes") && e.contains("10 bytes"), "got {e}");
     }
 
     #[cfg(windows)]
