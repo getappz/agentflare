@@ -908,11 +908,74 @@ pub(crate) struct ItemRequest {
     #[schemars(description = "Reason text (reject_plan)")]
     #[serde(default)]
     pub(crate) reason: Option<String>,
+    #[schemars(
+        description = "Structural filter (list, search): true = only unassigned items, false = only assigned items, omit = no filter. Combinable with blocked/has_comments/stale_claim/unestimated. Every returned row carries this and the other annotation flags regardless of whether the filter is set."
+    )]
+    #[serde(default)]
+    pub(crate) unassigned: Option<bool>,
+    #[schemars(
+        description = "Structural filter (list, search): true = only items with at least one open (non-completed/cancelled) dependency, false = only unblocked items, omit = no filter. Combinable with the other structural filters."
+    )]
+    #[serde(default)]
+    pub(crate) blocked: Option<bool>,
+    #[schemars(
+        description = "Structural filter (list, search): true = only items with at least one comment, false = only items with none, omit = no filter. Combinable with the other structural filters."
+    )]
+    #[serde(default)]
+    pub(crate) has_comments: Option<bool>,
+    #[schemars(
+        description = "Structural filter (list, search): true = only items whose claim lease has expired past its TTL with no live session holding it, false = only items with no stale claim, omit = no filter. Combinable with the other structural filters."
+    )]
+    #[serde(default)]
+    pub(crate) stale_claim: Option<bool>,
+    #[schemars(
+        description = "Structural filter (list, search): true = only items missing metadata.size, false = only sized items, omit = no filter. Combinable with the other structural filters."
+    )]
+    #[serde(default)]
+    pub(crate) unestimated: Option<bool>,
 }
 
-/// Lean per-item projection for `item(list)` — the raw 19-field `Item` (full
-/// description/metadata/timestamps) is what `get` returns; `list` only needs
-/// enough to triage, and resolves the opaque `state_id` into a readable name.
+/// Decision-support signals computed server-side for a batch of items —
+/// originally `groom`-only (staleness, blocking, fan-in, near-duplicates,
+/// size/estimation), now shared with `list`/`search` via
+/// `mcp_server::item::compute_annotations` so a caller filtering on e.g.
+/// "unassigned AND blocked" gets it in one call instead of `list` + N ×
+/// `get`. `has_comments`/`stale_claim` are new relative to `groom`'s
+/// original set. `#[serde(flatten)]`ed into each row type so the JSON shape
+/// is unchanged from when these fields lived directly on `GroomItem`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ItemAnnotations {
+    pub(crate) stale: bool,
+    pub(crate) unassigned: bool,
+    /// True when `due_date` is in the past and the item's state group isn't
+    /// completed/cancelled — a done-but-late item isn't "overdue" anymore.
+    pub(crate) overdue: bool,
+    /// Parsed from `metadata.size` ("S"|"M"|"L"); `None` when absent — see `unestimated`.
+    pub(crate) size: Option<String>,
+    /// True when `metadata.size` is missing — add a size label to enable real RICE scoring.
+    pub(crate) unestimated: bool,
+    /// IDs this item depends on that are still open (not completed/cancelled).
+    pub(crate) blocked_by: Vec<String>,
+    /// How many other items declare a dependency on this one.
+    pub(crate) depended_on_by_count: i64,
+    /// Other items in the same batch with a near-identical name (token-Jaccard ≥ 0.5).
+    pub(crate) possible_duplicates: Vec<String>,
+    /// True when this item has a confirmed `duplicate` relation on file
+    /// (persisted via `add_relation`), distinct from the unconfirmed
+    /// name-similarity heuristic in `possible_duplicates`.
+    pub(crate) confirmed_duplicate: bool,
+    /// True when the item has at least one comment (`comment::count_by_items`).
+    pub(crate) has_comments: bool,
+    /// True when the item's claim lease is past its TTL with no live session
+    /// holding it (`claim::list_all`).
+    pub(crate) stale_claim: bool,
+}
+
+/// Lean per-item projection for `item(list)`/`item(search)` — the raw
+/// 19-field `Item` (full description/metadata/timestamps) is what `get`
+/// returns; these only need enough to triage, plus the same annotation
+/// flags `groom` computes (flattened in), and resolve the opaque `state_id`
+/// into a readable name.
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct ItemSummary {
     pub(crate) id: String,
@@ -924,6 +987,9 @@ pub(crate) struct ItemSummary {
     pub(crate) parent_id: Option<String>,
     pub(crate) sequence_id: i64,
     pub(crate) updated_at: i64,
+    pub(crate) due_date: Option<i64>,
+    #[serde(flatten)]
+    pub(crate) annotations: ItemAnnotations,
 }
 
 /// `item(list)`'s response envelope — carries `next_offset`/`prev_offset` so
@@ -942,6 +1008,16 @@ pub(crate) struct ItemListPage {
     pub(crate) prev_offset: Option<usize>,
 }
 
+/// `item(search)`'s response envelope — no offset paging (search ranks by
+/// BM25 relevance, capped by `limit`), but `total` still reports how many
+/// of the ranked/fetched results matched the structural filters, for parity
+/// with `list`'s envelope.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ItemSearchPage {
+    pub(crate) items: Vec<ItemSummary>,
+    pub(crate) total: usize,
+}
+
 /// One shortlisted item plus the decision-support signals `groom` computes
 /// server-side (staleness, blocking, fan-in, near-duplicates) so the caller
 /// doesn't have to re-derive them by eyeballing timestamps and free text.
@@ -956,26 +1032,9 @@ pub(crate) struct GroomItem {
     pub(crate) priority: String,
     pub(crate) assignee_agent: Option<String>,
     pub(crate) updated_at: i64,
-    pub(crate) stale: bool,
-    pub(crate) unassigned: bool,
     pub(crate) due_date: Option<i64>,
-    /// True when `due_date` is in the past and the item's state group isn't
-    /// completed/cancelled — a done-but-late item isn't "overdue" anymore.
-    pub(crate) overdue: bool,
-    /// Parsed from `metadata.size` ("S"|"M"|"L"); `None` when absent — see `unestimated`.
-    pub(crate) size: Option<String>,
-    /// True when `metadata.size` is missing — add a size label to enable real RICE scoring.
-    pub(crate) unestimated: bool,
-    /// IDs this item depends on that are still open (not completed/cancelled).
-    pub(crate) blocked_by: Vec<String>,
-    /// How many other items declare a dependency on this one.
-    pub(crate) depended_on_by_count: i64,
-    /// Other shortlisted items with a near-identical name (token-Jaccard ≥ 0.5).
-    pub(crate) possible_duplicates: Vec<String>,
-    /// True when this item has a confirmed `duplicate` relation on file
-    /// (persisted via `add_relation`), distinct from the unconfirmed
-    /// name-similarity heuristic in `possible_duplicates`.
-    pub(crate) confirmed_duplicate: bool,
+    #[serde(flatten)]
+    pub(crate) annotations: ItemAnnotations,
 }
 
 /// One-call groom result: priority+staleness-ranked shortlist with all the

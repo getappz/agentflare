@@ -135,3 +135,100 @@ pub fn list_active(conn: &Connection, now: i64, ttl_secs: i64) -> rusqlite::Resu
         .map(|c| c.key.into_iter().next().unwrap())
         .collect())
 }
+
+/// All claims on file, live and stale alike — powers `item(list,
+/// stale_claim=true)`'s structural filter with one batched query instead of
+/// a per-item `current_owner` lookup loop.
+pub fn list_all(
+    conn: &Connection,
+    now: i64,
+    ttl_secs: i64,
+) -> rusqlite::Result<Vec<db_kit::claim::Claim>> {
+    LEDGER.list(conn, true, now, ttl_secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use crate::item::{self, CreateItem};
+    use crate::project::{self, CreateProject};
+    use crate::workspace::{self, CreateWorkspace};
+
+    const TTL: i64 = 1800;
+
+    fn seed_item(conn: &Connection, suffix: &str) -> String {
+        let ws = workspace::create(
+            conn,
+            CreateWorkspace {
+                name: format!("Test{suffix}"),
+                slug: format!("test{suffix}"),
+                owner_agent: None,
+                item_label: None,
+            },
+        )
+        .unwrap();
+        let proj = project::create(
+            conn,
+            CreateProject {
+                workspace_id: ws.id,
+                name: format!("Test{suffix}"),
+                identifier: format!("T{suffix}"),
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+        let state_id = crate::state::list_by_project(conn, &proj.id)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.is_default)
+            .unwrap()
+            .id;
+        item::create(
+            conn,
+            CreateItem {
+                project_id: proj.id,
+                state_id,
+                name: format!("Item{suffix}"),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    #[test]
+    fn list_all_reports_stale_flag_per_item_without_hiding_stale_rows() {
+        let conn = db::open_in_memory().unwrap();
+        let fresh_id = seed_item(&conn, "Fresh");
+        let stale_id = seed_item(&conn, "Stale");
+        acquire(&conn, &fresh_id, "agent-a", 1_000, TTL).unwrap();
+        acquire(&conn, &stale_id, "agent-b", 1_000, TTL).unwrap();
+
+        // Advance past the stale item's TTL, but heartbeat the fresh one so
+        // only one of the two claims is actually expired.
+        let now = 1_000 + TTL + 1;
+        heartbeat(&conn, &fresh_id, "agent-a", now).unwrap();
+
+        let claims = list_all(&conn, now, TTL).unwrap();
+        assert_eq!(claims.len(), 2, "list_all must not hide the stale claim");
+
+        let fresh = claims.iter().find(|c| c.key == [fresh_id.clone()]).unwrap();
+        let stale = claims.iter().find(|c| c.key == [stale_id.clone()]).unwrap();
+        assert!(!fresh.stale);
+        assert!(stale.stale);
+    }
+}
