@@ -886,6 +886,10 @@ fn create_worktree_soft_fails_on_bad_git() {
         err.len() > format!("worktree: creation skipped for item {}: ", item.id).len(),
         "error must carry the underlying git failure detail, not just the prefix: {err}"
     );
+    assert!(
+        err.contains("after 1 attempt(s)"),
+        "a non-retryable failure must report 1 attempt, not the full retry budget: {err}"
+    );
 }
 
 #[test]

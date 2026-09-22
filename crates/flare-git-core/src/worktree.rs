@@ -400,10 +400,17 @@ pub fn create_worktree(
     // work: a retry racing a half-torn-down worktree must fail loudly rather
     // than clobber it (item #633 ask 4 — #631's rescue was manual).
     if worktree_path.is_dir() && !worktree_already_checked_out(&worktree_path, &branch) {
-        let dirty = run_git_in(worktree_path.as_path(), &["status", "--porcelain"])
-            .map(|out| !out.trim().is_empty())
-            .unwrap_or(false);
-        if dirty {
+        // Fail closed: if cleanliness cannot be verified, don't proceed to
+        // stale-cleanup + recreate — an unreadable status must never read as
+        // "clean".
+        let status = run_git_in(worktree_path.as_path(), &["status", "--porcelain"]).map_err(|e| {
+            format!(
+                "worktree: refusing to recreate at {} for item {} because cleanliness could not be verified: {e}",
+                worktree_path.display(),
+                item.id
+            )
+        })?;
+        if !status.trim().is_empty() {
             let msg = format!(
                 "worktree: refusing to recreate over dirty worktree at {} for item {} \
                  (uncommitted changes preserved; clear or commit them before retrying)",
@@ -566,8 +573,10 @@ pub fn create_worktree(
     // into an immediate redispatch loop.
     const ADD_ATTEMPTS: usize = 3;
     const ADD_BACKOFF_SECS: [u64; 2] = [2, 5];
+    let mut attempts_made = 0usize;
     let mut last_err = String::new();
     for attempt in 0..ADD_ATTEMPTS {
+        attempts_made = attempt + 1;
         if attempt > 0 {
             // Reconcile again before retrying: the first attempt's failure may
             // have been the stale registration itself, now cleared.
@@ -598,7 +607,7 @@ pub fn create_worktree(
         }
     }
     let msg = format!(
-        "worktree: creation skipped for item {} after {ADD_ATTEMPTS} attempt(s): {}",
+        "worktree: creation skipped for item {} after {attempts_made} attempt(s): {}",
         item.id, last_err
     );
     eprintln!("{msg}");
@@ -685,6 +694,11 @@ fn remove_stale_registration_for_path(repo_root: &Path, worktree_path: &Path) ->
         if !admin.is_dir() {
             continue;
         }
+        // Never touch a locked registration (`git worktree lock` pins the
+        // entry on purpose — e.g. portable/network paths).
+        if admin.join("locked").exists() {
+            continue;
+        }
         let gitdir = std::fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
         let checkout = std::path::Path::new(gitdir.trim())
             .parent()
@@ -700,6 +714,18 @@ fn remove_stale_registration_for_path(repo_root: &Path, worktree_path: &Path) ->
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
         if worktree_path.exists() {
+            continue;
+        }
+        // Re-verify identity just before removal: another process may have
+        // recycled this admin dir for a replacement worktree since we first
+        // read it — deleting that live registration would orphan real work.
+        let gitdir_again = std::fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
+        let still_ours = std::path::Path::new(gitdir_again.trim())
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .as_deref()
+            == Some(worktree_path);
+        if !still_ours || admin.join("locked").exists() {
             continue;
         }
         if std::fs::remove_dir_all(&admin).is_ok() {
