@@ -1013,6 +1013,20 @@ fn update_priority_to_urgent_auto_gates_plan_required() {
 /// claimed until a submitted plan is approved.
 #[test]
 fn end_to_end_plan_gate_blocks_then_unblocks_claim() {
+    // Step 1 sets `assignee_agent: "claude-code"` so plan_required's new
+    // claimability check accepts it; the final claim in step 6 must then
+    // come from that same agent identity or `claim()`'s handoff freeze
+    // (`BlockedByAssignee`) blocks it. Pin the owner explicitly instead of
+    // relying on ambient agent-detection (`owner_id()` falls back to
+    // `agent_detector::agent_name()`, which resolves to "claude-code" only
+    // when actually running inside Claude Code -- a bare CI runner detects
+    // nothing and falls back to "cli", which doesn't match).
+    crate::claims::with_owner_override("claude-code:test", || {
+        end_to_end_plan_gate_blocks_then_unblocks_claim_inner();
+    });
+}
+
+fn end_to_end_plan_gate_blocks_then_unblocks_claim_inner() {
     let (s, _tmp, _repo_tmp) = claim_harness();
 
     // 1. Create with priority="urgent" plus an explicit plan_approver="agent"
