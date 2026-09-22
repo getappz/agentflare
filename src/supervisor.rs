@@ -818,6 +818,16 @@ enum SelfRepairOutcome {
     Skipped,
 }
 
+/// What `merge_or_repair_findings` decided for a CI-green PR. Distinct from
+/// `SelfRepairOutcome` because "merged" isn't a repair outcome at all --
+/// keeping them separate means the merge branch and the repair branch can't
+/// be conflated at the call site.
+enum PassingPrOutcome {
+    Merged,
+    NotMerged,
+    Repair(SelfRepairOutcome),
+}
+
 /// Everything one project contributes to a review sweep: its own
 /// `in_review` items, label lookup, and the folder its worktrees live
 /// under (from the `project_dirs` registry, not this process's cwd) --
@@ -1192,39 +1202,44 @@ fn handle_pr_status(
             {
                 notify_pr_approval_gate(item, folder_path, number);
             }
-            if merge_if_approved(mcp, item, repo_root, number, &labels) {
-                result.promoted += 1;
+            // CI being green and a human's approval label being attached
+            // don't mean the PR is actually done if CodeRabbit's own review
+            // still has unresolved findings sitting on it untouched (item
+            // #273) -- so the findings check must run, and gate the merge,
+            // *before* `merge_if_approved` is ever called, not only in the
+            // branch where it happened not to merge (item #628: an approved,
+            // CI-green PR with real findings on it got merged untouched
+            // because the two were checked in the wrong order -- see GitHub
+            // PR 791). Skip the two live GitHub calls this fetch costs
+            // entirely once the item is already gated or a repair job is
+            // already in flight -- `coderabbit_repair_or_gate` would just
+            // discard the findings and return `Skipped` anyway, but not
+            // before paying for the fetch on every single tick for as long
+            // as the PR sits gated or in-flight.
+            if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
+                result.skipped += 1;
             } else {
-                // Not merged (no approval yet, or the merge call itself was
-                // rejected) -- CI being green doesn't mean the PR is actually
-                // done if CodeRabbit's own review still has unresolved
-                // findings sitting on it untouched (item #273). Skip the two
-                // live GitHub calls this fetch costs entirely once the item
-                // is already gated or a repair job is already in flight --
-                // `coderabbit_repair_or_gate` would just discard the findings
-                // and return `Skipped` anyway, but not before paying for the
-                // fetch on every single tick for as long as the PR sits
-                // gated or in-flight.
-                if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
-                    result.skipped += 1;
-                } else {
-                    let findings = fetch_unresolved_coderabbit_comments(repo_root, number);
-                    match coderabbit_repair_or_gate(
-                        mcp,
-                        queue,
-                        auth_conn,
-                        host_policy,
-                        item,
-                        number,
-                        &findings,
-                        &labels,
-                        label_id_by_name,
-                        folder_path,
-                    ) {
-                        SelfRepairOutcome::Dispatched => result.review_repaired += 1,
-                        SelfRepairOutcome::Deferred => result.waiting += 1,
-                        SelfRepairOutcome::Skipped => result.skipped += 1,
+                let findings = fetch_unresolved_coderabbit_comments(repo_root, number);
+                match merge_or_repair_findings(
+                    mcp,
+                    queue,
+                    auth_conn,
+                    host_policy,
+                    item,
+                    repo_root,
+                    number,
+                    &findings,
+                    &labels,
+                    label_id_by_name,
+                    folder_path,
+                ) {
+                    PassingPrOutcome::Merged => result.promoted += 1,
+                    PassingPrOutcome::NotMerged => result.skipped += 1,
+                    PassingPrOutcome::Repair(SelfRepairOutcome::Dispatched) => {
+                        result.review_repaired += 1
                     }
+                    PassingPrOutcome::Repair(SelfRepairOutcome::Deferred) => result.waiting += 1,
+                    PassingPrOutcome::Repair(SelfRepairOutcome::Skipped) => result.skipped += 1,
                 }
             }
         }
@@ -1308,12 +1323,58 @@ fn promote_merged_item(mcp: &AgentflareMcp, item: &agentflare_backend::item::Ite
         .unwrap_or(false)
 }
 
+/// Routes a CI-green PR to either a CodeRabbit review-repair dispatch or an
+/// approval-gated merge attempt -- `findings` (pre-fetched by the caller,
+/// same convention as `self_repair_or_gate`'s `failed_checks`) is checked
+/// FIRST, so a PR with unresolved CodeRabbit findings can never reach
+/// `merge_if_approved`, regardless of its approval label or CI status (item
+/// #628: the two were previously checked in the wrong order -- `merge_if_approved`
+/// ran first and findings were only checked in the branch where it did NOT
+/// merge -- so an approved, CI-green PR with real findings still sitting on
+/// it got merged untouched; see GitHub PR 791).
+#[allow(clippy::too_many_arguments)]
+fn merge_or_repair_findings(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    auth_conn: &rusqlite::Connection,
+    host_policy: agentflare_resource_gate::Policy,
+    item: &agentflare_backend::item::Item,
+    repo_root: &std::path::Path,
+    number: u64,
+    findings: &[crate::github::models::ReviewComment],
+    labels: &[String],
+    label_id_by_name: &std::collections::HashMap<String, String>,
+    folder_path: &str,
+) -> PassingPrOutcome {
+    if !findings.is_empty() {
+        return PassingPrOutcome::Repair(coderabbit_repair_or_gate(
+            mcp,
+            queue,
+            auth_conn,
+            host_policy,
+            item,
+            number,
+            findings,
+            labels,
+            label_id_by_name,
+            folder_path,
+        ));
+    }
+    clear_stale_coderabbit_repair_label(folder_path, number, labels);
+    if merge_if_approved(mcp, item, repo_root, number, labels) {
+        PassingPrOutcome::Merged
+    } else {
+        PassingPrOutcome::NotMerged
+    }
+}
+
 /// Auto-merges a CI-green PR and promotes its item, but only once a human
 /// has attached `PR_APPROVAL_LABEL` to the PR itself -- checked first and
 /// short-circuits before any GitHub call so an unapproved item never touches
-/// the network here. Only ever called from `run_review_sweep`'s `Passing`
-/// arm, so CI green is structurally required: the label can add a gate on
-/// top of it, never bypass it.
+/// the network here. Only ever called from `merge_or_repair_findings`, once
+/// it has confirmed there are no unresolved CodeRabbit findings, so CI green
+/// is structurally required and findings are structurally clean: the label
+/// can add a gate on top of both, never bypass either.
 fn merge_if_approved(
     mcp: &AgentflareMcp,
     item: &agentflare_backend::item::Item,
@@ -1778,6 +1839,23 @@ fn fetch_unresolved_coderabbit_comments(
 /// can't quietly drift apart. `findings` is fetched once by the caller
 /// (`fetch_unresolved_coderabbit_comments`) rather than by this function
 /// itself, again mirroring how `self_repair_or_gate` receives `failed_checks`.
+/// Swaps a stale `CODERABBIT_REPAIR_PR_LABEL` back to plain in-review once no
+/// unresolved findings remain on the PR -- shared by `coderabbit_repair_or_gate`'s
+/// own empty-findings branch and `merge_or_repair_findings`'s, so a PR
+/// heading straight to `merge_if_approved` doesn't skip the same cleanup.
+/// Only touches GitHub when the label is actually still there.
+fn clear_stale_coderabbit_repair_label(folder_path: &str, pr_number: u64, labels: &[String]) {
+    if labels.iter().any(|l| l == CODERABBIT_REPAIR_PR_LABEL) {
+        update_pr_stage(
+            folder_path,
+            pr_number,
+            Some(CODERABBIT_REPAIR_PR_LABEL),
+            IN_REVIEW_PR_LABEL,
+            "## supervisor — CodeRabbit review clear\n\nNo unresolved findings remain.",
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn coderabbit_repair_or_gate(
     mcp: &AgentflareMcp,
@@ -1796,19 +1874,7 @@ fn coderabbit_repair_or_gate(
     }
 
     if findings.is_empty() {
-        // Findings from an earlier tick all got resolved since -- swap the
-        // stage label back rather than leaving a stale "review-repair" label
-        // on a PR nothing is actively repairing anymore. Only touches GitHub
-        // when the label is actually still there.
-        if labels.iter().any(|l| l == CODERABBIT_REPAIR_PR_LABEL) {
-            update_pr_stage(
-                folder_path,
-                pr_number,
-                Some(CODERABBIT_REPAIR_PR_LABEL),
-                IN_REVIEW_PR_LABEL,
-                "## supervisor — CodeRabbit review clear\n\nNo unresolved findings remain.",
-            );
-        }
+        clear_stale_coderabbit_repair_label(folder_path, pr_number, labels);
         return SelfRepairOutcome::Skipped;
     }
 

@@ -1503,6 +1503,60 @@ fn run_review_sweep_never_merges_when_the_approval_label_only_exists_on_the_proj
     assert_eq!(result.skipped, 1);
 }
 
+#[test]
+fn merge_or_repair_findings_never_merges_a_ci_green_approved_pr_with_unresolved_findings() {
+    // Regression for item #628 (GitHub PR 791): an approved, CI-green PR
+    // must not be merged while CodeRabbit findings are still unresolved on
+    // it, no matter what `merge_if_approved` would otherwise decide. Claim
+    // is backdated past the in_review TTL cap so the dispatch path is live
+    // rather than gated, proving the findings genuinely routed to repair
+    // instead of silently no-op'ing past both checks.
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    let label_id_by_name = seed_gate_label(&mcp);
+    let queue = test_queue();
+    let auth_conn = test_auth_conn();
+    let findings = vec![coderabbit_finding(1, "coderabbitai[bot]")];
+
+    let outcome = merge_or_repair_findings(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        repo.path(),
+        42,
+        &findings,
+        &[PR_APPROVAL_LABEL.to_string()],
+        &label_id_by_name,
+        "/repo",
+    );
+
+    assert!(
+        !matches!(outcome, PassingPrOutcome::Merged),
+        "unresolved CodeRabbit findings must block the merge even with the approval label present"
+    );
+    assert!(matches!(
+        outcome,
+        PassingPrOutcome::Repair(SelfRepairOutcome::Dispatched)
+    ));
+    let still_in_review = mcp
+        .with_backend_db(|conn| {
+            let refetched = agentflare_backend::item::get(conn, &item_id).unwrap();
+            let state = agentflare_backend::state::get(conn, &refetched.state_id).unwrap();
+            state.group_name == "in_review"
+        })
+        .unwrap();
+    assert!(
+        still_in_review,
+        "an item with unresolved findings must not be promoted"
+    );
+}
+
 // --- cross-machine self-repair claim arbitration (item #261) ---
 
 /// Wraps a marker comment body the way `MockResponse::json`'s callers need
