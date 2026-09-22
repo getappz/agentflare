@@ -374,6 +374,18 @@ fn item_update_assignee_to_different_instance_does_not_release_claim() {
 
 #[test]
 fn item_claim_blocked_by_plan() {
+    // Same environment-dependent trap as
+    // end_to_end_plan_gate_blocks_then_unblocks_claim: the create call below
+    // sets assignee_agent="claude-code" so plan_required's claimability
+    // check accepts it, so the final claim() must come from that same
+    // identity or claim()'s handoff freeze (BlockedByAssignee) blocks it.
+    // Pin the owner instead of relying on ambient agent-detection.
+    crate::claims::with_owner_override("claude-code:test", || {
+        item_claim_blocked_by_plan_inner();
+    });
+}
+
+fn item_claim_blocked_by_plan_inner() {
     let (s, tmp, _repo_tmp) = claim_harness();
     let created: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
