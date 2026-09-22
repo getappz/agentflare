@@ -89,6 +89,13 @@ pub fn run(version: Option<String>, check_only: bool, quiet: bool) {
             std::process::exit(1);
         }
     }
+    // Never claim success on the swap's say-so: compare what is on disk
+    // (item #624 found dev-install missing this; item #627 found `update`
+    // missing it too).
+    if let Err(e) = swap::verify_installed(&new_binary, &current) {
+        eprintln!("update FAILED, {} was not updated: {e}", current.display());
+        std::process::exit(1);
+    }
 
     if !quiet {
         println!("updated to {target_version}");
@@ -192,5 +199,38 @@ fn report_other_instances() {
              restart them to pick up this update",
             others.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression (item 627): `update::run`'s swap path calls `swap::replace_binary`
+    // then must call `swap::verify_installed` before declaring success, exactly
+    // like `dev_install::run` does for item 624. This exercises the same two
+    // calls in the same order `run` makes them, with the installed file made to
+    // differ from the build afterward, to confirm that combination fails loudly
+    // instead of silently reporting "updated".
+    #[test]
+    fn update_swap_path_rejects_an_installed_file_that_ends_up_different_from_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join(if cfg!(windows) {
+            "agentflare.exe"
+        } else {
+            "agentflare"
+        });
+        let new_binary = dir.path().join("new-binary");
+        std::fs::write(&current, b"OLD").unwrap();
+        std::fs::write(&new_binary, b"NEWCONTENT").unwrap();
+
+        let outcome = swap::replace_binary(&new_binary, &current).expect("swap should succeed");
+        assert!(matches!(outcome, swap::SwapOutcome::Installed));
+        assert!(swap::verify_installed(&new_binary, &current).is_ok());
+
+        // Something (a stale copy, a partial write, a racing second swap)
+        // leaves the installed file different from what was just built.
+        std::fs::write(&current, b"STALE").unwrap();
+        assert!(swap::verify_installed(&new_binary, &current).is_err());
     }
 }

@@ -18,6 +18,7 @@
 //! (item #127) calls it to install a freshly built binary over the installed
 //! one without disturbing a running server.
 
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// How [`replace_binary`] left `target`.
@@ -197,6 +198,37 @@ fn schedule_deferred_swap_windows(new_binary: &Path, target: &Path) -> Result<Sw
         .spawn()
         .map_err(|e| format!("spawn deferred updater: {e}"))?;
     Ok(SwapOutcome::Deferred { log })
+}
+
+/// `(size in bytes, hex SHA-256)` of the file at `path`.
+fn digest(path: &Path) -> Result<(u64, String), String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let size = std::io::copy(&mut file, &mut hasher)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok((size, hex::encode(hasher.finalize())))
+}
+
+/// Confirm `target` is byte-identical to `built` (size, then SHA-256).
+///
+/// Never trust a swap's reported outcome alone (item #624): `replace_binary`
+/// can report `Installed` while the file that actually lands on disk differs
+/// from what was built. Shared by `dev-install` and `agentflare update`
+/// (item #627) — both replace the one binary the user runs, and both must
+/// refuse to declare victory on the swap's say-so.
+pub(crate) fn verify_installed(built: &Path, target: &Path) -> Result<(), String> {
+    let (built_size, built_hash) = digest(built)?;
+    let (target_size, target_hash) = digest(target)?;
+    if (built_size, &built_hash) == (target_size, &target_hash) {
+        return Ok(());
+    }
+    Err(format!(
+        "installed file is {target_size} bytes (sha256 {}), the build is {built_size} bytes \
+         (sha256 {})",
+        &target_hash[..12],
+        &built_hash[..12]
+    ))
 }
 
 /// PIDs of *other* running `agentflare` processes, excluding this process.
@@ -396,6 +428,26 @@ mod tests {
         let name = a.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("agentflare."), "got {name}");
         assert!(name.ends_with(".old.exe"), "got {name}");
+    }
+
+    #[test]
+    fn verify_installed_accepts_identical_and_rejects_any_difference() {
+        let dir = tempfile::tempdir().unwrap();
+        let built = dir.path().join("built");
+        let same = dir.path().join("same");
+        let shorter = dir.path().join("shorter");
+        let same_size = dir.path().join("same-size");
+        std::fs::write(&built, b"NEWCONTENT").unwrap();
+        std::fs::write(&same, b"NEWCONTENT").unwrap();
+        std::fs::write(&shorter, b"NEW").unwrap();
+        std::fs::write(&same_size, b"OLDCONTENT").unwrap();
+
+        assert!(verify_installed(&built, &same).is_ok());
+        // A stale install (the item 624 symptom) must be a failure, not a success.
+        let e = verify_installed(&built, &shorter).unwrap_err();
+        assert!(e.contains("3 bytes") && e.contains("10 bytes"), "got {e}");
+        assert!(verify_installed(&built, &same_size).is_err());
+        assert!(verify_installed(&built, &dir.path().join("missing")).is_err());
     }
 
     #[cfg(windows)]
