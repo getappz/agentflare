@@ -1772,13 +1772,26 @@ impl AgentflareMcp {
         }
         self.with_backend_db(|conn| {
             let project = self.resolve_project(conn)?;
-            let mut items = agentflare_backend::item::search(
-                conn,
-                &project.id,
-                &query,
-                req.limit.map(|l| l as usize),
-            )
-            .map_err(map_backend_err)?;
+            let requested_limit = req.limit.map(|l| l as usize).unwrap_or(20);
+            let has_structural_filter = req.unassigned.is_some()
+                || req.blocked.is_some()
+                || req.has_comments.is_some()
+                || req.stale_claim.is_some()
+                || req.unestimated.is_some();
+            // A structural filter is applied in-memory (via `retain`) after
+            // this DB-level BM25 search, so fetching only `requested_limit`
+            // candidates would let filtered-out rows starve the result —
+            // lower-ranked matches never even get fetched. When a filter is
+            // set, widen the candidate pool to the search backend's own max
+            // and trim to `requested_limit` after filtering instead.
+            let fetch_limit = if has_structural_filter {
+                flare_search_kit::MAX_LIMIT
+            } else {
+                requested_limit
+            };
+            let mut items =
+                agentflare_backend::item::search(conn, &project.id, &query, Some(fetch_limit))
+                    .map_err(map_backend_err)?;
             let states = agentflare_backend::state::list_by_project(conn, &project.id)
                 .map_err(map_backend_err)?;
             let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
@@ -1801,6 +1814,7 @@ impl AgentflareMcp {
                     .get(&i.id)
                     .is_some_and(|s| matches_filter_signals(s, &req))
             });
+            items.truncate(requested_limit);
 
             // `search` has no further pagination beyond its own DB-level
             // `limit` (already applied above `items` was fetched), so the
