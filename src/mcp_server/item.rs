@@ -343,6 +343,134 @@ fn confirmed_duplicate_ids(
         .map_err(|e: rusqlite::Error| ErrorData::internal_error(e.to_string(), None))
 }
 
+/// Batched decision-support annotations for a set of items — originally
+/// `groom`-only (staleness, blocking, fan-in, near-duplicates, size), now
+/// shared with `list`/`search` so those actions carry the same flags
+/// without an N+1 `get` per item. Every underlying lookup (dependency
+/// edges/fan-in, near-duplicates, confirmed duplicates, comment counts,
+/// claim staleness) runs once for the whole batch, not once per item.
+fn compute_annotations(
+    conn: &Connection,
+    items: &[agentflare_backend::item::Item],
+    state_by_id: &std::collections::HashMap<&str, &agentflare_backend::state::State>,
+    now: i64,
+    stale_cutoff: i64,
+    claim_ttl_secs: i64,
+) -> Result<std::collections::HashMap<String, ItemAnnotations>, ErrorData> {
+    let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+    let edges = agentflare_backend::item::dependency_edges_for_items(conn, &ids)
+        .map_err(map_backend_err)?;
+    let blocked_by = blocked_by_map(&edges);
+    let fanin = agentflare_backend::item::dependency_fanin_for_items(conn, &ids)
+        .map_err(map_backend_err)?;
+    let duplicates = near_duplicates(items);
+    let confirmed_duplicates = confirmed_duplicate_ids(conn, &ids)?;
+    let comment_counts =
+        agentflare_backend::comment::count_by_items(conn, &ids).map_err(map_backend_err)?;
+    let stale_claims: std::collections::HashSet<String> =
+        agentflare_backend::claim::list_all(conn, now, claim_ttl_secs)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            .into_iter()
+            .filter(|c| c.stale && c.key.len() == 1)
+            .filter_map(|c| c.key.into_iter().next())
+            .collect();
+
+    Ok(items
+        .iter()
+        .map(|i| {
+            let state_group = state_by_id
+                .get(i.state_id.as_str())
+                .map(|s| s.group_name.as_str())
+                .unwrap_or_default();
+            let size = parsed_size(&i.metadata);
+            let annotations = ItemAnnotations {
+                stale: i.updated_at < stale_cutoff,
+                unassigned: i.assignee_agent.is_none(),
+                overdue: i.due_date.is_some_and(|d| d < now)
+                    && !matches!(state_group, "completed" | "cancelled"),
+                unestimated: size.is_none(),
+                size,
+                blocked_by: blocked_by.get(&i.id).cloned().unwrap_or_default(),
+                depended_on_by_count: *fanin.get(&i.id).unwrap_or(&0),
+                possible_duplicates: duplicates.get(&i.id).cloned().unwrap_or_default(),
+                confirmed_duplicate: confirmed_duplicates.contains(&i.id),
+                has_comments: comment_counts.get(&i.id).is_some_and(|&c| c > 0),
+                stale_claim: stale_claims.contains(&i.id),
+            };
+            (i.id.clone(), annotations)
+        })
+        .collect())
+}
+
+/// Cheap decision-support signals needed only to evaluate the structural
+/// filters (`unassigned`/`blocked`/`has_comments`/`stale_claim`/
+/// `unestimated`) -- a lean subset of `ItemAnnotations` computed once over
+/// the *whole* filtered candidate set via the same handful of batched
+/// queries `compute_annotations` uses (dependency edges, comment counts,
+/// claim staleness), but skipping its O(n^2) `near_duplicates` pass and the
+/// fan-in/confirmed-duplicate queries -- those are display-only and don't
+/// gate any filter, so `list`/`search` only pay for them on the final
+/// returned page via `compute_annotations`, not the whole backlog.
+struct FilterSignals {
+    unassigned: bool,
+    blocked: bool,
+    has_comments: bool,
+    stale_claim: bool,
+    unestimated: bool,
+}
+
+fn compute_filter_signals(
+    conn: &Connection,
+    items: &[agentflare_backend::item::Item],
+    now: i64,
+    claim_ttl_secs: i64,
+) -> Result<std::collections::HashMap<String, FilterSignals>, ErrorData> {
+    let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+    let edges = agentflare_backend::item::dependency_edges_for_items(conn, &ids)
+        .map_err(map_backend_err)?;
+    let blocked_by = blocked_by_map(&edges);
+    let comment_counts =
+        agentflare_backend::comment::count_by_items(conn, &ids).map_err(map_backend_err)?;
+    let stale_claims: std::collections::HashSet<String> =
+        agentflare_backend::claim::list_all(conn, now, claim_ttl_secs)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            .into_iter()
+            .filter(|c| c.stale && c.key.len() == 1)
+            .filter_map(|c| c.key.into_iter().next())
+            .collect();
+
+    Ok(items
+        .iter()
+        .map(|i| {
+            let signals = FilterSignals {
+                unassigned: i.assignee_agent.is_none(),
+                blocked: blocked_by.get(&i.id).is_some_and(|deps| !deps.is_empty()),
+                has_comments: comment_counts.get(&i.id).is_some_and(|&c| c > 0),
+                stale_claim: stale_claims.contains(&i.id),
+                unestimated: parsed_size(&i.metadata).is_none(),
+            };
+            (i.id.clone(), signals)
+        })
+        .collect())
+}
+
+/// Whether `signals` satisfies every structural filter the caller
+/// explicitly set on `req` (`unassigned`/`blocked`/`has_comments`/
+/// `stale_claim`/`unestimated`, each optional and combinable via AND).
+fn matches_filter_signals(signals: &FilterSignals, req: &ItemRequest) -> bool {
+    req.unassigned.is_none_or(|want| signals.unassigned == want)
+        && req.blocked.is_none_or(|want| signals.blocked == want)
+        && req
+            .has_comments
+            .is_none_or(|want| signals.has_comments == want)
+        && req
+            .stale_claim
+            .is_none_or(|want| signals.stale_claim == want)
+        && req
+            .unestimated
+            .is_none_or(|want| signals.unestimated == want)
+}
+
 fn to_standup_item(i: &agentflare_backend::item::Item) -> StandupItem {
     StandupItem {
         id: i.id.clone(),
@@ -367,9 +495,9 @@ fn capacity_buckets(
     let mut later = Vec::new();
     let mut ready = Vec::new();
     for i in items {
-        if i.unestimated {
+        if i.annotations.unestimated {
             needs_estimation.push(i.id.clone());
-        } else if !i.blocked_by.is_empty() {
+        } else if !i.annotations.blocked_by.is_empty() {
             later.push(i.id.clone());
         } else {
             ready.push(i.id.clone());
@@ -665,6 +793,32 @@ impl AgentflareMcp {
                 });
             }
 
+            // Structural filters (unassigned/blocked/has_comments/stale_claim/
+            // unestimated) need to run before pagination — filtering after
+            // paging would silently return a short page. `compute_filter_signals`
+            // batches its lookups over the whole (state_group/assignee-filtered)
+            // set in a handful of queries, not one per item, and deliberately
+            // skips the expensive display-only annotations (near-duplicates is
+            // O(n^2)) that don't gate any filter — those are computed below,
+            // only for the page actually being returned.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let stale_cutoff = now
+                - req
+                    .staleness_days
+                    .unwrap_or(14)
+                    .max(0)
+                    .saturating_mul(86_400);
+            let claim_ttl_secs = backend_claim_ttl_secs();
+            let filter_signals = compute_filter_signals(conn, &items, now, claim_ttl_secs)?;
+            items.retain(|i| {
+                filter_signals
+                    .get(&i.id)
+                    .is_some_and(|s| matches_filter_signals(s, &req))
+            });
+
             let total = items.len();
             let offset = req.offset.unwrap_or(0) as usize;
             let limit = req
@@ -673,10 +827,19 @@ impl AgentflareMcp {
                 .clamp(0, MAX_LIST_LIMIT) as usize;
             let page: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
 
+            // Only the returned page pays for the full annotation pass
+            // (near-duplicates, fan-in, confirmed-duplicate) — bounded by
+            // `MAX_LIST_LIMIT`, not the size of the filtered backlog.
+            let mut annotations_by_id =
+                compute_annotations(conn, &page, &state_by_id, now, stale_cutoff, claim_ttl_secs)?;
+
             let summaries: Vec<ItemSummary> = page
                 .into_iter()
                 .map(|i| {
                     let state = state_by_id.get(i.state_id.as_str());
+                    let annotations = annotations_by_id
+                        .remove(&i.id)
+                        .expect("compute_annotations returns an entry for every input item");
                     ItemSummary {
                         id: i.id,
                         name: i.name,
@@ -687,6 +850,8 @@ impl AgentflareMcp {
                         parent_id: i.parent_id,
                         sequence_id: i.sequence_id,
                         updated_at: i.updated_at,
+                        due_date: i.due_date,
+                        annotations,
                     }
                 })
                 .collect();
@@ -1600,20 +1765,98 @@ impl AgentflareMcp {
     pub(super) fn item_search(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let query = req
             .query
+            .clone()
             .ok_or_else(|| ErrorData::invalid_params("query is required for search", None))?;
         if query.trim().is_empty() {
             return Err(ErrorData::invalid_params("query is required", None));
         }
         self.with_backend_db(|conn| {
             let project = self.resolve_project(conn)?;
-            let items = agentflare_backend::item::search(
+            let requested_limit = req.limit.map(|l| l as usize).unwrap_or(20);
+            let has_structural_filter = req.unassigned.is_some()
+                || req.blocked.is_some()
+                || req.has_comments.is_some()
+                || req.stale_claim.is_some()
+                || req.unestimated.is_some();
+            // A structural filter is applied in-memory (via `retain`) after
+            // this DB-level BM25 search, so fetching only `requested_limit`
+            // candidates would let filtered-out rows starve the result —
+            // lower-ranked matches never even get fetched. When a filter is
+            // set, widen the candidate pool to the search backend's own max
+            // and trim to `requested_limit` after filtering instead.
+            let fetch_limit = if has_structural_filter {
+                flare_search_kit::MAX_LIMIT
+            } else {
+                requested_limit
+            };
+            let mut items =
+                agentflare_backend::item::search(conn, &project.id, &query, Some(fetch_limit))
+                    .map_err(map_backend_err)?;
+            let states = agentflare_backend::state::list_by_project(conn, &project.id)
+                .map_err(map_backend_err)?;
+            let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
+                states.iter().map(|s| (s.id.as_str(), s)).collect();
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let stale_cutoff = now
+                - req
+                    .staleness_days
+                    .unwrap_or(14)
+                    .max(0)
+                    .saturating_mul(86_400);
+            let claim_ttl_secs = backend_claim_ttl_secs();
+            let filter_signals = compute_filter_signals(conn, &items, now, claim_ttl_secs)?;
+            items.retain(|i| {
+                filter_signals
+                    .get(&i.id)
+                    .is_some_and(|s| matches_filter_signals(s, &req))
+            });
+            items.truncate(requested_limit);
+
+            // `search` has no further pagination beyond its own DB-level
+            // `limit` (already applied above `items` was fetched), so the
+            // filtered set here is already the final returned set — safe to
+            // run the full annotation pass (including near-duplicates)
+            // directly on it, same as `list` does for its own final page.
+            let mut annotations_by_id = compute_annotations(
                 conn,
-                &project.id,
-                &query,
-                req.limit.map(|l| l as usize),
-            )
-            .map_err(map_backend_err)?;
-            Ok(serde_json::to_string_pretty(&items).unwrap_or_default())
+                &items,
+                &state_by_id,
+                now,
+                stale_cutoff,
+                claim_ttl_secs,
+            )?;
+            let summaries: Vec<ItemSummary> = items
+                .into_iter()
+                .map(|i| {
+                    let state = state_by_id.get(i.state_id.as_str());
+                    let annotations = annotations_by_id
+                        .remove(&i.id)
+                        .expect("compute_annotations returns an entry for every input item");
+                    ItemSummary {
+                        id: i.id,
+                        name: i.name,
+                        state: state.map(|s| s.name.clone()).unwrap_or_default(),
+                        state_group: state.map(|s| s.group_name.clone()).unwrap_or_default(),
+                        priority: i.priority,
+                        assignee_agent: i.assignee_agent,
+                        parent_id: i.parent_id,
+                        sequence_id: i.sequence_id,
+                        updated_at: i.updated_at,
+                        due_date: i.due_date,
+                        annotations,
+                    }
+                })
+                .collect();
+
+            let page = ItemSearchPage {
+                total: summaries.len(),
+                items: summaries,
+            };
+            Ok(serde_json::to_string_pretty(&page).unwrap_or_default())
         })?
     }
 
@@ -1938,53 +2181,46 @@ impl AgentflareMcp {
             });
             let shortlist: Vec<_> = items.into_iter().take(cap).collect();
 
-            let ids: Vec<String> = shortlist.iter().map(|i| i.id.clone()).collect();
-            let edges = agentflare_backend::item::dependency_edges_for_items(conn, &ids)
-                .map_err(map_backend_err)?;
-            let blocked_by = blocked_by_map(&edges);
-            let fanin = agentflare_backend::item::dependency_fanin_for_items(conn, &ids)
-                .map_err(map_backend_err)?;
-            let duplicates = near_duplicates(&shortlist);
-            let confirmed_duplicates = confirmed_duplicate_ids(conn, &ids)?;
+            let claim_ttl_secs = backend_claim_ttl_secs();
+            let mut annotations_by_id = compute_annotations(
+                conn,
+                &shortlist,
+                &state_by_id,
+                now,
+                stale_cutoff,
+                claim_ttl_secs,
+            )?;
 
             let groom_items: Vec<GroomItem> = shortlist
                 .into_iter()
                 .map(|i| {
                     let state = state_by_id.get(i.state_id.as_str());
-                    let stale = i.updated_at < stale_cutoff;
-                    let unassigned = i.assignee_agent.is_none();
-                    let size = parsed_size(&i.metadata);
-                    let unestimated = size.is_none();
-                    let state_group = state.map(|s| s.group_name.clone()).unwrap_or_default();
-                    let overdue = i.due_date.is_some_and(|d| d < now)
-                        && !matches!(state_group.as_str(), "completed" | "cancelled");
+                    let annotations = annotations_by_id
+                        .remove(&i.id)
+                        .expect("compute_annotations returns an entry for every input item");
                     GroomItem {
-                        blocked_by: blocked_by.get(&i.id).cloned().unwrap_or_default(),
-                        depended_on_by_count: *fanin.get(&i.id).unwrap_or(&0),
-                        possible_duplicates: duplicates.get(&i.id).cloned().unwrap_or_default(),
-                        confirmed_duplicate: confirmed_duplicates.contains(&i.id),
                         id: i.id,
                         sequence_id: i.sequence_id,
                         name: i.name,
                         description: i.description,
                         state: state.map(|s| s.name.clone()).unwrap_or_default(),
-                        state_group,
+                        state_group: state.map(|s| s.group_name.clone()).unwrap_or_default(),
                         priority: i.priority,
                         assignee_agent: i.assignee_agent,
                         updated_at: i.updated_at,
-                        stale,
-                        unassigned,
-                        size,
-                        unestimated,
                         due_date: i.due_date,
-                        overdue,
+                        annotations,
                     }
                 })
                 .collect();
 
             let pull_next: Vec<String> = groom_items
                 .iter()
-                .filter(|i| i.unassigned && !i.stale && i.blocked_by.is_empty())
+                .filter(|i| {
+                    i.annotations.unassigned
+                        && !i.annotations.stale
+                        && i.annotations.blocked_by.is_empty()
+                })
                 .take(3)
                 .map(|i| i.id.clone())
                 .collect();
@@ -2002,9 +2238,15 @@ impl AgentflareMcp {
 
             let resp = GroomResponse {
                 staleness_days,
-                stale_count: groom_items.iter().filter(|i| i.stale).count(),
-                unassigned_count: groom_items.iter().filter(|i| i.unassigned).count(),
-                unestimated_count: groom_items.iter().filter(|i| i.unestimated).count(),
+                stale_count: groom_items.iter().filter(|i| i.annotations.stale).count(),
+                unassigned_count: groom_items
+                    .iter()
+                    .filter(|i| i.annotations.unassigned)
+                    .count(),
+                unestimated_count: groom_items
+                    .iter()
+                    .filter(|i| i.annotations.unestimated)
+                    .count(),
                 items: groom_items,
                 pull_next,
                 now,
