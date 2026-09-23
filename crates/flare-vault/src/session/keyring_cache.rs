@@ -14,7 +14,9 @@ static KEYRING_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// memory-only for the process; callers fall back to a passphrase prompt).
 /// Anything else (including unset) means "use the keyring".
 fn keyring_enabled() -> bool {
-    std::env::var("FLARE_VAULT_KEYRING").map(|v| v != "off").unwrap_or(true)
+    std::env::var("FLARE_VAULT_KEYRING")
+        .map(|v| v != "off")
+        .unwrap_or(true)
 }
 
 /// Runs `f` with the keyring forced available (clears any ambient
@@ -145,10 +147,10 @@ pub mod test_support {
 
     impl keyring::credential::CredentialApi for SharedEntry {
         fn set_secret(&self, secret: &[u8]) -> keyring::Result<()> {
-            store().lock().unwrap_or_else(|e| e.into_inner()).insert(
-                (self.service.clone(), self.user.clone()),
-                secret.to_vec(),
-            );
+            store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((self.service.clone(), self.user.clone()), secret.to_vec());
             Ok(())
         }
 
