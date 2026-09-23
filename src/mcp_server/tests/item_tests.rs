@@ -913,7 +913,11 @@ fn create_accepts_plan_required_with_assignee_agent_and_no_plan() {
 
 /// A plan written up front (spec first, assignment TBD): `plan_asset_id`
 /// provided in the same `create` call also unblocks the gate, even with no
-/// `assignee_agent`.
+/// `assignee_agent`. It must also actually submit the plan -- `plan_asset_id`
+/// stored and `plan_status` set to "pending" -- not just satisfy the
+/// claimability check while leaving the item permanently un-approvable
+/// (item #289 live incident: item #281 got stuck exactly this way, since
+/// `approve_plan` refuses forever once `plan_status` is absent).
 #[test]
 fn create_accepts_plan_required_with_plan_asset_id_and_no_assignee() {
     let (_tmp, s) = harness();
@@ -931,6 +935,43 @@ fn create_accepts_plan_required_with_plan_asset_id_and_no_assignee() {
     let metadata: serde_json::Value =
         serde_json::from_str(created["metadata"].as_str().unwrap()).unwrap();
     assert_eq!(metadata["plan_required"], true);
+    assert_eq!(metadata["plan_asset_id"], "asset-spec-1");
+    assert_eq!(metadata["plan_status"], "pending");
+}
+
+/// Same as the `create` case above, but reached via `update` on an
+/// already-existing ungated item -- and via `plan_asset_id` embedded
+/// directly in the `metadata` blob rather than the request's top-level
+/// field, the other shape that used to leave `plan_status` unset.
+#[test]
+fn update_accepts_plan_required_with_plan_asset_id_and_no_assignee() {
+    let (_tmp, s) = harness();
+    let created: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(empty_item_create("ungated item")))
+            .unwrap(),
+    )
+    .unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+
+    let updated: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "update".into(),
+            id: Some(item_id),
+            metadata: Some(serde_json::json!({
+                "plan_required": true,
+                "plan_approver": "human",
+                "plan_asset_id": "asset-spec-2",
+            })),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(updated["metadata"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["plan_required"], true);
+    assert_eq!(metadata["plan_asset_id"], "asset-spec-2");
+    assert_eq!(metadata["plan_status"], "pending");
 }
 
 /// Same dead-end check as `create`'s, but reached via `update` -- gating an
