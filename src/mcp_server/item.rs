@@ -171,6 +171,50 @@ fn plan_already_submitted(metadata_str: &str, plan_asset_id_field: Option<&str>)
     gate.plan_status.is_some() || gate.plan_asset_id.is_some()
 }
 
+/// Folds a create/update call's plan submission into `metadata`, pairing it
+/// with `plan_status: "pending"` exactly like `item_submit_plan` does. Two
+/// shapes reach here: the request's own `plan_asset_id` field (the
+/// schema-documented "attach a plan on create/update" path -- see its
+/// `#[schemars(description = ...)]` in `types.rs`), or a caller having put
+/// `plan_asset_id` directly inside the `metadata` blob. Before this fix,
+/// both were only ever read by `plan_already_submitted` as bypass evidence
+/// for `validate_plan_gate_claimable`'s "unclaimable" check -- neither
+/// actually set `plan_status`, so the item ended up gated with a plan
+/// attached but `plan_status` permanently absent, and `approve_plan` then
+/// refuses it forever (item #289 live incident: item #281). A `plan_status`
+/// already present in `metadata` is left alone -- on `update` that's reached
+/// only via a prior stored value (e.g. an already-`"approved"` item), since
+/// `strip_plan_transition_fields` already stripped any caller-supplied one.
+fn merge_submitted_plan(
+    metadata: Option<String>,
+    plan_asset_id_field: Option<&str>,
+) -> Option<String> {
+    let plan_asset_id_field = plan_asset_id_field.map(str::trim).filter(|s| !s.is_empty());
+    let base = match (&metadata, plan_asset_id_field) {
+        (None, None) => return metadata,
+        (None, Some(_)) => "{}".to_string(),
+        (Some(m), _) => m.clone(),
+    };
+    let with_field = match plan_asset_id_field {
+        Some(id) => agentflare_backend::item::plan_gate::merge_metadata_patch(
+            &base,
+            serde_json::json!({"plan_asset_id": id}),
+        ),
+        None => base,
+    };
+    let gate = agentflare_backend::item::plan_gate::read_plan_gate(&with_field);
+    Some(
+        if gate.plan_asset_id.is_some() && gate.plan_status.is_none() {
+            agentflare_backend::item::plan_gate::merge_metadata_patch(
+                &with_field,
+                serde_json::json!({"plan_status": "pending"}),
+            )
+        } else {
+            with_field
+        },
+    )
+}
+
 /// Refuses to let `create`/`update` write a `metadata_str` that gates the
 /// item (`plan_required: true` or a non-empty `plan_approver`) while leaving
 /// it permanently unclaimable -- no `assignee_agent` to auto-dispatch it, and
@@ -702,6 +746,7 @@ impl AgentflareMcp {
                 Some(patched) => Some(patched),
                 None => metadata_str,
             };
+            let metadata = merge_submitted_plan(metadata, req.plan_asset_id.as_deref());
             if let Some(m) = &metadata {
                 validate_plan_gate_claimable(
                     m,
@@ -919,6 +964,20 @@ impl AgentflareMcp {
                 }
                 None => metadata_str,
             };
+            // `merge_submitted_plan` below needs a base to patch into when a
+            // top-level `plan_asset_id` arrives with no `metadata`/`priority`
+            // in the same call -- same wholesale-replace hazard as the
+            // priority branch above, so seed it from the item's current
+            // stored metadata rather than an empty object.
+            let metadata = match (&metadata, req.plan_asset_id.as_deref()) {
+                (None, Some(pid)) if !pid.trim().is_empty() => Some(
+                    agentflare_backend::item::get(conn, &id)
+                        .map(|i| i.metadata)
+                        .unwrap_or_else(|_| "{}".to_string()),
+                ),
+                _ => metadata,
+            };
+            let metadata = merge_submitted_plan(metadata, req.plan_asset_id.as_deref());
             if let Some(m) = &metadata {
                 let effective_assignee = match req.assignee_agent.as_deref() {
                     Some(a) => Some(a.to_string()),

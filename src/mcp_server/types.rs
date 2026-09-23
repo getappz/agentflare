@@ -896,7 +896,7 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) repo_wide: Option<bool>,
     #[schemars(
-        description = "Asset id containing the plan content (submit_plan; required) — upload via the existing asset/handoff attachment path first, then pass its id here. On create/update, passing this alongside a gating `metadata.plan_required`/`plan_approver` counts as \"a plan was written up front\" — satisfies the plan-gate-claimability check even with no assignee_agent set"
+        description = "Asset id containing the plan content (submit_plan; required) — upload via the existing asset/handoff attachment path first, then pass its id here. On create/update, passing this alongside a gating `metadata.plan_required`/`plan_approver` actually submits the plan in the same call — it's stored as `plan_asset_id` and `plan_status` is set to \"pending\", exactly like a follow-up `submit_plan` would, which also satisfies the plan-gate-claimability check even with no assignee_agent set"
     )]
     #[serde(default)]
     pub(crate) plan_asset_id: Option<String>,
