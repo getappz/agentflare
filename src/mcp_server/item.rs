@@ -203,14 +203,16 @@ fn merge_submitted_plan(
         None => base,
     };
     let gate = agentflare_backend::item::plan_gate::read_plan_gate(&with_field);
-    Some(if gate.plan_asset_id.is_some() && gate.plan_status.is_none() {
-        agentflare_backend::item::plan_gate::merge_metadata_patch(
-            &with_field,
-            serde_json::json!({"plan_status": "pending"}),
-        )
-    } else {
-        with_field
-    })
+    Some(
+        if gate.plan_asset_id.is_some() && gate.plan_status.is_none() {
+            agentflare_backend::item::plan_gate::merge_metadata_patch(
+                &with_field,
+                serde_json::json!({"plan_status": "pending"}),
+            )
+        } else {
+            with_field
+        },
+    )
 }
 
 /// Refuses to let `create`/`update` write a `metadata_str` that gates the
