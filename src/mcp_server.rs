@@ -14,6 +14,7 @@ mod flare_git;
 mod handoff;
 pub(crate) mod item;
 mod item_doctor;
+mod item_status;
 mod memory_tool;
 mod pm;
 mod project_resolution;
@@ -826,31 +827,60 @@ impl AgentflareMcp {
         Ok(f(guard.as_ref().expect("just initialized above")))
     }
 
+    /// The job queue backing `cancel_jobs_for_reassignment` and
+    /// `item_status`: the `job_queue_override` in tests, or the real
+    /// on-disk queue -- except when only a `backend_db_override` is set
+    /// (unit tests that use an isolated backend DB but never wired a job
+    /// queue override), which returns `Ok(None)` rather than opening the
+    /// real `agentflare.db` queue those tests must not touch.
+    fn job_queue(&self) -> Result<Option<agentflare_jobs::Queue>, String> {
+        match &self.job_queue_override {
+            Some(queue) => Ok(Some(queue.clone())),
+            None if self.backend_db_override.is_some() => Ok(None),
+            None => agentflare_jobs::Queue::open(
+                &crate::db::agentflare_db_path(),
+                crate::state::state_dir().join("job-logs"),
+            )
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        }
+    }
+
     /// Hands `item_id` to `new_assignee` on the job-queue side: cancels the
     /// previous agent's queued/retrying/running jobs (see
     /// `claims::reassignment_cancels_jobs`) and returns how many. The
     /// reassignment itself already succeeded, so callers surface an `Err` as a
     /// warning rather than failing the call -- but they must surface it: a
-    /// job left running keeps working alongside the new assignee. Without a
-    /// `job_queue_override`, a `backend_db_override` (tests) skips this: the
-    /// real queue lives in `agentflare.db`, which they must not touch.
+    /// job left running keeps working alongside the new assignee.
     pub(crate) fn cancel_jobs_for_reassignment(
         &self,
         item_id: &str,
         new_assignee: &str,
     ) -> Result<usize, String> {
-        let queue = match &self.job_queue_override {
-            Some(queue) => queue.clone(),
-            None if self.backend_db_override.is_some() => return Ok(0),
-            None => agentflare_jobs::Queue::open(
-                &crate::db::agentflare_db_path(),
-                crate::state::state_dir().join("job-logs"),
-            )
-            .map_err(|e| e.to_string())?,
+        let Some(queue) = self.job_queue()? else {
+            return Ok(0);
         };
         crate::claims::reassignment_cancels_jobs(&queue, item_id, new_assignee)
             .map(|ids| ids.len())
             .map_err(|e| e.to_string())
+    }
+
+    /// The most recent dispatch job for `item_id` (by `created_at`), for
+    /// `item_status` -- mirrors `supervisor::job_in_flight`'s
+    /// `args.first() == item_id` convention (`enqueue_work_job` packs
+    /// `[item_id, agent]` positionally into `AgentJob::args`, there's no
+    /// dedicated `item_id` column). `list(None)` already orders by
+    /// `created_at DESC`, so the first match is the latest. Best-effort: a
+    /// missing/unreadable queue (no `job_queue_override` outside tests where
+    /// `agentflare.db` doesn't exist yet) or an empty match both read as "never
+    /// dispatched" rather than an error.
+    pub(crate) fn latest_job_for_item(&self, item_id: &str) -> Option<agentflare_jobs::JobInfo> {
+        let queue = self.job_queue().ok().flatten()?;
+        queue
+            .list(None)
+            .ok()?
+            .into_iter()
+            .find(|job| job.args.first().is_some_and(|a| a == item_id))
     }
 
     /// Open the store (create + migrate) if not yet open.
@@ -1385,6 +1415,7 @@ impl AgentflareMcp {
             "standup" => self.item_standup(req),
             "health" => self.item_health(req),
             "doctor" => self.item_doctor(req),
+            "status" => self.item_status(req),
             "clear_start_date" => self.item_clear_start_date(req),
             "clear_due_date" => self.item_clear_due_date(req),
             "submit_plan" => self.item_submit_plan(req),
@@ -1392,7 +1423,7 @@ impl AgentflareMcp {
             "reject_plan" => self.item_reject_plan(req),
             other => Err(ErrorData::invalid_params(
                 format!(
-                    "unknown item action: '{other}' — expected create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|groom|standup|health|doctor|clear_start_date|clear_due_date|submit_plan|approve_plan|reject_plan"
+                    "unknown item action: '{other}' — expected create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|groom|standup|health|doctor|status|clear_start_date|clear_due_date|submit_plan|approve_plan|reject_plan"
                 ),
                 None,
             )),
@@ -1400,7 +1431,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|groom|standup|health|doctor|submit_plan|approve_plan|reject_plan). `add_relation`/`remove_relation` record a typed relation (`relation_type`: blocks|duplicate|relates_to) between this item (`id`) and another (`related_item_id`); `blocks` is directional and drives dependency/cascade behavior, `duplicate`/`relates_to` are symmetric and purely informational. `list_relations` returns all three types for an item, or just one if `relation_type` is passed. `list`/`search` accept combinable structural filters `unassigned`/`blocked`/`has_comments`/`stale_claim`/`unestimated` (each true|false|omit) and every returned row carries the same decision-support flags `groom` computes (stale/unassigned/overdue/size/unestimated/blocked_by/depended_on_by_count/possible_duplicates/confirmed_duplicate/has_comments/stale_claim) -- answer e.g. \"unassigned AND blocked\" in one call instead of `list` + N x `get`. `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck/bottlenecks scorecard (`bottlenecks` = items handed between agents ≥2× in the window; history starts at the assignment-log migration). The read-only reporting actions groom|standup|health accept a `project` override (name or UUID from `project action=list`) for portfolio roll-ups. `done` moves an item to \"in_review\" (not \"completed\") when it results in an open PR, and leaves the worktree in place for follow-up commits; call `check_merge` once the PR is confirmed merged to promote it to \"completed\" and clean up the worktree. Pass `summary` on `done` with what you changed and why — it becomes the PR body; omitting it leaves the PR with a generic placeholder description. `redispatch` is the AI-agent-safe way to re-arm a stuck or failed item for the daemon's own supervisor to pick back up -- `agentflare work <id>` refuses to run under an AI agent on purpose. It atomically resets state to backlog, clears stale `dispatched`/`needs-manual-dispatch` labels, re-attaches `ready-for-work`, and normalizes `assignee_agent` (pass one explicitly to override, or it reuses the item's existing one); errors on a completed/cancelled item, and returns an error asking for `assignee_agent` if the item has none. `doctor` is the MCP equivalent of `agentflare git doctor`: scans every worktree in this repo for dirty/stale/orphaned/duplicate-branch/missing-upstream health flags (respects `staleness_days`, default 14) and, with `reclaim=true`, deletes the clean stale/orphaned ones (never the main worktree; add `force=true` to also delete dirty ones) — this is the tool to reach for a `git worktree remove/prune` shim denial, not a specific item's `check_merge`/`release`. To fix ONE broken worktree, always pass `worktree=\"<lane name or path>\"` alongside `reclaim=true`/`force=true`. An unscoped `force=true` (no `worktree`) is now refused — pass `repo_wide=true` to explicitly confirm a repo-wide force-reclaim, since omitting it otherwise silently deletes every dirty lane, including other items' uncommitted work (2026-08-16 incident: an unscoped force reclaim meant to fix one lane deleted two others' uncommitted work). `submit_plan|approve_plan|reject_plan` gate item_claim/automatic dispatch behind an optional per-item plan-approval step — see plan_required/plan_approver/plan_status in metadata."
+        description = "Manage work items in the repo's linked project. Single consolidated tool with `action` field (create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|groom|standup|health|doctor|status|submit_plan|approve_plan|reject_plan). `status` is the one-call progress check for a single dispatched item: item state, its most recent dispatch job (state/retries/error/stdout+stderr log paths), PR CI status (merged|failing|pending|passing|behind|conflicting|unknown, plus checks/labels/url), and recent daemon-log lines mentioning it -- replaces a `get` + `workflow(action=\"status\")` + `check_merge` + manual `agentflare daemon logs | grep` round trip. `limit` on `status` caps the number of daemon-log lines returned (default 20, max 200). `add_relation`/`remove_relation` record a typed relation (`relation_type`: blocks|duplicate|relates_to) between this item (`id`) and another (`related_item_id`); `blocks` is directional and drives dependency/cascade behavior, `duplicate`/`relates_to` are symmetric and purely informational. `list_relations` returns all three types for an item, or just one if `relation_type` is passed. `list`/`search` accept combinable structural filters `unassigned`/`blocked`/`has_comments`/`stale_claim`/`unestimated` (each true|false|omit) and every returned row carries the same decision-support flags `groom` computes (stale/unassigned/overdue/size/unestimated/blocked_by/depended_on_by_count/possible_duplicates/confirmed_duplicate/has_comments/stale_claim) -- answer e.g. \"unassigned AND blocked\" in one call instead of `list` + N x `get`. `groom` returns a priority+staleness-ranked shortlist with description, stale/unassigned/blocked/duplicate flags, and a pull_next list — all in one call, no per-item `get` round trips needed. `standup` returns done/in_progress(grouped by assignee)/stuck buckets computed server-side. `health` returns a velocity/WIP/stuck/bottlenecks scorecard (`bottlenecks` = items handed between agents ≥2× in the window; history starts at the assignment-log migration). The read-only reporting actions groom|standup|health accept a `project` override (name or UUID from `project action=list`) for portfolio roll-ups. `done` moves an item to \"in_review\" (not \"completed\") when it results in an open PR, and leaves the worktree in place for follow-up commits; call `check_merge` once the PR is confirmed merged to promote it to \"completed\" and clean up the worktree. Pass `summary` on `done` with what you changed and why — it becomes the PR body; omitting it leaves the PR with a generic placeholder description. `redispatch` is the AI-agent-safe way to re-arm a stuck or failed item for the daemon's own supervisor to pick back up -- `agentflare work <id>` refuses to run under an AI agent on purpose. It atomically resets state to backlog, clears stale `dispatched`/`needs-manual-dispatch` labels, re-attaches `ready-for-work`, and normalizes `assignee_agent` (pass one explicitly to override, or it reuses the item's existing one); errors on a completed/cancelled item, and returns an error asking for `assignee_agent` if the item has none. `doctor` is the MCP equivalent of `agentflare git doctor`: scans every worktree in this repo for dirty/stale/orphaned/duplicate-branch/missing-upstream health flags (respects `staleness_days`, default 14) and, with `reclaim=true`, deletes the clean stale/orphaned ones (never the main worktree; add `force=true` to also delete dirty ones) — this is the tool to reach for a `git worktree remove/prune` shim denial, not a specific item's `check_merge`/`release`. To fix ONE broken worktree, always pass `worktree=\"<lane name or path>\"` alongside `reclaim=true`/`force=true`. An unscoped `force=true` (no `worktree`) is now refused — pass `repo_wide=true` to explicitly confirm a repo-wide force-reclaim, since omitting it otherwise silently deletes every dirty lane, including other items' uncommitted work (2026-08-16 incident: an unscoped force reclaim meant to fix one lane deleted two others' uncommitted work). `submit_plan|approve_plan|reject_plan` gate item_claim/automatic dispatch behind an optional per-item plan-approval step — see plan_required/plan_approver/plan_status in metadata."
     )]
     fn item(&self, Parameters(req): Parameters<ItemRequest>) -> Result<String, ErrorData> {
         self.item_inner(req)

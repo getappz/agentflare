@@ -753,11 +753,11 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ItemRequest {
     #[schemars(
-        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|submit_plan|approve_plan|reject_plan|groom|standup|health|doctor|clear_start_date|clear_due_date"
+        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|submit_plan|approve_plan|reject_plan|groom|standup|health|doctor|status|clear_start_date|clear_due_date"
     )]
     pub(crate) action: String,
     #[schemars(
-        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, add_relation, remove_relation, list_relations, redispatch, submit_plan, approve_plan, reject_plan, clear_start_date, clear_due_date"
+        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, add_relation, remove_relation, list_relations, redispatch, submit_plan, approve_plan, reject_plan, status, clear_start_date, clear_due_date"
     )]
     #[serde(default)]
     pub(crate) id: Option<String>,
@@ -830,7 +830,7 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) state_group: Option<String>,
     #[schemars(
-        description = "Max items to return (list: omit for 50, capped at 500; search: omit for 20, capped at 1000; groom: omit for 15, capped at 200)"
+        description = "Max items to return (list: omit for 50, capped at 500; search: omit for 20, capped at 1000; groom: omit for 15, capped at 200; status: max daemon log lines, omit for 20, capped at 200)"
     )]
     #[serde(default)]
     pub(crate) limit: Option<i64>,
@@ -1116,6 +1116,54 @@ pub(crate) struct HealthResponse {
     /// caveat).
     pub(crate) bottlenecks: Vec<String>,
     pub(crate) bottleneck_note: String,
+}
+
+/// `item(action="status")`'s PR summary — a serializable flattening of
+/// `crate::worktree::PrCiStatus` (which itself doesn't derive `Serialize`).
+/// `number`/`url` are filled from `crate::worktree::pr_number_from_metadata`
+/// as a fallback whenever the CI-status variant itself doesn't carry a PR
+/// number (`Merged`/`Pending`/`Unknown`), so a merged-but-not-yet-`check_merge`d
+/// item still gets a clickable link.
+#[derive(Debug, Default, serde::Serialize)]
+pub(crate) struct PrStatusSummary {
+    /// "merged" | "failing" | "pending" | "passing" | "behind" | "conflicting" | "unknown"
+    /// ("unknown" also covers "no PR found" -- see `PrCiStatus`'s own doc comment).
+    pub(crate) status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) url: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) checks: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) labels: Vec<String>,
+}
+
+/// `item(action="status")`'s one-call response: item state + its most recent
+/// dispatch job + PR CI status + recent daemon-log lines mentioning it --
+/// the aggregator item #298 asked for, replacing `get` + `workflow status` +
+/// `check_merge` + a manual `agentflare daemon logs | grep` with one call.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ItemStatusResponse {
+    pub(crate) id: String,
+    pub(crate) sequence_id: i64,
+    pub(crate) name: String,
+    pub(crate) state: String,
+    pub(crate) state_group: String,
+    pub(crate) priority: String,
+    pub(crate) assignee_agent: Option<String>,
+    pub(crate) updated_at: i64,
+    /// The most recent dispatch job for this item (by `created_at`), or
+    /// `None` if it's never been dispatched. Carries its own
+    /// `stdout_path`/`stderr_path` for the agent's own work log --
+    /// deliberately separate from `log_lines` below, which is the
+    /// supervisor/daemon's log, not the dispatched agent's output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) job: Option<agentflare_jobs::JobInfo>,
+    pub(crate) pr: PrStatusSummary,
+    /// Recent lines from the daemon's own log (`crate::daemon::daemon_log_path`)
+    /// that mention this item's id or `#<sequence_id>`, oldest first.
+    pub(crate) log_lines: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]

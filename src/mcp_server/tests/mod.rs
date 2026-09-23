@@ -429,6 +429,7 @@ mod comment_tests;
 mod item_commit_failure_tests;
 mod item_doctor_tests;
 mod item_pr_failure_tests;
+mod item_status_tests;
 mod item_tests;
 mod item_tests_cross_project;
 mod item_tests_filters;
