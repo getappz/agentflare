@@ -215,6 +215,18 @@ pub fn cost_json(days: u32, by: &str) -> String {
     cost_totals_to_json(&crate::cost::summarize((start, today), group_by))
 }
 
+/// Host resource dispatch gate's current policy as
+/// `{ policy, pause_reason, forced_resume }` (item #643).
+pub fn gate_status_json() -> String {
+    let policy = agentflare_resource_gate::current_policy();
+    serde_json::json!({
+        "policy": policy.as_str(),
+        "pause_reason": policy.pause_reason().map(|r| r.as_str()),
+        "forced_resume": agentflare_resource_gate::force_resume_active(),
+    })
+    .to_string()
+}
+
 /// Combine an already-computed `claims` (JSON array string) and `cost_today`
 /// (JSON object string) into the `/events` snapshot `{ claims, cost_today }`.
 /// Re-parses each so they nest as JSON values rather than embedded strings;

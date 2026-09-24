@@ -675,6 +675,7 @@ pub fn router(queue: Queue) -> Router {
         .route("/api/cost", get(cost_handler))
         .route("/events", get(events_handler))
         .merge(super::chat::router())
+        .merge(super::gate::router())
         .merge(jobs_router(queue))
         .nest("/artifacts", super::artifacts::router())
         .merge(flare_proxy::router())
