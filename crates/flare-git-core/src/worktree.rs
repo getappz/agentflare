@@ -791,7 +791,9 @@ fn remove_stale_registration_for_path(repo_root: &Path, worktree_path: &Path) ->
         let checkout = resolve_gitdir_pointer(&admin, &gitdir)
             .parent()
             .map(std::path::Path::to_path_buf);
-        let is_ours = checkout.as_deref() == Some(worktree_path);
+        let is_ours = checkout
+            .as_deref()
+            .is_some_and(|c| same_location(c, worktree_path));
         if !is_ours {
             continue;
         }
@@ -810,9 +812,7 @@ fn remove_stale_registration_for_path(repo_root: &Path, worktree_path: &Path) ->
         let gitdir_again = std::fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
         let still_ours = resolve_gitdir_pointer(&admin, &gitdir_again)
             .parent()
-            .map(std::path::Path::to_path_buf)
-            .as_deref()
-            == Some(worktree_path);
+            .is_some_and(|c| same_location(c, worktree_path));
         if !still_ours || !lock_is_ours_or_absent(&admin) {
             continue;
         }

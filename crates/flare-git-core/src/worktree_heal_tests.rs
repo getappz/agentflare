@@ -447,3 +447,16 @@ fn git_children_get_english_non_interactive_env() {
     );
     assert_eq!(envs.get("GIT_OPTIONAL_LOCKS"), Some(&Some("0".to_string())));
 }
+
+#[test]
+fn same_location_matches_a_deleted_dir_through_its_canonical_parent() {
+    let tmp = TempDir::new().unwrap();
+    let real = tmp.path().join("task");
+    std::fs::create_dir_all(&real).unwrap();
+    // A differently-spelled path to the same (existing) parent, like a
+    // Windows 8.3 short name or a symlinked temp dir.
+    let alias = tmp.path().join("task").join("..").join("task").join("1");
+    let gone = real.join("1");
+    assert!(same_location(&alias, &gone));
+    assert!(!same_location(&real.join("2"), &gone));
+}

@@ -246,6 +246,30 @@ pub(super) fn is_half_created(worktree_path: &Path) -> bool {
     reason.contains("initializing") && old_enough
 }
 
+/// Whether two spellings name the same checkout location, even after the
+/// directory itself is gone (so plain `canonicalize` can't be used): the
+/// parents are canonicalized instead. Git records the long path while a
+/// caller may hold a Windows 8.3 short-name or differently-cased spelling
+/// of the same directory; a byte comparison then never matches and the
+/// stale registration is never cleared.
+pub(super) fn same_location(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let key = |p: &Path| {
+        let parent = p
+            .parent()
+            .map(|d| d.canonicalize().unwrap_or_else(|_| d.to_path_buf()));
+        let key = (parent, p.file_name().map(std::ffi::OsStr::to_os_string));
+        if cfg!(windows) {
+            format!("{key:?}").to_lowercase()
+        } else {
+            format!("{key:?}")
+        }
+    };
+    key(a) == key(b)
+}
+
 /// Resolves a gitdir pointer as git itself does: absolute as-is, relative
 /// (`worktree.useRelativePaths`, git 2.48+) against the directory holding
 /// the file it was read from.
