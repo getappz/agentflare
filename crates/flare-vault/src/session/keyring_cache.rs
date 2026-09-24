@@ -110,7 +110,16 @@ pub fn store_in_keyring(app_name: &str, entry_key: &str, dek: &[u8; 32]) -> bool
     load_from_keyring(app_name, entry_key).is_some_and(|loaded| loaded == *dek)
 }
 
+/// Clears the cached DEK from the OS keyring. Gated on `keyring_enabled()`
+/// like `load_from_keyring`/`store_in_keyring`: `FLARE_VAULT_KEYRING=off`
+/// exists precisely for machines where reaching `keyring::Entry` hangs (no
+/// interactive session for the OS backend to prompt through), so clearing a
+/// session must fail closed the same way loading/storing one does, rather
+/// than defeat the escape hatch.
 pub fn clear_keyring(app_name: &str, entry_key: &str) {
+    if !keyring_enabled() {
+        return;
+    }
     let service = build_service(app_name);
     if let Ok(entry) = keyring::Entry::new(&service, entry_key) {
         let _ = entry.delete_credential();

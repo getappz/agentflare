@@ -45,25 +45,23 @@ fn remove_legacy_file_cache(app_name: &str, entry_key: &str) {
 pub fn load_session(app_name: &str, vault_path: &Path) -> Option<[u8; 32]> {
     let entry_key = vault_path_hash(vault_path);
 
-    // Try keyring first
-    if let Some(dek) = keyring_cache::load_from_keyring(app_name, &entry_key) {
-        return Some(dek);
-    }
-
-    // Legacy XOR file, if any: delete on sight, never trust.
+    // Legacy XOR file, if any: delete on sight, never trust — regardless of
+    // whether the keyring lookup below hits or misses.
     remove_legacy_file_cache(app_name, &entry_key);
-    None
+
+    keyring_cache::load_from_keyring(app_name, &entry_key)
 }
 
 pub fn store_session(app_name: &str, vault_path: &Path, dek: &[u8; 32]) {
     let entry_key = vault_path_hash(vault_path);
 
-    if keyring_cache::store_in_keyring(app_name, &entry_key, dek) {
-        // Keyring holds it: make sure no weak legacy file lingers.
-        remove_legacy_file_cache(app_name, &entry_key);
-    }
-    // Else: fail closed (memory-only for this process). No file fallback —
-    // see the module doc comment above.
+    // Make sure no weak legacy file lingers, regardless of whether the
+    // keyring store below succeeds or fails closed.
+    remove_legacy_file_cache(app_name, &entry_key);
+
+    // Result ignored by design: on failure we fail closed (memory-only for
+    // this process). No file fallback — see the module doc comment above.
+    let _ = keyring_cache::store_in_keyring(app_name, &entry_key, dek);
 }
 
 pub fn clear_session(app_name: &str, vault_path: &Path) {
