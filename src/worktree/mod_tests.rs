@@ -327,7 +327,7 @@
 
         let status = pr_ci_status_impl(&item, Path::new("/does/not/exist"), &client, &repo);
 
-        assert!(matches!(status, PrCiStatus::Behind { number: 621 }));
+        assert!(matches!(status, PrCiStatus::Behind { number: 621, .. }));
         assert_eq!(server.requests().len(), 1);
     }
 
@@ -362,7 +362,7 @@
             owner: "o".into(),
             repo: "r".into(),
         };
-        assert!(update_branch_pr(&client, &repo, 7));
+        assert!(update_branch_pr(&client, &repo, 7, None));
     }
 
     // Idempotency invariant (task #198): whether the branch was already
@@ -385,7 +385,7 @@
             owner: "o".into(),
             repo: "r".into(),
         };
-        assert!(!update_branch_pr(&client, &repo, 7));
+        assert!(!update_branch_pr(&client, &repo, 7, None));
     }
 
     fn check(
@@ -397,7 +397,13 @@
             name: name.into(),
             status: status.into(),
             conclusion: conclusion.map(str::to_string),
+            required: false,
         }
+    }
+
+    fn required(mut run: crate::github::models::CheckRun) -> crate::github::models::CheckRun {
+        run.required = true;
+        run
     }
 
     fn batch_data(
@@ -414,6 +420,9 @@
             mergeable_state: mergeable_state.map(str::to_string),
             checks,
             labels,
+            head_sha: Some("head-sha".to_string()),
+            review_decision: None,
+            rollup_state: None,
         }
     }
 
@@ -431,7 +440,7 @@
         let data = batch_data(false, Some(true), Some("behind"), vec![], vec![]);
         assert!(matches!(
             pr_ci_status_from_batch(101, &data),
-            PrCiStatus::Behind { number: 101 }
+            PrCiStatus::Behind { number: 101, .. }
         ));
     }
 
@@ -454,9 +463,14 @@
             vec!["status:pr:approved".into()],
         );
         match pr_ci_status_from_batch(101, &data) {
-            PrCiStatus::Passing { number, labels } => {
+            PrCiStatus::Passing {
+                number,
+                labels,
+                head_sha,
+            } => {
                 assert_eq!(number, 101);
                 assert_eq!(labels, vec!["status:pr:approved".to_string()]);
+                assert_eq!(head_sha.as_deref(), Some("head-sha"));
             }
             other => panic!("expected Passing, got {other:?}"),
         }
@@ -542,6 +556,250 @@
             pr_ci_status_from_batch(101, &data),
             PrCiStatus::Pending
         ));
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_behind_carries_the_head_sha_for_update_branch() {
+        let data = batch_data(false, Some(true), Some("behind"), vec![], vec![]);
+        match pr_ci_status_from_batch(101, &data) {
+            PrCiStatus::Behind { head_sha, .. } => {
+                assert_eq!(head_sha.as_deref(), Some("head-sha"));
+            }
+            other => panic!("expected Behind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_reports_awaiting_review_when_blocked_only_on_review() {
+        for decision in ["REVIEW_REQUIRED", "CHANGES_REQUESTED"] {
+            let mut data = batch_data(
+                false,
+                Some(true),
+                Some("blocked"),
+                vec![required(check("build", "completed", Some("success")))],
+                vec![],
+            );
+            data.review_decision = Some(decision.to_string());
+            assert!(
+                matches!(
+                    pr_ci_status_from_batch(101, &data),
+                    PrCiStatus::AwaitingReview { number: 101, .. }
+                ),
+                "{decision}"
+            );
+        }
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_stays_pending_while_required_checks_run_even_if_review_is_due() {
+        let mut data = batch_data(
+            false,
+            Some(true),
+            Some("blocked"),
+            vec![required(check("build", "in_progress", None))],
+            vec![],
+        );
+        data.review_decision = Some("REVIEW_REQUIRED".to_string());
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Pending
+        ));
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_decides_on_required_contexts_only_when_any_are_marked() {
+        // An optional job failing must neither block nor trigger self-repair.
+        let data = batch_data(
+            false,
+            Some(true),
+            Some("unstable"),
+            vec![
+                required(check("build", "completed", Some("success"))),
+                check("flaky-optional", "completed", Some("failure")),
+                check("slow-optional", "in_progress", None),
+            ],
+            vec![],
+        );
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Passing { number: 101, .. }
+        ));
+
+        let data = batch_data(
+            false,
+            Some(true),
+            Some("blocked"),
+            vec![
+                required(check("build", "completed", Some("failure"))),
+                check("flaky-optional", "completed", Some("failure")),
+            ],
+            vec![],
+        );
+        match pr_ci_status_from_batch(101, &data) {
+            PrCiStatus::Failing { checks, .. } => assert_eq!(checks, vec!["build".to_string()]),
+            other => panic!("expected Failing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_counts_a_pending_required_legacy_status() {
+        let data = batch_data(
+            false,
+            Some(true),
+            Some("blocked"),
+            vec![
+                required(check("build", "completed", Some("success"))),
+                crate::github::models::CheckRun::from_status("cla", "PENDING", true),
+            ],
+            vec![],
+        );
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Pending
+        ));
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_treats_a_clean_pr_with_no_ci_at_all_as_passing() {
+        let data = batch_data(false, Some(true), Some("clean"), vec![], vec![]);
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Passing { number: 101, .. }
+        ));
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_keeps_a_checkless_pr_pending_until_github_says_mergeable() {
+        for state in ["blocked", "unknown"] {
+            let data = batch_data(false, Some(true), Some(state), vec![], vec![]);
+            assert!(
+                matches!(pr_ci_status_from_batch(101, &data), PrCiStatus::Pending),
+                "{state}"
+            );
+        }
+        let data = batch_data(false, None, Some("clean"), vec![], vec![]);
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Pending
+        ));
+        // No checks but blocked only on review: the approval gate, not Pending.
+        let mut data = batch_data(false, Some(true), Some("blocked"), vec![], vec![]);
+        data.review_decision = Some("REVIEW_REQUIRED".to_string());
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::AwaitingReview { .. }
+        ));
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_falls_back_to_the_rollup_state_when_no_context_is_listed() {
+        let mut data = batch_data(false, Some(true), Some("clean"), vec![], vec![]);
+        data.rollup_state = Some("FAILURE".to_string());
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Failing { .. }
+        ));
+        data.rollup_state = Some("PENDING".to_string());
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Pending
+        ));
+    }
+
+    #[test]
+    fn pr_ci_status_rest_path_also_reads_legacy_commit_statuses() {
+        // Check runs are all green, but a Statuses-API context failed: the
+        // REST fallback must see it too.
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"{"number":623,"html_url":"u","state":"open","title":"t","mergeable":true,"mergeable_state":"unstable","head":{"ref":"b","sha":"abc123"}}"#,
+            ),
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"{"check_runs":[{"name":"build","status":"completed","conclusion":"success"}]}"#,
+            ),
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"{"state":"failure","statuses":[{"context":"ci/jenkins","state":"failure"}]}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        let item = item_with_metadata(197, r#"{"pr":{"number":623,"branch":"b"}}"#);
+
+        match pr_ci_status_impl(&item, Path::new("/does/not/exist"), &client, &repo) {
+            PrCiStatus::Failing { checks, .. } => {
+                assert_eq!(checks, vec!["ci/jenkins".to_string()]);
+            }
+            other => panic!("expected Failing, got {other:?}"),
+        }
+        let reqs = server.requests();
+        assert_eq!(reqs[2].path, "/repos/o/r/commits/abc123/status?per_page=100");
+    }
+
+    #[test]
+    fn update_branch_pr_pins_expected_head_sha_and_skips_when_the_head_moved() {
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                422,
+                r#"{"message":"expected head sha didn't match current head ref."}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        assert!(!update_branch_pr(&client, &repo, 7, Some("stale")));
+        let sent: serde_json::Value =
+            serde_json::from_str(&server.requests()[0].body).unwrap();
+        assert_eq!(sent["expected_head_sha"], "stale");
+    }
+
+    fn repo_id(owner: &str, repo: &str) -> RepoId {
+        RepoId {
+            owner: owner.into(),
+            repo: repo.into(),
+        }
+    }
+
+    #[test]
+    fn closes_issue_line_links_a_bridge_adopted_item_to_its_issue() {
+        let mut item = item_with_metadata(1, "{}");
+        item.external_source = Some("github".into());
+        item.external_id = Some("42".into());
+        let here = repo_id("o", "r");
+        assert_eq!(
+            closes_issue_line(&item, Some(&here), &here).as_deref(),
+            Some("Closes #42")
+        );
+        assert_eq!(
+            closes_issue_line(&item, None, &here).as_deref(),
+            Some("Closes #42")
+        );
+        assert_eq!(
+            closes_issue_line(&item, Some(&repo_id("o", "issues")), &here).as_deref(),
+            Some("Closes o/issues#42")
+        );
+    }
+
+    #[test]
+    fn closes_issue_line_is_none_for_items_not_from_a_github_issue() {
+        let here = repo_id("o", "r");
+        let plain = item_with_metadata(1, "{}");
+        assert!(closes_issue_line(&plain, Some(&here), &here).is_none());
+        let mut other = item_with_metadata(2, "{}");
+        other.external_source = Some("linear".into());
+        other.external_id = Some("42".into());
+        assert!(closes_issue_line(&other, Some(&here), &here).is_none());
+        let mut bad = item_with_metadata(3, "{}");
+        bad.external_source = Some("github".into());
+        bad.external_id = Some("not-a-number".into());
+        assert!(closes_issue_line(&bad, Some(&here), &here).is_none());
     }
 
     #[test]

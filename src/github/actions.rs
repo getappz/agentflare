@@ -87,6 +87,41 @@ pub fn list_check_runs(
     serde_json::from_value(arr).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
+/// Legacy commit statuses (the Statuses API -- third-party CI, CLA bots,
+/// deploy previews) for a commit SHA, folded into the check-run shape via
+/// `CheckRun::from_status`. The Checks API behind `list_check_runs` never
+/// reports these, yet branch protection can require them, so a CI verdict
+/// built from check runs alone could call a PR green while a required
+/// status was still pending or red. One page of 100 covers every realistic
+/// commit; the combined endpoint already de-duplicates to each context's
+/// latest state.
+pub fn list_commit_statuses(
+    client: &Client,
+    repo: &RepoId,
+    sha: &str,
+) -> Result<Vec<CheckRun>, GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/commits/{sha}/status?per_page=100",
+        repo.owner, repo.repo
+    );
+    let json = client.request("GET", &path, None)?;
+    Ok(json["statuses"]
+        .as_array()
+        .map(|statuses| {
+            statuses
+                .iter()
+                .filter_map(|st| {
+                    Some(CheckRun::from_status(
+                        st["context"].as_str()?,
+                        st["state"].as_str().unwrap_or_default(),
+                        false,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +238,29 @@ mod tests {
         assert_eq!(
             server.requests()[0].path,
             "/repos/o/r/commits/abc123/check-runs?per_page=100&page=1"
+        );
+    }
+
+    #[test]
+    fn list_commit_statuses_folds_legacy_statuses_into_check_runs() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"state":"pending","statuses":[
+                {"context":"ci/jenkins","state":"success"},
+                {"context":"cla","state":"pending"},
+                {"context":"lint","state":"error"}
+            ]}"#,
+        )]);
+        let client = server.client(None);
+        let runs = list_commit_statuses(&client, &repo(), "abc123").unwrap();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].conclusion.as_deref(), Some("success"));
+        assert_eq!(runs[1].status, "pending");
+        assert_eq!(runs[1].conclusion, None);
+        assert_eq!(runs[2].conclusion.as_deref(), Some("failure"));
+        assert_eq!(
+            server.requests()[0].path,
+            "/repos/o/r/commits/abc123/status?per_page=100"
         );
     }
 }

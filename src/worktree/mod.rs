@@ -282,8 +282,22 @@ pub enum PrCiStatus {
     Pending,
     /// CI is green. Carries the PR number and its GitHub label names so
     /// `run_review_sweep` can decide whether to auto-merge without a second
-    /// API round-trip just to re-fetch labels.
+    /// API round-trip just to re-fetch labels, plus the head commit the
+    /// checks were judged against (`None` only if GitHub didn't report one)
+    /// so that merge is pinned to exactly that commit.
     Passing {
+        number: u64,
+        labels: Vec<String>,
+        head_sha: Option<String>,
+    },
+    /// Required CI is green but GitHub's `mergeStateStatus` is `BLOCKED` on
+    /// review: branch protection wants an approving review
+    /// (`reviewDecision == REVIEW_REQUIRED`) or a reviewer requested changes
+    /// (`CHANGES_REQUESTED`). Distinct from `Passing` because no merge can
+    /// succeed until a human acts -- the sweep surfaces the approval gate
+    /// instead of attempting one -- and from `Pending` because nothing
+    /// automated is still running that would ever move it.
+    AwaitingReview {
         number: u64,
         labels: Vec<String>,
     },
@@ -295,6 +309,9 @@ pub enum PrCiStatus {
     /// invalidate anyway.
     Behind {
         number: u64,
+        /// The head the "behind" verdict was made against, sent as
+        /// update-branch's `expected_head_sha`.
+        head_sha: Option<String>,
     },
     /// GitHub's own `mergeable_state == "dirty"` -- unlike `Behind` this is a
     /// real conflict, not a clean fast-forward, so `run_review_sweep` can't
@@ -382,16 +399,35 @@ fn pr_ci_status_impl(
     if pr.state == "closed" {
         return PrCiStatus::Closed { number: pr.number };
     }
+    let head_sha = pr
+        .head
+        .as_ref()
+        .map(|h| h.sha.clone())
+        .filter(|s| !s.is_empty());
     if pr.mergeable == Some(true) && pr.mergeable_state.as_deref() == Some("behind") {
-        return PrCiStatus::Behind { number: pr.number };
+        return PrCiStatus::Behind {
+            number: pr.number,
+            head_sha,
+        };
     }
     if pr.mergeable == Some(false) && pr.mergeable_state.as_deref() == Some("dirty") {
         return PrCiStatus::Conflicting { number: pr.number };
     }
-    let Some(sha) = pr.head.as_ref().map(|h| h.sha.clone()) else {
+    let Some(sha) = head_sha else {
         return PrCiStatus::Unknown;
     };
-    let checks = match crate::github::actions::list_check_runs(client, repo, &sha) {
+    // Both CI APIs: the Checks API (Actions and most apps) and the older
+    // Statuses API (third-party CI, CLA bots) -- branch protection can
+    // require contexts from either. REST can't say which are required, so
+    // every context counts on this path.
+    let checks =
+        crate::github::actions::list_check_runs(client, repo, &sha).and_then(|mut runs| {
+            runs.extend(crate::github::actions::list_commit_statuses(
+                client, repo, &sha,
+            )?);
+            Ok(runs)
+        });
+    let checks = match checks {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
@@ -401,13 +437,33 @@ fn pr_ci_status_impl(
             return PrCiStatus::Unknown;
         }
     };
-    let mergeable_state = pr.mergeable_state.clone();
     decide_from_checks(
         pr.number,
         &checks,
         pr.labels.into_iter().map(|l| l.name).collect(),
-        mergeable_state.as_deref(),
+        &MergeSignals {
+            mergeable: pr.mergeable,
+            mergeable_state: pr.mergeable_state.as_deref(),
+            // REST's PR object has no review decision; a review-blocked PR
+            // stays `Pending` on this path.
+            review_decision: None,
+            rollup_state: None,
+            head_sha: Some(&sha),
+        },
     )
+}
+
+/// GitHub's own view of a PR's mergeability, alongside its checks -- what
+/// `decide_from_checks` needs beyond the check list itself.
+struct MergeSignals<'a> {
+    mergeable: Option<bool>,
+    /// Lower-case, REST's `mergeable_state` vocabulary.
+    mergeable_state: Option<&'a str>,
+    /// Upper-case GraphQL `reviewDecision`; always `None` on the REST path.
+    review_decision: Option<&'a str>,
+    /// Upper-case GraphQL `statusCheckRollup.state`; always `None` on REST.
+    rollup_state: Option<&'a str>,
+    head_sha: Option<&'a str>,
 }
 
 /// The part of the CI-status decision tree that only needs check-run data
@@ -415,15 +471,66 @@ fn pr_ci_status_impl(
 /// shared verbatim by `pr_ci_status_impl`'s per-PR REST fetch and
 /// `pr_ci_status_from_batch`'s GraphQL-batch fetch, so the two fetch paths
 /// can never quietly disagree on what a given set of check runs means.
+///
+/// Which contexts count: when branch protection marks any context required
+/// (GraphQL's `isRequired`), only the required ones decide -- an optional
+/// flaky job must neither block nor trigger self-repair on a PR GitHub would
+/// happily merge. When none is marked (no protection, or the REST path,
+/// which can't tell), every context counts, as before.
+///
+/// A PR with no contexts at all is not left `Pending` forever: a repo with
+/// no CI whose PR GitHub reports cleanly mergeable (`mergeable_state ==
+/// "clean"`, so no required context is outstanding either) is `Passing`.
+/// The window right after a push, before CI has created its first check
+/// run, can also look like that on a repo whose checks are all optional;
+/// merges stay behind the human approval label and are pinned to the head
+/// SHA, so at worst the approval-gate card arrives a tick early.
 fn decide_from_checks(
     number: u64,
     checks: &[crate::github::models::CheckRun],
     labels: Vec<String>,
-    mergeable_state: Option<&str>,
+    signals: &MergeSignals<'_>,
 ) -> PrCiStatus {
-    let summary = crate::github::mcp::checks_wait_summary(checks, 0);
-    let total = summary["total_checks"].as_u64().unwrap_or(0);
-    if total == 0 || summary["pending"].as_bool().unwrap_or(true) {
+    let passing = |labels: Vec<String>| PrCiStatus::Passing {
+        number,
+        labels,
+        head_sha: signals.head_sha.map(str::to_string),
+    };
+    let awaiting_review = signals.mergeable_state == Some("blocked")
+        && matches!(
+            signals.review_decision,
+            Some("REVIEW_REQUIRED") | Some("CHANGES_REQUESTED")
+        );
+    let relevant: Vec<crate::github::models::CheckRun> = if checks.iter().any(|c| c.required) {
+        checks.iter().filter(|c| c.required).cloned().collect()
+    } else {
+        checks.to_vec()
+    };
+    if relevant.is_empty() {
+        // No context came back; GitHub's own roll-up is the next-best signal.
+        match signals.rollup_state {
+            Some("FAILURE") | Some("ERROR") => {
+                return PrCiStatus::Failing {
+                    number,
+                    checks: vec!["statusCheckRollup".to_string()],
+                    labels,
+                };
+            }
+            Some("PENDING") | Some("EXPECTED") => return PrCiStatus::Pending,
+            _ => {}
+        }
+        if signals.mergeable == Some(true) {
+            if signals.mergeable_state == Some("clean") {
+                return passing(labels);
+            }
+            if awaiting_review {
+                return PrCiStatus::AwaitingReview { number, labels };
+            }
+        }
+        return PrCiStatus::Pending;
+    }
+    let summary = crate::github::mcp::checks_wait_summary(&relevant, 0);
+    if summary["pending"].as_bool().unwrap_or(true) {
         return PrCiStatus::Pending;
     }
     let failed: Vec<String> = summary["failed_checks"]
@@ -441,6 +548,12 @@ fn decide_from_checks(
             labels,
         };
     }
+    // Every required context is green, and GitHub still says "blocked"
+    // purely on review: hand it to the approval gate rather than polling a
+    // PR that only a human can unblock.
+    if awaiting_review {
+        return PrCiStatus::AwaitingReview { number, labels };
+    }
     // The check-run list above only reflects what GitHub has created so far --
     // gated jobs (e.g. a `build` matrix behind a `changes` job) may not exist
     // yet even though every check-run seen so far is green, which would
@@ -454,10 +567,10 @@ fn decide_from_checks(
     // mergeability at all yet) before it ever settles into "blocked" --
     // that's the exact same incomplete-snapshot window, just caught one tick
     // earlier, so it gets the same treatment.
-    if matches!(mergeable_state, Some("blocked") | Some("unknown")) {
+    if matches!(signals.mergeable_state, Some("blocked") | Some("unknown")) {
         return PrCiStatus::Pending;
     }
-    PrCiStatus::Passing { number, labels }
+    passing(labels)
 }
 
 /// `pr_ci_status_impl`'s decision tree applied to data already fetched in
@@ -479,7 +592,10 @@ pub(crate) fn pr_ci_status_from_batch(
         return PrCiStatus::Closed { number };
     }
     if data.mergeable == Some(true) && data.mergeable_state.as_deref() == Some("behind") {
-        return PrCiStatus::Behind { number };
+        return PrCiStatus::Behind {
+            number,
+            head_sha: data.head_sha.clone(),
+        };
     }
     if data.mergeable == Some(false) && data.mergeable_state.as_deref() == Some("dirty") {
         return PrCiStatus::Conflicting { number };
@@ -488,7 +604,13 @@ pub(crate) fn pr_ci_status_from_batch(
         number,
         &data.checks,
         data.labels.clone(),
-        data.mergeable_state.as_deref(),
+        &MergeSignals {
+            mergeable: data.mergeable,
+            mergeable_state: data.mergeable_state.as_deref(),
+            review_decision: data.review_decision.as_deref(),
+            rollup_state: data.rollup_state.as_deref(),
+            head_sha: data.head_sha.as_deref(),
+        },
     )
 }
 
@@ -500,14 +622,14 @@ pub(crate) fn pr_ci_status_from_batch(
 /// transient API error) rather than retrying in-line -- same "let the next
 /// sweep tick see the real current state and decide again" shape
 /// `merge_approved_pr` already uses for its own GitHub call.
-pub fn update_stale_branch(repo_root: &Path, number: u64) -> bool {
+pub fn update_stale_branch(repo_root: &Path, number: u64, head_sha: Option<&str>) -> bool {
     let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
         return false;
     };
     let Ok(client) = crate::github::Client::new() else {
         return false;
     };
-    update_branch_pr(&client, &repo, number)
+    update_branch_pr(&client, &repo, number, head_sha)
 }
 
 /// The actual GitHub update-branch call. Split out from `update_stale_branch`
@@ -519,10 +641,24 @@ pub fn update_stale_branch(repo_root: &Path, number: u64) -> bool {
 /// sweep/daemon already updated it), so a rejection here -- GitHub itself
 /// refusing an already-current or already-merged branch -- must fall through
 /// to "log and skip", not panic or retry in-line, exactly like a duplicate
-/// `merge` call already does.
-fn update_branch_pr(client: &crate::github::Client, repo: &RepoId, number: u64) -> bool {
-    match crate::github::pulls::update_branch(client, repo, number) {
+/// `merge` call already does. `head_sha` pins the update to the head the
+/// verdict was made on: a branch someone pushed to since is left alone and
+/// re-judged next tick.
+fn update_branch_pr(
+    client: &crate::github::Client,
+    repo: &RepoId,
+    number: u64,
+    head_sha: Option<&str>,
+) -> bool {
+    match crate::github::pulls::update_branch(client, repo, number, head_sha) {
         Ok(()) => true,
+        Err(e) if crate::github::pulls::is_head_moved(&e) => {
+            eprintln!(
+                "worktree: PR #{number} in {repo} got new commits since it was checked; \
+                 leaving update-branch to the next sweep"
+            );
+            false
+        }
         Err(e) => {
             eprintln!("worktree: update-branch failed for PR #{number} in {repo}: {e}");
             false
@@ -540,6 +676,27 @@ fn pr_body(item_id: &str, summary: Option<&str>) -> String {
         Some(s) => s.to_string(),
         None => format!("Auto-opened on `item done` for {item_id}."),
     }
+}
+
+/// `Closes #N` for an item the GitHub bridge adopted from issue `N` (it
+/// records the link as `external_source = "github"`, `external_id = N`), so
+/// merging the PR closes the issue it was opened for. `issue_repo` is the
+/// repo the bridge watches; when it differs from `pr_repo` the reference
+/// is spelled `owner/repo#N`, which GitHub also honors across repos. `None`
+/// for any item that didn't come from an issue.
+fn closes_issue_line(
+    item: &agentflare_backend::item::Item,
+    issue_repo: Option<&RepoId>,
+    pr_repo: &RepoId,
+) -> Option<String> {
+    if item.external_source.as_deref() != Some(crate::github::bridge::items::EXTERNAL_SOURCE) {
+        return None;
+    }
+    let number: u64 = item.external_id.as_deref()?.trim().parse().ok()?;
+    Some(match issue_repo {
+        Some(r) if r != pr_repo => format!("Closes {r}#{number}"),
+        _ => format!("Closes #{number}"),
+    })
 }
 
 /// Human-readable attribution appended to the PR body -- who opened it and
@@ -786,11 +943,6 @@ pub fn push_and_open_pr(
         p.send(0.5, Some(1.0), Some("Creating PR...".into()));
     }
     let machine = crate::github::bridge::config::machine_label();
-    let body = format!(
-        "{}\n\n{}",
-        pr_body(&item.id, summary),
-        pr_footer(agent, &machine, item.sequence_id, &item.id)
-    );
     let repo = match RepoId::resolve_from_remote(repo_root) {
         Some(r) => r,
         None => {
@@ -817,6 +969,20 @@ pub fn push_and_open_pr(
             };
         }
     };
+    // The issue the GitHub bridge adopted this item from lives in the
+    // bridge's repo, which is normally -- but not necessarily -- this one.
+    let issue_repo = crate::github::bridge::config::resolve_project_repo(repo_root)
+        .ok()
+        .flatten();
+    let mut body = pr_body(&item.id, summary);
+    if let Some(closes) = closes_issue_line(item, issue_repo.as_ref(), &repo) {
+        body.push_str("\n\n");
+        body.push_str(&closes);
+    }
+    let body = format!(
+        "{body}\n\n{}",
+        pr_footer(agent, &machine, item.sequence_id, &item.id)
+    );
     open_pr_for_pushed_branch(
         &client,
         &repo,
