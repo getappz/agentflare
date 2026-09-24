@@ -137,7 +137,13 @@ pub fn decide(conn: &rusqlite::Connection, item: &agentflare_backend::item::Item
     }
 
     let now = crate::claims::now();
-    let ttl_secs = crate::claims::ttl_secs();
+    // The item-claim TTL, not `crate::claims::ttl_secs()` (the 30-minute
+    // GitHub-target claim TTL): item claims are taken with
+    // `backend_claim_ttl_secs()` (4h), so judging their liveness by the
+    // shorter one calls a perfectly live claim stale half an hour in.
+    // `effective_ttl_secs` then applies the same in_review cap the claim
+    // itself is subject to.
+    let item_claim_ttl = crate::mcp_server::types::backend_claim_ttl_secs();
 
     if let Some((goal_item, _)) = &goal {
         // Tier 3: evidence-wait — a sibling under the same goal is in the
@@ -157,6 +163,11 @@ pub fn decide(conn: &rusqlite::Connection, item: &agentflare_backend::item::Item
                 }
                 let has_any_claim =
                     agentflare_backend::claim::current_owner(conn, &sibling.id).is_some();
+                let ttl_secs = agentflare_backend::claim::effective_ttl_secs(
+                    conn,
+                    &sibling.id,
+                    item_claim_ttl,
+                );
                 let has_live_claim = agentflare_backend::claim::has_active_claim_by_other(
                     conn,
                     &sibling.id,
@@ -175,15 +186,43 @@ pub fn decide(conn: &rusqlite::Connection, item: &agentflare_backend::item::Item
         }
     }
 
-    // Tier 4: focus-wait — another agent already holds a live claim on this
-    // item itself.
-    let this_owner = item.assignee_agent.as_deref().unwrap_or("");
-    if agentflare_backend::claim::has_active_claim_by_other(
-        conn, &item.id, this_owner, now, ttl_secs,
-    )
-    .unwrap_or(false)
-    {
-        return Decision::wait("another agent already holds a live claim on this item");
+    // Tier 4: focus-wait — somebody already holds a live claim on this item
+    // itself. ANY live claim, not just one by someone other than
+    // `assignee_agent`: `item::claim` rewrites `assignee_agent` to the
+    // claim's own owner, so "other than the assignee" excluded exactly the
+    // claim that matters (e.g. an interactive session working the item) —
+    // the dispatched job then hit `Held`, burned its retries, and landed the
+    // item on needs-manual-dispatch. A claim-table read error waits a tick
+    // rather than dispatching blind into a possibly-live claim.
+    let ttl_secs = agentflare_backend::claim::effective_ttl_secs(conn, &item.id, item_claim_ttl);
+    match agentflare_backend::claim::live_claim_on_item(conn, &item.id, now, ttl_secs) {
+        Ok(None) => {}
+        Ok(Some(live)) => {
+            return Decision::wait(format!(
+                "'{}' already holds a live claim on this item (active {}s ago)",
+                live.owner, live.age_secs
+            ));
+        }
+        Err(e) => return Decision::wait(format!("could not read this item's claim: {e}")),
+    }
+
+    // Tier 4b: dependency-wait — an item relabeled ready-for-work by hand,
+    // or by a failure/orphan restore, while one of its blockers is still
+    // open must not be dispatched ahead of it. `cascade_unblock_dependents`
+    // is the only other place dependencies are checked, and it only runs
+    // when a blocker completes.
+    match agentflare_backend::item::list_dependencies(conn, &item.id) {
+        Ok(deps) if deps.is_empty() => {}
+        Ok(_) => match agentflare_backend::item::all_dependencies_completed(conn, &item.id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Decision::wait("a blocking dependency is not completed yet");
+            }
+            Err(e) => {
+                return Decision::wait(format!("could not read this item's dependencies: {e}"));
+            }
+        },
+        Err(e) => return Decision::wait(format!("could not read this item's dependencies: {e}")),
     }
 
     // Tier 5: eligibility — unchanged from today's supervisor behavior.
@@ -558,12 +597,12 @@ mod tests {
         let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, 0);
         let started_sid = seed_started_state(&conn, &pid);
         let stalled_sibling = make_todo(&conn, &pid, &started_sid, &goal.id);
-        // Claim it, then let the TTL be zero seconds — instantly stale.
+        // Claimed long enough ago to be past even the 4h item-claim TTL.
         agentflare_backend::claim::acquire(
             &conn,
             &stalled_sibling.id,
             "claude:1",
-            crate::claims::now() - 10_000,
+            crate::claims::now() - 20_000,
             1,
         )
         .unwrap();
@@ -584,6 +623,104 @@ mod tests {
 
         let decision = decide(&conn, &todo);
         assert_eq!(decision.effective_action, EffectiveActionInternal::Wait);
+    }
+
+    #[test]
+    fn sibling_claim_past_the_short_ttl_but_within_the_item_ttl_is_not_stale() {
+        // 45 minutes: stale by the 30-minute GitHub-target TTL, but live by
+        // the 4h TTL item claims are actually taken with.
+        let conn = test_conn();
+        let (pid, sid) = seed_project(&conn);
+        let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, 0);
+        let started_sid = seed_started_state(&conn, &pid);
+        let busy_sibling = make_todo(&conn, &pid, &started_sid, &goal.id);
+        agentflare_backend::claim::acquire(
+            &conn,
+            &busy_sibling.id,
+            "claude-code:1",
+            crate::claims::now() - 45 * 60,
+            14_400,
+        )
+        .unwrap();
+        let todo = make_todo(&conn, &pid, &sid, &goal.id);
+
+        let decision = decide(&conn, &todo);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Run);
+    }
+
+    #[test]
+    fn live_claim_by_the_items_own_assignee_session_waits() {
+        // `item::claim` sets `assignee_agent` to the claim owner, so an
+        // interactive session's claim has owner == assignee_agent. It must
+        // still block a supervisor dispatch.
+        let conn = test_conn();
+        let (pid, sid) = seed_project(&conn);
+        let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, 0);
+        let todo = make_todo(&conn, &pid, &sid, &goal.id);
+        agentflare_backend::item::claim(
+            &conn,
+            &todo.id,
+            "claude-code:interactive",
+            crate::claims::now(),
+            14_400,
+        )
+        .unwrap();
+        let todo = agentflare_backend::item::get(&conn, &todo.id).unwrap();
+        assert_eq!(
+            todo.assignee_agent.as_deref(),
+            Some("claude-code:interactive")
+        );
+
+        let decision = decide(&conn, &todo);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Wait);
+    }
+
+    #[test]
+    fn live_claim_older_than_the_short_ttl_still_waits() {
+        let conn = test_conn();
+        let (pid, sid) = seed_project(&conn);
+        let todo = make_todo(
+            &conn,
+            &pid,
+            &sid,
+            &make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, 0).id,
+        );
+        agentflare_backend::claim::acquire(
+            &conn,
+            &todo.id,
+            "codex:1",
+            crate::claims::now() - 45 * 60,
+            14_400,
+        )
+        .unwrap();
+
+        let decision = decide(&conn, &todo);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Wait);
+    }
+
+    #[test]
+    fn open_blocking_dependency_waits_until_it_completes() {
+        let conn = test_conn();
+        let (pid, sid) = seed_project(&conn);
+        let goal = make_goal_item(&conn, &pid, &sid, GoalLifecycle::Active, 0);
+        let blocker = make_todo(&conn, &pid, &sid, &goal.id);
+        let todo = make_todo(&conn, &pid, &sid, &goal.id);
+        agentflare_backend::item::add_dependency(&conn, &todo.id, &blocker.id).unwrap();
+
+        let decision = decide(&conn, &todo);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Wait);
+        assert!(
+            decision.reason.contains("dependency"),
+            "{}",
+            decision.reason
+        );
+
+        let completed_sid = agentflare_backend::state::first_in_group(&conn, &pid, "completed")
+            .unwrap()
+            .id;
+        agentflare_backend::item::update_state(&conn, &blocker.id, &completed_sid).unwrap();
+        let decision = decide(&conn, &todo);
+        assert_eq!(decision.effective_action, EffectiveActionInternal::Run);
     }
 
     #[test]

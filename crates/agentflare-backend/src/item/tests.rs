@@ -2184,3 +2184,5 @@ fn redispatch_rejects_a_completed_item() {
 mod tests_labels;
 #[path = "tests_relations.rs"]
 mod tests_relations;
+#[path = "tests_finalize.rs"]
+mod tests_finalize;

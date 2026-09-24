@@ -365,8 +365,9 @@ pub fn has_owner_override() -> bool {
 /// `<agent>:<instance>` — same agent chain as handoff, plus an instance
 /// discriminator so two parallel sessions of one agent are distinct owners.
 ///
-/// Instance is `AGENTFLARE_SESSION` if set, else the process pid. A long-lived
-/// MCP server has a stable pid, so all its `claim_*` calls share one owner —
+/// Instance is `AGENTFLARE_SESSION` if set, else a per-process id
+/// (`process_instance_id`: pid plus a random suffix). A long-lived MCP
+/// server computes it once, so all its `claim_*` calls share one owner —
 /// the common case. The CLI, however, is a fresh process per command, so
 /// `AGENTFLARE_SESSION` must be set to keep ownership continuous across
 /// separate `agentflare claim` invocations (acquire in one, release in
@@ -398,8 +399,20 @@ pub fn owner_id() -> String {
     let instance = std::env::var("AGENTFLARE_SESSION")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| std::process::id().to_string());
+        .unwrap_or_else(|| process_instance_id().to_string());
     format!("{agent}:{instance}")
+}
+
+/// This process's owner-instance discriminator: `<pid>-<random>`, computed
+/// once. A bare pid is not unique enough — every sandboxed job run under
+/// bwrap's `--unshare-pid` sees itself as a tiny pid (often the same one),
+/// and pids repeat across machines sharing a synced db — and `acquire`
+/// treats an identical owner string as "already ours", so two such
+/// processes would silently share one claim. The pid stays as a prefix for
+/// readability; no `:` so `agent_of`/`agent_part` still split correctly.
+fn process_instance_id() -> &'static str {
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| format!("{}-{:016x}", std::process::id(), rand::random::<u64>()))
 }
 
 /// Strips the `:<instance>` suffix off an owner id, leaving the stable agent
@@ -781,6 +794,21 @@ mod tests {
         let after = owner_id();
         assert_eq!(overridden, "claude-code:job-123");
         assert_ne!(after, "claude-code:job-123");
+    }
+
+    #[test]
+    fn process_instance_id_is_stable_pid_prefixed_and_colon_free() {
+        let id = process_instance_id();
+        assert_eq!(
+            id,
+            process_instance_id(),
+            "must be computed once per process"
+        );
+        assert!(id.starts_with(&format!("{}-", std::process::id())), "{id}");
+        assert!(!id.contains(':'), "{id}");
+        // Longer than the bare pid: carries the random disambiguator.
+        assert!(id.len() > std::process::id().to_string().len() + 1, "{id}");
+        assert_eq!(agent_of(&format!("claude-code:{id}")), "claude-code");
     }
 
     #[test]

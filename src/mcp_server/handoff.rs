@@ -317,7 +317,15 @@ impl AgentflareMcp {
                     let state = agentflare_backend::state::get(conn, &item.state_id)
                         .map_err(map_backend_err)?;
                     let now = crate::claims::now();
-                    let ttl_secs = crate::claims::ttl_secs();
+                    // Item claims live for the item-claim TTL (4h by
+                    // default), not `claims::ttl_secs()`'s 30 minutes --
+                    // judging by the shorter one re-queued an item whose
+                    // claim was still live, and the dispatch then hit Held.
+                    let ttl_secs = agentflare_backend::claim::effective_ttl_secs(
+                        conn,
+                        id,
+                        crate::mcp_server::types::backend_claim_ttl_secs(),
+                    );
                     let has_live_claim = agentflare_backend::claim::has_active_claim_by_other(
                         conn, id, "", now, ttl_secs,
                     )

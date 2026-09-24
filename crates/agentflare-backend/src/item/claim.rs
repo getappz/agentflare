@@ -51,6 +51,37 @@ fn without_metadata_keys(metadata: &str, keys: &[&str]) -> Option<String> {
     removed_any.then(|| value.to_string())
 }
 
+/// `metadata.pr.number`, the PR `push_and_open_pr`/`discover_untracked_prs`
+/// tracked for this item — same read as the main binary's
+/// `worktree::pr_number_from_metadata`.
+fn metadata_pr_number(metadata: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(metadata)
+        .ok()?
+        .get("pr")?
+        .get("number")?
+        .as_u64()
+}
+
+/// A write transaction that takes the write lock upfront — every
+/// read-then-write in this module needs this, see the comment in `claim()`
+/// below for why a DEFERRED one fails instantly under concurrent writers.
+fn immediate_tx(conn: &Connection) -> rusqlite::Result<Transaction<'_>> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+}
+
+/// Whether `item` is still somewhere a finalize (`mark_completed`/
+/// `mark_in_review`) may move it from: the "started" group a claim puts it
+/// in, or "in_review" (re-finalizing an item already awaiting review). An
+/// ownership check alone isn't enough — cancel only releases the canceller's
+/// own lease, and `redispatch` deliberately leaves the ledger alone, so a
+/// late finalize from a job that still holds its lease would otherwise
+/// revive a cancelled item, re-complete a completed one, or yank a
+/// just-redispatched item out of backlog.
+fn in_finalizable_state(conn: &Connection, item: &super::Item) -> Result<bool> {
+    let state = crate::state::get(conn, &item.state_id)?;
+    Ok(matches!(state.group_name.as_str(), "started" | "in_review"))
+}
+
 /// Claims an item so other agents don't duplicate the work: on a fresh
 /// acquire, sets the assignee and moves state into the project's "started"
 /// group (which sets `started_at`, via `update_state`). A live claim held by
@@ -78,7 +109,7 @@ pub fn claim(
     // ordinary lock contention does. Taking the write lock upfront closes
     // that window and puts this claim's lock wait through the normal,
     // busy_timeout-honoring path.
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let tx = immediate_tx(conn)?;
     let item = get(&tx, item_id)?;
     if let super::plan_gate::PlanGateStatus::Blocked(status) =
         super::plan_gate::plan_gate_status(&item.metadata)
@@ -138,7 +169,7 @@ pub fn claim(
 /// reassignment when it later fails, or its queue retry sees no assignee and
 /// falls back to the job's frozen agent.
 pub fn release(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = immediate_tx(conn)?;
     let released = crate::claim::release(&tx, item_id, owner)?;
     let reassigned = released
         && get(&tx, item_id)
@@ -178,18 +209,23 @@ pub fn release(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
 /// the same item between mark_completed and the deferred release below is
 /// still correctly rejected), and only *after* publish releases the lease
 /// via `claim::done`. Returns `Ok(true)` when the item was actually moved
-/// to completed, `Ok(false)` when the caller doesn't own the claim.
+/// to completed, `Ok(false)` when the caller doesn't own the claim or the
+/// item has since left the started/in_review groups (see
+/// `in_finalizable_state`).
 pub fn mark_completed(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
     // One transaction start to finish so the ownership check can't go stale
     // between the guard and the write — without this, a concurrent
     // release()+claim() by a different owner could slip in between the
     // check and update_state below, completing the item out from under its
-    // new owner.
-    let tx = conn.unchecked_transaction()?;
+    // new owner. IMMEDIATE for the same reason `claim()` above is.
+    let tx = immediate_tx(conn)?;
     if !crate::claim::is_owner(&tx, item_id, owner)? {
         return Ok(false);
     }
     let item = get(&tx, item_id)?;
+    if !in_finalizable_state(&tx, &item)? {
+        return Ok(false);
+    }
     let completed_state = crate::state::first_in_group(&tx, &item.project_id, "completed")?;
     update_state(&tx, item_id, &completed_state.id)?;
     tx.commit()?;
@@ -211,11 +247,14 @@ pub fn mark_completed(conn: &Connection, item_id: &str, owner: &str) -> Result<b
 /// existing projects were seeded before it existed and have no such state
 /// to find.
 pub fn mark_in_review(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = immediate_tx(conn)?;
     if !crate::claim::is_owner(&tx, item_id, owner)? {
         return Ok(false);
     }
     let item = get(&tx, item_id)?;
+    if !in_finalizable_state(&tx, &item)? {
+        return Ok(false);
+    }
     let review_state = match crate::state::first_in_group(&tx, &item.project_id, "in_review") {
         Ok(s) => s,
         Err(crate::error::Error::NotFound(_)) => crate::state::create(
@@ -249,10 +288,40 @@ pub fn mark_in_review(conn: &Connection, item_id: &str, owner: &str) -> Result<b
 /// not an error) when the item isn't currently in "in_review" — callers
 /// can call this speculatively without checking state first.
 pub fn promote_in_review_to_completed(conn: &Connection, item_id: &str) -> Result<bool> {
-    let tx = conn.unchecked_transaction()?;
+    promote_in_review(conn, item_id, None)
+}
+
+/// `promote_in_review_to_completed`, compare-and-set against the PR the
+/// caller actually confirmed merged: also returns `Ok(false)` unless the
+/// item's `metadata.pr.number` still equals `expected_pr` (`None` meaning
+/// "no PR number tracked", i.e. the merge was confirmed by branch lookup).
+/// `item_check_merge` reads the item, then spends a GitHub round trip
+/// checking *that* PR — long enough for a redispatch (which clears
+/// `metadata.pr`) plus a fresh attempt's own PR (which sets a new one) to
+/// land in between, and an unconditional promote would then complete the
+/// fresh attempt on the strength of the old attempt's merge.
+pub fn promote_in_review_to_completed_if_pr(
+    conn: &Connection,
+    item_id: &str,
+    expected_pr: Option<u64>,
+) -> Result<bool> {
+    promote_in_review(conn, item_id, Some(expected_pr))
+}
+
+fn promote_in_review(
+    conn: &Connection,
+    item_id: &str,
+    expected_pr: Option<Option<u64>>,
+) -> Result<bool> {
+    let tx = immediate_tx(conn)?;
     let item = get(&tx, item_id)?;
     let state = crate::state::get(&tx, &item.state_id)?;
     if state.group_name != "in_review" {
+        return Ok(false);
+    }
+    if let Some(expected) = expected_pr
+        && metadata_pr_number(&item.metadata) != expected
+    {
         return Ok(false);
     }
     let completed_state = crate::state::first_in_group(&tx, &item.project_id, "completed")?;
@@ -310,7 +379,7 @@ pub fn redispatch(
     item_id: &str,
     assignee_agent: Option<&str>,
 ) -> Result<RedispatchOutcome> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = immediate_tx(conn)?;
     let item = get(&tx, item_id)?;
     let state = crate::state::get(&tx, &item.state_id)?;
     if matches!(state.group_name.as_str(), "completed" | "cancelled") {

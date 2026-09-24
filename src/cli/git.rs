@@ -613,7 +613,7 @@ fn doctor_cmd(args: DoctorArgs) {
     let Some(repo_root) = resolve_repo_root("doctor") else {
         return;
     };
-    let item_states = item_state_groups();
+    let item_states = item_state_groups(&repo_root);
     let mut report = doctor::scan(&repo_root, args.staleness_days, &item_states);
     doctor::append_scope_check_violation(&mut report);
     if args.reclaim {
@@ -638,61 +638,125 @@ fn doctor_cmd(args: DoctorArgs) {
     }
 }
 
-/// Build set of claimed item sequence_ids from the DB.
-fn claimed_sequence_ids(_repo_root: &Path) -> HashSet<String> {
-    let conn = match crate::db::open() {
-        Ok(c) => c,
-        Err(_) => return HashSet::new(),
-    };
-    let now = db_kit::ids::now();
-    let ttl = agentflare_backend::claim::default_ttl_secs();
-    let claimed_ids: HashSet<String> = match agentflare_backend::claim::list_active(&conn, now, ttl)
-    {
-        Ok(c) => c.into_iter().collect(),
-        Err(_) => return HashSet::new(),
-    };
-    // Query all non-deleted items across all projects whose id appears
-    // in the active-claim set, collect their sequence_ids.
-    let mut stmt = match conn.prepare("SELECT id, sequence_id FROM items WHERE deleted_at IS NULL")
-    {
-        Ok(s) => s,
-        Err(_) => return HashSet::new(),
-    };
-    let rows: Vec<(String, i64)> =
-        match stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
-            Ok(r) => r.filter_map(|r| r.ok()).collect(),
-            Err(_) => return HashSet::new(),
+/// Build the set of item sequence_ids (as worktree dir names) that
+/// `audit_orphans` must treat as protected: every item with a not-yet-done
+/// claim row -- stale or live, since an audit that errs toward keeping a
+/// worktree costs disk space while erring the other way deletes someone's
+/// work. Read from `backend.db`, where `item_claims`/`items` actually live,
+/// and scoped to the project registered for `repo_root` in `project_dirs`
+/// (sequence_ids are only unique per project); a repo with no registered
+/// project falls back to every project's claims, which can only over-protect.
+///
+/// Fails CLOSED: if the claim state can't be read, every worktree dir under
+/// `.worktrees/task` is reported as claimed, so a prune on top of it removes
+/// nothing rather than treating "couldn't check" as "nothing is claimed".
+fn claimed_sequence_ids(repo_root: &Path) -> HashSet<String> {
+    fn read(repo_root: &Path) -> Result<HashSet<String>, String> {
+        // Never used on this machine: no items, so nothing is claimed.
+        let Some((conn, project_id)) = backend_for_repo(repo_root)? else {
+            return Ok(HashSet::new());
         };
-    rows.into_iter()
-        .filter(|(id, _)| claimed_ids.contains(id))
-        .map(|(_, seq)| seq.to_string())
-        .collect()
+        let now = db_kit::ids::now();
+        let ttl = crate::mcp_server::types::backend_claim_ttl_secs();
+        let claimed_ids: HashSet<String> = agentflare_backend::claim::list_all(&conn, now, ttl)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|c| c.status == "claimed")
+            .filter_map(|c| c.key.into_iter().next())
+            .collect();
+        let mut stmt = conn
+            .prepare("SELECT id, project_id, sequence_id FROM items WHERE deleted_at IS NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .filter(|(id, pid, _)| {
+                claimed_ids.contains(id) && project_id.as_ref().is_none_or(|p| p == pid)
+            })
+            .map(|(_, _, seq)| seq.to_string())
+            .collect())
+    }
+    match read(repo_root) {
+        Ok(claimed) => claimed,
+        Err(e) => {
+            eprintln!(
+                "warning: could not read item claims ({e}) -- treating every task worktree as \
+                 claimed, nothing will be reported or pruned as orphaned"
+            );
+            fs::read_dir(repo_root.join(".worktrees").join("task"))
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
+}
+
+/// Opens `backend.db` (where items and claims live) and resolves which
+/// project `repo_root` belongs to. `Ok(None)` when this machine has never
+/// used items at all.
+fn backend_for_repo(
+    repo_root: &Path,
+) -> Result<Option<(rusqlite::Connection, Option<String>)>, String> {
+    let db_path = crate::paths::agentflare_dir().join("backend.db");
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = agentflare_backend::db::open_db(&db_path).map_err(|e| e.to_string())?;
+    let canonical = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let root = canonical(repo_root);
+    let project_id = agentflare_backend::project_dir::list(&conn)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|d| canonical(Path::new(&d.folder_path)) == root)
+        .map(|d| d.project_id);
+    Ok(Some((conn, project_id)))
 }
 
 /// Map of item `sequence_id` (as a string, matching `doctor::LaneHealth`) to
 /// its state's `group_name` (e.g. "completed", "cancelled") — used by
 /// `flare doctor` to flag a worktree as orphaned when the item behind it is
-/// done but the worktree wasn't cleaned up. Best-effort: an empty map on any
-/// DB error just means orphan detection silently finds nothing, matching
-/// this file's existing soft-fail convention (see `claimed_sequence_ids`).
-fn item_state_groups() -> HashMap<String, String> {
-    let conn = match crate::db::open() {
-        Ok(c) => c,
-        Err(_) => return HashMap::new(),
+/// done but the worktree wasn't cleaned up. Scoped to `repo_root`'s own
+/// project: sequence ids repeat across projects, so another project's
+/// finished `#N` must never mark this repo's live `#N` worktree orphaned.
+/// Best-effort: an empty map (no project match, or any DB error) means
+/// orphan detection finds nothing -- the safe direction.
+fn item_state_groups(repo_root: &Path) -> HashMap<String, String> {
+    let read = || -> Result<HashMap<String, String>, String> {
+        let Some((conn, Some(project_id))) = backend_for_repo(repo_root)? else {
+            return Ok(HashMap::new());
+        };
+        let mut stmt = conn
+            .prepare(
+                "SELECT i.sequence_id, s.group_name FROM items i \
+                 JOIN states s ON i.state_id = s.id \
+                 WHERE i.deleted_at IS NULL AND i.project_id = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([&project_id], |r| {
+                Ok((r.get::<_, i64>(0)?.to_string(), r.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(rows.filter_map(Result::ok).collect())
     };
-    let mut stmt = match conn.prepare(
-        "SELECT i.sequence_id, s.group_name FROM items i \
-         JOIN states s ON i.state_id = s.id WHERE i.deleted_at IS NULL",
-    ) {
-        Ok(s) => s,
-        Err(_) => return HashMap::new(),
-    };
-    match stmt.query_map([], |r| {
-        Ok((r.get::<_, i64>(0)?.to_string(), r.get::<_, String>(1)?))
-    }) {
-        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-        Err(_) => HashMap::new(),
-    }
+    read().unwrap_or_else(|e| {
+        eprintln!("warning: could not read item states ({e}) -- orphan detection skipped");
+        HashMap::new()
+    })
 }
 
 /// Resolves the git repo root from the current working directory, printing
