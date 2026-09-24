@@ -652,12 +652,44 @@ fn launch_command(binary: &Path, args: &[String]) -> (String, Vec<String>, bool)
 }
 
 /// Outcome of a headless (non-interactive, output-captured) agent invocation.
+///
+/// The fields past `cost_usd` come from Claude Code's `result` event
+/// (`--output-format json` / `stream-json`) and stay at their defaults for
+/// agents whose reply is plain text.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HeadlessReply {
     pub text: String,
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
+    /// `success`, `error_max_turns`, `error_max_budget_usd`,
+    /// `error_during_execution`, ... — how the run ended.
+    pub subtype: Option<String>,
+    pub is_error: bool,
+    pub num_turns: Option<u64>,
+    /// Input tokens processed, summed over fresh, cache-creation and
+    /// cache-read input so it is comparable across runs whatever the cache
+    /// hit rate was.
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// The typed reply when the run was given a `--json-schema`.
+    pub structured_output: Option<serde_json::Value>,
+}
+
+/// What a `SendMessage` hook hands the workflow engine for an `Ok` reply:
+/// the reply text (the `--json-schema` structured output serialized, when
+/// there is one, so downstream parsers see the typed object rather than
+/// prose around it) and the token counts, `0` when the agent reported none.
+pub(crate) fn reply_payload(reply: HeadlessReply) -> (String, u64, u64) {
+    let text = match reply.structured_output {
+        Some(structured) => structured.to_string(),
+        None => reply.text,
+    };
+    (
+        text,
+        reply.input_tokens.unwrap_or(0),
+        reply.output_tokens.unwrap_or(0),
+    )
 }
 
 #[allow(dead_code)]
@@ -710,36 +742,121 @@ pub(crate) fn headless_full_args(
 /// "total_cost_usd"}` fields). Anything else comes back as raw text with no
 /// session or cost — never an error.
 fn parse_json_reply(stdout: &str) -> HeadlessReply {
+    match final_json_object(stdout) {
+        Some(value) => reply_from_result_event(&value, stdout),
+        None => HeadlessReply {
+            text: stdout.to_string(),
+            ..HeadlessReply::default()
+        },
+    }
+}
+
+/// The one JSON object a structured reply carries: the whole stdout for
+/// `--output-format json`, the final line for `stream-json`.
+fn final_json_object(stdout: &str) -> Option<serde_json::Value> {
     let trimmed = stdout.trim();
-    let value = serde_json::from_str::<serde_json::Value>(trimmed)
+    serde_json::from_str::<serde_json::Value>(trimmed)
         .ok()
         .or_else(|| {
             trimmed
                 .lines()
                 .next_back()
                 .and_then(|last| serde_json::from_str::<serde_json::Value>(last).ok())
-        });
-    match value {
-        Some(value) => HeadlessReply {
-            text: value
-                .get("result")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(stdout)
-                .to_string(),
-            session_id: value
-                .get("session_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            cost_usd: value
-                .get("total_cost_usd")
-                .and_then(serde_json::Value::as_f64),
-        },
-        None => HeadlessReply {
-            text: stdout.to_string(),
-            session_id: None,
-            cost_usd: None,
-        },
+        })
+}
+
+/// Reads a Claude Code `result` event (`{"type":"result","subtype":...,
+/// "is_error":...,"num_turns":...,"result":...,"session_id":...,
+/// "total_cost_usd":...,"usage":{...},"structured_output":...}`) into a
+/// reply. Any JSON object is accepted: fields that aren't there stay at
+/// their defaults, and a non-result object (no `type`/`session_id`) with no
+/// `result` text keeps `raw` as the text so nothing is lost.
+fn reply_from_result_event(value: &serde_json::Value, raw: &str) -> HeadlessReply {
+    use serde_json::Value;
+    let is_result_event = value.get("type").and_then(Value::as_str) == Some("result")
+        || value.get("session_id").is_some();
+    let text = match value.get("result").and_then(Value::as_str) {
+        Some(result) => result.to_string(),
+        None if is_result_event => String::new(),
+        None => raw.to_string(),
+    };
+    let usage = value.get("usage");
+    let tokens = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64);
+    let input_tokens = match (
+        tokens("input_tokens"),
+        tokens("cache_creation_input_tokens"),
+        tokens("cache_read_input_tokens"),
+    ) {
+        (None, None, None) => None,
+        (fresh, created, read) => {
+            Some(fresh.unwrap_or(0) + created.unwrap_or(0) + read.unwrap_or(0))
+        }
+    };
+    HeadlessReply {
+        text,
+        session_id: value
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        cost_usd: value.get("total_cost_usd").and_then(Value::as_f64),
+        subtype: value
+            .get("subtype")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        is_error: value
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        num_turns: value.get("num_turns").and_then(Value::as_u64),
+        input_tokens,
+        output_tokens: tokens("output_tokens"),
+        structured_output: value
+            .get("structured_output")
+            .filter(|s| !s.is_null())
+            .cloned(),
     }
+}
+
+/// Turns a parsed structured reply into an outcome. A cap hit
+/// (`error_max_turns`, `error_max_budget_usd`) is still a usable reply — the
+/// session id lets the next round `--resume` where the run stopped — so it
+/// stays `Ok`, with the stop reason spelled out ahead of the text for the
+/// reviewer/judge that reads it. Any other error subtype is a failure that
+/// names itself instead of hiding behind an opaque exit code.
+fn classify_result_reply(display_name: &str, mut reply: HeadlessReply) -> HeadlessOutcome {
+    match reply.subtype.as_deref() {
+        Some(subtype) if subtype.starts_with("error_max_") => {
+            reply.text = format!(
+                "[agentflare] {display_name} stopped early: {subtype}. Its partial reply follows.\n\n{}",
+                reply.text
+            );
+            HeadlessOutcome::Ok(reply)
+        }
+        Some(subtype) if reply.is_error || subtype.starts_with("error") => {
+            HeadlessOutcome::Failed(format!(
+                "{display_name} ended with {subtype}: {}",
+                tail_str(&reply.text, DIAGNOSTIC_TAIL_CHARS)
+            ))
+        }
+        _ if reply.is_error => HeadlessOutcome::Failed(format!(
+            "{display_name} reported an error result: {}",
+            tail_str(&reply.text, DIAGNOSTIC_TAIL_CHARS)
+        )),
+        _ => HeadlessOutcome::Ok(reply),
+    }
+}
+
+/// ` (<subtype>)` when a failed run's stdout still ends in a `result` event
+/// that names why it ended, else empty — so "exited non-zero" carries the
+/// CLI's own reason when it gave one.
+fn result_subtype_note(stdout: &str) -> String {
+    final_json_object(stdout)
+        .and_then(|v| {
+            v.get("subtype")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| format!(" ({s})"))
+        })
+        .unwrap_or_default()
 }
 
 /// Run an agent non-interactively with `prompt` and capture its reply, killing
@@ -1021,12 +1138,11 @@ fn run_headless_impl(
     match result {
         Ok(c) if c.success => {
             if request_json && json_output_args(spec.id).is_some() {
-                HeadlessOutcome::Ok(parse_json_reply(&c.stdout))
+                classify_result_reply(spec.display_name, parse_json_reply(&c.stdout))
             } else {
                 HeadlessOutcome::Ok(HeadlessReply {
                     text: c.stdout,
-                    session_id: None,
-                    cost_usd: None,
+                    ..HeadlessReply::default()
                 })
             }
         }
@@ -1061,8 +1177,9 @@ fn run_headless_impl(
             ))
         }
         Ok(c) => HeadlessOutcome::Failed(format!(
-            "{} exited non-zero{}",
+            "{} exited non-zero{}{}",
             spec.display_name,
+            result_subtype_note(&c.stdout),
             diagnostic_suffix(&c, sandbox_log.as_deref())
         )),
         Err(e) => HeadlessOutcome::Failed(format!("failed to run {}: {e}", spec.display_name)),
@@ -1102,23 +1219,8 @@ fn take_diagnostic_log(path: Option<&Path>) -> Option<String> {
 /// event, which has no `action` field — instead of the judge's actual
 /// decision on the transcript's last line, hard-failing every judge turn.
 pub(crate) fn parse_claude_reply(raw: &str) -> (String, Option<String>, Option<f64>) {
-    let last_line = raw.trim().lines().next_back().unwrap_or("");
-    match serde_json::from_str::<serde_json::Value>(last_line) {
-        Ok(v) => {
-            let text = v
-                .get("result")
-                .and_then(|r| r.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| raw.to_string());
-            let session_id = v
-                .get("session_id")
-                .and_then(|s| s.as_str())
-                .map(str::to_string);
-            let cost = v.get("total_cost_usd").and_then(serde_json::Value::as_f64);
-            (text, session_id, cost)
-        }
-        Err(_) => (raw.to_string(), None, None),
-    }
+    let reply = parse_json_reply(raw);
+    (reply.text, reply.session_id, reply.cost_usd)
 }
 
 /// Every role dispatched through `real_agent_send_hook` (`work_item_pipeline`)

@@ -413,14 +413,46 @@ otherwise open.
    `--name`, `--json-schema`, `permission_mode` values per role, confirmed
    flag mappings for Codex/Gemini/OpenCode/Cursor, and `agentflare run
    --print`/workflow steps adopting `RoleSpec`.
-3. Replace marker parsing in the SDD loop with schema verdicts; parse the
-   full stream-json `result` (usage, `num_turns`, `subtype`).
-4. Job-scoped `--settings` and `--mcp-config` files generated under the
-   worktree (Apps already do the `.mcp.json` half); stop depending on the
-   user's `~/.claude` for jobs. Keep the plugin path (§6.10) as the fallback
-   for `disableSideloadFlags` environments.
-5. Run personas as agents: `claude -p --agent <persona>` per step, or
-   `--agents` JSON; rewrite `apps/auto-company/workflow.json` prompts.
+   Second slice: `RoleSpec` gained `effort`, `session_name` and
+   `json_schema` (Claude Code: `--effort`, `--name`, `--json-schema`). The
+   judge carries a JSON Schema for its decision when
+   `AGENTFLARE_JUDGE_JSON_SCHEMA` opts in; the typed `structured_output`
+   is then preferred over the free-text reply, with the text parse as the
+   fallback. Off by default until confirmed against a live run. Still
+   open: setting effort/name per role, and the Codex/Gemini/OpenCode/
+   Cursor mappings — none of those CLIs is installed on the audit host, so
+   their flag spellings could not be confirmed, and the crate's rule is
+   to emit nothing unconfirmed.
+3. **started.** `HeadlessReply` now carries the full `result` event:
+   `subtype`, `is_error`, `num_turns`, `usage` (input tokens summed over
+   fresh, cache-creation and cache-read; output tokens) and
+   `structured_output`. Every send hook (SDD loop, JSON workflows, Apps)
+   reports the agent's real token counts to the workflow engine instead
+   of `0`. A cap hit (`error_max_turns`, `error_max_budget_usd`) stays a
+   usable reply with its session id, prefixed with the stop reason so the
+   judge can decide to resume; any other error subtype fails the step by
+   name, and a non-zero exit names the `result` subtype when there is one.
+   JSON workflow and App steps on Claude Code / cursor-agent now run with
+   `--output-format stream-json` (liveness plus structured replies).
+   Open: schema verdicts by default (see item 2).
+4. **done (self-contained jobs).** `src/claude_job_config.rs` writes a
+   job-scoped `mcp.json` (the `flare` server) and `settings.json` (the
+   same hook wiring `init` installs, now shared through
+   `init::claude_hook_specs`, plus the gateway allow-list) under
+   `~/.agentflare/job-config/claude-code/`, and every SDD dispatch on
+   Claude Code passes `--mcp-config` / `--settings` for whichever piece
+   the user-scope `~/.claude.json` / `~/.claude/settings.json` lacks. A
+   host that ran `init` gets neither flag, so hooks never run twice. Kept
+   out of the worktree so the agent can't commit it. Open: the plugin
+   path (§6.10) as the fallback for `disableSideloadFlags` environments.
+5. **done.** `JsonStep`/`StepInvocation` gained `persona`; on Claude Code
+   a step runs as `claude -p --agent <persona>` (the projected
+   `.claude/agents/<persona>.md` applies natively), elsewhere the send
+   hook folds the definition's body (frontmatter stripped) into the
+   prompt. `agentflare-apps` now adds the `name`/`description`
+   frontmatter Claude Code requires to plain-markdown personas.
+   `apps/auto-company/workflow.json`: all 20 steps use `persona` instead
+   of "read the file and answer in that voice".
 
 **P1: hooks, settings and hygiene**
 
@@ -468,8 +500,9 @@ otherwise open.
   `flare-docs.md`/coaching rule files (`src/uninstall.rs:55-110`).
 - README "Flare optimize module" and AGENTS.md describe `optimize context` as
   PreCompact-driven compaction; the handler is a no-op (`src/hook.rs:593-608`).
-- `src/cli/work.rs:267` warns about `--max-cost-usd` while the flag emitted
-  is `--max-budget-usd`.
+- (Withdrawn.) `src/cli/work.rs:267` names `--max-cost-usd`, which is
+  agentflare's own `work` flag; it is translated to Claude Code's
+  `--max-budget-usd` at `:263`. Not drift.
 - `crates/agent-registry/src/registry.rs:102-123` says `AgentSpec` and
   `REGISTRY` are "not yet consumed outside tests"; they are the launch path.
 - `docs-site/src/content/docs/compare.md:13` links lean-ctx to

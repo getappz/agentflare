@@ -3,11 +3,11 @@
 //
 // Each role's identity and tool policy is compiled by
 // `agent_registry::compile_role` into the target agent's own CLI flags
-// (Claude Code: `--append-system-prompt`, `--disallowedTools`), and folded
-// into the user prompt for agents whose CLI has no confirmed equivalent.
-// Before this, implementer, reviewer and judge were launched with the
-// identical argv and differed only by prose in the user prompt — a reviewer
-// could edit code, a judge could run the test suite.
+// (Claude Code: `--append-system-prompt`, `--disallowedTools`, ...), and
+// folded into the user prompt for agents whose CLI has no confirmed
+// equivalent. Before this, implementer, reviewer and judge were launched
+// with the identical argv and differed only by prose in the user prompt — a
+// reviewer could edit code, a judge could run the test suite.
 //
 // `include!`d into `work_item_pipeline.rs`, so `use` paths resolve there.
 
@@ -36,6 +36,27 @@ const DESIGN_SPEC_ANALYST_SYSTEM_PROMPT: &str = "You are the analyst in an agent
 const REVIEWER_SYSTEM_PROMPT: &str = "You are the reviewer in an agentflare SDD pipeline, reviewing one task as a headless run. File-editing tools are disabled for this session: verify by reading the diff and by running checks in the foreground, never by changing code yourself. Your final reply must start with REVIEW_APPROVED or REVIEW_ISSUES:.";
 
 const JUDGE_SYSTEM_PROMPT: &str = "You are the judge in an agentflare SDD pipeline. Editing and shell tools are disabled for this session: decide from the plan, the ledger, and the role reply you are shown. Your final reply must be exactly one JSON object and nothing else.";
+
+/// JSON Schema for the judge's decision — the same shape
+/// `build_judge_prompt` spells out in prose and `parse_judge_decision`
+/// reads back. Sent as `--json-schema` on Claude Code when
+/// `AGENTFLARE_JUDGE_JSON_SCHEMA` opts in (see `judge_json_schema`).
+pub(crate) const JUDGE_DECISION_SCHEMA: &str = r#"{"type":"object","properties":{"action":{"type":"string","enum":["continue_task","fix_round","escalate","park_finding","rule_and_continue","insert_task","skip_task","advance_task","complete_pipeline"]},"rationale":{"type":"string"},"ledger_line":{"type":"string"},"task_model_tier":{"type":["string","null"],"enum":["mechanical","integration","architecture",null]}},"required":["action","rationale","ledger_line"],"additionalProperties":false}"#;
+
+/// Env var that opts the judge into `--json-schema` (any value but `0`,
+/// `false`, or empty). Off by default until the schema mode has been
+/// confirmed against a live `agentflare work` run: with the schema on, the
+/// typed decision arrives in the reply's `structured_output` field and is
+/// preferred over the free-text reply, but the free-text parse stays as the
+/// fallback either way.
+pub(crate) const JUDGE_JSON_SCHEMA_ENV: &str = "AGENTFLARE_JUDGE_JSON_SCHEMA";
+
+fn judge_json_schema() -> Option<String> {
+    let opted_in = std::env::var(JUDGE_JSON_SCHEMA_ENV)
+        .ok()
+        .is_some_and(|v| !matches!(v.trim(), "" | "0" | "false" | "no" | "off"));
+    opted_in.then(|| JUDGE_DECISION_SCHEMA.to_string())
+}
 
 /// Shell-family tools a judge has no business running. Mirrors the Bash
 /// family `init::post_tool_use_matcher` names, minus the lowercase aliases
@@ -69,9 +90,11 @@ pub(crate) fn sdd_role_spec(role: SddRole) -> agent_registry::RoleSpec {
     agent_registry::RoleSpec {
         role: name.to_string(),
         system_prompt: Some(system_prompt.to_string()),
-        allowed_tools: Vec::new(),
         disallowed_tools,
-        permission_mode: None,
+        json_schema: (role == SddRole::Judge)
+            .then(judge_json_schema)
+            .flatten(),
+        ..agent_registry::RoleSpec::default()
     }
 }
 
@@ -79,7 +102,11 @@ pub(crate) fn sdd_role_spec(role: SddRole) -> agent_registry::RoleSpec {
 /// dispatch (empty for agents without confirmed flags) and the prompt to
 /// send, with the role's system prompt folded in whenever the argv can't
 /// carry it. Unknown agent names get the prompt-fold path.
-pub(crate) fn compile_sdd_role(agent_name: &str, role: SddRole, prompt: &str) -> (Vec<String>, String) {
+pub(crate) fn compile_sdd_role(
+    agent_name: &str,
+    role: SddRole,
+    prompt: &str,
+) -> (Vec<String>, String) {
     let spec = sdd_role_spec(role);
     let compiled = agent_registry::agent_by_name(agent_name)
         .map(|agent| agent_registry::compile_role(agent, &spec))

@@ -70,16 +70,31 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                 idle_timeout_secs,
                 cwd: _,
                 owner: _,
+                persona,
             } = inv;
             // `--model` ahead of any caller-supplied flags, mirroring
             // `run_launch_env`'s existing `--model` placement for the
             // interactive launch path.
-            let mut extra_args = Vec::with_capacity(args.len() + 2);
+            let mut extra_args = Vec::with_capacity(args.len() + 8);
             if let Some(m) = model {
                 extra_args.push("--model".to_string());
                 extra_args.push(m);
             }
             extra_args.extend(args);
+            let request_json = pin_stream_json(&agent, &mut extra_args);
+            // No projected scratch dir here: the persona definition is
+            // whatever the ambient cwd's `.claude/agents/` holds.
+            let agents_dir = std::env::current_dir()
+                .unwrap_or_default()
+                .join(".claude")
+                .join("agents");
+            let prompt = apply_persona(
+                &agent,
+                persona.as_deref(),
+                &agents_dir,
+                &mut extra_args,
+                prompt,
+            );
             let hard_cap = Duration::from_secs(hard_cap_secs.unwrap_or(DEFAULT_HARD_CAP_SECS));
             let idle_timeout =
                 Duration::from_secs(idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS));
@@ -96,16 +111,17 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                     hard_cap,
                     idle_timeout,
                     &extra_args,
-                    false,
+                    request_json,
                 )
             })
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
             match outcome {
+                // Token counts come from the agent's own result event when it
+                // reports them; 0 otherwise keeps accounting honest (unknown
+                // rather than fabricated).
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
-                    // Agent CLIs don't report token counts; 0 keeps accounting
-                    // honest (unknown rather than fabricated).
-                    Ok((reply.text, 0, 0))
+                    Ok(crate::agent_launch::reply_payload(reply))
                 }
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
                 | crate::agent_launch::HeadlessOutcome::NotHeadless(e)
@@ -114,6 +130,90 @@ pub(crate) fn agent_send_hook() -> SendMessage {
             }
         })
     })
+}
+
+/// For agents with a confirmed structured reply mode (see
+/// `agent_registry::json_output_args`), pin `--output-format stream-json`
+/// (plus the `--verbose` Claude Code requires with it) unless the step's own
+/// args already chose an output format, and return whether the reply should
+/// be parsed as JSON. Streaming rather than `json` so the idle timeout sees
+/// progress on a long step — the same reasoning as
+/// `cli::work::build_extra_args`. Returns `false`, touching nothing, for
+/// agents whose JSON reply shape isn't verified.
+fn pin_stream_json(agent: &str, extra_args: &mut Vec<String>) -> bool {
+    let Some(agent) = agent_registry::agent_by_name(agent) else {
+        return false;
+    };
+    if agent_registry::json_output_args(agent).is_none() {
+        return false;
+    }
+    let pinned = extra_args.iter().any(|a| {
+        a == "--output-format" || a.starts_with("--output-format=") || a == "--stream-json"
+    });
+    if !pinned {
+        extra_args.push("--output-format".to_string());
+        extra_args.push("stream-json".to_string());
+        if agent == agent_registry::Agent::ClaudeCode {
+            extra_args.push("--verbose".to_string());
+        }
+    }
+    true
+}
+
+/// Applies a step's `persona`: on Claude Code, `--agent <name>` so the
+/// definition under `<agents_dir>/<name>.md` applies natively (its own
+/// system prompt, tools, model); on any other agent, the definition's body
+/// (frontmatter stripped) is folded in ahead of the prompt. A persona whose
+/// file is missing leaves the prompt untouched rather than failing the step
+/// — Claude Code itself reports an unknown `--agent`. Returns the prompt to
+/// send.
+fn apply_persona(
+    agent: &str,
+    persona: Option<&str>,
+    agents_dir: &Path,
+    extra_args: &mut Vec<String>,
+    prompt: String,
+) -> String {
+    let Some(persona) = persona.map(str::trim).filter(|p| !p.is_empty()) else {
+        return prompt;
+    };
+    // Confirmed via `claude --help`: `--agent <name>` runs the session as
+    // that agent definition.
+    if agent_registry::agent_by_name(agent) == Some(agent_registry::Agent::ClaudeCode) {
+        extra_args.push("--agent".to_string());
+        extra_args.push(persona.to_string());
+        return prompt;
+    }
+    match std::fs::read_to_string(agents_dir.join(format!("{persona}.md"))) {
+        Ok(body) => {
+            let body = strip_frontmatter(&body).trim();
+            if body.is_empty() {
+                prompt
+            } else {
+                format!("{body}\n\n{prompt}")
+            }
+        }
+        Err(_) => prompt,
+    }
+}
+
+/// The markdown after a leading `---` YAML frontmatter block, or the whole
+/// text when there is none.
+fn strip_frontmatter(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix("---") else {
+        return text;
+    };
+    // `rest` starts with what's left of the opening line (usually just the
+    // newline); the block closes at the next line that is exactly `---`.
+    let mut consumed = 0;
+    for (i, line) in rest.split_inclusive('\n').enumerate() {
+        consumed += line.len();
+        if i > 0 && line.trim_end() == "---" {
+            return &rest[consumed..];
+        }
+    }
+    text
 }
 
 /// Same role as [`agent_send_hook`], but for a workflow that belongs to an
@@ -149,13 +249,26 @@ pub(crate) fn app_send_hook(
                 idle_timeout_secs,
                 cwd: _,
                 owner: _,
+                persona,
             } = inv;
-            let mut extra_args = Vec::with_capacity(args.len() + 2);
+            let mut extra_args = Vec::with_capacity(args.len() + 8);
             if let Some(m) = model {
                 extra_args.push("--model".to_string());
                 extra_args.push(m);
             }
             extra_args.extend(args);
+            let request_json = pin_stream_json(&agent, &mut extra_args);
+            // The projection above put the App's personas under the scratch
+            // dir's `.claude/agents/`, which is exactly where `--agent`
+            // resolves them and where the non-Claude fold reads them from.
+            let agents_dir = scratch.path().join(".claude").join("agents");
+            let prompt = apply_persona(
+                &agent,
+                persona.as_deref(),
+                &agents_dir,
+                &mut extra_args,
+                prompt,
+            );
             let hard_cap = Duration::from_secs(hard_cap_secs.unwrap_or(DEFAULT_HARD_CAP_SECS));
             let idle_timeout =
                 Duration::from_secs(idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS));
@@ -184,14 +297,16 @@ pub(crate) fn app_send_hook(
                     hard_cap,
                     idle_timeout,
                     &extra_args,
-                    false,
+                    request_json,
                 )
             })
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
 
             match outcome {
-                crate::agent_launch::HeadlessOutcome::Ok(reply) => Ok((reply.text, 0, 0)),
+                crate::agent_launch::HeadlessOutcome::Ok(reply) => {
+                    Ok(crate::agent_launch::reply_payload(reply))
+                }
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
                 | crate::agent_launch::HeadlessOutcome::NotHeadless(e)
                 | crate::agent_launch::HeadlessOutcome::NotFound(e)
@@ -1437,5 +1552,109 @@ mod tests {
 
         let status = workflow_status(&run_id.to_string(), &db).unwrap();
         assert_eq!(status["status"], "failed");
+    }
+}
+
+#[cfg(test)]
+mod persona_tests {
+    use super::*;
+
+    #[test]
+    fn strip_frontmatter_removes_a_leading_yaml_block_only() {
+        let with = "---\nname: ceo\ndescription: \"CEO\"\n---\n\n# CEO\nBody.";
+        assert_eq!(strip_frontmatter(with), "\n# CEO\nBody.");
+        assert_eq!(strip_frontmatter("# CEO\nBody."), "# CEO\nBody.");
+        assert_eq!(
+            strip_frontmatter("---\nunterminated"),
+            "---\nunterminated",
+            "an unterminated block is left alone"
+        );
+    }
+
+    #[test]
+    fn pin_stream_json_only_for_agents_with_a_verified_json_reply() {
+        let mut args = vec!["--model".to_string(), "sonnet".to_string()];
+        assert!(pin_stream_json("claude-code", &mut args));
+        assert_eq!(
+            args,
+            vec![
+                "--model",
+                "sonnet",
+                "--output-format",
+                "stream-json",
+                "--verbose"
+            ]
+        );
+
+        let mut pinned = vec!["--output-format".to_string(), "json".to_string()];
+        assert!(pin_stream_json("claude-code", &mut pinned));
+        assert_eq!(
+            pinned,
+            vec!["--output-format", "json"],
+            "caller's choice stands"
+        );
+
+        let mut codex = vec!["--full-auto".to_string()];
+        assert!(!pin_stream_json("codex", &mut codex));
+        assert_eq!(codex, vec!["--full-auto"]);
+    }
+
+    #[test]
+    fn apply_persona_uses_the_native_agent_flag_on_claude_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = Vec::new();
+        let prompt = apply_persona(
+            "claude-code",
+            Some("ceo-bezos"),
+            dir.path(),
+            &mut args,
+            "Pitch one idea.".to_string(),
+        );
+        assert_eq!(args, vec!["--agent", "ceo-bezos"]);
+        assert_eq!(
+            prompt, "Pitch one idea.",
+            "the definition applies natively, no fold"
+        );
+    }
+
+    #[test]
+    fn apply_persona_folds_the_definition_body_into_the_prompt_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ceo-bezos.md"),
+            "---\nname: ceo-bezos\ndescription: \"CEO\"\n---\n\n# CEO\nThink Day 1.\n",
+        )
+        .unwrap();
+        let mut args = Vec::new();
+        let prompt = apply_persona(
+            "opencode",
+            Some("ceo-bezos"),
+            dir.path(),
+            &mut args,
+            "Pitch one idea.".to_string(),
+        );
+        assert!(args.is_empty(), "no unconfirmed flags: {args:?}");
+        assert_eq!(prompt, "# CEO\nThink Day 1.\n\nPitch one idea.");
+    }
+
+    #[test]
+    fn apply_persona_leaves_the_prompt_alone_when_unset_or_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = Vec::new();
+        assert_eq!(
+            apply_persona("opencode", None, dir.path(), &mut args, "p".to_string()),
+            "p"
+        );
+        assert_eq!(
+            apply_persona(
+                "opencode",
+                Some("ghost"),
+                dir.path(),
+                &mut args,
+                "p".to_string()
+            ),
+            "p"
+        );
+        assert!(args.is_empty());
     }
 }
